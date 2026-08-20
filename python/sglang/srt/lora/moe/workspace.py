@@ -1,11 +1,3 @@
-"""Runner-owned buffers and stream state for the MoE LoRA backend.
-
-The workspace makes no selection decisions.  A validated execution plan tells
-the runner which buffers and overlap windows it needs; this object only makes
-their addresses stable across CUDA-graph replay and owns the stream/event
-objects used by those windows.
-"""
-
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
@@ -17,12 +9,8 @@ _T = TypeVar("_T")
 
 
 class MoeLoraWorkspace:
-    """Address-stable tensors plus reusable side streams and events.
-
-    Buffers are cached by semantic name *and exact tensor contract*.  Capture
-    buckets may therefore coexist without reusing a tensor with the wrong
-    shape.  Missing state is never created from inside a CUDA capture: the
-    graph warm-up forwards must have run the same plan and bucket first.
+    """Missing state is never created inside a CUDA capture: the graph warm-up
+    forwards must have run the same plan and bucket first.
     """
 
     def __init__(self) -> None:
@@ -37,12 +25,10 @@ class MoeLoraWorkspace:
         self._graph_mode = False
 
     def begin_forward(self, *, graph_mode: bool) -> None:
-        """Select bounded eager reuse or exact graph-bucket retention.
-
-        Eager forwards keep only the largest flat allocation per semantic
-        buffer name, so changing prefill lengths cannot grow a server-lifetime
-        shape cache. CUDA graphs retain exact warmed shapes because replacing
-        an allocation would invalidate an older captured graph.
+        """Eager keeps only the largest flat allocation per buffer name, so
+        varying prefill lengths cannot grow a lifetime shape cache. Graphs
+        retain exact warmed shapes because replacing an allocation would
+        invalidate an older captured graph.
         """
         self._graph_mode = bool(graph_mode)
 
@@ -59,13 +45,8 @@ class MoeLoraWorkspace:
         device: torch.device | str,
         zero_on_first_allocation: bool = False,
     ) -> torch.Tensor:
-        """Return reusable storage, optionally zeroed when it is new.
-
-        ``zero_on_first_allocation`` zeros only newly allocated or grown
-        storage. It suits buffers that are never written and buffers whose
-        owning kernel restores the zero invariant itself; a buffer needing a
-        fresh zero per forward would have to enqueue that memset itself, so
-        that the graph records it and every replay repeats it.
+        """A buffer needing a fresh zero per forward must enqueue that memset
+        itself, so the graph records it and every replay repeats it.
         """
         resolved_device = torch.device(device)
         resolved_shape = tuple(int(dim) for dim in shape)
@@ -101,8 +82,7 @@ class MoeLoraWorkspace:
 
     def side_stream(self, device: torch.device | str) -> torch.cuda.Stream:
         # Streams and events are keyed by device alone, which assumes every
-        # overlap window forks from the same consumer stream.  Key them by
-        # consumer stream once dense LoRA can be invoked from a model alt stream.
+        # overlap window forks from the same consumer stream.
         resolved_device = torch.device(device)
         stream = self._streams.get(resolved_device)
         if stream is None:
@@ -137,16 +117,9 @@ class MoeLoraWorkspace:
         compute: Callable[[], _T],
         side: Callable[[], object],
     ) -> _T:
-        """Run one explicit fork/join region without host synchronization.
-
-        CPU fixtures execute the same dependency order sequentially.  CUDA uses
-        this workspace's side stream and two of its reusable events, created on
-        first use. The graph warm-up forwards run this region eagerly before
-        capture, so the stream and both event handles already exist when
-        capture records it. Both closures and their tensors remain strongly
-        referenced through the final current-stream wait. That complete join is
-        the lifetime contract: side-stream work never escapes this method, so
-        allocator ``record_stream`` calls are neither required nor hidden here.
+        """The join is complete — side-stream work never escapes this method —
+        so allocator ``record_stream`` calls are neither required nor hidden
+        here.
         """
         if device.type != "cuda":
             side()

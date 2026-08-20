@@ -1,9 +1,8 @@
-"""The three LoRA-A families an execution plan can name.
-
-Grouped A rides the aligned route and is the general choice. Indexed A rides
-the raw route, for the decode down-A composition where aligned block padding
-dominates. Token-dedup grouped A is grouped A over a one-pair-per-token route,
-so a shared-outer bridge row is written once per token, not once per pair.
+"""The three LoRA-A families an execution plan can name. Grouped A rides the
+aligned route and is the general choice; indexed A rides the raw route, for the
+decode down-A composition where aligned block padding dominates; token-dedup
+grouped A is grouped A over a one-pair-per-token route, so a shared-outer bridge
+row is written once per token, not once per pair.
 """
 
 from __future__ import annotations
@@ -238,8 +237,8 @@ def _indexed_lora_a_kernel(
         )
         accumulator += tl.sum(rhs.to(tl.float32) * lhs[None, :].to(tl.float32), axis=1)
 
-    # A preserves invalid rows.  B owns and zero-fills every consumed
-    # destination cell, so an indexed A need not write sentinel pairs.
+    # B owns and zero-fills every consumed destination cell, so an indexed A need
+    # not write sentinel pairs.
     tl.store(
         output_ptr + pair64 * stride_om + n_offsets * stride_on,
         accumulator.to(output_ptr.dtype.element_ty),
@@ -300,7 +299,6 @@ def token_dedup_grouped_lora_a(
     config: Mapping[str, int],
     produce_pdl: bool = False,
 ) -> None:
-    """Grouped A over a one-pair-per-token route: one bridge row per token."""
     if token_routing.topk_ids.shape[1] != 1:
         raise ValueError(
             "token-deduplicated grouped A requires a T-domain top-k-1 route"

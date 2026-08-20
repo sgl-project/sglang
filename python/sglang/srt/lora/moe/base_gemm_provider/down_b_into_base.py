@@ -1,16 +1,8 @@
-"""Down-B GEMM that adds into the base down output, for the BF16 MoE row
-domains (the ``down_b_into_base`` experiment).
-
-Sibling of ``lora_b._one_launch_sliced_lora_b_kernel`` — the shipping kernel
-is untouched — with only the OUTPUT ADDRESSING changed.  The whole point
-versus a per-token down-B-in-finalize fusion (measured, rejected: without a
-route-block-tiled GEMM it degrades to scalar FMA) is that the tiled
-GEMM is preserved: the M schedule (aligned-route ``sorted_pair_ids`` blocks,
-``GROUP_SIZE_M`` swizzle over a host-static ``NUM_M_BLOCKS`` grid), the N/K
-tiling, the FP32 ``tl.dot`` accumulation, and the invalid-pair masking are
-the one-launch kernel's, with the down site's single output slice constant
-folded (``NUM_SLICES == 1``, so the per-slice tile arithmetic disappears).
-The two deltas are in the epilogue:
+"""Sibling of ``lora_b._one_launch_sliced_lora_b_kernel`` — the shipping kernel
+is untouched — with only the OUTPUT ADDRESSING changed, so the tiled GEMM is
+preserved.  A per-token down-B-in-finalize fusion was measured and rejected:
+without a route-block-tiled GEMM it degrades to scalar FMA.  The two deltas
+are in the epilogue:
 
 * the destination row is indirect — ``down_rows[src2dst[pair]]`` instead of
   the dense pair-major ``delta[pair]`` — targeting the base down GEMM's
@@ -21,33 +13,26 @@ The two deltas are in the epilogue:
   row domains (masked ``e * m_max + slot`` and contiguous
   ``seg_offsets[e] + slot`` are both injective over valid pairs), each pair
   appears exactly once in ``sorted_pair_ids``, and different N tiles of one
-  row touch disjoint columns.  Per-row H-vector accesses stay coalesced.
+  row touch disjoint columns.
 
-Sentinel semantics DIFFER from the pair-major twin by necessity: there the
-kernel owns every delta cell and must zero ``-1``-group blocks so stale graph
-memory never becomes a false delta; here the base down GEMM owns
-``down_rows`` and a zero-ADD is a no-op, so ``-1`` blocks return without any
-memory traffic.  That is also a correctness requirement — sentinel pairs'
-``src2dst`` entries are never written by either row domain's dispatch and
-must not be dereferenced.  A valid virtual-expert group implies routed pairs
-(the fused key is ``-1`` whenever ``topk_id < 0``), so every unmasked
-lane's ``src2dst`` entry was written.
-
-``src2dst`` is only READ here, so the documented hazard barring kernels that
-combine an in-place ``src2dst`` STORE with bulk row copies (see
-``_contig_fill_rows_kernel``) does not apply.
+Sentinel semantics DIFFER from the pair-major twin: there the kernel owns
+every delta cell and must zero ``-1``-group blocks so stale graph memory
+never becomes a false delta; here the base down GEMM owns ``down_rows`` and a
+zero-ADD is a no-op.  Returning early is also a correctness requirement —
+sentinel pairs' ``src2dst`` entries are never written by either row domain's
+dispatch and must not be dereferenced.  ``src2dst`` is only READ here, so the
+documented hazard barring kernels that combine an in-place ``src2dst`` STORE
+with bulk row copies (see ``_contig_fill_rows_kernel``) does not apply.
 
 NUMERICS: the FP32-accumulated delta is added to the BF16 base row and the
-sum is rounded to BF16 once, before the finalize's FP32 weighted top-k
-reduction — whereas the shipped tail rounds the delta to BF16 separately
-(pair-major) and keeps base and delta as two BF16 operands of that FP32 sum.
-Output equality versus the shipped tail is therefore judged by the
-established allclose discipline, not bitwise.
+sum is rounded to BF16 once, whereas the shipped tail rounds the delta to
+BF16 separately and keeps base and delta as two BF16 operands of finalize's
+FP32 sum.  Output equality versus the shipped tail is therefore judged
+allclose, not bitwise.
 
-Row-domain agnostic BY CONSTRUCTION, like ``post_reorder_deepgemm``: every
-physical row access goes through ``src2dst`` over a flat 2-D row view.  There is no PDL variant: the eligible plan shape is
-fully serial with the base down GEMM between down-A and this launch, so
-neither the down-A -> down-B nor the base-down -> finalize edge exists.
+There is no PDL variant: the eligible plan shape is fully serial with the
+base down GEMM between down-A and this launch, so neither the down-A ->
+down-B nor the base-down -> finalize edge exists.
 """
 
 from __future__ import annotations
@@ -86,7 +71,6 @@ def _down_b_into_base_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
 ):
-    """One-launch down-B tiling; epilogue scatter-adds into base rows."""
     pid = tl.program_id(0)
     num_pairs_post_padded = tl.load(num_pairs_post_padded_ptr)
     # Verbatim one-launch M/N schedule with the down site's single slice
@@ -103,11 +87,8 @@ def _down_b_into_base_kernel(
 
     group = tl.load(block_virtual_expert_ids_ptr + pid_m).to(tl.int64)
     if group == -1:
-        # Unlike the pair-major twin, B does NOT own these cells — the base
-        # down GEMM does, and a zero-add is a no-op.  Sentinel pairs'
-        # src2dst entries were never written by either row domain's
-        # dispatch, so this early return is also what keeps them from being
-        # dereferenced.
+        # B does NOT own these cells (the base down GEMM does), and this is
+        # what keeps sentinel pairs' unwritten src2dst entries from being read.
         return
 
     pair_slots = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
@@ -123,8 +104,7 @@ def _down_b_into_base_kernel(
     )
     store_mask = pair_mask[:, None] & n_mask[None, :]
 
-    # The down bridge is inherently pair-major (INTERMEDIATE_TOP_K == 1 in
-    # the one-launch kernel's terms): bridge rows ARE pair ids.
+    # The down bridge is inherently pair-major: bridge rows ARE pair ids.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k_begin in range(0, RANK, BLOCK_SIZE_K):
         k_offsets = k_begin + tl.arange(0, BLOCK_SIZE_K).to(tl.int64)
@@ -144,9 +124,8 @@ def _down_b_into_base_kernel(
         )
         accumulator += tl.dot(lhs, rhs, out_dtype=tl.float32)
 
-    # Read-modify-write add; each (row, N tile) cell is owned by exactly one
-    # program, so no atomics.  This is the one joint BF16 rounding of
-    # base + delta the module docstring's numerics note describes.
+    # Each (row, N tile) cell is owned by exactly one program, so no atomics.
+    # This is the single joint BF16 rounding of base + delta.
     base = tl.load(destination_ptrs, mask=store_mask, other=0.0).to(tl.float32)
     tl.store(
         destination_ptrs,
@@ -164,17 +143,6 @@ def invoke_down_b_into_base(
     routing: RouteView,
     config: Mapping[str, int],
 ) -> None:
-    """Scatter-add each routed pair's unweighted down-B delta into base rows.
-
-    ``down_rows`` is the provider's S4 output flattened to ``[rows, H]`` —
-    masked slab and contiguous compact buffer alike — indexed only through
-    ``src2dst``.  ``bridge`` is the pair-major down-A output and
-    ``b_down`` the flattened ``[V, H, rank]`` down-B groups, exactly the
-    operands of the standalone one-launch down-B whose tiling this launch
-    keeps; ``config`` is the down-B site's launch config with the same field
-    semantics (``BLOCK_SIZE_M``, when present, must equal the aligned
-    route's block size, as in the standalone launcher).
-    """
     if routing.view is not RouteViewKind.ALIGNED:
         raise ValueError(
             f"down-B into-base needs route view {RouteViewKind.ALIGNED.value!r}, got "

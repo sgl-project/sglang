@@ -1,11 +1,3 @@
-"""Bind-once semantics of the per-layer MoE LoRA engine.
-
-The engine resolves plans, tiles, and the runner exactly once, at the first
-weight bind — everything selection-shaped happens there, and the forward
-path is a phase lookup plus an M-bucket tile pick. These tests fake the
-runner and the device capability so the contract is pinned without CUDA.
-"""
-
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -96,13 +88,11 @@ def test_binding_resolves_and_prepares_every_phase_once(monkeypatch) -> None:
     assert engine.is_bound
     assert len(created) == 1
     runner = created[0]
-    # one plan per phase, each prepared against its provider on ONE runner
     assert runner.prepared == [sel.base_gemm_rows for sel in engine._selected.values()]
     assert set(runner.providers) == {
         sel.base_gemm_rows for sel in engine._selected.values()
     }
 
-    # a repeated identical bind is a no-op; a changed constant is an error
     engine.ensure_bound(is_shared_outer=False, physical_rank=64)
     assert len(created) == 1 and len(runner.prepared) == 2
     with pytest.raises(ValueError, match="layout changed"):
@@ -122,8 +112,6 @@ def test_run_routes_by_phase_and_buckets_by_batch_size(monkeypatch) -> None:
     prefill_rows, _ = engine.run(_dispatch(4096), _batch(is_prefill=True))
     assert prefill_rows == "route_major"
 
-    # the M-bucket pick is per forward: the gb300 decode ladder at rank 64
-    # serves different tiles at 4 and 17 tokens
     _, mse_launch = engine.run(_dispatch(16), _batch())
     _, large_launch = engine.run(_dispatch(17), _batch())
     assert tiny_launch.gate_up_b["BLOCK_SIZE_N"] == 128
@@ -150,7 +138,6 @@ def test_failed_initial_binding_is_transactional(monkeypatch) -> None:
         engine.ensure_bound(is_shared_outer=False, physical_rank=64)
     assert len(created) == 1
     assert not engine.is_bound
-    # the next bind starts clean and may succeed on a fixed runner
     with pytest.raises(NotImplementedError):
         engine.ensure_bound(is_shared_outer=False, physical_rank=64)
     assert len(created) == 2

@@ -1,11 +1,6 @@
-"""CPU-only guards for the production masked fusion/finalizer ABI.
-
-GPU numerical tests run with the Step-8 sweep.  These checks intentionally
-exercise source-level properties that must be true before a kernel can be
-compiled: provider capability names, exact config vocabularies, opaque
-workspace routing, optional pair activation stores, and exactly-once scaling
-ownership.
-"""
+"""Source-level guards for the masked fusion/finalizer ABI — properties that
+must hold before a kernel can be compiled.  GPU numerics run with the Step-8
+sweep."""
 
 from __future__ import annotations
 
@@ -57,7 +52,7 @@ class TestMaskedFusionSource(unittest.TestCase):
         # The kernel-level A->B PDL ABI stays complete (benchmarks drive it);
         # the serving runner no longer threads it (plan-level PDL knobs were
         # retired: route PDL is arch-keyed, A->B edges measured no better
-        # than launch-order overlap, 2026-08 twins).
+        # than launch-order overlap).
         a = (LORA_MOE / "lora_a.py").read_text()
         b = (LORA_MOE / "lora_b.py").read_text()
         runner = (LORA_MOE / "moe_lora_runner.py").read_text()
@@ -130,9 +125,9 @@ class TestMaskedFusionSource(unittest.TestCase):
 
     def test_both_device_kernels_carry_the_contiguous_admission_and_fold(self):
         # prepare_contiguous dispatches by capability, so the SM90 kernel
-        # must enforce the same admission (swap_ab + direct schedule at a
-        # (1, 1) cluster) and fold the segment base in BOTH device loops —
-        # a kernel missing one loop's fold reads the wrong expert's rows.
+        # must enforce the same admission and fold the segment base in BOTH
+        # device loops — a kernel missing one loop's fold reads the wrong
+        # expert's rows.
         for name in ("cutedsl_masked/kernel.py", "cutedsl_masked/kernel_sm90.py"):
             source = _source(name)
             self.assertIn(
@@ -314,12 +309,9 @@ class TestMaskedFusionSource(unittest.TestCase):
         self.assertIn("store_pair_act=act_pairs is not None", launcher)
 
     def test_materialized_activation_keeps_the_two_axes_independent(self):
-        """The pointwise function and the gating are separate constexprs.
-
-        NUM_SLICES carries the gating and ACTIVATION_TYPE the function, so all
-        four combinations compile. A kernel that took one "swiglu-or-relu2"
-        constant instead could not express non-gated silu or gated relu2.
-        """
+        """NUM_SLICES carries the gating and ACTIVATION_TYPE the pointwise
+        function, so all four combinations compile; one "swiglu-or-relu2"
+        constant could not express non-gated silu or gated relu2."""
         source = _source("masked_activation.py")
         kernel = _function(source, "_activation_delta_masked_kernel")
         wrapper = _function(source, "act_delta_masked")
@@ -331,14 +323,9 @@ class TestMaskedFusionSource(unittest.TestCase):
         self.assertIn("num_slices * inter", wrapper)
 
     def test_no_module_restates_the_activation_set(self):
-        """ActivationFn is the only place the accepted names are written.
-
-        The set used to be hand-copied into eight modules, three of them
-        checking what their own callee checked one frame down, so adding an
-        activation meant finding all eight. Membership is `in ActivationFn`
-        and conversion is ActivationFn.parse(); any literal pair reappearing
-        under moe/ is that drift starting again.
-        """
+        """The set used to be hand-copied into eight modules, so adding an
+        activation meant finding all eight; any literal pair reappearing
+        under moe/ is that drift starting again."""
         import re
 
         from sglang.srt.lora.moe.activation import ActivationFn
@@ -534,11 +521,9 @@ class TestMaskedFusionSource(unittest.TestCase):
             provider.mapped_down_lora_a_input(workspace, activation_rows)
 
     def test_cutedsl_schedule_uses_the_resident_slice_count(self):
-        """A NON-GATED provider must not schedule a two-slice GEMM1.
-
-        Named for the gating, not for relu2: the slice count comes from the
-        resident width, so a non-gated silu layer is the same case.
-        """
+        """A NON-GATED provider must not schedule a two-slice GEMM1 — the
+        slice count comes from the resident width, so non-gated silu is the
+        same case as relu2."""
 
         class StubWorkspace(msgspec.Struct, kw_only=True):
             hidden_permuted: torch.Tensor

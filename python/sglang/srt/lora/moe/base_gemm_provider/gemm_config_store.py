@@ -1,28 +1,11 @@
-"""M-bucketed launch-config store for the MoE LoRA base GEMM providers.
+"""M-bucketed launch-config store for the MoE LoRA base GEMM providers: one
+JSON file per (provider, geometry, device), keyed by ``expected_m`` buckets
+with nearest-M selection, mirroring sglang's Triton fused-MoE JSON pattern.
 
-Mirrors sglang's Triton fused-MoE JSON pattern
-(``fused_moe_triton_config.py``): one JSON file per (provider, geometry,
-device), keyed by ``expected_m`` buckets with nearest-M selection.  The
-loader returns ``None`` whenever no valid table exists, and every consumer
-then falls back to its built-in heuristic — behavior without config files is
-byte-identical to today's.
-
-File name::
-
-    provider={key},E={E},N1={n1},N2={n2},K={k},device_name={name},dtype=bf16.json
-
-Payload::
-
-    {"version": {"cutedsl": "<pkg version>", "generated_on": "GB300-152SM"},
-     "tiles":   [{"token_width": 64, "persistent_clusters": 128}, ...],
-     "buckets": {"16": {"token_width": 64}, "96": {"token_width": 128}}}
-
-``tiles`` (CuTeDSL only) declares the tile set to compile at attach, one
-``persistent_clusters`` per ``token_width``.  Bucket payloads carry
-``token_width`` for the CuTeDSL provider or ``expected_m`` for DeepGEMM.
-Files are generated on the target device by
-``benchmark/kernels/lora_moe/sweep_masked_gemm_configs.py``, never written
-by hand.
+Bucket payloads carry ``token_width`` for the CuTeDSL provider or
+``expected_m`` for DeepGEMM; ``tiles`` is CuTeDSL-only and declares the tile
+set to compile at attach.  Files are generated on the target device by
+``benchmark/kernels/lora_moe/sweep_masked_gemm_configs.py``, never by hand.
 """
 
 from __future__ import annotations
@@ -44,22 +27,16 @@ _PACKAGE_CONFIG_DIR = os.path.join(
 
 
 class GemmTile(msgspec.Struct, frozen=True, kw_only=True):
-    """One compiled-tile declaration for the CuTeDSL provider."""
-
     token_width: int
     persistent_clusters: int
 
 
 class GemmConfigTable(msgspec.Struct, kw_only=True):
-    """One provider+geometry+device table of expected_m-bucketed configs."""
-
     buckets: dict[int, dict[str, int]]
     tiles: tuple[GemmTile, ...] = ()
     version: dict[str, str] = {}
 
     def pick(self, expected_m: int) -> dict[str, int]:
-        """Nearest-M bucket payload — same rule as the Triton fused-MoE
-        ``try_get_optimal_moe_config`` lookup."""
         return self.buckets[min(self.buckets, key=lambda m: abs(m - expected_m))]
 
 
@@ -136,12 +113,9 @@ def load_config_table(
 ) -> GemmConfigTable | None:
     """Load the bucket table for one provider+geometry, or ``None``.
 
-    ``None`` always means "use the built-in heuristics unchanged".  Tables
-    live under ``base_gemm/`` in the directory named by
-    ``SGLANG_LORA_MOE_CONFIG_DIR``, else the package-local
-    ``lora/moe/configs/``.  The search is per file, matching how the plan and
-    tile tables resolve: an override dir that carries only some files
-    inherits the rest from the package instead of losing them.
+    ``None`` always means "use the built-in heuristics unchanged".  The search
+    is per file, so an override dir carrying only some files inherits the rest
+    from the package instead of losing them.
     """
     if device_name is None:
         from sglang.srt.utils import get_device_name
@@ -165,7 +139,6 @@ def load_config_table(
 
 
 def cutedsl_version() -> str | None:
-    """Installed CuTeDSL version for table version pinning, if importable."""
     try:
         import cutlass
     except ImportError:

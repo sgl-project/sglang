@@ -2,8 +2,7 @@
 
 The production modules pull in the full scheduler, Triton, and CUDA import
 graph.  These tests compile the exact small method bodies under test from the
-source tree and provide only their narrow CPU dependencies.  This keeps the
-contract runnable on developer laptops while still testing production code.
+source tree and provide only their narrow CPU dependencies.
 """
 
 from __future__ import annotations
@@ -17,8 +16,6 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-# Stand-ins for MoeRunnerBackend.{LORA,DEEP_GEMM}: this module stays free of
-# production imports, and the property under test only calls is_lora().
 _LORA_RUNNER = SimpleNamespace(is_lora=lambda: True)
 _OTHER_RUNNER = SimpleNamespace(is_lora=lambda: False)
 

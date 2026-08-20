@@ -1,18 +1,10 @@
-"""The masked-row-domain half of a BF16 MoE provider, GEMM-engine-agnostic.
-
-S1 preprocess (the engine-local `fused_masked_preprocess`), the S3 activation
-join (`act_delta_masked`), and the S5 finalize (`post_reorder_deepgemm`)
-are Triton kernels over one physical layout — rows in ``[E_local, m_max,·]``
-with ``masked_m`` counts and ``src2dst`` pair mapping — and carry nothing
-specific to any GEMM engine. Both shipped providers (DeepGEMM and CuTeDSL)
-consume exactly this layout and differ ONLY in how S2/S4 are executed, so the
-domain lives here once and each engine subclass implements just ``gateup`` and
-``down``.
-
-Extracted per Yanbin's review (plan section 51): before this, the CuTeDSL
-provider inherited from the DeepGEMM provider, which read as "CuTeDSL depends
-on DeepGEMM" when the true relationship is "both specialize the masked row
-domain".
+"""S1 preprocess, the S3 activation join, and the S5 finalize are Triton kernels
+over one physical layout — rows in ``[E_local, m_max,·]`` with ``masked_m``
+counts and ``src2dst`` pair mapping — and carry nothing specific to any GEMM
+engine. Both shipped providers (DeepGEMM and CuTeDSL) consume exactly this
+layout and differ ONLY in how S2/S4 are executed, so the domain lives here
+once and each engine subclass implements just ``gateup`` and ``down``. Neither
+inherits from the other: both specialize the masked row domain.
 """
 
 from __future__ import annotations
@@ -36,12 +28,10 @@ if TYPE_CHECKING:
 
 
 class MaskedRowState(msgspec.Struct, kw_only=True):
-    """Per-forward state of the masked row domain.
-
-    Rows are ``[E_local, m_max, ·]`` with
+    """Rows are ``[E_local, m_max, ·]`` with
     ``src2dst[t * top_k + k] = expert * m_max + offset``; validity is carried by
-    ``topk_ids >= 0`` for the activation join and final reordering. Providers
-    with extra per-forward state (e.g. tile schedules) subclass this.
+    ``topk_ids >= 0``. Providers with extra per-forward state (e.g. tile
+    schedules) subclass this.
     """
 
     hidden_permuted: torch.Tensor  # [E_local, m_max, hidden]
@@ -53,8 +43,6 @@ class MaskedRowState(msgspec.Struct, kw_only=True):
 
 
 class MaskedRowDomainProvider(MoeBaseProvider):
-    """S1/S3/S5 plus geometry over the masked row domain; S2/S4 stay abstract."""
-
     def __init__(self, quant_info: MoeLoraBf16QuantInfo):
         self.quant_info = quant_info
         if quant_info.intermediate_size <= 0:
@@ -117,8 +105,8 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             run_masked_fused_act,
         )
 
-        # Named, forceable implementations. A provider-specific CuTe port can
-        # inject another callable without changing the semantic method ABI.
+        # Named, forceable implementations: a port can inject another callable
+        # without changing the semantic method ABI.
         self._fused_act_impls: dict[tuple[str, str, str], Callable] = {
             (family, activation, MASKED_ACT_TRITON): run_masked_fused_act
             for family in MASKED_ACT_FAMILIES
@@ -204,9 +192,8 @@ class MaskedRowDomainProvider(MoeBaseProvider):
 
     def release_prepared_inputs(self, row_state: MaskedRowState) -> None:
         # The permuted hidden rows are dead after the gate/up GEMM; free them
-        # before the S3/S4 buffers are allocated when this provider owns the
-        # allocation. Runner-workspace inputs remain address-stable for graph
-        # replay and are reclaimed with the runner workspace.
+        # before the S3/S4 buffers when this provider owns the allocation.
+        # Runner-workspace inputs must stay address-stable for graph replay.
         if row_state.retained_inputs:
             return
         from sglang.srt.utils import dispose_tensor
@@ -225,8 +212,8 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         activation: str = "silu",
         consume_base_pdl: bool = False,
     ) -> None:
-        # No activation check: act_delta_masked fails closed on the same
-        # string one frame down, against the registry.
+        # No activation check: act_delta_masked fails closed on the same string
+        # one frame down, against the registry.
         self._act_kernel(
             gateup_out,
             gate_up_delta,
@@ -245,12 +232,6 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         row_state: MaskedRowState,
         activation: torch.Tensor,
     ) -> MappedLoraAInput:
-        """Expose masked activation rows without leaking row-state internals.
-
-        The mapping is the provider's semantic pair-to-physical-row ABI.  The
-        runner consumes only this descriptor and never reaches into ``ws``.
-        """
-
         if not isinstance(row_state, MaskedRowState):
             raise TypeError("masked down-A input requires MaskedRowState")
         expected = self.act_out_shape(row_state)
@@ -288,7 +269,6 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         name: str,
         implementation: Callable,
     ) -> None:
-        """Inject an explicitly forceable provider-local implementation."""
         if family != "b_activation":
             raise ValueError(f"unknown fused-act family {family!r}")
         if not name or not callable(implementation):
@@ -422,10 +402,6 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         routing: RouteView,
         config: Mapping[str, int],
     ) -> None:
-        # Same row-domain lever as post_reorder: rows are
-        # addressed only through src2dst over the flat [rows, H] view (masked
-        # rows e * m_max + slot).  src2dst is only READ, so the documented
-        # in-place-src2dst-store hazard does not apply.
         self._down_b_into_base(
             down_rows=down_out.view(-1, self.hidden_size),
             src2dst=row_state.src2dst,
@@ -491,9 +467,8 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             raise NotImplementedError(
                 f"{self.contract.key} has no {implementation!r} shared-rank reduction"
             ) from exc
-        # `row_state` is deliberately opaque and unused by this pair-domain launch;
-        # retaining it in the provider ABI lets every scheduled stage be
-        # invoked uniformly.
+        # `row_state` is unused by this pair-domain launch; it stays in the
+        # provider ABI so every scheduled stage is invoked uniformly.
         del row_state
         invoke(
             bridge=bridge,

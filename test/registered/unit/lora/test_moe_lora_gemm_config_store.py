@@ -1,10 +1,5 @@
-"""CPU coverage for the MoE LoRA base-GEMM M-bucketed config store.
-
-The load contract is fail-closed: any missing, malformed, or
-version-mismatched table returns ``None`` and the providers keep their
-built-in heuristics — behavior without config files must be byte-identical
-to a build that has none.
-"""
+"""The load contract is fail-closed: any missing, malformed, or version-mismatched
+table returns ``None`` and the providers keep their built-in heuristics."""
 
 from __future__ import annotations
 
@@ -82,10 +77,8 @@ def test_valid_table_loads_via_env_override(tmp_path: Path) -> None:
 def test_an_override_dir_without_the_file_inherits_the_packaged_one(
     tmp_path: Path, monkeypatch
 ) -> None:
-    # The documented override flow points the env var at a tuner output dir
-    # that carries plans and tiles only. Plan and tile lookup fall back per
-    # file, so base-GEMM lookup has to as well or that dir silently disables
-    # every packaged base-GEMM table.
+    # The env-override dir is a tuner output dir carrying plans/tiles only;
+    # without per-file fallback it silently disables every packaged table.
     package, override = tmp_path / "pkg", tmp_path / "override"
     override.mkdir()
     package.mkdir()
@@ -107,8 +100,6 @@ def test_nearest_m_pick() -> None:
     )
     assert table.pick(1)["token_width"] == 8
     assert table.pick(8)["token_width"] == 8
-    # 13 snaps to bucket 16, 150 to bucket 192: assertions check the chosen
-    # bucket's payload, not the bucket key.
     assert table.pick(13) is table.buckets[16]
     assert table.pick(90) is table.buckets[96]
     assert table.pick(150) is table.buckets[192]

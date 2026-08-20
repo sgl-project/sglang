@@ -1,5 +1,3 @@
-"""Focused contracts for the shared-factor joint route builder."""
-
 from __future__ import annotations
 
 import pytest
@@ -46,7 +44,6 @@ def test_joint_route_counts_are_initialized_only_on_first_allocation() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA route kernel required")
 def test_joint_route_scan_restores_both_count_buffers_between_calls() -> None:
-    """Each scan must leave both histograms ready for the next invocation."""
     device = torch.device("cuda")
     workspace = MoeLoraWorkspace()
     num_local_experts = 3

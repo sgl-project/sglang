@@ -1,27 +1,3 @@
-"""B_ACTIVATION-middle coverage for the MoE LoRA engine.
-
-The shipped config files serve the B_ACTIVATION middle on every serial
-per-expert SWIGLU prefill choice — the GB300 and H200 in-domain prefill
-scenarios plus the per-expert out-of-domain prefill fallback: the standalone
-one-launch gate/up LoRA-B stage disappears and the route-block-tiled
-activation join applies the same per-expert pair-major delta inline, with
-the down tail reordered by the composed ``down_b_into_base``.  CPU cases pin
-that config structure through the public resolver only (no menu internals).
-
-CUDA cases are runner-level oracles on the DeepGEMM providers: the SAME
-random inputs through the serial materialized reference plan versus the
-b_act-swapped plan (and versus b_act + into-base, the full shipped
-composition) must agree.  The reference plan/config pair is the shipped
-decode fallback choice — exactly the serial materialized shape with a
-complete tuned config — and the swapped plans are built directly from the
-execution-plan spec classes, keeping the SAME launch config so the plan
-change is isolated.  Agreement is allclose rather than bitwise BY
-JUSTIFICATION: the b_act middle rounds each pair's gate/up delta into the
-activation join's FP32 arithmetic instead of materializing a BF16 delta that
-the standalone join re-reads — the same rounding class as the shared-rank
-and into-base contract notes.
-"""
-
 from __future__ import annotations
 
 import pytest
@@ -58,12 +34,9 @@ _SWIGLU = ActivationFn.SILU
 
 
 def _menu(architecture, layout, activation=_SWIGLU):
-    """Every shipped row for one layout, keyed by row name.
-
-    The whole menu, built from the same table loader and plan builder
+    """The whole menu, built from the same table loader and plan builder
     serving uses — minus ``resolve_plans``' phase and rank predicates,
-    which pick ONE row per phase.
-    """
+    which pick ONE row per phase."""
     table = load_plans(architecture)
     layout_name = "shared" if layout else "per_expert"
     return {
@@ -79,7 +52,6 @@ def _menu(architecture, layout, activation=_SWIGLU):
 
 
 def _shipped_launch(architecture, sel, *, physical_rank=16, num_tokens=4096):
-    """The shipped tile pick for one row, resolved the way serving does."""
     return resolve_tiles(
         architecture_value=architecture.value,
         plan_key_name=sel.name,
@@ -94,9 +66,6 @@ def _build_plan(
     act_family=ActFamily.MATERIALIZED,
     down_b_into_base=False,
 ) -> MoeLoraExecutionPlan:
-    """The serial one-launch plan shape, built the way
-    ``execution_plan.build_plan`` materializes a table row (spec classes
-    directly)."""
     pe = False
     consumes_gate_up_b = act_family is ActFamily.B_ACTIVATION
     return MoeLoraExecutionPlan(
@@ -129,13 +98,8 @@ def _build_plan(
     )
 
 
-# ---- CPU: shipped config structure ----------------------------------------------
-
-
 class TestBActConfig:
     def test_h200_serial_prefill_ships_it_too(self) -> None:
-        # The H200 serial prefill shape is the same eligible form, on the
-        # SM90-capable DeepGEMM contiguous backend.
         serial = _menu(_H200, False)["prefill.serial"]
         assert serial.plan.act.family is ActFamily.B_ACTIVATION
         assert serial.plan.gate_up_b is None
@@ -143,9 +107,6 @@ class TestBActConfig:
         assert serial.base_gemm_rows == "route_major"
 
     def test_decode_choices_keep_the_materialized_act(self) -> None:
-        # The swap is a prefill-only config: every decode-phase choice on
-        # both architectures and layouts keeps the materialized middle with
-        # a standalone gate/up-B owner.
         for architecture in (_GB300, _H200):
             for layout in (False, True):
                 for activation in (_SWIGLU, ActivationFn.RELU2):
@@ -186,9 +147,6 @@ class TestBActConfig:
         assert relu2.plan.act.family is ActFamily.B_ACTIVATION
         assert relu2.plan.act.activation is ActivationFn.RELU2
         assert relu2.plan.down_b_into_base is True
-
-
-# ---- CUDA: runner-level oracle ---------------------------------------------------
 
 
 def _deep_gemm_ready() -> bool:
@@ -281,8 +239,7 @@ def _reference_choice():
     """The shipped choice carrying the serial materialized reference shape.
 
     The decode fallback is exactly that plan with a complete tuned launch
-    config (one-launch B tilings, b_activation section, aligned-16 routes),
-    so it doubles as the config donor for the swapped variants."""
+    config, so it doubles as the config donor for the swapped variants."""
     choice = _menu(_GB300, False)["fallback.serial"]
     assert choice.plan.act.family is ActFamily.MATERIALIZED
     assert choice.plan.gate_up_b is not None
@@ -351,10 +308,8 @@ def _run_once(runner, gpu, token_lora_mapping):
 def test_runner_b_act_matches_the_materialized_reference(
     base_gemm_rows: str, into_base: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """One serial prefill batch, serial materialized middle vs the b_act swap
-    (and vs b_act + into-base, the full shipped composition) — on the masked
-    provider and on the contiguous provider (row-domain agnosticism at the
-    seam), under ONE shared launch config so only the plan changes."""
+    """Serial materialized middle vs the b_act swap (and vs b_act + into-base)
+    under ONE shared launch config so only the plan changes."""
     from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
 
     device = torch.device("cuda")

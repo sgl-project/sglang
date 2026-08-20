@@ -1,28 +1,20 @@
 """Fused LoRA middle stage over the production masked MoE row domain.
 
-This kernel is the production-shaped form of the promoted Step-5 candidate.
 The base GEMM writes ``[E, m_max, S * I]`` while LoRA uses original pair
-order, so the kernel explicitly crosses the domains through ``src2dst``:
+order, so the kernel crosses the domains through ``src2dst``, computing
+gate/up LoRA-B and the activation in one launch.
 
-* ``b_activation`` computes gate/up LoRA-B and the activation in one launch.
+Activation always goes to the masked rows consumed by the base down GEMM.
+The pair-major copy is optional — the compatibility output for non-mapped
+down-A families, since grouped down-A can read the masked rows through the
+provider pair-to-row ABI; an invalid routed pair writes exact zero to the
+pair output and never touches a masked row.
 
-Activation is always written to the masked rows consumed by the base down
-GEMM.  A pair-major copy is optional: it remains the compatibility output
-for non-mapped down-A families, while grouped down-A can read the masked rows
-through the provider's explicit pair-to-row ABI.  When present, an invalid
-routed pair writes exact zero to the pair output and never touches a masked
-row.
-
-The fused B path accumulates the LoRA-B product and combines it with the BF16
-base row in FP32 before activation.  It therefore implements the mathematical
-``activation(base + A @ B)`` contract, but intentionally does not reproduce
-the extra BF16 delta-materialization rounding of the serial reference.  The
+LoRA-B is combined with the BF16 base row in FP32 before activation, so this
+implements ``activation(base + A @ B)`` but intentionally does not reproduce
+the extra BF16 delta-materialization rounding of the serial reference. The
 activation exposed to down-A and the base down GEMM is rounded to the
 provider BF16 ABI.
-
-The default implementation is Triton.  Providers expose the implementation
-name through their capability surface, so a targeted CuTe implementation can
-be injected and forced without changing the runner-facing semantic ABI.
 """
 
 from __future__ import annotations
@@ -90,7 +82,6 @@ def _validate_common(
     routing: RouteView,
     num_local_experts: int,
 ) -> tuple[int, int, int]:
-    """Validate the semantic ABI and return ``(slices, pairs, width)``."""
     ActivationFn.parse(activation)
     pairs = routing.topk_ids.numel()
     if src2dst.dtype != torch.int32 or src2dst.numel() != pairs:
@@ -102,7 +93,6 @@ def _validate_common(
     ):
         raise ValueError("act_masked must be [num_local_experts, m_max, intermediate]")
     width = act_masked.shape[2]
-    # Gating is a resident-shape property, independent of the activation.
     slices = base_gateup.shape[-1] // width
     if slices not in (1, 2) or slices * width != base_gateup.shape[-1]:
         raise ValueError(
@@ -286,9 +276,8 @@ def _b_act_kernel(
     consume_base_pdl: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    # Keep the schedule arithmetic in Triton's constexpr/Python domain. Using
-    # tl.cdiv here produces a tensor-like value on current Triton and makes
-    # the following constexpr multiplication fail during compilation.
+    # tl.cdiv would return a tensor-like value here and break the constexpr
+    # multiplication below, so keep the schedule arithmetic in Python.
     num_w_tiles: tl.constexpr = (width + block_w - 1) // block_w
     programs_per_group = group_m * num_w_tiles
     group_id = pid // programs_per_group
@@ -361,8 +350,8 @@ def _b_act_kernel(
             )
 
     if consume_base_pdl:
-        # The complete LoRA-B tile above is independent of GEMM1. Let it run
-        # while GEMM1 is resident, then wait at the first base-output load.
+        # The LoRA-B tile above does not depend on GEMM1; let it run while
+        # GEMM1 is resident and wait at the first base-output load.
         tl.extra.cuda.gdc_wait()
     base_gate = tl.load(
         base_ptr + dst_rows[:, None] * stride_pm + gate_cols[None, :] * stride_pn,
@@ -412,7 +401,6 @@ def run_masked_fused_act(
     bridge_top_k: int = 1,
     consume_base_pdl: bool = False,
 ) -> None:
-    """Run the production masked-act family with fail-closed arguments."""
     slices, pairs, width = _validate_common(
         activation=activation,
         base_gateup=base_gateup,

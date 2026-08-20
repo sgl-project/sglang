@@ -1,23 +1,10 @@
-"""Base-MoE provider seam for the MoE LoRA execution engine.
-
-``MoeBaseProvider`` is the per-quant seam. The runner drives
-prepare (S1: permute) -> gateup (S2) -> act_with_delta (S3, the gate/up LoRA
-injection point) -> down (S4) -> finalize (S5, router weight and routed scaling
-applied exactly once over base + LoRA delta), all launched from Python so
-future overlap topologies can place stream joins between stages.
-
-It provides the BASE model's half of the MoE — the LoRA half belongs to the
-runner, which owns route views, LoRA kernels, and pipeline buffers. A provider
-owns its physical row layout, resident weight format, activation join,
-finalize, and workspace config; the only reason it is decomposed into stages
-at all is so the runner can inject LoRA between them. No stock ``MoeRunner``
-is involved.
-
-Only fields that some code actually reads live on the contract. Descriptive
-axes (resident weight format, row domain, activation family, coefficient
-precision) belong to the campaign's case schema until a provider or a selector
-consumes them; declaring them here without a reader would document intent that
-execution does not honor.
+"""A provider owns the BASE model's half of the MoE — its physical row layout,
+resident weight format, activation join, finalize, and workspace config — and
+the runner owns the LoRA half. The only reason a provider is decomposed into
+stages (prepare -> gateup -> act_with_delta -> down -> finalize) is so the
+runner can inject LoRA between them, and every stage is launched from Python
+so overlap topologies can place stream joins between them. No stock
+``MoeRunner`` is involved.
 """
 
 from __future__ import annotations
@@ -34,8 +21,6 @@ if TYPE_CHECKING:
 
 
 class MoeBaseProviderContract(msgspec.Struct, frozen=True, kw_only=True):
-    """Semantics of one physical base provider that the runner must honor."""
-
     key: str
     # Column order of the provider's own gate/up GEMM output. The LoRA delta is
     # always [gate | up]; these flags describe the BASE rows only.
@@ -47,13 +32,8 @@ class MoeBaseProviderContract(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class MappedLoraAInput(msgspec.Struct, frozen=True, kw_only=True):
-    """Provider-owned activation rows exposed through a stable LoRA-A ABI.
-
-    ``rows`` is a 2-D physical provider row domain. ``pair_to_row`` is a
-    contiguous int32 tensor mapping each routed pair to one row;
-    ``-1`` denotes an invalid pair. Keeping this descriptor on the provider
-    seam lets the runner use mapped grouped LoRA-A without learning the
-    provider workspace's private field names or layout details.
+    """``pair_to_row`` is a contiguous int32 tensor mapping each routed pair
+    to one row; ``-1`` denotes an invalid pair.
     """
 
     rows: torch.Tensor
@@ -61,11 +41,10 @@ class MappedLoraAInput(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class MoeBaseProvider:
-    """Interface. One instance per (layer, quant type), bound to quant_info.
+    """One instance per (layer, quant type), bound to quant_info.
 
-    Subclasses must expose the semantic geometry below. The runner sizes its
-    LoRA buffers from it, so it is part of the seam rather than something to
-    read off a provider-private payload: a packed FP8/NVFP4 provider cannot be
+    The semantic geometry below is on the seam rather than read off a
+    provider-private payload because a packed FP8/NVFP4 provider cannot be
     asked for dimensions its resident tensors no longer carry.
     """
 
@@ -86,7 +65,6 @@ class MoeBaseProvider:
 
     @property
     def gate_up_slices(self) -> int:
-        """One for non-gated activations, two for gate/up."""
         raise NotImplementedError
 
     def prepare(
@@ -98,10 +76,10 @@ class MoeBaseProvider:
     ):
         """Permute inputs into the provider's physical row domain.
 
-        Returns a provider-private workspace object; the runner treats it as
-        opaque and passes it back to the later stages.  When the runner
-        supplies its workspace, every per-forward tensor must come from that
-        address-stable allocator so the provider is CUDA-graph capturable.
+        Returns an opaque provider-private workspace for the later stages.
+        When the runner supplies its workspace, every per-forward tensor must
+        come from that address-stable allocator so the provider is CUDA-graph
+        capturable.
         """
         raise NotImplementedError
 
@@ -109,10 +87,8 @@ class MoeBaseProvider:
         raise NotImplementedError
 
     def release_prepared_inputs(self, row_state) -> None:
-        """Free whatever ``prepare`` allocated once the gate/up GEMM is done.
-
-        The provider owns its workspace members, so it performs the release;
-        the runner only knows that the prepared inputs are dead after S2.
+        """Free whatever ``prepare`` allocated; the prepared inputs are dead
+        once the gate/up GEMM is done.
         """
         raise NotImplementedError
 
@@ -157,9 +133,8 @@ class MoeBaseProvider:
         """
         raise NotImplementedError
 
-    # Optional fused LoRA sites.  The implementation name is explicit so the
-    # config/benchmark can force Triton versus an injected CuTe candidate;
-    # unsupported providers fail before allocating or launching anything.
+    # The implementation name is explicit so the config/benchmark can force
+    # Triton versus an injected CuTe candidate.
     def fused_act_implementations(self, family: str) -> tuple[str, ...]:
         return ()
 
@@ -201,9 +176,8 @@ class MoeBaseProvider:
     ) -> MappedLoraAInput | None:
         """Expose provider activation rows for standalone grouped down-A.
 
-        Providers return ``None`` unless their activation row domain has a
-        stable pair-to-row mapping.  The default preserves the pair-major
-        bridge used by existing plans and future providers.
+        ``None`` unless the activation row domain has a stable pair-to-row
+        mapping; the default keeps the pair-major bridge.
         """
 
         return None
@@ -223,11 +197,9 @@ class MoeBaseProvider:
         return implementation in self.fused_finalize_implementations(family, ownership)
 
     def supports_down_b_into_base(self) -> bool:
-        """Whether S4's output rows admit the down-B into-base epilogue.
-
-        True only when the provider's physical row domain has a stable
-        pair-to-row mapping it can hand the into-base launch, the
-        same property behind ``mapped_down_lora_a_input``.
+        """Whether S4's output rows admit the down-B into-base epilogue; true
+        only with a stable pair-to-row mapping, as for
+        ``mapped_down_lora_a_input``.
         """
         return False
 
@@ -243,12 +215,10 @@ class MoeBaseProvider:
     ) -> None:
         """Scatter-add each pair's unweighted down-B delta into ``down_out``.
 
-        Runs AFTER the base down GEMM: the SAME one-launch sliced down-B
-        tiling targets ``down_out``'s physical rows through the provider's
-        pair-to-row mapping instead of a dense pair-major delta buffer, and
-        the materialized finalize then runs in no-pair-delta mode.
-        ``bridge`` is the pair-major down-A output and ``b_down``
-        the flattened per-virtual-expert down-B groups.
+        Runs AFTER the base down GEMM, through the provider's pair-to-row
+        mapping, and the materialized finalize then runs in no-pair-delta
+        mode.  ``bridge`` is the pair-major down-A output and ``b_down`` the
+        flattened per-virtual-expert down-B groups.
         """
         raise NotImplementedError(
             f"{self.contract.key} has no down-B into-base epilogue"

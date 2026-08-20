@@ -1,23 +1,11 @@
 """Typed execution plans for the BF16 MoE-LoRA pipeline, and the tables
 that pick one.
 
-This module describes *what* one forward executes and resolves which plan a
-layer runs: rows load from ``{arch}.plans.json`` and ``resolve_plans`` picks
-one per phase, once, at weight bind.  It holds no CUDA imports and no launch
-tiles (those are ``launch_config``), so a plan can be validated before any
-workspace is allocated.
-
-An A kernel writes a rank bridge and the matching B kernel reads it.  The
-bridge contract is explicit at each site:
-
-* ``PAIR_MAJOR`` is one row per routed ``(token, expert)`` pair.
-* ``TOKEN_MAJOR`` is the shared-outer gate/up form, one row per token.
-
-Fusion is represented by ownership, not by pretending that a consumed stage
-still runs independently.  For example, ``B_ACTIVATION`` requires
-``plan.gate_up_b is None``: the act family alone says who owns gate/up B.
-This makes illegal combinations such as gate/up-A+B overlap plus B+activation
-fusion fail before CUDA work.
+Plans say what a forward runs; ``resolve_plans`` picks one per phase at weight
+bind.  No CUDA imports and no launch tiles (those are ``launch_config``), so a
+plan is validated before any workspace is allocated.  Fusion is expressed as
+ownership -- a consumed stage records nothing of its own -- so illegal
+combinations fail before any CUDA work.
 """
 
 from __future__ import annotations
@@ -46,8 +34,6 @@ class Site(str, Enum):
 
 
 class BridgeLayout(str, Enum):
-    """Logical row layout of the rank bridge between A and B."""
-
     PAIR_MAJOR = "pair_major"
     TOKEN_MAJOR = "token_major"
 
@@ -55,12 +41,11 @@ class BridgeLayout(str, Enum):
 class RouteRequirement(str, Enum):
     """Route representations consumed by a whole execution plan.
 
-    The ``RAW_*`` pair materializes no derived metadata; consumers derive keys
-    directly from the source tensors.  Every value names its ownership, so a
-    plan that consumes only one form does not get the other built, and asking
-    for the form it did not request raises.  The values are distinct products
-    and may coexist.  In particular, a shared-outer forward can require both aligned
-    per-expert and aligned shared-outer pair plans.
+    ``RAW_*`` materializes no derived metadata; consumers derive keys from the
+    source tensors.  Only requested forms are built, and asking for one a plan
+    did not request raises.  The values are distinct products and may coexist: a
+    shared-outer forward can require both aligned per-expert and aligned
+    shared-outer pair plans.
     """
 
     RAW_PER_EXPERT = "raw_per_expert"
@@ -71,8 +56,6 @@ class RouteRequirement(str, Enum):
 
 
 class RouteBuilderFamily(str, Enum):
-    """Implementation used to build the required route products."""
-
     STANDARD = "standard"
     JOINT_SHARED_OUTER = "joint_shared_outer"
 
@@ -133,8 +116,6 @@ def _check_down_bridge_layout(site: Site, layout: BridgeLayout) -> None:
 
 @pydantic_dataclass(frozen=True, slots=True, config=_STRICT)
 class LoraASpec:
-    """One standalone LoRA-A execution stage."""
-
     site: Site
     family: LoraAFamily
     is_shared_outer: bool = False
@@ -172,8 +153,6 @@ class LoraASpec:
 
 @pydantic_dataclass(frozen=True, slots=True, config=_STRICT)
 class LoraBSpec:
-    """One standalone LoRA-B execution stage."""
-
     site: Site
     family: LoraBFamily
     is_shared_outer: bool = False
@@ -185,16 +164,12 @@ class LoraBSpec:
     def validate(self) -> LoraBSpec:
         _check_down_bridge_layout(self.site, self.input_layout)
         if self.family is LoraBFamily.INDEXED_PAIRS:
-            # The pair-indexed expand visits one routed pair at a time, so
-            # its bridge is inherently pair-major.
             if self.input_layout is not BridgeLayout.PAIR_MAJOR:
                 raise ValueError("pair-indexed B consumes a pair-major bridge")
         return self
 
     def route_requirements(self) -> frozenset[RouteRequirement]:
         if self.family is LoraBFamily.INDEXED_PAIRS:
-            # Descriptor-only: keys are derived inline from the raw source
-            # tensors; no aligned pair plan is required for this stage.
             return frozenset((_raw_requirement(self.is_shared_outer),))
         return frozenset((_aligned_requirement(self.is_shared_outer),))
 
@@ -203,9 +178,8 @@ class LoraBSpec:
 class ActSpec:
     """Activation boundary and the gate/up B stage optionally fused into it.
 
-    ``family`` alone names the ownership: B_ACTIVATION absorbs gate/up B.
-    The absorbed stage records nothing of its own -- it is per-expert, and
-    it reads whatever bridge gate/up A wrote.
+    B_ACTIVATION absorbs gate/up B; the absorbed stage records nothing of its
+    own -- it is per-expert and reads whatever bridge gate/up A wrote.
     """
 
     family: ActFamily
@@ -219,10 +193,8 @@ class ActSpec:
 
 @pydantic_dataclass(frozen=True, slots=True, config=_STRICT)
 class FinalizeSpec:
-    """Final combine family, and the ownership of the down B it consumes.
-
-    A materialized finalize consumes no down B and so records no ownership.
-    """
+    """Final combine family, and the ownership of the down B it consumes; a
+    materialized finalize consumes no down B and so records no ownership."""
 
     family: FinalizeFamily
     is_shared_outer: bool = False
@@ -250,8 +222,6 @@ class FinalizeSpec:
 
 @pydantic_dataclass(frozen=True, slots=True, kw_only=True, config=_STRICT)
 class MoeLoraExecutionPlan:
-    """One immutable whole-pipeline MoE-LoRA execution strategy."""
-
     gate_up_a: LoraASpec
     gate_up_b: LoraBSpec | None = None
     act: ActSpec
@@ -330,47 +300,34 @@ class MoeLoraExecutionPlan:
     def is_fully_serial(self) -> bool:
         """Whether the schedule is a plain ordered same-stream pipeline.
 
-        True iff the schedule has no early/late overlap windows and down-A
-        is GROUPED over the pair activation.  Such a plan drives
-        the provider seam
-        (prepare / gateup / act / down / finalize) as ordered same-stream
-        calls with no cross-stage coupling, which is the schedule shape
-        row-domain conversions key on; the finalize family is judged
-        separately (:meth:`is_fully_serial_materialized`).
+        True iff there are no overlap windows and down-A is GROUPED over the
+        pair activation: the provider seam then runs as ordered same-stream
+        calls with no cross-stage coupling, which is the shape row-domain
+        conversions key on.  The finalize family is judged separately
+        (:meth:`is_fully_serial_materialized`).
         """
         return (
             self.gate_up_overlap is GateUpOverlap.NONE
             and self.down_overlap is DownOverlap.NONE
             and self.down_a.family is LoraAFamily.GROUPED
-            # The into-base reordering couples down-B to the base down output;
-            # it is applied ON TOP of a fully serial materialized shape and
-            # must not re-qualify for shape-keyed conversions.
+            # Into-base couples down-B to the base down output; it sits ON TOP
+            # of a fully serial materialized shape and must not re-qualify for
+            # shape-keyed conversions.
             and not self.down_b_into_base
         )
 
     def is_fully_serial_materialized(self) -> bool:
-        """A fully serial schedule whose finalize is also MATERIALIZED.
-
-        The MATERIALIZED finalize recombines base and LoRA delta in one
-        standalone launch, so this is the shape the act-swap and
-        into-base config steps key on.
-        """
         return (
             self.is_fully_serial()
             and self.finalize.family is FinalizeFamily.MATERIALIZED
         )
 
     def down_b_into_base_eligible(self) -> bool:
-        """Whether the down tail admits the into-base reordering."""
-
-        # A standalone down-B implies the materialized finalize (any other
-        # finalize consumes it).  Which B kernel implements the epilogue is a
-        # provider capability, checked in MoeLoraRunner.validate_plan.
-        #
         # down-B must launch after the base down GEMM has written its rows.
-        # NONE and DOWN_A both satisfy that -- DOWN_A joins its fork before
-        # down-B runs -- while DOWN_B and DOWN_A_B put down-B on the side
-        # stream concurrently with the base GEMM, which is the real hazard.
+        # NONE and DOWN_A satisfy that -- DOWN_A joins its fork before down-B
+        # runs -- while DOWN_B and DOWN_A_B put down-B on the side stream
+        # concurrently with the base GEMM.  Which B kernel implements the
+        # epilogue is a provider capability, checked in MoeLoraRunner.validate_plan.
         return self.down_b is not None and self.down_overlap in (
             DownOverlap.NONE,
             DownOverlap.DOWN_A,
@@ -379,32 +336,26 @@ class MoeLoraExecutionPlan:
     def route_requirements(self) -> frozenset[RouteRequirement]:
         """Return the exact union of route products consumed by this plan.
 
-        Deliberately does not validate: build_routes calls this per forward
-        per layer, and the plan and every nested stage are frozen dataclasses
-        whose __post_init__ already proved the whole dependency graph.
+        Deliberately does not validate: this runs per forward per layer, and
+        every frozen stage already proved the dependency graph at construction.
         """
         return self._requirements_of(
             self.gate_up_a, self.gate_up_b, self.down_a, self.down_b
         )
 
     def downstream_route_requirements(self) -> frozenset[RouteRequirement]:
-        """The same union with gate/up-A left out.
+        """The same union with gate/up-A left out, so build_routes can tell when
+        the shared aligned route exists ONLY for gate/up-A and need not be built.
 
-        build_routes asks this to learn whether the SHARED per-expert
-        aligned route exists ONLY for gate/up-A, which -- when gate/up-A runs
-        at its own block size -- means the shared one need not be built.
-
-        It cannot be derived by subtracting gate_up_a's requirements from the
-        full union: that would also drop a requirement a downstream stage
-        shares with it, and skip a route something still reads.
+        Not derivable by subtracting gate_up_a's requirements from the full
+        union: that would also drop requirements downstream stages share with
+        it, and skip a route something still reads.
         """
         return self._requirements_of(self.gate_up_b, self.down_a, self.down_b)
 
     def _requirements_of(
         self, *stages: LoraASpec | LoraBSpec | None
     ) -> frozenset[RouteRequirement]:
-        # The act and finalize stages are never optional, so they join
-        # every union; only the standalone A/B stages vary.
         requirements: set[RouteRequirement] = set()
         for stage in stages:
             if stage is not None:
@@ -412,18 +363,6 @@ class MoeLoraExecutionPlan:
         requirements.update(self.act.route_requirements())
         requirements.update(self.finalize.route_requirements())
         return frozenset(requirements)
-
-
-# ---------------------------------------------------------------------------
-# Plan tables: pydantic-validated JSON, loaded once per architecture.
-#
-# Per-forward selection is a phase lookup: layout and the pool-padded rank
-# are server-lifetime constants, so ``resolve_plans`` runs once per layer at
-# bind time and returns one selected plan per phase. Rows are matched first
-# hit in order; ``max_rank`` is the only predicate (the measured H200
-# shared-prefill kernel band). Launch tiles live in the separate tile tables
-# (see ``launch_config``): plans say WHAT runs, tiles say HOW it launches.
-# ---------------------------------------------------------------------------
 
 
 class Phase(str, Enum):
@@ -446,8 +385,8 @@ def architecture_for_capability(major: int, minor: int) -> DeviceArchitecture:
 
 
 class _PlanSpecModel(pydantic.BaseModel):
-    """One row's plan spec. Enum-typed, so a malformed value in ANY row
-    fails at table load, not only when the row is selected."""
+    """Enum-typed, so a malformed value in ANY row fails at table load, not
+    only when the row is selected."""
 
     model_config = pydantic.ConfigDict(extra="forbid")
 
@@ -468,8 +407,8 @@ class _PlanRowModel(pydantic.BaseModel):
 
     name: str
     # Typed, not str: these three are the row's MATCH keys, and a typo in one
-    # loads clean and then never matches -- the row goes dead and its layers
-    # silently serve the fallback. None still means "matches both".
+    # would load clean, never match, and silently serve the fallback. None
+    # still means "matches both".
     layout: Literal["per_expert", "shared"] | None = None
     phase: Phase | None = None
     max_rank: int | None = None
@@ -479,20 +418,18 @@ class _PlanRowModel(pydantic.BaseModel):
     # implements it is --moe-lora-base-gemm, not a table value.
     base_gemm_rows: Literal["expert_major", "route_major"]
     plan: _PlanSpecModel
-    # Free-form annotation the offline tuner stamps on rows it emits or
-    # sweeps.  Declared so extra="forbid" still rejects genuine typos while
-    # a tuned table stays loadable (see tune_lora_config.py --emit-seed).
+    # Free-form tuner annotation, declared so extra="forbid" still rejects
+    # genuine typos while a tuned table stays loadable.
     provenance: str | None = None
 
 
 class _DomainModel(pydantic.BaseModel):
     """Geometry box the scenario rows were tuned inside.
 
-    Typed rather than a bare dict because the reads used to be
-    ``domain.get("max_hidden", 1 << 30)``: a typo'd key did not fail, it
-    silently left that gate wide open and admitted every geometry to rows
-    that were never measured for it. ``None`` means genuinely unbounded;
-    the shipped ``default`` table uses 0 to admit nothing.
+    Typed rather than a bare dict: with ``domain.get("max_hidden", 1 << 30)`` a
+    typo'd key silently left the gate wide open and admitted untuned geometry.
+    ``None`` means unbounded; the shipped ``default`` table uses 0 to admit
+    nothing.
     """
 
     model_config = pydantic.ConfigDict(extra="forbid")
@@ -514,7 +451,6 @@ class _PlansFileModel(pydantic.BaseModel):
     domain: _DomainModel = pydantic.Field(default_factory=_DomainModel)
     scenarios: list[_PlanRowModel] = pydantic.Field(default_factory=list)
     fallback: list[_PlanRowModel]
-    # Same: the geometry the tuner widened this table's domain for.
     seeded_for: dict[str, Any] | None = None
 
 
@@ -554,12 +490,6 @@ def load_plans(architecture: DeviceArchitecture) -> _PlansFileModel:
 
 @dataclass(frozen=True, slots=True)
 class SelectedPlan:
-    """One phase's resolved menu entry: identity, row order, validated plan.
-
-    Carries the row order the plan requires, not a provider name: the vendor
-    that implements it comes from serving config, so a table cannot pin it.
-    """
-
     key: str
     name: str
     base_gemm_rows: str
@@ -574,8 +504,8 @@ def build_plan(
 ) -> MoeLoraExecutionPlan:
     """Materialize one row's plan spec into a validated execution plan.
 
-    The activation is a property of the layer, injected at construction —
-    rows are activation-agnostic by decision (2026-08-16).
+    The activation is a property of the layer, injected at construction: rows
+    are activation-agnostic by decision (2026-08-16).
     """
     gate_up_a_family = spec.gate_up_a_family
     gate_up_layout = (
@@ -649,9 +579,8 @@ def resolve_plans(
 ) -> dict[Phase, SelectedPlan]:
     """Resolve the layer's one plan per phase, once, at bind time.
 
-    Every input is a server-lifetime constant, so nothing about plan
-    selection remains for the forward path. Out-of-domain geometry serves
-    the fallback rows.
+    Every input is a server-lifetime constant, so no selection work remains for
+    the forward path. Out-of-domain geometry serves the fallback rows.
     """
     table = load_plans(architecture)
     layout_name = "shared" if is_shared_outer else "per_expert"

@@ -1,19 +1,3 @@
-"""Behavioral tests for MoE LoRA attach, admission, and graph batch metadata.
-
-Coverage, stated precisely:
-
-* ``BaseLoRABackend.init_cuda_graph_moe_buffers`` is driven directly for both
-  engines, including with a layer that has no ``_quant_info`` at all (the new
-  engine never defines one), so the metadata path must not read layer geometry.
-* ``_add_moe_lora_info`` is then driven twice with DIFFERENT assignments under
-  ``use_cuda_graph=True`` and the metadata tensors are checked to keep their
-  addresses while their contents change — the property CUDA-graph replay
-  depends on, and the one a graph-enabled server previously crashed without.
-  This requires CUDA because the underlying update is a Triton kernel.
-* Admission is exercised through ``MoeLoraRunner._admit`` against
-  synthesized resident states; it does not build a full ``FusedMoE``.
-"""
-
 from __future__ import annotations
 
 import unittest
@@ -31,8 +15,6 @@ register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
 class _FakeMoeLayer:
-    """Minimal stand-in exposing only what buffer init reads."""
-
     def __init__(self, *, is_lora_runner: bool, with_quant_info: bool, device=None):
         device = device or torch.device("cpu")
         self._lora_runner_backend = (
@@ -61,14 +43,7 @@ class TestGraphBatchMetadata(unittest.TestCase):
         return backend
 
     def test_metadata_present_without_legacy_kernel_buffers(self):
-        """Regression: skipping the whole initializer broke graph capture.
-
-        `_add_moe_lora_info` writes into these exact tensors under CUDA graphs,
-        so their addresses must stay stable across replays. Skipping their
-        allocation raised AttributeError at capture; allocating them fresh per
-        step would be worse — the captured graph would keep capture-time
-        pointers while replays wrote elsewhere, i.e. silent stale routing.
-        """
+        """Regression: skipping the whole initializer broke graph capture."""
         backend = self._backend()
         backend.init_cuda_graph_moe_buffers(
             max_bs=8,
@@ -108,14 +83,8 @@ class TestGraphBatchMetadata(unittest.TestCase):
             self.assertIn(key, backend.moe_cg_buffers)
 
     def test_two_metadata_updates_keep_addresses_and_change_contents(self):
-        """The actual graph-replay contract, exercised end to end.
-
-        ``prepare_lora_batch`` runs OUTSIDE the captured graph while the runner
-        reads these tensors INSIDE it. So an update must write in place: the
-        addresses have to survive (or a replay reads capture-time storage while
-        the writer fills a different tensor — silent stale routing), and the
-        contents have to change (or the update did nothing).
-        """
+        """``prepare_lora_batch`` runs OUTSIDE the captured graph while the
+        runner reads these tensors INSIDE it, so an update must write in place."""
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA required: the metadata update is Triton")
         device = torch.device("cuda")
@@ -164,7 +133,6 @@ class TestGraphBatchMetadata(unittest.TestCase):
         first_mapping = first.token_lora_mapping[:4].clone()
         first_enabled = first.adapter_enabled.clone()
 
-        # A different assignment: slot 2 becomes the active one.
         second = update(weight_indices=[2, 0], lora_ranks=[0, 16, 32], seg_lens=[3, 1])
         torch.cuda.synchronize()
 
@@ -179,14 +147,11 @@ class TestGraphBatchMetadata(unittest.TestCase):
             torch.equal(second.adapter_enabled, first_enabled),
             "enabling a different slot must change adapter_enabled in place",
         )
-        # And the semantics the runner depends on: slot 2 active, slot 0 not.
         self.assertEqual(int(second.adapter_enabled[2]), 1)
         self.assertEqual(int(second.adapter_enabled[0]), 0)
 
 
 class TestEngineAdmission(unittest.TestCase):
-    """Admission must reject resident states the engine cannot consume."""
-
     def _base_layer(self, **overrides):
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
         from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -226,13 +191,8 @@ class TestEngineAdmission(unittest.TestCase):
         self._admit()
 
     def test_rejects_architectures_with_neither_mma_family(self):
-        """SM90 and SM100 are a closed set, not a floor.
-
-        SM120 is the case a ">= SM90" floor gets wrong: it reports major 12
-        yet has neither WGMMA nor tcgen05, and both
-        architecture_for_capability and _kernel_class_for test major >= 10,
-        so it would be handed the GB300 tables and a tcgen05 kernel.
-        """
+        """SM90 and SM100 are a closed set, not a floor: SM120 reports major 12
+        yet has neither WGMMA nor tcgen05, so a ">= SM90" check mis-admits it."""
         from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
 
         for capability in ((8, 0), (12, 0), (11, 0)):
@@ -243,12 +203,8 @@ class TestEngineAdmission(unittest.TestCase):
                     MoeLoraRunner._admit(self._base_layer())
 
     def test_unusable_deep_gemm_build_only_blocks_the_deepgemm_vendor(self):
-        """A CuteDSL serve must not need a dependency it never imports.
-
-        deep_gemm_wrapper binds its symbols only when the build is usable, so
-        an unusable build has to fail before a DeepGEMM provider is built --
-        but no earlier, or CuteDSL is refused for DeepGEMM's absence.
-        """
+        """An unusable DeepGEMM build must fail before a DeepGEMM provider is
+        built -- but no earlier, or CuteDSL is refused for DeepGEMM's absence."""
         from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
 
         with mock.patch(

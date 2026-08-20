@@ -3,12 +3,10 @@
 
 """Host adapter for the BF16 masked grouped GEMM (SM100 and SM90).
 
-Ported from the frozen base-GEMM study (plan section 45); the two containers
-are msgspec.Struct per repo convention. ``prepare`` compiles per call — the
-provider layer (cutedsl_bf16.py) owns the compile-once cache and per-forward
-re-wrapping, because compilation keys only on the config plus layout
-STRUCTURE: A/C/masked_m/schedule keep dynamic layouts, so one compiled fn
-serves every m_max.
+``prepare`` compiles per call; the provider layer (cutedsl_bf16.py) owns the
+compile-once cache and per-forward re-wrapping. Compilation keys only on the
+config plus layout STRUCTURE: A/C/masked_m/schedule keep dynamic layouts, so
+one compiled fn serves every m_max.
 """
 
 from typing import Any, Tuple
@@ -22,9 +20,9 @@ import msgspec
 import torch
 from cutlass.cute.runtime import from_dlpack
 
-# The shipped provider always selects swap_ab; the non-swap orientation is
-# kept because it is the planned SM90 port's fallback when the swap_ab
-# narrow-N WGMMA path proves unsupported there (plan section 54).
+# The shipped provider always selects swap_ab; the non-swap orientation is kept
+# as the SM90 port's fallback if the swap_ab narrow-N WGMMA path is
+# unsupported there.
 from sglang.srt.lora.moe.base_gemm_provider.cutedsl_masked.kernel import (
     MaskedGroupedGemmKernel,
     masked_grouped_gemm,
@@ -36,11 +34,6 @@ from sglang.srt.lora.moe.base_gemm_provider.cutedsl_masked.schedule_builder impo
 
 
 def _kernel_class_for(device: torch.device):
-    """SM100+ -> tcgen05 kernel; SM90 -> the WGMMA sibling; else reject.
-
-    The wrappers (`masked_grouped_gemm*`) are pure mode permutations and drive
-    either class; only the device kernel differs (plan section 54).
-    """
     major, _minor = torch.cuda.get_device_capability(device)
     if major >= 10:
         return MaskedGroupedGemmKernel
@@ -56,8 +49,6 @@ def _kernel_class_for(device: torch.device):
 
 
 class MaskedGroupedGemmConfig(msgspec.Struct, frozen=True, kw_only=True):
-    """Compile-time kernel configuration (arch picked per device). Hashable."""
-
     mma_tiler_mn: Tuple[int, int] = (64, 128)
     cluster_shape_mn: Tuple[int, int] = (1, 1)
     use_2cta_instrs: bool = False
@@ -66,16 +57,15 @@ class MaskedGroupedGemmConfig(msgspec.Struct, frozen=True, kw_only=True):
     use_warp_scan: bool = False
     uniform_m: int | None = None
     persistent_clusters: int | None = None
-    # Producer signaling and dependent-launch admission are different roles.
-    # This masked GEMM currently implements only the former: it may release a
-    # downstream middle/finalize kernel, but is not launched early against its
-    # own preprocess/activation producer without an internal wait.
+    # Producer signaling only: this GEMM may release a downstream
+    # middle/finalize kernel, but is not itself launched early against its own
+    # preprocess/activation producer without an internal wait.
     produce_pdl: bool = False
     swap_ab: bool = False
     direct_schedule: bool = False
     # Route-major flat row domain (segment bases in the masked_m slot); only
     # ``prepare_contiguous`` may set it, and it requires swap_ab +
-    # direct_schedule at a (1, 1) cluster (enforced by the kernel ctor).
+    # direct_schedule at a (1, 1) cluster.
     contiguous_segments: bool = False
 
 
@@ -153,15 +143,15 @@ def as_dynamic_cute_tensor(tensor: torch.Tensor, *, leading_dim: int) -> cute.Te
 
     Public because a caller sharing one compiled function across layers must
     wrap that layer's weight exactly the way the compile path wrapped its
-    representative one -- a divergent wrapping would silently change the
-    argument's MLIR type.
+    representative one -- divergent wrapping silently changes the argument's
+    MLIR type.
     """
     return from_dlpack(tensor, assumed_align=16).mark_layout_dynamic(
         leading_dim=leading_dim
     )
 
 
-_as_dynamic_cute_tensor = as_dynamic_cute_tensor  # internal callers below
+_as_dynamic_cute_tensor = as_dynamic_cute_tensor
 
 
 def prepare(
@@ -174,11 +164,6 @@ def prepare(
     direct_schedule: torch.Tensor | None = None,
     schedule_tiles: torch.Tensor | None = None,
 ) -> PreparedMaskedGroupedGemm:
-    """Validate, compile, and bind a masked grouped GEMM launch.
-
-    Compilation specializes only the kernel configuration. Tensor shapes and
-    strides remain dynamic while the contiguous leading dimensions are known.
-    """
     if config.contiguous_segments:
         raise ValueError(
             "config.contiguous_segments requires prepare_contiguous: this "
@@ -345,11 +330,10 @@ def prepare_contiguous(
     ``a``/``c`` are ONE flat row buffer whose per-expert segments start at
     ``seg_offsets[e]`` (each an ``m_alignment`` multiple); a host-side
     ``unsqueeze(0)`` gives them the unit L mode the masked swap_ab wrapper
-    expects, so descriptor construction, partitioning, and the epilogue are
-    reused verbatim.  ``seg_offsets`` rides the masked_m argument slot — the
-    direct scheduler this mode requires never reads that slot, and the kernel
-    reads it only for the segment-base tile fold.  Both device kernels carry
-    the fold, so this dispatches by capability exactly like ``prepare``.
+    expects, so descriptors, partitioning, and the epilogue are reused
+    verbatim.  ``seg_offsets`` rides the masked_m argument slot: the direct
+    scheduler this mode requires never reads that slot, and the kernel reads it
+    only for the segment-base tile fold.
     """
     if not config.contiguous_segments:
         raise ValueError("prepare_contiguous requires config.contiguous_segments")
@@ -358,8 +342,6 @@ def prepare_contiguous(
         a, b, c, seg_offsets, m_alignment=m_alignment
     )
 
-    # The unit L mode makes the flat tensors structurally identical to a
-    # single-expert masked slab; strides stay the natural contiguous ones.
     a_arg = _as_dynamic_cute_tensor(a.unsqueeze(0), leading_dim=2)
     b_arg = _as_dynamic_cute_tensor(b, leading_dim=2)
     c_arg = _as_dynamic_cute_tensor(c.unsqueeze(0), leading_dim=2)

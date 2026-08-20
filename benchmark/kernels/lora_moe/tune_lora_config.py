@@ -32,8 +32,7 @@ quant-specific providers as sweep arms, a ``quant`` key on the plan rows
 fail closed on newer tables instead of mis-matching), and per-quant seed
 emission.
 
-The sweep reuses the campaign protocol: bench_one_batch_server, input 4096 /
-output 1024, batch sizes 1/8/16/32, medians after first-pass discard.
+The sweep reuses the campaign protocol.
 """
 
 from __future__ import annotations
@@ -162,9 +161,7 @@ def emit_seed(args, geometry) -> str:
 def bench_once(
     args, env_extra: dict, tag: str, metric: str = "output_throughput"
 ) -> dict[int, float]:
-    """One server launch + protocol bench; returns bs -> tok/s for ``metric``.
-
-    ``output_throughput`` is decode, ``input_throughput`` is prefill. Score
+    """``output_throughput`` is decode, ``input_throughput`` is prefill. Score
     each axis on the side it moves: a prefill-only tile barely shifts decode
     tok/s, so scoring it on the default reads as noise and picks at random.
     """
@@ -244,9 +241,7 @@ def _set_route_block(sites: dict, block: int) -> None:
 
 
 def sweep_route_block(args, seed_path: str, arch: str, variant_dir: str) -> dict:
-    """Pick one route block per phase and write the winners into the tiles.
-
-    Occupancy decides it -- routed pairs per virtual expert, i.e.
+    """Occupancy decides it -- routed pairs per virtual expert, i.e.
     tokens x top_k / virtual experts -- so decode and prefill get their own
     sweep and their own metric. The shipped tables want 16 at decode and 32
     at prefill; a geometry far from the campaign's can land elsewhere, which
@@ -294,7 +289,6 @@ def sweep_route_block(args, seed_path: str, arch: str, variant_dir: str) -> dict
 
 
 def sweep(args, seed_path: str) -> None:
-    """Cross the geometry-sensitive axes; write winners into the seed file."""
     table = json.load(open(seed_path))
     arch = table["arch"]
     variant_dir = os.path.join(args.out, "variants")
@@ -346,9 +340,6 @@ def sweep(args, seed_path: str) -> None:
         indent=1,
     )
 
-    # Base-GEMM tiles: delegate to the masked-GEMM bucket sweep on this
-    # device; an empty output directory means the built-in heuristics won
-    # everywhere (the result at all three campaign geometries).
     gemm_out = os.path.join(args.out, "base_gemm")
     os.makedirs(gemm_out, exist_ok=True)
     geometry = load_geometry(args.model_path, args)

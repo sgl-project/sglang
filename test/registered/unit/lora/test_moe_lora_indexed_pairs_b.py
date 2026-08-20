@@ -1,27 +1,3 @@
-"""GPU oracle for the pair-indexed sliced LoRA-B decode family.
-
-``indexed_pairs_lora_b`` must reproduce ``one_launch_sliced_lora_b`` on
-identical inputs: same destination rows, same slice offsets, same per-pair
-delta.  Agreement is allclose rather than bitwise BY JUSTIFICATION: both
-kernels step the same BLOCK_SIZE_K tiles over RANK into an FP32 accumulator
-and BF16 products are exact in FP32, so the results differ only by the
-within-tile summation order (``tl.sum`` vector reduction here, the
-``tl.dot`` MMA tree there) — final-rounding distance in BF16.
-
-Also pinned:
-
-* the invalid-pair zero-store contract (B owns and zero-fills every consumed
-  destination cell, so stale graph-buffer poison cannot leak as a delta) on
-  a poison-initialized destination, including base-only traffic;
-* the descriptor-only RAW route is sufficient (no aligned fields touched);
-* mlpb-style multi-slot routing with -1 base tokens and unrouted (-1)
-  pairs, both gate/up (two slices) and down (one slice) shapes;
-* the zero-pair early return and the dispatcher wiring (INDEXED_PAIRS
-  executes; a PDL consumer request fails closed);
-* a captured graph replays on mutated routing content (the grid depends
-  only on ``num_pairs``, static per capture bucket).
-"""
-
 from __future__ import annotations
 
 import pytest
@@ -69,7 +45,8 @@ _INDEXED_CONFIG = {
     "num_warps": 4,
     "num_stages": 2,
 }
-# Same-math-different-in-tile-order: FP32 accumulators over exact products.
+# Same FP32 k-tile accumulation of exact BF16 products; only within-tile
+# reduction order differs (tl.sum vs tl.dot), so allclose, not bitwise.
 _TOLERANCE = {"atol": 5e-3, "rtol": 2e-2}
 
 
@@ -107,7 +84,6 @@ def _views(topk_ids, token_lora_mapping, num_experts, device):
 
 
 def _site_tensors(site: str, num_pairs: int, num_experts: int, seed: int, device):
-    """Bridge/weight/destination width per factor site."""
     generator = torch.Generator().manual_seed(seed)
     groups = _SLOTS * num_experts
     if site == "gate_up":
@@ -159,9 +135,8 @@ def test_indexed_pairs_matches_one_launch_on_identical_inputs(
         config=_ONE_LAUNCH_CONFIG,
     )
     indexed = _destination(num_pairs, num_slices, width, device)
-    # The descriptor-only raw view is sufficient: no aligned fields exist on
-    # it, so any aligned-metadata read would raise instead of silently
-    # depending on the sort.
+    # The raw view carries no aligned fields, so any aligned-metadata read
+    # would raise instead of silently depending on the sort.
     indexed_pairs_lora_b(
         bridge,
         weight,
@@ -180,7 +155,6 @@ def test_indexed_pairs_matches_one_launch_on_identical_inputs(
     invalid_rows = indexed[~pair_valid.to(device)]
     assert invalid_rows.numel() > 0
     assert torch.count_nonzero(invalid_rows) == 0
-    # And the case must exercise real work.
     assert torch.count_nonzero(indexed[pair_valid.to(device)]) > 0
 
 
@@ -252,9 +226,8 @@ def test_run_lora_b_dispatches_the_family_and_rejects_pdl() -> None:
 
 
 def test_graph_replay_recomputes_from_mutated_routing_content() -> None:
-    """The captured grid is (num_pairs, n_tiles); slot/expert changes are
-    pure data and must be honored at replay, exactly like the graph-captured
-    indexed down-A precedent."""
+    """The captured grid depends only on num_pairs; slot/expert routing is
+    pure data and must be honored at replay."""
     device = torch.device("cuda")
     num_tokens, top_k, num_experts = 16, 2, 8
     topk_ids, token_lora_mapping = _routing_case(num_tokens, top_k, num_experts, 0x1DB4)
@@ -283,8 +256,6 @@ def test_graph_replay_recomputes_from_mutated_routing_content() -> None:
     with torch.cuda.graph(graph):
         launch()
 
-    # Mutate every routing input in place: new expert ids, more base tokens,
-    # and a new bridge.
     new_topk_ids, new_token_lora_mapping = _routing_case(
         num_tokens, top_k, num_experts, 0x1DB5
     )

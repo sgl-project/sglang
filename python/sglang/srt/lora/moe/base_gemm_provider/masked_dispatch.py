@@ -1,29 +1,18 @@
-"""Fused S1 dispatch for the MoE LoRA BF16 pipeline.
-
-One Triton launch replacing the two-kernel ``moe_ep_deepgemm_preprocess``
-composition (``fused_moe_dispatch_index`` + ``fill_gateup_input``): each
-(token, k) pair reserves its masked-layout slot with one atomic, stores its
-``src2dst`` entry, and copies its token row into the ``[E_local, m_max, H]``
-slab in the same pass.  Engine-local by design — the shared no-LoRA
-``ep_moe_kernels`` path is untouched (precedent: ``masked_activation``).
+"""One-launch masked dispatch for the MoE LoRA BF16 pipeline, replacing the
+``fused_moe_dispatch_index`` + ``fill_gateup_input`` composition.
 
 Contract (drop-in for the bf16 branch of ``moe_ep_deepgemm_preprocess``):
 
-- Returns the same 5-tuple ``(masked_m, expected_m, src2dst, gateup_input,
-  None)`` with the same host formulas ``m_max = (T // 256 + 1) * 256`` and
+- Same 5-tuple return and host formulas ``m_max = (T // 256 + 1) * 256``,
   ``expected_m = ceil(T * top_k / E_local)``.
-- Sentinel: pairs with ``topk_ids < 0`` (EP-unrouted / padding) take no
-  atomic, get NO ``src2dst`` store (entries stay uninitialized), and copy
-  nothing; every consumer gates on ``topk_ids >= 0``.
-- Slot order within an expert is atomic-arrival nondeterministic, exactly as
-  in the two-kernel composition; all stages share the one ``src2dst``, so the
-  final combine is bitwise-independent of the slot permutation.
-- Graph safety: the grid derives only from host-static shapes, ``masked_m``
-  is zeroed by a stream-ordered memset before the launch, and there is no
-  host sync or readback.
-
-BF16 only: the engine path always runs ``output_dtype=torch.bfloat16`` with
-no quantization block shape.
+- Pairs with ``topk_ids < 0`` (EP-unrouted / padding) get no ``src2dst``
+  store (entries stay uninitialized) and copy nothing; every consumer gates
+  on ``topk_ids >= 0``.
+- Slot order within an expert is atomic-arrival nondeterministic, as in the
+  two-kernel composition; all stages share the one ``src2dst``, so the final
+  combine is bitwise-independent of the slot permutation.
+- Graph safe: the grid derives only from host-static shapes, with no host
+  sync or readback.
 """
 
 from __future__ import annotations
@@ -45,13 +34,11 @@ def fused_dispatch_fill_kernel(
     TOPK: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
-    t = tl.program_id(0)  # token
-    k = tl.program_id(1)  # k-slot
+    t = tl.program_id(0)
+    k = tl.program_id(1)
     pair = t * TOPK + k
     expert = tl.load(topk_ids_ptr + pair)
     if expert >= 0:
-        # The atomic returns this pair's destination row in-register, so the
-        # same CTA reserves the slot, stores the mapping, and copies the row.
         slot = tl.atomic_add(masked_m_ptr + expert, 1)
         dst = expert.to(tl.int64) * m_max + slot
         tl.store(src2dst_ptr + pair, dst.to(tl.int32))
@@ -75,12 +62,10 @@ def fused_masked_preprocess(
     src2dst_out: torch.Tensor | None = None,
     gateup_input_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, int, torch.Tensor, torch.Tensor, None]:
-    """One-launch masked dispatch; same signature/return as the bf16 branch
-    of ``moe_ep_deepgemm_preprocess`` so ``prepare()`` binds it unchanged."""
     if block_shape is not None:
         raise ValueError("fused masked preprocess takes no quantization block shape")
-    # output_dtype is a literal at every call site; the ACTIVATION dtype is
-    # the one that matters -- the fill kernel would silently downcast it.
+    # output_dtype is a literal at every call site; what matters is the
+    # activation dtype, which the fill kernel would silently downcast.
     if hidden_states.dtype != torch.bfloat16:
         raise ValueError("fused masked preprocess is BF16-only")
     if hidden_states.ndim != 2 or not hidden_states.is_contiguous():
@@ -145,10 +130,8 @@ def fused_masked_preprocess(
             )
         gateup_input = gateup_input_out
 
-    # One uniform path: masked_m doubles as the atomic cursor and must be
-    # zeroed before any atomic_add. A stream-ordered memset is legal inside
-    # CUDA-graph capture (the multi-block dispatch path captures exactly this
-    # memset today).
+    # masked_m doubles as the atomic cursor, so it must be zeroed first; a
+    # stream-ordered memset is legal inside CUDA-graph capture.
     masked_m.zero_()
     if num_tokens > 0:
         fused_dispatch_fill_kernel[(num_tokens, top_k)](

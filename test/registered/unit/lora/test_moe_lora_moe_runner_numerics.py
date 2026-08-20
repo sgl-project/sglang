@@ -1,16 +1,5 @@
-"""GPU numerical coverage for the production BF16 MoE LoRA runner.
-
-This test deliberately starts at the real config/provider/runner boundary.
-It does not reuse a benchmark reference kernel: the expected result is an
-explicit PyTorch FP32 implementation of per-expert SWIGLU MoE + LoRA.  The
-three token-slot patterns cover fully active traffic, mixed active/base
-traffic, and a base-only batch that still traverses the unified LoRA-capable
-topology.
-
-Shared-outer factors are covered separately at the serving boundary; this
-focused test validates the per-expert layout against the production
-contract.
-"""
+"""Numerics vs a deliberate FP32 reimplementation, never a benchmark kernel;
+shared-outer layouts are covered separately at the serving boundary."""
 
 from __future__ import annotations
 
@@ -57,7 +46,6 @@ def _rand_bf16(
 
 
 def _resolve_execution(architecture, mode: Phase, num_tokens: int):
-    """The served plan and tile pick for this device, phase, and batch."""
     selected = resolve_plans(
         architecture=architecture,
         is_shared_outer=False,
@@ -219,9 +207,6 @@ def test_config_chosen_per_expert_swiglu_matches_fp32_reference(
             f"MoE LoRA config does not support SM{capability[0]}{capability[1]}"
         )
 
-    # Serving wraps this allocation in the optional symmetric-memory context,
-    # which requires an initialized TP group.  This standalone numerical test
-    # has no collective and needs only the identical eager tensor geometry.
     monkeypatch.setattr(
         MoeLoraRunner, "_allocate_output", _standalone_output_allocation
     )
@@ -302,14 +287,8 @@ def test_config_chosen_per_expert_swiglu_matches_fp32_reference(
 def test_selected_pipeline_replays_correctly_in_a_real_cuda_graph(
     monkeypatch: pytest.MonkeyPatch, mode: Phase, num_tokens: int
 ) -> None:
-    """Capture the actual selected MoE-LoRA pipeline and replay it.
-
-    The engine's graph contract is that routes and kernel launches rebuild
-    from graph-stable metadata on every replay.  Each replay below mutates
-    only batch-preparation state (token slots, routing, activations) in
-    place and must observe the new result through unchanged captured
-    pointers.
-    """
+    """The graph contract: routes and launches rebuild from graph-stable
+    metadata, so in-place batch mutations show through unchanged pointers."""
     device = torch.device("cuda")
     capability = torch.cuda.get_device_capability(device)
     try:
@@ -389,7 +368,6 @@ def test_selected_pipeline_replays_correctly_in_a_real_cuda_graph(
         msg=f"{choice.key}: active replay",
     )
 
-    # Replay 2: the whole batch flips to base-only through the sentinel.
     token_lora_mapping.fill_(-1)
     graph.replay()
     torch.cuda.synchronize(device)
@@ -402,7 +380,6 @@ def test_selected_pipeline_replays_correctly_in_a_real_cuda_graph(
         msg=f"{choice.key}: base-only replay",
     )
 
-    # Replay 3: new routing and activations arrive in place, adapters return.
     cpu["topk_ids"] = cpu["topk_ids"].flip(dims=(1,)).contiguous()
     cpu["hidden_states"] = (cpu["hidden_states"].float() * 1.5).to(torch.bfloat16)
     gpu["topk_ids"].copy_(cpu["topk_ids"])

@@ -1,17 +1,3 @@
-"""Runtime contracts at the MoE LoRA config/runner boundary.
-
-This file intentionally covers only two durable properties:
-
-* every config runner is admitted against the resident BF16 MoE layout before
-  it can execute; and
-* decode and prefill CUDA graphs consume distinct, graph-stable routing
-  buffers whose contents may be refreshed in place between replays.
-
-The latter is exercised with a real ``torch.cuda.CUDAGraph``.  Metadata is
-updated outside capture, exactly as it is in serving, while a captured
-consumer reads the stable allocations on each replay.
-"""
-
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -37,8 +23,6 @@ if TYPE_CHECKING:
 
 
 class _FakeMoeLayer:
-    """Minimal layer surface needed by metadata allocation."""
-
     def __init__(self, device: torch.device) -> None:
         self.base_layer = SimpleNamespace(
             w13_weight=torch.empty(1, device=device, dtype=torch.bfloat16),
@@ -292,8 +276,6 @@ def test_decode_and_prefill_metadata_refresh_through_real_graph_replay() -> None
 
 
 class TestRunnerAdmission:
-    """Reject resident states no precreated config runner can consume."""
-
     @staticmethod
     def _base_layer(**overrides):
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
@@ -303,8 +285,6 @@ class TestRunnerAdmission:
         dispatcher = object.__new__(StandardDispatcher)
         dispatcher.skip_local_expert_mapping = overrides.get("skip_local", False)
         is_gated = overrides.get("is_gated", True)
-        # Resident gate/up width follows the gating declaration unless a test
-        # forces a disagreement.
         gateup_width = overrides.get("gateup_width", (2 if is_gated else 1) * 4)
         return SimpleNamespace(
             quant_method=quant_method,
@@ -340,11 +320,7 @@ class TestRunnerAdmission:
         activation: str,
         is_gated: bool,
     ) -> None:
-        """The two axes are independent, so the whole product is admissible.
-
-        Parametrized over the enum rather than a written-out list, so a new
-        member is covered the moment it is added instead of quietly not being.
-        """
+        """The two axes are independent, so the whole product is admissible."""
         self._admit(activation=activation, is_gated=is_gated)
 
     @pytest.mark.parametrize("activation", [fn.value for fn in ActivationFn])
@@ -354,13 +330,8 @@ class TestRunnerAdmission:
         activation: str,
         is_gated: bool,
     ) -> None:
-        """Admission is not enough: the cell must survive validate_plan too.
-
-        Non-gated SiLU used to pass _admit and then die here with "provider
-        exposes 1 gate/up slices but swiglu needs 2", because the slice count
-        was inferred from the activation. The slice count comes from the
-        resident width now, so all four cells bind.
-        """
+        """Regression: non-gated SiLU passed _admit then died in validate_plan
+        because the gate/up slice count was inferred from the activation."""
         from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
         from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
 
@@ -399,7 +370,6 @@ class TestRunnerAdmission:
         )[Phase.DECODE]
         runner.validate_plan(selected.plan, base_gemm_rows=selected.base_gemm_rows)
 
-        # ...and the mismatched provider is rejected ON THE GATING AXIS.
         runner.is_gated = not is_gated
         with pytest.raises(ValueError, match="is_gated"):
             runner.validate_plan(selected.plan, base_gemm_rows=selected.base_gemm_rows)

@@ -1,83 +1,9 @@
-"""The route-major (DeepGEMM "contiguous") row domain, GEMM-engine-agnostic.
-
-This is the row-domain twin of :mod:`masked_row_domain`.  Where the masked
-domain materializes expert-major ``[E_local, m_max, ·]`` slabs, the contiguous
-domain sorts routed rows by expert into ONE compact 2-D buffer whose per-expert
-segment starts are rounded up to the DeepGEMM contiguous m-alignment, exactly
-the layout ``m_grouped_bf16_gemm_nt_contiguous`` consumes (mirroring the
-upstream EP prefill convention of ``ep_scatter`` + ``grouped_gemm_nt_*_contig``
-in ``sglang.srt.layers.moe.moe_runner.deep_gemm``).
-
-Memory math per layer forward (P = T * top_k, a = m-alignment):
-
-    masked      gather + gateup + act + down =
-                E_local * m_max * (H + S*I + I + H)   rows scale O(E * chunk)
-    contiguous  M_ceil  * (H + S*I + I + H)           rows scale O(T * top_k)
-    M_ceil      = ceil((P + E_local * (a - 1)) / a) * a   (host-static ceiling
-                  over the dynamic M_pad = sum_e ceil(count_e / a) * a)
-
-``grouped_layout`` labels every row of an expert's ALIGNED segment (routed
-rows and the partial-block padding tail alike) with the owning expert id and
-the ceiling tail past ``M_pad`` with ``-1``.  Labeling in-segment padding with
-the expert id keeps every m-block group-uniform under both the per-block and
-per-row readings of the DeepGEMM contract — the exact convention upstream
-``ep_scatter`` writes — while ``-1`` ceiling blocks are skipped work.  Padding
-row CONTENT is never consumed: the GEMMs are row-independent, the pair-domain
-activation join and finalize index only routed rows through ``src2dst``, and
-``ensure_zero_padding`` (the wrapper default) zeroes ``-1`` output rows.
-
-Stage mapping versus the masked twin:
-
-* S1 dispatch: three launches (count/slot -> aligned prefix + segment labels
-  -> row fill) instead of the masked single fused launch; that is the price
-  of needing per-expert prefix sums before any row has a home.  The
-  pair-domain launches are PAIR-COARSENED (``PAIRS_PER_PROGRAM`` consecutive
-  pairs per program, vector prologue) — GB300 profiling showed these glue
-  launches are program-count-bound (see the constants below).  The
-  seg-layout launch owns the whole ``grouped_layout`` buffer: its extra tail
-  program writes the ``-1`` ceiling rows, so no host-side ``fill_(-1)``
-  memset precedes it, and a CuTeDSL caller can fold its dual-stage packed
-  tile-schedule build into the same launch through a
-  :class:`ContiguousSchedulePack` (both fusions cut one launch per layer
-  prefill each).
-* S3 activation join and S5 finalize REUSE the masked pair-domain kernels
-  verbatim (``_activation_delta_masked_kernel``, ``post_reorder_deepgemm``):
-  both index physical rows exclusively through ``src2dst``, so storing the
-  compact row ``seg_offsets[e] + slot`` there instead of the masked
-  ``e * m_max + slot`` re-targets them with zero kernel changes, including
-  the exactly-once invalid-pair zero-write duty on the pair activation.
-  For the same reason the LoRA A/B kernels need no contiguous variants:
-  gate/up A is token-domain, down A consumes the pair activation
-  (or the ``src2dst`` row map through ``MappedLoraAInput``), and every B
-  kernel is pair-domain.
-
-The fused B+activation middle (:func:`fused_b_act_contiguous`) and the
-mapped grouped down-A input reuse the masked pair-domain kernels through the
-same lever: ``_b_act_kernel`` indexes base gate/up rows and activation rows
-EXCLUSIVELY through ``src2dst`` over flattened views, so pointing it at the
-compact 2-D buffers re-targets it with zero kernel changes, and the
-pair-to-row ABI grouped down-A consumes is the same ``src2dst``.  That is
-what admits the GB300 shared-outer SERIAL prefill winner (token-dedup shared
-gate/up A + fused B+activation middle + one-launch shared down B + materialized
-finalize): every LoRA factor kernel it uses is pair/token-domain, the JOINT
-shared-outer route builder is pure pair-domain metadata whose PDL chain is
-internal to the three routing launches and independent of the row domain,
-and the finalize is the same ``post_reorder``.
-
-The shared-rank finalize family ports through the SAME lever: the rank
-reduction is pure pair-domain (it reads the pair-major down-A
-bridge the mapped grouped down-A already emits — output rows are indexed by
-pair id regardless of the input row map), and the from-scratch tail reads
-base down rows exclusively through ``src2dst`` over a flat row view, so
-pointing it at the compact 2-D down output re-targets it with zero kernel
-changes (:mod:`masked_finalize` kernels, reused verbatim).
-
-Eligibility is PREFILL-ONLY: a contiguous decode port measured slower than
-masked on GB300 (CuTeDSL at 8-row alignment by 5-10%, DeepGEMM at its
-128-row library alignment by 22-39%), so decode stays masked.  The
-OVERLAPPED H200 winners also stay masked: the INDEXED down-A and the PDL
-edges have no contiguous port, and overlap windows fail the serial
-predicate.
+"""Row-domain twin of :mod:`masked_row_domain`: instead of expert-major
+``[E_local, m_max, ·]`` slabs, routed rows are sorted by expert into one
+compact 2-D buffer whose per-expert segment starts are rounded up to the
+DeepGEMM contiguous m-alignment, so rows scale O(T * top_k) instead of the
+masked O(E * chunk).  PREFILL-ONLY: contiguous decode ports measured slower
+than masked on GB300, so decode stays masked.
 """
 
 from __future__ import annotations
@@ -113,13 +39,8 @@ if TYPE_CHECKING:
     from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
 
-# Default pair-coarsening factor for the pair-domain S1 glue kernels.  These
-# launches are program-count-bound on GB300 (~35us floor for 65,536 one-pair
-# programs regardless of per-program work), so each program owns
-# ``PAIRS_PER_PROGRAM`` consecutive pairs and the grid shrinks by that
-# factor.  Must be a power of two (``tl.arange`` lanes); 8 cuts the
-# T=8192/topk=8 program count from 65,536 to 8,192 while each program's
-# vector prologue stays two loads (sweep: 16/32 regress).
+# Pairs per program in the S1 glue kernels: they are program-count-bound, so
+# each program owns this many consecutive pairs.
 PAIRS_PER_PROGRAM = 8
 
 
@@ -136,13 +57,6 @@ def _validate_pairs_per_program(pairs_per_program: int) -> None:
 
 
 def coarsened_pair_grid(num_pairs: int, pairs_per_program: int) -> int:
-    """``ceil(num_pairs / pairs_per_program)`` programs cover every pair.
-
-    The ceiling keeps a partial tail program when ``num_pairs`` is not a
-    multiple; its out-of-range lanes predicate off inside the kernel.  The
-    count depends only on host-static values, so captured launches keep a
-    static grid exactly like the one-pair-per-program grids they replace.
-    """
     _validate_pairs_per_program(pairs_per_program)
     if num_pairs < 0:
         raise ValueError(f"num_pairs must be non-negative, got {num_pairs}")
@@ -150,14 +64,9 @@ def coarsened_pair_grid(num_pairs: int, pairs_per_program: int) -> int:
 
 
 def contiguous_m_pad_ceiling(num_pairs: int, num_experts: int, alignment: int) -> int:
-    """Host-static row ceiling of the aligned per-expert segment layout.
-
-    The dynamic total is ``M_pad = sum_e ceil(count_e / a) * a`` with
-    ``sum_e count_e <= num_pairs``; each expert adds at most ``a - 1`` padding
-    rows, so ``M_pad <= num_pairs + num_experts * (a - 1)``.  The ceiling is
-    rounded up to a multiple of the alignment so the GEMM's whole row domain
-    is m-block covered.  It depends only on host-static values, making every
-    buffer shape and grid CUDA-graph capture-stable.
+    """Each expert adds at most ``a - 1`` rows to the dynamic
+    ``M_pad = sum_e ceil(count_e / a) * a``, and the bound is rounded up to
+    the alignment so the GEMM's whole row domain is m-block covered.
     """
     if not isinstance(num_pairs, int) or num_pairs < 0:
         raise ValueError(f"num_pairs must be a non-negative int, got {num_pairs!r}")
@@ -177,9 +86,8 @@ def _contig_count_slots_kernel(
     num_pairs,
     PAIRS_PER_PROGRAM: tl.constexpr,
 ):
-    # Pair-coarsened counting pass; the vectorized atomic is exact under
-    # intra-vector expert collisions (each lane performs its own RMW), the
-    # same property the masked metadata dispatch relies on.
+    # The vectorized atomic is exact under intra-vector expert collisions
+    # (each lane performs its own RMW), as in the masked metadata dispatch.
     pairs = tl.program_id(0).to(tl.int64) * PAIRS_PER_PROGRAM + tl.arange(
         0, PAIRS_PER_PROGRAM
     )
@@ -213,24 +121,12 @@ def _contig_seg_layout_kernel(
     OUTPUT_SHIFT: tl.constexpr,
 ):
     # Grid (EXPERTS + 1,) plain, (EXPERTS + 1, 2) under BUILD_SCHEDULES.
-    # Every program recomputes the (cheap, one tl.cumsum) aligned prefix from
-    # seg_counts; each stage-0 program stores the shared seg_offsets entries
-    # — a benign same-value race, exactly the upstream ep_scatter stage-1
-    # pattern — then labels its FULL aligned segment (routed rows and the
-    # partial-block padding tail) with its expert id so every m-block the
-    # GEMM schedules is group-uniform.  Program EXPERTS owns the ceiling
-    # tail: it writes -1 over [M_pad, m_pad_ceiling), replacing the
-    # fill_(-1) memset this launch used to rely on; segment and tail writes
-    # are disjoint by construction.
-    #
-    # BUILD_SCHEDULES additionally folds the CuTeDSL dual-stage packed
-    # schedule build (the former standalone _dual_schedule_kernel launch)
-    # into this grid: program (expert, stage) packs that expert's stage
-    # entries from the SAME seg_counts, preserving the dual-ownership rule
-    # (both stages' schedules derive from the one device row-count source,
-    # in one launch).  The packing arithmetic is verbatim
-    # _dual_schedule_kernel so the fused and standalone builds are
-    # entry-identical.
+    # Stage-0 programs all store the same seg_offsets entries — a benign
+    # same-value race, exactly the upstream ep_scatter stage-1 pattern — then
+    # label their FULL aligned segment (padding tail included) so every m-block
+    # the GEMM schedules is group-uniform.  Program EXPERTS labels the ceiling
+    # tail [M_pad, m_pad_ceiling) with -1, replacing a host fill_(-1) memset;
+    # the two write ranges are disjoint by construction.
     expert = tl.program_id(0)
     stage = tl.program_id(1)
     offs = tl.arange(0, BLOCK_EXPERTS)
@@ -264,6 +160,9 @@ def _contig_seg_layout_kernel(
                 mask=rows < seg_rows,
             )
 
+    # Folded CuTeDSL schedule build: both stages derive from the one device
+    # row-count source in one launch, with arithmetic verbatim from
+    # _dual_schedule_kernel so fused and standalone builds are entry-identical.
     if BUILD_SCHEDULES:
         if expert < EXPERTS:
             out_clusters = tl.where(stage == 0, out_clusters1, out_clusters2)
@@ -307,7 +206,7 @@ def _contig_fill_rows_kernel(
     input_ptr,  # [num_tokens, hidden] bf16 source rows
     compact_ptr,  # [m_pad_ceiling, hidden] bf16, viewed flat
     topk_ids_ptr,  # [num_pairs]
-    src2dst_ptr,  # [num_pairs] int32: dense slots IN, compact rows OUT
+    src2dst_ptr,  # [num_pairs] int32 finalized compact rows
     seg_offsets_ptr,  # [E_local + 1] int32 aligned exclusive prefix
     hidden_size,
     num_pairs,
@@ -315,13 +214,11 @@ def _contig_fill_rows_kernel(
     PAIRS_PER_PROGRAM: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
-    # PURE copy pass: src2dst must already hold FINALIZED compact rows
-    # (written by _contig_finalize_src2dst_kernel). Fusing that rewrite
-    # into this kernel made the compiled kernel emit compact-row stores
-    # past the allocation at scale (T*topk=65536, hidden=2048) with
-    # provably correct inputs, in every formulation tried (vector-extract
-    # and per-pair scalar alike); the standalone split runs correctly, so
-    # the two stages stay separate kernels by construction.
+    # PURE copy pass: src2dst must already hold FINALIZED compact rows.
+    # Fusing that rewrite in here made the compiled kernel emit stores past
+    # the allocation at scale (T*topk=65536, hidden=2048) with provably
+    # correct inputs, in every formulation tried; the split runs correctly,
+    # so the two stages stay separate kernels by construction.
     lane = tl.arange(0, PAIRS_PER_PROGRAM)
     base = tl.program_id(0).to(tl.int64) * PAIRS_PER_PROGRAM
     pairs = base + lane
@@ -357,9 +254,7 @@ def _contig_finalize_src2dst_kernel(
     num_pairs,
     PAIRS_PER_PROGRAM: tl.constexpr,
 ):
-    # Rewrites src2dst in place from per-expert dense slots to compact rows
-    # ``seg_offsets[expert] + slot``. Kept as its own launch — see the
-    # hazard note on _contig_fill_rows_kernel.
+    # Own launch per the hazard note on _contig_fill_rows_kernel.
     base = tl.program_id(0).to(tl.int64) * PAIRS_PER_PROGRAM
     for i in tl.static_range(PAIRS_PER_PROGRAM):
         pair = base + i
@@ -374,16 +269,10 @@ def _contig_finalize_src2dst_kernel(
 class ContiguousSchedulePack(msgspec.Struct, kw_only=True):
     """CuTeDSL packed-schedule outputs folded into the S1 seg-layout launch.
 
-    The contiguous CuTeDSL provider hands this to
-    :func:`contiguous_dispatch_fill` so both stages' packed tile schedules
-    are emitted by the SAME launch that computes ``seg_offsets`` from
-    ``seg_counts`` — one launch fewer per layer prefill, and the
-    dual-ownership rule (both schedules derive from the one device row-count
-    source, in one launch) holds by construction.  Build instances through
+    Build instances through
     ``cutedsl_masked.schedule_builder.contiguous_dual_stage_schedule_pack``,
-    which owns the packed-ABI capacity validation and the field-shift
-    constants; this module stays engine-agnostic by taking the shifts as
-    data instead of importing the CuTeDSL ABI.
+    which owns the packed-ABI capacity validation; this module stays
+    engine-agnostic by taking the field shifts as data.
     """
 
     schedule1: torch.Tensor  # [capacity1] int64 packed (expert, tc, oc)
@@ -440,10 +329,8 @@ def _validate_schedule_pack(
             f"{pack.entry_block!r}"
         )
     # With the token tile dividing the alignment, the fused build writes at
-    # most (m_pad_ceiling / token_width) * out_clusters entries per stage —
-    # the same bound the standalone builder's capacity validation proves.
+    # most (m_pad_ceiling / token_width) * out_clusters entries per stage.
     total_clusters = m_pad_ceiling // pack.token_width
-    # Tile COUNTS stay int32: builder prefix arithmetic, not the packed ABI.
     for name, tensor, needed, dtype in (
         ("schedule1", pack.schedule1, total_clusters * pack.out_clusters1, torch.int64),
         ("schedule2", pack.schedule2, total_clusters * pack.out_clusters2, torch.int64),
@@ -487,14 +374,10 @@ def contiguous_dispatch_fill(
     """S1 of the contiguous domain: counts, aligned segments, and row gather.
 
     On return ``src2dst[t * top_k + k]`` holds the COMPACT row
-    ``seg_offsets[e] + slot`` for every routed pair (sentinel pairs get no
-    store anywhere, exactly like the masked dispatch), ``grouped_layout``
-    labels aligned segments as documented on the module, and
-    ``hidden_compact`` carries the gathered routed token rows.  With a
-    ``schedule_pack``, the seg-layout launch additionally emits both CuTeDSL
-    packed tile schedules from the same ``seg_counts``.  Grids and buffer
-    shapes derive only from host-static values; segment lengths are read
-    from device memory, so the whole sequence is CUDA-graph capturable.
+    ``seg_offsets[e] + slot`` for every routed pair; sentinel pairs get no
+    store anywhere, exactly like the masked dispatch.  Grids and buffer shapes
+    derive only from host-static values and segment lengths stay on device, so
+    the whole sequence is CUDA-graph capturable.
     """
     if hidden_states.ndim != 2 or not hidden_states.is_contiguous():
         raise ValueError("hidden_states must be contiguous [num_tokens, hidden]")
@@ -545,9 +428,9 @@ def contiguous_dispatch_fill(
             schedule_pack, alignment, m_pad_ceiling, hidden_states.device
         )
 
-    # Stream-ordered initialization (capture-legal): the counts double as the
-    # atomic cursors.  grouped_layout needs no host prefill — the seg-layout
-    # launch's tail program writes the -1 ceiling rows itself.
+    # Stream-ordered zeroing (capture-legal): the counts double as the atomic
+    # cursors.  grouped_layout needs no prefill — the seg-layout launch's tail
+    # program writes the -1 ceiling rows itself.
     seg_counts_out.zero_()
     if num_pairs > 0:
         _contig_count_slots_kernel[
@@ -563,8 +446,7 @@ def contiguous_dispatch_fill(
     # and (with a pack) the packed tile counts are defined for every forward.
     if schedule_pack is None:
         # The schedule pointer/geometry arguments alias live tensors but are
-        # never read or written: BUILD_SCHEDULES is constexpr-False, the same
-        # dead-alias pattern as build_single_stage_schedule's stage-2 legs.
+        # never read or written: BUILD_SCHEDULES is constexpr-False.
         _contig_seg_layout_kernel[(num_local_experts + 1,)](
             seg_counts_out,
             seg_offsets_out,
@@ -647,13 +529,11 @@ def act_delta_contiguous(
 ) -> None:
     """The masked S3 kernel re-targeted at compact rows through ``src2dst``.
 
-    Same launch, same grid, same per-pair arithmetic and the same
-    exactly-once invalid-pair zero write on ``activation_lora_input`` as
-    :func:`masked_activation.act_delta_masked`; only the physical row
-    behind each ``src2dst`` entry differs.  The only wrapper-level change is
-    that ``num_local_experts`` is explicit — the masked wrapper reads it from
-    the slab's leading dimension, which the compact 2-D buffer no longer
-    carries.
+    Same launch, grid, per-pair arithmetic and exactly-once invalid-pair zero
+    write on ``activation_lora_input`` as
+    :func:`masked_activation.act_delta_masked`; only the physical row behind
+    each ``src2dst`` entry differs.  ``num_local_experts`` is explicit because
+    the compact 2-D buffer has no expert leading dimension to read it from.
     """
     ActivationFn.parse(activation)  # fail closed on an unknown name
     num_pairs = topk_ids.numel()
@@ -723,18 +603,14 @@ def fused_b_act_contiguous(
 ) -> None:
     """The masked fused B+activation middle re-targeted at compact rows.
 
-    Same kernel (``_b_act_kernel``), same grid, same per-pair arithmetic, and
-    the same exactly-once invalid-pair zero-write duty on ``act_pairs`` as
-    :func:`masked_fused_act.run_masked_fused_act`: the kernel addresses
-    base and activation rows exclusively through ``src2dst`` over flattened
-    row views, so storing the compact row ``seg_offsets[e] + slot`` there
-    re-targets it with zero kernel changes.  Only the wrapper-level shape
-    contract differs — the compact domain is one flat 2-D buffer instead of
-    the masked ``[E, m_max, ·]`` slab, so the expert count cannot be read off
-    a leading dimension and both row buffers validate against the one shared
-    compact row count.  Segment-padding activation rows are untouched stale
-    content, exactly like the materialized contiguous S3: the down GEMM
-    computes over them row-independently and no consumer reads their output.
+    Same kernel (``_b_act_kernel``), grid, per-pair arithmetic and
+    exactly-once invalid-pair zero-write duty on ``act_pairs`` as
+    :func:`masked_fused_act.run_masked_fused_act`; only the wrapper-level
+    shape contract differs, since the compact domain is one flat 2-D buffer
+    instead of the masked ``[E, m_max, ·]`` slab.  Segment-padding activation
+    rows are untouched stale content, exactly like the materialized contiguous
+    S3: the down GEMM computes over them row-independently and no consumer
+    reads their output.
     """
     if family not in MASKED_ACT_FAMILIES:
         raise ValueError(f"family={family!r} is not one of {MASKED_ACT_FAMILIES}")
@@ -852,16 +728,6 @@ def fused_b_act_contiguous(
 
 
 class ContiguousRowState(msgspec.Struct, kw_only=True):
-    """Per-forward state of the contiguous row domain.
-
-    Rows live in one compact buffer with
-    ``src2dst[t * top_k + k] = seg_offsets[expert] + slot``; validity is
-    carried by ``topk_ids >= 0`` exactly as in the masked domain.
-    ``m_pad_ceiling`` is the host-static row ceiling every stage buffer is
-    shaped by; the dynamic aligned total lives in ``seg_offsets[-1]`` on
-    device and never reaches the host.
-    """
-
     hidden_compact: torch.Tensor  # [m_pad_ceiling, hidden] bf16
     seg_counts: torch.Tensor  # [E_local] int32
     seg_offsets: torch.Tensor  # [E_local + 1] int32 aligned exclusive prefix
@@ -875,8 +741,8 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
     """S1/S3/S5 plus geometry over the contiguous row domain; S2/S4 abstract.
 
     ``m_alignment`` is the GEMM engine's contiguous m-block alignment
-    (DeepGEMM's ``get_m_alignment_for_contiguous_layout()``); the engine
-    subclass supplies it so this domain stays engine-agnostic.
+    (DeepGEMM's ``get_m_alignment_for_contiguous_layout()``), supplied by the
+    engine subclass so this domain stays engine-agnostic.
     """
 
     def __init__(self, quant_info: MoeLoraBf16QuantInfo, *, m_alignment: int):
@@ -916,9 +782,9 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
                 f"gated gate/up slices, got {self._gate_up_slices}"
             )
 
-        # Bind callees once at attach time, mirroring the masked domain: the
-        # finalize is the SAME post_reorder kernel (it indexes rows only
-        # through src2dst, which now carries compact rows).
+        # Bind the masked callees once at attach time.  All of them are
+        # row-domain-agnostic for the same reason: every physical row access
+        # goes through src2dst over a flat row view, compact rows here.
         from sglang.kernels.ops.moe.ep_moe_kernels import post_reorder_deepgemm
         from sglang.srt.lora.moe.base_gemm_provider.down_b_into_base import (
             invoke_down_b_into_base,
@@ -930,13 +796,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         )
 
         self._post_reorder = post_reorder_deepgemm
-        # The down-B into-base epilogue is row-domain-agnostic for the same
-        # reason post_reorder is: every physical row access goes through
-        # src2dst over a flat row view.
         self._down_b_into_base = invoke_down_b_into_base
-        # The shared-rank finalize pair is reused verbatim: the reduce is
-        # pure pair-domain and the tail reads base rows only through
-        # src2dst over a flat row view (compact rows here).
         self._shared_reduce_impls: dict[str, Callable] = {
             MASKED_FINALIZE_TRITON: invoke_shared_rank_reduce
         }
@@ -980,10 +840,9 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         )
         device = hidden_states.device
         if workspace is not None:
-            # The alignment tag keeps this instance's row-geometry buffers
-            # distinct from any differently aligned sibling sharing the same
-            # layer workspace: compact rows and ceilings are
-            # alignment-dependent.
+            # Compact rows and ceilings are alignment-dependent, so the tag
+            # keeps a differently aligned sibling sharing this layer workspace
+            # off these buffers.
             prefix = f"contig:a{self._m_alignment}"
             seg_counts = workspace.tensor(
                 f"{prefix}:seg_counts",
@@ -1056,9 +915,8 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
 
     def release_prepared_inputs(self, row_state: ContiguousRowState) -> None:
         # Same lifetime contract as the masked twin: the compact hidden rows
-        # are dead after the gate/up GEMM; runner-workspace tensors remain
-        # address-stable for graph replay and are reclaimed with the runner
-        # workspace.
+        # are dead after the gate/up GEMM, but workspace tensors must stay
+        # address-stable for graph replay, so they are freed with the runner.
         if row_state.retained_inputs:
             return
         from sglang.srt.utils import dispose_tensor
@@ -1077,7 +935,6 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         activation: str = "silu",
         consume_base_pdl: bool = False,
     ) -> None:
-        # act_delta_contiguous, called on the next line, checks the registry.
         act_delta_contiguous(
             gateup_out,
             gate_up_delta,
@@ -1099,12 +956,10 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
     ) -> MappedLoraAInput | None:
         """Expose compact activation rows for standalone grouped down-A.
 
-        The contiguous twin of the masked provider's mapping and the same
-        semantic ABI: ``src2dst`` already holds one physical activation row
-        per routed pair.  Sentinel pairs' (uninitialized) entries
-        are never read — the aligned route buckets them into ``-1``-labeled
-        blocks the mapped grouped-A kernel skips, identical to the masked
-        domain, whose dispatch also leaves them unwritten.
+        Same semantic ABI as the masked mapping: ``src2dst`` already holds one
+        physical activation row per routed pair.  Sentinel pairs' entries stay
+        uninitialized but are never read — the aligned route buckets them into
+        ``-1``-labeled blocks the mapped grouped-A kernel skips.
         """
         if not isinstance(row_state, ContiguousRowState):
             raise TypeError("contiguous down-A input requires ContiguousRowState")
@@ -1171,8 +1026,8 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         bridge_top_k: int = 1,
         consume_base_pdl: bool = False,
     ) -> None:
-        # ``act_masked`` keeps the provider-ABI parameter name; on this
-        # domain it is the compact 2-D activation buffer.
+        # ``act_masked`` keeps the provider-ABI parameter name; here it is the
+        # compact 2-D activation buffer.
         if not self.supports_fused_act(
             family, activation=activation, implementation=implementation
         ):
@@ -1251,10 +1106,6 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         routing: RouteView,
         config: Mapping[str, int],
     ) -> None:
-        # Same lever as the contiguous S3/S5 reuse: rows are addressed only
-        # through src2dst, which here carries compact rows
-        # seg_offsets[e] + slot.  src2dst is only READ, so the documented
-        # in-place-src2dst-store hazard does not apply.
         self._down_b_into_base(
             down_rows=down_out.view(-1, self.hidden_size),
             src2dst=row_state.src2dst,
@@ -1315,9 +1166,8 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         config: Mapping[str, int],
     ) -> None:
         invoke = self._shared_reduce_impls[implementation]
-        # `row_state` is deliberately opaque and unused by this pair-domain launch;
-        # retaining it in the provider ABI lets every scheduled stage be
-        # invoked uniformly.
+        # Unused by this pair-domain launch, but kept in the provider ABI so
+        # every scheduled stage is invoked uniformly.
         del row_state
         invoke(
             bridge=bridge,
@@ -1342,10 +1192,8 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         token_rank: torch.Tensor,
         config: Mapping[str, int],
     ) -> None:
-        # ``down_masked`` keeps the provider-ABI parameter name; on this
-        # domain it is the compact 2-D [m_pad_ceiling, hidden] down output,
-        # and the verbatim tail kernel addresses its rows only through
-        # src2dst (compact rows seg_offsets[e] + slot).
+        # ``down_masked`` keeps the provider-ABI parameter name; here it is the
+        # compact 2-D [m_pad_ceiling, hidden] down output.
         invoke = self._shared_tail_impls[implementation]
         invoke(
             down_masked=down_masked,
@@ -1371,11 +1219,10 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         *,
         lora_delta: torch.Tensor | None = None,
     ) -> None:
-        # Verbatim masked finalize: post_reorder_deepgemm gathers each
-        # token's top-k rows through src2dst (now compact rows), applies the
-        # router weight and routed scaling exactly once over base + pair
-        # delta, and writes per-token in-register FP32 K-sums — identical
-        # arithmetic order to the masked domain.
+        # Verbatim masked finalize: post_reorder_deepgemm applies the router
+        # weight and routed scaling exactly once over base + pair delta and
+        # writes per-token in-register FP32 K-sums — identical arithmetic
+        # order to the masked domain.
         num_tokens, hidden = output.shape
         self._post_reorder(
             down_out.view(-1, hidden),

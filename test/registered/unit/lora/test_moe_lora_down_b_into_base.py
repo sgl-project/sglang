@@ -1,41 +1,3 @@
-"""Down-B into-base (``down_b_into_base``) coverage for the SGL
-MoE-LoRA engine.
-
-CPU cases pin the plan flag's invariants (built directly from the
-execution-plan spec classes) and the shipped config structure: every serial
-per-expert prefill choice — the GB300 and H200 in-domain prefill scenarios
-plus the per-expert out-of-domain prefill fallback — ships its down tail
-reordered to down-A -> base down GEMM -> down-B(into base) -> materialized
-finalize in no-pair-delta mode.  The standalone one-launch down-B stage is
-retained — only its output addressing changes — and the ``[T, K, H]``
-pair-major delta buffer is never allocated.  Decode choices, overlapped
-prefill, and shared-outer down-B are never scattered.
-
-CUDA cases split by dependency:
-
-* Kernel equality needs only Triton: ``invoke_down_b_into_base`` into a copy of
-  the base rows followed by no-pair-delta ``post_reorder_deepgemm`` against
-  the exact shipped tail — ``one_launch_sliced_lora_b`` writing a
-  materialized LoRA delta that ``post_reorder_deepgemm`` re-reads — on random
-  routing with sentinel pairs, a zero-routed token, base-only tokens, and a
-  zero-padded (mixed-rank, mlpb-style) slot, over BOTH row-domain
-  ``src2dst`` shapes (masked expert-major rows and contiguous compact rows).
-  Agreement is allclose rather than bitwise BY JUSTIFICATION: the scatter
-  rounds the FP32 delta to BF16 JOINTLY with the base row before the FP32
-  weighted sum, whereas the shipped tail rounds the delta to BF16 separately
-  (pair-major) and keeps base and delta as two operands of that sum.  Rows
-  no valid pair targets must be BITWISE untouched (base-only traffic makes
-  the whole launch a no-op), and an independent FP32 oracle pins the
-  mathematical ``scale * sum(weight * (base + bridge @ B))`` contract.
-* The runner-level oracle needs DeepGEMM: the SAME random inputs through the
-  serial materialized plan and its into-base reordering must agree, on the
-  masked provider and on the contiguous provider (row-domain agnosticism at
-  the seam), and the scatter runner's workspace must never allocate the
-  ``down_b:delta`` buffer.
-* A CUDA-graph case captures the reordered pipeline and replays it with the
-  batch flipped to base-only and with routing mutated in place.
-"""
-
 from __future__ import annotations
 
 from dataclasses import replace
@@ -73,12 +35,9 @@ _SWIGLU = ActivationFn.SILU
 
 
 def _menu(architecture, layout, activation=_SWIGLU):
-    """Every shipped row for one layout, keyed by row name.
-
-    The whole menu, built from the same table loader and plan builder
-    serving uses — minus ``resolve_plans``' phase and rank predicates,
-    which pick ONE row per phase.
-    """
+    """The whole menu, from the same table loader and plan builder serving
+    uses — minus ``resolve_plans``' phase and rank predicates, which pick
+    ONE row per phase."""
     table = load_plans(architecture)
     layout_name = "shared" if layout else "per_expert"
     return {
@@ -94,7 +53,6 @@ def _menu(architecture, layout, activation=_SWIGLU):
 
 
 def _shipped_launch(architecture, sel, *, physical_rank=16, num_tokens=4096):
-    """The shipped tile pick for one row, resolved the way serving does."""
     return resolve_tiles(
         architecture_value=architecture.value,
         plan_key_name=sel.name,
@@ -109,9 +67,6 @@ def _build_plan(
     finalize_family=FinalizeFamily.MATERIALIZED,
     down_overlap=DownOverlap.NONE,
 ) -> MoeLoraExecutionPlan:
-    """The serial one-launch plan shape, built the way
-    ``execution_plan.build_plan`` materializes a table row (spec classes
-    directly)."""
     pe = False
     consumes_down_b = finalize_family is not FinalizeFamily.MATERIALIZED
     return MoeLoraExecutionPlan(
@@ -147,11 +102,7 @@ def _build_plan(
 
 
 def _serial_plan():
-    """The serial materialized per-expert plan (the scatter's base shape)."""
     return _build_plan()
-
-
-# ---- CPU: plan flag invariants --------------------------------------------------
 
 
 class TestDownBIntoBasePlan:
@@ -161,7 +112,7 @@ class TestDownBIntoBasePlan:
         assert plan.down_b_into_base_eligible()
         reordered = replace(plan, down_b_into_base=True)
         # The standalone one-launch stage is RETAINED — only its output
-        # addressing changes — and the finalize stays materialized.
+        # addressing changes.
         assert reordered.down_b is not None
         assert reordered.down_b.family is LoraBFamily.ONE_LAUNCH_SLICED
         assert reordered.finalize.family is FinalizeFamily.MATERIALIZED
@@ -189,9 +140,8 @@ class TestDownBIntoBasePlan:
 
     def test_flag_requires_a_standalone_down_b(self) -> None:
         # A finalize-consumed down-B (shared-rank reduce) has no standalone
-        # down-B stage for the scatter to reorder.  Built directly: the H200
-        # shared prefill.shared_rank scenario still ships this form, and the
-        # flag must keep rejecting it.
+        # down-B stage to reorder; the H200 shared prefill.shared_rank row
+        # still ships this form.
         consumed = _build_plan(
             is_shared_outer=True,
             finalize_family=FinalizeFamily.SHARED_RANK_REDUCE,
@@ -212,26 +162,18 @@ class TestDownBIntoBasePlan:
     def test_flag_admits_the_down_a_window(self) -> None:
         # DOWN_A forks down-A against the base GEMM and JOINS before down-B
         # runs, so the rows are complete -- the same ordering the serial
-        # branch gives.  Legal, and no shipped row asks for it: the 3-model x
-        # 3-arch sweep measured it as a wash under CUDA-graph capture (configs
-        # README).  The rule stays permissive so a table CAN ask.
+        # branch gives.  No shipped row asks for it (measured a wash; configs
+        # README); the rule stays permissive so a table CAN ask.
         forked = _build_plan(down_overlap=DownOverlap.DOWN_A)
         assert replace(forked, down_b_into_base=True).down_b_into_base is True
 
 
-# ---- CPU: shipped config structure -----------------------------------------------
-
-
 def _into_base_expected(name: str, layout) -> bool:
-    """Which shipped rows run the into-base epilogue.
-
-    Per-expert: the serial prefill shapes. Shared-outer: the SM100
-    token-dedup prefill row, measured 1.8-6.8% of layer time on GB300 and
-    B200 across all three models (configs README). The shared fallback row
-    is expert-major and was not measured, so it stays off; H200's shared row
-    is prefill.shared_rank, whose finalize consumes down-B, so it has no
-    standalone down-B stage to reorder.
-    """
+    """Per-expert: the serial prefill shapes. Shared-outer: the SM100
+    token-dedup prefill row, measured on GB300 and B200 (configs README).
+    The expert-major shared fallback was not measured, so it stays off;
+    H200's shared row consumes down-B in its finalize, so there is no
+    standalone down-B stage to reorder."""
     if layout != False:
         return name == "prefill.token_dedup"
     return name in ("prefill.serial", "fallback.serial_prefill")
@@ -245,8 +187,7 @@ class TestDownBIntoBaseConfig:
             ("h200_sh", _H200, True, _SWIGLU),
             ("gb300_sh", _GB300, True, _SWIGLU),
             # Rows are activation-agnostic: the ReLU2 build of the same menu
-            # (including the fallback rows every menu carries) makes the
-            # same per-row scatter decision.
+            # makes the same per-row scatter decision.
             ("gb300_relu2", _GB300, False, ActivationFn.RELU2),
         )
         for name, architecture, layout, activation in cases:
@@ -305,9 +246,6 @@ class TestProviderIntoBaseSurface:
             )
 
 
-# ---- CUDA: kernel-level equality ----------------------------------------------
-
-
 cuda_only = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="the scatter kernel needs any CUDA device (plain Triton)",
@@ -339,8 +277,6 @@ _ROW_POISON = 2**30  # sentinel-pair src2dst entries must never be dereferenced
 
 
 def _kernel_case(num_tokens: int, top_k: int, num_experts: int, seed: int):
-    """Random routing with sentinel pairs, a zero-routed token, base-only
-    tokens, and a zero-padded (mixed-rank) slot."""
     generator = torch.Generator().manual_seed(seed)
     topk_ids = torch.randint(
         0, num_experts, (num_tokens, top_k), generator=generator, dtype=torch.int32
@@ -468,9 +404,6 @@ def _post_reorder(down_rows, output, src2dst, topk_ids, topk_weights, lora_delta
 def test_into_base_matches_the_standalone_downb_plus_post_reorder(
     row_domain: str, num_tokens: int, top_k: int, num_experts: int
 ) -> None:
-    """Scatter-add + no-pair-delta post_reorder must reproduce the shipped
-    tail (one-launch LoRA delta + delta-reading post_reorder), on both row
-    domains' src2dst shapes, under one shared down-B tiling config."""
     from sglang.srt.lora.moe.base_gemm_provider.down_b_into_base import (
         invoke_down_b_into_base,
     )
@@ -560,7 +493,6 @@ def test_into_base_matches_the_standalone_downb_plus_post_reorder(
         scattered[untouched.to(device)], gpu["down_rows"][untouched.to(device)]
     )
 
-    # And both tails must satisfy the independent FP32 contract.
     oracle = _fp32_finalize_oracle(
         down_rows,
         src2dst,
@@ -573,8 +505,7 @@ def test_into_base_matches_the_standalone_downb_plus_post_reorder(
     )
     torch.testing.assert_close(output.cpu(), oracle, atol=1.8e-2, rtol=0.06)
 
-    # Base-only traffic: the launch is a bitwise no-op on the base rows and
-    # the outputs collapse to the plain base combine.
+    # Base-only traffic: the launch is a bitwise no-op on the base rows.
     base_slots = torch.full_like(gpu["token_lora_mapping"], -1)
     aligned_base, _ = build_virtual_expert_routing(
         gpu["topk_ids"],
@@ -628,9 +559,6 @@ def test_into_base_rejects_a_mismatched_route_block() -> None:
             routing=aligned,
             config=_DOWN_B_CONFIG,  # declares BLOCK_SIZE_M=16, route uses 32
         )
-
-
-# ---- CUDA: runner-level oracle and graph replay --------------------------------
 
 
 def _make_gpu_tensors(num_tokens: int, num_experts: int, device: torch.device):
@@ -692,15 +620,11 @@ def _standalone_output_allocation(runner, *, num_tokens, dtype, device):
 
 
 def _into_base_pair():
-    """The serial materialized plan and its into-base reordering, with ONE
-    shipped launch config driving both.
-
-    The shipped menu carries the two forms composed with the b_act middle
-    (the dedicated b_act suite covers that composition); this oracle
-    isolates the down-tail change alone, so the reference is the shipped
-    decode fallback choice — exactly the serial materialized shape with a
-    complete tuned config — and the reordering is the same plan with the
-    flag flipped."""
+    """The shipped menu composes both forms with the b_act middle (covered by
+    the dedicated b_act suite); to isolate the down-tail change alone, the
+    reference is the shipped decode fallback choice — exactly the serial
+    materialized shape with a complete tuned config — and the reordering is
+    the same plan with the flag flipped."""
     reference = _menu(_GB300, False)["fallback.serial"]
     assert reference.plan.down_b_into_base is False
     assert reference.plan.act.family is ActFamily.MATERIALIZED
@@ -776,9 +700,8 @@ def _workspace_buffer_names(runner) -> set[str]:
 def test_runner_into_base_matches_the_materialized_reference(
     base_gemm_rows: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """One serial prefill batch, shipped tail vs the scatter reordering — on
-    the masked provider and on the contiguous provider (row-domain
-    agnosticism at the seam), with the delta-buffer accounting checked."""
+    """Shipped tail vs the scatter reordering on BOTH providers — row-domain
+    agnosticism at the seam."""
     from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
 
     device = torch.device("cuda")
@@ -816,8 +739,6 @@ def test_runner_into_base_matches_the_materialized_reference(
 def test_into_base_pipeline_replays_correctly_in_a_real_cuda_graph(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Capture the reordered pipeline and replay it against the eager
-    materialized reference under in-place batch mutation."""
     from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
 
     device = torch.device("cuda")

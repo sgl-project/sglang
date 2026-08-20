@@ -1,9 +1,8 @@
-"""The two LoRA-B families an execution plan can name.
-
-One-launch sliced B rides the aligned route and is the general choice.
-Pair-indexed sliced B rides the raw route: its grid covers occupied pairs
-rather than aligned expert-major blocks, so a sparse decode route -- hundreds
-of distinct experts at one pair each -- pays no block padding.
+"""The two LoRA-B families an execution plan can name. One-launch sliced B rides
+the aligned route and is the general choice; pair-indexed sliced B rides the raw
+route, its grid covering occupied pairs rather than aligned expert-major blocks,
+so a sparse decode route -- hundreds of distinct experts at one pair each -- pays
+no block padding.
 """
 
 from __future__ import annotations
@@ -84,9 +83,9 @@ def _one_launch_sliced_lora_b_kernel(
     store_mask = pair_mask[:, None] & n_mask[None, :]
 
     if group == -1:
-        # B owns these cells: zeroing sentinels prevents stale graph-buffer
-        # contents from becoming a false LoRA delta. This path never reads A's
-        # bridge and therefore must not wait on the producer.
+        # B owns these cells: zeroing sentinels keeps stale graph-buffer contents
+        # from becoming a false LoRA delta. This path never reads A's bridge, so
+        # it must not wait on the producer.
         zeros = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         tl.store(
             destination_ptrs,
@@ -210,11 +209,9 @@ def _indexed_pairs_lora_b_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
 ):
-    """One raw-route pair and one N tile per program: no sort, no padding.
-
-    Differs from one-launch only in within-tile summation order, so oracles
-    compare allclose rather than bitwise.
-    """
+    """One raw-route pair and one N tile per program: no sort, no padding. Differs
+    from one-launch only in within-tile summation order, so oracles compare
+    allclose rather than bitwise."""
     pair_id = tl.program_id(0)
     pid_n = tl.program_id(1)
     tiles_per_slice: tl.constexpr = (N_PER_SLICE + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
@@ -247,9 +244,9 @@ def _indexed_pairs_lora_b_kernel(
     )
 
     if key == -1:
-        # B owns these cells: zeroing invalid pairs prevents stale
-        # graph-buffer contents from becoming a false LoRA delta (the same
-        # contract as the one-launch sentinel-block store).
+        # B owns these cells: zeroing invalid pairs keeps stale graph-buffer
+        # contents from becoming a false LoRA delta, same contract as the
+        # one-launch sentinel-block store.
         zeros = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
         tl.store(
             destination_ptrs,

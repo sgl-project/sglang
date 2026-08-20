@@ -1,7 +1,6 @@
-"""Triton bodies behind the route builders; their hosts live in routing.py.
-
-Kept apart so they move to the kernels folder as one unit, and so the host layer
-can import the plan layer without dragging triton in behind it.
+"""Triton bodies behind routing.py's route builders, kept apart so they move to
+the kernels folder as one unit and the host layer can import the plan layer
+without dragging triton in behind it.
 """
 
 from __future__ import annotations
@@ -191,13 +190,13 @@ def _scan_one(
     BLOCK_SIZE_M: tl.constexpr,
     CHUNK: tl.constexpr,
 ):
-    """Exclusive scan of block-padded bucket sizes; re-zeroes counts as it reads."""
+    """Exclusive scan of block-padded bucket sizes; re-zeroes counts as it reads,
+    restoring the zero-count invariant the next replay needs."""
     running = 0
     for base in range(0, num_buckets, CHUNK):
         offsets = base + tl.arange(0, CHUNK)
         mask = offsets < num_buckets
         counts = tl.load(counts_ptr + offsets, mask=mask, other=0)
-        # This restores the zero-count invariant for the next replay.
         tl.store(counts_ptr + offsets, 0, mask=mask)
         blocks = (counts + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
         block_start = running + tl.cumsum(blocks) - blocks
@@ -234,9 +233,8 @@ def _scan_kernel(
     """Scan every requested group, one program each."""
     if USE_PDL:
         tl.extra.cuda.gdc_wait()
-        # The place kernel can launch now: its pair path recomputes keys with no
-        # scan output, then waits before its first cursor load, and its label
-        # paths wait before their first access.
+        # Safe to start the place kernel now: every path there waits before its
+        # first read of scan output.
         tl.extra.cuda.gdc_launch_dependents()
     scan_per_expert = (
         tl.program_id(0) == 0 if NEED_PER_EXPERT and NEED_SHARED else NEED_PER_EXPERT
@@ -303,8 +301,8 @@ def _label_blocks(
         tl.where(in_plan & (owner < NUM_VIRTUAL_EXPERTS), owner, -1),
         mask=block_mask,
     )
-    # Coalesced 2D fill of every in-plan block's padding tail, sentinel bucket
-    # included (a -1 block's slots ARE read by the aligned B kernels).
+    # Fill every in-plan block's padding tail, sentinel bucket included: a -1
+    # block's slots ARE read by the aligned B kernels.
     real_end = tl.load(bucket_end_ptr + owner, mask=in_plan, other=0)
     slots = block_ids[:, None] * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)[None, :]
     tl.store(
@@ -393,8 +391,8 @@ def _place_kernel(
             )
             return
 
-    # Recomputing the key beats a [T, K] round trip, and needs no scan -- so it
-    # runs before the wait below.
+    # Recomputing the key beats a [T, K] round trip and needs no scan, so it runs
+    # before the wait below.
     pair_ids = (
         pid - per_expert_label_programs - shared_label_programs
     ) * BLOCK + tl.arange(0, BLOCK)

@@ -1,15 +1,5 @@
-"""GPU invariance coverage for the engine's fused S1 dispatch kernel.
-
-``fused_masked_preprocess`` must be an exact drop-in for the bf16 branch of
-``moe_ep_deepgemm_preprocess``.  Slot order within an expert is
-atomic-arrival nondeterministic in BOTH implementations, so the checks are
-order-independent invariants rather than direct ``src2dst`` equality:
-bitwise-equal ``masked_m`` histograms, every valid pair's destination inside
-its expert region with no duplicates, and slab rows bitwise-equal to their
-source token rows.  Sentinel pairs, skewed routing, the >1024-pair regime
-(the reference's multi-block path), and the empty batch are the blind spots
-the runner numerics suite cannot reach.
-"""
+"""fused_masked_preprocess must be a bf16 drop-in for moe_ep_deepgemm_preprocess;
+slot order is nondeterministic in both, so checks are order-independent invariants."""
 
 from __future__ import annotations
 
@@ -120,8 +110,6 @@ def test_sentinel_pairs_are_skipped() -> None:
     hidden_states = _rand_hidden(num_tokens, hidden, seed=0xB0B).to(device)
     _assert_matches_reference(topk_ids, hidden_states, num_experts, top_k)
 
-    # Workspace out-tensor contract: pinned buffers are used in place, and a
-    # poisoned src2dst proves no store happens on invalid lanes.
     m_max = (num_tokens // 256 + 1) * 256
     src2dst_out = torch.full(
         (num_tokens * top_k,), -777, dtype=torch.int32, device=device

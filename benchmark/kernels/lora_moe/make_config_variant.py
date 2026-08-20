@@ -4,21 +4,6 @@ Point ``SGLANG_LORA_MOE_CONFIG_DIR`` at the output: lookup falls back per
 file, so the directory holds ONLY the file being varied and everything else
 still comes from the package.  Rows are matched by NAME, never by position —
 inserting a rule must not silently retarget anyone's tooling.
-
-Three variant kinds, one per invocation:
-
-  # Force one tile-rule's sites onto a whole row (kills its ladder):
-  python make_config_variant.py tiles --arch gb300 --out /tmp/v \
-      --row decode.per_expert --from-rule 'max_tokens=16'
-
-  # Drop a row's tile rules entirely (serve the built-in heuristics):
-  python make_config_variant.py tiles --arch gb300 --out /tmp/v \
-      --row decode.per_expert --drop
-
-  # Swap one plan row's base-GEMM row order (the vendor is a server flag,
-  # --moe-lora-base-gemm, not a table value):
-  python make_config_variant.py plans --arch gb300 --out /tmp/v \
-      --row prefill.serial --base-gemm-rows expert_major
 """
 
 from __future__ import annotations
@@ -28,7 +13,6 @@ import copy
 import json
 import os
 
-# repo root = three levels up from benchmark/kernels/lora_moe/
 _REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
@@ -43,7 +27,6 @@ def _load(arch: str, kind: str) -> dict:
 
 
 def _match_rule(rules: list[dict], spec: str) -> dict:
-    """Find exactly one rule by predicate, e.g. 'max_tokens=16' or 'wildcard'."""
     if spec == "wildcard":
         want = {}
     else:

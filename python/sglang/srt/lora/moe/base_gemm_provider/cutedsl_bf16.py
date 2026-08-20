@@ -1,33 +1,3 @@
-"""BF16 MoE provider backed by the SM90/SM100 CuTeDSL masked grouped GEMM.
-
-The study's winning family (plan section 45): swap_ab, direct schedule,
-standard ``[E, N, K]`` weights, 1-CTA MMA. Everything except S2/S4 is
-the shared :class:`MaskedRowDomainProvider` — same S1 preprocess (whose
-``hidden_permuted``/``masked_m`` are exactly this kernel's A contract), same
-S3 activation join, same S5 finalize as the DeepGEMM provider — so a
-numerical difference between the two providers can only come from the GEMMs
-themselves.
-
-Compile-once discipline: both stage configs are compiled AT CONSTRUCTION
-(LoRA-attach time) against the resident weights, and each is warmed with a
-zero-tile launch — compile and module load must never happen inside CUDA-graph
-capture (the study's keep-alive requirement). The compiled functions keep only
-layout STRUCTURE static, so one function serves every per-forward ``m_max``;
-A/C/masked_m/schedule are re-wrapped per call.
-
-Dual-ownership rule (the section 45 flagged risk): the tile schedules are
-rebuilt every forward, in ``prepare``, from the SAME ``masked_m`` the GEMMs
-read. No caller can supply a schedule through another path.
-
-Selected explicitly by the evidence-backed serving config on SM90/SM100; the
-device kernel is architecture-dispatched in ``cutedsl_masked.api``.
-
-:class:`CuteDslBf16ContiguousProvider` (bottom of this module) is the
-route-major twin over the contiguous row domain, selected by plan rows whose
-``base_gemm_rows`` is ``route_major``; it dispatches to the same two device
-kernels.
-"""
-
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -50,31 +20,21 @@ from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
 if TYPE_CHECKING:
     from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
-# PROCESS-GLOBAL compile cache. cute.compile never caches (by design -- it is
-# the documented escape hatch for callers who bring their own cache), so every
-# provider instance used to pay its own 6 compiles: measured 0.47 s each,
-# 2.82 s per attach, and a 60-layer model paid ~2.8 MINUTES of pure compile at
-# every server start (plan section 61.1). One compiled function serves every
-# layer because the resident weight is a RUNTIME argument, not a Constexpr --
-# only the per-layer wrapper around it differs. This is the same module-level
-# dict pattern the other CuTeDSL sites in sglang use (e.g. the TGV GEMM's
-# _TGV_CUTE_EXT_COMPILE_CACHE).
-#
-# The cache holds compiled functions ONLY, never a `b_arg`: retaining a
-# wrapper would keep every layer's weight tensor alive for the process.
+# PROCESS-GLOBAL compile cache. cute.compile never caches, so without it every
+# provider instance repays the full compile cost at every server start. One
+# compiled function serves every layer because the resident weight is a
+# RUNTIME argument, not a Constexpr. The cache holds compiled functions ONLY,
+# never a `b_arg`: that would keep every layer's weight tensor alive for the
+# process.
 _COMPILE_CACHE: dict[tuple, object] = {}
 
 
 class CuteDslStageCall(msgspec.Struct, frozen=True):
-    """One stage's shared compiled function plus THIS layer's weight wrapper."""
-
     compiled_fn: object
     b_arg: object
 
 
 class CuteDslMaskedRowState(MaskedRowState, kw_only=True):
-    """Masked row domain plus this forward's packed tile schedules."""
-
     token_width: int
     gemm1_schedule: torch.Tensor
     gemm1_tiles: torch.Tensor
@@ -92,11 +52,9 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
         lora_activation_dtype=torch.bfloat16,
     )
 
-    # Study winner tiles (section 45): (128, 8)/pc128 for decode-scale rows,
-    # (128, 64)/pc152 for large rows-per-expert. The tile choice is a
-    # PERFORMANCE regime decision keyed on expected rows per expert — the
-    # first boundary run of this provider mistakenly keyed it on the packing
-    # ceiling alone and ran prefill on the decode tile at 0.58x.
+    # The tile choice is a PERFORMANCE regime decision keyed on expected rows
+    # per expert; keying it on the packing ceiling alone ran prefill on the
+    # decode tile.
     NARROW_TOKEN_WIDTH = 8
     NARROW_PERSISTENT_CLUSTERS = 128
     WIDE_TOKEN_WIDTH = 64
@@ -104,19 +62,12 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
     XWIDE_TOKEN_WIDTH = 128
     XWIDE_PERSISTENT_CLUSTERS = 128
     # The packed direct schedule is representable only at a trivial cluster
-    # with 1-CTA MMA (see schedule_builder.build_dual_stage_schedules); these
-    # feed BOTH the compiled config and the builder's guard so the two cannot
-    # drift apart.
+    # with 1-CTA MMA; these feed BOTH the compiled config and the builder's
+    # guard so the two cannot drift apart.
     CLUSTER_SHAPE_MN = (1, 1)
     USE_2CTA_INSTRS = False
-    # Per-stage sweeps on GB300 (plan sections 53/55/58): wide wins from
-    # m ~= 16. The wide->xwide transition is NOT monotonic (cluster
-    # quantization: xwide wins m in [96, 128] and 256, wide wins back ~4% at
-    # m=192); threshold 96 dominates the located grid -- it fixes the
-    # m in [96, 128) cells (up to 1.26x on gemm2) and selects identically to
-    # the old 128 threshold everywhere else. The residual known-loss cell
-    # (xwide ~4% behind wide at m=192, both stages) is a Step-7
-    # quantization-aware-selection candidate.
+    # Per-stage sweeps on GB300; the wide->xwide transition is NOT monotonic
+    # (cluster quantization).
     WIDE_EXPECTED_M_THRESHOLD = 16
     XWIDE_EXPECTED_M_THRESHOLD = 96
     OUTPUT_WIDTH = 128
@@ -148,29 +99,18 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
             )
         self._build_schedules = build_dual_stage_schedules
         self._schedule_capacities = dual_stage_schedule_capacities
-        # Each compiled width packs up to width * MAX_TOKEN_CLUSTERS rows per
-        # expert; the SAME constant the builder packs with, so `_token_width_for`
-        # cannot escalate against a bound the packing does not have.
         self._max_token_clusters = MAX_TOKEN_CLUSTERS
 
         device = quant_info.w13_weight.device
-        # BF16 WGMMA accepts every N in 8..256 step 8, so the narrow N=8
-        # tile IS constructible on SM90 -- but this port has not implemented
-        # or validated it (the {64,128,256} gate mirrors the upstream example
-        # config pending that work; plan section 62). Hopper therefore
-        # compiles only the wide/xwide pair and decode runs on the 64-token
-        # tile -- the recorded headline H200 tuning experiment, worth up to
-        # 8x fewer token columns of tensor-core work at decode. The selection
-        # floor in `_token_width_for` follows the compiled set.
-        # The xwide regime has enough rows per expert to fill the physical
-        # machine.  On GB300, using all 152 SMs was 10% faster than retaining
-        # the study-era 128-cluster cap at T=2048; decode and small-prefill
-        # regimes still prefer their narrower 128-cluster tiles.
+        # BF16 WGMMA accepts every N in 8..256 step 8, so the narrow N=8 tile
+        # IS constructible on SM90 -- but this port has not implemented or
+        # validated it, so Hopper compiles only the wide/xwide pair and decode
+        # runs on the 64-token tile. `_token_width_for` follows the compiled
+        # set.
         device_properties = torch.cuda.get_device_properties(device)
         device_capability = torch.cuda.get_device_capability(device)
-        # The all-SM xwide schedule is measured only on the campaign's
-        # 152-SM GB300.  Keep Hopper and other geometries on the qualified
-        # 128-cluster schedule until they have their own evidence.
+        # The all-SM xwide schedule is qualified only on the campaign's 152-SM
+        # GB300; other geometries keep the 128-cluster schedule.
         xwide_clusters = self.XWIDE_PERSISTENT_CLUSTERS
         if (
             device_capability >= (10, 0)
@@ -190,8 +130,6 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
             load_config_table,
         )
 
-        # Swept per-device bucket table; None = the threshold heuristics,
-        # byte-identical to a build without any config file.
         version = cutedsl_version()
         self._config_table = load_config_table(
             self.contract.key,
@@ -207,9 +145,6 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
                     raise ValueError(
                         f"cutedsl_bf16 config bucket {bucket_m} lacks token_width"
                     )
-            # Measured table tiles win over the built-in default for their
-            # width; new widths are just extra compile-cache entries, warmed
-            # at attach like the rest.
             widths = dict(tile_set)
             widths.update(
                 (tile.token_width, tile.persistent_clusters)
@@ -236,8 +171,6 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
         torch.cuda.synchronize(device)
 
     def _compile_stage(self, token_width: int, stage: str) -> None:
-        """Compile and warm one exact stage at attach time."""
-
         call_key = stage
         if call_key in self._compiled[token_width]:
             return
@@ -252,8 +185,8 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
         experts = self.quant_info.num_local_experts
         k = weight.shape[2]
         n = weight.shape[1]
-        # Geometry and producer role are both in the key via ``config``. A
-        # signal-on binary can therefore never alias the exact PDL-off twin.
+        # Geometry and producer role are both in the key via ``config``, so a
+        # signal-on binary can never alias the exact PDL-off twin.
         key = (
             device.type,
             device.index,
@@ -280,8 +213,7 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
                 dummy_masked,
                 config=config,
             )
-            # Zero-tile warmup loads the module before graph capture. Signaling
-            # with no dependent launch is legal and performs no extra work.
+            # Zero-tile warmup loads the module before graph capture.
             prepared.launch()
             compiled_fn = prepared.compiled_fn
             _COMPILE_CACHE[key] = compiled_fn
@@ -291,18 +223,9 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
         )
 
     def _token_width_for(self, m_max: int, expected_m: int) -> int:
-        """Performance width first, then escalate through COMPILED widths
-        until one can pack ``m_max`` (each width packs up to
-        width x MAX_TOKEN_CLUSTERS rows per expert). The first version raised as soon as the performance
-        pick could not pack, even when a wider compiled tile could represent
-        the same workload (review finding: E=1024/top_k=1/T=65536 yields
-        expected_m=64 -> wide, but m_max=65792 needs xwide). Selection never
-        leaves the compiled set; only past the WIDEST compiled tile does
-        admission fall back to DeepGEMM.
-
-        A swept bucket table replaces only the performance pick; the
-        packability escalation is a correctness constraint and always clamps
-        the table's choice to compiled widths that can pack ``m_max``.
+        """A swept bucket table replaces only the performance pick; the
+        escalation to a width that can pack ``m_max`` is a correctness
+        constraint.
         """
         if self._config_table is not None:
             performance_width = self._config_table.pick(expected_m)["token_width"]
@@ -455,15 +378,6 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
 
 
 class CuteDslContiguousRowState(ContiguousRowState, kw_only=True):
-    """Contiguous row domain plus this forward's packed tile schedules.
-
-    Dual-ownership carries over from the masked twin: both schedules derive
-    from the SAME device ``seg_counts`` the dispatch wrote, in one launch —
-    the S1 seg-layout launch itself, which packs them through a
-    ``ContiguousSchedulePack`` instead of a standalone builder launch; the
-    GEMMs read the matching ``seg_offsets`` for their segment-base fold.
-    """
-
     token_width: int
     gemm1_schedule: torch.Tensor
     gemm1_tiles: torch.Tensor
@@ -472,34 +386,8 @@ class CuteDslContiguousRowState(ContiguousRowState, kw_only=True):
 
 
 class CuteDslBf16ContiguousProvider(ContiguousRowDomainProvider):
-    """Route-major twin of :class:`CuteDslBf16Provider`.
-
-    Same resident ``[E, N, K]`` BF16 weights, same swap_ab + direct-schedule
-    winner family, same compile-once/warm-at-attach discipline; only the row
-    domain changes.  The routed activation and every GEMM output live in ONE
-    flat aligned buffer (O(T * top_k) rows — the DeepGEMM-contiguous memory
-    math), the packed schedules keep per-expert LOCAL token clusters built
-    from ``seg_counts`` — emitted by the S1 seg-layout launch itself through
-    a ``ContiguousSchedulePack``, not a standalone builder launch — and the
-    kernel folds ``seg_offsets[e]`` into the flat tile index on device.
-    Every compiled token width must divide the
-    segment alignment so a partial tile's overrun stays inside its expert's
-    own aligned segment (the contiguous twin of masked slab padding);
-    ``_compile_stage`` validates that per width at attach.
-
-    Architecture dispatch matches the masked twin: tcgen05 on SM100+, the
-    WGMMA sibling on SM90 — both kernels carry the segment-base fold — with
-    Hopper dropping the unvalidated narrow-8 decode tile exactly as the
-    masked provider does.  Plan rows reach this class through
-    ``base_gemm_rows: route_major``, guarded by the expert-count packing cap
-    below so every menu choice stays attachable.
-    The base GEMMs are factor-layout-agnostic — resident
-    weights are identical either way — so the shared-outer plan differs from
-    the per-expert one only in the domain-level glue and LoRA kernels, all
-    inherited from :class:`ContiguousRowDomainProvider`.  No producer-PDL
-    twins are compiled — the eligible plan families exclude base-GEMM PDL
-    edges by construction (the shared plan's ``route_pdl`` chain lives
-    inside the routing launches, not the base GEMMs).
+    """Route-major twin of :class:`CuteDslBf16Provider`, reached by plan rows
+    whose ``base_gemm_rows`` is ``route_major``; only the row domain changes.
     """
 
     contract = MoeBaseProviderContract(
@@ -511,17 +399,13 @@ class CuteDslBf16ContiguousProvider(ContiguousRowDomainProvider):
         lora_activation_dtype=torch.bfloat16,
     )
 
-    # The segment alignment of the flat row buffer.  Pinned at 128: it keeps
-    # byte-parity with DeepGEMM's contiguous m-alignment (identical
-    # capture-memory math) and every study-winner token width (8/64/128)
-    # divides it.  A decode-oriented narrower alignment was tried and
-    # measured slower end-to-end than the masked decode path, so no
-    # per-choice override exists.
+    # Pinned at 128: byte-parity with DeepGEMM's contiguous m-alignment and
+    # every study-winner token width (8/64/128) divides it. A narrower
+    # decode-oriented alignment measured slower than the masked decode path.
     M_ALIGNMENT = 128
 
-    # One source of truth for the study-winner tile config: identical
-    # constants and the identical width-selection method as the masked
-    # provider, so a tuning change there cannot silently diverge here.
+    # Aliased, not copied, so a tuning change in the masked provider cannot
+    # silently diverge here.
     NARROW_TOKEN_WIDTH = CuteDslBf16Provider.NARROW_TOKEN_WIDTH
     NARROW_PERSISTENT_CLUSTERS = CuteDslBf16Provider.NARROW_PERSISTENT_CLUSTERS
     WIDE_TOKEN_WIDTH = CuteDslBf16Provider.WIDE_TOKEN_WIDTH
@@ -569,8 +453,8 @@ class CuteDslBf16ContiguousProvider(ContiguousRowDomainProvider):
         self._schedule_capacities = contiguous_dual_stage_schedule_capacities
         self._max_token_clusters = MAX_TOKEN_CLUSTERS
 
-        # Same physical-machine rule as the masked provider: the all-SM xwide
-        # schedule is qualified only on the campaign's 152-SM GB300.
+        # The all-SM xwide schedule is qualified only on the campaign's 152-SM
+        # GB300, same as the masked provider.
         device_properties = torch.cuda.get_device_properties(device)
         device_capability = torch.cuda.get_device_capability(device)
         xwide_clusters = self.XWIDE_PERSISTENT_CLUSTERS
@@ -584,9 +468,8 @@ class CuteDslBf16ContiguousProvider(ContiguousRowDomainProvider):
             (self.WIDE_TOKEN_WIDTH, self.WIDE_PERSISTENT_CLUSTERS),
             (self.XWIDE_TOKEN_WIDTH, xwide_clusters),
         )
-        # Same compiled-width rule as the masked provider: the SM90 port
-        # validates tile N in {64, 128, 256}, so Hopper drops the narrow-8
-        # decode tile and `_token_width_for` floors selection at wide.
+        # The SM90 port validates tile N in {64, 128, 256}, so Hopper drops the
+        # narrow-8 decode tile and `_token_width_for` floors selection at wide.
         if device_capability < (10, 0):
             tile_set = tile_set[1:]
 
@@ -611,9 +494,6 @@ class CuteDslBf16ContiguousProvider(ContiguousRowDomainProvider):
                         f"cutedsl_contiguous config bucket {bucket_m} lacks "
                         "token_width"
                     )
-            # Measured table tiles win over the built-in default for their
-            # width; new widths are just extra compile-cache entries, warmed
-            # at attach like the rest (and containment-checked there).
             widths = dict(tile_set)
             widths.update(
                 (tile.token_width, tile.persistent_clusters)
@@ -624,10 +504,6 @@ class CuteDslBf16ContiguousProvider(ContiguousRowDomainProvider):
         self._compiled: dict[int, dict[str, CuteDslStageCall]] = {}
         self._tile_configs: dict[int, object] = {}
         for token_width, persistent_clusters in tile_set:
-            # Segment-containment gate: a width that does not divide the
-            # alignment could read/store across expert segments (the exact
-            # hazard the masked slab padding absorbs), so it is rejected at
-            # attach — including table-supplied widths.
             self._validate_tile_geometry(token_width, self._m_alignment)
             config = MaskedGroupedGemmConfig(
                 mma_tiler_mn=(self.OUTPUT_WIDTH, token_width),
@@ -654,8 +530,6 @@ class CuteDslBf16ContiguousProvider(ContiguousRowDomainProvider):
         raise ValueError(f"unknown CuTeDSL base stage {stage!r}")
 
     def _compile_stage(self, token_width: int, stage: str) -> None:
-        """Compile and warm one exact stage geometry at attach time."""
-
         if stage in self._compiled[token_width]:
             return
         weight = self._stage_weight(stage)
@@ -709,16 +583,14 @@ class CuteDslBf16ContiguousProvider(ContiguousRowDomainProvider):
         num_pairs = topk_ids.numel()
         num_experts = self.quant_info.num_local_experts
         # The pack geometry precedes the dispatch because the S1 seg-layout
-        # launch emits the schedules itself; every input below is host-static
-        # (the same values the domain's prepare re-derives), so pack and
-        # dispatch cannot disagree on the row ceiling.
+        # launch emits the schedules itself; every input below is host-static,
+        # so pack and dispatch cannot disagree on the row ceiling.
         m_pad_ceiling = contiguous_m_pad_ceiling(
             num_pairs, num_experts, self._m_alignment
         )
-        # A single expert receives at most one pair per token (a token's
-        # top-k experts are distinct), the same host-static bound the masked
-        # slab relies on; it drives packability escalation and the schedule
-        # ABI check without any device readback.
+        # A single expert receives at most one pair per token (a token's top-k
+        # experts are distinct); this host-static bound drives packability
+        # escalation and the schedule ABI check without any device readback.
         max_expert_rows = max(int(hidden_states.size(0)), 1)
         expected_m = (num_pairs - 1) // num_experts + 1 if num_pairs else 1
         token_width = self._token_width_for(max_expert_rows, expected_m)
@@ -738,10 +610,9 @@ class CuteDslBf16ContiguousProvider(ContiguousRowDomainProvider):
                 cluster_shape_mn=self.CLUSTER_SHAPE_MN,
                 use_2cta_instrs=self.USE_2CTA_INSTRS,
             )
-            # The alignment tag keeps a differently aligned sibling
-            # instance's schedule buffers distinct: capacities derive from
-            # alignment-dependent row ceilings, and instances may share one
-            # layer workspace.
+            # The alignment tag keeps a differently aligned sibling instance's
+            # schedule buffers distinct: capacities are alignment-dependent and
+            # instances may share one layer workspace.
             prefix = f"base:cutedsl_contig:a{self._m_alignment}:tw{token_width}"
             schedule_outputs = {
                 "schedule1_out": workspace.tensor(

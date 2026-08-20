@@ -1,24 +1,17 @@
-"""S3 activation-join kernel for the MoE LoRA BF16 pipeline.
+"""S3 activation-join kernel for the MoE LoRA BF16 pipeline: activation with
+the LoRA delta added pre-activation, plus the ``activation_lora_input`` side
+output consumed by the down-proj LoRA shrink.
 
-A pointwise activation from ``moe.activation`` applied with the LoRA delta
-added PRE-activation, plus the ``activation_lora_input`` side output consumed
-by the down-proj LoRA shrink. Gating is NOT part of that choice: the gate half
-is multiplied in only when ``NUM_SLICES`` says the resident buffer has one.
+The base GEMM1 output is the provider masked layout ``[E_local, m_max,
+slices * inter]``, whose flat row for expanded pair (t, k) is
+``src2dst[t * top_k + k]``; the LoRA delta is contiguous ``[gate | up]``
+indexed by the expanded pair, so the two index spaces meet here. Gating is a
+shape property: the gate half is multiplied in only when ``NUM_SLICES`` says
+the resident buffer has one.
 
-Layout: the base GEMM1 output is the provider *masked* layout
-``[E_local, m_max, slices * inter]`` viewed flat by the kernel;
-``src2dst[t * top_k + k]`` is the flat row for expanded pair (t, k)
-(``expert * m_max + offset``, produced by ``moe_ep_deepgemm_preprocess``).
-The LoRA delta is contiguous ``[gate | up]`` indexed by the EXPANDED
-(t, k) — the two index spaces meet here, exactly like the trtllm
-``fused_activation_quant`` kernel.
-
-Invalid pairs (``topk_ids[t, k] < 0``: EP-unrouted / padding) mirror
-``post_reorder_deepgemm``: skip the store into the masked layout and zero
-``activation_lora_input`` so the down-LoRA shrink sees exact zeros.
-
-Layout flags (design §3): ``GATE_FIRST`` / ``INTERLEAVED`` are compile-time
-specializations; Phase 1a wires the standard (gate-first, contiguous) layout.
+Invalid pairs (``topk_ids[t, k] < 0``: EP-unrouted / padding) skip the store
+into the masked layout and zero ``activation_lora_input`` so the down-LoRA
+shrink sees exact zeros.
 """
 
 from __future__ import annotations
@@ -32,7 +25,6 @@ from sglang.srt.lora.moe.activation import ActivationFn
 
 @triton.jit
 def apply_activation(x, ACTIVATION_TYPE: tl.constexpr):
-    """Elementwise activation of the gate half; gating is the caller's shape."""
     if ACTIVATION_TYPE == "silu":
         return x * tl.sigmoid(x)
     elif ACTIVATION_TYPE == "relu2":
@@ -76,8 +68,8 @@ def _activation_delta_masked_kernel(
 
     vec = tl.arange(0, BLOCK_SIZE)
     if CONSUME_BASE_PDL:
-        # Route decoding and address construction are independent of GEMM1.
-        # Wait only at the first producer-owned base load.
+        # Route decoding and addressing do not depend on GEMM1; wait only at
+        # the first producer-owned base load.
         tl.extra.cuda.gdc_wait()
     for start in tl.range(0, inter, BLOCK_SIZE):
         offs = start + vec
@@ -87,7 +79,6 @@ def _activation_delta_masked_kernel(
             gate_offs = offs
             up_offs = offs
         elif INTERLEAVED:
-            # base gemm out columns are (g0, u0, g1, u1, ...)
             gate_offs = 2 * offs
             up_offs = 2 * offs + 1
         else:
@@ -136,11 +127,9 @@ def act_delta_masked(
     activation: str = "silu",
     consume_base_pdl: bool = False,
 ) -> None:
-    """Join base and LoRA delta, then activate; gating comes from the shapes."""
-    ActivationFn.parse(activation)  # fail closed on an unknown name
+    ActivationFn.parse(activation)
     num_pairs = topk_ids.numel()
     inter = act_out.shape[-1]
-    # Gating is a resident-shape property, independent of the activation.
     num_slices = gateup_output.shape[-1] // inter
     if num_slices not in (1, 2) or num_slices * inter != gateup_output.shape[-1]:
         raise ValueError(

@@ -1,8 +1,5 @@
-"""What a built route is, apart from how it was built.
-
-Every grouped LoRA kernel reads a route and nothing else from the routing layer,
-so the type lives alone here: the eleven kernel-side modules that consume routes
-import this file and stay clear of the plan layer's pydantic.
+"""The route type on its own, so the kernel-side modules that consume routes can
+import it without the plan layer's pydantic.
 """
 
 from __future__ import annotations
@@ -26,7 +23,6 @@ class RouteView(msgspec.Struct, frozen=True, kw_only=True):
     num_local_experts: int
     is_shared_outer: bool
     max_loras: int
-    # Present only for `aligned`.
     maybe_sorted_pair_ids: torch.Tensor | None = None
     maybe_block_virtual_expert_ids: torch.Tensor | None = None
     maybe_num_pairs_post_padded: torch.Tensor | None = None

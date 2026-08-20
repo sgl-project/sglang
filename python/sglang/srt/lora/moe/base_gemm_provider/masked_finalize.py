@@ -1,32 +1,16 @@
-"""Production shared-rank finalizers for the BF16 MoE row domains.
+"""``shared_rank_reduce`` is valid only when down-B is shared across all routed
+experts of an adapter: it folds router weights in rank space, then one
+from-scratch finalizer combines weighted base rows with the shared B tail and
+scales the complete sum.  Both kernels serve the masked AND contiguous
+providers verbatim -- the reduction is pure pair-domain, and the tail reads
+base rows only through ``src2dst`` over a flat row view; only the tail's host
+validation distinguishes the two layouts.
 
-The materialized fallback stays on :meth:`MoeBaseProvider.finalize`.  This
-module supplies the promoted Step-6 candidate:
-
-``shared_rank_reduce``
-    Valid only when down-B is shared across all routed experts of an adapter.
-    It folds router weights in rank space, then one from-scratch finalizer
-    combines weighted base rows with the shared B tail and applies routed
-    scaling to the complete sum.
-
-Both kernels are row-domain-agnostic and serve the masked AND contiguous
-providers verbatim: the rank reduction is pure pair-domain (it reads the
-pair-major down-A bridge and never touches a physical row), and
-the tail reads base down rows exclusively through ``src2dst`` over a flat
-row view — the same lever that makes ``post_reorder`` and the down-B
-into-base epilogue portable.  Only the tail's host validation distinguishes the
-masked ``[E_local, m_max, hidden]`` slab from the contiguous compact
-``[m_pad_ceiling, hidden]`` buffer.
-
-The family is deterministic: reductions use a fixed order and every
-destination cell has exactly one writer.
-
-The fused B tail accumulates in FP32 and is combined with the BF16 base rows
-before the requested output cast. This is the mathematical
-``scale * sum(weight * (base + A @ B))`` contract; it intentionally omits the
-serial reference's intermediate BF16 delta-materialization rounding.
-Correctness is therefore judged against the independent numerical contract
-rather than bitwise equality with the materialized staging path.
+Reductions use a fixed order and every destination cell has exactly one writer.
+The tail accumulates in FP32 and combines with the BF16 base rows before the
+output cast -- ``scale * sum(weight * (base + A @ B))`` -- omitting the serial
+reference's intermediate BF16 delta rounding, so correctness is judged against
+that contract rather than bitwise equality with the materialized path.
 """
 
 from __future__ import annotations
@@ -73,12 +57,8 @@ def _validate_output_boundary(
 ) -> tuple[int, int, int]:
     num_tokens, top_k = routing.topk_ids.shape
     pairs = num_tokens * top_k
-    # The tail kernel addresses base rows only as src2dst[pair] over the flat
-    # row view, so both physical row domains are valid inputs: the masked
-    # [E_local, m_max, hidden] slab (rows e * m_max + slot) and the
-    # contiguous compact [rows, hidden] buffer (rows seg_offsets[e] + slot).
-    # The compact row count is a device-side quantity (seg_offsets[-1]), so
-    # only the masked slab admits a host-side row-domain check.
+    # Only the masked slab admits a host-side row-domain check: the compact
+    # row count is a device-side quantity (seg_offsets[-1]).
     if down_masked.ndim == 3:
         if down_masked.shape[0] != num_local_experts or down_masked.shape[2] < 1:
             raise ValueError("down_masked must be [num_local_experts, m_max, hidden]")
@@ -172,10 +152,8 @@ def _shared_rank_reduce_kernel(
     block_t: tl.constexpr,
     block_r: tl.constexpr,
 ):
-    # Provenance: finalize_candidates.py::_shared_rank_reduce_kernel /
-    # invoke_shared_rank_reduce. The fixed-k FP32 reduction and BLOCK_SIZE_T
-    # semantics are retained. Routed scaling is deliberately deferred to the
-    # B tail so every finalizer implements scale * sum(weight * pair).
+    # Routed scaling is deliberately deferred to the B tail so every finalizer
+    # implements scale * sum(weight * pair).
     tokens = tl.program_id(0) * block_t + tl.arange(0, block_t)
     token_mask = tokens < num_tokens
     tokens64 = tokens.to(tl.int64)
@@ -243,11 +221,8 @@ def _shared_from_scratch_finalize_kernel(
     block_h: tl.constexpr,
     block_k: tl.constexpr,
 ):
-    """Finalize unscaled weighted base/rank sums, then apply routed scaling.
-
-    Scaling after the complete base+LoRA sum matches the stock DeepGEMM
-    coefficient order while avoiding the post-reorder + full-H
-    read-modify-write sequence.
+    """Scaling after the complete base+LoRA sum matches the stock DeepGEMM
+    coefficient order while avoiding a post-reorder + full-H read-modify-write.
     """
     token = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -312,11 +287,9 @@ def invoke_shared_rank_reduce(
     token_rank: torch.Tensor,
     config: Mapping[str, int],
 ) -> None:
-    """Reduce unscaled pair-rank rows while base W2 runs independently."""
-    # The provider ABI carries the forward's scaling factor through both
-    # scheduled halves so alternate implementations can bind the same inputs.
-    # This implementation deliberately applies it in the tail, after the
-    # fixed-order router-weight reduction.
+    # The provider ABI carries the scaling factor through both scheduled halves
+    # so alternate implementations can bind the same inputs; this one applies
+    # it in the tail, after the fixed-order router-weight reduction.
     del routed_scaling_factor
     _validate_shared_route(routing)
     num_tokens, top_k = routing.topk_ids.shape
@@ -394,7 +367,6 @@ def invoke_shared_from_scratch_finalize(
     num_local_experts: int,
     config: Mapping[str, int],
 ) -> None:
-    """Write weighted base plus shared-B delta in one deterministic launch."""
     num_tokens, _, hidden = _validate_output_boundary(
         down_masked=down_masked,
         src2dst=src2dst,

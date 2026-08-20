@@ -1,12 +1,3 @@
-"""BF16 MoE providers backed by the DeepGEMM grouped GEMMs.
-
-The row domains (S1 preprocess, S3 activation join, S5 finalize, geometry,
-workspace) live in :mod:`masked_row_domain` and :mod:`contiguous_row_domain`;
-the classes here supply only the GEMM engine — the raw
-``grouped_gemm_nt_bf16_masked`` / ``grouped_gemm_nt_bf16_contig`` primitives
-for S2/S4. No stock ``MoeRunner`` core participates.
-"""
-
 from __future__ import annotations
 
 import torch
@@ -44,10 +35,9 @@ class DeepGemmBf16Provider(MaskedRowDomainProvider):
             load_config_table,
         )
 
-        # ``expected_m`` is DeepGEMM's only config input (it drives the
-        # internal get_best_config choice); a swept bucket table may override
-        # the hint per M-bucket. ``masked_m`` still bounds the actual work,
-        # so the override is purely a performance knob. None = passthrough.
+        # ``expected_m`` is DeepGEMM's only config input (it drives the internal
+        # get_best_config choice); ``masked_m`` still bounds the actual work, so
+        # a swept bucket table overriding the hint is purely a performance knob.
         self._config_table = load_config_table(
             self.contract.key,
             num_local_experts=quant_info.num_local_experts,
@@ -63,12 +53,6 @@ class DeepGemmBf16Provider(MaskedRowDomainProvider):
 
     @staticmethod
     def _require_supported_geometry(quant_info: MoeLoraBf16QuantInfo) -> None:
-        """Reject contraction dimensions unsupported by DeepGEMM on SM90.
-
-        Hopper's BF16 kernel requires ``K % 64 == 0``. Gate/up contracts over
-        ``hidden_size`` and down contracts over ``intermediate_size``, so both
-        dimensions must qualify. The SM100 implementation has no such limit.
-        """
         major, _minor = torch.cuda.get_device_capability(quant_info.w2_weight.device)
         if major >= 10:
             return
@@ -122,13 +106,11 @@ class DeepGemmBf16Provider(MaskedRowDomainProvider):
 class DeepGemmBf16ContiguousProvider(ContiguousRowDomainProvider):
     """Route-major twin of :class:`DeepGemmBf16Provider`.
 
-    Same resident ``[E, N, K]`` BF16 weights, same contract semantics; only
-    the S2/S4 primitive changes to ``m_grouped_bf16_gemm_nt_contiguous``
-    (through the ``grouped_gemm_nt_bf16_contig`` wrapper, the exact call
-    convention of the upstream EP prefill path), driven by the domain's
-    ``grouped_layout`` row-to-expert tensor.  The wrapper's defaults keep
-    DeepGEMM's ``ensure_zero_padding=True``, so ``-1``-labeled ceiling rows
-    are skipped work with zeroed output.
+    Same weights and contract semantics; only the S2/S4 primitive changes to
+    ``m_grouped_bf16_gemm_nt_contiguous`` (the upstream EP prefill path's call
+    convention), driven by the domain's ``grouped_layout``.  The wrapper keeps
+    DeepGEMM's ``ensure_zero_padding=True``, so ``-1``-labeled ceiling rows are
+    skipped work with zeroed output.
     """
 
     contract = MoeBaseProviderContract(
@@ -141,19 +123,15 @@ class DeepGemmBf16ContiguousProvider(ContiguousRowDomainProvider):
     )
 
     def __init__(self, quant_info: MoeLoraBf16QuantInfo):
-        # The contiguous m-block alignment is the engine's own contract
-        # (typically 128); read it from DeepGEMM rather than hardcoding so a
-        # kernel-side change cannot silently break segment geometry.  It is
-        # the m-granule the contiguous kernel schedules and zero-pads by, so
-        # no config-level override exists.
+        # The m-granule the contiguous kernel schedules and zero-pads by is the
+        # engine's own contract; read it from DeepGEMM rather than hardcoding so
+        # a kernel-side change cannot silently break segment geometry.
         import deep_gemm
 
         super().__init__(
             quant_info,
             m_alignment=int(deep_gemm.get_m_alignment_for_contiguous_layout()),
         )
-        # The SM90 K % 64 constraint binds the BF16 kernel family, masked and
-        # contiguous alike; SM100 has no such limit.
         DeepGemmBf16Provider._require_supported_geometry(quant_info)
         from sglang.srt.layers import deep_gemm_wrapper
 

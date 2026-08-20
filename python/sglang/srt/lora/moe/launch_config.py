@@ -1,13 +1,3 @@
-"""Per-site launch tiles for a MoE-LoRA execution plan, and the tables
-that pick them.
-
-Rules load from ``{arch}.tiles.json``; ``resolve_tiles`` filters them against
-the bound rank once at weight bind, and ``TileTable.config_for`` makes the
-single per-forward decision left in the engine -- the M bucket.  The
-dataclass defaults are correctness baselines, served when a plan row has no
-tuned rules.
-"""
-
 from __future__ import annotations
 
 from dataclasses import field
@@ -73,13 +63,11 @@ def _validate_flat_config(name: str, config: Mapping[str, int]) -> None:
     frozen=True,
     slots=True,
     kw_only=True,
-    # strict: no value coercion; extra="forbid": an unknown site key in a
-    # tiles rule aborts bind instead of silently serving default tiles.
+    # extra="forbid": an unknown site key in a tiles rule aborts bind
+    # instead of silently serving default tiles.
     config=pydantic.ConfigDict(strict=True, extra="forbid"),
 )
 class MoeLoraLaunchConfig:
-    """Site-specific launch settings; no token/rank/device config."""
-
     # One aligned route is SHARED by every grouped LoRA stage; its block is
     # each stage's row tile. Values and their evidence: configs/README.md.
     routing_block_size: int = 16
@@ -117,13 +105,11 @@ class MoeLoraLaunchConfig:
         return self.gate_up_b if site is Site.GATE_UP else self.down_b
 
     def for_act(self, family: ActFamily) -> Mapping[str, int]:
-        """Return the explicit config for one fused-act kernel family."""
         if family is ActFamily.B_ACTIVATION:
             return self.b_activation
         raise ValueError(f"{family.value} has no fused-act launch config")
 
     def validate_for_plan(self, plan: MoeLoraExecutionPlan) -> None:
-        """Validate route tiles against the selected tensor-core consumers."""
         requirements = plan.route_requirements()
         aligned = {
             RouteRequirement.ALIGNED_PER_EXPERT,
@@ -136,14 +122,9 @@ class MoeLoraLaunchConfig:
             )
 
 
-# ---------------------------------------------------------------------------
-# Tile tables: pydantic-validated JSON, separate from the plan tables.
-#
-# Plans say WHAT runs; these say HOW each kernel launches. Rules are matched
-# first hit in order per plan-row name: ``max_rank`` resolves at bind (the
-# pool-padded rank is a server constant), ``max_tokens`` per forward (the
-# M bucket). A missing table or row serves the built-in defaults.
-# ---------------------------------------------------------------------------
+# Rules are matched first hit in order per plan-row name: ``max_rank`` resolves
+# at bind (the pool-padded rank is a server constant), ``max_tokens`` per
+# forward.
 
 
 class _TileRuleModel(pydantic.BaseModel):
@@ -176,13 +157,6 @@ def _config_from_sites(sites: Mapping[str, Any]) -> MoeLoraLaunchConfig:
 
 
 class TileTable:
-    """One plan row's launch tiles, resolved to the bound rank at bind time.
-
-    ``config_for(num_tokens)`` picks the first rule whose ``max_tokens``
-    bound admits the batch — the M bucket — and returns a validated
-    MoeLoraLaunchConfig constructed once per rule.
-    """
-
     def __init__(self, rules: list[tuple[int, MoeLoraLaunchConfig]]) -> None:
         # resolve_tiles is the only constructor and always supplies at least
         # one rule (falling back to the built-in default config).
@@ -205,11 +179,6 @@ def resolve_tiles(
     plan_key_name: str,
     physical_rank: int,
 ) -> TileTable:
-    """Resolve one plan row's tile rules against the bound rank, once.
-
-    Unknown rows or a missing table fall to the built-in default config —
-    byte-identical to serving without tile tables at all.
-    """
     table = _load_tiles(architecture_value)
     rules = table.rules.get(plan_key_name) if table is not None else None
     if not rules:

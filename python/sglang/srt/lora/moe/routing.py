@@ -1,12 +1,7 @@
 """Turn a forward's token/expert pairs into the routes a plan's kernels read.
 
 A route groups those pairs -- by virtual expert, or by adapter alone for shared
-outer factors -- either raw or sorted into whole blocks. build_routes asks for
-what the plan declared, build_virtual_expert_routing decides how each grouping
-gets built, and _build_aligned does the block-aligned work in three kernels from
-route_kernels.py. Sorting earns its own kernels only above the thresholds below;
-under them the shared CUDA align is cheaper -- and above 8191 buckets it is the
-only option, because that kernel asserts it cannot take more.
+outer factors -- either raw or sorted into whole blocks.
 """
 
 from __future__ import annotations
@@ -33,9 +28,8 @@ from sglang.srt.lora.moe.route_kernels import (
 from sglang.srt.lora.moe.route_view import RouteView, RouteViewKind
 from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
-# Smallest bucket count (V) and pair count (P) at which our three kernels beat
-# the shared CUDA align; either alone is enough to switch, and V is also that
-# kernel's own hard ceiling.
+# Smallest bucket count and pair count at which our three kernels beat the shared
+# CUDA align; the bucket count is also that kernel's own hard ceiling.
 FUSED_ALIGN_MIN_VIRTUAL_EXPERTS = 8192
 FUSED_ALIGN_MIN_PAIRS = 16384
 
@@ -48,7 +42,7 @@ SCAN_CHUNK = 2048
 SCAN_WARPS = 4
 
 # Bin ceiling and smallest pair counts at which counting a block's pairs beats
-# one atomic per pair; outside them the kernels keep their per-pair path.
+# one atomic per pair.
 COUNT_MAX_BINS = 512
 COUNT_MIN_PAIRS = 16384
 CLAIM_MIN_PAIRS_PER_BUCKET = 12288
@@ -133,7 +127,6 @@ def _build_aligned(
     need_per_expert: bool,
     need_shared: bool,
 ) -> tuple[RouteView | None, RouteView | None]:
-    """Sort the pairs into whole blocks, by virtual expert and/or by adapter."""
     from sglang.kernels.jit.utils import is_arch_support_pdl
 
     num_pairs = topk_ids.numel()
@@ -283,13 +276,12 @@ def _build_virtual_topk_ids(
     max_loras: int,
     is_shared_outer: bool = False,
 ) -> torch.Tensor:
-    # The sole caller validated these same objects before branching.
     virtual_topk_ids = torch.empty_like(topk_ids)
     if topk_ids.numel() == 0:
         # An idle DP rank arrives with zero tokens; cdiv(0, block) is no grid.
         return virtual_topk_ids
 
-    block_size = 1024  # pairs per program
+    block_size = 1024
     _build_virtual_topk_ids_kernel[(triton.cdiv(topk_ids.numel(), block_size),)](
         topk_ids,
         token_lora_mapping,
@@ -318,7 +310,6 @@ def build_virtual_expert_routing(
     workspace: MoeLoraWorkspace | None = None,
     tensor_prefix: str | None = None,
 ) -> tuple[RouteView | None, RouteView | None]:
-    """Build the requested grouping(s); the one not asked for comes back None."""
     if view not in RouteViewKind:
         raise ValueError(
             f"unknown route view {view!r}; expected one of "
@@ -391,8 +382,6 @@ def build_virtual_expert_routing(
 
 @dataclass(frozen=True, slots=True)
 class MoeLoraRoutes:
-    """Every route the plan asked for; the rest stay None."""
-
     raw_per_expert: RouteView | None = None
     raw_shared_outer: RouteView | None = None
     aligned_per_expert: RouteView | None = None

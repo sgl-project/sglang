@@ -1,44 +1,10 @@
-"""MoE-LoRA runner for the MoE LoRA execution engine.
-
-``MoeLoraRunner`` holds one MoE layer's LoRA execution state. The layer
-wrapper holds a :class:`MoeLoraLayerEngine`; that engine creates the runner at
-weight bind and keeps it for the layer's life. Construction admits every
-resident base provider, keyed by name, plus the layer geometry they share;
-``run`` selects the provider its plan names and executes the pipeline. No
-stock ``MoeRunner`` is involved — the per-quant base stages live behind
-:class:`MoeBaseProvider`, and this class owns the LoRA route views, the LoRA
-kernels, and every pipeline buffer.
-
-Every forward runs a typed ``MoeLoraExecutionPlan`` supplied by the caller —
-:class:`MoeLoraLayerEngine` resolves one per phase from the plan tables at
-weight bind, and the serial correctness pipeline ships there as the
-``fallback.serial`` rows.  Whichever plan arrives, every consumed stage has
-exactly one owner and every required route representation is built once:
-
-    gate/up LoRA A  (grouped_lora_a: token-major hidden -> pair-major rank)
-    gate/up LoRA B  (one_launch_sliced_lora_b -> standard [gate | up] delta)
-    S1 prepare      (provider permute to its physical row domain)
-    S2 gateup       (provider grouped GEMM)
-    S3 act          (base + delta -> activation; writes provider rows and,
-                     when required, a pair-major down-A source)
-    down LoRA A     (grouped_lora_a, original pairs or provider-mapped rows)
-    down LoRA B     (one_launch_sliced_lora_b -> unweighted LoRA delta [T, K, H])
-    S4 down         (provider grouped GEMM)
-    S5 finalize     (provider fixed-order top-k reduction; router coefficient
-                     and routed scaling applied EXACTLY ONCE over
-                     base + LoRA delta, at the provider-declared coefficient
-                     precision)
-
-Every batch runs this one LoRA-capable topology — base-only, mixed, and active
-alike — so they share a single graph shape. Inactive assignments ride sentinel
-routes and contribute exact zeros rather than being diverted to another path.
-
-Base rows: serving gives the base model a REAL resident slot whose factors are
-zero-filled and whose ``adapter_enabled`` entry is 0. Batch preparation
-normalizes such assignments to the ``-1`` execution sentinel before any
-layer runs — otherwise base rows build routed work against zero weights, which
-is numerically harmless but inflates route padding, group counts, and every
-LoRA GEMM's row count.
+"""Base-only, mixed, and active batches all run this one LoRA-capable topology so
+they share a single graph shape; inactive assignments ride sentinel routes and
+contribute exact zeros. Serving gives the base model a REAL resident slot whose
+factors are zero-filled, and batch preparation normalizes such assignments to
+the ``-1`` execution sentinel before any layer runs — otherwise base rows build
+routed work against zero weights, which is numerically harmless but inflates
+route padding, group counts, and every LoRA GEMM's row count.
 """
 
 from __future__ import annotations
@@ -98,32 +64,19 @@ if TYPE_CHECKING:
 
 @dataclass(slots=True)
 class _LoraStageState:
-    """One stage's LoRA side-branch results: A's rank, B's delta.
-
-    A mutable box because ``run_parallel`` returns only the COMPUTE closure's
-    value, and a side closure cannot rebind its enclosing local. ``None`` also
-    means "this plan has no such stage", which callers check.
-    """
-
     rank: torch.Tensor | None = None
     delta: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class _DownAInput:
-    """Standalone down-A source without exposing provider workspace details."""
-
     rows: torch.Tensor
     pair_to_row: torch.Tensor | None = None
 
 
 class MoeLoraBatch(msgspec.Struct, kw_only=True):
-    """The per-batch state the MoE-LoRA runner actually consumes.
-
-    Narrow by design: the legacy ``LoRAInfo`` carries ~18 fields for the old
-    kernels, and passing it wholesale would make it impossible to see what this
-    runner depends on. ``token_lora_mapping`` holds active physical slot
-    IDs, with every inactive assignment represented by the ``-1`` sentinel.
+    """Narrow by design: the legacy ``LoRAInfo`` carries ~18 fields for the old
+    kernels, and passing it wholesale would hide what this runner depends on.
     """
 
     gate_up_lora_a: torch.Tensor  # [L_cap, E_f, slices*R_phys, H]
@@ -142,8 +95,6 @@ class MoeLoraBatch(msgspec.Struct, kw_only=True):
 
 
 class MoeLoraRunner:
-    """One MoE layer's MoE LoRA execution state and pipeline."""
-
     def __init__(
         self,
         *,
@@ -158,10 +109,7 @@ class MoeLoraRunner:
         if not providers:
             raise ValueError("a MoE LoRA runner needs at least one provider")
         self.providers = dict(providers)
-        # Which vendor implements the base GEMMs, for the bind log.
         self.base_gemm_vendor = base_gemm_vendor
-        # Every provider of a layer reads the same resident tensors, so the
-        # geometry is a layer fact and lives here rather than per call.
         geometries = {
             (
                 provider.hidden_size,
@@ -184,9 +132,9 @@ class MoeLoraRunner:
         self.top_k = top_k
         self.routed_scaling_factor = routed_scaling_factor
         self.activation = activation
-        # The OTHER axis. Gating is a resident-shape fact -- the gate/up
-        # buffer is one slice or two -- and is never inferred from the
-        # activation, which is what made non-gated SiLU unservable.
+        # Gating is a resident-shape fact -- the gate/up buffer is one slice or
+        # two -- never inferred from the activation, which made non-gated SiLU
+        # unservable.
         self.is_gated = is_gated
         self.workspace = workspace if workspace is not None else MoeLoraWorkspace()
 
@@ -199,15 +147,8 @@ class MoeLoraRunner:
         vendor: str,
         workspace: MoeLoraWorkspace | None = None,
     ) -> MoeLoraRunner:
-        """Admit the layer's resident state and bind one provider per row order.
-
-        A layer needs at most two: the decode phase's and the prefill phase's.
-        Both come from the same vendor, so the flag is read once per layer.
-        """
-        # No vendor fallback: _admit has already narrowed the device to SM90 or
-        # SM100, and CuteDSL implements both. The fallback existed when the
-        # floor was ">= SM90" and something had to serve what CuteDSL refused --
-        # but DeepGEMM requires the very same two families, so below them there
+        # No vendor fallback: _admit narrows the device to SM90 or SM100 and
+        # both vendors require exactly those two families, so below them there
         # was never anything to fall back to.
         cls._admit(base_layer)
         config = base_layer.moe_runner_config
@@ -219,7 +160,6 @@ class MoeLoraRunner:
                 for rows in dict.fromkeys(row_orders)
             },
             base_gemm_vendor=vendor,
-            # Layer-static routing scalars, read once rather than per forward.
             top_k=int(config.top_k),
             routed_scaling_factor=config.routed_scaling_factor,
             activation=ActivationFn.parse(config.activation),
@@ -227,16 +167,12 @@ class MoeLoraRunner:
             workspace=workspace,
         )
 
-    # ---- attach-time admission and validation ---------------------------
-
     @staticmethod
     def _admit(base_layer: FusedMoE) -> None:
-        """Reject any resident state this engine does not actually consume.
-
-        The base layer picks its runner backend, reformats resident weights,
+        """The base layer picks its runner backend, reformats resident weights,
         configures dispatch, and decides routed-scaling ownership BEFORE the
-        LoRA layer attaches, so all of that is validated together here rather
-        than assumed.
+        LoRA layer attaches, so all of that is validated here rather than
+        assumed.
         """
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
         from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -276,8 +212,6 @@ class MoeLoraRunner:
 
         config = base_layer.moe_runner_config
         supported_activation = config.activation in ActivationFn
-        # Gating is validated as its own axis: the resident gate/up width must
-        # agree with the layer's is_gated declaration.
         gateup_width = base_layer.w13_weight.shape[1]
         intermediate = base_layer.w2_weight.shape[2]
         if gateup_width != (2 if config.is_gated else 1) * intermediate:
@@ -304,7 +238,6 @@ class MoeLoraRunner:
         base_gemm_rows: str,
         vendor: str,
     ) -> type[MoeBaseProvider]:
-        """Resolve (row order from the plan) x (vendor from serving config)."""
         if base_gemm_rows not in ("expert_major", "route_major"):
             raise ValueError(
                 f"unknown MoE LoRA base-GEMM row order {base_gemm_rows!r}; "
@@ -322,10 +255,9 @@ class MoeLoraRunner:
                 else CuteDslBf16ContiguousProvider
             )
         if vendor == "deepgemm":
-            # Only these providers import deep_gemm, and deep_gemm_wrapper
-            # binds its symbols only when the build is usable -- so an
-            # unusable build must fail HERE, not at admission, or a CuteDSL
-            # serve is refused for a dependency it never touches.
+            # An unusable build must fail HERE, not at admission: only these
+            # providers import deep_gemm, and checking earlier would refuse a
+            # CuteDSL serve for a dependency it never touches.
             from sglang.srt.layers import deep_gemm_wrapper
 
             if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
@@ -367,11 +299,6 @@ class MoeLoraRunner:
         )
 
     def validate_plan(self, plan: MoeLoraExecutionPlan, *, base_gemm_rows: str) -> None:
-        """Reject unsupported provider/plan pairs before forward CUDA work.
-
-        Takes the row order rather than the provider so the lookup stays with
-        the ``providers`` dict that owns it, once, at bind time.
-        """
         provider = self.providers[base_gemm_rows]
         plan.validate()
         if plan.act.activation is not self.activation:
@@ -426,8 +353,6 @@ class MoeLoraRunner:
         plan: MoeLoraExecutionPlan,
     ) -> tuple[str, str]:
         return plan.finalize.family.value, "triton"
-
-    # ---- forward --------------------------------------------------------
 
     def run_plan(
         self,
@@ -492,8 +417,8 @@ class MoeLoraRunner:
             batch,
             num_tokens,
         )
-        # Allocate before GEMM2 so a requested GEMM2 -> finalize PDL edge has
-        # no allocator activity between its producer and dependent launch.
+        # Allocate before GEMM2 so a requested GEMM2 -> finalize PDL edge has no
+        # allocator activity between producer and dependent launch.
         output = self._allocate_output(
             num_tokens=num_tokens,
             dtype=hidden_states.dtype,
@@ -937,13 +862,10 @@ class MoeLoraRunner:
         if plan.finalize.family is FinalizeFamily.MATERIALIZED:
             if plan.down_b_into_base:
                 # No-pair-delta mode: the unweighted delta was already
-                # scatter-added into the base down rows.  NUMERICS: the delta
-                # is rounded to BF16 JOINTLY with the base row before this
-                # FP32 weighted top-k sum, whereas the shipped tail rounds
-                # the delta to BF16 separately (pair-major) and keeps base
-                # and delta as two BF16 operands of that sum — output
-                # equality versus the shipped tail is therefore judged by
-                # the established allclose discipline, not bitwise.
+                # scatter-added into the base down rows, so it rounds to BF16
+                # JOINTLY with the base row before this FP32 weighted top-k
+                # sum, where the shipped tail rounds it separately. Equality
+                # versus that tail is therefore allclose, not bitwise.
                 provider.finalize(
                     base_gemm_state,
                     down_out,
@@ -990,15 +912,6 @@ class MoeLoraRunner:
 
 
 class MoeLoraLayerEngine:
-    """Everything one MoE layer needs to run LoRA behind ``run_moe_core``.
-
-    Construction reads layer-static facts; the first weight bind resolves
-    one plan per phase from the plan tables, one tile table per plan from
-    the tile tables, builds the runner, and validates every entry — all
-    server-lifetime constants. The forward path is a phase lookup plus an
-    M-bucket pick.
-    """
-
     _config_logged = False
 
     def __init__(self, base_layer: FusedMoE, *, workspace: MoeLoraWorkspace) -> None:
@@ -1014,7 +927,6 @@ class MoeLoraLayerEngine:
         self.activation = ActivationFn.parse(config.activation)
         self.hidden_size = int(base_layer.w2_weight.shape[1])
         self.num_local_experts = int(base_layer.num_local_experts)
-        # Server-lifetime constant, so nothing vendor-shaped reaches a forward.
         self.base_gemm_vendor = get_lora().moe_lora_base_gemm
         self.workspace = workspace
         self._selected: dict[Phase, SelectedPlan] | None = None
@@ -1028,12 +940,6 @@ class MoeLoraLayerEngine:
         return self._selected is not None
 
     def ensure_bound(self, *, is_shared_outer: bool, physical_rank: int) -> None:
-        """Resolve plans, tiles, and the runner once; later binds only assert.
-
-        Both inputs are server-lifetime constants (the resident layout flag
-        and the pool-padded rank), so everything selection-shaped happens
-        here and nothing remains for the forward path.
-        """
         if physical_rank < 1:
             raise ValueError("the resident physical LoRA rank must be positive")
         if self.is_bound:

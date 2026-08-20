@@ -6,13 +6,7 @@ buckets on the current device and writes the store files consumed by
 heuristic by at least ``--min-gain`` get entries — sparse tables are fine,
 nearest-M covers the gaps.
 
-Run on the target device (e.g. the GB300 pod) with the layer's real
-TP-sharded geometry, e.g. qwen3.5 TP4:
-
-    python benchmark/kernels/lora_moe/sweep_masked_gemm_configs.py \
-        --provider both --num-local-experts <E_local> --hidden-size <H> \
-        --intermediate-size <I> --gate-up-slices 2 --top-k <K> \
-        --output-dir python/sglang/srt/lora/moe/configs/base_gemm
+Run on the target device with the layer's real TP-sharded geometry.
 """
 
 from __future__ import annotations
