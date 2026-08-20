@@ -192,9 +192,11 @@ jobs:
           }
 
           # socket0 -> part_lo, socket1 -> part_hi; run concurrently, wait both.
-          run_socket 0 "0-31,64-95"   0 ${{ matrix.part_lo }} > s0.log 2>&1 &
+          # Runners have hyper-threading OFF: 64 physical cores = CPUs 0-63,
+          # NUMA0=0-31, NUMA1=32-63 (no sibling range).
+          run_socket 0 "0-31"  0 ${{ matrix.part_lo }} > s0.log 2>&1 &
           P0=$!
-          run_socket 1 "32-63,96-127" 1 ${{ matrix.part_hi }} > s1.log 2>&1 &
+          run_socket 1 "32-63" 1 ${{ matrix.part_hi }} > s1.log 2>&1 &
           P1=$!
 
           rc=0
