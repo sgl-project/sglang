@@ -704,9 +704,15 @@ def _flash_mla_b12x(
         else kv_u8
     )
     swa_pages = _b12x_page_bytes_view(kv_64)
-    extra_pages = (
-        _b12x_page_bytes_view(extra_k_cache) if extra_k_cache is not None else None
-    )
+    # c4 layers hand over 64-token pages, c128 layers 256/128 = 2-token pages;
+    # b12x addresses the indexed cache by raw token slot at this page size.
+    extra_pages = None
+    extra_page_tokens = None
+    if extra_k_cache is not None:
+        extra_pages = _b12x_page_bytes_view(extra_k_cache)
+        extra_page_tokens = (
+            int(extra_k_cache.shape[1]) if extra_k_cache.ndim >= 3 else _PBS_DST
+        )
 
     width = idx.shape[-1] + (extra_idx.shape[-1] if extra_idx is not None else 0)
     num_splits_cap = compressed_mla.split_chunks_for_contract(
@@ -748,7 +754,7 @@ def _flash_mla_b12x(
         swa_k_cache=swa_pages,
         swa_page_size=_PBS_DST,
         indexed_k_cache=extra_pages,
-        indexed_page_size=_PBS_DST if extra_pages is not None else None,
+        indexed_page_size=extra_page_tokens,
         attn_sink=_b12x_sink_f32(attn_sink, heads) if attn_sink is not None else None,
         sm_scale=softmax_scale,
         expected_num_q_heads=heads,
