@@ -518,7 +518,8 @@ struct AllReducePullImpl {
     const auto num_threads = blockDim.x * gridDim.x;
     const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // shot 1: reduce our shard from every peer, push it to every peer's gather
+    // shot 1: reduce our shard from every peer. Write the local result
+    // directly to output; only remote ranks need a gather-plane copy.
     for (auto vid = global_tid; vid < local_num_vecs; vid += num_threads) {
       vec_t vec[kWorldSize];
 #pragma unroll
@@ -531,13 +532,15 @@ struct AllReducePullImpl {
         clear_pos_zero(out_vec[j].x);
         clear_pos_zero(out_vec[j].y);
       }
+      const auto out_vid = local_vec_bias + vid;
+      st_global_16B(out_vec, params.output, out_vid);
 #pragma unroll
       for (uint32_t i = 0; i < kWorldSize; ++i) {
-        st_relaxed_16B(out_vec, gather[i], local_vec_bias + vid);
+        if (i != params.rank) st_relaxed_16B(out_vec, gather[i], out_vid);
       }
     }
-    // shot 2: poll the whole result out of our own gather region, restoring the
-    // pos_zero marker behind us so the phase comes back around empty
+    // shot 2: poll only the remote shards out of our gather region, restoring
+    // the pos_zero marker behind us so the phase comes back around empty.
     vec_t pos_zero_vec;
     {
       const auto z = get_pos_zero<T>();
@@ -548,7 +551,10 @@ struct AllReducePullImpl {
       }
     }
     const auto local_gather = gather[params.rank];
-    for (auto vid = global_tid; vid < total_num_vecs; vid += num_threads) {
+    const auto remote_num_vecs = total_num_vecs - local_num_vecs;
+    for (auto remote_vid = global_tid; remote_vid < remote_num_vecs; remote_vid += num_threads) {
+      // Compact the two remote ranges around our directly-written local shard.
+      const auto vid = remote_vid < local_vec_bias ? remote_vid : remote_vid + local_num_vecs;
       vec_t vec;
       do {
         bool has_zero = false;
