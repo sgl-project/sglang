@@ -444,6 +444,29 @@ largest row value of 18.1. Only 9 elements of 12.6 million passed a fixed
 tolerance of 3e-2, and each one is a near-zero output where the base and the
 delta cancel. Use a tolerance that scales with the row size, not a fixed one.
 
+H200 shared prefill, rank bands other than 16 (2026-08-20). Every sweep above
+used rank 16, which selects `prefill.shared_rank`. That row has no into-base
+axis, because its finalize consumes down-B. Two other rows serve the other rank
+bands, and both keep a standalone down-B: `prefill.materialized.small_rank` for
+rank 8 and below, and `prefill.materialized` above rank 64. 12 captured cells,
+each config captured twice:
+
+| rank | row | model | 2048 | 8192 |
+|---:|---|---|---:|---:|
+| 8 | prefill.materialized.small_rank | Qwen3.5-35B | +6.63% | +9.76% |
+| 8 | prefill.materialized.small_rank | Qwen3.5-397B | +4.38% | +7.99% |
+| 8 | prefill.materialized.small_rank | Inkling-Small | +4.21% | +6.76% |
+| 128 | prefill.materialized | Qwen3.5-35B | +2.17% | +2.40% |
+| 128 | prefill.materialized | Qwen3.5-397B | +1.31% | +2.57% |
+| 128 | prefill.materialized | Inkling-Small | +1.71% | +2.20% |
+
+All 12 cells are faster, from +1.31% to +9.76%, median +3.39%, worst noise
+floor 1.04%. These are the largest gains the epilogue gives anywhere. The gain
+falls as the rank rises, which fits: the delta buffer this removes is one row
+for each pair whatever the rank, so its cost is a larger share of a small-rank
+forward. Both rows now use the epilogue. `prefill.shared_rank` stays off,
+because it owns no separate down-B stage.
+
 Also seen, not acted on: on PER-EXPERT rows at the 2048 bucket, removing
 into-base measured -2.06% (B200) and -2.03% (GB300) for Qwen3.5-397B, while at
 8192 removing it costs +0.85% to +2.99%. That is a token-banded preference the

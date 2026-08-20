@@ -64,7 +64,8 @@
     "down_b_family": "one_launch_sliced",
     "act_family": "b_activation",
     "finalize_family": "materialized",
-    "route_builder": "parallel_shared_outer"
+    "route_builder": "parallel_shared_outer",
+    "down_b_into_base": true
    }
   },
   {
@@ -91,7 +92,8 @@
     "down_b_family": "one_launch_sliced",
     "act_family": "b_activation",
     "finalize_family": "materialized",
-    "route_builder": "parallel_shared_outer"
+    "route_builder": "parallel_shared_outer",
+    "down_b_into_base": true
    }
   }
  ],

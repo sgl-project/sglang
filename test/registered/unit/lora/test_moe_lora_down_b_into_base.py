@@ -176,7 +176,12 @@ def _into_base_expected(name: str, layout) -> bool:
     No separate down-B stage then remains to move.
     """
     if layout != False:
-        return name in ("prefill.token_dedup", "fallback.serial_prefill")
+        return name in (
+            "prefill.token_dedup",
+            "prefill.materialized.small_rank",
+            "prefill.materialized",
+            "fallback.serial_prefill",
+        )
     return name in ("prefill.serial", "fallback.serial_prefill")
 
 
