@@ -18,6 +18,9 @@ from pathlib import Path
 from summarize_msa_repetitions import expected_order
 
 
+OFFLINE_THROUGHPUT_DATASET = "random-ids"
+
+
 def command_text(command: list[str]) -> str:
     return shlex.join(command)
 
@@ -180,7 +183,7 @@ def run_provider(
                 "--model",
                 args.model,
                 "--dataset-name",
-                "random",
+                OFFLINE_THROUGHPUT_DATASET,
                 "--num-prompts",
                 "1",
                 "--random-input-len",
@@ -212,6 +215,7 @@ def run_provider(
                     "GPQA_DATASET": str(args.gpqa_dataset.resolve()),
                     "NUM_THREADS": str(args.num_threads),
                     "SERVER_LOG": str(server_log),
+                    "SERVING_DATASET_NAME": OFFLINE_THROUGHPUT_DATASET,
                 }
             )
             run_checked(
