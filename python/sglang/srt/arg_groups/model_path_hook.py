@@ -251,6 +251,15 @@ def handle_load_format(server_args: Any):
                 load_format="auto",
             )
 
+    if (
+        cfg.remote_instance_weight_loader_start_seed_via_transfer_engine
+        and cfg.remote_instance_weight_loader_start_seed_via_nixl
+    ):
+        raise ValueError(
+            "Cannot set --remote-instance-weight-loader-start-seed-via-transfer-engine "
+            "and --remote-instance-weight-loader-start-seed-via-nixl together"
+        )
+
     # Check whether TransferEngine can be used when users want to start seed service that supports TransferEngine backend.
     if cfg.remote_instance_weight_loader_start_seed_via_transfer_engine:
         declare_resolution(
@@ -259,6 +268,14 @@ def handle_load_format(server_args: Any):
             remote_instance_weight_loader_start_seed_via_transfer_engine=validate_transfer_engine(
                 server_args
             ),
+        )
+
+    # Check whether NIXL can be used when users want to start seed service that supports NIXL backend.
+    if cfg.remote_instance_weight_loader_start_seed_via_nixl:
+        declare_resolution(
+            server_args,
+            "_handle_load_format",
+            remote_instance_weight_loader_start_seed_via_nixl=validate_nixl(server_args),
         )
 
     # "ipc_cache" is an internal-only load format: ModelRunner sets it
@@ -301,6 +318,26 @@ def validate_transfer_engine(server_args: Any):
     elif cfg.enable_memory_saver:
         logger.warning(
             "Memory saver is enabled, which is not compatible with TransferEngine. Does not support using TransferEngine as remote instance weight loader backend."
+        )
+        return False
+    else:
+        return True
+
+
+def validate_nixl(server_args: Any):
+    cfg = resolving_view(server_args)
+    try:
+        nixl_available = importlib.util.find_spec("nixl._api") is not None
+    except (ModuleNotFoundError, ValueError):
+        nixl_available = False
+    if not nixl_available:
+        logger.warning(
+            "Failed to import nixl._api. Does not support using NIXL as remote instance weight loader backend."
+        )
+        return False
+    elif cfg.enable_memory_saver:
+        logger.warning(
+            "Memory saver is enabled, which is not compatible with NIXL. Does not support using NIXL as remote instance weight loader backend."
         )
         return False
     else:
