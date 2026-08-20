@@ -41,7 +41,12 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    build_transfer_entry_pairs,
+    compute_mamba_state_slice_byte_blocks,
+    resolve_dcp_dst_entry_indices,
+)
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
@@ -191,6 +196,12 @@ class KVArgsRegisterInfo:
     dst_kv_item_len: int
     dst_state_item_lens: List[List[int]]
     dst_state_dim_per_tensor: List[List[int]]
+    # Per-(state-type, tensor) and per-KV-desc global layer ids on the decode
+    # side. Let the sender pair src/dst transfer entries by layer id under PP,
+    # where the prefill stage registers only its own subset of layers. Empty for
+    # older receivers -> positional fallback (unchanged behavior).
+    dst_state_layer_ids: List[List[int]] = dataclasses.field(default_factory=list)
+    dst_kv_layer_ids: List[int] = dataclasses.field(default_factory=list)
 
     @property
     def engine_key(self) -> str:
@@ -218,6 +229,16 @@ class KVArgsRegisterInfo:
             if len(payload) > 12 and payload[12]
             else []
         )
+        dst_state_layer_ids = (
+            [list(x) for x in unpack_int_lists(payload[13], "I")]
+            if len(payload) > 13 and payload[13]
+            else []
+        )
+        dst_kv_layer_ids = (
+            np.frombuffer(payload[14], dtype=np.uint32).astype(int).tolist()
+            if len(payload) > 14 and payload[14]
+            else []
+        )
         return cls(
             endpoint=endpoint,
             dst_port=dst_port,
@@ -231,6 +252,8 @@ class KVArgsRegisterInfo:
             dst_kv_item_len=dst_kv_item_len,
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
+            dst_state_layer_ids=dst_state_layer_ids,
+            dst_kv_layer_ids=dst_kv_layer_ids,
         )
 
 
@@ -689,7 +712,9 @@ class MoriKVManager(CommonKVManager):
         )
 
     def _get_mha_mem_desc_slices(
-        self, dst_mem_descs: List[MemoryDesc]
+        self,
+        dst_mem_descs: List[MemoryDesc],
+        dst_kv_layer_ids: Optional[List[int]] = None,
     ) -> tuple[
         List[MemoryDesc], List[MemoryDesc], List[MemoryDesc], List[MemoryDesc], int
     ]:
@@ -700,32 +725,56 @@ class MoriKVManager(CommonKVManager):
         num_local_layers = len(src_descs) // 2
         src_k_descs = src_descs[:num_local_layers]
         src_v_descs = src_descs[num_local_layers:]
-
-        start_layer = self.kv_args.prefill_start_layer
-        end_layer = start_layer + num_local_layers
         dst_total_layers = len(dst_mem_descs) // 2
-        if len(dst_mem_descs) < 2 or end_layer > dst_total_layers:
-            raise ValueError(
-                "Destination KV descriptors do not match prefill pp configuration"
+
+        src_layer_ids = getattr(self.kv_args, "kv_layer_ids", None) or []
+        if src_layer_ids and dst_kv_layer_ids:
+            # Map each src KV desc -> dst desc by GLOBAL layer id (PP-safe). k/v
+            # share a layer id; build_transfer_entry_pairs pairs repeats in order,
+            # so the [k..., v...] ordering must match on both peers.
+            dst_idx = resolve_dcp_dst_entry_indices(
+                src_layer_ids, dst_kv_layer_ids, len(src_descs), len(dst_mem_descs)
             )
-        dst_k_descs = dst_mem_descs[start_layer:end_layer]
-        dst_v_descs = dst_mem_descs[
-            dst_total_layers + start_layer : dst_total_layers + end_layer
-        ]
+            dst_k_descs = [dst_mem_descs[dst_idx[i]] for i in range(num_local_layers)]
+            dst_v_descs = [
+                dst_mem_descs[dst_idx[num_local_layers + i]]
+                for i in range(num_local_layers)
+            ]
+        else:
+            # Legacy positional (no layer ids): contiguous PP slice.
+            start_layer = self.kv_args.prefill_start_layer
+            end_layer = start_layer + num_local_layers
+            if len(dst_mem_descs) < 2 or end_layer > dst_total_layers:
+                raise ValueError(
+                    "Destination KV descriptors do not match prefill pp configuration"
+                )
+            dst_k_descs = dst_mem_descs[start_layer:end_layer]
+            dst_v_descs = dst_mem_descs[
+                dst_total_layers + start_layer : dst_total_layers + end_layer
+            ]
         return src_k_descs, src_v_descs, dst_k_descs, dst_v_descs, num_local_layers
 
     def _get_mla_mem_desc_slices(
-        self, dst_mem_descs: List[MemoryDesc]
+        self,
+        dst_mem_descs: List[MemoryDesc],
+        dst_kv_layer_ids: Optional[List[int]] = None,
     ) -> tuple[List[MemoryDesc], List[MemoryDesc], int]:
         src_descs = self.kv_mem_descs
         num_local_layers = len(src_descs)
-        start_layer = self.kv_args.prefill_start_layer
-        end_layer = start_layer + num_local_layers
-        if end_layer > len(dst_mem_descs):
-            raise ValueError(
-                "Destination MLA KV descriptors do not match prefill pp configuration"
+        src_layer_ids = getattr(self.kv_args, "kv_layer_ids", None) or []
+        if src_layer_ids and dst_kv_layer_ids:
+            dst_idx = resolve_dcp_dst_entry_indices(
+                src_layer_ids, dst_kv_layer_ids, len(src_descs), len(dst_mem_descs)
             )
-        dst_slice = dst_mem_descs[start_layer:end_layer]
+            dst_slice = [dst_mem_descs[dst_idx[i]] for i in range(num_local_layers)]
+        else:
+            start_layer = self.kv_args.prefill_start_layer
+            end_layer = start_layer + num_local_layers
+            if end_layer > len(dst_mem_descs):
+                raise ValueError(
+                    "Destination MLA KV descriptors do not match prefill pp configuration"
+                )
+            dst_slice = dst_mem_descs[start_layer:end_layer]
         return src_descs, dst_slice, num_local_layers
 
     def _submit_batch_transfer_plan(
@@ -884,7 +933,9 @@ class MoriKVManager(CommonKVManager):
 
         if self.is_mla_backend:
             src_descs, dst_descs, layers_current_pp_stage = (
-                self._get_mla_mem_desc_slices(peer_info.dst_kv_mem_descs)
+                self._get_mla_mem_desc_slices(
+                    peer_info.dst_kv_mem_descs, peer_info.dst_kv_layer_ids
+                )
             )
             for layer_id in range(layers_current_pp_stage):
                 layer_plan = self._build_contiguous_transfer_plan(
@@ -905,7 +956,9 @@ class MoriKVManager(CommonKVManager):
             dst_k_descs,
             dst_v_descs,
             layers_current_pp_stage,
-        ) = self._get_mha_mem_desc_slices(peer_info.dst_kv_mem_descs)
+        ) = self._get_mha_mem_desc_slices(
+            peer_info.dst_kv_mem_descs, peer_info.dst_kv_layer_ids
+        )
 
         if peer_info.decode_tp_size != self.attn_tp_size:
             tp_cfg = self._build_tp_slice_config(peer_info)
@@ -1079,6 +1132,16 @@ class MoriKVManager(CommonKVManager):
                 if i < len(peer_info.dst_state_dim_per_tensor)
                 else []
             )
+            # Optional per-tensor reshard metadata + global layer ids (empty ->
+            # positional). Present on the generic KVArgs; guard for older peers.
+            _cshard = getattr(self.kv_args, "state_conv_shard_groups", None)
+            src_conv_shard_groups = _cshard[i] if _cshard and i < len(_cshard) else None
+            _outer = getattr(self.kv_args, "state_slice_outer_counts", None)
+            src_slice_outer_counts = _outer[i] if _outer and i < len(_outer) else None
+            _slid = getattr(self.kv_args, "state_layer_ids", None)
+            src_layer_ids = _slid[i] if _slid and i < len(_slid) else None
+            _dlid = getattr(peer_info, "dst_state_layer_ids", None)
+            dst_layer_ids = _dlid[i] if _dlid and i < len(_dlid) else None
 
             if st == "mamba":
                 statuses.extend(
@@ -1092,6 +1155,10 @@ class MoriKVManager(CommonKVManager):
                         dst_lens,
                         src_dims,
                         dst_dims,
+                        src_conv_shard_groups,
+                        src_slice_outer_counts,
+                        src_layer_ids,
+                        dst_layer_ids,
                     )
                 )
             elif st in ("swa", "dsa", "swa_ring", "c128_state", "minimax_index_k"):
@@ -1122,6 +1189,10 @@ class MoriKVManager(CommonKVManager):
         dst_state_item_lens: List[int],
         src_state_dim_per_tensor: List[int],
         dst_state_dim_per_tensor: List[int],
+        src_state_conv_shard_groups: Optional[List] = None,
+        src_state_slice_outer_counts: Optional[List[int]] = None,
+        src_layer_ids: Optional[List[int]] = None,
+        dst_layer_ids: Optional[List[int]] = None,
     ) -> List[TransferStatus]:
         if src_state_indices.size != 1 or dst_state_indices.size != 1:
             raise RuntimeError(
@@ -1151,53 +1222,80 @@ class MoriKVManager(CommonKVManager):
         local_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
         dst_tp_rank = peer_info.decode_tp_rank % peer_info.decode_tp_size
 
-        for i, src_desc in enumerate(src_state_mem_descs):
-            dst_desc = dst_state_mem_descs[i]
+        # Pair src(prefill-local) and dst(decode) state tensors by global layer id
+        # so PP (prefill registers only its stage's mamba layers) lines up. Falls
+        # back to positional (i==i) when no layer ids are provided.
+        pairs = build_transfer_entry_pairs(
+            src_layer_ids or [],
+            dst_layer_ids or [],
+            len(src_state_mem_descs),
+            len(dst_state_mem_descs),
+            allow_positional_fallback=getattr(self, "pp_size", 1) == 1,
+        )
+        for i, j in pairs:
+            src_desc = src_state_mem_descs[i]
+            dst_desc = dst_state_mem_descs[j]
             src_item_len = src_state_item_lens[i]
 
             if not tp_mismatch:
                 # same-TP: whole item copy
-                src_offset = src_idx * src_item_len
-                dst_offset = dst_idx * src_item_len
-                size = src_item_len
+                blocks = [
+                    (src_idx * src_item_len, dst_idx * src_item_len, src_item_len)
+                ]
             else:
-                # TP mismatch slice copy
-                dst_item_len = dst_state_item_lens[i]
+                # TP mismatch: layout-aware slice. Mamba state is nested
+                # [outer, slice_dim(=heads / conv groups), inner]; TP shards the
+                # slice_dim. Delegate to the shared helper so GDN conv groups and
+                # the outer/layer count are respected. A naive per-dim split is
+                # wrong for the recurrent state (num_heads outer vs flattened dim)
+                # and explodes the transfer size.
+                dst_item_len = dst_state_item_lens[j]
                 src_dim = src_state_dim_per_tensor[i]
-                dst_dim = dst_state_dim_per_tensor[i]
+                dst_dim = dst_state_dim_per_tensor[j]
+                conv_groups = (
+                    src_state_conv_shard_groups[i]
+                    if src_state_conv_shard_groups
+                    and i < len(src_state_conv_shard_groups)
+                    else None
+                )
+                outer_count = (
+                    src_state_slice_outer_counts[i]
+                    if src_state_slice_outer_counts
+                    and i < len(src_state_slice_outer_counts)
+                    else 1
+                )
+                byte_blocks = compute_mamba_state_slice_byte_blocks(
+                    src_item_len=src_item_len,
+                    dst_item_len=dst_item_len,
+                    src_dim=src_dim,
+                    dst_dim=dst_dim,
+                    outer_count=outer_count,
+                    src_attn_tp_size=self.attn_tp_size,
+                    dst_attn_tp_size=peer_info.decode_tp_size,
+                    dst_tp_rank_in_group=dst_tp_rank,
+                    local_tp_rank_in_group=local_tp_rank,
+                    conv_shard_groups=conv_groups,
+                )
+                base_src = src_idx * src_item_len
+                base_dst = dst_idx * dst_item_len
+                blocks = [
+                    (base_src + s_off, base_dst + d_off, sz)
+                    for (s_off, d_off, sz) in byte_blocks
+                ]
 
-                src_bytes_per_dim = src_item_len // src_dim
-
-                if self.attn_tp_size > peer_info.decode_tp_size:
-                    src_dim_start = 0
-                    num_dims_to_send = src_dim
-                    writers_per_decode = self.attn_tp_size // peer_info.decode_tp_size
-                    local_writer_idx = local_tp_rank % writers_per_decode
-                    dst_dim_start = local_writer_idx * src_dim
-                else:
-                    src_dim_start = (dst_tp_rank * dst_dim) % src_dim
-                    num_dims_to_send = dst_dim
-                    dst_dim_start = 0
-
-                dst_bytes_per_dim = dst_item_len // dst_dim
-                src_dim_offset = src_dim_start * src_bytes_per_dim
-                dst_dim_offset = dst_dim_start * dst_bytes_per_dim
-                bytes_to_send = num_dims_to_send * src_bytes_per_dim
-
-                src_offset = src_idx * src_item_len + src_dim_offset
-                dst_offset = dst_idx * dst_item_len + dst_dim_offset
-                size = bytes_to_send
-
-            transfer_uid = self.engine.allocate_transfer_uid()
-            batch_statuses = self.engine.batch_write(
-                [src_desc],
-                [[src_offset]],
-                [dst_desc],
-                [[dst_offset]],
-                [[size]],
-                [transfer_uid],
-            )
-            statuses.extend(batch_statuses)
+            for src_offset, dst_offset, size in blocks:
+                if size <= 0:
+                    continue
+                transfer_uid = self.engine.allocate_transfer_uid()
+                batch_statuses = self.engine.batch_write(
+                    [src_desc],
+                    [[src_offset]],
+                    [dst_desc],
+                    [[dst_offset]],
+                    [[size]],
+                    [transfer_uid],
+                )
+                statuses.extend(batch_statuses)
 
         return statuses
 
@@ -1676,6 +1774,13 @@ class MoriKVReceiver(CommonKVReceiver):
         packed_state_dim_per_tensor = pack_int_lists(
             self.kv_mgr.kv_args.state_dim_per_tensor, "I"
         )
+        packed_state_layer_ids = pack_int_lists(
+            getattr(self.kv_mgr.kv_args, "state_layer_ids", []) or [], "I"
+        )
+        packed_kv_layer_ids = b"".join(
+            struct.pack("I", int(lid))
+            for lid in (getattr(self.kv_mgr.kv_args, "kv_layer_ids", []) or [])
+        )
 
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
@@ -1697,6 +1802,8 @@ class MoriKVReceiver(CommonKVReceiver):
                             kv_item_len,
                             packed_state_item_lens,
                             packed_state_dim_per_tensor,
+                            packed_state_layer_ids,
+                            packed_kv_layer_ids,
                         ]
                     )
             except zmq.ZMQError:
