@@ -1499,18 +1499,21 @@ class DeepseekV2MoE(nn.Module):
             shared_fc1_done = None
             shared_fc2_done = None
 
-            def _fine_grained_dispatch_hook(dispatcher: BaseDispatcher):
-                """Overlap shared FC1+SwiGLU with dispatch_b."""
+            def _fine_grained_pre_dispatch_hook(
+                dispatcher: BaseDispatcher,
+                dispatch_hidden_states: torch.Tensor,
+                _dispatch_topk_output: TopKOutput,
+            ):
+                """Overlap shared FC1+SwiGLU with the full dispatch."""
                 nonlocal shared_intermediate, shared_fc1_done
                 self.alt_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self.alt_stream):
                     shared_intermediate = self.shared_experts.forward_gate_up_act(
-                        hidden_states
+                        dispatch_hidden_states
                     )
                     shared_intermediate.record_stream(self.alt_stream)
                     shared_fc1_done = self.alt_stream.record_event()
-                for handle in fine_dispatch_hook_handles:
-                    handle.remove()
+                fine_pre_dispatch_hook_handle.remove()
 
             def _fine_grained_post_dispatch_hook(
                 dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
@@ -1543,9 +1546,9 @@ class DeepseekV2MoE(nn.Module):
                 torch.cuda.current_stream().wait_event(shared_fc2_done)
                 fine_post_combine_hook_handle.remove()
 
-            fine_dispatch_hook_handles = (
-                self.experts.dispatcher.register_deepep_dispatch_hook(
-                    _fine_grained_dispatch_hook
+            fine_pre_dispatch_hook_handle = (
+                self.experts.dispatcher.register_pre_dispatch_hook(
+                    _fine_grained_pre_dispatch_hook
                 )
             )
             fine_post_dispatch_hook_handle = (
