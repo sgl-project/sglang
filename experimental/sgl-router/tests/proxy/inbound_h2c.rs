@@ -56,6 +56,7 @@ fn build_ctx() -> Arc<AppContext> {
             max_output_tokens: None,
             default_top_k: None,
             default_top_p: None,
+            pins: Default::default(),
             forward_input_ids: true,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {

@@ -394,12 +394,45 @@ pub struct ModelConfig {
     /// default-when-absent semantics as [`Self::default_top_k`]. `None`
     /// (default) leaves it to the engine/request.
     pub default_top_p: Option<f64>,
+    /// Sampling parameters pinned fleet-wide for this model (parameter
+    /// immutability). Unlike the `default_*` knobs above, every `Some` value
+    /// here is UNCONDITIONALLY injected into the forwarded body, overwriting
+    /// a client-supplied value — the deployment's serving contract wins over
+    /// the request. Empty (default) preserves today's behavior.
+    pub pins: SamplingPins,
     /// Whether the chat handler may forward ingress-computed `input_ids` to
     /// the engine so it skips re-tokenizing (the ingress tokenize offload).
     /// `false` gates ONLY the engine-facing forward — ingress tokenization
     /// still runs for routing and the cache-sim tees. Default `true`; the
     /// `--disable-input-ids-offload` kill switch flips it.
     pub forward_input_ids: bool,
+}
+
+/// Sampling parameters an operator pins for the whole fleet (the
+/// `--pin-temperature` / `--pin-top-p` / `--pin-frequency-penalty` /
+/// `--pin-presence-penalty` / `--pin-n` flags). A `Some` value is injected
+/// into every forwarded request body, REPLACING any client-supplied value —
+/// this is an immutability contract (e.g. serving a model whose upstream API
+/// fixes its sampling parameters), not a default. Contrast with
+/// [`ModelConfig::default_top_k`] / [`ModelConfig::default_top_p`], which
+/// only fill absent fields. The CLI rejects `--pin-top-p` combined with
+/// `--default-top-p`: the pin makes the default unreachable, so the
+/// combination is an operator error, not a precedence question.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SamplingPins {
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub frequency_penalty: Option<f64>,
+    pub presence_penalty: Option<f64>,
+    pub n: Option<u64>,
+}
+
+impl SamplingPins {
+    /// True when no parameter is pinned — the forwarding fast path uses this
+    /// to skip the body re-serialize entirely.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Default [`ModelConfig::tokenizer_shards`]. 8 independent instances is

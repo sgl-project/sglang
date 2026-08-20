@@ -80,6 +80,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
             max_output_tokens: None,
             default_top_k: None,
             default_top_p: None,
+            pins: Default::default(),
             forward_input_ids: true,
         },
         discovery: sgl_router::config::DiscoveryBackend::StaticUrls(

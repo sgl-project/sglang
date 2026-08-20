@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::{RetryConfig, DEFAULT_RETRY_ITL_REL_FACTOR};
+use crate::config::{RetryConfig, SamplingPins, DEFAULT_RETRY_ITL_REL_FACTOR};
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::{request_tokens_for, RequestTokens, SelectionContext};
@@ -806,8 +806,9 @@ async fn chat_completions_inner(
     };
 
     // Build the body forwarded to the engine(s) exactly once — injecting the
-    // `rid`, `input_ids`, bootstrap fields, and/or default `max_tokens`, or
-    // forwarding the original bytes untouched when none apply.
+    // `rid`, `input_ids`, bootstrap fields, default `max_tokens`, and/or the
+    // pinned sampling params, or forwarding the original bytes untouched when
+    // none apply.
     let outgoing_body = build_outgoing_body(
         &body,
         request_value,
@@ -817,6 +818,7 @@ async fn chat_completions_inner(
         inject_max_tokens,
         inject_top_k,
         inject_top_p,
+        ctx.config.model.pins,
     )?;
     let at_post_build = start.elapsed();
 
@@ -1564,6 +1566,7 @@ fn build_outgoing_body(
     max_tokens: Option<u64>,
     top_k: Option<i64>,
     top_p: Option<f64>,
+    pins: SamplingPins,
 ) -> Result<Bytes, ApiError> {
     if input_ids.is_none()
         && bootstrap.is_none()
@@ -1571,6 +1574,7 @@ fn build_outgoing_body(
         && max_tokens.is_none()
         && top_k.is_none()
         && top_p.is_none()
+        && pins.is_empty()
     {
         // Nothing to inject — forward the original bytes (cheap Arc clone).
         return Ok(body.clone());
@@ -1623,6 +1627,25 @@ fn build_outgoing_body(
         if let Some(n) = serde_json::Number::from_f64(p) {
             obj.insert("top_p".to_string(), serde_json::Value::Number(n));
         }
+    }
+    // Pinned sampling params: unlike the fill-if-absent defaults above, these
+    // unconditionally overwrite a client-supplied value — that IS the
+    // contract (`--pin-*`: parameter immutability). Same defensive
+    // `from_f64` skip as `top_p`; CLI validation already excludes NaN/inf.
+    for (field, pinned) in [
+        ("temperature", pins.temperature),
+        ("top_p", pins.top_p),
+        ("frequency_penalty", pins.frequency_penalty),
+        ("presence_penalty", pins.presence_penalty),
+    ] {
+        if let Some(v) = pinned {
+            if let Some(n) = serde_json::Number::from_f64(v) {
+                obj.insert(field.to_string(), serde_json::Value::Number(n));
+            }
+        }
+    }
+    if let Some(n) = pins.n {
+        obj.insert("n".to_string(), serde_json::Value::Number(n.into()));
     }
     if let Some(ids) = input_ids {
         obj.insert(
@@ -2451,6 +2474,7 @@ mod tests {
             None,
             None,
             None,
+            SamplingPins::default(),
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&injected).unwrap();
@@ -2689,8 +2713,18 @@ mod tests {
             Bytes::from_static(br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let ids = [1u32, 2, 3];
-        let out = build_outgoing_body(&body, Some(value), Some(&ids), None, None, None, None, None)
-            .unwrap();
+        let out = build_outgoing_body(
+            &body,
+            Some(value),
+            Some(&ids),
+            None,
+            None,
+            None,
+            None,
+            None,
+            SamplingPins::default(),
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([1, 2, 3])));
         assert!(
@@ -2705,8 +2739,18 @@ mod tests {
     fn build_outgoing_body_no_injection_returns_original_bytes() {
         let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let out =
-            build_outgoing_body(&body, Some(value), None, None, None, None, None, None).unwrap();
+        let out = build_outgoing_body(
+            &body,
+            Some(value),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            SamplingPins::default(),
+        )
+        .unwrap();
         assert_eq!(
             out, body,
             "no injection must forward the original bytes unchanged"
@@ -2719,8 +2763,18 @@ mod tests {
     #[test]
     fn build_outgoing_body_injects_default_max_tokens() {
         let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
-        let out =
-            build_outgoing_body(&body, None, None, None, None, Some(131072), None, None).unwrap();
+        let out = build_outgoing_body(
+            &body,
+            None,
+            None,
+            None,
+            None,
+            Some(131072),
+            None,
+            None,
+            SamplingPins::default(),
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed.get("max_tokens"), Some(&serde_json::json!(131072)));
         assert!(parsed.get("messages").is_some());
@@ -2729,8 +2783,18 @@ mod tests {
     #[test]
     fn build_outgoing_body_injects_default_top_k_and_top_p() {
         let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
-        let out = build_outgoing_body(&body, None, None, None, None, None, Some(1000), Some(0.95))
-            .unwrap();
+        let out = build_outgoing_body(
+            &body,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(1000),
+            Some(0.95),
+            SamplingPins::default(),
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed.get("top_k"), Some(&serde_json::json!(1000)));
         assert_eq!(parsed.get("top_p"), Some(&serde_json::json!(0.95)));
@@ -2757,6 +2821,7 @@ mod tests {
             None,
             Some(1000),
             Some(0.95),
+            SamplingPins::default(),
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -2764,6 +2829,73 @@ mod tests {
         assert_eq!(parsed.get("top_k"), Some(&serde_json::json!(1000)));
         assert_eq!(parsed.get("top_p"), Some(&serde_json::json!(0.95)));
         assert!(parsed.get("messages").is_some());
+    }
+
+    /// Pinned sampling params OVERWRITE client-supplied values — that is the
+    /// immutability contract, the opposite of the fill-if-absent defaults —
+    /// fill absent ones, and compose with input_ids forwarding in the same
+    /// `build_outgoing_body` call (so chat-encoder traffic is pinned too).
+    #[test]
+    fn build_outgoing_body_pins_overwrite_client_sampling_params() {
+        let body = Bytes::from_static(
+            br#"{"model":"x","messages":[{"role":"user","content":"hi"}],"temperature":0.2,"top_p":0.5,"frequency_penalty":1.5,"n":4}"#,
+        );
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ids = [1u32, 2, 3];
+        let pins = SamplingPins {
+            temperature: Some(1.0),
+            top_p: Some(1.0),
+            frequency_penalty: Some(0.0),
+            presence_penalty: Some(0.0),
+            n: Some(1),
+        };
+        let out = build_outgoing_body(
+            &body,
+            Some(value),
+            Some(&ids),
+            None,
+            None,
+            None,
+            None,
+            None,
+            pins,
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        // Present client values are replaced …
+        assert_eq!(parsed.get("temperature"), Some(&serde_json::json!(1.0)));
+        assert_eq!(parsed.get("top_p"), Some(&serde_json::json!(1.0)));
+        assert_eq!(
+            parsed.get("frequency_penalty"),
+            Some(&serde_json::json!(0.0))
+        );
+        assert_eq!(parsed.get("n"), Some(&serde_json::json!(1)));
+        // … an absent field is filled …
+        assert_eq!(
+            parsed.get("presence_penalty"),
+            Some(&serde_json::json!(0.0))
+        );
+        // … and the pins ride the same serialize as the forwarded input_ids.
+        assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([1, 2, 3])));
+        assert!(parsed.get("messages").is_some());
+    }
+
+    /// A partial pin set only touches its own fields: unpinned client values
+    /// survive untouched.
+    #[test]
+    fn build_outgoing_body_partial_pins_leave_other_fields_alone() {
+        let body =
+            Bytes::from_static(br#"{"model":"x","messages":[],"temperature":0.2,"top_p":0.5}"#);
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let pins = SamplingPins {
+            temperature: Some(1.0),
+            ..Default::default()
+        };
+        let out = build_outgoing_body(&body, Some(value), None, None, None, None, None, None, pins)
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed.get("temperature"), Some(&serde_json::json!(1.0)));
+        assert_eq!(parsed.get("top_p"), Some(&serde_json::json!(0.5)));
     }
 
     /// `default_when_absent` fills the configured default only when the request
@@ -2916,6 +3048,7 @@ mod tests {
             None,
             None,
             None,
+            SamplingPins::default(),
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -2952,6 +3085,7 @@ mod tests {
             None,
             None,
             None,
+            SamplingPins::default(),
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -3085,8 +3219,18 @@ mod tests {
             port: Some(1),
             room: 2,
         };
-        let out = build_outgoing_body(&body, None, None, Some(&bootstrap), None, None, None, None)
-            .unwrap();
+        let out = build_outgoing_body(
+            &body,
+            None,
+            None,
+            Some(&bootstrap),
+            None,
+            None,
+            None,
+            None,
+            SamplingPins::default(),
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             parsed.get("bootstrap_room"),

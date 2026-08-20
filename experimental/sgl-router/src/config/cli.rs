@@ -16,7 +16,7 @@ use crate::config::{
     default_stream_send_stall_secs, default_stream_total_timeout_secs, default_tokenizer_shards,
     resolve_mode, ActiveLoadConfig, AdmissionConfig, CacheAwareConfig, CircuitBreakerConfig,
     Config, DiscoveryBackend, K8sDiscoveryConfig, LoadGate, LogFormat, ModelConfig,
-    ObservabilityConfig, PolicyKind, ProxyConfig, RetryConfig, ServerConfig,
+    ObservabilityConfig, PolicyKind, ProxyConfig, RetryConfig, SamplingPins, ServerConfig,
     StaticUrlsDiscoveryConfig, StickyConfig,
 };
 
@@ -91,6 +91,31 @@ pub struct Cli {
     /// semantics as `--default-top-k`. Must be in (0, 1].
     #[arg(long)]
     pub default_top_p: Option<f64>,
+    /// Pin `temperature` fleet-wide: injected into EVERY forwarded request
+    /// body, overwriting a client-supplied value (parameter immutability —
+    /// unlike the fill-when-absent `--default-*` flags). Use when serving a
+    /// model whose upstream API fixes its sampling parameters. Must be in
+    /// [0, 2].
+    #[arg(long)]
+    pub pin_temperature: Option<f64>,
+    /// Pin `top_p` fleet-wide, with the same overwrite semantics as
+    /// `--pin-temperature`. Must be in (0, 1]. Mutually exclusive with
+    /// `--default-top-p` (the pin would make the default unreachable).
+    #[arg(long)]
+    pub pin_top_p: Option<f64>,
+    /// Pin `frequency_penalty` fleet-wide, with the same overwrite semantics
+    /// as `--pin-temperature`. Must be in [-2, 2] (negative values allowed:
+    /// `--pin-frequency-penalty -0.5`).
+    #[arg(long, allow_negative_numbers = true)]
+    pub pin_frequency_penalty: Option<f64>,
+    /// Pin `presence_penalty` fleet-wide, with the same overwrite semantics
+    /// as `--pin-temperature`. Must be in [-2, 2] (negative values allowed).
+    #[arg(long, allow_negative_numbers = true)]
+    pub pin_presence_penalty: Option<f64>,
+    /// Pin `n` (choices per request) fleet-wide, with the same overwrite
+    /// semantics as `--pin-temperature`. Must be >= 1.
+    #[arg(long)]
+    pub pin_n: Option<u64>,
     /// Central kill switch for the ingress tokenize offload: when set, the
     /// router NEVER injects its ingress-computed `input_ids` into the
     /// forwarded body, so the engine always tokenizes from `messages` itself.
@@ -619,6 +644,40 @@ impl Cli {
             }
         }
 
+        // Pinned sampling params get the same startup-time validation. Range
+        // checks are written as positive containment so NaN fails them too.
+        if let Some(t) = self.pin_temperature {
+            if !(0.0..=2.0).contains(&t) {
+                return Err(anyhow!("--pin-temperature ({t}) must be in [0, 2]"));
+            }
+        }
+        if let Some(p) = self.pin_top_p {
+            if !(p > 0.0 && p <= 1.0) {
+                return Err(anyhow!("--pin-top-p ({p}) must be in (0, 1]"));
+            }
+            if self.default_top_p.is_some() {
+                return Err(anyhow!(
+                    "--pin-top-p cannot be combined with --default-top-p: the pin \
+                     overwrites every request, so the default could never apply"
+                ));
+            }
+        }
+        for (flag, v) in [
+            ("--pin-frequency-penalty", self.pin_frequency_penalty),
+            ("--pin-presence-penalty", self.pin_presence_penalty),
+        ] {
+            if let Some(v) = v {
+                if !(-2.0..=2.0).contains(&v) {
+                    return Err(anyhow!("{flag} ({v}) must be in [-2, 2]"));
+                }
+            }
+        }
+        if let Some(n) = self.pin_n {
+            if n < 1 {
+                return Err(anyhow!("--pin-n ({n}) must be >= 1"));
+            }
+        }
+
         let circuit_breaker = self.cb_threshold.map(|threshold| CircuitBreakerConfig {
             threshold,
             cool_down_secs: self.cb_cool_down_secs.unwrap_or_else(default_cb_cool_down),
@@ -695,6 +754,13 @@ impl Cli {
                 max_output_tokens: self.max_output_tokens,
                 default_top_k: self.default_top_k,
                 default_top_p: self.default_top_p,
+                pins: SamplingPins {
+                    temperature: self.pin_temperature,
+                    top_p: self.pin_top_p,
+                    frequency_penalty: self.pin_frequency_penalty,
+                    presence_penalty: self.pin_presence_penalty,
+                    n: self.pin_n,
+                },
                 forward_input_ids: !self.disable_input_ids_offload,
             },
             discovery,
@@ -864,6 +930,69 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(c.model.default_top_p, Some(1.0));
+    }
+
+    #[test]
+    fn pin_flags_reach_the_model_config() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--pin-temperature",
+            "1.0",
+            "--pin-top-p",
+            "1.0",
+            "--pin-frequency-penalty",
+            "0",
+            "--pin-presence-penalty",
+            "-0.5",
+            "--pin-n",
+            "1",
+        ]))
+        .unwrap();
+        assert_eq!(c.model.pins.temperature, Some(1.0));
+        assert_eq!(c.model.pins.top_p, Some(1.0));
+        assert_eq!(c.model.pins.frequency_penalty, Some(0.0));
+        assert_eq!(c.model.pins.presence_penalty, Some(-0.5));
+        assert_eq!(c.model.pins.n, Some(1));
+        assert!(!c.model.pins.is_empty());
+        // Unset -> empty: no request field is ever overwritten.
+        let c = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        assert!(c.model.pins.is_empty());
+    }
+
+    #[test]
+    fn rejects_out_of_range_pins() {
+        // `=`-form throughout so the negative values aren't read as flags
+        // (only the penalty flags opt into allow_negative_numbers).
+        for (arg, needle) in [
+            ("--pin-temperature=2.5", "pin-temperature"),
+            ("--pin-temperature=-0.1", "pin-temperature"),
+            ("--pin-top-p=0", "pin-top-p"),
+            ("--pin-top-p=1.5", "pin-top-p"),
+            ("--pin-frequency-penalty=2.1", "pin-frequency-penalty"),
+            ("--pin-presence-penalty=-2.1", "pin-presence-penalty"),
+            ("--pin-n=0", "pin-n"),
+        ] {
+            let err = into_config_owned(with_model(&["--worker-urls", "http://x:30000", arg]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "{arg}: got {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_pin_top_p_combined_with_default_top_p() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--pin-top-p",
+            "1.0",
+            "--default-top-p",
+            "0.95",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--pin-top-p cannot be combined"), "got: {err}");
     }
 
     #[test]

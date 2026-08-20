@@ -52,6 +52,7 @@ fn config(forward_input_ids: bool) -> Config {
             max_output_tokens: None,
             default_top_k: None,
             default_top_p: None,
+            pins: Default::default(),
             forward_input_ids,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
