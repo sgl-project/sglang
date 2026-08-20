@@ -59,6 +59,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     CompressorAscendBackendMixin,
     DeepseekV4AscendMultiStepDraftBackend,
     _apply_hadamard,
+    _build_cycle_state_block_table,
     _get_kv_indices,
     _overlap_transform,
     _sparse_attn_kv_quant_kwargs,
@@ -183,6 +184,19 @@ class TestApplyHadamard(unittest.TestCase):
         expected = inp.matmul(H).to(torch.bfloat16)
         out = _apply_hadamard(inp, H)
         self.assertTrue(torch.equal(out, expected))
+
+
+class TestCompressorStateTableABI(unittest.TestCase):
+    def test_a5_cycle_table_is_one_bank_per_request(self):
+        req_pool_indices = torch.tensor([7, 3], dtype=torch.int64)
+        table = _build_cycle_state_block_table(req_pool_indices)
+        self.assertEqual(tuple(table.shape), (2,))
+        self.assertEqual(table.dtype, torch.int32)
+        self.assertEqual(table.tolist(), [7, 3])
+
+    def test_a5_cycle_table_rejects_explicit_shape(self):
+        with self.assertRaises(ValueError):
+            _build_cycle_state_block_table(torch.zeros((2, 8), dtype=torch.int32))
 
 
 class TestAtlasA5SparseAttentionDispatch(unittest.TestCase):

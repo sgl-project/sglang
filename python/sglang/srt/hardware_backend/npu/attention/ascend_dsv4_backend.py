@@ -140,6 +140,21 @@ def _build_explicit_state_block_table(
     ).contiguous()
 
 
+def _build_cycle_state_block_table(req_pool_indices: torch.Tensor) -> torch.Tensor:
+    """Build the Atlas A5 cache_mode=2 request-bank table.
+
+    A5 interprets this input as one bank id per request and computes the
+    in-bank ring offset itself.  It must never receive the A3 explicit
+    per-token location table.
+    """
+    if req_pool_indices.ndim != 1:
+        raise ValueError(
+            "Atlas A5 compressor requires a 1-D request-bank table, got "
+            f"shape={tuple(req_pool_indices.shape)}"
+        )
+    return req_pool_indices.to(dtype=torch.int32).contiguous()
+
+
 class CompressorAscendBackendMixin:
 
     @staticmethod
@@ -416,21 +431,31 @@ class CompressorAscendBackendMixin:
         pool = self.token_to_kv_pool
         state_pool = pool._get_state_pool(compressor.layer_id, compressor.is_in_indexer)
         state_cache = state_pool.state_cache_3d
-        table_cache = fm.dsv4_explicit_state_block_tables
-        if ratio not in table_cache:
-            table_cache[ratio] = _build_explicit_state_block_table(
-                compress_ratio=ratio,
-                coff=coff,
-                state_pool=state_pool,
-                token_to_kv_pool=pool,
-                req_to_token=self.req_to_token,
-                req_pool_indices=forward_batch.req_pool_indices,
-                start_pos=fm.start_pos,
-                cu_seqlens=fm.actual_seq_lengths_q_pa,
-                seqused=fm.seqused,
-                max_input_capacity=fm.dsv4_max_input_capacity,
+        if _is_atlas_a5():
+            # A5 cache_mode=2 is CYCLE: one request bank per row.  The
+            # compressor derives the in-bank offset from start_pos; passing
+            # the A3 explicit [B, width] table here would be an ABI violation.
+            state_block_table = _build_cycle_state_block_table(
+                forward_batch.req_pool_indices
             )
-        state_block_table = table_cache[ratio]
+            cache_mode = 2
+        else:
+            table_cache = fm.dsv4_explicit_state_block_tables
+            if ratio not in table_cache:
+                table_cache[ratio] = _build_explicit_state_block_table(
+                    compress_ratio=ratio,
+                    coff=coff,
+                    state_pool=state_pool,
+                    token_to_kv_pool=pool,
+                    req_to_token=self.req_to_token,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    start_pos=fm.start_pos,
+                    cu_seqlens=fm.actual_seq_lengths_q_pa,
+                    seqused=fm.seqused,
+                    max_input_capacity=fm.dsv4_max_input_capacity,
+                )
+            state_block_table = table_cache[ratio]
+            cache_mode = 2
 
         cos, sin = Dsv4NpuRoPE.for_freqs(
             compressor.freqs_cis, getattr(compressor, "rotary_emb", None)
@@ -459,7 +484,7 @@ class CompressorAscendBackendMixin:
             coff=coff,
             norm_eps=compressor.norm.variance_epsilon,
             rotary_mode=2,
-            cache_mode=2,
+            cache_mode=cache_mode,
         )
 
         # prefill output may be padded; trim to loc length
