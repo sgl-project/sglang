@@ -95,6 +95,51 @@ def test_namespaces_isolate_the_same_tokens():
     assert unsalted.device_indices.numel() == 0
 
 
+def test_backfill_hashes_existing_nodes_in_parent_order():
+    expected = _tree_core()
+    expected.enable_storage = True
+    _pump_insert(
+        expected,
+        InsertParams(key=_key([1, 2]), value=torch.tensor([10, 11], dtype=torch.int64)),
+    )
+    _pump_insert(
+        expected,
+        InsertParams(
+            key=_key([1, 2, 3, 4]),
+            value=torch.tensor([10, 11, 12, 13], dtype=torch.int64),
+        ),
+    )
+
+    late = _tree_core()
+    _pump_insert(
+        late,
+        InsertParams(key=_key([1, 2]), value=torch.tensor([10, 11], dtype=torch.int64)),
+    )
+    _pump_insert(
+        late,
+        InsertParams(
+            key=_key([1, 2, 3, 4]),
+            value=torch.tensor([10, 11, 12, 13], dtype=torch.int64),
+        ),
+    )
+
+    parent = late.match_prefix(MatchPrefixParams(key=_key([1, 2]))).best_match_node
+    child = late.match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4]))).best_match_node
+    expected_parent = expected.match_prefix(
+        MatchPrefixParams(key=_key([1, 2]))
+    ).best_match_node
+    expected_child = expected.match_prefix(
+        MatchPrefixParams(key=_key([1, 2, 3, 4]))
+    ).best_match_node
+
+    assert late.get_hash_values(parent) == []
+    assert late.get_hash_values(child) == []
+    assert late.backfill_missing_hash_values() == 2
+    assert late.get_hash_values(parent) == expected.get_hash_values(expected_parent)
+    assert late.get_hash_values(child) == expected.get_hash_values(expected_child)
+    assert late.backfill_missing_hash_values() == 0
+
+
 if __name__ == "__main__":
     import sys
 

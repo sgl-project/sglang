@@ -1271,6 +1271,11 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py.allow_threads(|| self.core().get_hash_values(node_id))
     }
 
+    /// Hash every node built while storage was disabled.
+    fn backfill_missing_hash_values(&self, py: Python<'_>) -> usize {
+        py.allow_threads(|| self.core().backfill_missing_hash_values())
+    }
+
     fn root_node_handle(&self, py: Python<'_>, extra_key: Option<String>) -> NodeId {
         py.allow_threads(|| self.core().root_node_handle(extra_key.as_deref()))
     }
@@ -1908,6 +1913,11 @@ macro_rules! tree_core_binding {
 
             fn get_hash_values(&self, py: Python<'_>, node_id: NodeId) -> Vec<String> {
                 self.inner.get_hash_values(py, node_id)
+            }
+
+            /// Hash every node built while storage was disabled.
+            fn backfill_missing_hash_values(&self, py: Python<'_>) -> usize {
+                self.inner.backfill_missing_hash_values(py)
             }
 
             #[pyo3(signature = (extra_key = None))]
