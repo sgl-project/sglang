@@ -113,10 +113,7 @@ def initialize_dspark_sparse_attn_ops() -> Optional[Path]:
         name="DSpark sparse-attention",
         so_env="SGLANG_DSPARK_EXTRA_OPS_SO",
         namespace="_C_ascend",
-        required_ops=(
-            "npu_sparse_attn_sharedkv_metadata",
-            "npu_sparse_attn_sharedkv",
-        ),
+        required_ops=("npu_sparse_attn_sharedkv",),
         pre_load_imports=("torch_npu",),
     )
     return TorchOpLoader(spec).initialize()
