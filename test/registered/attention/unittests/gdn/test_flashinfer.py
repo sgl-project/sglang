@@ -374,6 +374,18 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         linear_attn_decode_backend="flashinfer",
         linear_attn_prefill_backend="flashinfer",
     )
+    CAKE_CHECKPOINT_PREFILL_CASE = GDNAttentionCase(
+        name="flashinfer_cake_gdn_tp4_prefill_b7_t421_checkpoints",
+        backend="flashinfer",
+        forward_mode=ForwardMode.EXTEND,
+        num_k_heads=4,
+        num_v_heads=8,
+        page_size=16,
+        prefix_lens=(4, 7, 10, 13, 16, 19, 22),
+        extend_lens=(52, 93, 15, 107, 72, 61, 21),
+        linear_attn_decode_backend="flashinfer",
+        linear_attn_prefill_backend="flashinfer",
+    )
     CAKE_CP_PREFILL_CASE = GDNAttentionCase(
         name="flashinfer_cake_gdn_tp4_cp_prefill_b1_s128",
         backend="flashinfer",
@@ -574,6 +586,62 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
             expected.final_states[cache_indices],
             atol=1e-2,
             rtol=1e-2,
+        )
+
+    def test_cake_exact_checkpoint_prefill_tracks_indexed_state(self):
+        cake_api = self._cake_api_or_skip()
+        fixture = build_gdn_attention_fixture(
+            self,
+            self.CAKE_CHECKPOINT_PREFILL_CASE,
+            head_k_dim=self.HEAD_DIM,
+            head_v_dim=self.HEAD_DIM,
+            max_context_len=192,
+        )
+        batch = fixture.forward_batch
+        batch.mamba_track_mask = torch.tensor(
+            [False, True, False, True, True, False, False],
+            dtype=torch.bool,
+            device="cuda",
+        )
+        batch.mamba_track_indices = torch.tensor(
+            [7, 8, 9, 10, 11, 12, 13], dtype=torch.int64, device="cuda"
+        )
+        batch.mamba_track_seqlens = torch.tensor(
+            [56, 100, 25, 120, 88, 80, 43],
+            dtype=torch.int64,
+            device="cuda",
+        )
+
+        cache = fixture.runner.req_to_token_pool.mamba2_layer_cache(0)
+        initial_conv = cache.conv[0].clone()
+        initial_ssm = cache.temporal.clone()
+        with mock.patch.object(
+            cake_api,
+            "load_cake_gdn_kernel",
+            wraps=cake_api.load_cake_gdn_kernel,
+        ) as load_kernel:
+            cake_output = run_gdn_fixture_eager(fixture)
+        cake_tracked = cache.temporal[batch.mamba_track_indices].clone()
+        cake_final = cache.temporal[_cache_indices(fixture)].clone()
+
+        self.assertGreater(load_kernel.call_count, 0)
+        cache.conv[0].copy_(initial_conv)
+        cache.temporal.copy_(initial_ssm)
+        fixture.backend.linear_attn_backend.kernel_dispatcher.extend_kernel = (
+            TritonGDNKernel()
+        )
+        triton_output = run_gdn_fixture_eager(fixture)
+        triton_tracked = cache.temporal[batch.mamba_track_indices]
+        triton_final = cache.temporal[_cache_indices(fixture)]
+
+        torch.testing.assert_close(
+            cake_output, triton_output, atol=3e-2, rtol=3e-2
+        )
+        torch.testing.assert_close(
+            cake_tracked, triton_tracked, atol=3e-2, rtol=3e-2
+        )
+        torch.testing.assert_close(
+            cake_final, triton_final, atol=3e-2, rtol=3e-2
         )
 
     def test_cake_exact_verify_eager_and_cuda_graph(self):
