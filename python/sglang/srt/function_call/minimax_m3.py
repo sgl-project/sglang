@@ -380,6 +380,19 @@ class MinimaxM3Detector(BaseFormatDetector):
             child_schema = properties[child_tag]
             return child_schema if isinstance(child_schema, dict) else None
 
+        # A composed schema declares its properties per branch, so a top-level
+        # oneOf/anyOf/allOf has no "properties" of its own. The model picks one
+        # branch per call; resolve the tag against whichever branch declares it,
+        # otherwise every value in a composed schema is typed as a bare string.
+        for keyword in ("oneOf", "anyOf", "allOf"):
+            branches = parent_schema.get(keyword)
+            if not isinstance(branches, list):
+                continue
+            for branch in branches:
+                child_schema = self._get_child_schema(branch, child_tag, parent_value)
+                if child_schema is not None:
+                    return child_schema
+
         additional_properties = parent_schema.get("additionalProperties")
         if isinstance(additional_properties, dict):
             return additional_properties
@@ -508,14 +521,14 @@ class MinimaxM3Detector(BaseFormatDetector):
                 gt = chunk.find(">", 2)
                 tag = chunk[2:gt].strip() if gt != -1 else chunk[2:].strip()
                 if len(stack) == 1:
-                    raise ValueError(f"unexpected closing tag: {tag}")
-                if stack[-1]["tag"] != tag:
-                    raise ValueError(
-                        f"mismatched closing tag: expected {stack[-1]['tag']}, got {tag}"
-                    )
-
-                frame = stack.pop()
-                self._assign_child(stack[-1]["value"], frame["tag"], frame["value"])
+                    continue
+                depth = next(
+                    (i for i in range(len(stack) - 1, 0, -1) if stack[i]["tag"] == tag),
+                    len(stack) - 1,
+                )
+                while len(stack) > depth:
+                    frame = stack.pop()
+                    self._assign_child(stack[-1]["value"], frame["tag"], frame["value"])
                 continue
 
             if chunk.startswith("<"):

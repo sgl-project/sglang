@@ -569,6 +569,15 @@ class ChatCompletionMessageContentImageURL(BaseModel):
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
     content_hash: Optional[str] = None
+    max_long_side_pixel: Optional[int] = Field(default=None, gt=0)
+
+    @field_validator("detail", mode="before")
+    @classmethod
+    def _normalize_detail(cls, value):
+        # MiniMax's API sends detail="default" for the unscaled tier.
+        if isinstance(value, str) and value.lower() == "default":
+            return "auto"
+        return value
 
     @field_validator("content_hash")
     @classmethod
@@ -586,6 +595,7 @@ class ChatCompletionMessageContentVideoURL(BaseModel):
     max_frames: Optional[int] = None
     max_tokens_per_frame: Optional[int] = None
     max_image_tokens: Optional[int] = None
+    max_long_side_pixel: Optional[int] = Field(default=None, gt=0)
 
 
 class ChatCompletionMessageContentAudioURL(BaseModel):
@@ -701,7 +711,13 @@ class ToolCall(BaseModel):
 
 
 _GenericMessageRole = Literal[
-    "system", "assistant", "tool", "function", "developer", "latest_reminder"
+    "system",
+    "assistant",
+    "tool",
+    "function",
+    "developer",
+    "latest_reminder",
+    "root",
 ]
 _GENERIC_MESSAGE_ROLES: Tuple[str, ...] = get_args(_GenericMessageRole)
 
@@ -1005,6 +1021,14 @@ class ChatCompletionRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_reasoning_inputs(cls, values: Dict):
+        t = values.get("thinking")
+        if isinstance(t, dict) and isinstance(t.get("type"), str):
+            ctk = values.get("chat_template_kwargs")
+            if not isinstance(ctk, dict):
+                ctk = {}
+            ctk.setdefault("thinking_mode", t["type"].lower())
+            values["chat_template_kwargs"] = ctk
+
         r = values.get("reasoning")
         thinking = None
 

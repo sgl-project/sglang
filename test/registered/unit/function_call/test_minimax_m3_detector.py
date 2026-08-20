@@ -502,19 +502,158 @@ class TestMinimaxM3Malformed(CustomTestCase):
         self.assertEqual(len(result.calls), 0)
         self.assertEqual(result.normal_text, text)
 
-    def test_mismatched_closing_tag(self):
-        text = _wire(
-            "<tool_call>",
-            '<invoke name="get_weather">',
-            "<city>Beijing",
-            "</wrong>",
-            "</invoke>",
-            "</tool_call>",
+
+class TestMinimaxM3LenientClosingTags(CustomTestCase):
+    """MiniMax's provider spec (格式正确性检查 §3, "工具调用解析格式兼容能力")
+    lists four malformed-XML shapes that must parse as the well-formed
+    equivalent instead of leaking the raw tool-call tokens as content."""
+
+    def setUp(self):
+        self.tools = _make_tools()
+
+    def _weather(self, *param_segments):
+        return _parse_segments(
+            (
+                "<tool_call>",
+                '<invoke name="get_weather">',
+                *param_segments,
+                "</invoke>",
+                "</tool_call>",
+            ),
+            self.tools,
+        )[0]
+
+    def test_wrong_name_closes_innermost(self):
+        # <a>...</b>  ==  <a>...</a>
+        self.assertEqual(
+            self._weather("<city>Beijing", "</wrong>"),
+            [{"name": "get_weather", "args": {"city": "Beijing"}}],
         )
-        detector = MinimaxM3Detector()
-        result = detector.detect_and_parse(text, self.tools)
-        self.assertEqual(len(result.calls), 0)
-        self.assertEqual(result.normal_text, text)
+
+    def test_wrong_name_then_correct_one(self):
+        # <a>...</b></a>  ==  <a>...</a>
+        self.assertEqual(
+            self._weather("<city>Beijing", "</wrong>", "</city>"),
+            [{"name": "get_weather", "args": {"city": "Beijing"}}],
+        )
+
+    def test_trailing_stray_closer_is_ignored(self):
+        # <a>...</a></b>  ==  <a>...</a>
+        self.assertEqual(
+            self._weather("<city>Beijing", "</city>", "</wrong>"),
+            [{"name": "get_weather", "args": {"city": "Beijing"}}],
+        )
+
+    def test_unclosed_sibling_is_auto_closed(self):
+        # <a><b>...</b><c></a>  ==  <a><b>...</b><c></c></a>
+        calls = _parse_segments(
+            (
+                "<tool_call>",
+                '<invoke name="create_event">',
+                "<location>",
+                "<city>Beijing",
+                "</city>",
+                "<zip>",
+                "</location>",
+                "</invoke>",
+                "</tool_call>",
+            ),
+            self.tools,
+        )[0]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "create_event")
+        self.assertEqual(calls[0]["args"]["location"]["city"], "Beijing")
+
+
+class TestMinimaxM3ComposedSchema(CustomTestCase):
+    """A top-level oneOf has no `properties`, so child tags used to resolve to no
+    schema at all and every value came back as a bare string (report case
+    TestToolCallSchema::test_14_07: number arrived as "42" instead of 42)."""
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="ExampleFunction",
+                    description="An example function to verify the parameters.",
+                    parameters={
+                        "type": "object",
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {"number": {"type": "number"}},
+                            },
+                            {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "stringList": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    }
+                                },
+                            },
+                            {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "numberList": {
+                                        "type": "array",
+                                        "items": {"type": "number"},
+                                    }
+                                },
+                            },
+                        ],
+                    },
+                ),
+            )
+        ]
+
+    def _call(self, *param_segments):
+        calls, _ = _parse_segments(
+            (
+                "<tool_call>",
+                '<invoke name="ExampleFunction">',
+                *param_segments,
+                "</invoke>",
+                "</tool_call>",
+            ),
+            self.tools,
+        )
+        self.assertEqual(len(calls), 1, calls)
+        return calls[0]["args"]
+
+    def test_scalar_branch_keeps_its_declared_type(self):
+        self.assertEqual(self._call("<number>42", "</number>"), {"number": 42})
+
+    def test_string_items_branch(self):
+        args = self._call(
+            "<stringList>",
+            "<item>12",
+            "</item>",
+            "<item>34",
+            "</item>",
+            "</stringList>",
+        )
+        self.assertEqual(args, {"stringList": ["12", "34"]})
+
+    def test_number_items_branch(self):
+        args = self._call(
+            "<numberList>",
+            "<item>12",
+            "</item>",
+            "<item>34",
+            "</item>",
+            "</numberList>",
+        )
+        self.assertEqual(args, {"numberList": [12, 34]})
+
+
+class TestMinimaxM3MalformedStillContent(CustomTestCase):
+    def setUp(self):
+        self.tools = _make_tools()
 
     def test_truncated_streaming_does_not_crash(self):
         segments = (

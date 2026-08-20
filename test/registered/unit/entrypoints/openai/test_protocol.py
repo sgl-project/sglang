@@ -776,6 +776,52 @@ class TestValidationEdgeCases(unittest.TestCase):
             CompletionRequest(model="test-model", prompt="Hello", max_tokens=-1)
 
 
+class TestMiniMaxCompat(unittest.TestCase):
+    """MiniMax-flavored request fields must not 400 (see M3 release check)."""
+
+    def test_image_detail_default_is_auto(self):
+        url = ChatCompletionMessageContentImageURL(
+            url="data:image/png;base64,AA", detail="default"
+        )
+        self.assertEqual(url.detail, "auto")
+
+    def test_root_role_preserved(self):
+        # M3's chat template renders messages[0].role == "root" into the
+        # high-priority system block; it must not be rewritten to "system".
+        req = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {"role": "root", "content": "You are M3."},
+                {"role": "system", "content": "You are something else."},
+                {"role": "user", "content": "Who are you?"},
+            ],
+        )
+        self.assertEqual([m.role for m in req.messages], ["root", "system", "user"])
+
+    def test_thinking_type_maps_to_thinking_mode(self):
+        req = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hi"}],
+            thinking={"type": "disabled"},
+        )
+        self.assertEqual(req.chat_template_kwargs["thinking_mode"], "disabled")
+
+    def test_explicit_thinking_mode_wins(self):
+        req = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hi"}],
+            thinking={"type": "disabled"},
+            chat_template_kwargs={"thinking_mode": "enabled"},
+        )
+        self.assertEqual(req.chat_template_kwargs["thinking_mode"], "enabled")
+
+    def test_unknown_role_still_rejected(self):
+        with self.assertRaises(ValidationError):
+            ChatCompletionRequest(
+                model="test-model", messages=[{"role": "wheel", "content": "Hi"}]
+            )
+
+
 class TestParsedResponseFieldsProtocol(unittest.TestCase):
     """Test ParsedResponseFields protocol."""
 

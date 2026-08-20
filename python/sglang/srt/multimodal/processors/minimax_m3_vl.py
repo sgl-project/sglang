@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torchvision
+from PIL import Image
 from torchvision.transforms import InterpolationMode
 
 from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
@@ -16,7 +17,45 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils import round_up
+from sglang.srt.utils import ImageData, VideoData, round_up
+
+MIN_SHORT_SIDE_PIXEL = 112
+MAX_TOTAL_PIXELS_IMAGE = 12_845_056
+MAX_TOTAL_PIXELS_VIDEO = 301_056_000
+
+
+def resolve_media_size(
+    width: int, height: int, max_long_side_pixel: Optional[int]
+) -> Tuple[int, int]:
+    """Target (width, height) for one image or video frame."""
+    long_side, short_side = max(width, height), min(width, height)
+    if max_long_side_pixel is not None and long_side > max_long_side_pixel:
+        scale = max_long_side_pixel / long_side
+    elif short_side < MIN_SHORT_SIDE_PIXEL:
+        scale = MIN_SHORT_SIDE_PIXEL / short_side
+    else:
+        return width, height
+    return max(1, round(width * scale)), max(1, round(height * scale))
+
+
+def check_total_pixels(width: int, height: int, frames: int, limit: int) -> None:
+    total = width * height * frames
+    if total > limit:
+        raise ValueError(
+            f"media exceeds the total pixel limit: {width}x{height}"
+            f"{f'x{frames} frames' if frames != 1 else ''} = {total} > {limit}"
+        )
+
+
+def _max_long_side_pixel(item) -> Optional[int]:
+    """Read the per-item cap off whichever carrier the request used."""
+    if isinstance(item, ImageData):
+        return item.max_long_side_pixel
+    if isinstance(item, VideoData):
+        return (item.preprocess_kwargs or {}).get("max_long_side_pixel")
+    if isinstance(item, dict):
+        return item.get("max_long_side_pixel")
+    return None
 
 
 def get_hw_multiple_of(
@@ -236,6 +275,27 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
             video_token_regex=re.compile(r"<video>|<\|video\|>|\]\<\]video\[\>\["),
         ).build(_processor)
 
+    def _rescale_images(self, images: List, image_items: List) -> List:
+        """Apply the provider spec's long-side cap / short-side floor / ceiling."""
+        rescaled = []
+        for index, image in enumerate(images):
+            item = image_items[index] if index < len(image_items) else None
+            if not isinstance(image, Image.Image):
+                # Preprocessed tensors and GPU-decoded images carry their own size.
+                rescaled.append(image)
+                continue
+            cap = _max_long_side_pixel(item)
+            width, height = resolve_media_size(image.width, image.height, cap)
+            if cap is not None:
+                # Only the caller-requested size is ours to bound. Without a cap
+                # the HF processor's own area cap decides the final size, so the
+                # decoded size is not the number to check.
+                check_total_pixels(width, height, 1, MAX_TOTAL_PIXELS_IMAGE)
+            if (width, height) != (image.width, image.height):
+                image = image.resize((width, height), Image.BICUBIC)
+            rescaled.append(image)
+        return rescaled
+
     async def process_mm_data_async(
         self,
         image_data: Optional[List],
@@ -251,26 +311,55 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
             multimodal_tokens=self.mm_tokens,
         )
 
+        extra_kwargs = {}
+        if base_output.images:
+            base_output.images = self._rescale_images(
+                base_output.images, image_data or []
+            )
+            image_caps = [_max_long_side_pixel(item) for item in image_data or []]
+            if image_caps and all(cap is not None for cap in image_caps):
+                # The long-side cap only binds if the processor's own area cap is
+                # loose enough to let it through.
+                extra_kwargs["images_kwargs"] = {"max_pixels": max(image_caps) ** 2}
+
         video_metadata = None
         if base_output.videos:
             image_factor, max_size = self._video_resize_config()
+            video_items = list(request_obj.video_data or [])
+            video_caps = [
+                (
+                    _max_long_side_pixel(video_items[index])
+                    if index < len(video_items)
+                    else None
+                )
+                for index in range(len(base_output.videos))
+            ]
             videos_processed = [
                 await get_video_tensor(
                     video,
                     image_factor=image_factor,
                     max_size=max_size,
                     fps=self.video_fps,
-                    frame_max_size=self.video_frame_max_size,
+                    frame_max_size=cap or self.video_frame_max_size,
                     max_frames=self.video_max_frames,
                 )
-                for video in base_output.videos
+                for video, cap in zip(base_output.videos, video_caps)
             ]
             base_output.videos, video_metadata = map(list, zip(*videos_processed))
+            for video in base_output.videos:
+                frames, _, height, width = video.shape
+                check_total_pixels(width, height, frames, MAX_TOTAL_PIXELS_VIDEO)
+            if video_caps and all(cap is not None for cap in video_caps):
+                extra_kwargs["processor_video_config"] = {
+                    **self.video_config,
+                    "max_pixels": max(video_caps) ** 2,
+                }
 
         mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
             base_output=base_output,
             mm_tokens=self.mm_tokens,
             video_metadata=video_metadata,
+            **extra_kwargs,
         )
 
         return MultimodalProcessorOutput(

@@ -229,6 +229,9 @@ def process_content_for_template_format(
                             detail=image_obj.get("detail") or "auto",
                             max_dynamic_patch=mdp,
                             content_hash=image_obj.get("content_hash"),
+                            max_long_side_pixel=image_obj.get(
+                                "max_long_side_pixel", None
+                            ),
                         )
                     )
 
@@ -246,6 +249,9 @@ def process_content_for_template_format(
                     }
                     if mdp is not None:
                         preprocess_kwargs["max_dynamic_patch"] = mdp
+                    mlsp = video_obj.get("max_long_side_pixel", None)
+                    if mlsp is not None:
+                        preprocess_kwargs["max_long_side_pixel"] = mlsp
                     if not preprocess_kwargs:
                         video_data.append(chunk["video_url"]["url"])
                     else:
