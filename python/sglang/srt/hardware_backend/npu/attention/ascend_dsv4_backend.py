@@ -856,6 +856,9 @@ class DeepseekV4AscendAttnBackend(
             getattr(model_runner, "is_draft_worker", False)
             and self._is_dspark_algorithm
         )
+        # The host metadata op is selected in _kernel_metadata_from_parts exactly
+        # on the DSpark draft worker
+        self._use_host_sparse_metadata = self._is_dspark_draft_worker
         self._dsv4_graph_tokens_per_req = int(model_runner.decode_num_tokens_per_req())
         self._dsv4_state_pools_by_ratio = {
             pool.ratio: pool
@@ -1790,28 +1793,21 @@ class DeepseekV4AscendAttnBackend(
             "has_ori_kv": True,
             "has_cmp_kv": False,
         }
+        # The host metadata op reads CPU int32 mirrors — never a D2H sync of the
+        # device tensors (that would drain the stream and stall overlapped prep).
         c1a_kwargs = base_kwargs | common
-        if self._is_dspark_draft_worker:
-            seq_lens_cpu = getattr(fm, "seq_lens_cpu_int", None)
-            max_seqlen_kv = (
-                int(seq_lens_cpu[:bs].max().item())
-                if seq_lens_cpu is not None and bs > 0
-                else int(actual_seq_lengths_kv[:bs].max().item())
-            )
-            c1a_kwargs.update(
-                cu_seqlens_ori_kv=actual_seq_lengths_q_pa,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_kv=max_seqlen_kv,
-            )
-            c1a_metadata = torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata(
-                device=str(actual_seq_lengths_kv.device),
-                **c1a_kwargs,
-            )
+        if self._use_host_sparse_metadata:
+            cu_q_cpu = fm.actual_seq_lengths_q_pa_cpu
+            if cu_q_cpu is not None and cu_q_cpu.numel() > bs + 1:
+                cu_q_cpu = cu_q_cpu[: bs + 1]
+            host_inputs = {"seqused_kv": fm.seq_lens_cpu_int[:bs].int()}
+            if cu_q_cpu is not None:
+                host_inputs["cu_seqlens_q"] = cu_q_cpu
+            c1a_kwargs = c1a_kwargs | host_inputs
+            metadata_op = torch.ops.npu.sparse_attn_sharedkv_metadata_host
         else:
-            c1a_metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
-                **c1a_kwargs,
-            )
-        kernel_metadata = {"c1a_metadata": c1a_metadata}
+            metadata_op = torch.ops.custom.npu_sparse_attn_sharedkv_metadata
+        kernel_metadata = {"c1a_metadata": metadata_op(**c1a_kwargs)}
 
         if self._dsv4_has_c4:
             c4a_overrides = {
@@ -1820,9 +1816,7 @@ class DeepseekV4AscendAttnBackend(
                 "cmp_topk": self._dsv4_index_topk,
             }
             c4a_kwargs = c1a_kwargs | c4a_overrides
-            kernel_metadata["c4a_metadata"] = (
-                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c4a_kwargs)
-            )
+            kernel_metadata["c4a_metadata"] = metadata_op(**c4a_kwargs)
 
             if actual_seq_lengths_q_pa is not None:
                 # the indexer metadata op wants a fresh contiguous tensor without the leading 0
@@ -1850,9 +1844,7 @@ class DeepseekV4AscendAttnBackend(
         if self._dsv4_has_c128:
             c128a_overrides = {"cmp_ratio": 128, "has_cmp_kv": True}
             c128a_kwargs = c1a_kwargs | c128a_overrides
-            kernel_metadata["c128a_metadata"] = (
-                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c128a_kwargs)
-            )
+            kernel_metadata["c128a_metadata"] = metadata_op(**c128a_kwargs)
 
         return kernel_metadata
 
