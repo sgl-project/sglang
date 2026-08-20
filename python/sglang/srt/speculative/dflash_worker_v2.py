@@ -976,7 +976,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 bs=bs, sampling_info=sampling_info, device=device
             ),
         )
-        if not _is_all_greedy(sampling_info):
+        if not _is_all_greedy(sampling_info) and not _is_npu:
             self._selector_sample = (candidate_ids, q_rows)
         return tokens.view(bs, num_pred)
 
@@ -1908,7 +1908,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
-            if self.selector is not None and not _is_all_greedy(batch.sampling_info):
+            if (
+                self.selector is not None
+                and not _is_all_greedy(batch.sampling_info)
+                and not _is_npu
+            ):
                 self._selector_sample = (
                     self._draft_sampler.candidate_out[:bs],
                     self._draft_sampler.q_out[:bs],
@@ -2014,7 +2018,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         candidates = draft_tokens
         new_seq_lens = None
         target_predict = None
-        if self._selector_sample is not None:
+        # The selector sampling verify (_selector_sampling_accept) scatters a
+        # dense [bs, gamma, vocab] draft-probability buffer and runs the full
+        # chain sampler over the whole vocabulary each step. That is fine on
+        # CUDA, but on Ascend NPU the 200K-vocab softmax/cumsum cost dominates
+        # the step and its cost does not shrink with the verify window. EAGLE
+        # and first-gen DFLASH already fall back to the argmax greedy verify
+        # on NPU (no full-vocab ops); skip the sampling verify there to match.
+        if self._selector_sample is not None and not _is_npu:
             selector_candidate_ids, selector_q_rows = self._selector_sample
             accept_len, bonus = self._selector_sampling_accept(
                 candidates=candidates,
