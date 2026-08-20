@@ -4,7 +4,8 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.pool.base import KVCache
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import BackendAdaptor
 

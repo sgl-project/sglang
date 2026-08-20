@@ -1046,13 +1046,13 @@ def setup_state_kv_args(
     """
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
-    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import (
         DSATokenToKVPool,
         HybridLinearKVPool,
         MiniMaxSparseKVPool,
     )
+    from sglang.srt.mem_cache.pool.base import BaseSWAKVPool
 
     kv_args.state_types = []
     kv_args.state_data_ptrs = []
