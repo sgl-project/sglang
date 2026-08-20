@@ -19,6 +19,7 @@ from sglang.srt.lora.moe.execution_plan import (
     LoraBFamily,
     LoraBSpec,
     MoeLoraExecutionPlan,
+    RouteRequirement,
     SelectedPlan,
     Site,
     build_plan,
@@ -138,6 +139,31 @@ class TestDownBIntoBasePlan:
             ),
         )
         assert replace(indexed, down_b_into_base=True).down_b_into_base is True
+
+    def test_flag_moves_the_down_b_route_to_the_aligned_view(self) -> None:
+        # A raw down-B family asks for the raw route. Under into-base that
+        # family kernel does not run, so the plan must ask for the aligned
+        # route that the into-base kernel reads. Before this rule the plan
+        # built only the raw route and the first forward failed.
+        indexed = replace(
+            _serial_plan(),
+            gate_up_a=LoraASpec(Site.GATE_UP, LoraAFamily.INDEXED),
+            gate_up_b=LoraBSpec(Site.GATE_UP, LoraBFamily.INDEXED_PAIRS),
+            down_a=LoraASpec(Site.DOWN, LoraAFamily.INDEXED),
+            down_b=LoraBSpec(
+                Site.DOWN,
+                LoraBFamily.INDEXED_PAIRS,
+                False,
+                BridgeLayout.PAIR_MAJOR,
+            ),
+        )
+        assert RouteRequirement.ALIGNED_PER_EXPERT not in indexed.route_requirements()
+        scattered = replace(indexed, down_b_into_base=True)
+        assert RouteRequirement.ALIGNED_PER_EXPERT in scattered.route_requirements()
+        assert (
+            RouteRequirement.ALIGNED_PER_EXPERT
+            in scattered.downstream_route_requirements()
+        )
 
     def test_flag_requires_a_standalone_down_b(self) -> None:
         # The shared-rank reduce consumes down-B inside finalize. There is

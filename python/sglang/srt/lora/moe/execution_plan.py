@@ -326,8 +326,9 @@ class MoeLoraExecutionPlan:
 
     def route_requirements(self) -> frozenset[RouteRequirement]:
         """The route products this plan reads."""
-        return self._requirements_of(
-            self.gate_up_a, self.gate_up_b, self.down_a, self.down_b
+        return (
+            self._requirements_of(self.gate_up_a, self.gate_up_b, self.down_a)
+            | self._down_b_route_requirements()
         )
 
     def downstream_route_requirements(self) -> frozenset[RouteRequirement]:
@@ -338,7 +339,22 @@ class MoeLoraExecutionPlan:
         by subtraction. Subtraction also removes a product that a later stage
         reads.
         """
-        return self._requirements_of(self.gate_up_b, self.down_a, self.down_b)
+        return (
+            self._requirements_of(self.gate_up_b, self.down_a)
+            | self._down_b_route_requirements()
+        )
+
+    def _down_b_route_requirements(self) -> frozenset[RouteRequirement]:
+        """The route the down-B stage reads.
+
+        Under into-base the family kernel does not run. The into-base kernel
+        runs in its place, and it reads the aligned route.
+        """
+        if self.down_b is None:
+            return frozenset()
+        if self.down_b_into_base:
+            return frozenset((_aligned_requirement(self.down_b.is_shared_outer),))
+        return self.down_b.route_requirements()
 
     def _requirements_of(
         self, *stages: LoraASpec | LoraBSpec | None

@@ -755,7 +755,10 @@ class MoeLoraRunner:
                 down_out=down_out,
                 bridge=state.rank,
                 b_down=batch.down_lora_b.flatten(0, 1),
-                routing=self._route_for_b(plan.down_b, routes),
+                # The into-base kernel runs in place of the family kernel, and
+                # it walks the aligned route's padded blocks. A raw down-B
+                # family must not pull the raw view in here.
+                routing=routes.aligned(plan.down_b.is_shared_outer),
                 config=launch_config.for_b(plan.down_b.site),
             )
 
