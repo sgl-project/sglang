@@ -1100,10 +1100,13 @@ class LayerwiseOffloadableModuleMixin:
         self.layerwise_offload_managers = []
         named_modules = dict(self.named_modules())
         configured_layer_names = []
-        # These legacy tuning knobs are explicitly DiT-scoped. Auxiliary
-        # components still support layerwise streaming, but their layers run
-        # once per component use and get no reuse benefit from DiT residency.
-        dit_tuning_enabled = self.layerwise_offload_dit_group_enabled
+        # `--dit-*` is the group default these fall back to, not a scope.
+        prefetch_value, resident_value, residency_policy = (
+            server_args.layerwise_tuning_for(
+                component_name,
+                dit_group=self.layerwise_offload_dit_group_enabled,
+            )
+        )
         for layer_name in self.layer_names:
             module_list = named_modules.get(layer_name)
             if not isinstance(module_list, (torch.nn.ModuleList, torch.nn.Sequential)):
@@ -1112,9 +1115,6 @@ class LayerwiseOffloadableModuleMixin:
                 continue
 
             num_layers = len(module_list)
-            prefetch_value = (
-                server_args.dit_offload_prefetch_size if dit_tuning_enabled else 0.0
-            )
             if current_platform.is_mps() and prefetch_value == 0.0:
                 prefetch_size = 0
             elif prefetch_value < 1.0:
@@ -1122,9 +1122,6 @@ class LayerwiseOffloadableModuleMixin:
             else:
                 prefetch_size = int(prefetch_value)
 
-            resident_value = (
-                server_args.dit_layerwise_resident_layers if dit_tuning_enabled else 0.0
-            )
             if resident_value <= 0:
                 resident_layers = 0
             elif resident_value < 1.0:
@@ -1151,11 +1148,7 @@ class LayerwiseOffloadableModuleMixin:
                 prefetch_size=prefetch_size,
                 resident_layers=resident_layers,
                 initialize=False,
-                residency_policy=(
-                    server_args.dit_layerwise_residency_policy
-                    if dit_tuning_enabled
-                    else RESIDENCY_POLICY_LEADING
-                ),
+                residency_policy=residency_policy,
             )
             self.layerwise_offload_managers.append(manager)
             configured_layer_names.append(layer_name)
