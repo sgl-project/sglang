@@ -62,6 +62,7 @@ class SchedulerOutputStreamer:
     # Rust egress ring via `rust_server.push_generation` instead of the zmq
     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
     rust_server: Optional[RustServer] = None
+    is_multimodal_gen: bool = False
     _test_stream_output_count: int = 0
 
     def __post_init__(self) -> None:
@@ -205,6 +206,8 @@ class SchedulerOutputStreamer:
                 acc.customized_info[key] = values
 
         # Send to detokenizer
+        if self.is_multimodal_gen:
+            return
         payload = acc.to_payload(
             dp_rank=get_parallel().dp_rank,
             is_idle_batch=is_idle_batch,

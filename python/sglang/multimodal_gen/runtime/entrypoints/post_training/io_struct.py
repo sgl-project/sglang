@@ -79,6 +79,8 @@ class RolloutRequest(BaseModel):
     fps: Optional[int] = None
 
     rollout: bool = True
+    # "uint8": quantise the video engine-side; None: ship unchanged
+    rollout_video_dtype: Optional[str] = None
     rollout_sde_type: str = "sde"
     rollout_noise_level: float = 0.7
     rollout_log_prob_no_const: bool = False
