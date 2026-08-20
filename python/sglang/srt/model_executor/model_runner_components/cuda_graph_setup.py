@@ -396,7 +396,7 @@ def capture_prefill_graph(
     model_runner.attention_layers = _align_pipeline_layers(
         model_runner.attention_layers, layer_model
     )
-    if len(model_runner.attention_layers) < len(layer_model.layers):
+    if len(model_runner.attention_layers) < model_runner.model_config.num_hidden_layers:
         # TODO(yuwei): support Non-Standard GQA
         log_info_on_rank0(
             logger,
