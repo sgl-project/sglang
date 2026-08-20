@@ -366,7 +366,15 @@ class MoeLoraExecutionPlan:
         # A standalone down-B implies the materialized finalize (any other
         # finalize consumes it).  Which B kernel implements the epilogue is a
         # provider capability, checked in MoeLoraRunner.validate_plan.
-        return self.down_b is not None and self.down_overlap is DownOverlap.NONE
+        #
+        # down-B must launch after the base down GEMM has written its rows.
+        # NONE and DOWN_A both satisfy that -- DOWN_A joins its fork before
+        # down-B runs -- while DOWN_B and DOWN_A_B put down-B on the side
+        # stream concurrently with the base GEMM, which is the real hazard.
+        return self.down_b is not None and self.down_overlap in (
+            DownOverlap.NONE,
+            DownOverlap.DOWN_A,
+        )
 
     def route_requirements(self) -> frozenset[RouteRequirement]:
         """Return the exact union of route products consumed by this plan.

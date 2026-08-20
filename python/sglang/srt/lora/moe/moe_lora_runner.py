@@ -834,6 +834,16 @@ class MoeLoraRunner:
             )
             state.delta = delta
 
+        def down_b_into_base(down_out: torch.Tensor) -> None:
+            provider.run_down_b_into_base(
+                base_gemm_state,
+                down_out=down_out,
+                bridge=state.rank,
+                b_down=batch.down_lora_b.flatten(0, 1),
+                routing=self._route_for_b(plan.down_b, routes),
+                config=launch_config.for_b(plan.down_b.site),
+            )
+
         def base() -> torch.Tensor:
             down_out = self.workspace.tensor(
                 "base:down",
@@ -847,17 +857,8 @@ class MoeLoraRunner:
         if plan.down_overlap is DownOverlap.NONE:
             down_a()
             if plan.down_b_into_base:
-                # base writes its rows first, then down-B adds into
-                # them through src2dst rather than into a delta of its own.
                 down_out = base()
-                provider.run_down_b_into_base(
-                    base_gemm_state,
-                    down_out=down_out,
-                    bridge=state.rank,
-                    b_down=batch.down_lora_b.flatten(0, 1),
-                    routing=self._route_for_b(plan.down_b, routes),
-                    config=launch_config.for_b(plan.down_b.site),
-                )
+                down_b_into_base(down_out)
             else:
                 if plan.down_b is not None:
                     down_b()
@@ -869,7 +870,9 @@ class MoeLoraRunner:
                 compute=base,
                 side=down_a,
             )
-            if plan.down_b is not None:
+            if plan.down_b_into_base:
+                down_b_into_base(down_out)
+            elif plan.down_b is not None:
                 down_b()
         elif plan.down_overlap is DownOverlap.DOWN_B:
             down_a()

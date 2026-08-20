@@ -361,6 +361,44 @@ is never just one stage.
 Provenance and the full axis inventory: the campaign's best-config tables
 document, plus `B200_POLICY_ADJUDICATION_20260814.md`.
 
+DOWN_A window on top of `down_b_into_base` (2026-08-20, B200
+`verda-b200-fin-03-3`, one layer forward, hidden 2048 / intermediate 768 /
+top-k 8 / rank 16, 21 repeats x 40 iterations with the arm order rotated per
+repeat, first repeat discarded). Percentages are paired per-repeat deltas
+against `down_overlap=none` + delta buffer; the CONTROL column is a fifth arm
+byte-identical to that baseline, so it is the noise floor and no number inside
+it means anything:
+
+| tokens | rows | E | into-base | DOWN_A | both | control |
+|---:|---|---:|---:|---:|---:|---:|
+| 8192 | route_major | 64 | -1.98% | -1.94% | **-3.95%** [-6.1,-1.9] | +0.86% |
+| 8192 | route_major | 128 | -1.46% | -1.68% | **-3.43%** [-5.2,-1.7] | +0.64% |
+| 8192 | expert_major | 64 | -1.59% | -1.57% | **-3.73%** [-5.5,-0.8] | +0.68% |
+| 4096 | route_major | 64 | -1.92% | -2.75% | **-3.41%** | +0.46% |
+| 2048 | route_major | 64 | **-2.86%** | +1.64% | +0.81% | +0.38% |
+| 1024 | route_major | 64 | -0.90% | +7.12% | +6.54% | +0.02% |
+
+Three readings. The two effects are near-additive at prefill token counts, and
+at 8192 the whole paired range of the combined arm is negative and clear of the
+control. The row domain does not matter, which is what the epilogue's
+row-domain agnosticism predicts. And the DOWN_A fork crosses over between 2048
+and 4096 tokens: below that its fork/join costs more than it hides, +1.6% at
+2048 and +7.1% at 1024, while the into-base epilogue alone wins at every size
+measured.
+
+That crossover is why the shipped rows still declare `down_overlap: none`.
+`down_b_into_base_eligible` admits DOWN_A, so a table can ask for it, but plan
+selection has no token predicate (`max_rank` is the only one), so a prefill row
+applies to a short final chunk and a short prompt too, where this costs 7%.
+Turning it on needs either an e2e run at the serving protocol that stays ahead
+including short prefills, or a `max_tokens` predicate on plan rows the way the
+tile rules already have one.
+
+Harness: the arms are the 2x2 of `down_overlap` and `down_b_into_base` over one
+`MoeLoraRunner.run_plan`, timed as wall clock over batches of back-to-back
+calls -- never CUDA events around a single call, which has measured a config
+faster than itself here before.
+
 To onboard a model whose geometry the shipped `domain`/rows do not cover:
 
 ```

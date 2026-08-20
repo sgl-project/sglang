@@ -200,10 +200,22 @@ class TestDownBIntoBasePlan:
         with pytest.raises(ValueError, match="down-B into-base"):
             replace(consumed, down_b_into_base=True)
 
-    def test_flag_rejects_down_overlap_windows(self) -> None:
-        overlapped = _build_plan(down_overlap=DownOverlap.DOWN_B)
-        with pytest.raises(ValueError, match="down-B into-base"):
-            replace(overlapped, down_b_into_base=True)
+    def test_flag_rejects_the_windows_that_race_the_base_gemm(self) -> None:
+        # down-B must launch after the base down GEMM has written its rows.
+        # DOWN_B and DOWN_A_B put down-B on the side stream concurrently with
+        # the base GEMM, so it would read rows that are not there yet.
+        for window in (DownOverlap.DOWN_B, DownOverlap.DOWN_A_B):
+            overlapped = _build_plan(down_overlap=window)
+            with pytest.raises(ValueError, match="down-B into-base"):
+                replace(overlapped, down_b_into_base=True)
+
+    def test_flag_admits_the_down_a_window(self) -> None:
+        # DOWN_A forks down-A against the base GEMM and JOINS before down-B
+        # runs, so the rows are complete -- the same ordering the serial
+        # branch gives.  Measured faster than either alone at prefill token
+        # counts; see the configs README.
+        forked = _build_plan(down_overlap=DownOverlap.DOWN_A)
+        assert replace(forked, down_b_into_base=True).down_b_into_base is True
 
 
 # ---- CPU: shipped config structure -----------------------------------------------
