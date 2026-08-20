@@ -2391,7 +2391,7 @@
             "expected_avg_denoise_ms": 429.1,
             "expected_median_denoise_ms": 438.64,
             "load_peak_vram_mb": 64344.0,
-            "runtime_peak_vram_mb": 74118.0,
+            "runtime_peak_vram_mb": 70620.0,
             "estimated_full_test_time_s": 145.1
         },
         "wan2_1_t2v_1.3b_upscaling_4x": {
@@ -2749,8 +2749,8 @@
             "expected_e2e_ms": 0.0,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
-            "load_peak_vram_mb": 43056.0,
-            "runtime_peak_vram_mb": 74396.0,
+            "load_peak_vram_mb": 42814.0,
+            "runtime_peak_vram_mb": 73256.0,
             "estimated_full_test_time_s": 126.0
         },
         "ltx_2_3_hq_pipeline": {

@@ -489,6 +489,9 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
                 "--pipeline-class-name LingBotWorldCausalDMDPipeline --warmup-mode off"
             ],
             text_encoder_cpu_offload=True,
+            env_vars={
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            },
         ),
         REALTIME_MODEL_sampling_params,
         run_component_accuracy_check=False,
