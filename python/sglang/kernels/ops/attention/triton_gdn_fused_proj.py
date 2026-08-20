@@ -187,6 +187,8 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     TOTAL_Q: tl.constexpr = NUM_HEADS_QK * HEAD_QK
     TOTAL_K: tl.constexpr = NUM_HEADS_QK * HEAD_QK
     TOTAL_V: tl.constexpr = NUM_HEADS_V * HEAD_V
+    TOTAL_QKVZ: tl.constexpr = TOTAL_Q + TOTAL_K + TOTAL_V + TOTAL_V
+    TOTAL_BA: tl.constexpr = NUM_HEADS_V * 2
 
     # ── Output dimensions ──
     QKV_DIM_T: tl.constexpr = TOTAL_Q + TOTAL_K + TOTAL_V
@@ -220,6 +222,7 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
         + TOTAL_V
         + i_qk * V_PER_GROUP * HEAD_V
         + tl.arange(0, V_PER_GROUP * HEAD_V)
+    )
     # Base offsets of the v/z regions for head group i_qk. tl.arange only
     # accepts power-of-two extents, so non-power-of-two group sizes (e.g. the
     # v/k head ratio 3 of the dense 27B hybrids) walk the group one
