@@ -1,8 +1,12 @@
-"""DeepSeek-V4 MXFP4 expert backend backed by the b12x W4A16 fused MoE.
+"""DeepSeek-V4 MXFP4 expert backend backed by the b12x fused MoE.
 
 Same checkpoint as :mod:`mxfp4_flashinfer_cutlass_moe`, different runtime: one
-fused kernel per expert layer instead of seven, and bf16 activations instead of
-MXFP8.
+fused kernel per expert layer instead of seven.
+
+The quant mode is ``SGLANG_B12X_MOE_QUANT_MODE``, passed to b12x verbatim. It
+defaults to ``w4a8_mx`` (activations quantized to MXFP8-E4M3 in-kernel), the
+recipe the official vLLM DGX Spark image runs and where all of b12x's GB10 MoE
+tuning lives; ``w4a16`` keeps bf16 activations on a load-time frozen plan.
 
 This targets exactly one generation of the standalone ``b12x`` package: the
 op-registry API (``b12x.moe.fused_moe``, ``Caps -> plan() -> bind() -> run()``)
@@ -152,12 +156,14 @@ def _warmup(*, launch, top_k, num_experts, hidden_size, device, counts):
     _B12X_WARMED = True
 
 
-def _prepare_weights(*, w13, s13, w2, s2, ones, num_experts, hidden_size, intermediate):
+def _prepare_weights(
+    *, w13, s13, w2, s2, ones, num_experts, hidden_size, intermediate, quant_mode
+):
     """Weight plan + prep. Repacks in place, so the caller's tensors stay live."""
     from b12x.moe import fused_moe
 
     weight_plan = fused_moe.plan_weights(
-        quant_modes="w4a16",
+        quant_modes=quant_mode,
         source_format="fp4_e8m0_k32",
         activation="silu",
         params_dtype=torch.bfloat16,
@@ -233,7 +239,7 @@ def _plan_scratch(*, experts, top_k, device, swiglu_limit, counts):
 
 
 def _make_launcher(*, plan, scratch, experts):
-    """Bind-and-run closure, matching vLLM's call sequence."""
+    """W4A16 bind-and-run closure over the load-time frozen plan."""
     from b12x.moe import fused_moe
 
     def launch(a, topk_ids, topk_weights, out):
@@ -255,8 +261,92 @@ def _make_launcher(*, plan, scratch, experts):
     return launch
 
 
+def _plan_a8_arena(*, experts, top_k, device, swiglu_limit, counts, quant_mode):
+    """Shared arena for the W4A8 per-forward-planned path.
+
+    W4A8 selects its implementation (micro vs dynamic) and tile regime from
+    the live token count, so the plan is rebuilt per call, vLLM-style --
+    b12x's planning is host-only, allocation- and compile-free for this
+    recipe, and under full-graph capture it runs once per bucket at capture
+    time. Only the arena is fixed: sized here over the whole count ladder
+    (required_nbytes covers every bucketed count including the micro/dynamic
+    cutover), shared by every layer and every per-call plan.
+    """
+    from b12x.moe import fused_moe
+
+    from sglang.srt.runtime_context import get_resources
+
+    fingerprint = (
+        quant_mode,
+        int(top_k),
+        tuple(counts),
+        None if swiglu_limit is None else float(swiglu_limit),
+        int(experts.num_experts),
+        int(experts.hidden_size),
+        int(experts.intermediate_size),
+    )
+    buffers = get_resources().buffers
+    key = f"b12x:moe_a8_arena:{device}"
+    cached = buffers.get(key)
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
+    caps = fused_moe.Caps(
+        max_tokens=max(counts),
+        num_topk=top_k,
+        device=device,
+        weight_plan=experts.plan,
+        core_token_counts=tuple(counts),
+        route_num_experts=0,
+        route_logits_dtype=None,
+        quant_mode=quant_mode,
+        apply_router_weight_on_input=False,
+        swiglu_limit=swiglu_limit,
+        frozen=True,
+    )
+    arena = torch.empty(
+        int(fused_moe.required_nbytes(caps)), dtype=torch.uint8, device=device
+    )
+    buffers[key] = (fingerprint, arena)
+    return arena
+
+
+def _make_launcher_a8(*, arena, experts, top_k, device, swiglu_limit, quant_mode):
+    """W4A8 bind-and-run closure; plans at the live token count per call."""
+    from b12x.moe import fused_moe
+
+    def launch(a, topk_ids, topk_weights, out):
+        m = max(1, int(a.shape[0]))
+        caps = fused_moe.Caps(
+            max_tokens=m,
+            num_topk=top_k,
+            device=device,
+            weight_plan=experts.plan,
+            core_token_counts=(m,),
+            route_num_experts=0,
+            route_logits_dtype=None,
+            quant_mode=quant_mode,
+            apply_router_weight_on_input=False,
+            swiglu_limit=swiglu_limit,
+            frozen=True,
+        )
+        plan = fused_moe.plan(caps)
+        fused_moe.run(
+            binding=plan.bind(
+                scratch=arena,
+                a=a,
+                experts=experts,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                output=out,
+                input_scales_static=True,
+            )
+        )
+
+    return launch
+
+
 class Mxfp4B12xMoEMethod:
-    """b12x MXFP4 MoE: one fused W4A16 kernel per expert layer."""
+    """b12x MXFP4 MoE: one fused kernel per expert layer."""
 
     def __init__(self, fp8_method, prefix: str):
         _require_aligned_generation()
@@ -334,9 +424,12 @@ class Mxfp4B12xMoEMethod:
                     f"of source_format='fp4_e8m0_k32'. Got {scale.dtype}."
                 )
 
+        # Passed straight to b12x. "w4a16" is the frozen-plan path; every other
+        # mode quantizes activations in-kernel and plans per call.
+        quant_mode = envs.SGLANG_B12X_MOE_QUANT_MODE.get()
         log_info_on_rank0(
             logger,
-            f"Preparing DSv4 MXFP4 experts for b12x W4A16 "
+            f"Preparing DSv4 MXFP4 experts for b12x {quant_mode} "
             f"(layer: {self.prefix}, swiglu_limit={self._swiglu_limit})...",
         )
 
@@ -366,26 +459,48 @@ class Mxfp4B12xMoEMethod:
             num_experts=num_experts,
             hidden_size=hidden_size,
             intermediate=intermediate,
+            quant_mode=quant_mode,
         )
         counts = _core_token_counts(_b12x_max_tokens(), spec_tokens)
-        plan, scratch = _plan_scratch(
-            experts=experts,
-            top_k=int(layer.top_k),
-            device=device,
-            swiglu_limit=self._swiglu_limit,
-            counts=counts,
-        )
-        self._launch = _make_launcher(plan=plan, scratch=scratch, experts=experts)
+        if quant_mode != "w4a16":
+            arena = _plan_a8_arena(
+                experts=experts,
+                top_k=int(layer.top_k),
+                device=device,
+                swiglu_limit=self._swiglu_limit,
+                counts=counts,
+                quant_mode=quant_mode,
+            )
+            self._launch = _make_launcher_a8(
+                arena=arena,
+                experts=experts,
+                top_k=int(layer.top_k),
+                device=device,
+                swiglu_limit=self._swiglu_limit,
+                quant_mode=quant_mode,
+            )
+            plan_or_arena = arena
+        else:
+            plan, scratch = _plan_scratch(
+                experts=experts,
+                top_k=int(layer.top_k),
+                device=device,
+                swiglu_limit=self._swiglu_limit,
+                counts=counts,
+            )
+            self._launch = _make_launcher(plan=plan, scratch=scratch, experts=experts)
+            plan_or_arena = (plan, scratch)
         # The prepared weights alias the checkpoint storage (REUSE_SOURCE for
-        # 128-aligned fp4_e8m0_k32), so these tensors must stay reachable. Keep
-        # the Parameters as they are and hold our own references.
-        self._keepalive = (experts, w13, s13, w2, s2, ones, plan, scratch)
+        # 128-aligned fp4_e8m0_k32; w4a8_mx repacks likewise discard the
+        # source Parameters), so these tensors must stay reachable. Keep the
+        # Parameters as they are and hold our own references.
+        self._keepalive = (experts, w13, s13, w2, s2, ones, plan_or_arena)
         # b12x will not compile while a CUDA graph is being captured, so every
         # shape a graph can present has to have run once already.
         if not _B12X_WARMED and envs.SGLANG_B12X_WARMUP.get():
             log_info_on_rank0(
                 logger,
-                f"Compiling b12x W4A16 kernels for {len(counts)} "
+                f"Compiling b12x {quant_mode} kernels for {len(counts)} "
                 f"token counts ({counts[0]}..{counts[-1]})...",
             )
             _warmup(
