@@ -107,23 +107,27 @@ class SchedulerRequestReceiver:
                 recv_reqs = []
 
                 # Rust ringbuffer backend: drain the in-process ring fed by the
-                # embedded Rust TokenizerManager instead of a zmq socket. Same
-                # non-blocking, msgpack-decoded contract as the zmq path below.
+                # embedded Rust TokenizerManager instead of the zmq *tokenizer*
+                # socket. Same non-blocking, msgpack-decoded contract.
                 if envs.SGLANG_RUST_SERVER.get():
                     recv_reqs.extend(
                         self.recv_from_tokenizer.drain(self.max_recv_per_poll)
                     )
-                    return recv_reqs
-
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
+                else:
+                    while True:
+                        try:
+                            if self.recv_limit_reached(len(recv_reqs)):
+                                break
+                            recv_req = sock_recv(self.recv_from_tokenizer, zmq.NOBLOCK)
+                        except zmq.ZMQError:
                             break
-                        recv_req = sock_recv(self.recv_from_tokenizer, zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_req)
+                        recv_reqs.append(recv_req)
 
+                # The peer here is the offline `Engine` (`collective_rpc`). The
+                # Rust server replaces the tokenizer channel only, so this loop
+                # runs in both modes. In rust mode `RustServerIdleSleeper` parks
+                # on the ring alone, so a frame arriving at an idle scheduler
+                # waits out that park before this loop sees it.
                 while True:
                     try:
                         if self.recv_limit_reached(len(recv_reqs)):
