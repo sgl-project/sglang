@@ -794,13 +794,13 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         # Bind the masked helpers once. Each one serves either row domain,
         # because it reaches every row through src2dst over a flat row view.
         from sglang.kernels.ops.moe.ep_moe_kernels import post_reorder_deepgemm
-        from sglang.srt.lora.moe.base_gemm_provider.down_b_into_base import (
-            invoke_down_b_into_base,
-        )
         from sglang.srt.lora.moe.base_gemm_provider.masked_finalize import (
             MASKED_FINALIZE_TRITON,
             invoke_shared_from_scratch_finalize,
             invoke_shared_rank_reduce,
+        )
+        from sglang.srt.lora.moe.lora_b import (
+            invoke_down_b_into_base,
         )
 
         self._post_reorder = post_reorder_deepgemm

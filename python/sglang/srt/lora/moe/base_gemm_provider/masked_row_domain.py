@@ -90,9 +90,6 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         self._post_reorder = post_reorder_deepgemm
         self._act_kernel = act_delta_masked
 
-        from sglang.srt.lora.moe.base_gemm_provider.down_b_into_base import (
-            invoke_down_b_into_base,
-        )
         from sglang.srt.lora.moe.base_gemm_provider.masked_finalize import (
             MASKED_FINALIZE_TRITON,
             invoke_shared_from_scratch_finalize,
@@ -102,6 +99,9 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             MASKED_ACT_FAMILIES,
             MASKED_ACT_TRITON,
             run_masked_fused_act,
+        )
+        from sglang.srt.lora.moe.lora_b import (
+            invoke_down_b_into_base,
         )
 
         # A port can install another callable under a new name. The method
