@@ -1032,11 +1032,27 @@ def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker
 def _check_rerun_test_permissions(gh_repo, pr, comment, user_perms, command_name):
     """
     Check permissions shared by /rerun-test and /rerun-group.
+
+    `can_rerun_test` is the only permission that clears a fork PR, and it counts
+    only when it comes from CI_PERMISSIONS.json -- main() marks PR authors with
+    `_is_pr_author` instead, so opening a fork PR never self-grants the fork
+    exemption.
     """
+    can_rerun_test = user_perms.get("can_rerun_test", False)
+
+    if not (
+        can_rerun_test
+        or user_perms.get("can_rerun_stage", False)
+        or user_perms.get("_is_pr_author", False)
+    ):
+        print(f"Permission denied: /{command_name} requires can_rerun_test.")
+        return False
+
     # SECURITY: These commands check out and execute code from the PR branch on
-    # self-hosted GPU runners, so fork PRs require a trusted collaborator.
+    # self-hosted GPU runners, so a fork PR needs either an explicit
+    # `can_rerun_test` grant or a trusted collaborator.
     is_fork = pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
-    if is_fork:
+    if is_fork and not can_rerun_test:
         commenter = comment.user.login
         perm = gh_repo.get_collaborator_permission(commenter)
         if perm not in ("admin", "write"):
@@ -1044,18 +1060,12 @@ def _check_rerun_test_permissions(gh_repo, pr, comment, user_perms, command_name
             comment.create_reaction("confused")
             pr.create_issue_comment(
                 f"⛔ `/{command_name}` is not available for fork PRs unless the commenter "
-                "has write permission on the repo.\n\n"
+                "has `can_rerun_test` in `.github/CI_PERMISSIONS.json` or write "
+                "permission on the repo.\n\n"
                 "Please ask a maintainer to run this command, or use the normal CI flow."
             )
             return False
         print(f"Fork PR, but commenter {commenter} has write+ permission. Proceeding.")
-
-    if not (
-        user_perms.get("can_rerun_test", False)
-        or user_perms.get("can_rerun_stage", False)
-    ):
-        print("Permission denied: neither can_rerun_test nor can_rerun_stage is true.")
-        return False
 
     return True
 
@@ -1323,7 +1333,8 @@ def main():
     # PR authors can always rerun failed CI and rerun individual UTs on their own PRs,
     # even if they are not listed in CI_PERMISSIONS.json.
     # Note: /tag-run-ci-label still requires CI_PERMISSIONS.json.
-    # Note: /rerun-test is blocked entirely for fork PRs in handle_rerun_test() itself.
+    # Note: authorship is marked as `_is_pr_author`, never as `can_rerun_test` --
+    # only the latter clears a fork PR, and it must come from CI_PERMISSIONS.json.
     if pr.user.login == user_login:
         if user_perms is None:
             print(
@@ -1336,7 +1347,7 @@ def main():
                 f"User {user_login} is the PR author and has existing CI permissions."
             )
         user_perms["can_rerun_failed_ci"] = True
-        user_perms["can_rerun_test"] = True
+        user_perms["_is_pr_author"] = True
 
     if not user_perms:
         print(f"User {user_login} does not have any configured permissions. Exiting.")
