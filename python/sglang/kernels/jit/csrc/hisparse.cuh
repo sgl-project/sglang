@@ -673,8 +673,15 @@ __global__ void load_cache_to_device_buffer_kernel(
 #endif
   }
 
-  // each warp copies one miss directly, can be separated into a new kernel if parallelism is a concern
-  if constexpr (!SkipIO) {
+  // CUDA generic MLA records the plan and performs the copies in a separate
+  // multi-CTA kernel. ROCm, DSv4, and callers without plan scratch keep the
+  // original fused path.
+#ifndef USE_ROCM
+  constexpr bool UseParallelMissCopy = IsMLA && !IsDsv4Layout && RecordMissPlan;
+#else
+  constexpr bool UseParallelMissCopy = false;
+#endif
+  if constexpr (!SkipIO && !UseParallelMissCopy) {
     for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
       const int32_t miss_token = s_top_k_tokens[miss_idx];
       const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_idx];
@@ -687,6 +694,19 @@ __global__ void load_cache_to_device_buffer_kernel(
     }
   }
 }
+
+template <int BLOCK_SIZE, bool IsMLA, bool IsDsv4Layout, bool SkipIO>
+__global__ __launch_bounds__(BLOCK_SIZE, 1) void copy_cache_planned_kernel(
+    const int64_t* __restrict__ miss_src_locs,
+    const int32_t* __restrict__ miss_dst_locs,
+    const int32_t* __restrict__ miss_counts,
+    const int32_t* __restrict__ num_real_reqs,
+    const void* __restrict__ host_cache_k,
+    const void* __restrict__ host_cache_v,
+    void* __restrict__ device_buffer_k,
+    void* __restrict__ device_buffer_v,
+    int64_t plan_stride,
+    int64_t item_size_bytes);
 
 template <
     int BLOCK_SIZE,
@@ -832,6 +852,26 @@ void load_cache_to_device_buffer(
         static_cast<const int32_t*>(seq_lens.data_ptr()),
         static_cast<const int32_t*>(req_pool_indices.data_ptr()));
   }
+
+#ifndef USE_ROCM
+  if constexpr (IsMLA && !IsDsv4Layout && RecordMissPlan) {
+    // Preserve the original per-request scheduling policy while reusing the
+    // shared-index plan representation introduced by #34329.
+    const int64_t copy_blocks = (bs <= 2) ? bs * 4 : bs;
+    LaunchKernel(copy_blocks, BLOCK_SIZE, device)(
+        copy_cache_planned_kernel<BLOCK_SIZE, IsMLA, IsDsv4Layout, SkipIO>,
+        miss_src_ptr,
+        miss_dst_ptr,
+        miss_count_ptr,
+        static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+        host_cache_k.data_ptr(),
+        (IsMLA || host_cache_v.ndim() == 0) ? (const void*)nullptr : host_cache_v.data_ptr(),
+        device_buffer_k.data_ptr(),
+        (IsMLA || device_buffer_v.ndim() == 0) ? (void*)nullptr : device_buffer_v.data_ptr(),
+        plan_stride,
+        item_size_bytes);
+  }
+#endif
 }
 
 // Copy-only swap-in for shared-index skip layers: replays the anchor's recorded

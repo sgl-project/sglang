@@ -141,7 +141,10 @@ def _load_cache_to_device_buffer_mla(
         hot_buffer_size >= num_top_k
     ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
 
-    record_miss_plan = miss_src is not None
+    # CUDA generic MLA splits resolve and Host->GPU IO. Reuse the same miss
+    # plan format as shared-index prefetch so both paths share one copy kernel.
+    use_parallel_miss_copy = not is_dsv4_layout and torch.version.hip is None
+    record_miss_plan = miss_src is not None or use_parallel_miss_copy
     module = _jit_sparse_module(
         item_size_bytes,
         block_size,
@@ -158,6 +161,18 @@ def _load_cache_to_device_buffer_mla(
     if num_real_reqs is None:
         num_real_reqs = torch.tensor(
             [top_k_tokens.size(0)], dtype=torch.int32, device=top_k_tokens.device
+        )
+
+    if use_parallel_miss_copy and miss_src is None:
+        batch_size = top_k_tokens.size(0)
+        miss_src = torch.empty(
+            (batch_size, num_top_k), dtype=torch.int64, device=top_k_tokens.device
+        )
+        miss_dst = torch.empty(
+            (batch_size, num_top_k), dtype=torch.int32, device=top_k_tokens.device
+        )
+        miss_count = torch.empty(
+            batch_size, dtype=torch.int32, device=top_k_tokens.device
         )
 
     if record_miss_plan:
