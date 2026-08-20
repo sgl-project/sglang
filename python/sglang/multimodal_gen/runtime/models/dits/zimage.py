@@ -1245,7 +1245,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             return None, None
 
         cos, sin = freqs_cis
-        if not current_platform.is_cuda_alike() or not (cos.is_cuda and sin.is_cuda):
+        if not (cos.is_cuda and sin.is_cuda):
             return None, None
 
         cache_key = (

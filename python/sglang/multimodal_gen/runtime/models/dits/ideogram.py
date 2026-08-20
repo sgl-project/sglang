@@ -54,10 +54,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
-from sglang.multimodal_gen.runtime.platforms import (
-    AttentionBackendEnum,
-    current_platform,
-)
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -81,7 +78,6 @@ def _can_use_fused_rope(
     return (
         q.dtype is torch.bfloat16
         and k.dtype is torch.bfloat16
-        and current_platform.is_cuda_alike()
         and q.is_cuda
         and q.dim() == 4
         and q.is_contiguous()
@@ -437,7 +433,6 @@ def _norm_scale(
             return y
     if (
         not torch.compiler.is_compiling()
-        and current_platform.is_cuda_alike()
         and x.is_cuda
         and not torch.cuda.is_current_stream_capturing()
         and x.dim() == 3
@@ -475,7 +470,6 @@ def _gate_residual(
     tanh_gate = torch.tanh(gate)
     if (
         not torch.compiler.is_compiling()
-        and current_platform.is_cuda_alike()
         and x.is_cuda
         and not torch.cuda.is_current_stream_capturing()
     ):

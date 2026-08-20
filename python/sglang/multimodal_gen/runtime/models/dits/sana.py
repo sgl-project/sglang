@@ -24,7 +24,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -74,12 +73,7 @@ def _sana_ln_modulate(
     """
     global _SANA_LN_MOD_DISABLED
 
-    if (
-        _SANA_LN_MOD_DISABLED
-        or torch.compiler.is_compiling()
-        or not current_platform.is_cuda_alike()
-        or not x.is_cuda
-    ):
+    if _SANA_LN_MOD_DISABLED or torch.compiler.is_compiling() or not x.is_cuda:
         return _eager_ln_modulate(norm, x, scale, shift)
 
     capturing = torch.cuda.is_current_stream_capturing()
@@ -163,11 +157,7 @@ def _mps_safe_conv2d(conv: nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
 
 
 def _use_sana_bcg_fast_path(x: torch.Tensor) -> bool:
-    if (
-        torch.compiler.is_compiling()
-        or not current_platform.is_cuda_alike()
-        or not x.is_cuda
-    ):
+    if torch.compiler.is_compiling() or not x.is_cuda:
         return False
     return torch.cuda.is_current_stream_capturing() or (
         torch.cuda.current_stream() != torch.cuda.default_stream()

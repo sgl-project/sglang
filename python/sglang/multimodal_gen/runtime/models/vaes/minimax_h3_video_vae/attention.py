@@ -45,7 +45,6 @@ def _apply_qk_norm(module, hidden_states):
         and isinstance(module, (nn.LayerNorm, nn.RMSNorm))
         and module.weight is None
         and (not isinstance(module, nn.LayerNorm) or module.bias is None)
-        and current_platform.is_cuda_alike()
         and hidden_states.is_cuda
         and hidden_states.dtype in (torch.float16, torch.bfloat16)
         and not torch.is_grad_enabled()

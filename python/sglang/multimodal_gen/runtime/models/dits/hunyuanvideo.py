@@ -147,7 +147,6 @@ def _hunyuan_pack_qkv(
     verified = sig in _HUNYUAN_QKV_PACK_SIGS
     can_attempt = (
         not _HUNYUAN_QKV_PACK.disabled
-        and current_platform.is_cuda_alike()
         and img_q.is_cuda
         and img_q.dtype == torch.bfloat16
         and img_q.shape[-1] <= 128

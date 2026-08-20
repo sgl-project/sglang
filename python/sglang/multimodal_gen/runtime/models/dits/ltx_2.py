@@ -232,7 +232,6 @@ def _ltx2_try_fused_ada_values9(
     if (
         _LTX2_FUSED_ADA_VALUES_RUNTIME_DISABLED
         or get_tp_world_size() != 1
-        or not current_platform.is_cuda_alike()
         or not timestep.is_cuda
         or timestep.dtype != torch.bfloat16
         or timestep.ndim != 3
@@ -326,7 +325,6 @@ def apply_split_rotary_emb(
         and x.dtype == torch.bfloat16
         and cos.dtype == torch.bfloat16
         and sin.dtype == torch.bfloat16
-        and current_platform.is_cuda_alike()
         and x.is_cuda
         and x.is_contiguous()
         and cos.is_cuda

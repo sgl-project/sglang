@@ -103,7 +103,6 @@ def _fused_conv_cache_supported(conv: nn.Module, x: torch.Tensor) -> bool:
         cat_pad_channels_last_3d is not None
         and type(conv) is WanCausalConv3d
         and x.dim() == 5
-        and current_platform.is_cuda_alike()
         and x.is_cuda
         and current_platform.is_amp_supported()
         and _conv3d_weight_is_channels_last_3d(conv.weight)
@@ -519,7 +518,6 @@ def residual_up_block_forward(self, x):
         if (
             dup_up3d_add is not None
             and type(shortcut) is DupUp3D
-            and current_platform.is_cuda_alike()
             and x.is_cuda
             and x_copy.is_cuda
             and x.dtype == x_copy.dtype

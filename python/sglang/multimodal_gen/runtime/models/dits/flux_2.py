@@ -156,7 +156,6 @@ def _flux2_swiglu(x: torch.Tensor) -> torch.Tensor:
     verified = sig in _FLUX2_SWIGLU_SIGS
     can_fuse = (
         not _FLUX2_SWIGLU.disabled
-        and current_platform.is_cuda_alike()
         and x.is_cuda
         and x.dtype is torch.bfloat16
         and x.dim() == 3

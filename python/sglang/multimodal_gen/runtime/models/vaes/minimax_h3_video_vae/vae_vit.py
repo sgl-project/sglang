@@ -9,8 +9,6 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils import logging
 
-from sglang.multimodal_gen.runtime.platforms import current_platform
-
 from .base_module import RotaryEmbeddingND, TransformerBlock
 from .vit_utils import create_token_ids, prepare_rotary_pos_emb
 
@@ -27,11 +25,7 @@ def _linear_with_module_dtype(linear, tensor, out_dtype=None):
 
 
 def _cuda_autocast_disabled(tensor: torch.Tensor):
-    return (
-        torch.autocast("cuda", enabled=False)
-        if current_platform.is_cuda_alike() and tensor.is_cuda
-        else nullcontext()
-    )
+    return torch.autocast("cuda", enabled=False) if tensor.is_cuda else nullcontext()
 
 
 def _pack_tensors_3d(tensors, patch_size, patch_size_t):
@@ -296,9 +290,7 @@ class ViT3DDecoder(ViTBase):
         patch_dims = [latent_T, latent_H, latent_W]
         rotary_dtype = (
             torch.get_autocast_dtype("cuda")
-            if current_platform.is_cuda_alike()
-            and x.is_cuda
-            and torch.is_autocast_enabled("cuda")
+            if x.is_cuda and torch.is_autocast_enabled("cuda")
             else hidden_states.dtype
         )
         cache_enabled = (

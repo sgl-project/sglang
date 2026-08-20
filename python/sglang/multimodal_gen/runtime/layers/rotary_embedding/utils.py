@@ -134,7 +134,6 @@ def apply_flashinfer_rope_qk_inplace(
 
     use_flashinfer = (
         flashinfer_apply_rope_inplace is not None
-        and current_platform.is_cuda_alike()
         and q.is_cuda
         and k.is_cuda
         and cos_sin_cache.is_cuda

@@ -27,7 +27,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_enabled,
@@ -304,7 +303,7 @@ class MiniMaxH3DecodingStage(DecodingStage):
                     dtype=audio_vae_dtype,
                     enabled=audio_autocast_enabled,
                 )
-                if current_platform.is_cuda_alike() and audio_latent.is_cuda
+                if audio_latent.is_cuda
                 else nullcontext()
             )
             with autocast_context:
@@ -365,7 +364,7 @@ class MiniMaxH3DecodingStage(DecodingStage):
                     dtype=video_vae_dtype,
                     enabled=visual_autocast_enabled,
                 )
-                if current_platform.is_cuda_alike() and visual_latent.is_cuda
+                if visual_latent.is_cuda
                 else nullcontext()
             )
             with autocast_context:

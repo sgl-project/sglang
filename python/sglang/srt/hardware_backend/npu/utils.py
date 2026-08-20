@@ -1,6 +1,5 @@
 import functools
 import logging
-import sys
 from enum import IntEnum
 from typing import TYPE_CHECKING, Callable
 
@@ -16,6 +15,7 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 indexer_weight_stream = None
 gva_is_inited = False
+_disable_torch_npu_transfer = False
 
 
 class NPUACLFormat(IntEnum):
@@ -86,6 +86,12 @@ def set_default_server_args(args: "ServerArgs"):
             args.hicache_mem_layout = "page_first_direct"
 
 
+def disable_torch_npu_transfer() -> None:
+    """Prevent torch_npu's CUDA compatibility shim in diffusion workers."""
+    global _disable_torch_npu_transfer
+    _disable_torch_npu_transfer = True
+
+
 @_call_once
 def init_npu_backend():
     """
@@ -101,10 +107,12 @@ def init_npu_backend():
         logger.warning("NPU custom kernel packages unavailable: %s", e)
 
     import torch_npu
-    from torch_npu.contrib import transfer_to_npu  # noqa: F401
 
-    # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True
-    torch.cuda.is_available = lambda: False
+    if not _disable_torch_npu_transfer:
+        from torch_npu.contrib import transfer_to_npu  # noqa: F401
+
+        # Re-mock torch.cuda.is_available because transfer_to_npu mocks it True.
+        torch.cuda.is_available = lambda: False
 
     torch_npu.npu.config.allow_internal_format = True
     torch_npu.npu.set_compile_mode(jit_compile=False)

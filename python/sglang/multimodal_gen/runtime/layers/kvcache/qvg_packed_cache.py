@@ -33,7 +33,6 @@ from sglang.multimodal_gen.configs.quantization.qvg_kv import QVGKVQuantArgs
 from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
     CausalAttentionKVView,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -195,9 +194,7 @@ class QVGPackedCausalKVCache:
 
         def q(x):
             xb = x.permute(0, 2, 1, 3).contiguous()  # [B,S,H,D]->[B,H,S,D]
-            devices = (
-                [xb.device] if current_platform.is_cuda_alike() and xb.is_cuda else []
-            )
+            devices = [xb.device] if xb.is_cuda else []
             with torch.random.fork_rng(devices=devices):
                 torch.manual_seed(1234)
                 return triton_prq_quantize_tensor(

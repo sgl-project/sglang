@@ -7,8 +7,6 @@ from typing import Tuple
 import torch
 from diffusers.utils import logging
 
-from sglang.multimodal_gen.runtime.platforms import current_platform
-
 
 def _env_flag(name, default="0"):
     value = os.environ.get(name, default)
@@ -121,8 +119,7 @@ def prepare_rotary_pos_emb(
     """Prebuild the native Q/K rotary cache once per ViT decoder forward."""
     cos, sin = rotary_pos_emb
     if (
-        not current_platform.is_cuda_alike()
-        or not cos.is_cuda
+        not cos.is_cuda
         or dtype not in (torch.float16, torch.bfloat16)
         or cos.shape != sin.shape
         or cos.dim() != 4
@@ -220,7 +217,6 @@ def apply_rotary_pos_emb_qk(
     """Apply the exact native NeoX rotary kernel to Q/K together when possible."""
     if (
         len(rotary_pos_emb) == 4
-        and current_platform.is_cuda_alike()
         and query.is_cuda
         and query.shape == key.shape
         and query.dtype == key.dtype
@@ -231,13 +227,11 @@ def apply_rotary_pos_emb_qk(
     ):
         _, _, cache, positions = rotary_pos_emb
         if (
-            current_platform.is_cuda_alike()
-            and cache.is_cuda
+            cache.is_cuda
             and cache.dtype == query.dtype
             and cache.dim() == 2
             and cache.shape[0] == query.shape[1]
             and cache.shape[1] <= query.shape[-1]
-            and current_platform.is_cuda_alike()
             and positions.is_cuda
             and positions.shape == (query.shape[1],)
         ):
