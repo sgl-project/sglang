@@ -460,13 +460,17 @@ class ModelConfig:
         self.is_audio_model = enable_multimodal and is_audio_model(
             self.hf_config.architectures
         )
-        # TODO: requires further polishing
+        # Gated on `is_multimodal` because this flag is advertised via /model_info
+        # and drives the VLM warmup request, while the OpenAI serving layer rejects
+        # media input for models that are not `is_multimodal`. A text-only model
+        # with an auto-populated `vision_config` (see above) would otherwise warm up
+        # with an image request that its own serving layer answers with 400.
         # Key on the tower, not the attribute: several config classes default
         # vision_config to None, which presence alone would read as image-capable
         # (MuseGlimmerConfig's text-only layouts are one such case).
+        # TODO: requires further polishing
         self.is_image_understandable_model = (
-            enable_multimodal
-            and not self.is_lm_only
+            self.is_multimodal
             and getattr(self.hf_config, "vision_config", None) is not None
         )
 
@@ -1516,14 +1520,14 @@ class ModelConfig:
                 "quant_method", "" if not self.quantization else self.quantization
             ).lower()
 
-            # ModelOpt FP4 checkpoints quantize only the target model; an
-            # embedded MTP draft may stay unquantized, so an explicit
+            # ModelOpt FP4 and mixed checkpoints can quantize only the target
+            # model; an embedded MTP draft may stay unquantized, so an explicit
             # nvfp4_online opt-in for the draft wins over checkpoint detection.
             # The online loader rejects already-packed weights at load time.
             preserve_online_draft_quantization = (
                 self.is_draft_model
                 and self.quantization == "nvfp4_online"
-                and quant_method == "modelopt_fp4"
+                and quant_method in ("modelopt_fp4", "modelopt_mixed")
             )
             # An explicit online-requantization request (e.g. quark_mxfp4 on top
             # of an NVFP4/mixed checkpoint) must not be overridden back to the
