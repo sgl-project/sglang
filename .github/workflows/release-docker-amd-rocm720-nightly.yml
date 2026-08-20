@@ -10,6 +10,12 @@ on:
         options:
           - 'all'
           - publish
+          - verify_profiling
+      probe_image:
+        description: 'With job_select=verify_profiling, qualify this image instead of building one, e.g. rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820. Pair it with gpu_arch to pick the GPU it runs on.'
+        required: false
+        type: string
+        default: ''
       gpu_arch:
         description: 'Select which ROCm 7.2 GPU arch to build'
         required: false
@@ -140,6 +146,125 @@ jobs:
         run: |
           docker tag rocm/sgl-dev:${{ env.IMAGE_TAG }} lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
           docker push lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
+
+  # The rocm724 flavors exist to restore torch.profiler under HIP graph replay,
+  # which ROCm 7.2.0 drops (ROCm/ROCm#6102, fixed in 7.2.2). Nothing else notices
+  # if that regresses: the loss is partial, so an under-reported trace still looks
+  # like a successful profile, and the profiling suite runs without CUDA graphs on
+  # ROCm (#34452), so it never exercises the replay path. Each flavor is checked on
+  # the GPU it targets, since the behaviour lives in the HIP runtime.
+  #
+  # Two runs per image, because installing the fixed ROCm is not the same as
+  # loading it: the default records what users get, and the preloaded run is what
+  # the image can do and is the one that has to pass.
+  #
+  # Runs after publish rather than gating it: the images should not wait on a GPU
+  # runner queue. A red leg here means the day's rocm724 image traces nothing
+  # under graph replay and should not be recommended for profiling.
+  verify_profiling:
+    # Per leg, like the mirror job below: a rocm720 leg failing in publish must
+    # not stop the rocm724 images from being checked, and a rocm724 leg that
+    # never published has no artifact and fails at the download.
+    if: |
+      always() && !cancelled() && github.repository == 'sgl-project/sglang' &&
+      needs.publish.result != 'cancelled' &&
+      (github.event_name != 'workflow_dispatch' ||
+       ((inputs.job_select == 'all' || inputs.job_select == 'verify_profiling') &&
+        (inputs.gpu_arch == 'all' || inputs.gpu_arch == '' ||
+         contains(inputs.gpu_arch, 'rocm724'))))
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        gpu_arch: ${{ fromJson((github.event_name == 'workflow_dispatch' && contains(inputs.gpu_arch, 'rocm724')) && format('["{0}"]', inputs.gpu_arch) || '["gfx942-rocm724", "gfx950-rocm724"]') }}
+    runs-on: ${{ matrix.gpu_arch == 'gfx942-rocm724' && 'linux-mi300-1gpu-sglang' || 'linux-mi35x-gpu-1' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download image tag artifact
+        if: inputs.probe_image == ''
+        uses: actions/download-artifact@v4
+        with:
+          name: image-tag-${{ matrix.gpu_arch }}
+
+      - name: Resolve image
+        env:
+          PROBE_IMAGE: ${{ inputs.probe_image }}
+        run: |
+          if [ -n "${PROBE_IMAGE}" ]; then
+            image="${PROBE_IMAGE}"
+          else
+            image_tag=$(tr -d '[:space:]' < "${{ matrix.gpu_arch }}.txt")
+            if [ -z "${image_tag}" ]; then
+              echo "::error::Image tag artifact is empty"
+              exit 1
+            fi
+            image="rocm/sgl-dev:${image_tag}"
+          fi
+          echo "IMAGE=${image}" >> $GITHUB_ENV
+          echo "Verifying ${image}"
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --custom-image "${IMAGE}"
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+          DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+      # No dependency install: this checks the image's own torch and HIP runtime,
+      # which is what was just published.
+      # Out of the box the torch wheel loads the HIP and roctracer it vendors in
+      # torch/lib, which are 7.2.0, so this records what a user gets by default
+      # rather than what the image is capable of. It is expected to fail until
+      # torch stops shadowing the ROCm install, so it does not fail the job.
+      - name: Probe HIP-graph profiling (image default)
+        id: default_probe
+        continue-on-error: true
+        timeout-minutes: 20
+        run: |
+          set -o pipefail
+          docker exec -w /sglang-checkout ci_sglang \
+            python3 scripts/ci/amd/check_hip_graph_profiling.py 2>&1 | tee probe-default.log
+
+      # The image's own 7.2.4 HIP and roctracer, which is the configuration that
+      # traces graph replay in full. LD_PRELOAD has to be set before the process
+      # starts, so it goes on docker exec rather than inside the probe.
+      - name: Probe HIP-graph profiling (ROCm runtime preloaded)
+        timeout-minutes: 20
+        run: |
+          set -o pipefail
+          preload=$(docker exec ci_sglang \
+            python3 /sglang-checkout/scripts/ci/amd/check_hip_graph_profiling.py --print-ld-preload)
+          echo "LD_PRELOAD=${preload}"
+          docker exec -w /sglang-checkout -e LD_PRELOAD="${preload}" ci_sglang \
+            python3 scripts/ci/amd/check_hip_graph_profiling.py 2>&1 | tee probe-preloaded.log
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.gpu_arch }}"
+            echo "- **Image:** \`${IMAGE}\`"
+            echo ""
+            echo "**Image default** (\`${{ steps.default_probe.outcome }}\`)"
+            echo '```'
+            cat probe-default.log 2>/dev/null || echo "no probe output"
+            echo '```'
+            echo "**ROCm runtime preloaded**"
+            echo '```'
+            cat probe-preloaded.log 2>/dev/null || echo "no probe output"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # These runners are shared with the AMD test suites, and the container
+      # holds VRAM until something reclaims it.
+      - name: Stop CI container
+        if: always()
+        run: docker rm -f ci_sglang || true
 
   # Mirror the freshly published rocm/sgl-dev image to the in-network Docker
   # registry so AMD CI runners can pull without hitting Docker Hub rate limits.
