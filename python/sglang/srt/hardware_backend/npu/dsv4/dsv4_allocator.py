@@ -213,6 +213,17 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             f"on req finish."
         )
 
+    def prefill_compressed_headroom(
+        self, extend_tokens: int, reserve_tokens: int = 0
+    ) -> bool:
+        """Project one more request's c128 sidecar need (positions = raw //
+        128 plus one page of anchor/continuation slack) and compare against
+        current availability, so admission queues instead of the generic
+        Prefill-out-of-memory raise killing the scheduler."""
+        alloc = self.c128_attn_allocator
+        need = -(-extend_tokens // 128) + -(-reserve_tokens // 128)
+        return alloc.available_size() >= need + alloc.page_size
+
     def _alloc_c_extend(
         self,
         allocator: NPUPagedTokenToKVPoolAllocator,

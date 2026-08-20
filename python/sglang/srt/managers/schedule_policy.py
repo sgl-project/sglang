@@ -558,6 +558,9 @@ class PrefillAdder:
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
         self.reprocessed_log_input_tokens = 0
+        # Uncached tokens of the in-flight chunked req; reserved for the
+        # auxiliary-pool admission gate (see add_one_req).
+        self.chunked_reserve_tokens = 0
 
         if running_batch is not None:
             # Estimate the offset in the remaining token space
@@ -1033,6 +1036,9 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
+        # Reserve the chunked req's full remaining need for the auxiliary-pool
+        # admission gate: its future chunks must stay affordable too.
+        self.chunked_reserve_tokens = cand_extend_input_len
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
@@ -1087,6 +1093,10 @@ class PrefillAdder:
                 > self.rem_swa_tokens
             ):
                 return AddReqResult.NO_TOKEN
+        if not self.token_to_kv_pool_allocator.prefill_compressed_headroom(
+            cand_extend_input_len, self.chunked_reserve_tokens
+        ):
+            return AddReqResult.OTHER
 
         def add_req_state(r, insert_sort=False):
             new_token_ratio = (
@@ -1275,6 +1285,14 @@ class PrefillAdder:
             # If without chunked prefill:
             # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
             # - if the can_run_list is empty, always accept the first prefill request
+            return AddReqResult.OTHER
+
+        # The DSV4 compressed pools are invisible to the full/swa budgets;
+        # gate admission on projected headroom or alloc_extend fails and
+        # kills the scheduler mid-burst.
+        if not self.token_to_kv_pool_allocator.prefill_compressed_headroom(
+            real_input_tokens, self.chunked_reserve_tokens
+        ):
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):

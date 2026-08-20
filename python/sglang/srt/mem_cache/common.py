@@ -121,16 +121,26 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
     allocator = tree_cache.token_to_kv_pool_allocator
 
     if isinstance(allocator, SWATokenToKVPoolAllocator):
-        # Hybrid allocator
-        full_available_size = allocator.full_available_size()
-        swa_available_size = allocator.swa_available_size()
-
-        if full_available_size < num_tokens or swa_available_size < num_tokens:
-            full_num_tokens = max(0, num_tokens - full_available_size)
-            swa_num_tokens = max(0, num_tokens - swa_available_size)
+        # Hybrid allocator. One evict() pass can free far fewer real slots than
+        # its token accounting claims (tombstoned SWA ranges free nothing), so
+        # retry while availability actually grows.
+        for _ in range(256):
+            full_available_size = allocator.full_available_size()
+            swa_available_size = allocator.swa_available_size()
+            if (
+                full_available_size >= num_tokens
+                and swa_available_size >= num_tokens
+            ):
+                return
+            before = full_available_size + swa_available_size
             tree_cache.evict(
-                EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+                EvictParams(
+                    num_tokens=max(0, num_tokens - full_available_size),
+                    swa_num_tokens=max(0, num_tokens - swa_available_size),
+                )
             )
+            if allocator.full_available_size() + allocator.swa_available_size() <= before:
+                return  # tree exhausted; more passes would not help
     else:
         # Standard allocator: evict only the shortfall (mirrors the SWA arm)
         available_size = allocator.available_size()
