@@ -22,14 +22,6 @@ if TYPE_CHECKING:
     from sglang.srt.lora.moe.execution_plan import LoraASpec
 
 
-def _spec_value(spec: object, field: str) -> str:
-    """Read a string/Enum field without coupling kernels to selector code."""
-    value = getattr(spec, field, None)
-    if value is None:
-        raise ValueError(f"LoRA-A execution spec is missing {field!r}")
-    return str(getattr(value, "value", value))
-
-
 def _validate_pair_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -39,8 +31,6 @@ def _validate_pair_gemm(
     pair_input: bool,
 ) -> None:
     num_pairs = routing.topk_ids.numel()
-    if weight.ndim != 3:
-        raise ValueError(f"weight must be 3D, got shape {tuple(weight.shape)}")
     num_groups, width, input_width = weight.shape
     expected_groups = routing.max_loras * routing.lora_experts_per_adapter
     if num_groups != expected_groups:
@@ -53,14 +43,6 @@ def _validate_pair_gemm(
         raise ValueError(f"input must have shape {(expected_rows, input_width)}")
     if output.ndim != 2 or output.shape != (num_pairs, width):
         raise ValueError(f"output must have shape {(num_pairs, width)}")
-    devices = {
-        input.device,
-        weight.device,
-        output.device,
-        routing.topk_ids.device,
-    }
-    if len(devices) != 1:
-        raise ValueError(f"tensors span devices {sorted(map(str, devices))}")
 
 
 @triton.jit
@@ -380,8 +362,8 @@ def run_lora_a(
     produce_pdl: bool = False,
 ) -> torch.Tensor:
     """Run exactly the family the spec names; no fallback, no selector."""
-    family = _spec_value(spec, "family")
-    site = _spec_value(spec, "site")
+    family = spec.family.value
+    site = spec.site.value
     pair_input = site == "down"
     if pair_to_row is not None and not (family == "grouped" and site == "down"):
         raise ValueError(

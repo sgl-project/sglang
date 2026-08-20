@@ -21,15 +21,6 @@ from sglang.srt.lora.moe.route_view import RouteView
 if TYPE_CHECKING:
     from sglang.srt.lora.moe.execution_plan import LoraBSpec
 
-MAX_SLICES = 2
-
-
-def _spec_value(spec: object, field: str) -> str:
-    value = getattr(spec, field, None)
-    if value is None:
-        raise ValueError(f"LoRA-B execution spec is missing {field!r}")
-    return str(getattr(value, "value", value))
-
 
 def _validate_b_call(
     bridge: torch.Tensor,
@@ -40,28 +31,10 @@ def _validate_b_call(
     destination_offsets: Sequence[int],
     intermediate_top_k: int,
 ) -> tuple[int, int, int]:
-    """Fail-closed common contract; return slices, width, and rank."""
-    num_slices = len(destination_offsets)
-    if not 1 <= num_slices <= MAX_SLICES:
-        raise ValueError(f"LoRA-B supports 1..{MAX_SLICES} slices")
-    if weight.ndim != 3:
-        raise ValueError(f"weight must be 3D, got shape {tuple(weight.shape)}")
+    """Cross-check the weights, bridge and destination agree; derive the slicing."""
     num_groups, weight_rows, rank = weight.shape
-    if weight_rows % num_slices:
-        raise ValueError(
-            f"weight rows {weight_rows} not divisible by {num_slices} slices"
-        )
+    num_slices = len(destination_offsets)
     slice_width = weight_rows // num_slices
-
-    offsets = tuple(int(offset) for offset in destination_offsets)
-    ordered = sorted(offsets)
-    if ordered[0] < 0:
-        raise ValueError(f"destination offsets must be non-negative: {ordered}")
-    for low, high in zip(ordered, ordered[1:]):
-        if high - low < slice_width:
-            raise ValueError(
-                f"destination offsets {ordered} overlap at width {slice_width}"
-            )
 
     expected_groups = routing.max_loras * routing.lora_experts_per_adapter
     if num_groups != expected_groups:
@@ -69,41 +42,21 @@ def _validate_b_call(
             f"weight groups {num_groups} != max_loras * "
             f"lora_experts_per_adapter {expected_groups}"
         )
-    num_tokens, top_k = routing.topk_ids.shape
     num_pairs = routing.topk_ids.numel()
-    if intermediate_top_k == 1:
-        expected_rows = num_pairs
-    elif intermediate_top_k == top_k:
-        expected_rows = num_tokens
-    else:
-        raise ValueError(
-            f"intermediate_top_k must be 1 or route top-k {top_k}, "
-            f"got {intermediate_top_k}"
-        )
-    if bridge.ndim != 2 or bridge.shape != (
-        expected_rows,
-        num_slices * rank,
-    ):
+    expected_rows = num_pairs if intermediate_top_k == 1 else routing.topk_ids.shape[0]
+    if bridge.shape != (expected_rows, num_slices * rank):
         raise ValueError(
             f"bridge must have shape {(expected_rows, num_slices * rank)}, "
             f"got {tuple(bridge.shape)}"
         )
-    if destination.ndim != 2 or destination.shape[0] != num_pairs:
+    if destination.shape[0] != num_pairs:
         raise ValueError(f"destination must have {num_pairs} rows")
-    for offset in offsets:
-        if offset + slice_width > destination.shape[1]:
-            raise ValueError(
-                f"destination offset {offset} + width {slice_width} exceeds "
-                f"{destination.shape[1]} columns"
-            )
-    devices = {
-        bridge.device,
-        weight.device,
-        destination.device,
-        routing.topk_ids.device,
-    }
-    if len(devices) != 1:
-        raise ValueError(f"tensors span devices {sorted(map(str, devices))}")
+    last = max(destination_offsets)
+    if last + slice_width > destination.shape[1]:
+        raise ValueError(
+            f"destination slice at {last} + width {slice_width} exceeds "
+            f"{destination.shape[1]} columns"
+        )
     return num_slices, slice_width, rank
 
 
@@ -454,7 +407,7 @@ def run_lora_b(
     consume_pdl: bool = False,
 ) -> None:
     """Execute exactly the B family named by an execution-plan spec."""
-    family = _spec_value(spec, "family")
+    family = spec.family.value
     if consume_pdl and family != "one_launch_sliced":
         raise ValueError(
             f"{family} B has no qualified programmatic-dependent-launch consumer"
