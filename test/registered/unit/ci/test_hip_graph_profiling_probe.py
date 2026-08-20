@@ -11,6 +11,7 @@ import contextlib
 import importlib.util
 import io
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -24,23 +25,35 @@ PROBE_PATH = (
     Path(__file__).resolve().parents[4] / "scripts/ci/amd/check_hip_graph_profiling.py"
 )
 
+ROCM_LIBS = [
+    "/opt/rocm-7.2.4/lib/libamdhip64.so.7.2.70204",
+    "/opt/rocm-7.2.4/lib/libroctracer64.so.4.1.70204",
+]
+# What a rocm724 image maps by default: the wheel's own 7.2.0 copies.
+VENDORED_LIBS = [
+    "/opt/venv/lib/python3.12/site-packages/torch/lib/libamdhip64.so",
+    "/opt/venv/lib/python3.12/site-packages/torch/lib/libroctracer64.so",
+]
 ENV_OK = {
     "status": "ok",
     "device_count": 8,
-    "torch": "2.9.1+rocm7.2.4",
+    "torch": "2.11.0+rocm7.2",
     "torch_hip": "7.2.41134",
     "rocm_version": "7.2.4",
     "device_name": "AMD Instinct MI355X",
     "gcn_arch": "gfx950",
-    "libs": ["libamdhip64.so.7.2.70204"],
+    "libs": ROCM_LIBS,
 }
 TRACED = {
     "status": "ok",
-    "kernels": 32,
+    "kernels": 512,
+    "expected_kernels": 512,
     "self_device_time_us": 1234.5,
-    "trace_events": 900,
-    "libs": ["libroctracer64.so.4.1.70204"],
+    "trace_events": 9000,
+    "libs": ROCM_LIBS,
 }
+# The measured ROCm 7.2.0 result: most kernels traced, some silently dropped.
+PARTIAL = dict(TRACED, kernels=448, self_device_time_us=1000.0)
 UNTRACED = dict(TRACED, kernels=0, self_device_time_us=0.0)
 TIMED_OUT = {"status": "timeout", "output": "(no output before the kill)"}
 CRASHED = {"status": "error", "output": "Segmentation fault"}
@@ -104,10 +117,18 @@ class TestVerdict(CustomTestCase):
         self.assertIn("VERDICT: FAIL", out)
         self.assertIn("6102", out)
 
+    def test_partial_graph_loss_fails_and_reports_the_shortfall(self):
+        # The whole reason the check counts dispatches: 448 of 512 kernels is the
+        # broken runtime, and "some kernels arrived" must not read as healthy.
+        code, out = self._verdict(graph=PARTIAL)
+        self.assertEqual(code, 1)
+        self.assertIn("64 of 512", out)
+        self.assertIn("6102", out)
+
     def test_untraced_eager_launches_invalidate_the_graph_result(self):
         code, out = self._verdict(eager=UNTRACED, graph=UNTRACED)
         self.assertEqual(code, 1)
-        self.assertIn("cannot trace GPU work at all", out)
+        self.assertIn("cannot trace GPU work reliably at all", out)
 
     def test_wedged_graph_replay_is_reported_as_a_deadlock(self):
         code, out = self._verdict(graph=TIMED_OUT)
@@ -131,6 +152,54 @@ class TestVerdict(CustomTestCase):
         code, out = self._verdict(env=dict(ENV_OK, device_name=""))
         self.assertEqual(code, 0)
         self.assertIn("libdrm-amdgpu-common", out)
+
+    def test_vendored_runtime_is_named_when_graph_replay_is_lossy(self):
+        # A rocm724 image failing this way has the fix installed but is not
+        # loading it, so the remedy is the preload, not a different image.
+        code, out = self._verdict(
+            env=dict(ENV_OK, libs=VENDORED_LIBS),
+            eager=dict(TRACED, libs=VENDORED_LIBS),
+            graph=dict(PARTIAL, libs=VENDORED_LIBS),
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("torch is using its own HIP/roctracer", out)
+        self.assertIn("torch/lib/libamdhip64.so", out)
+        self.assertNotIn("--disable-cuda-graph", out)
+
+    def test_rocm_install_libs_are_not_reported_as_vendored(self):
+        code, out = self._verdict()
+        self.assertEqual(code, 0)
+        self.assertNotIn("torch is using its own", out)
+
+
+class TestVendoredRuntimeDetection(CustomTestCase):
+    def test_only_hip_and_roctracer_outside_opt_rocm_count(self):
+        probe = _load_probe()
+        libs = VENDORED_LIBS + ROCM_LIBS + ["/opt/venv/.../torch/lib/libtorch_hip.so"]
+        self.assertEqual(probe.vendored_runtime_libs(libs), VENDORED_LIBS)
+
+    def test_nothing_flagged_when_the_rocm_install_is_in_use(self):
+        probe = _load_probe()
+        self.assertEqual(probe.vendored_runtime_libs(ROCM_LIBS), [])
+
+
+class TestPreloadValue(CustomTestCase):
+    def test_names_the_real_files_and_skips_the_symlinks(self):
+        # Preloading the unversioned symlink is not what was measured, and the
+        # versioned name is what pins the ROCm patch level in the value.
+        probe = _load_probe()
+        with tempfile.TemporaryDirectory() as lib_dir:
+            hip = Path(lib_dir) / "libamdhip64.so.7.2.70204"
+            tracer = Path(lib_dir) / "libroctracer64.so.4.1.70204"
+            hip.touch()
+            tracer.touch()
+            (Path(lib_dir) / "libamdhip64.so.7").symlink_to(hip)
+            self.assertEqual(probe.rocm_runtime_preload(lib_dir), f"{hip}:{tracer}")
+
+    def test_no_value_when_the_image_has_no_rocm_runtime(self):
+        probe = _load_probe()
+        with tempfile.TemporaryDirectory() as lib_dir:
+            self.assertIsNone(probe.rocm_runtime_preload(lib_dir))
 
 
 if __name__ == "__main__":
