@@ -17,8 +17,8 @@
 Ported from flashinfer-ai/flashinfer#4358 at main commit 906181e (with
 sibling package mnnvl_cutedsl/), pending an installable FlashInfer release
 that ships flashinfer.comm.mnnvl_cutedsl. The base communication
-infrastructure (pattern enum, workspace ABC, cuda utils) still comes from
-the installed FlashInfer; the pinned release (0.6.15.post1) provides it.
+infrastructure (mnnvl probing, pattern enum, workspace ABC) still comes
+from the installed FlashInfer; the pinned release provides it.
 """
 
 from __future__ import annotations
@@ -32,14 +32,10 @@ import torch.distributed._symmetric_memory as symm_mem
 
 # Keep the copied backend and kernel package self-contained while reusing the
 # stable communication infrastructure already supplied by the serving image.
-# Upstream imports is_multicast_supported from flashinfer.comm.mnnvl, which
-# only ships it since 0.6.16; the compat module carries it for the pinned
-# release.
+from flashinfer.comm.mnnvl import is_multicast_supported
 from flashinfer.comm.trtllm_ar import AllReduceFusionPattern
 from flashinfer.comm.workspace_base import AllReduceFusionWorkspace
 from torch.distributed import ProcessGroup
-
-from sglang.kernels.ops.communication.flashinfer_compat import is_multicast_supported
 
 from .mnnvl_cutedsl import DEFAULT_CONFIG, MNNVLCuteDSLConfig, ProtocolKind
 from .mnnvl_cutedsl.config import StaticProfile

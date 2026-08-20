@@ -24,7 +24,7 @@ def _import_kernel_backend():
     except ImportError as error:
         raise RuntimeError(
             "MNNVL CuTe DSL fusion requires FlashInfer's communication "
-            "infrastructure (flashinfer >= 0.6.15)"
+            "infrastructure (flashinfer >= 0.6.16)"
         ) from error
     try:
         from sglang.kernels.ops.communication.mnnvl_cutedsl import DEFAULT_CONFIG
