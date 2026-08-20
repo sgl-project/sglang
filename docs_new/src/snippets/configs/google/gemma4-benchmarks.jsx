@@ -118,8 +118,6 @@ export const benchmarks = [
     accuracy: { mmlu: 0.891, mmmu: 0.549 },
     notes: "H200, base command (no MTP/parsers). MMLU overall (Humanities/Social Sciences/STEM/Other); MMMU overall on the 900-sample val split.",
     speed: [
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
-        ttft_ms: 3911815, tpot_ms: 35.86, tokens_per_sec_per_gpu: 9022 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
         ttft_ms: 2790445, tpot_ms: 29.56, tokens_per_sec_per_gpu: 12592 },
     ],
@@ -264,16 +262,6 @@ export const benchmarks = [
         ttft_ms: 316010, tpot_ms: 15.86, tokens_per_sec_per_gpu: 26556 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
         ttft_ms: 1340393, tpot_ms: 17.32, tokens_per_sec_per_gpu: 26498 },
-    ],
-  },
-  {
-    match: { hw: "b200", variant: "12b", quant: "qat", strategy: "high-throughput", nodes: "single" },
-    sglang_version: "0.5.16",
-    speed: [
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
-        ttft_ms: 115370, tpot_ms: 20.62, tokens_per_sec_per_gpu: 64480 },
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
-        ttft_ms: 527219, tpot_ms: 21.87, tokens_per_sec_per_gpu: 64733 },
     ],
   },
   {
