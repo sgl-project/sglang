@@ -395,10 +395,10 @@ pub struct ModelConfig {
     /// (default) leaves it to the engine/request.
     pub default_top_p: Option<f64>,
     /// Sampling parameters pinned fleet-wide for this model (parameter
-    /// immutability). Unlike the `default_*` knobs above, every `Some` value
-    /// here is UNCONDITIONALLY injected into the forwarded body, overwriting
-    /// a client-supplied value — the deployment's serving contract wins over
-    /// the request. Empty (default) preserves today's behavior.
+    /// immutability). Unlike the `default_*` knobs above, a request sending
+    /// a different value than the pin is rejected with 400 before admission,
+    /// and an exact pin is injected when the request omits the field — see
+    /// [`SamplingPins`]. Empty (default) preserves today's behavior.
     pub pins: SamplingPins,
     /// Whether the chat handler may forward ingress-computed `input_ids` to
     /// the engine so it skips re-tokenizing (the ingress tokenize offload).
@@ -409,18 +409,32 @@ pub struct ModelConfig {
 }
 
 /// Sampling parameters an operator pins for the whole fleet (the
-/// `--pin-temperature` / `--pin-top-p` / `--pin-frequency-penalty` /
-/// `--pin-presence-penalty` / `--pin-n` flags). A `Some` value is injected
-/// into every forwarded request body, REPLACING any client-supplied value —
-/// this is an immutability contract (e.g. serving a model whose upstream API
-/// fixes its sampling parameters), not a default. Contrast with
-/// [`ModelConfig::default_top_k`] / [`ModelConfig::default_top_p`], which
-/// only fill absent fields. The CLI rejects `--pin-top-p` combined with
-/// `--default-top-p`: the pin makes the default unreachable, so the
-/// combination is an operator error, not a precedence question.
+/// `--pin-temperature` / `--pin-temperature-range` / `--pin-top-p` /
+/// `--pin-frequency-penalty` / `--pin-presence-penalty` / `--pin-n` flags).
+///
+/// A pinned parameter is an immutability contract, matching how Moonshot's
+/// API serves Kimi models (and what the Kimi-Vendor-Verifier `tests/params`
+/// suite checks): a request that OMITS the parameter is fine, a request
+/// sending the pinned value (or, for `temperature_range`, any value inside
+/// the range) is fine, and a request sending anything else is REJECTED with
+/// 400 before admission — never silently rewritten. When an exact-pinned
+/// parameter is absent, the pinned value is injected into the forwarded body
+/// so the engine's own defaults can't drift from the contract
+/// (`temperature_range` names no single value, so it never injects).
+///
+/// Contrast with [`ModelConfig::default_top_k`] / [`ModelConfig::default_top_p`],
+/// which only fill absent fields and let any client value through. The CLI
+/// rejects `--pin-top-p` combined with `--default-top-p`: the pin subsumes
+/// the default, so the combination is an operator error, not a precedence
+/// question.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SamplingPins {
     pub temperature: Option<f64>,
+    /// Inclusive `(lo, hi)` band of accepted `temperature` values — for
+    /// contracts that fix every sampling knob but leave temperature tunable
+    /// inside a range (Kimi K3 accepts [0, 1]). Mutually exclusive with
+    /// [`Self::temperature`] (CLI-enforced).
+    pub temperature_range: Option<(f64, f64)>,
     pub top_p: Option<f64>,
     pub frequency_penalty: Option<f64>,
     pub presence_penalty: Option<f64>,

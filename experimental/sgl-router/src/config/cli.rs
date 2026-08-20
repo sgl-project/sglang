@@ -91,29 +91,39 @@ pub struct Cli {
     /// semantics as `--default-top-k`. Must be in (0, 1].
     #[arg(long)]
     pub default_top_p: Option<f64>,
-    /// Pin `temperature` fleet-wide: injected into EVERY forwarded request
-    /// body, overwriting a client-supplied value (parameter immutability —
-    /// unlike the fill-when-absent `--default-*` flags). Use when serving a
-    /// model whose upstream API fixes its sampling parameters. Must be in
-    /// [0, 2].
+    /// Pin `temperature` fleet-wide (parameter immutability, matching how
+    /// Moonshot's API serves Kimi models): a request omitting it gets the
+    /// pinned value injected; a request sending exactly this value passes;
+    /// any other numeric value is REJECTED with 400 before admission —
+    /// never silently rewritten. Must be in [0, 2]. Mutually exclusive with
+    /// `--pin-temperature-range`.
     #[arg(long)]
     pub pin_temperature: Option<f64>,
-    /// Pin `top_p` fleet-wide, with the same overwrite semantics as
+    /// Accept `temperature` only inside this inclusive `LO:HI` band (e.g.
+    /// `0:1` for Kimi K3), rejecting numeric values outside it with 400.
+    /// Unlike `--pin-temperature` this names no single value, so nothing is
+    /// injected when the request omits temperature — the engine's own
+    /// default applies. Bounds must be in [0, 2] with LO <= HI. Mutually
+    /// exclusive with `--pin-temperature`.
+    #[arg(long, value_name = "LO:HI")]
+    pub pin_temperature_range: Option<String>,
+    /// Pin `top_p` fleet-wide, with the same reject-or-inject semantics as
     /// `--pin-temperature`. Must be in (0, 1]. Mutually exclusive with
-    /// `--default-top-p` (the pin would make the default unreachable).
+    /// `--default-top-p` (the pin subsumes the default).
     #[arg(long)]
     pub pin_top_p: Option<f64>,
-    /// Pin `frequency_penalty` fleet-wide, with the same overwrite semantics
-    /// as `--pin-temperature`. Must be in [-2, 2] (negative values allowed:
-    /// `--pin-frequency-penalty -0.5`).
+    /// Pin `frequency_penalty` fleet-wide, with the same reject-or-inject
+    /// semantics as `--pin-temperature`. Must be in [-2, 2] (negative values
+    /// allowed: `--pin-frequency-penalty -0.5`).
     #[arg(long, allow_negative_numbers = true)]
     pub pin_frequency_penalty: Option<f64>,
-    /// Pin `presence_penalty` fleet-wide, with the same overwrite semantics
-    /// as `--pin-temperature`. Must be in [-2, 2] (negative values allowed).
+    /// Pin `presence_penalty` fleet-wide, with the same reject-or-inject
+    /// semantics as `--pin-temperature`. Must be in [-2, 2] (negative values
+    /// allowed).
     #[arg(long, allow_negative_numbers = true)]
     pub pin_presence_penalty: Option<f64>,
-    /// Pin `n` (choices per request) fleet-wide, with the same overwrite
-    /// semantics as `--pin-temperature`. Must be >= 1.
+    /// Pin `n` (choices per request) fleet-wide, with the same
+    /// reject-or-inject semantics as `--pin-temperature`. Must be >= 1.
     #[arg(long)]
     pub pin_n: Option<u64>,
     /// Central kill switch for the ingress tokenize offload: when set, the
@@ -651,6 +661,31 @@ impl Cli {
                 return Err(anyhow!("--pin-temperature ({t}) must be in [0, 2]"));
             }
         }
+        let pin_temperature_range = match &self.pin_temperature_range {
+            None => None,
+            Some(raw) => {
+                if self.pin_temperature.is_some() {
+                    return Err(anyhow!(
+                        "--pin-temperature-range cannot be combined with \
+                         --pin-temperature: one names a band, the other a single value"
+                    ));
+                }
+                let (lo, hi) = raw
+                    .split_once(':')
+                    .and_then(|(a, b)| {
+                        Some((a.trim().parse::<f64>().ok()?, b.trim().parse::<f64>().ok()?))
+                    })
+                    .ok_or_else(|| {
+                        anyhow!("--pin-temperature-range ({raw}) must be LO:HI, e.g. 0:1")
+                    })?;
+                if !((0.0..=2.0).contains(&lo) && (0.0..=2.0).contains(&hi) && lo <= hi) {
+                    return Err(anyhow!(
+                        "--pin-temperature-range ({raw}) bounds must be in [0, 2] with LO <= HI"
+                    ));
+                }
+                Some((lo, hi))
+            }
+        };
         if let Some(p) = self.pin_top_p {
             if !(p > 0.0 && p <= 1.0) {
                 return Err(anyhow!("--pin-top-p ({p}) must be in (0, 1]"));
@@ -658,7 +693,7 @@ impl Cli {
             if self.default_top_p.is_some() {
                 return Err(anyhow!(
                     "--pin-top-p cannot be combined with --default-top-p: the pin \
-                     overwrites every request, so the default could never apply"
+                     subsumes the default, so the default could never apply"
                 ));
             }
         }
@@ -756,6 +791,7 @@ impl Cli {
                 default_top_p: self.default_top_p,
                 pins: SamplingPins {
                     temperature: self.pin_temperature,
+                    temperature_range: pin_temperature_range,
                     top_p: self.pin_top_p,
                     frequency_penalty: self.pin_frequency_penalty,
                     presence_penalty: self.pin_presence_penalty,
@@ -955,9 +991,49 @@ mod tests {
         assert_eq!(c.model.pins.presence_penalty, Some(-0.5));
         assert_eq!(c.model.pins.n, Some(1));
         assert!(!c.model.pins.is_empty());
-        // Unset -> empty: no request field is ever overwritten.
+        // Unset -> empty: no request is ever validated or injected.
         let c = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
         assert!(c.model.pins.is_empty());
+    }
+
+    #[test]
+    fn pin_temperature_range_parses_and_excludes_exact_pin() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--pin-temperature-range",
+            "0:1",
+        ]))
+        .unwrap();
+        assert_eq!(c.model.pins.temperature_range, Some((0.0, 1.0)));
+        assert_eq!(c.model.pins.temperature, None);
+
+        for (arg, needle) in [
+            ("--pin-temperature-range=1:0", "LO <= HI"),
+            ("--pin-temperature-range=0:2.5", "LO <= HI"),
+            ("--pin-temperature-range=zero:1", "LO:HI"),
+            ("--pin-temperature-range=0.5", "LO:HI"),
+        ] {
+            let err = into_config_owned(with_model(&["--worker-urls", "http://x:30000", arg]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "{arg}: got {err}");
+        }
+
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--pin-temperature-range",
+            "0:1",
+            "--pin-temperature",
+            "1.0",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("cannot be combined with --pin-temperature"),
+            "got: {err}"
+        );
     }
 
     #[test]
