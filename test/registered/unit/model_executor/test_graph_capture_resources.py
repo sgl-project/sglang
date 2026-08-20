@@ -7,9 +7,9 @@ reusing what an earlier pass left inactive. With adaptive speculative decoding
 that is one pass per candidate step times three runners — tens of GB of
 segments that all read back ``inactive``.
 
-CPU-only: ``get_stream`` allocates a ``torch.cuda.Stream`` handle, which does
-not require a live CUDA context to construct in these assertions, and the
-memory-pool tests use a fake device module.
+CPU-only: constructing a real ``torch.cuda.Stream`` needs a live CUDA runtime,
+so the stream tests patch ``torch.cuda.Stream`` with a counting fake (or inject
+through ``set_stream``) and the memory-pool tests use a fake device module.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -17,6 +17,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
+from unittest.mock import patch
+
+import torch
 
 from sglang.srt.model_executor.runner_utils.pool import (
     _CAPTURE_STREAM_NAME,
@@ -27,6 +30,11 @@ from sglang.srt.model_executor.runner_utils.pool import (
 )
 from sglang.srt.runtime_context import get_resources, reset_context
 from sglang.test.test_utils import CustomTestCase
+
+
+class _FakeStream:
+    """Stands in for ``torch.cuda.Stream``, whose ctor needs a live CUDA
+    runtime; CI runs this suite on CPU-only machines."""
 
 
 class _FakeDeviceModule:
@@ -75,6 +83,11 @@ class TestGraphMemoryPool(CustomTestCase):
 class TestGraphCaptureStream(CustomTestCase):
     def setUp(self):
         reset_context()
+        # ``get_stream`` constructs a real torch.cuda.Stream on the create path,
+        # which needs a live CUDA runtime; CI is CPU-only, so stand in a fake.
+        patcher = patch.object(torch.cuda, "Stream", _FakeStream)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         reset_context()
