@@ -16,11 +16,9 @@
 External OpenAI-compatible frontends (e.g. token-in-token-out session
 routers) must interpret Anthropic Messages requests exactly as this server
 does, but without a live serving runtime (tokenizer manager, engine,
-streaming loop). This module exposes ``serving.py``'s conversion semantics
-as unbound functions while leaving ``serving.py`` and ``protocol.py``
-untouched: request and response conversion delegate to the original
-``AnthropicServing`` methods through a runtime-detached instance, so there
-is one conversion implementation for the server and external callers.
+streaming loop). Request and response conversion call the same module-level
+functions as ``AnthropicServing``, so there is one implementation for the
+server and external callers.
 
 What is new here rather than delegated:
 
@@ -79,9 +77,10 @@ from sglang.srt.entrypoints.anthropic.serving import (
 )
 from sglang.srt.entrypoints.anthropic.serving import (
     STOP_REASON_MAP,
-    AnthropicServing,
     _anthropic_usage_from_openai,
     _scrub_error_message,
+    convert_response,
+    convert_to_chat_completion_request,
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -126,21 +125,6 @@ class AnthropicRequestContext:
     allow_tool_references: bool = False
     allow_search_results: bool = False
     allow_server_tools: bool = False
-
-
-class _ConversionOnlyAnthropicServing(AnthropicServing):
-    """``AnthropicServing`` detached from the serving runtime.
-
-    The conversion methods only read ``self._merge_inline_system``; the
-    thinking/reasoning paths additionally need ``self.openai_serving_chat``
-    but the feature gates reject those requests before delegation, so
-    ``AnthropicServing.__init__`` (which requires a live
-    ``OpenAIServingChat``) is deliberately not called.
-    """
-
-    def __init__(self, merge_inline_system: bool):
-        self.openai_serving_chat = None
-        self._merge_inline_system = merge_inline_system
 
 
 def anthropic_message_id() -> str:
@@ -226,9 +210,11 @@ def to_openai_request(
     request under ``context``. Any validation or conversion failure raises
     ``AnthropicRequestError`` (the server's behavior: HTTP 400)."""
     _validate_known_features(request, context)
-    converter = _ConversionOnlyAnthropicServing(context.merge_inline_system)
     try:
-        return converter._convert_to_chat_completion_request(request)
+        return convert_to_chat_completion_request(
+            request,
+            merge_inline_system=context.merge_inline_system,
+        )
     except Exception as e:
         # Same policy as ``handle_messages``: every conversion failure is a
         # 400 invalid_request_error, logged with its traceback server-side.
@@ -242,12 +228,9 @@ def to_anthropic_response(
     id_factory: Callable[[], str] = anthropic_message_id,
 ) -> AnthropicMessagesResponse:
     """Convert an OpenAI ChatCompletionResponse to an Anthropic Messages
-    response. ``id_factory`` replaces the delegate's internally generated
+    response. ``id_factory`` replaces the converter's internally generated
     message ID (same wire format by default; inject for determinism)."""
-    # ``_convert_response`` never reads the inline-system policy.
-    anthropic_response = _ConversionOnlyAnthropicServing(
-        merge_inline_system=False
-    )._convert_response(response)
+    anthropic_response = convert_response(response)
     return anthropic_response.model_copy(update={"id": id_factory()})
 
 

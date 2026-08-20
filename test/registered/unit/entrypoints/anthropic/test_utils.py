@@ -1,14 +1,12 @@
 """Tests for the standalone Anthropic conversion utilities.
 
-Request/response conversion in ``utils`` delegates to the original
-``AnthropicServing`` methods through a runtime-detached instance, so the
-delegation tests here compare against a normally constructed
-``AnthropicServing``: if the serving methods ever grow instance state that
-``__init__`` provides but the detached instance does not, these fail.
-Conversion semantics themselves are covered by ``test_serving.py``; the
-behavior tests below cover only what ``utils`` adds — feature gates, the
-composite error map, the envelope DTO seam, eager fake-SSE synthesis, and
-message-ID injection.
+Request/response conversion in ``utils`` and ``AnthropicServing`` shares
+module-level functions from ``serving.py``. The delegation tests verify the
+serving wrapper binds its runtime inputs consistently with the standalone
+path. Conversion semantics themselves are covered by ``test_serving.py``;
+the behavior tests below cover only what ``utils`` adds — feature gates,
+the composite error map, the envelope DTO seam, eager fake-SSE synthesis,
+and message-ID injection.
 """
 
 import ast
