@@ -204,7 +204,10 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         for reference, revision in references:
             with self.subTest(reference=reference):
                 server_args = self._make_server_args(transformer_weights_path=reference)
-                with patch("os.path.isfile", return_value=True):
+                with patch(
+                    "os.path.isfile",
+                    side_effect=lambda path: path == "/cache/model.safetensors",
+                ):
                     self.assertEqual(
                         resolve_transformer_safetensors_to_load(
                             server_args, "/unused/component/path"

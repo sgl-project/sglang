@@ -100,7 +100,7 @@ def test_native_weight_names_and_grouped_qkv_reorder():
     for dtype in (torch.bfloat16, torch.float8_e4m3fn):
         grouped = torch.arange(48, dtype=torch.float32).reshape(24, 2).to(dtype)
         reordered = _reorder_grouped_qkv_to_qkv(
-            grouped.float(),
+            grouped,
             num_query_groups=4,
             heads_per_group=1,
             head_dim=2,
@@ -125,7 +125,7 @@ def test_native_weight_names_and_grouped_qkv_reorder():
                 expected_shard = reordered.view(3, 8, 2)[
                     :, start : start + local_rows
                 ].reshape(-1, 2)
-                assert torch.equal(param.float(), expected_shard)
+                assert torch.equal(param, expected_shard)
 
 
 def test_pruned_adaln_curve_interpolates_without_timestep_mlp():
