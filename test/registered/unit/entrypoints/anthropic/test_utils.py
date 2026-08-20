@@ -1,12 +1,8 @@
-"""Tests for the standalone Anthropic conversion utilities.
+"""Tests for the Anthropic conversion seams used by external frontends.
 
-Request/response conversion in ``utils`` and ``AnthropicServing`` shares
-module-level functions from ``serving.py``. The delegation tests verify the
-serving wrapper binds its runtime inputs consistently with the standalone
-path. Conversion semantics themselves are covered by ``test_serving.py``;
-the behavior tests below cover only what ``utils`` adds — feature gates,
-the composite error map, the envelope DTO seam, eager fake-SSE synthesis,
-and message-ID injection.
+Request and response goldens call the public runtime-independent functions in
+serving.py directly. The utils-specific tests cover the composite error DTO,
+eager fake-SSE synthesis, and message-ID generation.
 """
 
 import ast
@@ -15,10 +11,8 @@ import json
 import subprocess
 import sys
 import unittest
-import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
@@ -28,27 +22,15 @@ from sglang.srt.entrypoints.anthropic import utils  # noqa: E402
 from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
     AnthropicMessagesRequest,
 )
-from sglang.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
+from sglang.srt.entrypoints.anthropic.serving import (  # noqa: E402
+    AnthropicServing,
+    convert_response,
+    convert_to_chat_completion_request,
+)
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionResponse  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
-
-_FIXED_UUID = uuid.UUID(int=0x1234)
-_FIXED_MSG_ID = f"msg_{_FIXED_UUID.hex}"
-
-# Permissive policy: the delegation matrix compares the conversion semantics
-# of every typed feature, so no gate may reject the fixtures.
-_ALL_FEATURES = dict(
-    allow_images=True,
-    allow_output_config=True,
-    allow_beta_fields=True,
-    allow_tool_references=True,
-    allow_search_results=True,
-    allow_server_tools=True,
-)
-
-_DEFAULT_CTX = utils.AnthropicRequestContext(merge_inline_system=True)
 
 
 class _FakeOpenAIServingChat:
@@ -76,9 +58,11 @@ def _payload(messages, **extra) -> dict:
     return {"model": "claude-test", "max_tokens": 64, "messages": messages, **extra}
 
 
-def _convert(payload: dict, context=_DEFAULT_CTX) -> dict:
-    request = utils.parse_anthropic_request(json.dumps(payload).encode())
-    openai_request = utils.to_openai_request(request, context=context)
+def _convert(payload: dict, merge_inline_system: bool = True) -> dict:
+    request = AnthropicMessagesRequest.model_validate(payload)
+    openai_request = convert_to_chat_completion_request(
+        request, merge_inline_system=merge_inline_system
+    )
     return openai_request.model_dump(mode="json", exclude_none=True, by_alias=True)
 
 
@@ -139,59 +123,6 @@ _REQUEST_CASES = {
         tools=_TOOLS,
         tool_choice={"type": "auto"},
     ),
-    "tool_result_variants": _payload(
-        [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "tool_result", "id": "legacy_id", "content": None}
-                ],
-            },
-            {
-                "role": "assistant",
-                "content": [
-                    {"type": "tool_result", "tool_use_id": "t2", "content": "inner"}
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": "t3",
-                        "content": [
-                            {"type": "text", "text": "a"},
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": "image/png",
-                                    "data": "eA==",
-                                },
-                            },
-                            {"type": "tool_reference", "tool_name": "deferred_fn"},
-                            {
-                                "type": "search_result",
-                                "title": "T",
-                                "source": "https://s",
-                            },
-                        ],
-                    }
-                ],
-            },
-        ]
-    ),
-    "tool_choice_required": _payload(
-        [{"role": "user", "content": "q"}], tools=_TOOLS, tool_choice={"type": "any"}
-    ),
-    "tool_choice_named": _payload(
-        [{"role": "user", "content": "q"}],
-        tools=_TOOLS,
-        tool_choice={"type": "tool", "name": "get_weather"},
-    ),
-    "tool_choice_none": _payload(
-        [{"role": "user", "content": "q"}], tools=_TOOLS, tool_choice={"type": "none"}
-    ),
     "empty_placeholders": _payload(
         [
             {"role": "assistant", "content": [{"type": "text", "text": ""}]},
@@ -236,20 +167,9 @@ _REQUEST_CASES = {
             }
         ]
     ),
-    "output_config_and_betas": _payload(
-        [{"role": "user", "content": "q"}],
-        output_config={
-            "effort": "xhigh",
-            "task_budget": {"type": "tokens", "total": 1000},
-        },
-        betas=["thinking-2025-08-04"],
-    ),
     "server_tools_skipped": _payload(
         [{"role": "user", "content": "q"}],
         tools=[{"type": "web_search_20250305", "name": "web_search"}, *_TOOLS],
-    ),
-    "unknown_extra_keys": _payload(
-        [{"role": "user", "content": "hi", "unknown_msg_key": 1}], unknown_top_key="x"
     ),
 }
 
@@ -277,7 +197,6 @@ def _chat_response(
 
 
 _RESPONSE_CASES = {
-    "text": ({"content": "hi"}, "stop", None),
     "reasoning_and_tools": (
         {
             "content": "text",
@@ -298,81 +217,11 @@ _RESPONSE_CASES = {
         "tool_calls",
         None,
     ),
-    "empty_content": ({"content": ""}, "stop", None),
-    "length_stop": ({"content": "x"}, "length", None),
-    "unmapped_finish_reason": ({"content": "x"}, "content_filter", None),
-    "cached_usage": (
-        {"content": "hi"},
-        "stop",
-        {
-            "prompt_tokens": 10,
-            "completion_tokens": 5,
-            "total_tokens": 15,
-            "prompt_tokens_details": {"cached_tokens": 4},
-        },
-    ),
 }
 
 
-class TestRequestDelegation(unittest.TestCase):
-    def test_matches_normally_constructed_serving(self):
-        for case in sorted(_REQUEST_CASES):
-            for merge_inline_system in (True, False):
-                with self.subTest(case=case, merge_inline_system=merge_inline_system):
-                    payload = _REQUEST_CASES[case]
-                    serving_request = AnthropicMessagesRequest.model_validate(payload)
-                    utils_request = utils.parse_anthropic_request(
-                        json.dumps(payload).encode()
-                    )
-                    context = utils.AnthropicRequestContext(
-                        merge_inline_system=merge_inline_system, **_ALL_FEATURES
-                    )
-                    with patch("uuid.uuid4", return_value=_FIXED_UUID):
-                        expected = _real_serving(
-                            merge_inline_system
-                        )._convert_to_chat_completion_request(serving_request)
-                        actual = utils.to_openai_request(utils_request, context=context)
-                    self.assertEqual(actual.model_dump(), expected.model_dump())
-
-    def test_conversion_failures_match_serving(self):
-        failure_payloads = {
-            "named_tool_missing": _payload(
-                [{"role": "user", "content": "q"}],
-                tools=_TOOLS,
-                tool_choice={"type": "tool", "name": "nope"},
-            ),
-            "required_without_tools": _payload(
-                [{"role": "user", "content": "q"}], tool_choice={"type": "any"}
-            ),
-        }
-        context = utils.AnthropicRequestContext(
-            merge_inline_system=True, **_ALL_FEATURES
-        )
-        for case, payload in sorted(failure_payloads.items()):
-            with self.subTest(case=case):
-                serving_request = AnthropicMessagesRequest.model_validate(payload)
-                with self.assertRaises(ValueError) as serving_error:
-                    _real_serving(True)._convert_to_chat_completion_request(
-                        serving_request
-                    )
-                utils_request = utils.parse_anthropic_request(
-                    json.dumps(payload).encode()
-                )
-                with self.assertRaises(utils.AnthropicRequestError) as utils_error:
-                    utils.to_openai_request(utils_request, context=context)
-                self.assertEqual(
-                    str(utils_error.exception), str(serving_error.exception)
-                )
-
-
 class TestRequestGoldens(unittest.TestCase):
-    """Absolute value pins for the gated launch surface.
-
-    The delegation matrix proves utils == serving at the same commit; these
-    goldens pin WHAT that shared behavior is, so a deliberate serving.py
-    semantic change must update them explicitly instead of moving both sides
-    of the delegation comparison silently.
-    """
+    """Absolute value pins for the public request converter."""
 
     def test_sampling_params_and_system(self):
         dump = _convert(_REQUEST_CASES["text_system_sampling"])
@@ -401,17 +250,13 @@ class TestRequestGoldens(unittest.TestCase):
 
     def test_system_blocks_and_inline_system_merge(self):
         payload = _REQUEST_CASES["system_blocks_and_inline_system"]
-        merged = _convert(
-            payload, utils.AnthropicRequestContext(merge_inline_system=True)
-        )
+        merged = _convert(payload, merge_inline_system=True)
         self.assertEqual(
             merged["messages"][0], {"role": "system", "content": "s1\ns2\ninline"}
         )
         self.assertEqual([m["role"] for m in merged["messages"]], ["system", "user"])
 
-        unmerged = _convert(
-            payload, utils.AnthropicRequestContext(merge_inline_system=False)
-        )
+        unmerged = _convert(payload, merge_inline_system=False)
         self.assertEqual(
             unmerged["messages"][0], {"role": "system", "content": "s1\ns2"}
         )
@@ -524,17 +369,13 @@ class TestRequestGoldens(unittest.TestCase):
             {"type": "function", "function": {"name": "get_weather"}},
         )
         self.assertEqual(_convert(_payload(msgs, tools=_TOOLS))["tool_choice"], "auto")
-        with self.assertRaisesRegex(
-            utils.AnthropicRequestError, "not in the forwarded tools list"
-        ):
+        with self.assertRaisesRegex(ValueError, "not in the forwarded tools list"):
             _convert(
                 _payload(
                     msgs, tools=_TOOLS, tool_choice={"type": "tool", "name": "missing"}
                 )
             )
-        with self.assertRaisesRegex(
-            utils.AnthropicRequestError, "requires at least one custom"
-        ):
+        with self.assertRaisesRegex(ValueError, "requires at least one custom"):
             _convert(_payload(msgs, tool_choice={"type": "any"}))
 
     def test_empty_text_and_empty_assistant_placeholders(self):
@@ -543,26 +384,12 @@ class TestRequestGoldens(unittest.TestCase):
         self.assertEqual(dump["messages"][1], {"role": "assistant", "content": ""})
 
 
-class TestResponseDelegation(unittest.TestCase):
-    def test_matches_normally_constructed_serving(self):
-        for case in sorted(_RESPONSE_CASES):
-            with self.subTest(case=case):
-                message, finish_reason, usage = _RESPONSE_CASES[case]
-                response = _chat_response(message, finish_reason, usage)
-                with patch("uuid.uuid4", return_value=_FIXED_UUID):
-                    expected = _real_serving(True)._convert_response(response)
-                actual = utils.to_anthropic_response(
-                    response, id_factory=lambda: _FIXED_MSG_ID
-                )
-                self.assertEqual(actual.model_dump(), expected.model_dump())
+class TestResponseGoldens(unittest.TestCase):
+    """Absolute value pins for the public response converter."""
 
     def test_default_id_factory_keeps_wire_format(self):
-        result = utils.to_anthropic_response(_chat_response({"content": "hi"}))
+        result = convert_response(_chat_response({"content": "hi"}))
         self.assertRegex(result.id, r"^msg_[0-9a-f]{32}$")
-
-
-class TestResponseGoldens(unittest.TestCase):
-    """Absolute value pins for response conversion (see TestRequestGoldens)."""
 
     def test_empty_choices_response(self):
         no_choices = ChatCompletionResponse.model_validate(
@@ -579,7 +406,7 @@ class TestResponseGoldens(unittest.TestCase):
                 },
             }
         )
-        result = utils.to_anthropic_response(no_choices, id_factory=lambda: "m")
+        result = convert_response(no_choices)
         self.assertEqual(result.stop_reason, "end_turn")
         self.assertEqual([b.type for b in result.content], ["text"])
         self.assertEqual(result.content[0].text, "")
@@ -589,170 +416,61 @@ class TestResponseGoldens(unittest.TestCase):
 
     def test_block_order_and_invalid_json_tool_arguments(self):
         message, finish_reason, _ = _RESPONSE_CASES["reasoning_and_tools"]
-        result = utils.to_anthropic_response(
-            _chat_response(message, finish_reason), id_factory=lambda: "m"
-        )
+        result = convert_response(_chat_response(message, finish_reason))
         types = [(b.type, getattr(b, "name", None)) for b in result.content]
         self.assertEqual(
             types,
             [("thinking", None), ("text", None), ("tool_use", "f"), ("tool_use", "g")],
         )
         self.assertEqual(result.content[2].input, {"a": 1})
-        # Invalid JSON arguments -> empty input, never a crash.
         self.assertEqual(result.content[3].input, {})
         self.assertEqual(result.stop_reason, "tool_use")
 
     def test_stop_reason_mapping(self):
-        length = utils.to_anthropic_response(
-            _chat_response({"content": "x"}, "length"), id_factory=lambda: "m"
-        )
+        length = convert_response(_chat_response({"content": "x"}, "length"))
         self.assertEqual(length.stop_reason, "max_tokens")
-        unmapped = utils.to_anthropic_response(
-            _chat_response({"content": "x"}, "content_filter"), id_factory=lambda: "m"
-        )
+        unmapped = convert_response(_chat_response({"content": "x"}, "content_filter"))
         self.assertEqual(unmapped.stop_reason, "end_turn")
 
 
-class TestParse(unittest.TestCase):
-    def test_parse_failures_are_request_errors(self):
-        with self.assertRaisesRegex(utils.AnthropicRequestError, "invalid JSON body"):
-            utils.parse_anthropic_request(b"{not json")
-        with self.assertRaises(utils.AnthropicRequestError):
-            # missing required max_tokens
-            utils.parse_anthropic_request(
-                json.dumps({"model": "m", "messages": []}).encode()
-            )
-
+class TestExtendedRequestGoldens(unittest.TestCase):
     def test_unknown_extra_keys_keep_pydantic_ignore_behavior(self):
         payload = _payload(
             [{"role": "user", "content": "hi", "unknown_msg_key": 1}],
             unknown_top_key="x",
         )
-        request = utils.parse_anthropic_request(json.dumps(payload).encode())
+        request = AnthropicMessagesRequest.model_validate(payload)
         self.assertEqual(request.model, "claude-test")
         self.assertFalse(hasattr(request, "unknown_top_key"))
 
-
-class TestFeatureGates(unittest.TestCase):
-    def test_disabled_features_fail_closed(self):
-        msgs = [{"role": "user", "content": "q"}]
-        cases = {
-            "thinking_param": _payload(
-                msgs, thinking={"type": "enabled", "budget_tokens": 2048}
-            ),
-            "output_config": _payload(msgs, output_config={"effort": "high"}),
-            "betas": _payload(msgs, betas=["b-1"]),
-            "image_block": _payload(
-                [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {"type": "base64", "data": "eA=="},
-                            }
-                        ],
-                    }
-                ]
-            ),
-            "thinking_block": _payload(
-                [
-                    {
-                        "role": "assistant",
-                        "content": [{"type": "thinking", "thinking": "t"}],
-                    }
-                ]
-            ),
-            "redacted_thinking_block": _payload(
-                [
-                    {
-                        "role": "assistant",
-                        "content": [{"type": "redacted_thinking", "data": "x"}],
-                    }
-                ]
-            ),
-            "search_result_block": _payload(
-                [{"role": "user", "content": [{"type": "search_result", "title": "t"}]}]
-            ),
-            "nested_tool_reference": _payload(
-                [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": "t",
-                                "content": [
-                                    {"type": "tool_reference", "tool_name": "f"}
-                                ],
-                            }
-                        ],
-                    }
-                ]
-            ),
-            "server_tool": _payload(
-                msgs, tools=[{"type": "web_search_20250305", "name": "web_search"}]
-            ),
-        }
-        for case, payload in sorted(cases.items()):
-            with self.subTest(case=case):
-                with self.assertRaises(utils.AnthropicRequestError):
-                    _convert(payload)
-
-    def test_thinking_rejected_even_with_all_gates_open(self):
-        context = utils.AnthropicRequestContext(
-            merge_inline_system=True, **_ALL_FEATURES
-        )
-        payload = _payload(
-            [{"role": "user", "content": "q"}],
-            thinking={"type": "enabled", "budget_tokens": 2048},
-        )
-        with self.assertRaises(utils.AnthropicRequestError):
-            _convert(payload, context)
-
-    def test_enabled_image_conversion(self):
-        context = utils.AnthropicRequestContext(
-            merge_inline_system=True, allow_images=True
-        )
-        dump = _convert(_REQUEST_CASES["images"], context)
+    def test_image_conversion(self):
+        dump = _convert(_REQUEST_CASES["images"])
         parts = dump["messages"][0]["content"]
         self.assertEqual([p["type"] for p in parts], ["text", "image_url", "image_url"])
         self.assertEqual(parts[1]["image_url"]["url"], "data:image/jpeg;base64,eA==")
         self.assertEqual(parts[2]["image_url"]["url"], "https://x/y.png")
 
-    def test_enabled_output_config_effort_mapping(self):
-        context = utils.AnthropicRequestContext(
-            merge_inline_system=True, allow_output_config=True
-        )
+    def test_output_config_effort_mapping(self):
         msgs = [{"role": "user", "content": "q"}]
-        high = _convert(_payload(msgs, output_config={"effort": "high"}), context)
-        xhigh = _convert(_payload(msgs, output_config={"effort": "xhigh"}), context)
+        high = _convert(_payload(msgs, output_config={"effort": "high"}))
+        xhigh = _convert(_payload(msgs, output_config={"effort": "xhigh"}))
         self.assertEqual(high["reasoning_effort"], "high")
         self.assertEqual(xhigh["reasoning_effort"], "max")
 
-    def test_enabled_server_tools_are_skipped_not_forwarded(self):
-        context = utils.AnthropicRequestContext(
-            merge_inline_system=True, allow_server_tools=True
-        )
-        dump = _convert(_REQUEST_CASES["server_tools_skipped"], context)
+    def test_server_tools_are_skipped_not_forwarded(self):
+        dump = _convert(_REQUEST_CASES["server_tools_skipped"])
         self.assertEqual(
-            [t["function"]["name"] for t in dump["tools"]], ["get_weather"]
+            [tool["function"]["name"] for tool in dump["tools"]], ["get_weather"]
         )
 
-    def test_enabled_search_result_flattening(self):
-        context = utils.AnthropicRequestContext(
-            merge_inline_system=True, allow_search_results=True
-        )
-        dump = _convert(_REQUEST_CASES["search_result_block"], context)
+    def test_search_result_flattening(self):
+        dump = _convert(_REQUEST_CASES["search_result_block"])
         self.assertEqual(
             dump["messages"][0],
             {"role": "user", "content": "Title: T\nSource: https://s\nContent: C"},
         )
 
-    def test_enabled_tool_reference_translation(self):
-        context = utils.AnthropicRequestContext(
-            merge_inline_system=True, allow_tool_references=True
-        )
+    def test_nested_tool_reference_translation(self):
         dump = _convert(
             _payload(
                 [
@@ -772,56 +490,12 @@ class TestFeatureGates(unittest.TestCase):
                         ],
                     }
                 ]
-            ),
-            context,
+            )
         )
         self.assertEqual(
             dump["messages"][0]["content"],
             [{"type": "tool_reference", "name": "deferred_fn"}],
         )
-
-    def test_gate_depth_matches_conversion_depth_canary(self):
-        """Gated blocks nested at depth >= 2 (tool_result inside tool_result)
-        pass the closed gates today ONLY because conversion reads exactly one
-        nesting level and drops them — wire-safe by convention. The moment
-        serving.py deepens ``_convert_tool_result_content`` this fails: deepen
-        ``_iter_typed_content_blocks`` together with it."""
-        payload = _payload(
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "outer",
-                            "content": [
-                                {"type": "text", "text": "depth1"},
-                                {
-                                    "type": "tool_result",
-                                    "tool_use_id": "inner",
-                                    "content": [
-                                        {
-                                            "type": "image",
-                                            "source": {
-                                                "type": "base64",
-                                                "media_type": "image/png",
-                                                "data": "eA==",
-                                            },
-                                        }
-                                    ],
-                                },
-                            ],
-                        }
-                    ],
-                }
-            ]
-        )
-        dump = _convert(payload)  # closed gates: must not raise
-        self.assertEqual(
-            dump["messages"][0],
-            {"role": "tool", "tool_call_id": "outer", "content": "depth1"},
-        )
-        self.assertNotIn("image_url", json.dumps(dump))
 
 
 _ERROR_BODIES = [
@@ -964,6 +638,12 @@ class TestErrorConversion(unittest.TestCase):
 
 
 class TestFakeSse(unittest.TestCase):
+    def test_default_id_factory_keeps_wire_format(self):
+        events = utils.to_anthropic_fake_sse_events(
+            _chat_response({"content": "hello"}), model="claude-test"
+        )
+        self.assertRegex(events[0].message.id, r"^msg_[0-9a-f]{32}$")
+
     def test_text_event_sequence_uses_request_model(self):
         events = utils.to_anthropic_fake_sse_events(
             _chat_response({"content": "hello"}),
