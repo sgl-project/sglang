@@ -1,10 +1,12 @@
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 from torch import nn
 
+import sglang.srt.models.deepseek_v4 as deepseek_v4
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.layers.moe.utils import (
     install_shared_experts_fusion_decision,
@@ -38,12 +40,82 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
             lambda: setattr(get_flags().moe, "disable_shared_experts_fusion", None)
         )
 
-    def _install(self, model_class=DeepseekV4ForCausalLM, n_shared_experts=1):
+    def _install(
+        self,
+        model_class=DeepseekV4ForCausalLM,
+        n_shared_experts=1,
+        hf_config=None,
+        quant_config=None,
+    ):
         install_shared_experts_fusion_decision(
             model_class,
-            SimpleNamespace(n_shared_experts=n_shared_experts),
-            None,
+            hf_config or SimpleNamespace(n_shared_experts=n_shared_experts),
+            quant_config,
         )
+
+    def _valid_config(self):
+        return SimpleNamespace(
+            n_shared_experts=1,
+            n_routed_experts=384,
+            num_experts_per_tok=6,
+            hidden_size=7168,
+            moe_intermediate_size=3072,
+            hidden_act="silu",
+        )
+
+    def _valid_quant_config(self):
+        return SimpleNamespace(
+            is_fp4_experts=True,
+            is_checkpoint_fp8_serialized=True,
+            weight_block_size=[128, 128],
+            ignored_layers=[],
+        )
+
+    def _fhmoe_environment(self):
+        stack = ExitStack()
+        stack.enter_context(patch.object(deepseek_v4, "_is_hip", True))
+        stack.enter_context(patch.object(deepseek_v4, "_use_aiter", True))
+        stack.enter_context(
+            patch.object(deepseek_v4, "is_gfx95_supported", return_value=True)
+        )
+        stack.enter_context(
+            patch.object(
+                deepseek_v4,
+                "aiter_fused_moe_supports_heterogeneous_shared_expert",
+                return_value=True,
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                deepseek_v4,
+                "get_moe_runner_backend",
+                return_value=SimpleNamespace(
+                    is_auto=lambda: True, is_aiter=lambda: False
+                ),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                deepseek_v4,
+                "get_moe_a2a_backend",
+                return_value=SimpleNamespace(is_none=lambda: True),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                deepseek_v4,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_size=8, moe_ep_size=1),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                deepseek_v4.envs.SGLANG_USE_AITER_MOE_GU_ITLV,
+                "get",
+                return_value=True,
+            )
+        )
+        return stack
 
     def _make_dspark_config(self):
         return DeepSeekV4Config(
@@ -71,13 +143,24 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
 
     def test_enables_shared_fusion_when_enforced(self):
         self._publish(enforce=True)
-        self.assertIsNone(
-            DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
-                SimpleNamespace(n_shared_experts=1), None
+        with self._fhmoe_environment():
+            self.assertIsNone(
+                DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
+                    self._valid_config(), self._valid_quant_config()
+                )
             )
-        )
-        self._install()
-        self.assertFalse(is_shared_experts_fusion_disabled())
+
+    def test_falls_back_when_aiter_fhmoe_abi_is_missing(self):
+        self._publish(enforce=True)
+        with self._fhmoe_environment(), patch.object(
+            deepseek_v4,
+            "aiter_fused_moe_supports_heterogeneous_shared_expert",
+            return_value=False,
+        ):
+            reason = DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
+                self._valid_config(), self._valid_quant_config()
+            )
+        self.assertIn("does not expose", reason)
 
     def test_enforcing_with_more_than_one_shared_expert_is_rejected(self):
         self._publish(enforce=True)
@@ -87,27 +170,24 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
             )
 
     def test_mixed_precision_quant_vetoes_even_when_enforced(self):
-        """A precision mismatch causes crash when shared expert fusion is enabled,
-        so --enforce-shared-experts-fusion must not override it. Guards the gap
-        where the enforce early-return skipped the quant check entirely."""
+        """Non-HIP fusion keeps the generic precision-mismatch veto."""
         self._publish(enforce=True)
         mixed = SimpleNamespace(
             get_name=lambda: "quark", can_fuse_shared_expert=lambda: False
         )
-        self.assertIn(
-            "higher precision",
-            DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
-                SimpleNamespace(n_shared_experts=1), mixed
-            ),
-        )
-        matched = SimpleNamespace(
-            get_name=lambda: "quark", can_fuse_shared_expert=lambda: True
-        )
-        self.assertIsNone(
-            DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
-                SimpleNamespace(n_shared_experts=1), matched
+        with patch.object(deepseek_v4, "_is_hip", False):
+            self.assertIn(
+                "higher precision",
+                DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
+                    SimpleNamespace(n_shared_experts=1), mixed
+                ),
             )
-        )
+        with self._fhmoe_environment():
+            self.assertIsNone(
+                DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
+                    self._valid_config(), self._valid_quant_config()
+                )
+            )
 
     def test_dspark_entry_class_uses_the_v4_gate(self):
         """A DSV4 DSpark draft must inherit the target's default fusion policy."""
@@ -120,7 +200,12 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
     def test_dspark_records_explicitly_forced_fusion(self):
         """A forced DSpark build must retain its fused shared-expert count."""
         self._publish(enforce=True)
-        self._install(DeepseekV4ForCausalLMDSpark)
+        with self._fhmoe_environment():
+            self._install(
+                DeepseekV4ForCausalLMDSpark,
+                hf_config=self._valid_config(),
+                quant_config=self._valid_quant_config(),
+            )
 
         class Stage(nn.Module):
             def __init__(self, **_kwargs):

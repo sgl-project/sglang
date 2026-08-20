@@ -60,6 +60,11 @@ class AiterMoeQuantInfo(MoeQuantInfo):
     intermediate_pad: int = 0
     swiglu_limit: float = 0.0
     fused_moe_kwargs: Optional[dict[str, Any]] = None
+    shared_w1: Optional[torch.Tensor] = None
+    shared_w2: Optional[torch.Tensor] = None
+    shared_w1_scale: Optional[torch.Tensor] = None
+    shared_w2_scale: Optional[torch.Tensor] = None
+    shared_expert_id: int = -1
 
 
 @dataclass
@@ -123,6 +128,27 @@ def _aiter_fused_moe_supports_no_combine() -> bool:
     return "no_combine" in inspect.signature(fused_moe).parameters
 
 
+@functools.cache
+def aiter_fused_moe_supports_heterogeneous_shared_expert() -> bool:
+    """Whether the installed AITER exposes the native-FP8 shared-expert ABI."""
+    try:
+        from aiter.fused_moe import fused_moe
+    except (ImportError, OSError):
+        return False
+
+    params = inspect.signature(fused_moe).parameters
+    return all(
+        name in params
+        for name in (
+            "shared_w1",
+            "shared_w2",
+            "shared_w1_scale",
+            "shared_w2_scale",
+            "shared_expert_id",
+        )
+    )
+
+
 class AiterRunnerCore(MoeRunnerCore):
     def run(
         self,
@@ -162,6 +188,41 @@ class AiterRunnerCore(MoeRunnerCore):
         extra: dict = {}
         if quant_info.fused_moe_kwargs:
             extra.update(quant_info.fused_moe_kwargs)
+        shared_tensors = (
+            quant_info.shared_w1,
+            quant_info.shared_w2,
+            quant_info.shared_w1_scale,
+            quant_info.shared_w2_scale,
+        )
+        if any(tensor is not None for tensor in shared_tensors):
+            if not all(tensor is not None for tensor in shared_tensors):
+                raise ValueError(
+                    "AITER heterogeneous fused MoE requires both shared weights "
+                    "and both shared scales."
+                )
+            if quant_info.shared_expert_id < 0:
+                raise ValueError(
+                    "AITER heterogeneous fused MoE requires a non-negative "
+                    "shared expert ID."
+                )
+            if not aiter_fused_moe_supports_heterogeneous_shared_expert():
+                raise RuntimeError(
+                    "The installed AITER does not support heterogeneous shared experts."
+                )
+            extra.update(
+                shared_w1=quant_info.shared_w1,
+                shared_w2=quant_info.shared_w2,
+                shared_w1_scale=quant_info.shared_w1_scale,
+                shared_w2_scale=quant_info.shared_w2_scale,
+                shared_expert_id=quant_info.shared_expert_id,
+            )
+            from aiter.ops.flydsl.moe_common import GateMode
+
+            extra["gate_mode"] = (
+                GateMode.INTERLEAVE.value
+                if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                else GateMode.SEPARATED.value
+            )
         if runner_input.num_local_tokens is not None:
             extra["num_local_tokens"] = runner_input.num_local_tokens
         if runner_input.output_dtype is not None:
