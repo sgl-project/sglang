@@ -2397,6 +2397,7 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
@@ -2406,6 +2407,7 @@ class Scheduler(
         )
 
         if session_id is None or radix_native_session:
+            # Normal non-session request, or a radix-native session request
             if recv_req.input_embeds is not None:
                 # Generate fake input_ids based on the length of input_embeds
                 seq_length = len(recv_req.input_embeds)
@@ -2467,6 +2469,7 @@ class Scheduler(
                 )
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
+                # Invalid request for disaggregated mode
                 if (
                     recv_req.bootstrap_room is None
                     and self.transfer_backend != TransferBackend.FAKE
@@ -2488,6 +2491,7 @@ class Scheduler(
             session_id in self.session_controller
             and not self.session_controller.get(session_id).close_on_finish
         ):
+            # Session exists and is not closing: create request from session
             session = self.session_controller.get(session_id)
             req = session.create_req(
                 recv_req,
@@ -2508,6 +2512,7 @@ class Scheduler(
                 return
 
         else:
+            # Session not found, or session is closing
             if session_id in self.session_controller:
                 error_msg = (
                     f"Invalid request: close was requested for session {session_id}"
@@ -2811,6 +2816,7 @@ class Scheduler(
         ):
             return False
 
+        # Reject the incoming request by default.
         req_to_abort = recv_req
         message = "The request queue is full."
         if self.enable_priority_scheduling:
@@ -3153,8 +3159,10 @@ class Scheduler(
             need_mlp_sync = new_batch is None
 
         if new_batch is not None:
+            # Run prefill first if possible
             ret = new_batch
         else:
+            # Run decode (skip for prefill-only batches)
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
                 running_batch = self.update_running_batch(running_batch)
                 ret = running_batch if not running_batch.is_empty() else None
@@ -3187,6 +3195,7 @@ class Scheduler(
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
+            # Get max usage across all pools for prefill delay decision
             max_pool_usage = (
                 self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
             )
@@ -3258,6 +3267,7 @@ class Scheduler(
             running_batch.batch_is_full = True
             return None, running_batch
 
+        # Get priority queue
         self.policy.calc_priority(self.waiting_queue, running_batch)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
@@ -3266,6 +3276,7 @@ class Scheduler(
             # in the waiting queue.
             return None, running_batch
 
+        # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
         if self.chunked_req is not None and self.enable_dynamic_chunking:
             history_len = len(self.chunked_req.prefix_indices)
@@ -3320,6 +3331,7 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+        # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
@@ -3454,6 +3466,7 @@ class Scheduler(
             for req in can_run_list:
                 req.swa_evict_floor = req.extend_range.end
 
+        # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
             adder,
             running_batch.reqs,
@@ -3467,6 +3480,7 @@ class Scheduler(
             ),
         )
 
+        # Mixed-style chunked prefill
         if (
             self.is_mixed_chunk
             and not running_batch.is_empty()
@@ -3979,6 +3993,7 @@ class Scheduler(
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
 
+        # Emit forward pass metrics (every iteration when enabled)
         if self.enable_fpm:
             self.metrics_reporter._emit_forward_pass_metrics(batch, result)
 
@@ -4100,17 +4115,22 @@ class Scheduler(
                 self.invariant_checker._report_leak("pool", "\n".join(messages))
             self.invariant_checker._check_req_pool()
 
+        # tree cache sanity check
         self.invariant_checker._check_tree_cache()
 
+        # metrics every 30s
         self.metrics_reporter._maybe_log_idle_metrics()
 
+        # kv event publishing
         self.kv_events_publisher.publish_kv_events()
 
+        # reset token ratio
         self.new_token_ratio_tracker.reset()
 
         # Publish the idle state so /get_loads and DP balancing do not see stale load.
         self.publish_load_snapshot(force=True)
 
+        # sleep until next event
         self.maybe_sleep_on_idle()
 
     def is_fully_idle(self, for_health_check=False) -> bool:
