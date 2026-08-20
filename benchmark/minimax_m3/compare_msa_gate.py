@@ -39,7 +39,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline-dir", type=Path, required=True)
     parser.add_argument("--candidate-dir", type=Path, required=True)
-    parser.add_argument("--score-tolerance", type=float, default=0.0)
+    parser.add_argument("--gpqa-score-tolerance", type=float, required=True)
+    parser.add_argument("--longbench-score-tolerance", type=float, required=True)
     parser.add_argument("--num-prompts", type=int, default=256)
     parser.add_argument(
         "--output",
@@ -111,6 +112,13 @@ def main() -> None:
         if int(manifest.get("minimum_observed_tokens", 0)) < 32768:
             failures.append(f"{label} LongBench-v2 subset contains a sub-32K prompt")
 
+    score_tolerances = {
+        "gpqa": args.gpqa_score_tolerance,
+        "longbench_v2": args.longbench_score_tolerance,
+    }
+    if any(value < 0 for value in score_tolerances.values()):
+        raise ValueError("score tolerances must be non-negative")
+
     comparisons = {"accuracy": {}, "serving": {}}
     for eval_name in ("gpqa", "longbench_v2"):
         baseline = load(args.baseline_dir / f"{eval_name}.json")
@@ -121,10 +129,13 @@ def main() -> None:
             "baseline": baseline_score,
             "candidate": candidate_score,
             "delta": candidate_score - baseline_score,
+            "noninferiority_tolerance": score_tolerances[eval_name],
         }
-        if candidate_score + args.score_tolerance < baseline_score:
+        if candidate_score + score_tolerances[eval_name] < baseline_score:
             failures.append(
-                f"{eval_name} regressed: {candidate_score:.6f} < {baseline_score:.6f}"
+                f"{eval_name} exceeded its noninferiority margin: "
+                f"{candidate_score:.6f} + {score_tolerances[eval_name]:.6f} "
+                f"< {baseline_score:.6f}"
             )
 
     for concurrency in (1, 8, 32, 128):

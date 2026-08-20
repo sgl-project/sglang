@@ -18,6 +18,7 @@ SERVING_METRICS = {
     "median_itl_ms": False,
     "p99_itl_ms": False,
 }
+ACCURACY_METRICS = ("gpqa", "longbench_v2")
 
 
 def load(path: Path) -> dict:
@@ -106,7 +107,7 @@ def build_summary(root: Path, repetitions: int = 3) -> dict:
         "accuracy": {},
         "serving": {},
     }
-    for eval_name in ("gpqa", "longbench_v2"):
+    for eval_name in ACCURACY_METRICS:
         baseline = [
             number(row["accuracy"][eval_name]["baseline"], f"{eval_name} baseline")
             for row in comparisons
@@ -164,6 +165,27 @@ def build_summary(root: Path, repetitions: int = 3) -> dict:
     return result
 
 
+def accuracy_noninferiority_failures(
+    summary: dict, score_tolerances: dict[str, float]
+) -> list[str]:
+    if set(score_tolerances) != set(ACCURACY_METRICS):
+        raise ValueError("score tolerances must cover every accuracy metric")
+    if any(value < 0 for value in score_tolerances.values()):
+        raise ValueError("score tolerances must be non-negative")
+
+    failures = []
+    for eval_name, tolerance in score_tolerances.items():
+        accuracy = summary["accuracy"][eval_name]
+        accuracy["noninferiority_tolerance"] = tolerance
+        if accuracy["candidate_median"] + tolerance < accuracy["baseline_median"]:
+            failures.append(
+                f"{eval_name} median exceeded its noninferiority margin: "
+                f"{accuracy['candidate_median']:.6f} + {tolerance:.6f} < "
+                f"{accuracy['baseline_median']:.6f}"
+            )
+    return failures
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
@@ -174,10 +196,16 @@ def main() -> None:
         default=0.0,
         help="Minimum candidate gain computed from the two backend medians",
     )
+    parser.add_argument("--gpqa-score-tolerance", type=float, required=True)
+    parser.add_argument("--longbench-score-tolerance", type=float, required=True)
     args = parser.parse_args()
 
     summary = build_summary(args.root)
-    failures = []
+    score_tolerances = {
+        "gpqa": args.gpqa_score_tolerance,
+        "longbench_v2": args.longbench_score_tolerance,
+    }
+    failures = accuracy_noninferiority_failures(summary, score_tolerances)
     for concurrency in CONCURRENCIES:
         observed = summary["serving"][str(concurrency)]["output_throughput"]
         observed = observed["gain_from_backend_medians"]
