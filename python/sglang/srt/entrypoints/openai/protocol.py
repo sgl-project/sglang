@@ -1226,13 +1226,25 @@ class ChatCompletionRequest(BaseModel):
             if self.tool_choice == "required" or isinstance(
                 self.tool_choice, ToolChoice
             ):
-                raise ValueError(
-                    "tool_choice 'required' or a named tool cannot be combined with "
-                    "response_format, regex, or ebnf: the tool-call constraint and the "
-                    "output constraint cannot both be honored."
+                if self.regex or self.ebnf:
+                    raise ValueError(
+                        "tool_choice 'required' or a named tool cannot be combined "
+                        "with regex or ebnf: the tool-call constraint and the "
+                        "output constraint cannot both be honored."
+                    )
+                # A forced tool call produces a tool_calls message with no
+                # content, so a response_format constraint has nothing left to
+                # constrain — honor the tool call (OpenAI/Moonshot behavior).
+                logger.warning(
+                    "tool_choice forces a tool call; ignoring response_format "
+                    "for this request."
                 )
-            logger.warning("Constrained decoding is not compatible with tool calls.")
-        elif tool_call_constraint:
+                sampling_params.pop("json_schema", None)
+                sampling_params.pop("structural_tag", None)
+                has_existing_constraints = False
+            else:
+                logger.warning("Constrained decoding is not compatible with tool calls.")
+        if tool_call_constraint and not has_existing_constraints:
             constraint_type, constraint_value = tool_call_constraint
             if constraint_type == "structural_tag":
                 sampling_params[constraint_type] = convert_json_schema_to_str(
