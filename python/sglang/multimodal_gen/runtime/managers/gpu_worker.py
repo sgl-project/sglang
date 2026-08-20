@@ -65,9 +65,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin import (
     GPUWorkerPostTrainingMixin,
 )
-from sglang.multimodal_gen.runtime.realtime.session import (
-    RealtimeSessionCache,
-)
+from sglang.multimodal_gen.runtime.realtime.session import RealtimeSessionCache
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -228,7 +226,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
-        current_platform.set_device(current_platform.get_device(self.local_rank))
+        if not current_platform.is_mps():
+            current_platform.set_device(current_platform.get_device(self.local_rank))
         # num_gpus is the total world size across every node; the co-located,
         # CPU-contending worker count on THIS host is num_gpus // nnodes.
         local_num_gpus = self.server_args.num_gpus // self.server_args.nnodes
@@ -316,9 +315,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if output_batch.metrics:
             output_batch.metrics.record_memory_snapshot("mem_analysis", final_snapshot)
 
-        # for details on max_memory_reserved: https://docs.pytorch.org/docs/stable/generated/torch.cuda.memory.max_memory_reserved.html
-        peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
-        peak_allocated_bytes = torch.get_device_module().max_memory_allocated()
+        peak_reserved_bytes = final_snapshot.peak_reserved_mb * (1024**2)
+        peak_allocated_bytes = final_snapshot.peak_allocated_mb * (1024**2)
 
         output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
         peak_reserved_gb = peak_reserved_bytes / (1024**3)
@@ -466,7 +464,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         output_batch = None
         forward_failed = False
         try:
-            if self.is_output_rank and not current_platform.is_cpu():
+            if (
+                self.is_output_rank
+                and not current_platform.is_cpu()
+                and not current_platform.is_mps()
+            ):
                 torch.get_device_module().reset_peak_memory_stats()
 
             start_time = (
@@ -690,8 +692,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def _record_output_peak_memory(self, output_batch: OutputBatch) -> None:
         if not self.is_output_rank or current_platform.is_cpu():
             return
-        peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
-        output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
+        output_batch.peak_memory_mb = capture_memory_snapshot().peak_reserved_mb
 
     def _forward_group(self, batch: list[Req]) -> OutputBatch:
         assert self.pipeline is not None
