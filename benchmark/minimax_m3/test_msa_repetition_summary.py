@@ -14,12 +14,19 @@ from summarize_msa_repetitions import (
     expected_order,
 )
 from precompile_fmha_sm100 import runtime_variants
-from run_msa_ab_repetitions import OFFLINE_THROUGHPUT_DATASET
+from run_msa_ab_repetitions import (
+    OFFLINE_THROUGHPUT_ARGS,
+    OFFLINE_THROUGHPUT_DATASET,
+)
 
 
 class MSARepetitionSummaryTest(unittest.TestCase):
     def test_throughput_dataset_is_offline_and_deterministic(self) -> None:
         self.assertEqual(OFFLINE_THROUGHPUT_DATASET, "random-ids")
+        self.assertEqual(
+            OFFLINE_THROUGHPUT_ARGS,
+            ("--dataset-name", "random-ids", "--tokenize-prompt"),
+        )
 
     def test_precompile_variants_cover_tp4_sparse_paged_routes(self) -> None:
         dtype_code = 42
