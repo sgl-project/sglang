@@ -246,6 +246,15 @@ class CommonKVManager(BaseKVManager):
             # fail to receive the KV indices from the decode instance of this request.
             # These timeout requests should be aborted to release the tree cache.
             self.bootstrap_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+            # Fallback DP-rank registration is request-scoped HTTP metadata.
+            # Keep it off the scheduler thread and reuse per-worker sessions.
+            # Only the TP/CP/PP leader submits, so one bootstrap room is not
+            # redundantly registered by every model-parallel rank.
+            self._dp_rank_registration_executor: Optional[
+                concurrent.futures.ThreadPoolExecutor
+            ] = None
+            self._dp_rank_registration_executor_lock = threading.Lock()
+            self._dp_rank_registration_sessions = threading.local()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.enable_staging: bool = False
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
@@ -407,6 +416,64 @@ class CommonKVManager(BaseKVManager):
         room Failed FIRST -- registering while it still accepts chunks lets the
         worker ack, then a new chunk writes pages the decode already released."""
         self._deferred_ack_targets[room] = (decode_ip, decode_port)
+
+    def _is_dp_rank_registration_leader(self) -> bool:
+        return self.attn_tp_rank == 0 and self.attn_cp_rank == 0 and self.pp_rank == 0
+
+    def _ensure_dp_rank_registration_executor(
+        self,
+    ) -> concurrent.futures.ThreadPoolExecutor:
+        executor = self._dp_rank_registration_executor
+        if executor is not None:
+            return executor
+        with self._dp_rank_registration_executor_lock:
+            if self._dp_rank_registration_executor is None:
+                workers = envs.SGLANG_DISAGGREGATION_THREAD_POOL_SIZE.get()
+                if workers is None:
+                    workers = 16
+                self._dp_rank_registration_executor = (
+                    concurrent.futures.ThreadPoolExecutor(
+                        max_workers=max(1, workers),
+                        thread_name_prefix="pd-rank-register",
+                    )
+                )
+            return self._dp_rank_registration_executor
+
+    def _get_dp_rank_registration_session(self) -> requests.Session:
+        session = getattr(self._dp_rank_registration_sessions, "session", None)
+        if session is None:
+            session = requests.Session()
+            self._dp_rank_registration_sessions.session = session
+        return session
+
+    def submit_prefill_dp_rank_registration(
+        self, bootstrap_server_url: str, bootstrap_room: int
+    ) -> None:
+        """Register request routing metadata without blocking the scheduler."""
+        if not self._is_dp_rank_registration_leader():
+            return
+        url = f"http://{bootstrap_server_url}/register_dp_rank"
+        payload = {
+            "bootstrap_room": bootstrap_room,
+            "dp_rank": self.attn_dp_rank,
+        }
+        self._ensure_dp_rank_registration_executor().submit(
+            self._run_prefill_dp_rank_registration, url, payload
+        )
+
+    def _run_prefill_dp_rank_registration(self, url: str, payload: dict) -> None:
+        try:
+            response = self._get_dp_rank_registration_session().post(
+                url, json=payload, timeout=5
+            )
+            if response.status_code != 200:
+                logger.error(
+                    "Failed to register prefill dp_rank: %s, %s",
+                    response.status_code,
+                    response.text,
+                )
+        except Exception as e:
+            logger.error("Failed to register prefill dp_rank: %s", e)
 
     def get_kv_replica_factor(self) -> int:
         if self._kv_replica_factor is None:
@@ -1189,19 +1256,9 @@ class CommonKVSender(BaseKVSender):
 
     def _register_prefill_dp_rank(self):
         """Register this request's prefill dp_rank to the bootstrap server."""
-        url = f"http://{self.bootstrap_server_url}/register_dp_rank"
-        payload = {
-            "bootstrap_room": self.bootstrap_room,
-            "dp_rank": self.kv_mgr.attn_dp_rank,
-        }
-        try:
-            response = requests.post(url, json=payload, timeout=5)
-            if response.status_code != 200:
-                logger.error(
-                    f"Failed to register prefill dp_rank: {response.status_code}, {response.text}"
-                )
-        except Exception as e:
-            logger.error(f"Failed to register prefill dp_rank: {e}")
+        self.kv_mgr.submit_prefill_dp_rank_registration(
+            self.bootstrap_server_url, self.bootstrap_room
+        )
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.num_kv_indices = num_kv_indices
