@@ -56,20 +56,15 @@ logger = logging.getLogger(__name__)
 
 
 def _rows_topk_logprobs(pieces: Sequence[torch.Tensor], num_candidates: int):
-    """Per-row top-`num_candidates` logprobs from raw decode logits.
-
-    Normalizes with a per-row logsumexp instead of materializing a full
-    [rows, vocab] log_softmax; topk order on the raw logits is identical
-    (monotone shift). Returns fp32 [rows, 2k] values and int64 token ids.
-    """
-    # Per piece, not on one concatenated tensor: logsumexp's CUDA reduction
-    # splits by row count, so folding the pieces together shifts the leader
-    # row's lse by an ulp and can flip topk order between near-equal beams.
+    # One logsumexp per piece: it is not batch-invariant on CUDA, and folding
+    # pieces shifts the leader's lse by an ulp, flipping near-equal beams.
     vals, toks = [], []
     for piece in pieces:
         if piece.shape[0] == 0:
             continue
         x = piece.float()
+        # lse instead of a full [rows, vocab] log_softmax; topk order on raw
+        # logits is identical under the monotone shift.
         lse = torch.logsumexp(x, dim=-1, keepdim=True)
         v, t = torch.topk(x, num_candidates, dim=-1)
         vals.append(v - lse)
@@ -100,11 +95,8 @@ class BeamCoordinator:
         return getattr(recv_req.sampling_params, "beam_width", None) or 1
 
     def validate_and_init(self, req: Req, recv_req) -> Optional[str]:
-        """Validate a beam request and attach its group; returns an error or None.
-
-        On success the leader's row params are neutralized (the user's
-        semantics move onto the group).
-        """
+        """Validate a beam request and attach its group; returns an error or
+        None. On success the leader's row params are neutralized."""
         user_params = req.sampling_params
         beam_width = user_params.beam_width
 
@@ -212,9 +204,8 @@ class BeamCoordinator:
         return None
 
     def pending_member_rows(self, batch: ScheduleBatch) -> int:
-        """Member rows that admitted-but-not-yet-spawned groups will claim
-        (beam_width - 1 each; the leader has its own row). The admission gate
-        subtracts this so it never over-commits the req slot pool."""
+        """Rows admitted-but-not-yet-spawned groups will claim; the admission
+        gate subtracts this so it never over-commits the req slot pool."""
         if self._num_live_groups == 0:
             return 0
         return sum(
@@ -299,10 +290,8 @@ class BeamCoordinator:
         logits_output: LogitsProcessorOutput,
         tick: int = 0,
     ) -> None:
-        """Launch half of the leader's prefill tick: first joint selection off
-        the pre-sample capture of its prefill logits (row `pos` of the beam
-        capture), member-row spawn, and the relay overwrite (the sampled
-        token is void)."""
+        """Launch half of the leader's prefill tick: first selection, member-row
+        spawn, and the relay overwrite (the sampled token is void)."""
         group: BeamGroup = req.beam_group
         top_logprobs, top_tokens = _rows_topk_logprobs(
             [logits_output.beam.leader_logits[pos : pos + 1]], group.num_candidates
@@ -320,9 +309,8 @@ class BeamCoordinator:
         self._stash_next_tokens(group.all_rows, next_tokens)
 
     def commit_prefill(self, req: Req, up_to_tick: Optional[int] = None) -> None:
-        """Deferred half of the leader's prefill tick: fold the staged
-        selection into the DAG (the designated D2H point) and apply
-        finish/abort actions."""
+        """Deferred half of the leader's prefill tick: fold the staged selection
+        into the DAG (the designated D2H point) and apply finish/abort."""
         group: BeamGroup = req.beam_group
         if group.retired:
             return
@@ -335,8 +323,6 @@ class BeamCoordinator:
             self._finish_group(group)
 
     def _spawn_member_rows(self, group: BeamGroup, leader: Req) -> None:
-        """Allocate the k-1 member rows and alias the leader's prompt KV
-        mapping onto them, batched. No Req objects, no host sync."""
         rows = self.req_to_token_pool.alloc_rows(group.beam_width - 1)
         assert rows is not None, (
             f"Beam member spawn needs {group.beam_width - 1} req-to-token slots "
@@ -363,11 +349,8 @@ class BeamCoordinator:
     def select_and_relay_decode(
         self, batch: ScheduleBatch, logits_output: LogitsProcessorOutput
     ) -> None:
-        """Launch half: joint-select every group in this decode batch on
-        device, reparent KV, and overwrite the relayed next tokens.
-
-        Rows come from the batch's beam tail layout, their raw logits from the
-        worker's capture -- one leader_logits row per tail entry."""
+        """Launch half: joint-select every group in this decode batch on device,
+        reparent KV, and overwrite the relayed next tokens."""
         tail = batch.beam_tail
         if tail is None:
             return
@@ -389,13 +372,10 @@ class BeamCoordinator:
             self._apply_survivors(group, next_tokens, parent_idx, batch.forward_iter)
 
     def commit_decode(self, batch: ScheduleBatch) -> set:
-        """Deferred half: fold staged selections into the DAG (the designated
-        D2H point) and apply finish/abort, group-atomically.
-
-        Returns the ids of groups finished/aborted by THIS call: under overlap
-        a finished leader row reappears for one overshoot tick, and the
-        caller's per-req loop must run the shared finish machinery (KV
-        release, stream) exactly once -- on the committing tick."""
+        """Deferred half: fold staged selections into the DAG and apply
+        finish/abort. Returns groups finished by THIS call -- under overlap a
+        finished leader reappears for one overshoot tick, so the caller runs the
+        shared finish machinery only on the committing tick."""
         newly_finished = set()
         for req in batch.reqs:
             group = req.beam_group
@@ -421,11 +401,10 @@ class BeamCoordinator:
         top_tokens: torch.Tensor,
         tick: int,
     ):
-        """One on-device selection step; returns (next_tokens, parent_idx)
-        GPU tensors of shape [k]. parent_idx is None on a length-terminated
-        final step (its selections all finish, so no row moves onto them)."""
         k = group.beam_width
         if group.next_step_is_final():
+            # parent_idx is None on a final step: every selection finishes, so
+            # no row moves onto another's slots.
             fsel = select_final_topk(
                 group.frontier_cum_logprobs, top_logprobs, top_tokens, k
             )
@@ -448,12 +427,6 @@ class BeamCoordinator:
         parent_idx: Optional[torch.Tensor],
         tick: int,
     ) -> None:
-        """Move rows onto surviving paths on-device: reparent by pointing each
-        row at its parent's slots and relay the selected next tokens.
-
-        The leader's output_ids carries length only (the DAG owns history, and
-        member rows have no host state), so advance it by one placeholder.
-        """
         rows = group.all_rows
         if parent_idx is not None:
             # Share-on-fork: the survivor's history IS its parent's window
@@ -472,20 +445,20 @@ class BeamCoordinator:
                 seq_len=group.leader.kv_committed_len,
             )
             group.pending_orphans.append(StagedOrphans(tick, old_map, new_map))
-            group.leader.output_ids.append(0)  # length placeholder
+            # Length placeholder only; the DAG owns history and member rows
+            # have no host state.
+            group.leader.output_ids.append(0)
         self._stash_next_tokens(rows, next_tokens)
 
     def _reclaim_orphans(
         self, group: BeamGroup, up_to_tick: Optional[int] = None
     ) -> None:
-        """Deferred half: return the slots no surviving row references. Runs
-        where the tick's copy_done sync already happened, so the unique/isin
-        set difference costs no extra stall on the launch path.
-
-        up_to_tick=None drains everything (group teardown)."""
+        # Callers must be past the tick's copy_done sync: collect_orphan_slots
+        # synchronizes, which would stall the launch path.
         if not group.pending_orphans:
             return
         if up_to_tick is None:
+            # Teardown drains every staged tick.
             staged, group.pending_orphans = group.pending_orphans, []
         else:
             staged = [e for e in group.pending_orphans if e.tick <= up_to_tick]
@@ -507,8 +480,7 @@ class BeamCoordinator:
     # ==================== group finish ====================
 
     def _finish_group(self, group: BeamGroup) -> None:
-        """Finish the leader (it carries the best sequence's finish reason)
-        and free the member rows in one shot."""
+        # The leader carries the best sequence's finish reason.
         group.final_results = group.finalize()
         top = group.final_results[0]
         leader = group.leader
@@ -520,7 +492,6 @@ class BeamCoordinator:
         self._retire_group(group)
 
     def _abort_group(self, group: BeamGroup) -> None:
-        """Terminate a group whose leader was aborted: no beam results."""
         group.state = BeamGroupState.FINISHED
         group.final_results = []
         leader = group.leader
@@ -530,9 +501,8 @@ class BeamCoordinator:
         self._retire_group(group)
 
     def retire_aborted_beam_groups(self, reqs_to_abort: List[Req]) -> None:
-        """Leader aborted outside the commit path (retract_decode OOM): the
-        member rows were already freed there, while the leader's kv info still
-        carried the group's lockstep allocated length."""
+        """Leader aborted outside the commit path (retract_decode OOM); the
+        member rows were already freed there."""
         for req in reqs_to_abort:
             group = req.beam_group
             if group is None or group.retired:
@@ -548,23 +518,20 @@ class BeamCoordinator:
         free_member_rows(group, self.req_to_token_pool, self.token_to_kv_pool_allocator)
 
     def _retire_group(self, group: BeamGroup) -> None:
-        """Leave the live set exactly once (finish or abort); keeps the O(1)
-        gate accurate and drops overshoot selections staged after the
-        terminal commit."""
+        # Exactly once per group, so the O(1) live gate stays accurate.
         if not group.retired:
             # Staged orphans are referenced by no row, so the retract-abort
-            # path's direct fork.free_member_rows cannot see them; drain here
-            # so every exit covers. No-op on the commit paths, already drained.
+            # path's direct fork.free_member_rows cannot see them.
             self._reclaim_orphans(group)
             group.retired = True
+            # Drops overshoot selections staged after the terminal commit.
             group._pending_steps.clear()
             self._num_live_groups -= 1
 
     # ==================== helpers ====================
 
     def _stash_next_tokens(self, rows, tokens) -> None:
-        """Relay next tokens into the FutureMap. Accepts GPU tensors (decode
-        path, no D2H) or host lists (prefill-final seeding)."""
+        # Accepts GPU tensors (decode path, no D2H) or host lists (prefill).
         device = self.req_to_token_pool.device
         if not torch.is_tensor(rows):
             rows = torch.tensor(rows, dtype=torch.int64, device=device)

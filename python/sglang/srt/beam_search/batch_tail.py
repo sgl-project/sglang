@@ -29,12 +29,10 @@ class BeamTail:
 
 
 def append_beam_tail(batch: ScheduleBatch) -> None:
-    """Append every live group's member rows after the reqs-aligned rows, so
-    the decode forward (allocation, relay resolve, attention) covers them.
-
-    Reqs-sized host metadata (sampling_info, top_logprobs_nums, rids, ...) is
-    intentionally NOT extended -- the worker slices the member rows off the
-    logits before sampling."""
+    """Append every live group's member rows after the reqs-aligned rows, so the
+    decode forward (allocation, relay resolve, attention) covers them."""
+    # Reqs-sized host metadata (sampling_info, top_logprobs_nums, rids, ...) is
+    # intentionally NOT extended; the worker slices the tail off before sampling.
     assert batch.beam_tail is None
     entries = []
     tails = []
@@ -114,10 +112,8 @@ def num_beam_member_rows(reqs) -> int:
 
 
 def beam_retraction_order(sorted_indices: List[int], reqs: List[Req]) -> List[int]:
-    """Beam groups are not retractable yet: members alias the leader's prompt
-    KV, so a partial retract corrupts the group. Prefer keeping them (retract
-    normal reqs first); under sustained pressure the caller aborts the whole
-    group atomically."""
+    """Beam groups are not retractable -- members alias the leader's prompt KV.
+    Keep them, retract normal reqs first; the caller aborts the group instead."""
     if not any(reqs[i].beam_group is not None for i in sorted_indices):
         return sorted_indices
     return [i for i in sorted_indices if reqs[i].beam_group is not None] + [

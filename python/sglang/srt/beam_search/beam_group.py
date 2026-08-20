@@ -47,11 +47,8 @@ class BeamResult:
 
 
 class BeamGroup:
-    """State machine: one prefill selection, then decode selections, then finalize.
-
-    The frontier starts as a single pseudo-row (the prompt, cum_logprob 0), so
-    the prefill selection is just joint_select with num_rows=1.
-    """
+    """State machine: one prefill selection, then decode selections, then
+    finalize. The frontier starts as one pseudo-row (the prompt, cum_logprob 0)."""
 
     def __init__(
         self,
@@ -112,18 +109,14 @@ class BeamGroup:
         return 0 if self.member_rows is None else self.member_rows.shape[0]
 
     def extra_uncached_tokens(self) -> int:
-        """Uncached KV the group holds beyond the leader's own window (which
-        the generic per-req sum already counts).
-
-        held = allocated - freed, both host-side counters: the region grows by
-        exactly k slots per step and the reclaim accumulates what it returned.
-        Counting distinct slots off req_to_token instead would mean reading the
-        launch half's staged tensors, unsafe on the checker's stream under
-        overlap."""
+        """Uncached KV the group holds beyond the leader's own window, which the
+        generic per-req sum already counts."""
         if self.all_rows is None:
             return 0
         end = self.leader.kv.kv_allocated_len
         start = self.prompt_len
+        # Host-side arithmetic, not distinct slots off req_to_token: that would
+        # read the launch half's staged tensors, unsafe on the checker's stream.
         held = self.beam_width * (end - start) - self.slots_freed
         return held - (end - start)
 
@@ -149,20 +142,15 @@ class BeamGroup:
         self._pending_steps.append((tick, sel))
 
     def commit_pending(self, up_to_tick: Optional[int] = None) -> bool:
-        """Deferred half: consume staged selection results (the D2H sync
-        point) into the DAG and detect finish. Returns True when this commit
-        finishes the group; steps staged behind a finish (overlap overshoot)
-        are discarded.
-
-        Tick gate -- the reason every commit_* on this path takes an
-        up_to_tick: the caller's copy_done sync covers exactly the selection
-        kernels enqueued up to that forward, so a later-staged step's device
-        tensors may not be readable yet. None = consume all (teardown)."""
+        """Deferred half: consume staged selections into the DAG (the D2H sync
+        point). Returns True when this commit finishes the group."""
         if self.state == BeamGroupState.FINISHED:
             self._pending_steps.clear()
             return False
         while self._pending_steps:
             tick, sel = self._pending_steps[0]
+            # Tick gate: copy_done covers only kernels enqueued up to that
+            # forward, so a later-staged step may not be readable yet.
             if up_to_tick is not None and tick > up_to_tick:
                 break
             self._pending_steps.pop(0)

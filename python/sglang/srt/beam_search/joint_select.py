@@ -20,12 +20,8 @@ import torch
 
 @dataclass
 class SelectResult:
-    """Fixed-shape outputs of one expansion step.
-
-    Survivor slots are valid in [0, num_survivors); finished slots in
-    [0, num_finished); the remaining slots hold zeros from the dump-slot
-    scatter and must not be read.
-    """
+    """Fixed-shape outputs of one expansion step. Valid in [0, num_survivors)
+    and [0, num_finished); past that, dump-slot zeros that must not be read."""
 
     next_tokens: torch.Tensor  # [beam_width] int64
     parent_idx: torch.Tensor  # [beam_width] int64, row index into the input frontier
@@ -55,7 +51,6 @@ def _scatter_fixed(src: torch.Tensor, slot: torch.Tensor, size: int) -> torch.Te
 
 
 def _ranked_candidates(cum_logprobs, top_logprobs, top_tokens, num_out):
-    """Score all row x candidate extensions, return the top num_out sorted."""
     num_candidates = top_logprobs.shape[1]
     scores = cum_logprobs.unsqueeze(1) + top_logprobs
     cand_scores, cand_idx = scores.reshape(-1).topk(num_out, sorted=True)
@@ -113,11 +108,8 @@ def select_final_topk(
     top_tokens: torch.Tensor,  # [num_rows, num_candidates] int64
     beam_width: int,
 ) -> FinalSelect:
-    """Length-terminated step: the best beam_width extensions all finish.
-
-    No stop check is needed; the caller decides this step deterministically
-    from the step counter (max_new_tokens is uniform across the group).
-    """
+    """Length-terminated step: the best beam_width extensions all finish. No
+    stop check needed -- the caller decides this step from the step counter."""
     cand_scores, parent, tokens = _ranked_candidates(
         cum_logprobs, top_logprobs, top_tokens, beam_width
     )

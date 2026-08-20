@@ -37,11 +37,8 @@ MEMBER_LENGTH_MARGIN = 4
 
 
 def neutral_member_sampling_params(leader_params):
-    """Neutral params: raw logprob scoring, and no leader-side finish path.
-
-    The leader row never self-finishes (the coordinator owns all stop/length
-    semantics), so stop conditions are stripped and ignore_eos is forced.
-    """
+    """Raw logprob scoring, and no leader-side finish path: the coordinator owns
+    all stop/length semantics, so stops are stripped and ignore_eos forced."""
     from sglang.srt.sampling.sampling_params import SamplingParams
 
     return SamplingParams(
@@ -66,23 +63,14 @@ def alias_members_prompt_kv(
     leader_row: int,
     prompt_len: int,
 ) -> None:
-    """One indexed copy for all members (they share leader_row + prompt_len,
-    so batching saves a kernel launch per member).
-
-    Any tree lock on a matched prompt prefix is the leader's for the group's
-    whole lifetime; member rows never touch the tree.
-    """
+    """One indexed copy for all members, which share leader_row + prompt_len.
+    Any tree lock stays the leader's; members never touch the tree."""
     req_to_token[dst_rows, :prompt_len] = req_to_token[leader_row, :prompt_len]
 
 
 def free_member_rows(group, req_to_token_pool, token_to_kv_pool_allocator) -> None:
-    """Release the decode-suffix KV [prompt_len, leader_allocated) plus the
-    member row slots. Idempotent.
-
-    Must run while the leader still holds its kv info: leader_allocated is the
-    lockstep allocated length of every member row, overlap overshoot slot
-    included.
-    """
+    """Release the decode-suffix KV plus the member row slots. Idempotent; must
+    run while the leader's kv info still carries the lockstep allocated length."""
     if group.member_rows is None:
         return
     leader = group.leader
@@ -112,14 +100,10 @@ def remap_kv_mapping(
     prefix_len: int,
     seq_len: int,
 ):
-    """Returns (old_mapping, new_mapping) so the caller can reclaim the slots
-    no surviving row references any more.
-
-    All rows are length-synchronized, so a survivor's history is exactly its
-    parent's window [prefix_len, seq_len) -- including the token just computed
-    at seq_len-1. The row's own slot there becomes garbage unless some other
-    survivor inherits it.
-    """
+    """Returns (old_mapping, new_mapping) so the caller can reclaim the slots no
+    surviving row references any more."""
+    # Rows are length-synchronized, so a survivor's history is exactly its
+    # parent's window, including the token just computed at seq_len-1.
     window = req_to_token[rows, prefix_len:seq_len]
     old_mapping = window.clone()
     new_mapping = old_mapping[parent_idx]
@@ -128,11 +112,8 @@ def remap_kv_mapping(
 
 
 def collect_orphan_slots(old_mapping: torch.Tensor, new_mapping: torch.Tensor):
-    """Slots referenced before the remap and by nobody after it.
-
-    Data-dependent output shape (unique/isin), so this synchronizes -- callers
-    must keep it off the launch path.
-    """
+    """Slots referenced before the remap and by nobody after it. Data-dependent
+    shape (unique/isin), so it synchronizes -- keep it off the launch path."""
     old_slots = old_mapping.flatten().unique()
     new_slots = new_mapping.flatten().unique()
     return old_slots[~torch.isin(old_slots, new_slots)]

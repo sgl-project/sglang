@@ -23,12 +23,8 @@ if TYPE_CHECKING:
 
 
 def pack_beam_search_output(req: Req) -> Optional[BeamSearchOutput]:
-    """Build the beam_results carrier for a finished leader.
-
-    Returns the group's top num_return sequences, best score first, with
-    JSON-serializable finish reasons (the carrier crosses IPC boundaries).
-    Returns None for a group that ended without results (aborted).
-    """
+    """Top num_return sequences, best score first; None for a group that ended
+    without results. Finish reasons are JSON: the carrier crosses IPC."""
     # Scheduler-side only; keep schedule_batch out of the module import graph.
     from sglang.srt.managers.schedule_batch import FINISH_LENGTH, FINISH_MATCHED_TOKEN
 
@@ -119,11 +115,8 @@ def decode_beam_search_output(
 
 
 def build_beam_search_out(out: Dict[str, Any]) -> Dict[str, Any]:
-    """Flatten a beam_results dict into a regular out dict: best beam at the
-    top level, full list under meta_info. Shaping it like a normal response
-    is what lets _wait_one_response reuse its logging / metrics / abort path
-    unchanged.
-    """
+    """Flatten beam_results into a regular out dict: best beam at the top level,
+    full list under meta_info, so _wait_one_response reuses its normal path."""
     beam_results = out.get("beam_results", [])
     if not beam_results:
         return out

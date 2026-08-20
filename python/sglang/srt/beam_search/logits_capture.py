@@ -32,9 +32,8 @@ def capture_pre_sample_logits(
     forward_batch: ForwardBatch,
     logits_output: Optional[LogitsProcessorOutput],
 ) -> None:
-    """Decode: split the member-row tail off logits/hidden_states/positions
-    and clone the leader rows. Extend: clone the beam leaders' rows. No-op
-    for a forward without logits or without beam rows."""
+    """Decode: split the member tail off logits/hidden_states/positions and
+    clone the leader rows. Extend: clone the leaders' rows. No-op otherwise."""
     if (
         batch is None
         or logits_output is None
