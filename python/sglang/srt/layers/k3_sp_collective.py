@@ -76,7 +76,7 @@ def _init_state() -> Optional[_State]:
         or a2a not in ("megamoe", "deepep")
         or not isinstance(comm, CustomAllReduceV2)
         or comm.disabled
-        or comm.mc_base_ptr == 0
+        or not comm.has_multicast
     ):
         message = (
             "K3 SP collective requires SM103, TP4/TP8, MegaMoE/DeepEP, and "
@@ -104,8 +104,8 @@ def _init_state() -> Optional[_State]:
         )
         return None
 
-    sp_collective.register_comm(comm.obj, pull_sem_mc_ptr=comm.pull_sem_mc_ptr)
-    attn_res.register_comm(comm.obj, pull_sem_mc_ptr=comm.pull_sem_mc_ptr)
+    sp_collective.register_comm(comm.obj)
+    attn_res.register_comm(comm.obj)
     _STATE = _State(group, comm)
     logger.info(
         "K3 SP collective enabled (TP%d, fused RS residual + AG)",
@@ -393,7 +393,6 @@ def all_gather(tensor: torch.Tensor) -> Optional[torch.Tensor]:
             state.group.world_size,
             tensor,
             output,
-            ws_mc_base=state.comm.mc_base_ptr,
             tuning=dispatch.tuning,
         )
     if dispatch.strategy == "direct":

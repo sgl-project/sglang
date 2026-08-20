@@ -69,11 +69,11 @@ def _init_comm():
         max_pull_size=4 * _MB,
         max_push_size=4 * _MB,
     )
-    if comm.disabled or comm.mc_base_ptr == 0:
+    if comm.disabled or not comm.has_multicast:
         raise RuntimeError("Kimi K3 collectives require multicast symmetric memory")
-    all_reduce.register_comm(comm.obj, pull_sem_mc_ptr=comm.pull_sem_mc_ptr)
-    sp_collective.register_comm(comm.obj, pull_sem_mc_ptr=comm.pull_sem_mc_ptr)
-    attn_res.register_comm(comm.obj, pull_sem_mc_ptr=comm.pull_sem_mc_ptr)
+    all_reduce.register_comm(comm.obj)
+    sp_collective.register_comm(comm.obj)
+    attn_res.register_comm(comm.obj)
     register_comm_cleanup(comm)
     return comm
 
@@ -138,7 +138,6 @@ def test_all_reduce_push():
         comm.world_size,
         x,
         residual,
-        ws_mc_base=comm.mc_base_ptr,
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(x, expected, rtol=0, atol=0)
@@ -204,7 +203,6 @@ def test_sequence_parallel_collectives():
         world_size,
         gather_input,
         gather_output,
-        ws_mc_base=comm.mc_base_ptr,
         tuning=_SP_TUNING,
     )
     torch.cuda.synchronize()
@@ -243,7 +241,6 @@ def test_gemm_all_gather():
         bias,
         None,
         output,
-        ws_mc_base=comm.mc_base_ptr,
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(output, expected, rtol=3e-2, atol=3e-2)

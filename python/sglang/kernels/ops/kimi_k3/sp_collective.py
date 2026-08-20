@@ -155,10 +155,9 @@ def _jit_module(world_size: int) -> Module:
 
 
 _COMM_MAP: dict[int, Communicator] = {}
-_PULL_SEM_MC_MAP: dict[int, int] = {}
 
 
-def register_comm(comm: Communicator, *, pull_sem_mc_ptr: int = 0) -> None:
+def register_comm(comm: Communicator) -> None:
     # One communicator per world_size per process -- see the note in
     # kimi_k3/all_reduce.py::register_comm. The ops key only on world_size, so an
     # overwrite here would hand the old group's callers the new group's peer
@@ -169,7 +168,6 @@ def register_comm(comm: Communicator, *, pull_sem_mc_ptr: int = 0) -> None:
         f"{comm.world_size}"
     )
     _COMM_MAP[comm.world_size] = comm
-    _PULL_SEM_MC_MAP[comm.world_size] = pull_sem_mc_ptr
 
 
 @register_custom_op(mutates_args=["output"])
@@ -211,7 +209,6 @@ def _reduce_scatter_pull_op(
         None if residual is None else residual.view(-1),
         residual_is_local,
         input_mc_ptr,
-        _PULL_SEM_MC_MAP[world_size],
         num_blocks,
         block_size,
     )
@@ -222,7 +219,6 @@ def _all_gather_op(
     world_size: int,
     input: torch.Tensor,
     output: torch.Tensor,
-    ws_mc_base: int,
     num_blocks: int,
     block_size: int,
 ) -> None:
@@ -230,7 +226,6 @@ def _all_gather_op(
         _COMM_MAP[world_size],
         input.view(-1),
         output.view(-1),
-        ws_mc_base,
         num_blocks,
         block_size,
     )
@@ -250,7 +245,6 @@ def _all_gather_direct_op(
         input.view(-1),
         output.view(-1),
         output_mc_ptr,
-        _PULL_SEM_MC_MAP[world_size],
         num_blocks,
         block_size,
     )
@@ -305,14 +299,12 @@ def all_gather(
     input: torch.Tensor,
     output: torch.Tensor,
     *,
-    ws_mc_base: int,
     tuning: Tuning = DEFAULT_TUNING,
 ) -> torch.Tensor:
     _all_gather_op(
         world_size,
         input,
         output,
-        ws_mc_base,
         tuning.num_blocks,
         tuning.block_size,
     )

@@ -442,6 +442,7 @@ class MiniMaxM2QKRMSNorm:
         comm = CustomAllReduceV2(
             group=get_parallel().attn_tp_group.cpu_group,
             device=device,
+            # push-only: no barrier plane and no staging buffer
             max_pull_size=0,
             max_pull_blocks=0,
             max_push_size=max_size,
