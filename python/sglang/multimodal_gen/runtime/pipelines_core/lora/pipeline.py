@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.lora.peft_adapter import (
 from sglang.multimodal_gen.runtime.server_args import LORA_MERGE_MODES, ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.platforms import current_platform
 
 # to avoid deadlocks when forking
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -289,11 +290,8 @@ class LoRAPipeline(ComposedPipelineBase):
             return
 
         # Clear device cache to free unused memory on backends that expose it.
-        device_module = torch.get_device_module()
-        if device_module.is_available() and hasattr(device_module, "empty_cache"):
-            if hasattr(device_module, "synchronize"):
-                device_module.synchronize()
-            device_module.empty_cache()
+        current_platform.synchronize()
+        current_platform.empty_cache()
 
         offload_disabled_modules = []
         for module_name in module_names:
