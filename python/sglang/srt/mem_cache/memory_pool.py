@@ -1075,7 +1075,7 @@ class MambaPool:
             slice_axis = self.conv_slice_axis if field == "conv" else 0
             for state_tensor in tensors:
                 # A ShortConv layer has no temporal state, so that buffer is
-                # empty; advertising it fails the whole batch registration.
+                # empty. Advertising it fails the whole batch registration.
                 if state_tensor.numel() == 0:
                     continue
                 yield field, state_tensor, slice_axis
