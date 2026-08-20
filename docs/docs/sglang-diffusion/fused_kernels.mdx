@@ -97,6 +97,7 @@ These fusion families mount under `quality="high"`:
 | --- | --- | --- | --- |
 | `fused_inplace_qknorm_rope` | JIT CUDA | one bf16 rounding step vs the split baseline; exact with `round_norm_before_rope=True` | separate QK-norm kernel + RoPE |
 | `rope_rotate_half` | Triton | bit-exact | `chunk` → `cat(-x2, x1)` → two muls + add → `cat(tail)`, about 7 kernels per projection |
+| `interleaved_rope_fp64` | JIT CUDA | bit-exact | paired SANA-Video Q/K RoPE with fp64 tables, about 14 eager kernels |
 | `ltx2_qknorm_split_rope` | JIT CUDA | close (validated on B200) | LTX-2 QK-norm + split RoPE |
 | `hunyuan_qkv_rope_pack` | Triton | bit-exact | QKV pack and RoPE in one pass |
 
@@ -143,6 +144,7 @@ Kernels are written against a specific eager chain in a specific model, so cover
 | Ideogram 4 | gate RMSNorm, SwiGLU, rotate-half RoPE, modulate, residual-gate add |
 | LTX-2 | QK-norm + split RoPE, ada-values split, RMSNorm+modulate, modulate, residual-gate add, linear+GELU |
 | HunyuanVideo | QKV+RoPE pack, strided QK RMSNorm, linear+GELU |
+| SANA-Video | paired fp64 interleaved RoPE |
 | Sana | LN+modulate, GLUMB bias+SiLU / bias+GLU, residual-gate add |
 | Sana-WM | bidirectional gated delta-net, fused QK inverse-RMS |
 | Wan | temb table slices; VAE cat+pad and DupUp3D add, `channels_last_3d` RMSNorm+SiLU |
