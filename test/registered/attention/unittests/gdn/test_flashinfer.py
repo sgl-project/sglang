@@ -506,7 +506,7 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
             torch.cuda.stream(capture_stream),
             forward_context(ForwardContext(attn_backend=fixture.backend)),
         ):
-            with torch.cuda.graph(graph):
+            with torch.cuda.graph(graph, stream=capture_stream):
                 graph_output = fixture.actual_module(
                     fixture.forward_batch,
                     fixture.mixed_qkv,
