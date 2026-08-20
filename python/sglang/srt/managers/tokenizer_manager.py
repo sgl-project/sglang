@@ -597,7 +597,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
 
         # Dumping
-        self.dump_requests_folder = ""
+        self.dump_requests_folder = ""  # By default do not dump
         self.dump_requests_threshold = 1000
         self.dump_requests_exclude_meta_keys: List[str] = [
             "routed_experts",
@@ -605,7 +605,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ]
         self.dump_request_list: List[Tuple] = []
         self.crash_dump_request_list: deque[Tuple] = deque()
-        self.crash_dump_performed = False
+        self.crash_dump_performed = False  # Flag to ensure dump is only called once
 
         # Initialize performance metrics loggers with proper skip names
         _, obj_skip_names, out_skip_names = self.request_logger.metadata

@@ -1095,7 +1095,9 @@ class Req(ReqDllmMixin):
         self.cached_tokens_device = 0  # Tokens from device cache (GPU)
         self.cached_tokens_host = 0  # Tokens from host cache (CPU memory)
         self.cached_tokens_storage = 0  # Tokens from L3 storage backend
-        self._cache_breakdown_computed = False
+        self._cache_breakdown_computed = (
+            False  # Track if breakdown was already computed
+        )
 
         # Per-request count of verification forward passes.
         self.spec_verify_ct = 0
