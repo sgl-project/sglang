@@ -22,7 +22,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
-from sglang.srt.mem_cache.unified_cache_linker import UnifiedCacheLinker
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
 from sglang.srt.mem_cache.utils import hash_str_to_int64
 from sglang.srt.utils import freeze_gc, get_device_module
 

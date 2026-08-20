@@ -31,7 +31,7 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     ExternalLinkerLoadPhase,
     LinkerTransferPhase,
 )
-from sglang.srt.mem_cache.unified_cache_linker import (
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     DevicePoolEntry,
     DevicePoolGroup,
     UnifiedCacheLinkerWrapper,

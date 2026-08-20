@@ -26,7 +26,7 @@ from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
     _PoolRangePlan,
 )
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
-from sglang.srt.mem_cache.unified_cache_linker import (
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     DevicePoolEntry,
     DevicePoolGroup,
     UnifiedCacheLinkerWrapper,

@@ -30,7 +30,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.mem_cache.unified_cache_linker import (
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     DevicePoolEntry,
     DevicePoolGroup,
 )

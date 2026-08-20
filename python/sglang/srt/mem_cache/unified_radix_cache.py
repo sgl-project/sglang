@@ -78,7 +78,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
     UnifiedTreeCore,
     UnifiedTreeNode,
 )
-from sglang.srt.mem_cache.unified_cache_linker import (
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.observability.metrics_collector import (
