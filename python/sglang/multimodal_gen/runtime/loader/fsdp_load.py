@@ -299,15 +299,15 @@ def maybe_load_fsdp_model(
         logger.info("Disabling FSDP for MPS platform as it's not compatible")
 
     weight_load_plan = weight_load_plan or WeightLoadPlan(checkpoint_load_device=device)
-    mps_zero_copy_weight_loading = bool(
+    keep_checkpoint_mapping = bool(
         current_platform.is_mps()
         and weight_load_plan.mps_layerwise_cpu_staging
         and weight_load_plan.checkpoint_load_device.type == "cpu"
     )
-    if mps_zero_copy_weight_loading:
-        # layerwise offload replaces block parameters with mps placeholders after
+    if keep_checkpoint_mapping:
+        # layerwise offload replaces block parameters with placeholders after
         # load, so compatible checkpoint tensors stay file-backed on CPU
-        model._mps_zero_copy_weight_loading = True
+        model._keep_checkpoint_mapping = True
     defer_cpu_placement = bool(
         component_starts_on_cpu
         and weight_load_plan.defer_cpu_placement
@@ -425,7 +425,7 @@ def maybe_load_fsdp_model(
         strict=strict,
         cpu_offload=load_on_cpu,
         param_names_mapping=param_names_mapping_fn,
-        mps_zero_copy_weight_loading=mps_zero_copy_weight_loading,
+        keep_checkpoint_mapping=keep_checkpoint_mapping,
         preconverted_state_dict=preconverted_state_dict,
     )
     if bnb_quant_states:
@@ -549,7 +549,7 @@ def load_model_from_full_model_state_dict(
     strict: bool = False,
     cpu_offload: bool = False,
     param_names_mapping: Callable[[str], tuple[str, Any, Any]] | None = None,
-    mps_zero_copy_weight_loading: bool = False,
+    keep_checkpoint_mapping: bool = False,
     preconverted_state_dict: (
         tuple[
             dict[
@@ -574,7 +574,7 @@ def load_model_from_full_model_state_dict(
         strict (bool): flag to check if to load the model in strict mode
         cpu_offload (bool): flag to check if FSDP offload is enabled
         param_names_mapping (Optional[Callable[[str], str]]): a function that maps full param name to sharded param name
-        mps_zero_copy_weight_loading (bool): retain compatible CPU checkpoint tensors for MPS layerwise offload
+        keep_checkpoint_mapping (bool): retain compatible CPU checkpoint tensors instead of copying them
     Returns:
         ``NamedTuple`` with ``missing_keys`` and ``unexpected_keys`` fields:
             * **missing_keys** is a list of str containing the missing keys
@@ -717,9 +717,9 @@ def load_model_from_full_model_state_dict(
                 else None
             )
             use_checkpoint_tensor_directly = bool(
-                mps_zero_copy_weight_loading
+                keep_checkpoint_mapping
                 and actual_param is not None
-                and not getattr(actual_param, "mps_zero_copy_unsafe", False)
+                and not getattr(actual_param, "checkpoint_mapping_unsafe", False)
                 and tuple(meta_sharded_param.shape) == tuple(full_tensor.shape)
                 and full_tensor.device.type == "cpu"
                 and full_tensor.dtype == target_dtype

@@ -38,6 +38,10 @@ _UNLIMITED_ABOVE = 1 << 62
 HOST_RESERVE_FRACTION = 0.05
 MIN_HOST_RESERVE_BYTES = 2 * GIB_BYTES
 
+# Left free when weighing a checkpoint against host memory: activations, staging
+# buffers and allocator slack are none of them in the weight total.
+HOST_COPY_RESERVE_BYTES = 4 * GIB_BYTES
+
 
 def _read_int(path: str) -> int | None:
     try:
@@ -76,6 +80,19 @@ def host_memory_available_bytes() -> int:
         return available
     limit, usage = capped
     return min(available, max(0, limit - usage))
+
+
+def host_copies_would_not_fit(weight_bytes: int) -> bool:
+    """Whether copying `weight_bytes` into host memory would run the host out.
+
+    The alternative to a copy is leaving the weights on their file mapping,
+    which the kernel may drop under pressure and re-read from disk. That is
+    slower per byte but bounded, so it is the right answer exactly when the
+    copies do not fit -- and the wrong one when they do.
+    """
+    if weight_bytes <= 0:
+        return False
+    return weight_bytes >= host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES
 
 
 class HostPinBudget:
