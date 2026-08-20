@@ -669,14 +669,13 @@ class TextEncoderLoader(ComponentLoader):
                     model = model.to("cpu")
                     mesh = init_device_mesh(
                         current_platform.device_type,
-                        mesh_shape=(1, dist.get_world_size()),
-                        mesh_dim_names=("offload", "replicate"),
+                        mesh_shape=(dist.get_world_size(),),
                     )
                     shard_model(
                         model,
                         cpu_offload=True,
                         reshard_after_forward=True,
-                        mesh=mesh["offload"],
+                        mesh=mesh,
                         fsdp_shard_conditions=fsdp_shard_conditions,
                         pin_cpu_memory=server_args.pin_cpu_memory,
                     )

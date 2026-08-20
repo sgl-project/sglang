@@ -29,6 +29,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_context,
     autocast_enabled_for_device,
     resolve_decode_precision,
     resolve_precision,
@@ -356,16 +357,11 @@ class MiniMaxH3DecodingStage(DecodingStage):
             )
             if visual_autocast_enabled:
                 selected_video_vae.prepare_decoder_autocast_weights(video_vae_dtype)
-            autocast_context = (
-                torch.autocast(
-                    device_type="cuda",
-                    dtype=video_vae_dtype,
-                    enabled=visual_autocast_enabled,
-                )
-                if visual_latent.is_cuda
-                else nullcontext()
-            )
-            with autocast_context:
+            with autocast_context(
+                video_vae_dtype,
+                server_args.disable_autocast,
+                enabled=visual_autocast_enabled,
+            ):
                 video_decode = self._get_vae_decode_fn(
                     selected_video_vae,
                     server_args,
