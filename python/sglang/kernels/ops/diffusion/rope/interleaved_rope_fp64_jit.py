@@ -88,6 +88,8 @@ def can_use_interleaved_rope_fp64(
         and q.shape[-1] % 2 == 0
         and q.is_contiguous()
         and k.is_contiguous()
+        and q.data_ptr() % 4 == 0
+        and k.data_ptr() % 4 == 0
         and cos.dtype is torch.float64
         and sin.dtype is torch.float64
         and cos.shape == expected_table_shape

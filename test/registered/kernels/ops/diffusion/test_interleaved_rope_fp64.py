@@ -86,6 +86,11 @@ def test_interleaved_rope_fp64_predicate_rejects_unsupported_inputs() -> None:
     assert not can_use_interleaved_rope_fp64(q, k[..., ::2], cos, sin)
     assert not can_use_interleaved_rope_fp64(q, k, cos.float(), sin)
     assert not can_use_interleaved_rope_fp64(q, k, cos[..., :-2], sin[..., :-2])
+    unaligned = torch.empty(q.numel() + 1, dtype=torch.bfloat16, device="cuda")[
+        1:
+    ].view_as(q)
+    assert unaligned.is_contiguous()
+    assert not can_use_interleaved_rope_fp64(unaligned, k, cos, sin)
 
 
 if __name__ == "__main__":

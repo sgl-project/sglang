@@ -97,6 +97,7 @@ struct InterleavedRopeFP64Kernel {
       int64_t num_heads,
       int64_t head_dim) {
     using namespace host;
+    using Pair = device::AlignedVector<T, 2>;
 
     auto N = SymbolicSize{"activation_elements"};
     auto R = SymbolicSize{"table_elements"};
@@ -115,6 +116,12 @@ struct InterleavedRopeFP64Kernel {
         q_out.data_ptr() != k_out.data_ptr() && q_out.data_ptr() != q.data_ptr() && q_out.data_ptr() != k.data_ptr() &&
         k_out.data_ptr() != q.data_ptr() && k_out.data_ptr() != k.data_ptr())
         << "interleaved_rope_fp64 outputs must not alias inputs";
+    CHECK_HOST(
+        reinterpret_cast<uintptr_t>(q_out.data_ptr()) % alignof(Pair) == 0 &&
+        reinterpret_cast<uintptr_t>(k_out.data_ptr()) % alignof(Pair) == 0 &&
+        reinterpret_cast<uintptr_t>(q.data_ptr()) % alignof(Pair) == 0 &&
+        reinterpret_cast<uintptr_t>(k.data_ptr()) % alignof(Pair) == 0)
+        << "interleaved_rope_fp64 activations must be aligned to rotation pairs";
 
     const int64_t num_pairs = N.unwrap() / 2;
     const int64_t pairs_per_head = head_dim / 2;
