@@ -187,8 +187,6 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     TOTAL_Q: tl.constexpr = NUM_HEADS_QK * HEAD_QK
     TOTAL_K: tl.constexpr = NUM_HEADS_QK * HEAD_QK
     TOTAL_V: tl.constexpr = NUM_HEADS_V * HEAD_V
-    TOTAL_QKVZ: tl.constexpr = TOTAL_Q + TOTAL_K + TOTAL_V + TOTAL_V
-    TOTAL_BA: tl.constexpr = NUM_HEADS_V * 2
 
     # ── Output dimensions ──
     QKV_DIM_T: tl.constexpr = TOTAL_Q + TOTAL_K + TOTAL_V
@@ -230,7 +228,11 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     # vector access. V_POW2 arrives as a wrapper-computed constexpr so the
     # dead branch is pruned before tl.arange validation.
     v_ld_base = (
-        mixed_qkvz + i_bs * TOTAL_QKVZ + TOTAL_Q + TOTAL_K + i_qk * V_PER_GROUP * HEAD_V
+        mixed_qkvz
+        + i_bs * QKVZ_STRIDE
+        + TOTAL_Q
+        + TOTAL_K
+        + i_qk * V_PER_GROUP * HEAD_V
     )
     z_ld_base = v_ld_base + TOTAL_V
 
