@@ -40,6 +40,7 @@ from __future__ import annotations
 import copy
 import inspect
 import logging
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
@@ -821,19 +822,29 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return prefix_chunk_len, prefix_chunk_len * capture_req_slots
 
     def _select_prefix_capture_chunks(
-        self, forward_batch: ForwardBatch
+        self, prefix_lens: Sequence[int]
     ) -> Optional[int]:
         """Smallest captured variant covering the batch's max prefix, or None."""
-        max_prefix_len = max(
-            int(length) for length in forward_batch.extend_prefix_lens_cpu
-        )
+        max_prefix_len = max(int(length) for length in prefix_lens)
         real_n = _ceil_div(max_prefix_len, self._prefix_chunk_len)
         return next((n for n in self._prefix_capture_variants if n >= real_n), None)
+
+    def _has_uncapturable_chunked_prefix(
+        self, prefix_lens: Sequence[int] | None
+    ) -> bool:
+        return (
+            self._capture_chunked_prefix
+            and prefix_lens is not None
+            and any(int(length) > 0 for length in prefix_lens)
+            and self._select_prefix_capture_chunks(prefix_lens) is None
+        )
 
     def _shape_key(self, num_tokens: int, forward_batch: ForwardBatch) -> ShapeKey:
         variant = None
         if self._capture_chunked_prefix and self._has_prefix_hit(forward_batch):
-            captured_n = self._select_prefix_capture_chunks(forward_batch)
+            captured_n = self._select_prefix_capture_chunks(
+                forward_batch.extend_prefix_lens_cpu
+            )
             assert captured_n is not None, "prefix batch has no captured FullCG variant"
             variant = _chunked_prefix_variant(captured_n)
         return ShapeKey(size=num_tokens, variant_label=variant)
@@ -1050,7 +1061,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         capture_hidden_mode,
         return_logprob: bool,
         lora_ineligible: bool = False,
-        chunked_prefix_uncapturable: bool = False,
     ) -> bool:
         """Rank-local replay eligibility: the single source of truth for
         ``can_run_graph`` (ForwardBatch, forward time) and the dp mlp-sync
@@ -1079,10 +1089,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and any(prefix_lens)
         ):
             return False
-        # FullCG's chunked-prefix topology covers a bounded prefix. The flag
-        # gating it is FULL-backend-only, so this is inert for the breakable
-        # vote path.
-        if chunked_prefix_uncapturable:
+        # FullCG's chunked-prefix topology covers a bounded prefix. Its capture
+        # flag is FullCG-only, so this is inert for the BreakableCG vote path.
+        if self._has_uncapturable_chunked_prefix(prefix_lens):
             return False
         # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
         if is_target_verify:
@@ -1110,7 +1119,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # (min-reduced votes; also requires every rank to hold tokens).
         if (
             forward_batch.global_num_tokens_cpu is not None
-            and not forward_batch.can_run_dp_breakable_cuda_graph
+            and not forward_batch.can_run_dp_prefill_cuda_graph
         ):
             return False
 
@@ -1135,11 +1144,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 and self.model_runner.lora_manager.can_use_prefill_cuda_graph(
                     forward_batch
                 )
-            ),
-            chunked_prefix_uncapturable=(
-                self._capture_chunked_prefix
-                and self._has_prefix_hit(forward_batch)
-                and self._select_prefix_capture_chunks(forward_batch) is None
             ),
         ):
             return False

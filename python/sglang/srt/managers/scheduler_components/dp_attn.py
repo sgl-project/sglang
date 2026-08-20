@@ -222,7 +222,7 @@ def _update_gather_batch(
 
     # Check forward mode for cuda graph
     batch.can_run_dp_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
-    batch.can_run_dp_breakable_cuda_graph = mlp_sync_info.can_run_prefill_cuda_graph
+    batch.can_run_dp_prefill_cuda_graph = mlp_sync_info.can_run_prefill_cuda_graph
 
 
 def prepare_mlp_sync_batch_raw(
@@ -271,14 +271,15 @@ def prepare_mlp_sync_batch_raw(
         or local_batch.forward_mode.is_decode_or_idle()
         or local_batch.forward_mode.is_prebuilt()
     ) and not disable_cuda_graph
-    breakable_prefill = check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
+    coordinated_prefill = check_cuda_graph_backend(
+        Phase.PREFILL, Backend.BREAKABLE
+    ) or check_cuda_graph_backend(Phase.PREFILL, Backend.FULL)
     prefill_graph_runner = (
-        model_runner.prefill_cuda_graph_runner if breakable_prefill else None
+        model_runner.prefill_cuda_graph_runner if coordinated_prefill else None
     )
     can_run_prefill_cuda_graph = (
         local_batch is None
         or local_batch.forward_mode.is_idle()
-        # Breakable Cuda Graph Backend Check.
         or (
             local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
             and (
@@ -287,7 +288,7 @@ def prepare_mlp_sync_batch_raw(
                     batch_size=local_batch.batch_size(),
                     num_tokens=local_batch.extend_num_tokens,
                     input_embeds=local_batch.input_embeds,
-                    replace_embeds=None,
+                    replace_embeds=local_batch.replace_embeds,
                     prefix_lens=local_batch.prefix_lens,
                     is_target_verify=local_batch.forward_mode.is_target_verify(),
                     capture_hidden_mode=None,
@@ -295,7 +296,7 @@ def prepare_mlp_sync_batch_raw(
                     lora_ineligible=prefill_graph_runner.enable_lora,
                 )
             )
-            and breakable_prefill
+            and coordinated_prefill
         )
     )
 
