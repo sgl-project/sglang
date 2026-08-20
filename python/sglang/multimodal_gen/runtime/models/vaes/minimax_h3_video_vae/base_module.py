@@ -13,6 +13,7 @@ from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding,
 )
 from sglang.kernels.ops.diffusion import try_fused_scaled_residual_add_exact
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 from .attention import Attention
 from .vit_utils import _env_flag, _vit_torch_compile_kwargs
@@ -77,6 +78,7 @@ class FeedForward(nn.Module):
         if self.use_gated:
             if (
                 isinstance(self.act_fn, nn.SiLU)
+                and current_platform.is_cuda_alike()
                 and hidden_states.is_cuda
                 and hidden_states.dtype in (torch.float16, torch.bfloat16)
                 and hidden_states.is_contiguous()
@@ -173,7 +175,9 @@ class RotaryEmbeddingND(nn.Module):
             raise ValueError(f"Expected {self.n_dim} dimensions, got {D}")
 
         autocast_context = (
-            torch.autocast("cuda", enabled=False) if img_ids.is_cuda else nullcontext()
+            torch.autocast("cuda", enabled=False)
+            if current_platform.is_cuda_alike() and img_ids.is_cuda
+            else nullcontext()
         )
         with autocast_context:
             angles = (

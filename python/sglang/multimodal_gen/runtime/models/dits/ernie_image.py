@@ -60,6 +60,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -582,6 +583,7 @@ def _ernie_geglu(gate_up: torch.Tensor) -> torch.Tensor:
     if (
         not _ERNIE_GEGLU.disabled
         and gate_up.dtype in (torch.bfloat16, torch.float16)
+        and current_platform.is_cuda_alike()
         and gate_up.is_cuda
         and gate_up.is_contiguous()
         and gate_up.shape[-1] % 2 == 0

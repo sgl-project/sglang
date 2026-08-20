@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from diffusers.models.embeddings import get_1d_rotary_pos_embed
 
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -2051,7 +2052,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             return _SANA_WM_TRITON_GDN_DISABLED_REASON
         if self.training or torch.is_grad_enabled():
             return "requires eval/inference mode"
-        if not qkv.is_cuda:
+        if not current_platform.is_cuda_alike() or not qkv.is_cuda:
             return "requires CUDA tensor"
         if qkv.dtype not in (torch.float16, torch.bfloat16):
             return f"requires fp16/bf16 qkv, got {qkv.dtype}"
@@ -2196,7 +2197,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             return _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON
         if self.training or torch.is_grad_enabled():
             return "requires eval/inference mode"
-        if not q.is_cuda:
+        if not current_platform.is_cuda_alike() or not q.is_cuda:
             return "requires CUDA tensor"
         if (
             q.dtype != torch.float32
@@ -2246,7 +2247,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             precheck_reason = _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON
         elif self.training or torch.is_grad_enabled():
             precheck_reason = "requires eval/inference mode"
-        elif not q.is_cuda:
+        elif not current_platform.is_cuda_alike() or not q.is_cuda:
             precheck_reason = "requires CUDA tensor"
 
         if precheck_reason is not None:

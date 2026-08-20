@@ -341,7 +341,7 @@ def _usp_input_all_to_all_packed_qkv(
     h_local = h_global // world_size
 
     if (
-        (current_platform.is_cuda() or current_platform.is_rocm())
+        current_platform.is_cuda_alike()
         and q.is_cuda
         and q.dtype in (torch.float16, torch.bfloat16)
         and q.dtype == k.dtype == v.dtype
@@ -382,7 +382,7 @@ def _can_use_packed_qkv_a2a_4d(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, world_size: int
 ) -> bool:
     return (
-        (current_platform.is_cuda() or current_platform.is_rocm())
+        current_platform.is_cuda_alike()
         and q.is_cuda
         and q.ndim == 4
         and q.shape == k.shape == v.shape

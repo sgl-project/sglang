@@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -116,7 +117,12 @@ def norm_scale_shift(
     ``weight`` is the effective RMSNorm weight (K2 stores ``scale``, so callers
     pass ``scale + 1``), kept off the checkpoint so the identity load is unaffected.
     """
-    if x.is_cuda and x.shape[-1] % 256 == 0 and x.shape[-1] <= 8192:
+    if (
+        current_platform.is_cuda_alike()
+        and x.is_cuda
+        and x.shape[-1] % 256 == 0
+        and x.shape[-1] <= 8192
+    ):
         from sglang.kernels.ops.diffusion import fused_norm_scale_shift
 
         return fused_norm_scale_shift(
@@ -349,6 +355,7 @@ class Attention(nn.Module):
         # parity off CUDA / for unsupported dtypes.
         if (
             freqs is not None
+            and current_platform.is_cuda_alike()
             and q.is_cuda
             and q.dtype in (torch.float16, torch.bfloat16)
             and _fused_qknorm_rope_enabled()
