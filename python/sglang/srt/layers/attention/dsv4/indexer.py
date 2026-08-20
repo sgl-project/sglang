@@ -715,11 +715,12 @@ class C4IndexerBackendMixin:
             else:
                 fn = fp8_paged_mqa_logits_torch
         elif is_xpu():
-            from sgl_kernel import fp8_paged_mqa_logits_triton
-
-            # TODO: switch from triton to SYCL when OOM is resolved
-
-            fn = fp8_paged_mqa_logits_triton
+            if envs.SGLANG_FP8_PAGED_MQA_XPU_KERNEL.get():
+                from sgl_kernel import fp8_paged_mqa_logits
+                fn = fp8_paged_mqa_logits
+            else:
+                from sgl_kernel import fp8_paged_mqa_logits_triton
+                fn = fp8_paged_mqa_logits_triton
         else:
             from deep_gemm import fp8_paged_mqa_logits as fn
 
