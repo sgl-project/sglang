@@ -6,7 +6,7 @@ import unittest
 
 import torch
 
-from sglang.srt.lora.moe.workspace import MoeLoraWorkspace, run_parallel
+from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -41,8 +41,7 @@ class TestMoeLoraParallelWorkspace(CustomTestCase):
             # A shared runner workspace reuses region events sequentially
             # across layers. Exercise two same-name regions in one graph.
             for _ in range(2):
-                result = run_parallel(
-                    workspace,
+                result = workspace.run_parallel(
                     name="shared_region",
                     device=self.device,
                     compute=compute,

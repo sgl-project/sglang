@@ -23,7 +23,6 @@ sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 
 MoeLoraWorkspace = _MODULE.MoeLoraWorkspace
-run_parallel = _MODULE.run_parallel
 
 
 def test_eager_buffers_retain_only_largest_capacity_per_semantic_name():
@@ -138,8 +137,7 @@ def test_run_parallel_cpu_preserves_dependency_order_and_compute_result():
         order.append("compute")
         return "result"
 
-    result = run_parallel(
-        workspace,
+    result = workspace.run_parallel(
         name="cpu_order",
         device=torch.device("cpu"),
         compute=compute,

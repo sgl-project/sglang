@@ -129,40 +129,39 @@ class MoeLoraWorkspace:
             self._events[key] = event
         return event
 
+    def run_parallel(
+        self,
+        *,
+        name: str,
+        device: torch.device,
+        compute: Callable[[], _T],
+        side: Callable[[], object],
+    ) -> _T:
+        """Run one explicit fork/join region without host synchronization.
 
-def run_parallel(
-    workspace: MoeLoraWorkspace,
-    *,
-    name: str,
-    device: torch.device,
-    compute: Callable[[], _T],
-    side: Callable[[], object],
-) -> _T:
-    """Run one explicit fork/join region without host synchronization.
+        CPU fixtures execute the same dependency order sequentially.  CUDA uses
+        this workspace's side stream and two of its reusable events, created on
+        first use. The graph warm-up forwards run this region eagerly before
+        capture, so the stream and both event handles already exist when
+        capture records it. Both closures and their tensors remain strongly
+        referenced through the final current-stream wait. That complete join is
+        the lifetime contract: side-stream work never escapes this method, so
+        allocator ``record_stream`` calls are neither required nor hidden here.
+        """
+        if device.type != "cuda":
+            side()
+            return compute()
 
-    CPU fixtures execute the same dependency order sequentially.  CUDA uses a
-    runner-owned side stream and two reusable events, created on first use.
-    The graph warm-up forwards run this region eagerly before capture, so the
-    stream and both event handles already exist when capture records it.
-    Both closures and their tensors remain strongly referenced through the
-    final current-stream wait. That complete join is the lifetime contract:
-    side-stream work never escapes this helper, so allocator ``record_stream``
-    calls are neither required nor hidden here.
-    """
-    if device.type != "cuda":
-        side()
-        return compute()
+        current = torch.cuda.current_stream(device)
+        side_stream = self.side_stream(device)
+        ready = self.event(device, f"{name}:ready")
+        done = self.event(device, f"{name}:done")
 
-    current = torch.cuda.current_stream(device)
-    side_stream = workspace.side_stream(device)
-    ready = workspace.event(device, f"{name}:ready")
-    done = workspace.event(device, f"{name}:done")
-
-    ready.record(current)
-    side_stream.wait_event(ready)
-    with torch.cuda.stream(side_stream):
-        side()
-        done.record(side_stream)
-    result = compute()
-    current.wait_event(done)
-    return result
+        ready.record(current)
+        side_stream.wait_event(ready)
+        with torch.cuda.stream(side_stream):
+            side()
+            done.record(side_stream)
+        result = compute()
+        current.wait_event(done)
+        return result

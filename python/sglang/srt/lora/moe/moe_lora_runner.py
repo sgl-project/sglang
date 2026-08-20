@@ -85,7 +85,7 @@ from sglang.srt.lora.moe.lora_b import run_lora_b
 from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
 from sglang.srt.lora.moe.route_view import RouteView
 from sglang.srt.lora.moe.routing import MoeLoraRoutes, build_routes
-from sglang.srt.lora.moe.workspace import MoeLoraWorkspace, run_parallel
+from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 from sglang.srt.runtime_context import get_lora
 
 if TYPE_CHECKING:
@@ -699,8 +699,7 @@ class MoeLoraRunner:
                 gate_up_b()
             base_gemm_state, gateup = base()
         elif plan.gate_up_overlap is GateUpOverlap.GATE_UP_A:
-            base_gemm_state, gateup = run_parallel(
-                self.workspace,
+            base_gemm_state, gateup = self.workspace.run_parallel(
                 name=plan.gate_up_overlap.value,
                 device=hidden_states.device,
                 compute=base,
@@ -714,8 +713,7 @@ class MoeLoraRunner:
                 gate_up_a()
                 gate_up_b()
 
-            base_gemm_state, gateup = run_parallel(
-                self.workspace,
+            base_gemm_state, gateup = self.workspace.run_parallel(
                 name=plan.gate_up_overlap.value,
                 device=hidden_states.device,
                 compute=base,
@@ -895,8 +893,7 @@ class MoeLoraRunner:
                     down_b()
                 down_out = base()
         elif plan.down_overlap is DownOverlap.DOWN_A:
-            down_out = run_parallel(
-                self.workspace,
+            down_out = self.workspace.run_parallel(
                 name=plan.down_overlap.value,
                 device=act_out.device,
                 compute=base,
@@ -907,8 +904,7 @@ class MoeLoraRunner:
         elif plan.down_overlap is DownOverlap.DOWN_B:
             if state.rank is None:
                 down_a()
-            down_out = run_parallel(
-                self.workspace,
+            down_out = self.workspace.run_parallel(
                 name=plan.down_overlap.value,
                 device=act_out.device,
                 compute=base,
@@ -920,8 +916,7 @@ class MoeLoraRunner:
                 down_a()
                 down_b()
 
-            down_out = run_parallel(
-                self.workspace,
+            down_out = self.workspace.run_parallel(
                 name=plan.down_overlap.value,
                 device=act_out.device,
                 compute=base,
