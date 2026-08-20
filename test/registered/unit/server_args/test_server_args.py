@@ -2316,6 +2316,9 @@ class TestSameGpuReplicas(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "conflicts with --dp-size"):
             self._args(dp_size=3)
 
+    def test_non_cuda_accelerator_is_not_rejected_by_same_gpu_validation(self):
+        self._args(device="xpu")._check_same_gpu_dp()
+
     def test_removed_nvidia_mps_flag_is_rejected(self):
         with self.assertRaises(SystemExit):
             prepare_server_args(

@@ -6758,8 +6758,6 @@ class ServerArgs:
         if self.gpu_id_step != 0:
             return
         unsupported = []
-        if self.device != "cuda":
-            unsupported.append("device must be cuda")
         if self.dp_size <= 1:
             unsupported.append("dp_size must be greater than 1")
         if self.tp_size != 1:
