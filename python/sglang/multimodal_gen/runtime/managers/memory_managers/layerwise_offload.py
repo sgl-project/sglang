@@ -158,19 +158,22 @@ def restore_host_resident_tables(
 def _install_host_gather_hooks(
     module: torch.nn.Module, device: torch.device | str
 ) -> None:
-    """Run this module's gather on the host, move only the result."""
+    """Run this module's gather beside its current weight, move only the result."""
 
-    def _inputs_to_host(_module, args, kwargs):
+    def _inputs_to_table(_module, args, kwargs):
         if not args or not torch.is_tensor(args[0]):
             return None
-        return (args[0].to("cpu"),) + args[1:], kwargs
+        # A runtime residency promotion can later materialize this table on
+        # the device.  Keep the gather input colocated with its current
+        # weight instead of unconditionally moving it back to the host.
+        return (args[0].to(_module.weight.device),) + args[1:], kwargs
 
     def _output_to_device(_module, _args, output):
         if not torch.is_tensor(output):
             return output
         return output.to(device, non_blocking=True)
 
-    module.register_forward_pre_hook(_inputs_to_host, with_kwargs=True)
+    module.register_forward_pre_hook(_inputs_to_table, with_kwargs=True)
     module.register_forward_hook(_output_to_device)
 
 
