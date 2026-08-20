@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKerne
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -73,7 +74,7 @@ def make_runner(
     )
 
 
-class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
+class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
     def apply_policy(
         self,
         runner,
@@ -118,6 +119,22 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
             with self.subTest(backend=backend):
                 runner = make_runner(self, linear_attn_prefill_backend=backend)
                 self.assertIsNone(self.apply_policy(runner))
+
+    def test_declines_when_deterministic_inference_is_enabled(self):
+        """Batch-sensitive GDN prefill must not bypass deterministic inference."""
+        runner = make_runner(
+            self,
+            state_dtype=torch.float32,
+            enable_deterministic_inference=True,
+        )
+
+        self.assertIsNone(
+            self.apply_policy(
+                runner,
+                capability=(9, 0),
+                cuda_version="12.9",
+            )
+        )
 
     def test_rejects_unsupported_capability(self):
         cases = (
