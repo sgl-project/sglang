@@ -5,7 +5,6 @@ import importlib.util
 import unittest
 from pathlib import Path
 
-
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 
 # Load the CI marker directly so this source-only test does not import the full
