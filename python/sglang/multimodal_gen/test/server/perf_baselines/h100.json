@@ -1892,7 +1892,7 @@
             "expected_avg_denoise_ms": 1437.82,
             "expected_median_denoise_ms": 1416.85,
             "load_peak_vram_mb": 6784.0,
-            "runtime_peak_vram_mb": 19756.0,
+            "runtime_peak_vram_mb": 21450.0,
             "estimated_full_test_time_s": 181.8
         },
         "wan2_1_t2v_1_3b_lora_1gpu": {
