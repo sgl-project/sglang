@@ -101,6 +101,15 @@ class StagedPrefillTransferIndices:
     mamba_indices: Optional[torch.Tensor] = None
 
 
+@dataclass
+class StagedCachedPrefixTransferIndices:
+    """Pinned prefix page IDs staged before the DP admission collective."""
+
+    end_idx: int
+    page_indices: torch.Tensor
+    ready_event: object
+
+
 def _copy_page_indices_to_pinned_cpu(
     kv_indices: torch.Tensor, page_size: int
 ) -> torch.Tensor:
@@ -622,6 +631,73 @@ class SchedulerDisaggregationPrefillMixin:
 
         return staged
 
+    def stage_cached_prefix_transfer_indices(
+        self: Scheduler, batch: Optional[ScheduleBatch]
+    ) -> None:
+        """Stage early-send page IDs before DP admission can block the CPU.
+
+        ``maybe_send_cached_prefix_chunk`` runs immediately before the suffix
+        forward.  Converting the device mapping there with pageable ``.cpu()``
+        can drain an unrelated prior forward from the scheduler stream.  Queue
+        the fixed-shape D2H here, before the DP-attention collective, and make
+        the eventual sender wait only for this narrow copy event.
+        """
+        if (
+            batch is None
+            or _is_npu
+            or not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get()
+        ):
+            return
+
+        page_size = self.token_to_kv_pool_allocator.page_size
+        pending = []
+        for req in batch.reqs:
+            if req.pending_bootstrap or is_aborted(req):
+                continue
+            if self.enable_staging and req.early_send_prefix_end is None:
+                req.early_send_prefix_end = max(
+                    0, len(req.prefix_indices) - req.host_hit_length
+                )
+            cached_end = (
+                req.early_send_prefix_end
+                if self.enable_staging
+                else len(req.prefix_indices) - req.host_hit_length
+            )
+            if (
+                cached_end <= req.start_send_idx
+                or cached_end % page_size != 0
+            ):
+                continue
+
+            full_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :cached_end
+            ]
+            transfer_indices = (
+                self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                    full_indices
+                )
+            )
+            pending.append(
+                (
+                    req,
+                    cached_end,
+                    _copy_page_indices_to_pinned_cpu(transfer_indices, page_size),
+                )
+            )
+
+        if not pending:
+            return
+        ready_event = self.device_module.Event()
+        ready_event.record()
+        for req, cached_end, page_indices in pending:
+            req._staged_cached_prefix_transfer_indices = (
+                StagedCachedPrefixTransferIndices(
+                    end_idx=cached_end,
+                    page_indices=page_indices,
+                    ready_event=ready_event,
+                )
+            )
+
     def resolve_waiting_queue_bootstrap(self: Scheduler) -> None:
         """Resolve bootstrap status for waiting prefill requests before admission.
 
@@ -682,6 +758,7 @@ class SchedulerDisaggregationPrefillMixin:
         prefill_plan = self.get_new_batch_prefill(running_batch)
         batch = prefill_plan.batch_to_run
         running_batch = prefill_plan.running_batch
+        self.stage_cached_prefix_transfer_indices(batch)
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
 
         if batch:
@@ -1111,6 +1188,7 @@ class SchedulerDisaggregationPrefillMixin:
         for the process lifetime.
         """
         self.disagg_prefill_pending_chunk_rids.discard(req.rid)
+        req._staged_cached_prefix_transfer_indices = None
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
         self.clear_pending_chunk_send(req)
@@ -1302,6 +1380,10 @@ class SchedulerDisaggregationPrefillMixin:
         staged: Optional[StagedPrefillTransferIndices] = getattr(
             req, "_staged_prefill_transfer_indices", None
         )
+        staged_prefix: Optional[StagedCachedPrefixTransferIndices] = getattr(
+            req, "_staged_cached_prefix_transfer_indices", None
+        )
+        staged_prefix_ready = False
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
@@ -1438,6 +1520,19 @@ class SchedulerDisaggregationPrefillMixin:
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
             if (
+                staged_prefix is not None
+                and staged_prefix.end_idx >= seg_end
+                and seg_start % page_size == 0
+            ):
+                if not staged_prefix_ready:
+                    staged_prefix.ready_event.synchronize()
+                    staged_prefix_ready = True
+                page_start = seg_start // page_size
+                page_count = kv_to_page_num(seg_end - seg_start, page_size)
+                page_indices = staged_prefix.page_indices[
+                    page_start : page_start + page_count
+                ].numpy()
+            elif (
                 staged is not None
                 and staged.end_idx >= seg_end
                 and seg_start % page_size == 0
@@ -1470,6 +1565,8 @@ class SchedulerDisaggregationPrefillMixin:
                 num_kv_tokens=seg_end - seg_start,
             )
         req.start_send_idx = end_idx
+        if staged_prefix is not None and end_idx >= staged_prefix.end_idx:
+            req._staged_cached_prefix_transfer_indices = None
         # A last chunk needs no entry: every `last_chunk=True` call site has
         # already put the request on `disagg_prefill_inflight_queue`.
         if last_chunk:
@@ -1490,6 +1587,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.tmp_end_idx = -1
         req.disagg_decode_prefix_len = 0
         req.early_send_prefix_end = None
+        req._staged_cached_prefix_transfer_indices = None
         req.hidden_states_tensor = None
         req.output_dsa_topk_indices = None
         req.pending_bootstrap = True
