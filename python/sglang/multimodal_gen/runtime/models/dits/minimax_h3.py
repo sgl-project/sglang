@@ -193,8 +193,8 @@ def _copy_grouped_qkv_tp_shard(
         or getattr(param, "output_dim", None) != 0
         or getattr(param, "is_sharded_weight", False)
         or getattr(param, "packed_dim", None) is not None
-        or param.dtype != _BF16_DTYPE
-        or loaded_weight.dtype != _BF16_DTYPE
+        or param.dtype != loaded_weight.dtype
+        or param.dtype not in (_BF16_DTYPE, torch.float8_e4m3fn)
         or not param.is_contiguous()
         or not loaded_weight.is_contiguous()
     ):
