@@ -138,7 +138,7 @@ def _build_plan(
 # ---- CPU: shipped config structure ----------------------------------------------
 
 
-class TestBActMiddleConfig:
+class TestBActConfig:
     def test_h200_serial_prefill_ships_it_too(self) -> None:
         # The H200 serial prefill shape is the same eligible form, on the
         # SM90-capable DeepGEMM contiguous backend.
@@ -148,7 +148,7 @@ class TestBActMiddleConfig:
         assert serial.plan.down_b_scatter is True
         assert serial.base_gemm_rows == "route_major"
 
-    def test_decode_choices_keep_the_materialized_middle(self) -> None:
+    def test_decode_choices_keep_the_materialized_act(self) -> None:
         # The swap is a prefill-only config: every decode-phase choice on
         # both architectures and layouts keeps the materialized middle with
         # a standalone gate/up-B owner.

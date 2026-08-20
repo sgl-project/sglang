@@ -277,7 +277,7 @@ class TestMaskedFusionSource(unittest.TestCase):
         contiguous_reduce = _function(contiguous, "run_shared_rank_reduce")
         self.assertIn("del row_state", contiguous_reduce)
 
-    def test_middle_pair_store_is_optional_and_masked_store_is_unconditional(self):
+    def test_act_pair_store_is_optional_and_masked_store_is_unconditional(self):
         source = _source("masked_fused_act.py")
         self.assertIn('("b_activation",)', source)
         # The activation set is single-sourced from moe.activation; restating

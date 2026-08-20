@@ -88,7 +88,7 @@ Route block size (`routing_block_size`):
 One aligned route serves every grouped LoRA kernel on a plan row, and its
 block is each kernel's row tile — of nothing else. The base GEMMs never read
 it (their flat buffer uses their own `m_alignment`, 128 on CuteDSL, and their
-own token-width tiles from `base_gemm/`); the fused middle and finalize are
+own token-width tiles from `base_gemm/`); the fused act and finalize are
 pair-domain through `src2dst`. A padded slot costs masked `tl.dot` lanes
 inside whichever LoRA kernel tiles over it, and nothing anywhere else.
 
