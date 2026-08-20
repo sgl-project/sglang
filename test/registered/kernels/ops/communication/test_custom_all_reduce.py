@@ -46,11 +46,7 @@ register_cuda_ci(
     runner_config="8-gpu-h200",
 )
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
-register_cuda_ci(
-    est_time=300,
-    suite="nightly-kernel-8-gpu-h200",
-    nightly=True,
-)
+register_cuda_ci(est_time=110, stage="nightly", runner_config="8-gpu-h200")
 
 # ---------------------------------------------------------------------------
 # Test parameters
@@ -235,12 +231,13 @@ def test_custom_all_reduce(
 
 
 if __name__ == "__main__":
-    # Only sweep the common world sizes (2, 4, 8) by default: testing every
-    # count in 2..8 serially overruns the per-file CI time budget, and 3/5/6/7
-    # are rare in practice. Use --num-gpu to exercise them explicitly.
+    # Only sweep the common world sizes (2, 4, 8, 16) by default: testing every
+    # count in 2..16 serially overruns the per-file CI time budget, and numbers
+    # in the middle are rare in practice. Use --num-gpu to exercise them
+    # explicitly.
     multigpu_pytest_main(
         __name__,
         __file__,
-        num_gpus=(2, 4, 8),
+        num_gpus=(2, 4, 8, 16),
         pre_launch_fn=_precompile_kernels,
     )

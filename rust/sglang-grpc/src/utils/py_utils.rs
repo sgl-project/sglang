@@ -2,7 +2,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList};
 use std::collections::HashMap;
 
-fn json_value_to_py<'py>(py: Python<'py>, v: &serde_json::Value) -> PyResult<PyObject> {
+fn json_value_to_py<'py>(py: Python<'py>, v: &serde_json::Value) -> PyResult<Py<PyAny>> {
     match v {
         serde_json::Value::Null => Ok(py.None()),
         serde_json::Value::Bool(b) => Ok(b.into_pyobject(py)?.to_owned().into_any().unbind()),
@@ -17,7 +17,7 @@ fn json_value_to_py<'py>(py: Python<'py>, v: &serde_json::Value) -> PyResult<PyO
         }
         serde_json::Value::String(s) => Ok(s.into_pyobject(py)?.into_any().unbind()),
         serde_json::Value::Array(arr) => {
-            let items: Vec<PyObject> = arr
+            let items: Vec<Py<PyAny>> = arr
                 .iter()
                 .map(|item| json_value_to_py(py, item))
                 .collect::<PyResult<_>>()?;

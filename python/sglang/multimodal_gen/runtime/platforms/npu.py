@@ -189,6 +189,6 @@ class NPUPlatformBase(Platform):
         return "sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # noqa
 
     @classmethod
-    def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:
-        """The performance of the layerwise_offload feature depends on the device's memory size and the memory size occupied by the model. Use --dit-layerwise-offload True if it suitable for your case."""
+    def enable_dit_layerwise_offload_by_default(cls) -> bool:
+        """Whether automatic DiT layerwise offload is enabled on this platform."""
         return False

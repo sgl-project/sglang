@@ -2,9 +2,11 @@
 Unit tests for the OpenAIServingEmbedding class from serving_embedding.py.
 """
 
+import base64
 import importlib
 import importlib.abc
 import importlib.machinery
+import struct
 import sys
 import types
 import unittest
@@ -338,6 +340,29 @@ class ServingEmbeddingTestCase(unittest.TestCase):
             self.serving_embedding._convert_to_internal_request(
                 self.image_only_multimodal_req
             )
+
+    def test_base64_embedding_response_uses_little_endian_float32(self):
+        response = self.serving_embedding._build_embedding_response(
+            [{"embedding": [0.25, -1.5], "meta_info": {"prompt_tokens": 2}}],
+            encoding_format="base64",
+        )
+
+        encoded_embedding = response.data[0].embedding
+        self.assertIsInstance(encoded_embedding, str)
+        self.assertEqual(
+            struct.unpack("<2f", base64.b64decode(encoded_embedding)), (0.25, -1.5)
+        )
+        self.assertEqual(response.usage.prompt_tokens, 2)
+
+    def test_rejects_unknown_embedding_encoding_format(self):
+        invalid_request = EmbeddingRequest(
+            model="test-model", input="hello", encoding_format="binary"
+        )
+
+        self.assertIn(
+            "encoding_format must be either",
+            self.serving_embedding._validate_request(invalid_request),
+        )
 
 
 if __name__ == "__main__":
