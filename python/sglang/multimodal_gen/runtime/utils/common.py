@@ -1,8 +1,10 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+import io
 import ipaddress
 import logging
 import os
+import pickle
 import platform
 import signal
 import socket
@@ -17,6 +19,58 @@ import zmq
 
 # use the native logger to avoid circular import
 logger = logging.getLogger(__name__)
+
+
+class SafeRuntimeUnpickler(pickle.Unpickler):
+    ALLOWED_MODULE_PREFIXES = {
+        "builtins.",
+        "collections.",
+        "copyreg.",
+        "functools.",
+        "itertools.",
+        "operator.",
+        "types.",
+        "weakref.",
+        "numpy.",
+        "PIL.",
+        "torch.",
+        "torch._tensor.",
+        "torch.storage.",
+        "torch.nn.parameter.",
+        "torch.autograd.function.",
+        "sglang.multimodal_gen.configs.",
+        "sglang.multimodal_gen.runtime.",
+    }
+
+    DENY_CLASSES = {
+        ("builtins", "eval"),
+        ("builtins", "exec"),
+        ("builtins", "compile"),
+        ("builtins", "__import__"),
+        ("builtins", "getattr"),
+        ("os", "system"),
+        ("subprocess", "Popen"),
+        ("subprocess", "run"),
+        ("types", "CodeType"),
+        ("types", "FunctionType"),
+    }
+
+    def find_class(self, module, name):
+        if (module, name) in self.DENY_CLASSES:
+            raise RuntimeError(f"Blocked unsafe class loading ({module}.{name})")
+        if any(
+            (module + ".").startswith(prefix) for prefix in self.ALLOWED_MODULE_PREFIXES
+        ):
+            return super().find_class(module, name)
+        raise RuntimeError(f"Blocked unsafe class loading ({module}.{name})")
+
+
+def safe_runtime_pickle_loads(data: bytes | bytearray | memoryview) -> Any:
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        buf = bytes(data)
+    else:
+        buf = bytes(memoryview(data))
+    return SafeRuntimeUnpickler(io.BytesIO(buf)).load()
 
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
