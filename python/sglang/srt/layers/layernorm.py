@@ -1170,7 +1170,12 @@ class GemmaRMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if _is_cpu_amx_available:
+            # The AMX kernels update x/residual in place and require contiguous
+            # tensors; speculative-decoding paths can pass strided views (the
+            # caller consumes the returned tensors, so copying is safe).
+            x = x.contiguous()
             if residual is not None:
+                residual = residual.contiguous()
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
                 torch.ops.sgl_kernel.gemma_fused_add_rmsnorm_cpu(

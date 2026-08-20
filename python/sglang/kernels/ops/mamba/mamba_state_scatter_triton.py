@@ -144,6 +144,27 @@ def track_mamba_states_if_needed(
     )
 
 
+def _state_scatter_with_mask_torch(
+    dst: torch.Tensor,
+    src: torch.Tensor,
+    dst_indices_raw: torch.Tensor,
+    step_indices_raw: torch.Tensor,
+):
+    """Non-CUDA fallback for the masked state scatters, in plain torch.
+
+    Advanced indexing reads/writes through arbitrary strides, so it serves both
+    the dense SSM/conv layouts used on CPU and NPU and (if ever needed) the
+    overlapping conv-window view.
+    """
+    valid_mask = step_indices_raw >= 0
+    if not valid_mask.any():
+        return
+    valid_indices = valid_mask.nonzero(as_tuple=True)[0]
+    dst_indices = dst_indices_raw[valid_indices].long()
+    step_indices = step_indices_raw[valid_indices].long()
+    dst[:, dst_indices] = src[:, valid_indices, step_indices]
+
+
 @triton.jit
 def _fused_mamba_state_scatter_with_mask_kernel(
     src_ptr,
@@ -249,9 +270,8 @@ def fused_mamba_state_scatter_with_mask(
             f"dst and src must be on the same device. {dst.device=} {src.device=}"
         )
     if not dst.is_cuda or not src.is_cuda:
-        raise ValueError(
-            "fused_mamba_state_scatter_with_mask only supports CUDA tensors."
-        )
+        _state_scatter_with_mask_torch(dst, src, dst_indices_raw, step_indices_raw)
+        return
     if dst.ndim < 2 or src.ndim < 3:
         raise ValueError(f"Unexpected tensor ranks: {dst.ndim=} {src.ndim=}")
     if dst.shape[0] != src.shape[0]:
@@ -408,11 +428,13 @@ def fused_conv_window_scatter_with_mask(
     if total_requests == 0:
         return
 
-    if not (dst.is_cuda and src.is_cuda and dst.device == src.device):
+    if dst.device != src.device:
         raise ValueError(
-            "fused_conv_window_scatter_with_mask requires dst and src to be CUDA "
-            f"tensors on the same device ({dst.device=}, {src.device=})."
+            f"dst and src must be on the same device. {dst.device=} {src.device=}"
         )
+    if not dst.is_cuda or not src.is_cuda:
+        _state_scatter_with_mask_torch(dst, src, dst_indices_raw, step_indices_raw)
+        return
     if dst.ndim != 4 or src.ndim != 5:
         raise ValueError(f"Unexpected ranks: {dst.ndim=} (want 4) {src.ndim=} (want 5)")
     if dst.shape[0] != src.shape[0]:
@@ -587,6 +609,9 @@ def _conv_multi_eligible(pairs) -> bool:
         return False
     layers = pairs[0][0].shape[0]
     for dst, src in pairs:
+        # Triton-only fast path; off-CUDA the per-pair scatter falls back to torch
+        if not dst.is_cuda or not src.is_cuda:
+            return False
         if dst.dtype != torch.bfloat16 or src.dtype != torch.bfloat16:
             return False
         if dst.ndim != 4 or src.ndim != 5:
