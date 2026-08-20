@@ -1,19 +1,28 @@
+import sys
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+import pytest
 import torch
 
 from sglang.srt.disaggregation.prefill import (
     SchedulerDisaggregationPrefillMixin,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class _Event:
     def __init__(self):
         self.recorded = False
+        self.ready = True
 
     def record(self):
         self.recorded = True
+
+    def query(self):
+        return self.ready
 
 
 class _Allocator:
@@ -37,17 +46,14 @@ def test_stage_cached_prefix_transfer_indices_before_send():
     scheduler = SimpleNamespace(
         enable_staging=True,
         token_to_kv_pool_allocator=_Allocator(),
-        req_to_token_pool=SimpleNamespace(
-            req_to_token=torch.arange(32).view(2, 16)
-        ),
+        req_to_token_pool=SimpleNamespace(req_to_token=torch.arange(32).view(2, 16)),
         device_module=SimpleNamespace(Event=_Event),
     )
     staged_page_ids = torch.tensor([29, 30])
 
     with (
         patch(
-            "sglang.srt.disaggregation.prefill."
-            "_copy_page_indices_to_pinned_cpu",
+            "sglang.srt.disaggregation.prefill." "_copy_page_indices_to_pinned_cpu",
             return_value=staged_page_ids,
         ) as copy_page_ids,
         patch(
@@ -87,16 +93,13 @@ def test_stage_cached_prefix_skips_partial_page():
     scheduler = SimpleNamespace(
         enable_staging=True,
         token_to_kv_pool_allocator=_Allocator(),
-        req_to_token_pool=SimpleNamespace(
-            req_to_token=torch.arange(16).view(1, 16)
-        ),
+        req_to_token_pool=SimpleNamespace(req_to_token=torch.arange(16).view(1, 16)),
         device_module=SimpleNamespace(Event=_Event),
     )
 
     with (
         patch(
-            "sglang.srt.disaggregation.prefill."
-            "_copy_page_indices_to_pinned_cpu"
+            "sglang.srt.disaggregation.prefill." "_copy_page_indices_to_pinned_cpu"
         ) as copy_page_ids,
         patch(
             "sglang.srt.disaggregation.prefill.envs."
@@ -111,3 +114,79 @@ def test_stage_cached_prefix_skips_partial_page():
 
     copy_page_ids.assert_not_called()
     assert not hasattr(req, "_staged_cached_prefix_transfer_indices")
+
+
+def test_cached_prefix_early_send_does_not_wait_for_staging_copy():
+    ready_event = _Event()
+    ready_event.ready = False
+    req = SimpleNamespace(
+        pending_bootstrap=False,
+        early_send_prefix_end=8,
+        prefix_indices=torch.arange(12),
+        host_hit_length=4,
+        start_send_idx=0,
+        _staged_cached_prefix_transfer_indices=SimpleNamespace(
+            end_idx=8,
+            ready_event=ready_event,
+        ),
+    )
+    scheduler = SimpleNamespace(
+        enable_staging=True,
+        enable_overlap=True,
+        token_to_kv_pool_allocator=_Allocator(),
+        send_kv_chunk=Mock(),
+    )
+
+    with (
+        patch(
+            "sglang.srt.disaggregation.prefill.envs."
+            "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get",
+            return_value=True,
+        ),
+        patch("torch.cuda.Event") as cuda_event,
+    ):
+        SchedulerDisaggregationPrefillMixin.maybe_send_cached_prefix_chunk(
+            scheduler, req
+        )
+
+    scheduler.send_kv_chunk.assert_not_called()
+    cuda_event.assert_not_called()
+
+
+def test_cached_prefix_early_send_uses_ready_staging_copy():
+    ready_event = _Event()
+    req = SimpleNamespace(
+        pending_bootstrap=False,
+        early_send_prefix_end=8,
+        prefix_indices=torch.arange(12),
+        host_hit_length=4,
+        start_send_idx=0,
+        _staged_cached_prefix_transfer_indices=SimpleNamespace(
+            end_idx=8,
+            ready_event=ready_event,
+        ),
+        disagg_kv_sender=SimpleNamespace(),
+    )
+    scheduler = SimpleNamespace(
+        enable_staging=True,
+        enable_overlap=False,
+        token_to_kv_pool_allocator=_Allocator(),
+        send_kv_chunk=Mock(),
+    )
+
+    with (
+        patch(
+            "sglang.srt.disaggregation.prefill.envs."
+            "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get",
+            return_value=True,
+        ),
+    ):
+        SchedulerDisaggregationPrefillMixin.maybe_send_cached_prefix_chunk(
+            scheduler, req
+        )
+
+    scheduler.send_kv_chunk.assert_called_once_with(req, last_chunk=False, end_idx=8)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
