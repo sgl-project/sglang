@@ -725,7 +725,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if child.evicted and not child.backuped:
                 break
 
-            prefix_len = child.key.match(key, page_size=self.page_size)
+            prefix_len = child.key.match(
+                key, page_size=self.page_size, first_page_matched=True
+            )
             full_kv_hit_length += prefix_len
             if prefix_len < len(child.key):
                 node, action = self._split_node(child.key, child, prefix_len)
@@ -951,7 +953,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         step_actions = state.pending_actions
         node = state.node.children[child_key]
         self._touch_node(node)
-        prefix_len = node.key.match(key, page_size=self.page_size)
+        prefix_len = node.key.match(
+            key, page_size=self.page_size, first_page_matched=True
+        )
         if prefix_len < len(node.key):
             node, action = self._split_node(node.key, node, prefix_len)
             if action is not None:
@@ -1755,7 +1759,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         while len(key) > 0 and child_key in node.children:
             node = node.children[child_key]
             self._touch_node(node)
-            prefix_len = node.key.match(key, page_size=self.page_size)
+            prefix_len = node.key.match(
+                key, page_size=self.page_size, first_page_matched=True
+            )
 
             key = key[prefix_len:]
             host_value = host_value[prefix_len:]

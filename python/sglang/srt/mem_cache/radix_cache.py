@@ -178,19 +178,38 @@ class RadixKey:
                 f"{self.cache_salt=} != {other.cache_salt=}"
             )
 
-    def match(self, other: RadixKey, page_size: int = 1) -> int:
-        """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
+    def match(
+        self,
+        other: RadixKey,
+        page_size: int = 1,
+        first_page_matched: bool = False,
+    ) -> int:
+        """Return the logical-unit prefix length shared with ``other``.
+
+        ``first_page_matched`` means the caller has already proved that the first
+        ``page_size`` logical units match, so the galloping search can start after
+        that page. The result remains page aligned.
+        """
         self._check_compatible(other)
+        if page_size < 1:
+            raise ValueError(f"page_size must be >= 1, got {page_size}")
         t0, t1 = self.token_ids, other.token_ids
         assert type(t0) is type(t1), (type(t0), type(t1))
         n = min(len(t0), len(t1))
+
+        if first_page_matched:
+            assert min(len(self), len(other)) >= page_size, (
+                "first_page_matched=True requires at least one complete logical "
+                f"page in both keys, got {len(self)=}, {len(other)=}, {page_size=}"
+            )
 
         # Exponential search for the first diverging token: gallop in doubling
         # windows (one C-level slice compare each), then binary-search the window
         # holding the divergence -- no per-token Python loop on long shared prefixes.
         matched_tokens = n
-        lo = 0
-        step = 1
+        # One page of bigrams spans page_size + 1 raw tokens.
+        lo = page_size + int(self.is_bigram) if first_page_matched else 0
+        step = page_size if first_page_matched else 1
         while lo < n:
             hi = lo + step if lo + step < n else n
             if t0[lo:hi] != t1[lo:hi]:
@@ -207,12 +226,12 @@ class RadixKey:
 
         if self.is_bigram:
             matched = max(0, min(matched_tokens - 1, len(self), len(other)))
-            return (matched // page_size) * page_size if page_size > 1 else matched
+        else:
+            matched = min(matched_tokens, len(self), len(other))
 
-        matched_tokens = min(matched_tokens, len(self), len(other))
         if page_size == 1:
-            return matched_tokens
-        return (matched_tokens // page_size) * page_size
+            return matched
+        return matched // page_size * page_size
 
     def child_key(self, page_size: int = 1):
         """Hashable dict-key for the first ``page_size`` logical units, namespaced by ``extra_key``."""
@@ -686,7 +705,11 @@ class RadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = access_time
-            prefix_len = child.key.match(key, page_size=self.page_size)
+            prefix_len = child.key.match(
+                key,
+                page_size=self.page_size,
+                first_page_matched=True,
+            )
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
@@ -759,7 +782,11 @@ class RadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = access_time
-            prefix_len = node.key.match(key, page_size=self.page_size)
+            prefix_len = node.key.match(
+                key,
+                page_size=self.page_size,
+                first_page_matched=True,
+            )
             total_prefix_length += prefix_len
             key = key[prefix_len:]
             value = value[prefix_len:]

@@ -1106,7 +1106,9 @@ class MambaRadixCache(BasePrefixCache):
                 best_value_len = len(value)
                 best_last_node = node
 
-            prefix_len = child.key.match(key, page_size=self.page_size)
+            prefix_len = child.key.match(
+                key, page_size=self.page_size, first_page_matched=True
+            )
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
@@ -1268,7 +1270,9 @@ class MambaRadixCache(BasePrefixCache):
             node = node.children[child_key]
             node.last_access_time = get_last_access_time()
             self.full_lru_list.reset_node_mru(node)
-            prefix_len = node.key.match(key, page_size=self.page_size)
+            prefix_len = node.key.match(
+                key, page_size=self.page_size, first_page_matched=True
+            )
 
             if prev_prefix_len < total_prefix_length + prefix_len:
                 start = max(0, prev_prefix_len - total_prefix_length)

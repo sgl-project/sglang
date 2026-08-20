@@ -929,7 +929,9 @@ class SWARadixCache(BasePrefixCache):
                 # reset match_len_since_tombstone if we hit a tombstone node
                 match_len_since_tombstone = 0
 
-            prefix_len = child.key.match(key, page_size=self.page_size)
+            prefix_len = child.key.match(
+                key, page_size=self.page_size, first_page_matched=True
+            )
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
@@ -1160,7 +1162,9 @@ class SWARadixCache(BasePrefixCache):
             self.full_lru_list.reset_node_mru(node)
             if not node.swa_tombstone:
                 self.swa_lru_list.reset_node_mru(node)
-            prefix_len = node.key.match(key, page_size=self.page_size)
+            prefix_len = node.key.match(
+                key, page_size=self.page_size, first_page_matched=True
+            )
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
