@@ -553,24 +553,20 @@ class MoeLoraRunner:
         routes: MoeLoraRoutes,
         name: str,
         *,
-        input_row_map: torch.Tensor | None = None,
+        pair_to_row: torch.Tensor | None = None,
     ) -> torch.Tensor:
         route = self._route_for_a(spec, routes)
-        if input_row_map is not None:
-            # Only the count: grouped_lora_a masks pair loads by
-            # `pair_ids < num_pairs`, so an undersized map reads out of bounds
-            # and the row mask silently substitutes zeros. Shape, dtype, device
-            # and contiguity come from the producers' own workspace allocation.
-            if input_row_map.numel() != route.topk_ids.numel():
+        if pair_to_row is not None:
+            if pair_to_row.numel() != route.topk_ids.numel():
                 raise ValueError(
-                    "mapped down-A pair_to_row must have one entry per " "routed pair"
+                    "mapped down-A pair_to_row must have one entry per routed pair"
                 )
         num_tokens = (
             input.shape[0]
             if spec.site is Site.GATE_UP
             else (
                 route.topk_ids.shape[0]
-                if input_row_map is not None
+                if pair_to_row is not None
                 else input.shape[0] // self.top_k
             )
         )
@@ -593,7 +589,7 @@ class MoeLoraRunner:
             output=output,
             routing=route,
             config=config,
-            input_row_map=input_row_map,
+            pair_to_row=pair_to_row,
         )
 
     def _run_b(
@@ -834,7 +830,7 @@ class MoeLoraRunner:
                 batch.down_lora_a.flatten(0, 1),
                 routes,
                 "down_a",
-                input_row_map=down_a_input.pair_to_row,
+                pair_to_row=down_a_input.pair_to_row,
             )
 
         def down_b() -> None:

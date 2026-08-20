@@ -251,7 +251,7 @@ def run_lora_a(
     output: torch.Tensor,
     routing: RouteView,
     config: Mapping[str, int],
-    input_row_map: torch.Tensor | None = None,
+    pair_to_row: torch.Tensor | None = None,
     produce_pdl: bool = False,
 ) -> torch.Tensor:
     """Execute exactly the A family named by an execution-plan spec.
@@ -262,9 +262,9 @@ def run_lora_a(
     family = _spec_value(spec, "family")
     site = _spec_value(spec, "site")
     pair_input = site == "down"
-    if input_row_map is not None and not (family == "grouped" and site == "down"):
+    if pair_to_row is not None and not (family == "grouped" and site == "down"):
         raise ValueError(
-            "a provider input_row_map is supported only by standalone grouped down-A"
+            "a provider pair_to_row is supported only by standalone grouped down-A"
         )
 
     if family in ("grouped", "token_dedup_grouped"):
@@ -285,7 +285,7 @@ def run_lora_a(
                 routing,
                 config=config,
                 pair_input=pair_input,
-                input_row_map=input_row_map,
+                pair_to_row=pair_to_row,
                 produce_pdl=produce_pdl,
             )
         return output

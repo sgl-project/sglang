@@ -20,7 +20,7 @@ def _grouped_lora_a_kernel(
     input_ptr,
     weight_ptr,
     output_ptr,
-    input_row_map_ptr,
+    pair_to_row_ptr,
     sorted_pair_ids_ptr,
     block_virtual_expert_ids_ptr,
     num_pairs_post_padded_ptr,
@@ -37,7 +37,7 @@ def _grouped_lora_a_kernel(
     N: tl.constexpr,
     K: tl.constexpr,
     PAIR_INPUT: tl.constexpr,
-    USE_INPUT_ROW_MAP: tl.constexpr,
+    USE_PAIR_TO_ROW: tl.constexpr,
     NUM_M_BLOCKS: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -64,9 +64,9 @@ def _grouped_lora_a_kernel(
     if virtual_expert_id == -1:
         return
 
-    if USE_INPUT_ROW_MAP:
+    if USE_PAIR_TO_ROW:
         input_rows = tl.load(
-            input_row_map_ptr + pair_ids,
+            pair_to_row_ptr + pair_ids,
             mask=pair_mask,
             other=-1,
         ).to(tl.int64)
@@ -121,13 +121,13 @@ def grouped_lora_a(
     *,
     config: Mapping[str, int],
     pair_input: bool = False,
-    input_row_map: torch.Tensor | None = None,
+    pair_to_row: torch.Tensor | None = None,
     produce_pdl: bool = False,
 ) -> None:
     """Write one single-K grouped LoRA-A result in original pair order.
 
     ``input`` is token-major by default.  ``pair_input`` selects
-    pair-major input.  A supplied ``input_row_map[pair]`` instead selects a
+    pair-major input.  A supplied ``pair_to_row[pair]`` instead selects a
     provider-private row and may contain ``-1``; such rows are overwritten by
     zero in ``output``. Rows whose virtual expert ID is ``-1`` are undefined;
     the paired B primitive never observes them and overwrites its destination.
@@ -142,14 +142,14 @@ def grouped_lora_a(
     block_size_n = int(config["BLOCK_SIZE_N"])
     block_size_k = int(config["BLOCK_SIZE_K"])
     group_size_m = int(config["GROUP_SIZE_M"])
-    input_row_map_ptr = output if input_row_map is None else input_row_map
+    pair_to_row_ptr = output if pair_to_row is None else pair_to_row
     num_m_blocks = triton.cdiv(routing.sorted_pair_ids.numel(), routing.block_size)
     num_n_blocks = triton.cdiv(weight.shape[1], block_size_n)
     _grouped_lora_a_kernel[(num_m_blocks * num_n_blocks,)](
         input,
         weight,
         output,
-        input_row_map_ptr,
+        pair_to_row_ptr,
         routing.sorted_pair_ids,
         routing.block_virtual_expert_ids,
         routing.num_pairs_post_padded,
@@ -166,7 +166,7 @@ def grouped_lora_a(
         N=weight.shape[1],
         K=weight.shape[2],
         PAIR_INPUT=pair_input,
-        USE_INPUT_ROW_MAP=input_row_map is not None,
+        USE_PAIR_TO_ROW=pair_to_row is not None,
         NUM_M_BLOCKS=num_m_blocks,
         BLOCK_SIZE_M=routing.block_size,
         BLOCK_SIZE_N=block_size_n,
