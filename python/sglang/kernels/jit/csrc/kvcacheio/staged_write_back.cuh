@@ -8,6 +8,40 @@
 
 namespace sglang {
 
+inline bool validate_page_first_destination_indices(
+    const std::vector<tvm::ffi::TensorView>& dst_ptrs,
+    const int64_t* dst_indices_ptr,
+    int64_t num_pages,
+    int64_t page_size) {
+  using namespace host;
+
+  RuntimeCheck(!dst_ptrs.empty(), "HiCache staged write-back: destination tensor list must not be empty");
+  const int64_t dst_token_capacity = dst_ptrs.front().shape()[0];
+  for (const auto tensor_id : irange(dst_ptrs.size())) {
+    RuntimeCheck(
+        dst_ptrs[tensor_id].shape()[0] == dst_token_capacity,
+        "HiCache staged write-back: destination tensors must have the same token capacity");
+  }
+
+  bool all_pages_contiguous = true;
+  for (const auto page_offset : irange(num_pages)) {
+    const int64_t token_begin = page_offset * page_size;
+    const int64_t first_dst_index = dst_indices_ptr[token_begin];
+    for (const auto token_offset : irange(page_size)) {
+      const int64_t dst_index = dst_indices_ptr[token_begin + token_offset];
+      RuntimeCheck(
+          dst_index >= 0 && dst_index < dst_token_capacity,
+          "HiCache staged write-back: destination index ",
+          dst_index,
+          " is outside [0, ",
+          dst_token_capacity,
+          ")");
+      all_pages_contiguous &= dst_index == first_dst_index + token_offset;
+    }
+  }
+  return all_pages_contiguous;
+}
+
 #if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
 #if CUDA_VERSION >= 13000
 using CudaMemcpyBatchPtr = const void*;
@@ -67,6 +101,7 @@ inline void copy_page_first_pages_fallback(
     const int64_t* dst_indices_ptr,
     int64_t num_pages,
     int64_t page_size,
+    bool pages_are_contiguous,
     cudaStream_t stream) {
   using namespace host;
 
@@ -78,15 +113,30 @@ inline void copy_page_first_pages_fallback(
     const int64_t elem_size = host::dtype_bytes(src_ptrs[tensor_id].dtype());
     const int64_t src_stride0 = src_ptrs[tensor_id].stride(0);
     const int64_t dst_stride0 = dst_ptrs[tensor_id].stride(0);
+    const size_t src_token_bytes = static_cast<size_t>(src_stride0 * elem_size);
+    const size_t dst_token_bytes = static_cast<size_t>(dst_stride0 * elem_size);
     const size_t src_page_bytes = static_cast<size_t>(page_size * src_stride0 * elem_size);
     const size_t dst_page_bytes = static_cast<size_t>(page_size * dst_stride0 * elem_size);
+    RuntimeCheck(src_token_bytes == dst_token_bytes, "Source and destination token spans must match");
     RuntimeCheck(src_page_bytes == dst_page_bytes, "Source and destination page spans must match");
     for (const auto page_offset : irange(num_pages)) {
-      const char* src_ptr = static_cast<const char*>(src_ptrs[tensor_id].data_ptr()) +
-                            static_cast<size_t>(page_offset * page_size * src_stride0 * elem_size);
-      char* dst_ptr = static_cast<char*>(dst_ptrs[tensor_id].data_ptr()) +
-                      static_cast<size_t>(dst_indices_ptr[page_offset * page_size] * dst_stride0 * elem_size);
-      RuntimeDeviceCheck(cudaMemcpyAsync(dst_ptr, src_ptr, src_page_bytes, cudaMemcpyDeviceToHost, stream));
+      const int64_t token_begin = page_offset * page_size;
+      if (pages_are_contiguous) {
+        const char* src_ptr = static_cast<const char*>(src_ptrs[tensor_id].data_ptr()) +
+                              static_cast<size_t>(token_begin) * src_token_bytes;
+        char* dst_ptr = static_cast<char*>(dst_ptrs[tensor_id].data_ptr()) +
+                        static_cast<size_t>(dst_indices_ptr[token_begin]) * dst_token_bytes;
+        RuntimeDeviceCheck(cudaMemcpyAsync(dst_ptr, src_ptr, src_page_bytes, cudaMemcpyDeviceToHost, stream));
+      } else {
+        for (const auto token_offset : irange(page_size)) {
+          const int64_t token_id = token_begin + token_offset;
+          const char* src_ptr = static_cast<const char*>(src_ptrs[tensor_id].data_ptr()) +
+                                static_cast<size_t>(token_id) * src_token_bytes;
+          char* dst_ptr = static_cast<char*>(dst_ptrs[tensor_id].data_ptr()) +
+                          static_cast<size_t>(dst_indices_ptr[token_id]) * dst_token_bytes;
+          RuntimeDeviceCheck(cudaMemcpyAsync(dst_ptr, src_ptr, src_token_bytes, cudaMemcpyDeviceToHost, stream));
+        }
+      }
     }
   }
 }
@@ -243,6 +293,7 @@ struct HiCacheStagedWriteBackKernel {
         .with_device<kDLGPU>(device_)
         .verify(page_indices_src);
     TensorMatcher({T})  //
+        .with_strides({1})
         .with_dtype<int64_t>(dst_indices_dtype)
         .with_device<kDLCPU, kDLGPUHost>()
         .verify(dst_indices_cpu);
@@ -253,6 +304,14 @@ struct HiCacheStagedWriteBackKernel {
         kElementSize == D.unwrap() * dtype_bytes(cache_dtype.unwrap()),
         "HiCache staged relayout: element size mismatch");
     RuntimeCheck(kElementSize % 16 == 0, "HiCache staged relayout: element size must be 16-byte aligned");
+
+    const int64_t* dst_indices_ptr = static_cast<const int64_t*>(dst_indices_cpu.data_ptr());
+    const bool pages_are_contiguous = validate_page_first_destination_indices(
+        kIsMLA ? std::vector<tvm::ffi::TensorView>{k_cache_dst}
+               : std::vector<tvm::ffi::TensorView>{k_cache_dst, v_cache_dst},
+        dst_indices_ptr,
+        P.unwrap(),
+        page_size);
 
     const auto params = HicacheRelayoutParams{
         .k_cache_dst = staging_k.data_ptr(),
@@ -269,23 +328,30 @@ struct HiCacheStagedWriteBackKernel {
     launch_hicache_relayout_kernel<kElementSize, kIsMLA>(params, P.unwrap(), N.unwrap(), page_size, use_int32, device);
 
     auto stream = LaunchKernel::resolve_device(device);
-    const int64_t* dst_indices_ptr = static_cast<const int64_t*>(dst_indices_cpu.data_ptr());
     if constexpr (kIsMLA) {
-      if (!try_copy_page_first_pages_batch(
+      if (!pages_are_contiguous ||
+          !try_copy_page_first_pages_batch(
               {staging_k}, {k_cache_dst}, dst_indices_ptr, P.unwrap(), page_size, device.device_id, stream)) {
-        copy_page_first_pages_fallback({staging_k}, {k_cache_dst}, dst_indices_ptr, P.unwrap(), page_size, stream);
+        copy_page_first_pages_fallback(
+            {staging_k}, {k_cache_dst}, dst_indices_ptr, P.unwrap(), page_size, pages_are_contiguous, stream);
       }
     } else {
-      if (!try_copy_page_first_pages_batch(
-              {staging_k, staging_v},
-              {k_cache_dst, v_cache_dst},
-              dst_indices_ptr,
-              P.unwrap(),
-              page_size,
-              device.device_id,
-              stream)) {
+      if (!pages_are_contiguous || !try_copy_page_first_pages_batch(
+                                       {staging_k, staging_v},
+                                       {k_cache_dst, v_cache_dst},
+                                       dst_indices_ptr,
+                                       P.unwrap(),
+                                       page_size,
+                                       device.device_id,
+                                       stream)) {
         copy_page_first_pages_fallback(
-            {staging_k, staging_v}, {k_cache_dst, v_cache_dst}, dst_indices_ptr, P.unwrap(), page_size, stream);
+            {staging_k, staging_v},
+            {k_cache_dst, v_cache_dst},
+            dst_indices_ptr,
+            P.unwrap(),
+            page_size,
+            pages_are_contiguous,
+            stream);
       }
     }
   }

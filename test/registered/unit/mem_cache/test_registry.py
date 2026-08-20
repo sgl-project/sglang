@@ -39,6 +39,7 @@ def _make_ctx(
     is_hybrid_ssm=False,
     is_dsa=False,
     enable_hierarchical_cache=False,
+    enable_mla_hicache_host_dedup=False,
     disable_radix_cache=False,
     effective_chunked_prefill_size=None,
     full_tokens_per_layer=None,
@@ -52,6 +53,7 @@ def _make_ctx(
         enable_streaming_session=enable_streaming,
         enable_lmcache=enable_lmcache,
         enable_flexkv=False,
+        enable_mla_hicache_host_dedup=enable_mla_hicache_host_dedup,
     )
     return TreeCacheBuildContext(
         server_args=server_args,
@@ -276,6 +278,30 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             )
             ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once()
             self.assertIs(result, fake_module.HiRadixCache.return_value)
+
+    def test_mla_host_dedup_uses_unified_radix_cache(self):
+        ctx = _make_ctx(
+            self,
+            enable_hierarchical_cache=True,
+            enable_mla_hicache_host_dedup=True,
+        )
+        fake_components = MagicMock()
+        fake_radix = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
+            },
+        ):
+            result = default_radix_cache_factory(ctx)
+
+        fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
+        fake_radix.UnifiedRadixCache.return_value.init_hicache.assert_called_once_with(
+            ctx.server_args, ctx.params
+        )
+        ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once()
+        self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
 
     def test_unified_radix_cache_when_hierarchical_and_hybrid_ssm(self):
         ctx = _make_ctx(self, enable_hierarchical_cache=True, is_hybrid_ssm=True)
