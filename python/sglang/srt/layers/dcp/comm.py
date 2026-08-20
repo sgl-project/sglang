@@ -49,12 +49,7 @@ def _warn_deprecated_dcp_accessor(name: str, replacement: str) -> None:
 
 
 def draft_forward_guard(is_draft: bool):
-    """Run a draft forward with DCP disabled; no-op when is_draft is False.
-
-    The draft KV pool is replicated, not sharded, so every DCP branch must see
-    dcp_enabled == False for the whole draft forward (this also drives
-    attn_dcp_size to 1 and attn_dcp_rank to 0).
-    """
+    """Run a draft forward with DCP disabled (the draft KV pool is not sharded)."""
     if not is_draft:
         return contextlib.nullcontext()
     return get_parallel().override(dcp_enabled=False)

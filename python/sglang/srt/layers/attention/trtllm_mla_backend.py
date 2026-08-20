@@ -463,13 +463,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
     ):
-        """No-op: this family caches no tree-mask- or position-derived metadata.
-
-        Its verify metadata is a function of the draft token COUNT (fixed at config
-        time), not of the sampled tokens. run_eagle_verify calls this unconditionally,
-        so the override is required or the base raises NotImplementedError. Same as
-        trtllm_mha / triton.
-        """
+        pass
 
     def _init_cuda_graph_metadata(
         self,

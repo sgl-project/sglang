@@ -374,7 +374,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             from sglang.srt.layers.dcp import draft_forward_guard
 
-            # Capture must match replay: a DCP-enabled capture + non-DCP replay -> IMA.
+            # Capture with DCP disabled to match draft replay.
             with draft_forward_guard(True):
                 self.cuda_graph_runner = Device2DraftCudaGraphRunner[
                     self.target_worker.device
@@ -529,7 +529,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         from sglang.srt.layers.dcp import draft_forward_guard
 
-        # Runs outside ModelRunner.forward; unconditional to match graph capture.
+        # This draft path runs outside ModelRunner.forward, so guard it here.
         with canary_outside_ctx, draft_forward_guard(True):
             # Run draft
             if can_run_decode_cuda_graph:

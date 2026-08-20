@@ -1,19 +1,8 @@
 """CPU unit test for DCP-aware EAGLE draft KV-pool budgeting.
 
-Under DCP the target KV pool is sharded across ranks, but the draft pool spans the allocator's
-*widened virtual location space* — it is replicated, not sharded. So the draft term in cell_size
-must scale with ``get_parallel().attn_dcp_size``. Upstream already applies exactly this rule to the
-DFLASH term (``_dflash_draft_cell_size_per_token``); these tests pin the EAGLE counterpart at both
-sites that budget an EAGLE draft:
-
-  * ``DefaultPoolConfigurator``   — ratio form, (1 + dcp * draft_layers / num_layers)
-  * ``HybridSWAPoolConfigurator`` — layer-count form, _draft_full_layers_num * dcp
-
-Under-budgeting here does not fail loudly: the widened draft pool quietly eats the transient
-headroom and the server OOMs at the first large prefill, far from the cause. Hence a unit test.
-
-Usage:
-    python -m pytest test_dcp_draft_pool_bounds.py -v
+The draft pool is replicated, not sharded, across DCP ranks, so the EAGLE draft
+term in cell_size must scale with ``get_parallel().attn_dcp_size`` (the same rule
+upstream applies to the DFLASH draft term).
 """
 
 import unittest
@@ -96,17 +85,12 @@ class TestEagleDraftPoolDCPBudget(CustomTestCase):
         self.assertLess(sizes[0], sizes[-1])
 
     def test_no_invented_draft_depth(self):
-        """A None draft depth must NOT be silently replaced by a guessed floor.
-
-        Inventing a depth trades a loud failure for a quiet under-allocation; upstream skips the
-        scaling when the depth is unknown, and so must we.
-        """
+        """A None draft depth must skip the scaling, not fall back to a guessed floor."""
         from sglang.srt.model_executor.pool_configurator import _eagle_draft_layers
 
         kvc = _kvc()
         kvc.spec_aux_config.eagle_draft_num_layers = None
         with rc.get_parallel().override(attn_dcp_size=8):
-            # 0 => caller skips the scaling entirely; no invented floor.
             self.assertEqual(_eagle_draft_layers(kvc), 0)
 
 

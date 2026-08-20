@@ -1,20 +1,7 @@
-"""CPU unit test for ``draft_forward_guard`` — the DCP-disable scope for draft forwards.
+"""CPU unit test for ``draft_forward_guard``.
 
-Under spec x DCP the target KV pool is sharded but the draft pool is replicated, so every DCP
-branch must observe ``dcp_enabled == False`` for the whole draft forward. This used to be enforced
-twice: by this guard AND by a shadow ``ModelRunner.dcp_size = 1 if is_draft_worker`` field. Upstream
-has since removed ``ModelRunner.dcp_size``/``dcp_rank`` entirely and made the attention-facing
-accessors derive from ``dcp_enabled``:
-
-    attn_dcp_size = dcp_size if dcp_enabled else 1      (runtime_context.py)
-    attn_dcp_rank = dcp_rank if dcp_enabled else 0
-
-so the guard is now the *only* mechanism. That makes these assertions load-bearing rather than
-redundant: if the guard stops driving ``attn_dcp_size`` to 1, draft forwards silently take DCP
-branches against an unsharded pool, which is the chain-decode corruption this exists to prevent.
-
-Usage:
-    python -m pytest test_dcp_draft_guard.py -v
+The draft KV pool is replicated, not sharded, so draft forwards must observe
+``dcp_enabled == False`` (which drives attn_dcp_size to 1 and attn_dcp_rank to 0).
 """
 
 import unittest
@@ -36,12 +23,10 @@ class TestDraftForwardGuard(CustomTestCase):
             self.assertEqual(parallel.attn_dcp_rank, 3)
 
             with draft_forward_guard(True):
-                # The whole point: the draft forward must see an unsharded world.
                 self.assertFalse(parallel.dcp_enabled)
                 self.assertEqual(parallel.attn_dcp_size, 1)
                 self.assertEqual(parallel.attn_dcp_rank, 0)
 
-            # ...and the target state must come back afterwards.
             self.assertTrue(parallel.dcp_enabled)
             self.assertEqual(parallel.attn_dcp_size, 8)
             self.assertEqual(parallel.attn_dcp_rank, 3)

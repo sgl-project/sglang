@@ -143,17 +143,10 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     if algo is not None:
         algo.handle_server_args(server_args)
 
-    _validate_dcp_spec_topk(server_args)
+    _validate_dcp_spec(server_args)
 
 
-def _validate_dcp_spec_topk(server_args: ServerArgs) -> None:
-    """Reject tree drafting (topk > 1) under decode context parallelism.
-
-    The DCP verify path bounds each draft token by its GLOBAL position, which can only
-    express a linear chain; the verify kernel has no tree-causal masking. Must run after
-    the per-algorithm handler, which resolves speculative_eagle_topk. getattr is for
-    test_spec_registry, which passes a minimal SimpleNamespace.
-    """
+def _validate_dcp_spec(server_args: ServerArgs) -> None:
     if (
         server_args.speculative_algorithm is None
         or getattr(server_args, "dcp_size", 1) <= 1
@@ -163,7 +156,6 @@ def _validate_dcp_spec_topk(server_args: ServerArgs) -> None:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
-    # is_dflash(), NOT is_dflash_family(): that includes DSPARK, which ships with DCP.
     if not (algo.is_eagle() or algo.is_dflash()):
         return
 

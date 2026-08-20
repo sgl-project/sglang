@@ -288,8 +288,8 @@ class EagerRunner(BaseRunner):
                 )
                 and not forward_batch.forward_mode.is_target_verify()
             ):
-                # prepare kv cache buffer for dcp to gather kv cache.
-                # Target-verify excluded above: no extend_prefix_lens; the backend plans it.
+                # prepare kv cache buffer for dcp to gather kv cache
+                # (target-verify is excluded: the attention backend plans it)
                 forward_batch.attn_dcp_metadata = (
                     model_runner.model.prepare_context_parallel_metadata_for_dcp(
                         forward_batch.seq_lens,

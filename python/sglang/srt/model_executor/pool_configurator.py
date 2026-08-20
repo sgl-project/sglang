@@ -84,13 +84,7 @@ logger = logging.getLogger(__name__)
 
 
 def _eagle_draft_layers(kvc: KVCacheConfigurator) -> int:
-    """Effective EAGLE/STANDALONE draft layer count for KV budgeting, 0 if none.
-
-    Under DCP the target pool is sharded but the draft pool spans the allocator's widened
-    virtual location space, so the draft term is replicated across ranks (same rule as
-    _dflash_draft_cell_size). Returns 0 rather than a guessed depth when unknown, so the
-    caller skips scaling instead of silently under-allocating.
-    """
+    """EAGLE/STANDALONE draft layer count for KV budgeting, replicated across DCP ranks."""
     if kvc.is_draft_worker or not (
         kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
     ):
@@ -220,7 +214,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         num_layers=draft_num_layers,
                         allocate_all_layers=True,
                     )
-                    # Draft pool spans the widened loc space: replicated per DCP rank.
+                    # The draft pool is replicated, not sharded, across DCP ranks.
                     self._cell_size += (
                         draft_kv_size + draft_indexer_size
                     ) * get_parallel().attn_dcp_size
@@ -505,7 +499,6 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         if (
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
-            # RAW depth: banded_depths is structural; DCP replication applies below.
             draft_layers = kvc.spec_aux_config.eagle_draft_num_layers
             if draft_layers is not None and int(draft_layers) > 0:
                 draft_layers = int(draft_layers)

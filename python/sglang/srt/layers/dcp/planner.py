@@ -46,7 +46,7 @@ def prepare_decode_context_parallel_metadata(
     if not parallel.dcp_enabled:
         return None
     if extend_prefix_lens is None:
-        # No chunked-prefix metadata (eager target-verify): the attention backend plans.
+        # Eager target-verify has no chunked-prefix metadata; the attention backend plans it.
         return None
     # dcp_kv_buffer tokens' layout
     # [ rank0_r1.prefix_tokens, rank1_r1.prefix_tokens, ..., rank7_r1.prefix_tokens,
