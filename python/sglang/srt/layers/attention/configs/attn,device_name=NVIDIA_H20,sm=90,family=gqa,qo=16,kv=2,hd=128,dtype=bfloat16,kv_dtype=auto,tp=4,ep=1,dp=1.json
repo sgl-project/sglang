@@ -1,0 +1,274 @@
+{
+  "schema_version": "attune/1",
+  "fingerprint": "deead0be4a334dba",
+  "device": {
+    "name": "NVIDIA_H20",
+    "sm": 90,
+    "cuda_version": "12.4",
+    "driver_version": "550.00",
+    "sm_clock_max_mhz": 1980,
+    "pcie_gen": 5,
+    "pcie_width": 16
+  },
+  "profile": {
+    "family": "gqa",
+    "qo": 16,
+    "kv": 2,
+    "hd": 128,
+    "dtype": "bfloat16",
+    "kv_dtype": "auto",
+    "tp": 4,
+    "ep": 1,
+    "dp": 1
+  },
+  "provenance": {
+    "attune_version": "0.1.0-prototype"
+  },
+  "decode": {
+    "1:1024": {
+      "backend": "trtllm_mha",
+      "latency_us": 40.04,
+      "page_size": 16
+    },
+    "2:1024": {
+      "backend": "trtllm_mha",
+      "latency_us": 40.16,
+      "page_size": 16
+    },
+    "4:1024": {
+      "backend": "trtllm_mha",
+      "latency_us": 40.4,
+      "page_size": 16
+    },
+    "8:1024": {
+      "backend": "trtllm_mha",
+      "latency_us": 40.88,
+      "page_size": 16
+    },
+    "16:1024": {
+      "backend": "trtllm_mha",
+      "latency_us": 41.84,
+      "page_size": 16
+    },
+    "32:1024": {
+      "backend": "trtllm_mha",
+      "latency_us": 43.76,
+      "page_size": 16
+    },
+    "64:1024": {
+      "backend": "trtllm_mha",
+      "latency_us": 47.6,
+      "page_size": 16
+    },
+    "128:1024": {
+      "backend": "fa4",
+      "latency_us": 54.28,
+      "page_size": 128
+    },
+    "256:1024": {
+      "backend": "fa4",
+      "latency_us": 69.64,
+      "page_size": 128
+    },
+    "1:4096": {
+      "backend": "trtllm_mha",
+      "latency_us": 42.81,
+      "page_size": 16
+    },
+    "2:4096": {
+      "backend": "trtllm_mha",
+      "latency_us": 42.93,
+      "page_size": 16
+    },
+    "4:4096": {
+      "backend": "trtllm_mha",
+      "latency_us": 43.17,
+      "page_size": 16
+    },
+    "8:4096": {
+      "backend": "trtllm_mha",
+      "latency_us": 43.65,
+      "page_size": 16
+    },
+    "16:4096": {
+      "backend": "trtllm_mha",
+      "latency_us": 44.61,
+      "page_size": 16
+    },
+    "32:4096": {
+      "backend": "trtllm_mha",
+      "latency_us": 46.53,
+      "page_size": 16
+    },
+    "64:4096": {
+      "backend": "trtllm_mha",
+      "latency_us": 50.37,
+      "page_size": 16
+    },
+    "128:4096": {
+      "backend": "fa4",
+      "latency_us": 57.05,
+      "page_size": 128
+    },
+    "256:4096": {
+      "backend": "fa4",
+      "latency_us": 72.41,
+      "page_size": 128
+    },
+    "1:16384": {
+      "backend": "trtllm_mha",
+      "latency_us": 53.87,
+      "page_size": 16
+    },
+    "2:16384": {
+      "backend": "trtllm_mha",
+      "latency_us": 53.99,
+      "page_size": 16
+    },
+    "4:16384": {
+      "backend": "trtllm_mha",
+      "latency_us": 54.23,
+      "page_size": 16
+    },
+    "8:16384": {
+      "backend": "trtllm_mha",
+      "latency_us": 54.71,
+      "page_size": 16
+    },
+    "16:16384": {
+      "backend": "trtllm_mha",
+      "latency_us": 55.67,
+      "page_size": 16
+    },
+    "32:16384": {
+      "backend": "trtllm_mha",
+      "latency_us": 57.59,
+      "page_size": 16
+    },
+    "64:16384": {
+      "backend": "trtllm_mha",
+      "latency_us": 61.43,
+      "page_size": 16
+    },
+    "128:16384": {
+      "backend": "fa4",
+      "latency_us": 68.11,
+      "page_size": 128
+    },
+    "256:16384": {
+      "backend": "fa4",
+      "latency_us": 83.47,
+      "page_size": 128
+    },
+    "1:65536": {
+      "backend": "flashinfer",
+      "latency_us": 97.95,
+      "page_size": 1
+    },
+    "2:65536": {
+      "backend": "flashinfer",
+      "latency_us": 98.06,
+      "page_size": 1
+    },
+    "4:65536": {
+      "backend": "flashinfer",
+      "latency_us": 98.29,
+      "page_size": 1
+    },
+    "8:65536": {
+      "backend": "flashinfer",
+      "latency_us": 98.75,
+      "page_size": 1
+    },
+    "16:65536": {
+      "backend": "flashinfer",
+      "latency_us": 99.66,
+      "page_size": 1
+    },
+    "32:65536": {
+      "backend": "flashinfer",
+      "latency_us": 101.48,
+      "page_size": 1
+    },
+    "64:65536": {
+      "backend": "flashinfer",
+      "latency_us": 105.13,
+      "page_size": 1
+    },
+    "128:65536": {
+      "backend": "fa4",
+      "latency_us": 112.34,
+      "page_size": 128
+    },
+    "256:65536": {
+      "backend": "flashinfer",
+      "latency_us": 127.02,
+      "page_size": 1
+    }
+  },
+  "prefill": {
+    "1:128": {
+      "backend": "fa3",
+      "latency_us": 38.3
+    },
+    "4:128": {
+      "backend": "fa3",
+      "latency_us": 45.22
+    },
+    "16:128": {
+      "backend": "fa3",
+      "latency_us": 72.86
+    },
+    "1:512": {
+      "backend": "fa3",
+      "latency_us": 45.22
+    },
+    "4:512": {
+      "backend": "fa3",
+      "latency_us": 72.86
+    },
+    "16:512": {
+      "backend": "fa3",
+      "latency_us": 183.46
+    },
+    "1:2048": {
+      "backend": "fa3",
+      "latency_us": 72.86
+    },
+    "4:2048": {
+      "backend": "fa3",
+      "latency_us": 183.46
+    },
+    "16:2048": {
+      "backend": "fa3",
+      "latency_us": 625.82
+    },
+    "1:8192": {
+      "backend": "fa3",
+      "latency_us": 183.46
+    },
+    "4:8192": {
+      "backend": "fa3",
+      "latency_us": 625.82
+    },
+    "16:8192": {
+      "backend": "fa3",
+      "latency_us": 2395.3
+    },
+    "1:32768": {
+      "backend": "flashinfer",
+      "latency_us": 594.46
+    },
+    "4:32768": {
+      "backend": "flashinfer",
+      "latency_us": 2265.62
+    },
+    "16:32768": {
+      "backend": "flashinfer",
+      "latency_us": 8950.3
+    }
+  },
+  "skipped": {
+    "prefill/trtllm_mha": "trtllm_mha prefill unsupported on sm90"
+  }
+}
