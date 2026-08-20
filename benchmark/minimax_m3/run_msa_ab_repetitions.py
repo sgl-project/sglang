@@ -19,6 +19,11 @@ from summarize_msa_repetitions import expected_order
 
 
 OFFLINE_THROUGHPUT_DATASET = "random-ids"
+OFFLINE_THROUGHPUT_ARGS = (
+    "--dataset-name",
+    OFFLINE_THROUGHPUT_DATASET,
+    "--tokenize-prompt",
+)
 
 
 def command_text(command: list[str]) -> str:
@@ -182,8 +187,7 @@ def run_provider(
                 args.base_url,
                 "--model",
                 args.model,
-                "--dataset-name",
-                OFFLINE_THROUGHPUT_DATASET,
+                *OFFLINE_THROUGHPUT_ARGS,
                 "--num-prompts",
                 "1",
                 "--random-input-len",

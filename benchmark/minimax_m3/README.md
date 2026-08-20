@@ -149,9 +149,9 @@ for `/health_generate`, verifies one startup-log line contains the requested
 `main_attn`, `msa_decode=True`, `msa_owns_decode=True`, and
 `decode_cuda_graph=True`, sends an unmeasured 8K/1K warmup, and only then starts
 the full gate. Both warmup and serving sweeps use the fixed-seed, offline
-`random-ids` generator, so they never depend on an implicit dataset download.
-It stops the server between providers and fails if the old server still owns
-the port.
+`random-ids` generator and send token IDs directly, so the 8K input length is
+exact and they never depend on an implicit dataset download. It stops the
+server between providers and fails if the old server still owns the port.
 
 Each repetition is compared independently. `summary.json` then reports the
 three raw values, backend median, gain computed from backend medians, and median

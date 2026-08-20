@@ -73,6 +73,7 @@ for concurrency in 1 8 32 128; do
     --base-url "${BASE_URL}" \
     --model "${MODEL}" \
     --dataset-name "${SERVING_DATASET_NAME}" \
+    --tokenize-prompt \
     --num-prompts 256 \
     --random-input-len 8192 \
     --random-output-len 1024 \
