@@ -846,6 +846,7 @@ class Req(ReqDllmMixin):
             Union[APIServerReqTimeStats, DPControllerReqTimeStats]
         ] = None,
         return_pooled_hidden_states: bool = False,
+        spec_capture: Optional[Dict[str, Any]] = None,
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
@@ -914,10 +915,16 @@ class Req(ReqDllmMixin):
             }
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
+        self.spec_capture = spec_capture
         self.return_hidden_states = return_hidden_states
-        self.return_hidden_states_mode = get_return_hidden_states_mode(
-            return_hidden_states
+        self.return_hidden_states_mode = (
+            CaptureHiddenMode.FULL
+            if spec_capture is not None
+            else get_return_hidden_states_mode(return_hidden_states)
         )
+        self.spec_capture_aux: List[torch.Tensor] = []
+        self.spec_capture_last_hidden: List[torch.Tensor] = []
+        self.spec_capture_result: Optional[Dict[str, Any]] = None
 
         # Extra key for caller-defined request classification.
         if lora_id is not None:

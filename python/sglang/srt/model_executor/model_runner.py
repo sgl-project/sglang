@@ -361,6 +361,7 @@ class ModelRunner:
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         self.init_spec_aux_hidden_state()
+        self.configure_spec_capture_hidden_state()
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
@@ -545,6 +546,18 @@ class ModelRunner:
                 is_draft_worker=self.is_draft_worker,
             )
         )
+
+    def configure_spec_capture_hidden_state(self) -> None:
+        if not self.server_args.enable_spec_capture or self.is_draft_worker:
+            return
+        layer_ids = self.server_args.spec_capture_aux_layer_ids
+        method = self.server_args.spec_capture_method
+        if method == "eagle3":
+            self.spec_aux_config.eagle_use_aux_hidden_state = True
+            self.spec_aux_config.eagle_aux_hidden_state_layer_ids = layer_ids
+            return
+        self.spec_aux_config.dflash_use_aux_hidden_state = True
+        self.spec_aux_config.dflash_target_layer_ids = layer_ids
 
     def init_weight_exporter(self):
         self.weight_exporter = WeightExporter(
