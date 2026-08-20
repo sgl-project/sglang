@@ -43,6 +43,15 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_prefill_decode_interval(self):
+        args = ServerArgs(model_path="dummy", prefill_decode_interval=16)
+        self.assertEqual(args.prefill_decode_interval, 16)
+
+        with self.assertRaisesRegex(
+            ValueError, "--prefill-decode-interval must be non-negative"
+        ):
+            ServerArgs(model_path="dummy", prefill_decode_interval=-1)
+
     def test_dsv4_prefill_backend_cli_choices(self):
         parser = server_args_module.argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
@@ -533,11 +542,21 @@ class TestLoadBalanceMethod(unittest.TestCase):
         server_args = ServerArgs(
             model_path="dummy",
             disaggregation_mode="decode",
+            disaggregation_transfer_backend="mori",
+            dcp_size=4,
+        )
+        with self.assertRaisesRegex(
+            ValueError, "mooncake, nixl, or fake for synthetic benchmarking"
+        ):
+            server_args._handle_pd_disaggregation()
+
+    def test_pd_decode_dcp_allows_fake_transfer_backend(self):
+        server_args = self._load_balance_args(
+            disaggregation_mode="decode",
             disaggregation_transfer_backend="fake",
             dcp_size=4,
         )
-        with self.assertRaisesRegex(ValueError, "mooncake or nixl"):
-            server_args._handle_pd_disaggregation()
+        self.assertTrue(server_args.disable_radix_cache)
 
     def test_pd_decode_dcp_rejects_radix_cache(self):
         server_args = ServerArgs(
