@@ -264,6 +264,15 @@ def test_indel_token_ids_come_from_checkpoint_config(mock_model_config):
     assert config.delete_token_id == DELETE_ID
     assert config.split_token_id == SPLIT_ID
 
+    # A checkpoint that omits the ids falls back to the values declared by the
+    # LLaDA2 reference implementation, so released checkpoints serve as-is.
     mock_model_config.return_value.hf_config.delete_token_id = None
+    mock_model_config.return_value.hf_config.split_token_id = None
+    config = DllmConfig.from_server_args(server_args("block-routing-model"))
+    assert config.delete_token_id == 156930
+    assert config.split_token_id == 156931
+
+    # Families with no documented edit tokens still refuse InDel decoding.
+    mock_model_config.return_value.hf_config.architectures = ["SDARForCausalLM"]
     with pytest.raises(RuntimeError, match="delete_token_id and split_token_id"):
-        DllmConfig.from_server_args(server_args("block-routing-model"))
+        DllmConfig.from_server_args(server_args("no-indel-model"))

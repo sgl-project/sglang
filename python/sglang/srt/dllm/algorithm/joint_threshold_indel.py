@@ -1,5 +1,6 @@
 """Joint-threshold denoising with insertion and deletion support."""
 
+import logging
 from typing import Any
 
 import torch
@@ -10,14 +11,20 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_npu
 
+logger = logging.getLogger(__name__)
+
 _is_npu = is_npu()
 argmax_softmax_prob_fused = None
+scrub_argmax_fused = None
 if _is_npu:
     try:
         from sgl_kernel_npu.sample.argmax_softmax_prob import argmax_softmax_prob_fused
     except (ImportError, OSError):
         pass
-    from sglang.kernels.ops.llada2.indel_npu import scrub_argmax_fused
+    try:
+        from sglang.kernels.ops.llada2.indel_npu import scrub_argmax_fused
+    except (ImportError, OSError):
+        pass
 
 
 def _argmax_prob(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -46,7 +53,8 @@ def _init_graph_state(
 ):
     batch_size, block_size = input_ids.shape
     return {
-        "prompt_mask": (input_ids != mask_id).cumprod(dim=1).bool(),
+        # aclnn has no bool cumprod, so the prefix scan runs in int32.
+        "prompt_mask": (input_ids != mask_id).to(torch.int32).cumprod(dim=1).bool(),
         "is_orig_mask": input_ids == mask_id,
         "sampled_mask": torch.zeros(
             (batch_size, block_size, vocab_size),
@@ -75,6 +83,36 @@ def _init_graph_state(
     }
 
 
+def _probe_fused_reductions(
+    flat_logits: torch.Tensor,
+    *,
+    mask_id: int,
+    delete_token_id: int,
+    split_token_id: int,
+) -> None:
+    """Run the fused reductions once before any graph capture.
+
+    The in-tree scrub kernel is JIT-compiled on first call, and a compile
+    failure inside a capture would abort the capture instead of falling back.
+    Probing here keeps an unusable kernel from reaching the captured graph.
+    """
+    global argmax_softmax_prob_fused, scrub_argmax_fused
+
+    if argmax_softmax_prob_fused is None or scrub_argmax_fused is None:
+        return
+    try:
+        argmax_softmax_prob_fused(flat_logits)
+        scrub_argmax_fused(flat_logits, mask_id, delete_token_id, split_token_id)
+    except Exception as error:
+        logger.warning(
+            "Fused LLaDA2 InDel reductions are unavailable (%s); "
+            "falling back to the Torch path.",
+            error,
+        )
+        argmax_softmax_prob_fused = None
+        scrub_argmax_fused = None
+
+
 def _graph_step(
     input_ids: torch.Tensor,
     full_logits: torch.Tensor,
@@ -92,7 +130,11 @@ def _graph_step(
     vocab_size = full_logits.shape[-1]
     device = input_ids.device
 
-    if argmax_softmax_prob_fused is not None and full_logits.device.type == "npu":
+    if (
+        argmax_softmax_prob_fused is not None
+        and scrub_argmax_fused is not None
+        and full_logits.device.type == "npu"
+    ):
         flat_logits = full_logits.view(-1, vocab_size)
         x_flat, p_flat = argmax_softmax_prob_fused(flat_logits)
         fallback_flat, scrub_flat = scrub_argmax_fused(
@@ -360,6 +402,13 @@ class _NPUJointThresholdGraphRunner:
         self.graph = torch.npu.NPUGraph()
         self.stream = torch.npu.Stream()
 
+        _probe_fused_reductions(
+            self.full_logits.view(-1, self.full_logits.shape[-1]),
+            mask_id=mask_id,
+            delete_token_id=delete_token_id,
+            split_token_id=split_token_id,
+        )
+
         torch.npu.synchronize()
         with torch.npu.graph(
             self.graph,
@@ -473,7 +522,10 @@ class JointThresholdInDel(DllmAlgorithm):
             "max_post_edit_steps", 16
         )
         self.max_regular_update_steps = self.block_size + self.max_post_edit_steps
-        self.enable_graph = config.algorithm_config.get("enable_graph", False)
+        # The graph path is an NPU-only, output-identical fast path, so it is
+        # on by default wherever it is supported.  `enable_graph: false` in the
+        # algorithm config still forces the eager path.
+        self.enable_graph = config.algorithm_config.get("enable_graph", _is_npu)
         if self.enable_graph and not _is_npu:
             raise ValueError("JointThresholdInDel graph mode requires an NPU device")
         self.delete_token_id = config.delete_token_id
@@ -486,7 +538,9 @@ class JointThresholdInDel(DllmAlgorithm):
     def init_step_state(self, forward_batch: ForwardBatch) -> list[Any]:
         batch_size = forward_batch.batch_size
         input_ids = forward_batch.input_ids.view(batch_size, self.block_size)
-        prompt_lens = (input_ids != self.mask_id).cumprod(dim=1).sum(dim=1)
+        prompt_lens = (
+            (input_ids != self.mask_id).to(torch.int32).cumprod(dim=1).sum(dim=1)
+        )
         positions = torch.arange(self.block_size, device=input_ids.device)
         return [
             {
