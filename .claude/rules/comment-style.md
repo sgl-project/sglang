@@ -1,3 +1,13 @@
+---
+paths:
+  - "**/*.py"
+  - "**/*.cu"
+  - "**/*.cuh"
+  - "**/*.cpp"
+  - "**/*.h"
+  - "**/*.rs"
+---
+
 # Comment Style
 
 Applies to `#` and `//` comments and to docstrings, in Python, CUDA/C++, and Rust
