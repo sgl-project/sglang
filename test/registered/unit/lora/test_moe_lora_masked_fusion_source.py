@@ -226,10 +226,10 @@ class TestMaskedFusionSource(unittest.TestCase):
             "run_shared_rank_finalize",
             "run_shared_rank_reduce",
             "finish_shared_rank_finalize",
-            "mapped_down_lora_a_input",
         ):
             self.assertIn(f"def {method}(", base)
             self.assertIn(f"def {method}(", row)
+        self.assertIn("def mapped_down_lora_a_input(", base)
         # Every fused stage has exactly one implementation, so no stage takes
         # an implementation name and no provider enumerates or installs one.
         for gone in (
@@ -256,8 +256,11 @@ class TestMaskedFusionSource(unittest.TestCase):
         self.assertIn("invoke(", finish)
         self.assertIn("down_masked=down_masked", finish)
         self.assertIn("src2dst=row_state.src2dst", finish)
-        mapped = _function(row, "mapped_down_lora_a_input")
+        # One copy, on the base: both row domains carry src2dst.
+        mapped = _function(base, "mapped_down_lora_a_input")
         self.assertIn("pair_to_row=row_state.src2dst", mapped)
+        for row_domain in (row, _source("contiguous_row_domain.py")):
+            self.assertNotIn("def mapped_down_lora_a_input(", row_domain)
         self.assertNotIn("base_gemm_state.src2dst", runner)
 
         # The contiguous domain offers the same shared-rank finalize methods.
@@ -399,22 +402,13 @@ class TestMaskedFusionSource(unittest.TestCase):
             package.__path__ = []
             packages[name] = package
 
-        base = types.ModuleType("sglang.srt.lora.moe.base_gemm_provider.base")
-
-        class MappedInput(msgspec.Struct, frozen=True, kw_only=True):
-            rows: torch.Tensor
-            pair_to_row: torch.Tensor
-
-        class StubBaseProvider:
-            def act_out_shape(self, ws):
-                return (
-                    self.quant_info.num_local_experts,
-                    ws.m_max,
-                    self.quant_info.intermediate_size,
-                )
-
-        base.MappedLoraAInput = MappedInput
-        base.MoeBaseProvider = StubBaseProvider
+        # Load the real base. It imports only msgspec and torch, and the
+        # row domains now inherit mapped_down_lora_a_input from it, so a stub
+        # would hide the very method this test exercises.
+        base_spec = importlib.util.spec_from_file_location(
+            "sglang.srt.lora.moe.base_gemm_provider.base", PROVIDER / "base.py"
+        )
+        base = importlib.util.module_from_spec(base_spec)
         quant = types.ModuleType("sglang.srt.lora.moe.quant_info")
         quant.MoeLoraBf16QuantInfo = object
         ep = types.ModuleType("sglang.kernels.ops.moe.ep_moe_kernels")
@@ -442,6 +436,7 @@ class TestMaskedFusionSource(unittest.TestCase):
         into_base = types.ModuleType("sglang.srt.lora.moe.lora_b")
         into_base.invoke_down_b_into_base = lambda *_args, **_kwargs: None
 
+        base_spec.loader.exec_module(base)
         spec = importlib.util.spec_from_file_location(
             "_cpu_masked_row_domain", PROVIDER / "masked_row_domain.py"
         )

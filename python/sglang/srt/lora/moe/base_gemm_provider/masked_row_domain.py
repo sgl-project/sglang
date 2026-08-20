@@ -16,7 +16,6 @@ import msgspec
 import torch
 
 from sglang.srt.lora.moe.base_gemm_provider.base import (
-    MappedLoraAInput,
     MoeBaseProvider,
 )
 from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
@@ -210,41 +209,6 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             interleaved=self.contract.interleaved,
             activation=activation,
             consume_base_pdl=consume_base_pdl,
-        )
-
-    def mapped_down_lora_a_input(
-        self,
-        row_state: MaskedRowState,
-        activation: torch.Tensor,
-    ) -> MappedLoraAInput:
-        if not isinstance(row_state, MaskedRowState):
-            raise TypeError("masked down-A input requires MaskedRowState")
-        expected = self.act_out_shape(row_state)
-        if tuple(activation.shape) != expected:
-            raise ValueError(
-                f"mapped down-A activation must be {expected}, got "
-                f"{tuple(activation.shape)}"
-            )
-        if activation.dtype != self.contract.lora_activation_dtype:
-            raise TypeError(
-                "mapped down-A activation dtype must match the provider "
-                f"contract {self.contract.lora_activation_dtype}"
-            )
-        if not activation.is_contiguous():
-            raise ValueError("mapped down-A activation rows must be contiguous")
-        if (
-            row_state.src2dst.ndim != 1
-            or row_state.src2dst.dtype != torch.int32
-            or row_state.src2dst.device != activation.device
-            or not row_state.src2dst.is_contiguous()
-        ):
-            raise ValueError(
-                "mapped down-A pair-to-row metadata must be contiguous 1-D "
-                "int32 on the activation device"
-            )
-        return MappedLoraAInput(
-            rows=activation.view(-1, activation.shape[-1]),
-            pair_to_row=row_state.src2dst,
         )
 
     def run_fused_act(

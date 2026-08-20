@@ -159,14 +159,42 @@ class MoeBaseProvider:
         self,
         row_state,
         activation: torch.Tensor,
-    ) -> MappedLoraAInput | None:
+    ) -> MappedLoraAInput:
         """Give the provider's activation rows to a standalone grouped down-A.
 
-        Return ``None`` when the activation rows have no stable pair-to-row
-        map. The caller then keeps the pair-major bridge.
+        ``src2dst`` already holds one activation row for each routed pair. A
+        sentinel pair's entry stays uninitialized and no kernel reads it: the
+        route puts every sentinel in a block labelled ``-1``, and the kernel
+        skips those blocks. Both row domains carry ``src2dst``, so this works
+        for either one.
         """
-
-        return None
+        expected = self.act_out_shape(row_state)
+        if tuple(activation.shape) != expected:
+            raise ValueError(
+                f"mapped down-A activation must be {expected}, got "
+                f"{tuple(activation.shape)}"
+            )
+        if activation.dtype != self.contract.lora_activation_dtype:
+            raise TypeError(
+                "mapped down-A activation dtype must match the provider "
+                f"contract {self.contract.lora_activation_dtype}"
+            )
+        if not activation.is_contiguous():
+            raise ValueError("mapped down-A activation rows must be contiguous")
+        if (
+            row_state.src2dst.ndim != 1
+            or row_state.src2dst.dtype != torch.int32
+            or row_state.src2dst.device != activation.device
+            or not row_state.src2dst.is_contiguous()
+        ):
+            raise ValueError(
+                "mapped down-A pair-to-row metadata must be contiguous 1-D "
+                "int32 on the activation device"
+            )
+        return MappedLoraAInput(
+            rows=activation.view(-1, activation.shape[-1]),
+            pair_to_row=row_state.src2dst,
+        )
 
     def supports_down_b_into_base(self) -> bool:
         """Report whether the down rows accept the down-B into-base add.
