@@ -52,9 +52,12 @@ def _make_manager(pool_size: int, page_size: int = 1):
     freed_indices = []
 
     allocator = MagicMock()
-    allocator.free = MagicMock(
-        side_effect=lambda idx: freed_indices.append(idx.clone())
-    )
+    # Row ranges reach the allocator as free_full (whole range) plus free_swa
+    # (from the eviction floor up); record the full side, which is what a leak
+    # would show up in. Hook free() too so a direct caller still registers.
+    record = MagicMock(side_effect=lambda idx: freed_indices.append(idx.clone()))
+    allocator.free = record
+    allocator.free_full = record
 
     tree_cache = MagicMock()
     tree_cache.protected_size_ = 0

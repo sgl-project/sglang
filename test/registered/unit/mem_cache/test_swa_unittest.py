@@ -700,14 +700,23 @@ class TestSWA(unittest.TestCase):
         req2.cache_protected_len = 1
         req2.prefix_indices = torch.tensor([21, 22, 23, 24, 25], device=tree.device)
 
-        freed_lens = []
-        original_free = allocator.free
+        # Probe the pool-specific pair, not free(): a row range gives its full
+        # side back whole and its SWA side from the eviction floor up.
+        full_freed_lens = []
+        swa_freed_lens = []
+        original_free_full = allocator.free_full
+        original_free_swa = allocator.free_swa
 
-        def wrapped_free(indices):
-            freed_lens.append(int(indices.numel()))
-            return original_free(indices)
+        def wrapped_free_full(indices):
+            full_freed_lens.append(int(indices.numel()))
+            return original_free_full(indices)
 
-        allocator.free = wrapped_free
+        def wrapped_free_swa(indices):
+            swa_freed_lens.append(int(indices.numel()))
+            return original_free_swa(indices)
+
+        allocator.free_full = wrapped_free_full
+        allocator.free_swa = wrapped_free_swa
         tree.cache_finished_req(
             req2, is_insert=False, kv_len_to_handle=req2._kv_committed_len
         )
@@ -716,7 +725,9 @@ class TestSWA(unittest.TestCase):
         # Expected frees:
         #   overlap range [1:5] -> 4
         #   tail range [5:]     -> 1
-        self.assertEqual(freed_lens, [4, 1])
+        self.assertEqual(full_freed_lens, [4, 1])
+        # swa_evicted_seqlen is 0 here, so nothing is skipped on the SWA side.
+        self.assertEqual(swa_freed_lens, [4, 1])
 
 
 # Optimization: SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT.
