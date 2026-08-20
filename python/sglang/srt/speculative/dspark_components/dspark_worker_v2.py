@@ -597,11 +597,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         pp_proxy_tensors = self._next_pp_proxy_tensors
         self._next_pp_proxy_tensors = None
 
-        if getattr(batch, "return_logprob", False):
-            raise ValueError(
-                "DSpark speculative decoding does not support return_logprob yet."
-            )
-
         if self._is_lifecycle_only_pp_prefill_rank:
             return self._forward_lifecycle_only_prefill(
                 batch=batch,
