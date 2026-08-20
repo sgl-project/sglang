@@ -41,7 +41,7 @@ logger = init_logger(__name__)
 # publish.
 SGL_TEST_FILES_CI_DATA_REPO = "sgl-project/ci-data-diffusion"
 SGL_TEST_FILES_CI_DATA_REVISION = "15b30030ef980756788ab40072f9223fe21a5526"
-SGL_TEST_FILES_MINIMAX_H3_CI_DATA_REVISION = "81ca8f18d485df4e4bac9a5a40c5b4666f0fa57f"
+SGL_TEST_FILES_MINIMAX_H3_CI_DATA_REVISION = "9faa8df39eda1acfa71e9f13b6a672db73197d79"
 
 # The NPU pin is kept as a separate branch so ascend GT can be bumped independently
 # when it's regenerated on its own cadence.
