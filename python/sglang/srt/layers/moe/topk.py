@@ -2151,9 +2151,6 @@ def select_experts(
     # Set by the fused-gating+pack branch below; None everywhere else.
     packed_topk = None
 
-    if _use_aiter and use_grouped_topk and correction_bias is not None:
-        correction_bias = topk_config.correction_bias_for_dtype(router_logits.dtype)
-
     (
         router_logits,
         correction_bias,
@@ -2162,6 +2159,9 @@ def select_experts(
         correction_bias=correction_bias,
         info=expert_location_dispatch_info,
     )
+
+    if _use_aiter and use_grouped_topk and correction_bias is not None:
+        correction_bias = topk_config.correction_bias_for_dtype(router_logits.dtype)
 
     # DeepSeek V2/V3/R1 series models use grouped_top_k
     # remove num_fused_shared_experts from grouped_topk/biased_grouped_topk
