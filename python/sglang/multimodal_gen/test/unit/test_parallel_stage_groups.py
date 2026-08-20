@@ -105,6 +105,12 @@ class _NoopComponentResidencyManager:
     def parallel_stage_group(self):
         return _null_context()
 
+    def begin_stage(self):
+        pass
+
+    def end_stage(self):
+        pass
+
 
 def _server_args(**overrides):
     defaults = dict(
@@ -453,8 +459,8 @@ class TestParallelLevelExecution(unittest.TestCase):
         second.set_execution_group("g")
 
         executor = _executor()
-        executor.component_residency_manager = SimpleNamespace(
-            pipeline=SimpleNamespace(modules={"transformer": torch.nn.Linear(1, 1)})
+        executor.component_residency_manager.pipeline = SimpleNamespace(
+            modules={"transformer": torch.nn.Linear(1, 1)}
         )
 
         with patch(
