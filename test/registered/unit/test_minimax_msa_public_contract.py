@@ -5,7 +5,9 @@ import pytest
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
-from sglang.srt.layers.attention.minimax_sparse_backend import MiniMaxSparseAttnBackend
+from sglang.srt.layers.attention.minimax_sparse_backend import (
+    MiniMaxSparseAttnBackend,
+)
 from sglang.srt.layers.attention.minimax_sparse_ops import msa
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
