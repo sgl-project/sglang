@@ -10,28 +10,6 @@ from sglang.srt.load_reporter.config import WorkerMetadata
 from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
 from sglang.srt.load_reporter.snapshot_validation import RankSnapshot
 
-# ---------------------------------------------------------------------------
-# Sequence allocator
-# ---------------------------------------------------------------------------
-
-
-class SequenceAllocator:
-    """Allocate process-local monotonically increasing report sequence IDs."""
-
-    def __init__(self) -> None:
-        """Initialize the sequence at zero before the first report."""
-        self._value = 0
-
-    def next(self) -> int:
-        """Return the next positive sequence ID."""
-        self._value += 1
-        return self._value
-
-
-# ---------------------------------------------------------------------------
-# Report builder
-# ---------------------------------------------------------------------------
-
 
 class ReportBuilder:
     """Convert validated rank tuples into protocol load reports."""
@@ -40,12 +18,16 @@ class ReportBuilder:
         self,
         source_instance_id: str,
         stale_after_ms: int,
-        sequence: SequenceAllocator,
     ) -> None:
         """Initialize report identity, staleness policy, and sequence allocation."""
         self._source_instance_id = source_instance_id
         self._stale_after_ms = stale_after_ms
-        self._sequence = sequence
+        self._sequence_id = 0
+
+    def _next_sequence_id(self) -> int:
+        """Return the next positive process-local sequence ID."""
+        self._sequence_id += 1
+        return self._sequence_id
 
     def build(
         self,
@@ -103,7 +85,7 @@ class ReportBuilder:
         """Allocate one protobuf report; success and failure share this path."""
         report = pb.LoadReport(
             source_instance_id=self._source_instance_id,
-            sequence_id=self._sequence.next(),
+            sequence_id=self._next_sequence_id(),
             report_time_unix_ms=report_time_unix_ms,
             worker=pb.Worker(
                 worker_addr=identity.worker_addr,

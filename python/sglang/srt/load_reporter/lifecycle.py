@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Optional
+
+if TYPE_CHECKING:
+    from sglang.srt.load_reporter.snapshot_source import LoadSnapshotSource
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +47,7 @@ class LoadReporterHandle:
 
 async def start_load_reporter(
     server_args: Any,
-    snapshot_source: Any,
+    snapshot_source: Optional[LoadSnapshotSource],
 ) -> Optional[LoadReporterHandle]:
     """Start the reporter and return its handle when enabled."""
     if getattr(server_args, "load_reporter_port", None) is None:
@@ -58,7 +61,7 @@ async def start_load_reporter(
 
 async def _start_owner(
     server_args: Any,
-    snapshot_source: Any,
+    snapshot_source: LoadSnapshotSource,
 ) -> LoadReporterHandle:
     """Start the reporter runtime and gRPC listener on the reporter port."""
     import grpc.aio

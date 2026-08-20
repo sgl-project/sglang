@@ -16,15 +16,15 @@ SHUTDOWN_TIMEOUT_SECONDS = 5.0
 SNAPSHOT_STALE_AFTER_MS = 3000
 
 
-class LoadReporterConfig(msgspec.Struct, frozen=True):
-    """Timing configuration for the load reporter."""
-
-    snapshot_stale_after_ms: int = SNAPSHOT_STALE_AFTER_MS
-
-    @classmethod
-    def from_server_args(cls, args: ServerArgs) -> LoadReporterConfig:
-        """Build reporter timing configuration from ServerArgs."""
-        return cls()
+def validate_session_timing(
+    report_interval_ms: Optional[int] = None,
+    lease_ttl_ms: Optional[int] = None,
+) -> None:
+    """Reject non-positive session timing values."""
+    if report_interval_ms is not None and report_interval_ms <= 0:
+        raise ValueError("report_interval_ms must be greater than zero")
+    if lease_ttl_ms is not None and lease_ttl_ms <= 0:
+        raise ValueError("lease_ttl_ms must be greater than zero")
 
 
 class WorkerMetadata(msgspec.Struct, frozen=True):

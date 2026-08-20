@@ -2,20 +2,21 @@
 
 from __future__ import annotations
 
-from typing import Any, Collection, Optional, Protocol, runtime_checkable
+from typing import Any, Collection, Protocol
+
+from sglang.srt.managers.load_snapshot import LoadSnapshot
 
 
-@runtime_checkable
 class LoadSnapshotSource(Protocol):
     """Protocol for a load-snapshot data source."""
 
-    async def get_loads(self) -> list:
+    async def get_loads(self) -> list[LoadSnapshot]:
         """Return the source's latest scheduler load snapshots."""
-        raise NotImplementedError
+        ...
 
-    def expected_dp_ranks(self) -> frozenset:
+    def expected_dp_ranks(self) -> frozenset[int]:
         """Return the authoritative DP ranks required for a full snapshot."""
-        raise NotImplementedError
+        ...
 
 
 class ManagerLoadSnapshotSource:
@@ -25,18 +26,13 @@ class ManagerLoadSnapshotSource:
         self,
         manager: Any,
         expected_dp_ranks: Collection[int],
-        *,
-        snapshot_reader: Optional[Any] = None,
     ) -> None:
         """Wrap a manager with an authoritative rank fallback."""
         self._manager = manager
-        self._snapshot_reader = snapshot_reader
         self._expected: frozenset[int] = frozenset(expected_dp_ranks)
 
-    async def get_loads(self) -> list:
+    async def get_loads(self) -> list[LoadSnapshot]:
         """Fetch core load snapshots from the wrapped manager."""
-        if self._snapshot_reader is not None:
-            return self._snapshot_reader.read_all()
         return await self._manager.get_loads(include=["core"])
 
     def expected_dp_ranks(self) -> frozenset[int]:
@@ -59,7 +55,7 @@ class RouterLoadSnapshotSource:
         self._reader = reader
         self._expected: frozenset[int] = frozenset(expected_dp_ranks)
 
-    async def get_loads(self) -> list:
+    async def get_loads(self) -> list[LoadSnapshot]:
         """Read all load snapshots currently published in shared memory."""
         return self._reader.read_all()
 

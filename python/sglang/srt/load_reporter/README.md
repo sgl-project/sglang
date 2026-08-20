@@ -241,11 +241,11 @@ only; its parameter name is chosen by the Router owner and is not defined here.
 |---|---|
 | `lifecycle.py` | Composition root (`start_load_reporter`) and `LoadReporterHandle`. |
 | `service.py` | `LoadMonitorService.Monitor` bidi handler (depends only on runtime + proto). |
-| `runtime.py` | `LoadReporterRuntime`: session table, the single fire loop, bounded shutdown. |
+| `runtime.py` | `LoadReporterRuntime`: session table, shared period schedules, the single fire loop, bounded shutdown. |
 | `snapshot_source.py` | `LoadSnapshotSource` protocol; `ManagerLoadSnapshotSource` / `RouterLoadSnapshotSource` adapters. |
 | `snapshot_validation.py` | Stateless one-pull validation (`validate_full_snapshot`). |
-| `report_builder.py` | Validated rank tuple → `pb.LoadReport` with status + sequence id. |
-| `config.py` | `LoadReporterConfig` / `WorkerMetadata` from `ServerArgs`; internal constants. |
+| `report_builder.py` | Validated rank tuple → `pb.LoadReport` with status and process-local sequence allocation. |
+| `config.py` | Shared timing validation, `WorkerMetadata` from `ServerArgs`, and internal constants. |
 | `proto/` | Generated `sglang.router.loadmonitor.v1` bindings. |
 
 ## Threading and async model
@@ -253,26 +253,19 @@ only; its parameter name is chosen by the Router owner and is not defined here.
 - Reporter components use the serving loop owned by HTTP, the
   `MultiTokenizerRouter`, or standalone SMG RPC.
 - Single fire loop: at most one `get_loads()` in flight; the loop idles when
-  no sessions remain and starts with the first registration.
+  no sessions remain, and the first registration triggers its first pull.
 - Pull, connection, write, and shutdown failures never propagate into
   inference requests. Shutdown cancels the fire task directly, so an in-flight
   pull is aborted immediately.
 
 ## Tests and validation
 
-- Unit / integration (CPU, real in-process `grpc.aio`): proto contract, runtime
-  fire loop (coalesced initial broadcast, shared period buckets, staggered
-  same-period registration, harmonic-period overlap, interval migration and
-  cleanup, missed-tick phase preservation, pull retry on rank-set change,
-  stale/error reports, in-flight pulls, re-registration, leases, shutdown),
-  validation and report-builder contracts, service handshake/reporting,
-  composition-root lifecycle (disabled, owner startup, cleanup, port conflicts,
-  expected-rank updates), and standalone SMG wiring (capability guard,
-  `_serve_grpc` failure/exit/cancel cleanup) via a faked `_serve_grpc` import
-  boundary (no smg install required).
-- Negative invariant tests verify that request activity does not trigger
-  snapshot pulls.
-- Topology-change tests verify that `update_expected_dp_ranks` updates the
+- Contract-oriented CPU unit/integration coverage (with a real in-process
+  `grpc.aio` server where needed): protobuf compatibility, snapshot validation,
+  report construction, shared period grouping, in-flight interval migration,
+  retry budgets, leases, shutdown, service errors, disabled/owner lifecycle,
+  port recovery, and standalone SMG capability/cancellation handling.
+- One topology-change test verifies that `update_expected_dp_ranks` updates the
   expected rank set without an immediate pull and that the next fire observes
   the new set.
 - E2E (GPU + model, CUDA CI) under `test/registered/tokenizer/`: a real

@@ -9,6 +9,7 @@ from typing import Any, Optional
 import grpc
 import grpc.aio
 
+from sglang.srt.load_reporter.config import validate_session_timing
 from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
 from sglang.srt.load_reporter.proto import load_monitor_pb2_grpc as pb_grpc
 
@@ -25,10 +26,10 @@ def _validate_timing(
     lease_ttl_ms: Optional[int] = None,
 ) -> Optional[pb.StreamError]:
     """Return an error when a present timing field is not positive."""
-    if report_interval_ms is not None and report_interval_ms <= 0:
-        return _invalid_argument("report_interval_ms must be greater than zero")
-    if lease_ttl_ms is not None and lease_ttl_ms <= 0:
-        return _invalid_argument("lease_ttl_ms must be greater than zero")
+    try:
+        validate_session_timing(report_interval_ms, lease_ttl_ms)
+    except ValueError as exc:
+        return _invalid_argument(str(exc))
     return None
 
 
@@ -59,7 +60,7 @@ class LoadMonitorService(pb_grpc.LoadMonitorServiceServicer):
         read_task = None
         write_task = None
         try:
-            first_frame = await self._read_frame(request_iterator, context)
+            first_frame = await self._read_frame(request_iterator)
             if first_frame is None:
                 return  # stream ended before any frame
 
@@ -129,8 +130,8 @@ class LoadMonitorService(pb_grpc.LoadMonitorServiceServicer):
                         pass
 
     @staticmethod
-    async def _read_frame(request_iterator: Any, context: Any) -> pb.RouterFrame | None:
-        """Read one RouterFrame; return None on EOF or context cancel."""
+    async def _read_frame(request_iterator: Any) -> pb.RouterFrame | None:
+        """Read one RouterFrame; return None on EOF or read failure."""
         try:
             return await request_iterator.__anext__()
         except StopAsyncIteration:
