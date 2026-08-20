@@ -311,6 +311,89 @@ if _use_aiter:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
 
+def _wo_a_aiter_gemm_eligible(
+    flag: bool, use_aiter: bool, is_hip: bool, is_gfx95: bool
+) -> bool:
+    """Static eligibility for the aiter ``wo_a`` reroute.
+
+    Folds the opt-in flag, the global ``SGLANG_USE_AITER`` switch, and the
+    HIP/gfx95 platform gates into one predicate. Evaluated once at import (see
+    ``_wo_a_aiter_batched_gemm_enabled``) so none of it runs on the per-token
+    decode critical path.
+    """
+    return bool(flag and use_aiter and is_hip and is_gfx95)
+
+
+# Read the opt-in flag and import the aiter kernel ONCE at module import: the
+# decode ``wo_a`` matmul runs per layer/token on the critical path, so it must
+# not pay an ``EnvBool.get()`` plus a function-local import on every call. If the
+# path is eligible but the kernel import fails, disable it here and fall back to
+# the einsum for the process (logged once) instead of retrying every step.
+_wo_a_aiter_batched_gemm_enabled = _wo_a_aiter_gemm_eligible(
+    envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.get(),
+    _use_aiter,
+    _is_hip,
+    _is_gfx95_supported,
+)
+_wo_a_batched_gemm_bf16 = None
+if _wo_a_aiter_batched_gemm_enabled:
+    try:
+        from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import (
+            batched_gemm_bf16 as _wo_a_batched_gemm_bf16,
+        )
+    except Exception as err:  # pragma: no cover - env-dependent
+        _wo_a_aiter_batched_gemm_enabled = False
+        logger.warning(
+            "aiter wo_a batched_gemm_bf16 import failed; using einsum for wo_a "
+            "for the rest of this process: %s",
+            err,
+        )
+
+# Flipped once if the (already-imported) aiter kernel raises at runtime, so a
+# per-call kernel failure falls back to the einsum for the rest of the process
+# instead of re-raising (and re-logging) on every layer/token.
+_wo_a_aiter_batched_gemm_disabled = False
+
+
+def _apply_wo_a_bf16_matmul(
+    o: torch.Tensor, wo_a: torch.Tensor, is_decode: bool
+) -> torch.Tensor:
+    """wo_a (attn output -> o_proj low-rank) bf16 batched matmul.
+
+    ``o`` is ``[T, G, D]`` (tokens, groups, head_dim) and ``wo_a`` is
+    ``[G, R, D]`` (groups, o_lora_rank, head_dim); the result is ``[T, G, R]``.
+
+    Dispatch contract: on the decode path, when the reroute is enabled
+    (``_wo_a_aiter_batched_gemm_enabled``, computed once at import) and has not
+    been disabled by a prior runtime failure, call the pre-imported aiter
+    ``batched_gemm_bf16`` (``Y[i] = X[i] @ W[i]^T``). Otherwise -- prefill, any
+    gate off, or after a failure -- use the numerically-equivalent
+    ``torch.einsum("tgd,grd->tgr", ...)``. The first runtime kernel failure
+    disables the reroute for the process (logged once).
+    """
+    global _wo_a_aiter_batched_gemm_disabled
+    if (
+        is_decode
+        and _wo_a_aiter_batched_gemm_enabled
+        and not _wo_a_aiter_batched_gemm_disabled
+    ):
+        try:
+            # aiter batched_gemm_bf16: XQ[B,M,K] @ WQ[B,N,K]^T -> [B,M,N].
+            # Here batch = group G: XQ = o.transpose(0,1) [G,T,D], WQ = wo_a
+            # [G,R,D] -> [G,T,R] -> transpose back to [T,G,R].
+            xq = o.transpose(0, 1).contiguous()
+            y = _wo_a_batched_gemm_bf16(xq, wo_a, dtype=torch.bfloat16)
+            return y.transpose(0, 1).contiguous()
+        except Exception as err:
+            _wo_a_aiter_batched_gemm_disabled = True
+            logger.warning(
+                "aiter wo_a batched_gemm_bf16 failed; disabling the reroute and "
+                "falling back to einsum for the rest of this process: %s",
+                err,
+            )
+    return torch.einsum("tgd,grd->tgr", o, wo_a)
+
+
 def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):
     x_quant, x_bf16, _, _ = fused_rms_fp8_group_quant(
         hidden_states,
@@ -1582,7 +1665,9 @@ class MQALayer(MqaAttentionBase):
             o = output
         else:
             wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-            o = torch.einsum("tgd,grd->tgr", o, wo_a)
+            o = _apply_wo_a_bf16_matmul(
+                o, wo_a, is_decode=forward_batch.forward_mode.is_decode()
+            )
 
         o, _ = self.wo_b(o.flatten(1))
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:

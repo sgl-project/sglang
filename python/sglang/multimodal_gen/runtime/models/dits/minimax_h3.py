@@ -77,6 +77,19 @@ logger = init_logger(__name__)
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
+_MPS_MLP_TOKEN_CHUNK_SIZE = 128
+# keep MPS activation chunks below the allocator high-watermark; CUDA keeps
+# its fused full-sequence projection
+_MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE = 128
+_MPS_ATTENTION_QUERY_TOKEN_CHUNK_SIZE = 128
+
+_MPS_EMBED_WEIGHT_PREFIXES = (
+    "condition_proj",
+    "video_patch_proj",
+    "audio_patch_proj",
+    "time_embedder",
+    "token_refiner.final_norm",
+)
 
 _MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER = (
     "video_patch_proj.weight",
@@ -390,6 +403,18 @@ def _apply_rope_qk(
     return q, k
 
 
+def _apply_rope(
+    x: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the eager (non-CUDA) H3 RoPE path to one Q or K tensor."""
+    half = cos_sin_cache.shape[-1] // 2
+    cos_half, sin_half = cos_sin_cache.split(half, dim=-1)
+    cos = torch.cat((cos_half, cos_half), dim=-1).unsqueeze(1)
+    sin = torch.cat((sin_half, sin_half), dim=-1).unsqueeze(1)
+    return _apply_rope_cos_sin(x, cos, sin)
+
+
 class MiniMaxH3TimeEmbedder(nn.Module):
     def __init__(
         self,
@@ -597,6 +622,9 @@ class MiniMaxH3Attention(nn.Module):
 
     def _install_qkv_weight_loader(self, arch: MiniMaxH3DiTArchConfig) -> None:
         weight = self.qkv_proj.weight
+        # h3 checkpoints interleave each attention head's Q, K, and V rows
+        # this parameter needs reordering before the native QKV projection
+        weight.mps_zero_copy_unsafe = True
         base_loader = weight.weight_loader
 
         def _reorder_checkpoint_weight(loaded_weight: torch.Tensor) -> torch.Tensor:
@@ -630,6 +658,107 @@ class MiniMaxH3Attention(nn.Module):
         # rank-local FSDP must reorder grouped QKV before selecting each shard
         weight.rank_local_weight_transform = _reorder_checkpoint_weight
 
+    def _forward_mps_streamed_attention(
+        self,
+        x: torch.Tensor,
+        *,
+        rope_cache: tuple[torch.Tensor, torch.Tensor] | None,
+        cu_seqlens: torch.Tensor,
+        cu_seqlens_host: tuple[int, ...] | None,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        """Run MPS attention without materializing the full QKV activation.
+
+        H3's fused QKV output alone is roughly 1.45 GiB at 768px.  MPS shares
+        unified memory with the host, so retaining it alongside the packed
+        residual and SDPA workspace can evict the OS.  Build normalized K/V
+        once, then project Q a small chunk at a time and immediately consume it
+        through attention and the output projection.  The formula, weights,
+        and complete K/V context are unchanged; this is intentionally limited
+        to single-device MPS where Ulysses collectives are not active.
+        """
+        total = x.shape[0]
+        key = torch.empty(
+            (total, self.num_heads, self.head_dim), dtype=x.dtype, device=x.device
+        )
+        value = torch.empty_like(key)
+        cos_sin_cache = None if rope_cache is None else rope_cache[0]
+
+        # Do not retain Q while producing the K/V cache.  Dropping the chunk
+        # before the next transfer keeps only two full-width attention tensors.
+        for start in range(0, total, _MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE):
+            stop = min(start + _MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE, total)
+            qkv, _ = self.qkv_proj(x[start:stop])
+            q_chunk, k_chunk, v_chunk = qkv.split(self.local_inner_dim, dim=-1)
+            del q_chunk
+            k_chunk = self.k_norm(k_chunk.view(-1, self.num_heads, self.head_dim))
+            if cos_sin_cache is not None:
+                k_chunk = _apply_rope(k_chunk, cos_sin_cache[start:stop])
+            key[start:stop].copy_(k_chunk)
+            value[start:stop].copy_(v_chunk.view(-1, self.num_heads, self.head_dim))
+            del qkv, k_chunk, v_chunk
+            torch.mps.synchronize()
+            torch.mps.empty_cache()
+
+        if self._attention_impl is None:
+            self._set_attention_backend(
+                get_attn_backend(
+                    self.head_dim,
+                    x.dtype,
+                    attention_requirements=AttentionRequirements(packed_varlen=True),
+                )
+            )
+        bounds = (
+            cu_seqlens_host
+            if cu_seqlens_host is not None
+            else tuple(int(item) for item in cu_seqlens.tolist())
+        )
+        out = torch.empty_like(x)
+        for sequence_start, sequence_stop in zip(bounds[:-1], bounds[1:]):
+            if sequence_start == sequence_stop:
+                continue
+            keys = key[sequence_start:sequence_stop].unsqueeze(0)
+            values = value[sequence_start:sequence_stop].unsqueeze(0)
+            for start in range(
+                sequence_start,
+                sequence_stop,
+                _MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE,
+            ):
+                stop = min(start + _MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE, sequence_stop)
+                qkv, _ = self.qkv_proj(x[start:stop])
+                q_chunk, k_chunk, v_chunk = qkv.split(self.local_inner_dim, dim=-1)
+                del k_chunk, v_chunk
+                for query_start in range(
+                    start, stop, _MPS_ATTENTION_QUERY_TOKEN_CHUNK_SIZE
+                ):
+                    query_stop = min(
+                        query_start + _MPS_ATTENTION_QUERY_TOKEN_CHUNK_SIZE, stop
+                    )
+                    q = self.q_norm(
+                        q_chunk[query_start - start : query_stop - start].view(
+                            -1, self.num_heads, self.head_dim
+                        )
+                    )
+                    if cos_sin_cache is not None:
+                        q = _apply_rope(q, cos_sin_cache[query_start:query_stop])
+                    attention_out = self._attention_impl.forward(
+                        q.unsqueeze(0), keys, values, None
+                    )[0]
+                    projected, _ = self.out_proj(
+                        attention_out.reshape(
+                            query_stop - query_start, self.local_inner_dim
+                        )
+                    )
+                    out[query_start:query_stop].copy_(projected)
+                    del q, attention_out, projected
+                del qkv, q_chunk
+                torch.mps.synchronize()
+                torch.mps.empty_cache()
+
+        del key, value
+        torch.mps.empty_cache()
+        return out
+
     def forward(
         self,
         x: torch.Tensor,
@@ -652,6 +781,15 @@ class MiniMaxH3Attention(nn.Module):
         so cu_seqlens retains global packed-document semantics. The inverse
         all-to-all restores the row shard before the output projection.
         """
+        if x.device.type == "mps" and not ulysses_active:
+            return self._forward_mps_streamed_attention(
+                x,
+                rope_cache=rope_cache,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_host=cu_seqlens_host,
+                max_seqlen=max_seqlen,
+            )
+
         total = x.shape[0]
         qkv, _ = self.qkv_proj(x)
         q, k, v = qkv.split(self.local_inner_dim, dim=-1)
@@ -747,6 +885,18 @@ class MiniMaxH3MLP(nn.Module):
         self.reuse_fc1_activation = quant_config is None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device.type == "mps":
+            out = torch.empty_like(x)
+            for start in range(0, x.shape[0], _MPS_MLP_TOKEN_CHUNK_SIZE):
+                stop = min(start + _MPS_MLP_TOKEN_CHUNK_SIZE, x.shape[0])
+                hidden, _ = self.fc1(x[start:stop])
+                hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
+                chunk, _ = self.fc2(hidden)
+                out[start:stop].copy_(chunk)
+                del hidden, chunk
+                torch.mps.synchronize()
+                torch.mps.empty_cache()
+            return out
         hidden, _ = self.fc1(x)
         hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
         out, _ = self.fc2(hidden)
@@ -848,6 +998,13 @@ class MiniMaxH3AdalnCache(nn.Module):
             raise ValueError(
                 "MiniMax H3 AdaLN cache takes exactly one of path (prebuilt "
                 "sidecar) or weight_files (rebuild from the checkpoint)"
+            )
+        if max_plans < 1:
+            raise ValueError("MiniMax H3 AdaLN cache max_plans must be positive")
+        if max_plan_width < 1:
+            raise ValueError(
+                "MiniMax H3 AdaLN cache max_plan_width must be positive; "
+                "set --minimax-h3-adaln-plan-width to at least 1"
             )
         self.path = path
         self.model_variant = model_variant
@@ -981,18 +1138,12 @@ class MiniMaxH3AdalnCache(nn.Module):
         missing = {k: v for k, v in wanted.items() if k not in self._slots}
         if not missing:
             return
-        if len(self._slots) + len(missing) > self.max_plans:
-            # Every plan a request looks up has to stay resident for the whole
-            # denoise loop, so an overflow means the capacity is too small --
-            # evicting part of it would only move the failure into lookup().
-            self._slots.clear()
-            self.plan_lengths.zero_()
-        if len(missing) > self.max_plans:
+        if len(wanted) > self.max_plans:
             raise ValueError(
-                f"MiniMax H3 AdaLN rebuild needs {len(missing)} plans but "
+                f"MiniMax H3 AdaLN rebuild needs {len(wanted)} plans but "
                 f"max_plans is {self.max_plans}"
             )
-        widest = max(timesteps.numel() for timesteps in missing.values())
+        widest = max(timesteps.numel() for timesteps in wanted.values())
         if widest > self.max_plan_width:
             raise ValueError(
                 f"MiniMax H3 AdaLN rebuild hit a {widest}-timestep plan but the "
@@ -1000,11 +1151,20 @@ class MiniMaxH3AdalnCache(nn.Module):
                 "--minimax-h3-adaln-plan-width (t2va needs 2, fl2va 3, ref2va 4)"
             )
 
+        reset = len(self._slots) + len(missing) > self.max_plans
+        # A reset also evicts this request's cache hits, so rebuild its complete
+        # plan set rather than only the plans that were initially missing.
+        plans_to_build = wanted if reset else missing
+        if reset:
+            self._slots.clear()
+            self.plan_lengths.zero_()
+
         device = self.block_params.device
         slots = []
-        for key, timesteps in missing.items():
-            slot = len(self._slots)
-            self._slots[key] = slot
+        pending_slots: dict[tuple[int, ...], int] = {}
+        for offset, (key, timesteps) in enumerate(plans_to_build.items()):
+            slot = len(self._slots) + offset
+            pending_slots[key] = slot
             slots.append((slot, timesteps.numel(), embed(timesteps.to(device))))
             self.plan_timesteps[slot, : timesteps.numel()] = timesteps.to(device)
 
@@ -1052,10 +1212,14 @@ class MiniMaxH3AdalnCache(nn.Module):
 
         for slot, length, _ in slots:
             self.plan_lengths[slot] = length
+        # Commit host metadata only after every layer has been written. If a
+        # checkpoint read or projection raises, the zero-length slots remain
+        # invisible and a later request can retry the rebuild.
+        self._slots.update(pending_slots)
         self.rebuilds += 1
         logger.info(
             "MiniMax H3 AdaLN: rebuilt %d plan(s), %d/%d resident, pass #%d",
-            len(missing),
+            len(plans_to_build),
             len(self._slots),
             self.max_plans,
             self.rebuilds,
@@ -1341,6 +1505,38 @@ class MiniMaxH3FinalLayer(nn.Module):
                 raise ValueError("MiniMax H3 AdaLN cache parameters are required")
             adaln_params = self.adaln_proj(adaln_input)
         shift, scale = adaln_params
+        if x.device.type == "mps":
+            video = audio = None
+            for start in range(0, x.shape[0], _MPS_MLP_TOKEN_CHUNK_SIZE):
+                stop = min(start + _MPS_MLP_TOKEN_CHUNK_SIZE, x.shape[0])
+                h = self.norm(x[start:stop])
+                h = _modulate_scale_shift(
+                    h,
+                    shift,
+                    scale,
+                    inverse_indices[start:stop],
+                    dtype=_BF16_DTYPE,
+                ).to(_FP32_DTYPE)
+                video_chunk, _ = self.video_out(h)
+                audio_chunk, _ = self.audio_out(h)
+                if video is None:
+                    video = torch.empty(
+                        (x.shape[0], video_chunk.shape[-1]),
+                        dtype=video_chunk.dtype,
+                        device=x.device,
+                    )
+                    audio = torch.empty(
+                        (x.shape[0], audio_chunk.shape[-1]),
+                        dtype=audio_chunk.dtype,
+                        device=x.device,
+                    )
+                video[start:stop].copy_(video_chunk)
+                audio[start:stop].copy_(audio_chunk)
+                del h, video_chunk, audio_chunk
+                torch.mps.synchronize()
+                torch.mps.empty_cache()
+            assert video is not None and audio is not None
+            return video, audio
         h = self.norm(x)
         h = _modulate_scale_shift(h, shift, scale, inverse_indices, dtype=_BF16_DTYPE)
         # Preserve full precision through both final output projections.
@@ -1357,6 +1553,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     # parameters mix fp32 (patch projections, timestep embedder, and output
     # heads) with bf16 blocks; FSDP must gather in each parameter's own dtype
     _fsdp_mixed_dtype_params = True
+    mps_stream_non_layer_weights = True
     _compile_conditions = [is_block]
     param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
     reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
@@ -1537,7 +1734,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 for index in range(arch.num_layers)
             ]
         )
-        self.layer_names = ["blocks"]
+        self.layer_names = ["token_refiner.blocks", "blocks"]
         self.final_layer = MiniMaxH3FinalLayer(
             arch,
             quant_config,
@@ -1641,6 +1838,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         device: torch.device,
     ) -> torch.Tensor:
         """Project and refine request-static text conditioning once."""
+        self.materialize_mps_non_layer_weights(
+            "condition_proj", "token_refiner.final_norm"
+        )
         text_len = int(refiner_cu_seqlens[1].item())
         if text_len <= 0 or text_len > int(prompt_embeds.shape[0]):
             raise ValueError(
@@ -1656,12 +1856,14 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             )
         )
         text_embed, _ = self.condition_proj(text_rows)
-        return self.token_refiner(
+        refined = self.token_refiner(
             text_embed,
             cu_seqlens=true_refiner_cu,
             cu_seqlens_host=(0, text_len, text_len),
             max_seqlen=text_len,
         )
+        self.release_mps_non_layer_weights("condition_proj", "token_refiner.final_norm")
+        return refined
 
     def build_rope_cache(
         self,
@@ -1676,6 +1878,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         chunk) -- see forward()'s row_start derivation for the identity
         this must stay in sync with.
         """
+        self.materialize_mps_non_layer_weights("rope")
         if img_position_ids.dim() != 3 or img_position_ids.shape[0] != 1:
             raise ValueError(
                 "img_position_ids must be [1, S, 3], got "
@@ -1697,7 +1900,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         rope_freqs = self.rope(
             img_position_ids[:, row_start : row_start + local_seq_len]
         ).to(device)
-        return (
+        result = (
             _rope_cos_sin_cache(rope_freqs, dtype=_BF16_DTYPE),
             torch.arange(
                 local_seq_len,
@@ -1705,6 +1908,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 dtype=torch.long,
             ),
         )
+        self.release_mps_non_layer_weights("rope")
+        return result
 
     @eager_on_graph(True)
     def _embed(
@@ -1980,6 +2185,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         # request-static cache once; direct model callers use this fallback.
         rope_cache = kwargs.get("rope_cache")
         if rope_cache is None:
+            self.materialize_mps_non_layer_weights("rope")
             rope_freqs = self.rope(img_position_ids[:, row_start:row_stop]).to(device)
             rope_cache = (
                 _rope_cos_sin_cache(rope_freqs, dtype=_BF16_DTYPE),
@@ -1989,6 +2195,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                     dtype=torch.long,
                 ),
             )
+            self.release_mps_non_layer_weights("rope")
+        self.materialize_mps_non_layer_weights(*_MPS_EMBED_WEIGHT_PREFIXES)
         img_pos = img_pos.to(device)
         audio_pos = audio_pos.to(device)
         text_pos = text_pos.to(device)
@@ -2009,6 +2217,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             refined_prompt_embeds_length=kwargs.get("refined_prompt_embeds_length"),
             local_embedding_layout=kwargs.get("local_embedding_layout"),
         )
+        self.release_mps_non_layer_weights(*_MPS_EMBED_WEIGHT_PREFIXES)
         # request-step AdaLN input shared by all blocks
         adaln_input = nn.functional.silu(t_emb).to(_BF16_DTYPE)
         inverse_indices = inverse_indices.to(device)
@@ -2077,6 +2286,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                     None if block_adaln_params is None else block_adaln_params[index]
                 ),
             )
+        self.materialize_mps_non_layer_weights("final_layer")
         video_logits, audio_logits = self.final_layer(
             hidden,
             adaln_input=adaln_input,
@@ -2090,6 +2300,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 )
             ),
         )
+        self.release_mps_non_layer_weights("final_layer")
         if sp_ws > 1:
             from sglang.multimodal_gen.runtime.distributed.parallel_state import (
                 get_sp_group,
