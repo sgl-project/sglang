@@ -108,14 +108,12 @@ tracing = [
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
 # => base docker rocm/vllm-dev:20250114, not from public vllm whl
 srt_hip = [
-  # Pin to 0.15.0: 0.16.0 needs torch>=2.10 (incompatible with ROCm torch
-  # 2.9.1). An open-ended `<0.16.0` made pip backtrack into an unbuildable
-  # ancient setuptools sdist; an exact pin keeps the resolver converging.
-  "compressed-tensors==0.15.0",
   "petit_kernel==0.0.2",
   "sglang[runtime_common]",
   "torch",
   "wave-lang==3.8.2",
+  # compressed-tensors version is supplied by rocm_legacy or rocm_rock (see below),
+  # injected alongside this extra by the Dockerfile / CI install script.
 ]
 
 diffusion_hip = [
@@ -126,6 +124,23 @@ diffusion_hip = [
   "st_attn==0.0.7",
   "vsa==0.0.4",
 ]
+
+# Per-ROCm-SDK compressed-tensors version extras. The two versions are mutually
+# exclusive: 0.15.0 requires torch<2.11 and 0.16.0 requires torch>=2.10, so the
+# right one depends on which torch the ROCm SDK generation ships. Pinning the
+# wrong one leaves pip trying to replace the image's ROCm torch with a PyPI
+# build, which it cannot do, and the resolve then blows up.
+#
+#   rocm_legacy = ROCm 7.0 / 7.2 legacy SDK, torch 2.9.x   → 0.15.0
+#   rocm_rock   = ROCm 7.15 / 10.x rock SDK, torch 2.11+   → 0.16.0
+#
+# Neither is pulled automatically; the Dockerfile and the CI install script
+# append one of them based on the GPU_ARCH / ROCm version detected at build or
+# test time. Local developers should add the appropriate extra manually, e.g.:
+#   pip install -e "python[dev_hip,rocm_legacy]"
+#   pip install -e "python[dev_hip,rocm_rock]"
+rocm_legacy = ["compressed-tensors==0.15.0"]
+rocm_rock   = ["compressed-tensors==0.16.0"]
 
 # For Intel Gaudi(device : hpu) follow the installation guide
 # https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
