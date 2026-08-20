@@ -2759,7 +2759,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 continue
             src = state.source_indices
             dst = state.destination_indices
-            assert src is not None and dst is not None and len(src) == len(dst)
+            if src is None or dst is None:
+                # Overlap scheduling can prepare a later chunk of the same
+                # request before the result that releases the source lock is
+                # processed. The copy was already transferred to the earlier
+                # ForwardBatch, so there is nothing to collect again.
+                assert src is None and dst is None
+                continue
+            assert len(src) == len(dst)
             assert state.source_node is not None
             src_tensors.append(src)
             dst_tensors.append(dst)

@@ -39,6 +39,7 @@ from sglang.srt.disaggregation.kv_events import (
     BlockStoredWithMetadata,
     StorageMedium,
 )
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache import kv_cache_configurator
 from sglang.srt.mem_cache.allocator.paged import (
     PagedTokenToKVPoolAllocator,
@@ -1319,6 +1320,38 @@ class TestRadixCache(unittest.TestCase):
             req_to_token.req_to_token[0, :10], req.prefix_indices
         )
         torch.testing.assert_close(req_to_token.req_to_token[0, 10:12], dst_page[2:4])
+
+    def test_deferred_partial_prefix_copy_collection_is_overlap_safe(self):
+        source_node = object()
+        state = SimpleNamespace(
+            source_indices=torch.tensor([10, 11], dtype=torch.int64),
+            destination_indices=torch.tensor([20, 21], dtype=torch.int64),
+            source_node=source_node,
+            page_indices=torch.tensor([20, 21, 22, 23], dtype=torch.int64),
+        )
+        req = SimpleNamespace(_partial_prefix_copy_state=state)
+        batch = SimpleNamespace()
+
+        ScheduleBatch._collect_deferred_partial_prefix_copy(batch, [req])
+        torch.testing.assert_close(
+            batch.partial_prefix_copy_src_indices,
+            torch.tensor([10, 11], dtype=torch.int64),
+        )
+        torch.testing.assert_close(
+            batch.partial_prefix_copy_dst_indices,
+            torch.tensor([20, 21], dtype=torch.int64),
+        )
+        self.assertIsNone(state.source_indices)
+        self.assertIsNone(state.destination_indices)
+        self.assertIsNone(state.page_indices)
+        self.assertIs(state.source_node, source_node)
+
+        # A later chunk may be prepared before the earlier forward result
+        # releases source_node. Collection must be idempotent in that window.
+        ScheduleBatch._collect_deferred_partial_prefix_copy(batch, [req])
+        self.assertIsNone(batch.partial_prefix_copy_src_indices)
+        self.assertIsNone(batch.partial_prefix_copy_dst_indices)
+        self.assertIs(state.source_node, source_node)
 
     @unittest.skipUnless(
         torch.cuda.is_available() and torch.version.hip is None,
