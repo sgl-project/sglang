@@ -373,22 +373,32 @@ class SchedulerDllmMixin:
         self: Scheduler, adder: PrefillAdder, reqs: List[Req]
     ) -> AddReqResult:
         """Process staging DLLM requests with resource allocation."""
+        result = AddReqResult.CONTINUE
+        blocked_req = None
         for req in reqs:
             res = adder.add_dllm_staging_req(req)
             if res == AddReqResult.NO_TOKEN:
-                # Abort only when no batch can make progress.
-                running_batch = getattr(adder, "running_batch", None)
-                no_batch = running_batch is None or running_batch.is_empty()
-                if not adder.can_run_list and no_batch:
-                    logger.error(
-                        "Aborting dLLM staging request %s: insufficient KV "
-                        "capacity for an aligned extend",
-                        req.rid,
-                    )
-                    self._abort_dllm_req_exact(req)
-                return res
+                # Keep scanning: a later request may reuse retained KV even
+                # when this request cannot allocate a fresh block.
+                result = AddReqResult.NO_TOKEN
+                if blocked_req is None and req not in adder.can_run_list:
+                    blocked_req = req
 
-        return AddReqResult.CONTINUE
+        if result == AddReqResult.NO_TOKEN:
+            # Abort only after proving that no request or running batch can
+            # make progress. Preserve the first blocked request to keep queue
+            # ordering deterministic.
+            running_batch = getattr(adder, "running_batch", None)
+            no_batch = running_batch is None or running_batch.is_empty()
+            if blocked_req is not None and not adder.can_run_list and no_batch:
+                logger.error(
+                    "Aborting dLLM staging request %s: insufficient KV "
+                    "capacity for an aligned extend",
+                    blocked_req.rid,
+                )
+                self._abort_dllm_req_exact(blocked_req)
+
+        return result
 
     def _cleanup_dllm_req(self: Scheduler, req: Req) -> None:
         if self.enable_hicache_storage:

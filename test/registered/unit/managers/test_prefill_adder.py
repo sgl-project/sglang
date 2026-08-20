@@ -391,6 +391,35 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(req.extend_range, Range(0, 32))
         scheduler._abort_dllm_req_exact.assert_not_called()
 
+    def test_dllm_staging_scans_both_request_orders_before_aborting(self):
+        for fresh_first in (True, False):
+            with self.subTest(fresh_first=fresh_first):
+                adder = self.create_dllm_adder(is_prefill=False, available_size=0)
+                fresh = self.create_dllm_req(
+                    origin_len=20, prefix_len=0, is_prefill=False
+                )
+                fresh.rid = "fresh"
+                retained = self.create_dllm_req(
+                    origin_len=20, prefix_len=0, is_prefill=False
+                )
+                retained.rid = "retained"
+                retained.req_pool_idx = 1
+                retained.dllm_incomplete_ids = array("q", range(32))
+                retained.full_untruncated_fill_ids = list(retained.dllm_incomplete_ids)
+                retained.kv = SimpleNamespace(kv_allocated_len=32)
+                scheduler = SimpleNamespace(_abort_dllm_req_exact=MagicMock())
+                reqs = [fresh, retained] if fresh_first else [retained, fresh]
+
+                result = SchedulerDllmMixin.process_dllm_staging_reqs(
+                    scheduler, adder, reqs
+                )
+
+                self.assertEqual(result, AddReqResult.NO_TOKEN)
+                self.assertEqual(len(adder.can_run_list), 1)
+                self.assertIs(adder.can_run_list[0], retained)
+                self.assertEqual(retained.extend_range, Range(0, 32))
+                scheduler._abort_dllm_req_exact.assert_not_called()
+
     def test_dllm_staging_aborts_when_no_batch_can_make_progress(self):
         adder = self.create_dllm_adder(is_prefill=False, available_size=0)
         req = self.create_dllm_req(origin_len=20, prefix_len=0, is_prefill=False)

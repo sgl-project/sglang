@@ -4,6 +4,11 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.server_args import ServerArgs
 
 
+def _require_positive_int(name: str, value: Any) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"dLLM {name} must be a positive integer, got {value!r}")
+
+
 def _validate_multi_block_prefill_backend(
     *, block_size: int, prefill_block_size: int, prefill_attention_backend: str
 ) -> None:
@@ -82,11 +87,14 @@ class DllmConfig:
             # Parse common algorithm configurations
             block_size = algorithm_config.get("block_size", block_size)
 
+        _require_positive_int("block_size", block_size)
+
         # Preserve the previous fixed-block behavior unless the user explicitly
         # opts into larger prefill chunks.
         prefill_block_size = algorithm_config.get("prefill_block_size", block_size)
         if server_args.dllm_prefill_block_size is not None:
             prefill_block_size = server_args.dllm_prefill_block_size
+        _require_positive_int("prefill_block_size", prefill_block_size)
         if prefill_block_size < block_size or prefill_block_size % block_size != 0:
             raise ValueError(
                 "dllm prefill_block_size must be a positive multiple of block_size "
