@@ -2460,7 +2460,9 @@ class DeepseekV2AttentionMLA(
                 assert (
                     not self.o_proj.reduce_results
                 ), "short-circuiting allreduce will lead to hangs"
-                return hidden_states[0], None, forward_batch, None
+                if _enable_attn_o_tensor_parallel:
+                    return hidden_states[0], None, forward_batch, None
+                return hidden_states[0]
         else:
             if (
                 not get_attn_tp_context().input_scattered
