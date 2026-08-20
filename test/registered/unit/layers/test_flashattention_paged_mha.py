@@ -1,6 +1,8 @@
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
 import torch
 
 from sglang.srt.layers.attention.flashattention_backend import (
@@ -71,3 +73,7 @@ def test_prepare_paged_mha_query_reuses_fa_scaling_policy():
     assert q.dtype == torch.float16
     assert k_descale.shape == (2, 1)
     assert v_descale.shape == (2, 1)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

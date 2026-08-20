@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -337,3 +338,7 @@ def test_attach_compressed_cache_is_idempotent():
 
     assert pool._aux_cache is cache
     assert pool.req_to_sparse_k1_token is k1_table
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

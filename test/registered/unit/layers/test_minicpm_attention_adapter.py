@@ -1,6 +1,8 @@
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 
 from sglang.srt.layers.attention.minicpm import attention_adapter as adapter_module
@@ -186,3 +188,7 @@ def test_flashinfer_decode_indices_cover_dense_rows():
 
     assert adapter.kv_indices.numel() == 14
     assert adapter.active_kv_indices.numel() == 14
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

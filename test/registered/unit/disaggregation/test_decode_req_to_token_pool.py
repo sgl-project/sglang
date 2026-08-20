@@ -1,3 +1,6 @@
+import sys
+
+import pytest
 import torch
 
 from sglang.srt.disaggregation.decode import (
@@ -46,3 +49,7 @@ def test_hybrid_decode_pool_initializes_aux_cache_contract():
     )
 
     assert pool.schedulable_token_capacity(17) == 17
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

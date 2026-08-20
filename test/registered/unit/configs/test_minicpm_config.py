@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -342,3 +343,7 @@ def test_lightning_backend_uses_layer_scale(monkeypatch):
     )
 
     assert captured["softmax_scale"] == 0.25
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
