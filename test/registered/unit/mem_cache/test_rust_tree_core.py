@@ -93,3 +93,9 @@ def test_namespaces_isolate_the_same_tokens():
     assert salted.device_indices.tolist() == [20, 21]
     unsalted = core.match_prefix(MatchPrefixParams(key=_key([1, 2])))
     assert unsalted.device_indices.numel() == 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
