@@ -282,6 +282,18 @@ class UnifiedCacheLinker(ABC):
         """Start queued loads and return the layer-counter consumer index."""
 
     @abstractmethod
+    def cancel_queued_load(self, rid: str) -> bool:
+        """Cancel a load that has not started yet."""
+
+    @abstractmethod
+    def num_completed_loads(self) -> int:
+        """Return the number of completed load batches waiting to be consumed."""
+
+    @abstractmethod
+    def pop_completed_load(self) -> list[str]:
+        """Consume the oldest completed load batch and return its request IDs."""
+
+    @abstractmethod
     def offload(self, transfers: list[PoolTransfer]) -> bool:
         """Queue every transfer for atomic persistence."""
 
@@ -348,6 +360,8 @@ class UnifiedCacheLinkerWrapper:
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
+        # Loads in flight, each pinning its inserted endpoint until DMA completes.
+        self.pending_loads: dict[str, tuple[NodeId, DecLockRefParams]] = {}
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[tuple[NodeId, DecLockRefParams]] = []
 
@@ -544,14 +558,30 @@ class UnifiedCacheLinkerWrapper:
             canonical_full=canonical_tail,
         )
 
-        if load_transfers and not self.cache_linker.load(req.rid, load_transfers):
-            raise RuntimeError(f"Failed to queue the linker load for {req.rid=}.")
+        self._queue_load(req.rid, insert_result.last_device_node, load_transfers)
 
         node = cache.resolve_node_handle(insert_result.last_device_node)
         while node.id != req.last_node:
             node.external_cache_stored = True
             node = node.parent
         return canonical_tail, insert_result.last_device_node
+
+    def _queue_load(
+        self, rid: str, node_id: NodeId, transfers: list[PoolTransfer]
+    ) -> None:
+        if not transfers:
+            return
+        assert rid not in self.pending_loads
+        lock_params = self.cache.inc_lock_ref(node_id).to_dec_params()
+        try:
+            queued = self.cache_linker.load(rid, transfers)
+        except BaseException:
+            self.cache.dec_lock_ref(node_id, lock_params)
+            raise
+        if not queued:
+            self.cache.dec_lock_ref(node_id, lock_params)
+            raise RuntimeError(f"Failed to queue the linker load for rid={rid!r}.")
+        self.pending_loads[rid] = (node_id, lock_params)
 
     def _update_load(
         self,
@@ -680,12 +710,25 @@ class UnifiedCacheLinkerWrapper:
             self.cache_linker.num_completed_offloads(), len(self.pending_offloads)
         )
 
-    def drain_offloads(self, finish_count: int) -> None:
-        assert finish_count <= len(self.pending_offloads)
+    def num_completed_loads(self) -> int:
+        return self.cache_linker.num_completed_loads()
+
+    def drain_loads(self, finish_count: int) -> None:
         for _ in range(finish_count):
+            for rid in self.cache_linker.pop_completed_load():
+                node_id, lock_params = self.pending_loads.pop(rid)
+                self.cache.dec_lock_ref(node_id, lock_params)
+
+    def take_completed_offloads(self, finish_count: int) -> list[bool]:
+        assert finish_count <= len(self.pending_offloads)
+        return [self.cache_linker.pop_completed_offload() for _ in range(finish_count)]
+
+    def commit_completed_offloads(self, successes: Sequence[bool]) -> None:
+        assert len(successes) <= len(self.pending_offloads)
+        for success in successes:
             node_id, lock_params = self.pending_offloads.pop(0)
             node = self.cache.resolve_node_handle(node_id)
-            node.external_cache_stored = self.cache_linker.pop_completed_offload()
+            node.external_cache_stored = success
             self.cache.dec_lock_ref(node_id, lock_params)
 
     def start_layer_wise_loading(self) -> int:
@@ -696,10 +739,16 @@ class UnifiedCacheLinkerWrapper:
     def reset(self) -> None:
         self.cache_linker.reset()
         self.hit_markers.clear()
+        for node_id, lock_params in self.pending_loads.values():
+            self.cache.dec_lock_ref(node_id, lock_params)
+        self.pending_loads.clear()
         self.pending_offloads.clear()
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
+        if self.cache_linker.cancel_queued_load(rid):
+            node_id, lock_params = self.pending_loads.pop(rid)
+            self.cache.dec_lock_ref(node_id, lock_params)
 
     def close(self) -> None:
         self.cache_linker.close()

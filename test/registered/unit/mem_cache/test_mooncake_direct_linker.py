@@ -168,6 +168,7 @@ def test_load_and_offload_share_gc_freeze(monkeypatch):
     linker.gc_frozen = False
     linker.offload_queue = Queue()
     linker.pending_loads = {"first": [object()]}
+    linker.completed_loads = Queue()
     linker.layer_done_counter = SimpleNamespace(update_producer=lambda: 3)
     linker.load_queue = Queue()
     linker.stats = {"load": 0}
@@ -205,6 +206,7 @@ def test_load_waits_for_scheduler_stream(monkeypatch):
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
     linker.gc_frozen = True
     linker.pending_loads = {"rid": [object()]}
+    linker.completed_loads = Queue()
     linker.layer_done_counter = SimpleNamespace(update_producer=lambda: 7)
     linker.load_queue = Queue()
     linker.stats = {"load": 0}
@@ -222,6 +224,7 @@ def test_load_waits_for_scheduler_stream(monkeypatch):
     assert linker.start_layer_wise_loading() == 7
     assert loaded.wait(timeout=5)
     linker.load_queue.join()
+    assert linker.pop_completed_load() == ["rid"]
     linker.load_queue.put(None)
     thread.join(timeout=5)
 
@@ -335,27 +338,90 @@ def test_async_offload_pins_node_until_completion():
 
     results.append(False)
     assert wrapper.num_completed_offloads() == 1
-    wrapper.drain_offloads(finish_count=1)
+    completed = wrapper.take_completed_offloads(finish_count=1)
+    wrapper.commit_completed_offloads(completed)
     assert not node.external_cache_stored
     assert unlocks == [(node_id, lock_params)]
 
 
-def test_check_hicache_events_drains_common_tp_offloads():
-    drained = []
-    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-    cache.linker = SimpleNamespace(
-        num_completed_offloads=lambda: 3,
-        drain_offloads=drained.append,
+def test_async_load_pins_node_until_completion():
+    completed = []
+    linker = SimpleNamespace(
+        load=lambda rid, transfers: True,
+        num_completed_loads=lambda: len(completed),
+        pop_completed_load=lambda: completed.pop(0),
+    )
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache_linker = linker
+    wrapper.pending_loads = {}
+    lock_params = object()
+    locks = []
+    unlocks = []
+
+    def inc_lock_ref(node):
+        locks.append(node)
+        return SimpleNamespace(to_dec_params=lambda: lock_params)
+
+    node_id = 7
+    wrapper.cache = SimpleNamespace(
+        inc_lock_ref=inc_lock_ref,
+        dec_lock_ref=lambda node, params: unlocks.append((node, params)),
     )
 
-    def reduce_to_common_count(count, op):
-        assert op == torch.distributed.ReduceOp.MIN
-        count.fill_(1)
+    wrapper._queue_load("rid", node_id, [object()])
+    assert locks == [node_id]
+    assert not unlocks
 
-    cache._all_reduce_attn_groups = reduce_to_common_count
+    completed.append(["rid"])
+    assert wrapper.num_completed_loads() == 1
+    wrapper.drain_loads(finish_count=1)
+    assert unlocks == [(node_id, lock_params)]
+
+
+def test_cancel_queued_load_releases_lock():
+    lock_params = object()
+    unlocks = []
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache_linker = SimpleNamespace(cancel_queued_load=lambda rid: True)
+    wrapper.cache = SimpleNamespace(
+        dec_lock_ref=lambda node, params: unlocks.append((node, params))
+    )
+    wrapper.hit_markers = {"rid": object()}
+    wrapper.pending_loads = {"rid": (7, lock_params)}
+
+    wrapper.release_request("rid")
+
+    assert wrapper.hit_markers == {}
+    assert wrapper.pending_loads == {}
+    assert unlocks == [(7, lock_params)]
+
+
+def test_check_hicache_events_drains_common_tp_offloads():
+    committed = []
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.linker = SimpleNamespace(
+        num_completed_loads=lambda: 1,
+        drain_loads=lambda count: committed.append(("load", count)),
+        num_completed_offloads=lambda: 3,
+        take_completed_offloads=lambda count: [True] * count,
+        commit_completed_offloads=committed.append,
+    )
+
+    reduce_calls = 0
+
+    def reduce_to_common_state(value, op):
+        nonlocal reduce_calls
+        assert op == torch.distributed.ReduceOp.MIN
+        reduce_calls += 1
+        if reduce_calls == 1:
+            value.copy_(torch.tensor([1, 1]))
+        else:
+            value.fill_(0)
+
+    cache._all_reduce_attn_groups = reduce_to_common_state
     cache.check_hicache_events()
 
-    assert drained == [1]
+    assert committed == [("load", 1), [False]]
 
 
 def test_deepseek_v4_device_pool_group_maps_sparse_sidecars():

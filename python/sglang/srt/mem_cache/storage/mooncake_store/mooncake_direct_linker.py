@@ -131,9 +131,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
         self.gc_frozen = False
-        self.load_queue: Queue[tuple[int, list[list[PoolTransfer]], object] | None] = (
-            Queue()
-        )
+        self.load_queue: Queue[
+            tuple[int, dict[str, list[PoolTransfer]], object] | None
+        ] = Queue()
+        self.completed_loads: Queue[list[str]] = Queue()
         self.offload_queue: Queue[tuple[list[PoolTransfer], int, object] | None] = (
             Queue()
         )
@@ -202,8 +203,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pending_loads[rid] = expanded
         return True
 
-    def cancel_queued_load(self, rid: str) -> None:
-        self.pending_loads.pop(rid, None)
+    def cancel_queued_load(self, rid: str) -> bool:
+        return self.pending_loads.pop(rid, None) is not None
+
+    def num_completed_loads(self) -> int:
+        return self.completed_loads.qsize()
+
+    def pop_completed_load(self) -> list[str]:
+        return self.completed_loads.get_nowait()
 
     def freeze_gc_once(self) -> None:
         if self.gc_frozen:
@@ -223,7 +230,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         counter_index = self.layer_done_counter.update_producer()
         ready_event = device_module.Event()
         ready_event.record()
-        self.load_queue.put((counter_index, list(pending.values()), ready_event))
+        self.load_queue.put((counter_index, pending, ready_event))
         self.stats["load"] += len(pending)
         return counter_index
 
@@ -233,9 +240,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                counter_index, transfers, ready_event = task
-                ready_event.synchronize()
-                self.load_layer_wise(counter_index, transfers)
+                counter_index, pending, ready_event = task
+                try:
+                    ready_event.synchronize()
+                    self.load_layer_wise(counter_index, list(pending.values()))
+                finally:
+                    self.completed_loads.put(list(pending))
             finally:
                 self.load_queue.task_done()
 
@@ -349,6 +359,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         while True:
             try:
                 self.offload_results.get_nowait()
+            except Empty:
+                break
+        while True:
+            try:
+                self.completed_loads.get_nowait()
             except Empty:
                 break
         self.layer_done_counter.reset()
