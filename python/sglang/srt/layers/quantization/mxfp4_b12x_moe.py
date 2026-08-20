@@ -23,7 +23,7 @@ that choice:
 
 Install the pinned tree::
 
-    pip install --no-deps "b12x @ https://github.com/local-inference-lab/b12x/archive/b4d6c7593c9fae46f4cb6f7a645e0e10fc9c1faa.tar.gz"
+    pip install --no-deps "b12x @ https://github.com/local-inference-lab/b12x/archive/5c8318009ea9833d4f50b5789fb291076c79baca.tar.gz"
 
 (``--no-deps``: b12x's metadata pulls a newer torch and breaks the rest of the
 image.) Earlier generations -- 0.15.x and the PyPI 1.2.x wheels -- keep the old
@@ -63,7 +63,7 @@ if TYPE_CHECKING:
 
 _B12X_INSTALL_HINT = (
     "pip install --no-deps 'b12x @ https://github.com/local-inference-lab/"
-    "b12x/archive/b4d6c7593c9fae46f4cb6f7a645e0e10fc9c1faa.tar.gz'"
+    "b12x/archive/5c8318009ea9833d4f50b5789fb291076c79baca.tar.gz'"
 )
 
 
