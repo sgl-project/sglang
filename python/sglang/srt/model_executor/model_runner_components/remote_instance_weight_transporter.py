@@ -11,6 +11,7 @@ from sglang.srt.environ import envs
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     register_memory_region,
+    register_memory_region_nixl,
 )
 from sglang.srt.runtime_context import (
     get_model,
@@ -33,13 +34,26 @@ class RemoteInstanceWeightTransporter:
     session_id: str = ""
     weight_info: Optional[dict[str, tuple[int, int, int]]] = None
     parallelism_config: Optional[RankParallelismConfig] = None
-    _nixl_manager: Optional[Any] = None
+    _nixl_agent: Optional[Any] = None
+    _nixl_agent_metadata: Optional[bytes] = None
 
     @property
     def model(self) -> torch.nn.Module:
         return self.get_model()
 
     def init_engine(self):
+        use_nixl = self.server_args.remote_instance_weight_loader_start_seed_via_nixl
+        if use_nixl:
+            self._init_nixl()
+        else:
+            self._init_mooncake()
+        if self.engine is None and self._nixl_agent is None:
+            return
+        self.parallelism_config = RankParallelismConfig.from_parallel_state(
+            self.tp_rank
+        )
+
+    def _init_mooncake(self):
         try:
             from mooncake.engine import TransferEngine
         except ImportError:
@@ -65,6 +79,48 @@ class RemoteInstanceWeightTransporter:
                 self.tp_rank
             )
 
+    def _init_nixl(self):
+        """Initialize a NIXL agent on the worker (NIXL weight-transfer backend).
+
+        SGLang is the passive, export-only target: it creates a ``nixl_agent`` and
+        captures its opaque ``agent_metadata`` blob so the metadata can be published
+        for the external peer (Miles). SGLang does NOT call ``add_remote_agent`` and
+        does NOT issue ``transfer()`` calls itself -- the peer registers SGLang's
+        agent metadata on its side and performs the RDMA WRITEs.
+        """
+        import uuid
+
+        try:
+            from nixl._api import nixl_agent, nixl_agent_config
+        except ImportError:
+            logger.warning(
+                "Please install NIXL for using the NIXL remote instance weight "
+                "transfer backend. See "
+                "https://github.com/ai-dynamo/nixl/blob/main/README.md"
+            )
+            return
+
+        backend = envs.SGLANG_REMOTE_INSTANCE_NIXL_BACKEND.get()
+        agent_config = nixl_agent_config(backends=[backend])
+        agent_name = f"nixl_weight_tp{self.tp_rank}_{uuid.uuid4()}"
+        agent = nixl_agent(agent_name, agent_config)
+
+        available_plugins = agent.get_plugin_list()
+        if backend not in available_plugins:
+            raise ValueError(
+                f"NIXL backend '{backend}' not found. Available: {available_plugins}. "
+                f"Please install the required NIXL plugin or choose from: {available_plugins}"
+            )
+
+        self._nixl_agent = agent
+        # _nixl_agent_metadata is NOT set here. It must be set after
+        # register_memory_region_nixl() so the blob includes the VRAM rkeys
+        # the Miles peer needs to RDMA-WRITE into the weight buffers.
+        logger.info(
+            f"NIXL weight-transfer agent initialized (agent_name={agent_name}, "
+            f"backend={backend}) for tp_rank={self.tp_rank}"
+        )
+
     def maybe_register_and_publish_weight_info(self) -> None:
         if (
             remote_instance_transfer_engine_enabled()
@@ -78,6 +134,16 @@ class RemoteInstanceWeightTransporter:
         ):
             # Register memory and upstream the transfer engine info to the bootstrap server
             self.weight_info = register_memory_region(self.model, self.engine)
+            self._register_to_engine_info_bootstrap()
+
+        if self._nixl_agent is not None and self.weight_info is None:
+            # Register VRAM, then capture agent metadata. Metadata must be
+            # captured AFTER registration so the blob includes the rkeys the
+            # peer needs to RDMA-WRITE into the weight buffers.
+            self.weight_info = register_memory_region_nixl(
+                self.model, self._nixl_agent, self.gpu_id
+            )
+            self._nixl_agent_metadata = self._nixl_agent.get_agent_metadata()
             self._register_to_engine_info_bootstrap()
 
         # The P2P weight-update client needs each rank's parallelism layout to
@@ -146,12 +212,30 @@ class RemoteInstanceWeightTransporter:
         bootstrap_na = NetworkAddress(bootstrap_host, bootstrap_port)
         url = f"{bootstrap_na.to_url()}/register_transfer_engine_info"
 
-        payload = {
-            "tp_rank": self.tp_rank,
-            "transfer_engine_info": {
+        # NIXL needs the peer to call add_remote_agent() before any transfer,
+        # so we publish agent_name + the opaque agent_metadata (base64-encoded
+        # for JSON transport) alongside the weight addresses.
+        if self._nixl_agent is not None:
+            import base64
+
+            transfer_engine_info = {
+                "backend": "nixl",
+                "agent_name": self._nixl_agent.name,
+                "agent_metadata": base64.b64encode(self._nixl_agent_metadata).decode(
+                    "ascii"
+                ),
+                "weights_info_dict": self.weight_info,
+            }
+        else:
+            transfer_engine_info = {
+                "backend": "mooncake",
                 "session_id": self.session_id,
                 "weights_info_dict": self.weight_info,
-            },
+            }
+
+        payload = {
+            "tp_rank": self.tp_rank,
+            "transfer_engine_info": transfer_engine_info,
         }
 
         try:

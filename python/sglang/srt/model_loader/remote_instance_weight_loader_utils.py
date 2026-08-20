@@ -97,13 +97,13 @@ def get_remote_instance_transfer_engine_info_per_rank(seed_url: str, rank: int):
                 logger.error(
                     "Failed to get `remote_instance_transfer_engine_info` in response."
                 )
-                return None, None
+                return None
         else:
             logger.error(f"request.get failed: {response.status_code}")
-            return None, None
+            return None
     except Exception as e:
         logger.error(f"Exception: {e}")
-        return None, None
+        return None
 
 
 def register_memory_region(model, transfer_engine):
@@ -191,4 +191,85 @@ def register_memory_region_v2(model, transfer_engine):
 
     end_tic = time.time()
     logger.debug(f"Register memory region v2 time: {(end_tic - start_tic):.4f}s")
+    return weight_mr_dict
+
+
+def register_memory_region_nixl(model, nixl_agent, gpu_id):
+    """NIXL parallel of ``register_memory_region_v2`` for the weight-transfer backend.
+
+    Same structure as the Mooncake ``v2`` path (build the per-tensor dict, merge
+    physically-contiguous weight blocks from the CUDA memory snapshot, register the
+    merged blocks), with only the two NIXL-specific differences:
+
+    - ``weights_info_dict`` entries widen to 4 fields
+      ``(data_ptr, numel, element_size, gpu_id)`` -- the extra ``gpu_id`` /
+      ``device_id`` the peer needs to address VRAM.
+    - registration uses ``agent.register_memory([(addr, size, gpu_id, "")], "VRAM")``
+      (instead of the per-block ``engine.register_memory(addr, size)``) and the
+      returned ``descs`` handle is kept alive on ``nixl_agent._weight_descs`` for the
+      process lifetime (design Q2).
+
+    SGLang is the passive, export-only target: it registers buffers and publishes
+    descriptors; Miles performs the RDMA WRITE. No ``transfer()`` is issued here.
+    """
+    start_tic = time.time()
+
+    weight_mr_dict = {}
+    weight_addr_set = set()
+    for name, weight in model.named_parameters():
+        weight_mr_dict[name] = (
+            weight.data_ptr(),
+            weight.numel(),
+            weight.element_size(),
+            gpu_id,
+        )
+        weight_addr_set.add(weight.data_ptr())
+
+    import torch
+
+    memory_snapshot = torch.cuda.memory.memory_snapshot()
+    # (address, size, gpu_id, "") — NIXL register_memory takes this list in one call.
+    reg_addrs = []
+    # Blocks in each segment have continuous physical addresses,
+    # so they can be merged for memory registration.
+    for segment in memory_snapshot:
+        current_weight_block = None
+        blocks = segment.get("blocks", [])
+        for block in blocks:
+            address = block.get("address", -1)
+            size = block.get("size", -1)
+            state = block.get("state", "")
+            if address < 0 or size < 0 or state == "":
+                continue
+            # Only register active allocated memory blocks that hold weights.
+            if state == "active_allocated":
+                if address in weight_addr_set:
+                    if current_weight_block is None:
+                        current_weight_block = (address, size, gpu_id, "")
+                    elif current_weight_block[0] + current_weight_block[1] == address:
+                        current_weight_block = (
+                            current_weight_block[0],
+                            current_weight_block[1] + size,
+                            gpu_id,
+                            "",
+                        )
+                    else:
+                        reg_addrs.append(current_weight_block)
+                        current_weight_block = (address, size, gpu_id, "")
+        if current_weight_block is not None:
+            reg_addrs.append(current_weight_block)
+
+    # Same merge as Mooncake v2. Register differs: Mooncake loops
+    # register_memory(addr, size) (int status, engine holds the pin). NIXL does
+    # one register_memory([(addr, size, gpu_id, "")], "VRAM"); the returned
+    # descriptor *is* the pin (rkeys), so keep it alive.
+    descs = nixl_agent.register_memory(reg_addrs, "VRAM")
+    if not descs:
+        raise RuntimeError(
+            f"NIXL memory registration failed for {len(reg_addrs)} weight blocks"
+        )
+    nixl_agent._weight_descs = descs
+
+    end_tic = time.time()
+    logger.debug(f"Register memory region nixl time: {(end_tic - start_tic):.4f}s")
     return weight_mr_dict
