@@ -16,7 +16,7 @@ from sglang.srt.cuda_vmm_utils import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import KvBufferDesc
+    from sglang.srt.mem_cache.pool.base import KvBufferDesc
 
 logger = logging.getLogger(__name__)
 

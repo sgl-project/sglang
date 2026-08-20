@@ -43,7 +43,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _loc_info(virtual_loc, swa_phys=None, full_phys=None):
-    from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+    from sglang.srt.mem_cache.pool.base import KVWriteLoc
 
     return KVWriteLoc(virtual_loc, swa_phys, full_phys)
 
