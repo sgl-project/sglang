@@ -140,10 +140,8 @@ def _grouped_gemm_mxfp8(
     M_routed = num_valid_tokens
     E, N, K = w.shape
     assert K % 128 == 0, f"MXFP8 native MoE requires K%128==0, got K={K}"
-    # A route filtered to expert -1 can have its row left untouched -- its block sits in
-    # the extra bucket moe_align_block_size reserves, which the kernel may skip -- so the
-    # row has to start at zero. When no route can be filtered, every row is written by the
-    # GEMM and the fill is dead: one full-tensor kernel per GEMM per layer.
+    # Rows for routes filtered to expert -1 can be left unwritten, so they must start at
+    # zero. When nothing can be filtered, the GEMM writes every row and the fill is dead.
     alloc = torch.zeros if may_filter_routes else torch.empty
     out = alloc((M_routed, N), dtype=out_dtype, device=a_q.device)
     if a_div == top_k and M_routed <= 32 and K >= 3072:
@@ -285,13 +283,11 @@ def fused_moe_mxfp8_native(
         topk_ids = topk_ids.to(torch.int32, copy=True)
         topk_ids.masked_fill_((topk_ids < 0) | (topk_ids >= local_num_experts), -1)
     else:
-        # Every expert is local, so router ids are already valid local ids and the
-        # clamp above cannot change any of them. Skipping it drops 5 tiny kernels
-        # per MoE layer; `to` is a no-op when the ids are already int32.
+        # Every expert is local, so the clamp above cannot change any id. Keep the int32
+        # conversion: it is free once the ids already are int32, unlike `copy=True`.
         topk_ids = topk_ids.to(torch.int32)
 
-    # Only the two branches above can drop a route to expert -1. When neither can fire,
-    # every routed row is written by the grouped GEMM and its output zero-fill is dead.
+    # Only the branches above can drop a route to -1.
     may_filter_routes = expert_map is not None or filter_expert
 
     block_m = 64

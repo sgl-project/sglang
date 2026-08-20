@@ -30,7 +30,7 @@ import math
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, TypeGuard, Union
 
 import numpy as np
 import torch
@@ -132,23 +132,16 @@ def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     return np.prod(t.shape) * t.dtype.itemsize
 
 
-def _is_noop_kv_scale(scale) -> bool:
-    """Whether dividing by ``scale`` can be skipped as an exact identity.
-
-    Only host-side scalars are inspected: reading a device tensor would force a
-    device sync and is illegal under CUDA-graph capture, so a tensor scale always
-    takes the normal division path.
-    """
-    return scale is None or (isinstance(scale, (int, float)) and float(scale) == 1.0)
+def _kv_scale_divides(scale: Optional[float]) -> TypeGuard[float]:
+    """Host scalar only: reading a device tensor would sync, illegal under graph capture."""
+    return scale is not None and scale != 1.0
 
 
 def _has_dense_kv_rows(t: torch.Tensor, head_num: int, head_dim: int) -> bool:
     """Whether ``t`` is addressable as ``token * t.stride(0) + head * head_dim + dim``.
 
-    That is all ``reshape_and_cache_flash`` needs, because it takes each source's token
-    stride as a kernel argument: only the (head, dim) block of one token has to be dense
-    and head-major. Whole-tensor contiguity is stricter than the kernel, and rejects the
-    ``dim=-1`` slice of a fused QKV projection that the decode path actually passes.
+    That is all ``reshape_and_cache_flash`` needs, since it takes the token stride per
+    source. So a ``dim=-1`` slice of fused QKV qualifies; ``is_contiguous`` would not.
     """
     row = head_num * head_dim
     if t.is_contiguous():
@@ -168,9 +161,8 @@ def _has_dense_kv_rows(t: torch.Tensor, head_num: int, head_dim: int) -> bool:
 def _as_token_head_dim(t: torch.Tensor, head_num: int, head_dim: int) -> torch.Tensor:
     """View ``t`` as ``[tokens, head_num, head_dim]`` without moving data.
 
-    Splits only the trailing block, so a strided token dimension keeps its own stride
-    rather than being flattened, which would need a copy. Pair with
-    :func:`_has_dense_kv_rows`, which establishes that these views are legal.
+    Splits only the trailing block, so a strided token dimension survives. Guard with
+    :func:`_has_dense_kv_rows`.
     """
     if t.dim() == 3 and t.shape[1] == head_num and t.shape[2] == head_dim:
         return t
@@ -2296,15 +2288,11 @@ class MHATokenToKVPool(KVCache):
         k_scale=None,
         v_scale=None,
     ) -> bool:
-        """Whether a pending dtype cast can be folded into the paged write.
+        """Whether the pending dtype cast can be folded into the paged write.
 
-        ``reshape_and_cache_flash`` converts on store, so the separate
-        ``.to(self.dtype)`` pass -- one full-tensor elementwise kernel per tensor
-        per layer -- is only needed when this returns False. The kernel reuses K's
-        head geometry for V and needs each token's (head, dim) block dense, but it
-        takes the token stride per source, so K and V may be strided views with
-        different strides. It can only take a device-tensor scale, so a non-unit
-        host scalar falls back.
+        ``reshape_and_cache_flash`` converts on store, so the separate ``.to(self.dtype)``
+        is only needed when this returns False. It reuses K's head geometry for V and
+        applies no scale, so mismatched shapes or a real scale fall back.
         """
         if self.kv_cache_layout != "nhd" or self.use_hnd:
             return False
@@ -2314,7 +2302,7 @@ class MHATokenToKVPool(KVCache):
             return False
         if self.head_dim != self.v_head_dim:
             return False
-        if not (_is_noop_kv_scale(k_scale) and _is_noop_kv_scale(v_scale)):
+        if _kv_scale_divides(k_scale) or _kv_scale_divides(v_scale):
             return False
         return (
             _has_dense_kv_rows(cache_k, self.head_num, self.head_dim)
@@ -2329,12 +2317,14 @@ class MHATokenToKVPool(KVCache):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ) -> None:
-        """Cast K/V to the cache dtype and scatter both into the paged buffers in
-        one launch. Guard with :meth:`can_store_kv_fused_cast`."""
+        """Cast K/V to the cache dtype and scatter both in one launch.
+
+        Guard with :meth:`can_store_kv_fused_cast`.
+        """
         from sglang.kernels.ops.attention.utils import launch_reshape_and_cache_flash
 
-        # unsqueeze(1) presents the flat slot-indexed buffer as a page-size-1
-        # paged cache, which is the layout the kernel indexes with `loc`.
+        # The kernel indexes `loc` into a paged cache; unsqueeze(1) presents the flat
+        # slot-indexed buffer as page-size 1.
         launch_reshape_and_cache_flash(
             _as_token_head_dim(cache_k, self.head_num, self.head_dim),
             _as_token_head_dim(cache_v, self.head_num, self.head_dim),
@@ -2378,9 +2368,9 @@ class MHATokenToKVPool(KVCache):
             return
 
         if cache_k.dtype != self.dtype:
-            if not _is_noop_kv_scale(k_scale):
+            if _kv_scale_divides(k_scale):
                 cache_k.div_(k_scale)
-            if not _is_noop_kv_scale(v_scale):
+            if _kv_scale_divides(v_scale):
                 cache_v.div_(v_scale)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
@@ -2751,9 +2741,9 @@ class MHATokenToKVPool(KVCache):
             )
 
         if cache_k.dtype != self.dtype:
-            if not _is_noop_kv_scale(k_scale):
+            if _kv_scale_divides(k_scale):
                 cache_k.div_(k_scale)
-            if not _is_noop_kv_scale(v_scale):
+            if _kv_scale_divides(v_scale):
                 cache_v.div_(v_scale)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
@@ -3099,9 +3089,9 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         else:
             layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
-            if not _is_noop_kv_scale(k_scale):
+            if _kv_scale_divides(k_scale):
                 cache_k.div_(k_scale)
-            if not _is_noop_kv_scale(v_scale):
+            if _kv_scale_divides(v_scale):
                 cache_v.div_(v_scale)
 
             from sglang.srt.layers.quantization.kvfp4_tensor import (
@@ -4953,10 +4943,9 @@ class MiniMaxSparseKVPool(KVCache):
             cache_idx_k = cache_idx_k.view(sub_pool.store_dtype)
         k_buffer = sub_pool.k_buffer[mapped_id]
         if cache_idx_k.is_contiguous():
-            # A plain scatter instead of ATen advanced indexing, whose index_put
-            # pays for broadcast/index machinery this store does not need.
             store_k_slots(k_buffer, cache_idx_k.view(-1, *k_buffer.shape[1:]), loc)
         else:
+            # store_k_slots requires contiguous rows.
             k_buffer[loc] = cache_idx_k
 
     def _can_fuse_kv_index_store(
@@ -5026,9 +5015,7 @@ class MiniMaxSparseKVPool(KVCache):
             )
             return
 
-        # Fallback: separate stores (identical semantics). The main K/V write
-        # still folds its bf16 -> cache-dtype cast into the scatter when the
-        # layout allows, which is what the ROCm decode path takes.
+        # Fallback: separate stores (identical semantics).
         main = self.main_pool
         if main.can_store_kv_fused_cast(cache_k, cache_v):
             main.store_kv_fused_cast(layer.layer_id, loc, cache_k, cache_v)

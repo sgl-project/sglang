@@ -316,19 +316,16 @@ def store_k_slots_kernel(
     ROW_DIM: tl.constexpr,  # head_num * head_dim
     BLOCK: tl.constexpr,
 ):
-    """Token-parallel scatter of one K tensor into a slot-major buffer.
+    """Writes ``k_buffer[loc[i]] = src[i]``, one program per (token, row block).
 
-    Grid: ``(N, ceil(ROW_DIM / BLOCK))`` -- one program per (token, row block).
-    Writes ``k_buffer[loc[i]] = src[i]`` for ``i in [0, N)``.
-
-    Cuda-graph safe: no host branching on tensor values and no ``.item()``.
+    Grid ``(N, ceil(ROW_DIM / BLOCK))``. CUDA-graph safe: no host branching on tensor
+    values, no ``.item()``.
     """
     pid_n = tl.program_id(0)
     pid_b = tl.program_id(1)
 
     loc = tl.load(loc_ptr + pid_n).to(tl.int64)
-    # Padded / inactive rows are signalled by a negative slot; skipping them
-    # matches reshape_and_cache_flash, which consumes the same `loc`.
+    # Negative slot = padded row, as in reshape_and_cache_flash, which shares this `loc`.
     if loc < 0:
         return
 
@@ -339,19 +336,10 @@ def store_k_slots_kernel(
 
 
 def store_k_slots(k_buffer: torch.Tensor, src: torch.Tensor, loc: torch.Tensor) -> None:
-    """Scatter ``src[i]`` into ``k_buffer[loc[i]]`` in one launch.
+    """Scatter ``src[i]`` into slot-major ``k_buffer[loc[i]]`` in place, one launch.
 
-    Replaces ``k_buffer[loc] = src`` (ATen advanced indexing, which dispatches
-    an ``index_put`` kernel) for a K-only cache.
-
-    Contract:
-        - ``k_buffer``: slot-major ``(num_slots, head_num, head_dim)``.
-        - ``src``: ``(N, head_num, head_dim)`` with the same dtype.
-        - both contiguous in the trailing ``(head_num, head_dim)`` dims, so the
-          kernel can address them as one flat ``ROW_DIM`` axis.
-        - ``loc``: 1-D, N elements; negative entries are skipped.
-
-    Returns nothing; writes in place.
+    Negative ``loc`` entries are skipped. The trailing ``(head_num, head_dim)`` dims must
+    be contiguous, so the kernel can treat them as one flat axis.
     """
     if loc.numel() == 0:
         return

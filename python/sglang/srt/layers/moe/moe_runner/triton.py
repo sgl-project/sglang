@@ -74,8 +74,7 @@ class TritonMoeQuantInfo(MoeQuantInfo):
 def _needs_expert_filter(config: MoeRunnerConfig) -> bool:
     """Whether topk ids can address a non-local expert and must be filtered.
 
-    False only when every expert is local, so the router's global ids are already
-    valid local ids. An unknown expert count is treated as needing the filter.
+    False only when every expert is local. An unknown expert count needs the filter.
     """
     return config.num_experts is None or config.num_experts != config.num_local_experts
 
