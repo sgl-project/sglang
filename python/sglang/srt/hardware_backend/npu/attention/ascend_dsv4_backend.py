@@ -1682,7 +1682,7 @@ class DeepseekV4AscendAttnBackend(
             attn_kwargs["ori_sparse_indices"] = ori_sparse_indices
         q_arg = attn_kwargs.pop("q")
         if self._is_dspark_draft_worker:
-            out, _ = torch.ops._C_ascend.npu_sparse_attn_sharedkv(q_arg, **attn_kwargs)
+            out, _ = torch.ops.npu.sparse_attn_sharedkv(q_arg, **attn_kwargs)
         else:
             out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(q_arg, **attn_kwargs)
         return out
