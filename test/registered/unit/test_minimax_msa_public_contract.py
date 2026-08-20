@@ -1,3 +1,4 @@
+import sys
 from unittest.mock import Mock
 
 import pytest
@@ -236,3 +237,7 @@ def test_graph_state_and_page_table_keep_stable_addresses(monkeypatch):
     )
     assert result.data_ptr() == page_table.data_ptr()
     assert result.tolist() == [[1, 2], [4, 5]]
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
