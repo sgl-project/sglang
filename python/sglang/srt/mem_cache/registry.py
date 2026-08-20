@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.runtime_context import get_memory
+from sglang.srt.runtime_context import get_disagg, get_memory
 from sglang.srt.utils.tensor_bridge import use_mlx
 
 if TYPE_CHECKING:
@@ -81,6 +81,12 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     """Built-in Radix Cache selection chain."""
     server_args = ctx.server_args
     params = ctx.params
+
+    if (
+        ctx.disable_radix_cache
+        and get_disagg().disaggregation_decode_retraction_backup == "host_pool"
+    ):
+        return _create_unified_radix_cache(ctx, server_args, params)
 
     if ctx.effective_chunked_prefill_size is not None and ctx.disable_radix_cache:
         if not ctx.is_hybrid_swa:
@@ -167,6 +173,12 @@ def _create_unified_radix_cache(
     params: CacheInitParams,
 ) -> BasePrefixCache:
     """Initialize a UnifiedRadixCache with proper components and optional HiCache."""
+    if get_disagg().disaggregation_decode_retraction_backup == "host_pool":
+        if ctx.is_hybrid_ssm:
+            raise ValueError("Host-pool retraction does not support Mamba models.")
+        if ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0:
+            raise ValueError("Host-pool retraction does not support pure-SWA models.")
+
     from sglang.srt.mem_cache.unified_cache.components import ComponentType
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
@@ -175,6 +187,17 @@ def _create_unified_radix_cache(
         tree_components.append(ComponentType.SWA)
     if ctx.is_hybrid_ssm:
         tree_components.append(ComponentType.MAMBA)
+
+    if hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
+        from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
+            C128SidecarComponent,
+        )
+
+        tree_components.append(ComponentType.C128)
+        params.component_registry_override = {
+            **(params.component_registry_override or {}),
+            ComponentType.C128: C128SidecarComponent,
+        }
 
     params.tree_components = tuple(tree_components)
     if use_mlx() and ctx.is_hybrid_ssm:
@@ -186,7 +209,10 @@ def _create_unified_radix_cache(
             ComponentType.MAMBA: MlxAuxiliaryStateComponent,
         }
     cache = UnifiedRadixCache(params)
-    if ctx.enable_hierarchical_cache:
+    if (
+        ctx.enable_hierarchical_cache
+        or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
+    ):
         cache.init_hicache(server_args, params)
         ctx.tp_worker.register_hicache_layer_transfer_counter(
             cache.cache_controller.layer_done_counter
@@ -211,6 +237,18 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         cache = default_radix_cache_factory(ctx)
         source = "default"
 
+    if (
+        ctx.server_args.enable_hierarchical_cache
+        and ctx.server_args.hicache_host_memory_mode == "buffer_only"
+    ):
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        if not isinstance(cache, UnifiedRadixCache):
+            raise ValueError(
+                "--hicache-host-memory-mode buffer_only is only implemented for "
+                f"the unified radix tree; this model selected {type(cache).__name__}."
+            )
+
     if ctx.server_args.enable_session_radix_cache and not getattr(
         cache, "enable_session_radix_cache", False
     ):
@@ -221,6 +259,7 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             "--enable-session-radix-cache)."
         )
 
+    hicache_attached = cache.cache_controller is not None
     streaming_wrapped = False
     if (
         ctx.server_args.enable_streaming_session
@@ -233,12 +272,12 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
     logger.info(
         "Tree cache initialized: source=%s impl=%s hybrid_swa=%s hybrid_ssm=%s "
-        "hierarchical=%s streaming_wrapped=%s",
+        "hicache_attached=%s streaming_wrapped=%s",
         source,
         type(cache).__name__,
         ctx.is_hybrid_swa,
         ctx.is_hybrid_ssm,
-        ctx.enable_hierarchical_cache,
+        hicache_attached,
         streaming_wrapped,
     )
     return cache
