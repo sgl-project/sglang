@@ -50,11 +50,12 @@ fi
 IMAGE_TORCH_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.__version__)')
 IMAGE_HIP_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.version.hip or "")')
 IMAGE_GPU_ARCH=$(docker exec ci_sglang printenv GPU_ARCH 2>/dev/null || true)
-if [[ "${IMAGE_GPU_ARCH}" =~ ^(gfx942|gfx950)(-rocm720|-rocm724)?$ ]]; then
+if [[ "${IMAGE_GPU_ARCH}" =~ ^(gfx942|gfx950)(-rocm720|-rocm724|-rocm714)?$ ]]; then
     echo "[CI-IMAGE] Image GPU_ARCH=${IMAGE_GPU_ARCH}"
     case "${IMAGE_GPU_ARCH}" in
         *-rocm724) IMAGE_BASE_ARG_SUFFIX="_ROCM724"; IMAGE_STAGE_SUFFIX="-rocm724" ;;
         *-rocm720) IMAGE_BASE_ARG_SUFFIX="_ROCM720"; IMAGE_STAGE_SUFFIX="-rocm720" ;;
+        *-rocm714) IMAGE_BASE_ARG_SUFFIX="_ROCM714"; IMAGE_STAGE_SUFFIX="-rocm714" ;;
         *)         IMAGE_BASE_ARG_SUFFIX=""; IMAGE_STAGE_SUFFIX="" ;;
     esac
     IMAGE_GFX="${IMAGE_GPU_ARCH%-*}"
@@ -82,9 +83,10 @@ fi
 unset IMAGE_GPU_ARCH
 
 # Install the required dependencies in CI.
-# ROCm 7.2.4 images ship torch 2.11, which srt_hip cannot satisfy (it pins
-# compressed-tensors 0.15.0, requiring torch<2.11). Select the rocm724 extras.
-if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" ]]; then
+# ROCm 7.2.4 and 7.14 images ship torch 2.11, which srt_hip cannot satisfy (it
+# pins compressed-tensors 0.15.0, requiring torch<2.11). Both select the
+# rocm724 extras, matching the choice docker/rocm.Dockerfile makes at build time.
+if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" || "${IMAGE_STAGE_SUFFIX}" == "-rocm714" ]]; then
   EXTRAS="${EXTRAS/dev_hip/dev_hip_rocm724}"
 fi
 echo "Image torch ${IMAGE_TORCH_VERSION}, HIP ${IMAGE_HIP_VERSION}; installing python extras: [${EXTRAS}]"
@@ -271,6 +273,19 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
     git submodule update --init --recursive
     apt-get update
     apt-get install -y --no-install-recommends libgrpc++-dev 2>/dev/null || true
+    # Same rocm_sysdeps handling as docker/rocm.Dockerfile's MORI step: the pip
+    # ROCm SDK used by the rocm714 images vendors NUMA and libdrm there, off
+    # every default search path. Kept scoped to this build rather than exported
+    # image-wide because rocm_sysdeps/include also carries zlib.h / expat.h /
+    # elf.h, which would shadow the system headers for every other component.
+    ROCM_SYSDEPS=\"\${ROCM_HOME:-/opt/rocm}/lib/rocm_sysdeps\"
+    if [ -d \"\${ROCM_SYSDEPS}\" ]; then
+      export CMAKE_PREFIX_PATH=\"\${ROCM_SYSDEPS}\${CMAKE_PREFIX_PATH:+:\${CMAKE_PREFIX_PATH}}\"
+      export CPATH=\"\${ROCM_SYSDEPS}/include\${CPATH:+:\${CPATH}}\"
+      export LIBRARY_PATH=\"\${ROCM_SYSDEPS}/lib\${LIBRARY_PATH:+:\${LIBRARY_PATH}}\"
+      echo \"\${ROCM_SYSDEPS}/lib\" > /etc/ld.so.conf.d/rocm-sysdeps.conf
+      ldconfig
+    fi
     python3 setup.py develop
     python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), \"lib\"))' > /etc/ld.so.conf.d/torch.conf
     ldconfig
