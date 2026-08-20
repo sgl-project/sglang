@@ -163,10 +163,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             ) // self.block_size_k + 1
         self.topk_blocks = sparse_cfg["sparse_topk_blocks"]
 
-        # MSA (fmha_sm100) is SM100-only; fall back to the Triton sparse path when
-        # the kernel is unavailable or its constraints don't hold.
+        # MSA is SM100-only. Prefer FlashInfer's public source implementation;
+        # retain fmha_sm100 for older installations and all-FP8 Q/K/V.
         if self.is_npu:
             self.use_msa = False
+            self.msa_backend = None
             # Prime the native sparse op probe before cuda-graph capture.
             from sgl_kernel_npu.attention.gqa_share_sparse_attention import (
                 _get_native_sparse_op,
@@ -177,6 +178,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._native_sparse_ok = False
             from sglang.srt.layers.attention.minimax_sparse_ops.msa import (
                 msa_available,
+                selected_msa_backend,
             )
 
             # MSA (fmha_sm100) runs bf16, or uniform fp8_e4m3 under fp8 attn-GEMM mode
@@ -193,9 +195,19 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 self.fp8_attn_gemm
                 and self.kv_pool.main_pool.dtype == torch.float8_e4m3fn
             )
+            self.msa_backend = (
+                None
+                if envs.SGLANG_DISABLE_MSA.get()
+                else selected_msa_backend(
+                    self.kv_pool.main_pool.dtype,
+                    self.kv_pool.main_pool.head_num,
+                    self.topk_blocks,
+                )
+            )
             self.use_msa = (
                 not envs.SGLANG_DISABLE_MSA.get()
                 and msa_available()
+                and self.msa_backend is not None
                 and self.block_size_k == 128
                 and self.kv_pool.page_size == self.block_size_k
                 and self.topk_blocks in (4, 8, 16, 32)
@@ -218,6 +230,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 )
 
         self._msa_dec_meta = None
+        self._msa_prefill_meta = None
+        self._msa_capture_active = False
+        self._msa_active_graph_states: Optional[dict[int, object]] = None
         if self.use_msa:
             from sglang.srt.runtime_context import get_parallel
 
@@ -229,6 +244,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 self.max_context_len + self.block_size_k - 1
             ) // self.block_size_k
             self._msa_cg: dict[int, tuple] = {}
+            self._msa_prefill_cg: dict[tuple[int, int], tuple] = {}
+            # A public workspace becomes capture-owned after one graph capture
+            # and cannot be captured again. Retain every per-capture state for
+            # the lifetime of the backend so its graph pointers remain valid.
+            self._msa_graph_state_lifetime: list[dict[int, object]] = []
 
         self.page_size = self.kv_pool.page_size
         self.use_dense_sparse_decode = (
@@ -253,7 +273,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             Phase.DECODE, Backend.DISABLED
         )
         self._use_msa_decode = self.use_msa and (
-            not _decode_cuda_graph or envs.SGLANG_OPT_USE_MSA_DECODE_UNDER_GRAPH.get()
+            not _decode_cuda_graph
+            # FlashInfer's public workspace has an explicit warm/capture/replay
+            # contract. Keep the opt-in for the standalone compatibility path,
+            # whose graph support depends on undocumented plan internals.
+            or self.msa_backend == "flashinfer"
+            or envs.SGLANG_OPT_USE_MSA_DECODE_UNDER_GRAPH.get()
         )
 
         # MSA + spec decode + cuda graph crashes mid-capture: TARGET_VERIFY batches
@@ -276,7 +301,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
             f"(score_type={self.score_type!r}, "
-            f"main_attn={'MSA' if self.use_msa else 'triton'}, "
+            f"main_attn={self.msa_backend if self.use_msa else 'triton'}, "
             f"msa_decode={self._use_msa_decode}, "
             f"msa_owns_decode={self._msa_owns_decode}, "
             f"decode_cuda_graph={_decode_cuda_graph}, "
@@ -327,6 +352,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     ):
         # getattr covers replay views lacking extend_seq_lens_cpu and TARGET_VERIFY.
         self._msa_dec_meta = None
+        self._msa_prefill_meta = None
+        self._msa_capture_active = in_capture
+        self._msa_active_graph_states = None
         if self.is_npu:
             # Invalidate cached prefill/extend metadata; rebuilt on first sparse layer.
             self._prefill_meta = None
@@ -350,7 +378,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # Build plan + page table eager (outside capture) so captured forward_decode
         # runs only device-side ops; host-side code can't be captured.
         if self._msa_owns_decode and forward_batch.forward_mode.is_decode_or_idle():
-            self._prepare_msa_decode_meta(forward_batch)
+            self._prepare_msa_decode_meta(forward_batch, in_capture=in_capture)
+
+        if (
+            self.use_msa
+            and self.msa_backend == "flashinfer"
+            and forward_batch.forward_mode.is_extend()
+        ):
+            self._prepare_msa_prefill_meta(forward_batch, in_capture=in_capture)
 
         # ---- REPLAY-FRESH native verify block_table ----
         if (
@@ -392,16 +427,49 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     // self.page_size
                 ).to(torch.int32)
 
-    def _prepare_msa_decode_meta(self, forward_batch: ForwardBatch):
+    def _prepare_msa_decode_meta(
+        self, forward_batch: ForwardBatch, *, in_capture: bool = False
+    ):
         """Refresh the persistent per-batch-size MSA decode plan + page table in place."""
         from sglang.srt.layers.attention.minimax_sparse_ops.msa import (
+            build_flashinfer_page_table,
             build_msa_decode_cg_plan,
+            make_flashinfer_msa_graph_state,
             update_msa_decode_cg_meta,
         )
 
         bs = forward_batch.seq_lens.shape[0]
         if bs == 0:
             return
+        if self.msa_backend == "flashinfer":
+            entry = self._msa_cg.get(bs)
+            if entry is None:
+                device = forward_batch.seq_lens.device
+                page_table = torch.empty(
+                    (bs, self._msa_nb_max), dtype=torch.int32, device=device
+                )
+                entry = (page_table, None)
+                self._msa_cg[bs] = entry
+            page_table, _ = entry
+            if in_capture:
+                graph_states = {
+                    layer_id: make_flashinfer_msa_graph_state(
+                        forward_batch.seq_lens.device
+                    )
+                    for layer_id in self.sparse_layer_ids
+                }
+                self._msa_graph_state_lifetime.append(graph_states)
+                self._msa_active_graph_states = graph_states
+            build_flashinfer_page_table(
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                self.block_size_k,
+                out=page_table,
+            )
+            self._msa_dec_meta = (page_table, None)
+            return
+
         entry = self._msa_cg.get(bs)
         if entry is None:
             device = forward_batch.seq_lens.device
@@ -432,6 +500,65 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self.num_kv_heads,
         )
         self._msa_dec_meta = (kv_indices_buf, plan)
+
+    def _prepare_msa_prefill_meta(
+        self, forward_batch: ForwardBatch, *, in_capture: bool = False
+    ):
+        """Build one page table per prefill and persistent workspaces for CG."""
+        from sglang.srt.layers.attention.minimax_sparse_ops.msa import (
+            build_flashinfer_page_table,
+            make_flashinfer_msa_graph_state,
+        )
+
+        bs = int(forward_batch.seq_lens.shape[0])
+        total_q = int(forward_batch.input_ids.shape[0])
+        if bs == 0:
+            return
+        key = (bs, total_q)
+        entry = self._msa_prefill_cg.get(key) if in_capture else None
+        if entry is None and in_capture:
+            page_table = torch.empty(
+                (bs, self._msa_nb_max),
+                dtype=torch.int32,
+                device=forward_batch.seq_lens.device,
+            )
+            entry = (page_table, None)
+            self._msa_prefill_cg[key] = entry
+        if entry is None:
+            max_pages = (
+                self._max_seqlen_k + self.block_size_k - 1
+            ) // self.block_size_k
+            page_table = build_flashinfer_page_table(
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                self.block_size_k,
+                max_pages=max_pages,
+            )
+        else:
+            page_table, _ = entry
+            build_flashinfer_page_table(
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                self.block_size_k,
+                out=page_table,
+            )
+        self._msa_prefill_meta = page_table
+        if in_capture:
+            graph_states = {
+                layer_id: make_flashinfer_msa_graph_state(
+                    forward_batch.seq_lens.device
+                )
+                for layer_id in self.sparse_layer_ids
+            }
+            self._msa_graph_state_lifetime.append(graph_states)
+            self._msa_active_graph_states = graph_states
+
+    def on_after_cuda_graph_warmup(self):
+        """Honor FlashInfer's requirement to finish workspace warmup first."""
+        if self._msa_capture_active and self.msa_backend == "flashinfer":
+            torch.cuda.current_stream().synchronize()
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         if not self.is_npu:
@@ -1428,6 +1555,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_q_scale=layer.idx_q_scale_float,
                 idx_k_scale=layer.idx_k_scale_float,
                 idx_v_scale=layer.idx_v_scale_float,
+                msa_backend=self.msa_backend,
+                msa_page_table=self._msa_prefill_meta,
+                msa_graph_state=(
+                    self._msa_active_graph_states.get(layer.layer_id)
+                    if self._msa_active_graph_states is not None
+                    else None
+                ),
             )
         if actual_num_tokens < original_num_tokens:
             pad_len = original_num_tokens - actual_num_tokens
@@ -1532,9 +1666,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 )
 
         msa_kv_indices = msa_plan = None
+        msa_page_table = None
         if self._use_msa_decode and attn_fn is None:
             if self._msa_dec_meta is not None:
-                msa_kv_indices, msa_plan = self._msa_dec_meta
+                if self.msa_backend == "flashinfer":
+                    msa_page_table, _ = self._msa_dec_meta
+                else:
+                    msa_kv_indices, msa_plan = self._msa_dec_meta
             elif q.shape[0] > 0:
                 # Rebuilding the plan inline would run host-side code inside
                 # CUDA-graph capture; fail loudly instead.
@@ -1595,6 +1733,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_q_scale=layer.idx_q_scale_float,
                 idx_k_scale=layer.idx_k_scale_float,
                 idx_v_scale=layer.idx_v_scale_float,
+                msa_backend=self.msa_backend,
+                msa_page_table=msa_page_table,
+                msa_graph_state=(
+                    self._msa_active_graph_states.get(layer.layer_id)
+                    if self._msa_active_graph_states is not None
+                    else None
+                ),
             )
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),
@@ -1639,6 +1784,12 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         self.sparse.init_forward_metadata_in_graph(forward_batch)
         self.dense.init_forward_metadata_in_graph(forward_batch)
+
+    def on_after_cuda_graph_warmup(self):
+        self.sparse.on_after_cuda_graph_warmup()
+        hook = getattr(self.dense, "on_after_cuda_graph_warmup", None)
+        if hook is not None:
+            hook()
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.dense.init_cuda_graph_state(max_bs, max_num_tokens)
