@@ -11,6 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+"""TokenizerManager is a process that tokenizes the text."""
 
 from __future__ import annotations
 
@@ -212,16 +213,19 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
 
 @dataclasses.dataclass
 class ReqState:
+    """Store the state a request."""
 
     out_list: List[Dict[Any, Any]]
     finished: bool
     event: asyncio.Event
     obj: Union[GenerateReqInput, EmbeddingReqInput]
 
+    # For performance metrics
     time_stats: APIServerReqTimeStats
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
+    # For streaming output
     last_output_offset: int = 0
 
     # Accumulate text lazily so incremental streaming can emit the incoming
@@ -247,6 +251,7 @@ class ReqState:
             out["output_ids"] = self.output_ids.copy()
         return out
 
+    # For incremental state update.
     # TODO(lianmin): do not initialize some lists if not needed.
     output_ids: List[int] = dataclasses.field(default_factory=list)
     input_token_logprobs_val: List[float] = dataclasses.field(default_factory=list)
@@ -275,6 +280,7 @@ class ReqState:
         None
     )
 
+    # For detokenized logprobs
     input_token_logprobs: List[Any] = dataclasses.field(default_factory=list)
     output_token_logprobs: List[Any] = dataclasses.field(default_factory=list)
     input_top_logprobs: List[Any] = dataclasses.field(default_factory=list)
@@ -285,6 +291,7 @@ class ReqState:
         default_factory=dict
     )
 
+    # For return_prompt_token_ids: stores prompt token IDs captured after tokenization
     prompt_token_ids: Optional[List[int]] = None
 
 
@@ -293,6 +300,7 @@ def _slice_streaming_output_meta_info(
     last_output_offset: int,
     customized_info_keys: Optional[Iterable[str]] = None,
 ) -> None:
+    """Align output-side metadata with the current incremental streaming chunk."""
     streaming_meta_info_keys = set(_INCREMENTAL_STREAMING_META_INFO_KEYS)
     if customized_info_keys is not None:
         streaming_meta_info_keys.update(customized_info_keys)
@@ -411,25 +419,35 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.preferred_sampling_params = get_serving().preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
 
+        # Init model config
         self.init_model_config()
         self._validate_cuda_vmm_feature_transport_support()
 
+        # Initialize tokenizer and multimodalprocessor
         self.init_tokenizer_and_processor()
 
+        # Init inter-process communication
         self.init_ipc_channels(port_args)
 
+        # Init running status
         self.init_running_status()
 
+        # Init logging and dumping
         self.init_request_logging_and_dumping()
 
+        # Init weight update
         self.init_weight_update()
 
+        # Init LoRA status
         self.init_lora()
 
+        # Init PD disaggregation and encoder disaggregation
         self.init_disaggregation(start_pd_bootstrap_service=start_pd_bootstrap_service)
 
+        # Init metric collector and watchdog
         self.init_metric_collector_watchdog()
 
+        # Init request dispatcher
         self.init_request_dispatcher()
 
         # Construct this last so later initialization failures cannot orphan
@@ -554,14 +572,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         await async_sock_send(self.send_to_scheduler, obj)
 
     def init_running_status(self):
+        # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
 
+        # Health check
         self.server_status = ServerStatus.Starting
         self.gracefully_exit = False
         self.last_receive_tstamp = real_time()
 
+        # Session
         self.session_futures = {}  # session_id -> asyncio event
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
@@ -575,6 +596,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             log_requests_target=self.server_args.log_requests_target,
         )
 
+        # Dumping
         self.dump_requests_folder = ""
         self.dump_requests_threshold = 1000
         self.dump_requests_exclude_meta_keys: List[str] = [
@@ -585,6 +607,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.crash_dump_request_list: deque[Tuple] = deque()
         self.crash_dump_performed = False
 
+        # Initialize performance metrics loggers with proper skip names
         _, obj_skip_names, out_skip_names = self.request_logger.metadata
         self.request_metrics_exporter_manager = RequestMetricsExporterManager(
             self.server_args, obj_skip_names, out_skip_names
@@ -595,6 +618,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if self.server_args.checkpoint_engine_wait_weights_before_ready:
             self.initial_weights_loaded = False
 
+        # The event to notify the weight sync is finished.
         self.model_update_lock = RWLock()
         self.model_update_result: Optional[Awaitable[UpdateWeightFromDiskReqOutput]] = (
             None
@@ -1906,6 +1930,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
+        # Immediately update the weights if the engine is in paused state
         async with self.is_pause_cond:
             is_paused = self.is_pause
 
@@ -2303,7 +2328,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if pooled_hidden_states[i] is not None:
                         out_dict["pooled_hidden_state"] = pooled_hidden_states[i]
 
-            # Single write point for first_token_time.
+            # Set first_token_time on the first output batch.
+            # This is the single write point for first_token_time.
             if state.time_stats.first_token_time == 0.0:
                 state.time_stats.set_first_token_time()
 

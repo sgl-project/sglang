@@ -131,6 +131,7 @@ class TokenizerManagerScoreMixin:
         input_logprobs = meta_info.get("input_token_ids_logprobs", [])
         embedding = single_result.get("embedding")
 
+        # Generation model: extract label-token logprobs at each delimiter
         if input_logprobs:
             per_delimiter_scores = []
             for logprobs_data in input_logprobs:
@@ -141,6 +142,7 @@ class TokenizerManagerScoreMixin:
                     logprobs, label_token_ids, apply_softmax
                 )
                 per_delimiter_scores.append(score_list)
+        # Classification model: scores are directly in 2D embedding.
         elif embedding is not None:
             if apply_softmax:
                 scores_tensor = (
@@ -329,6 +331,7 @@ class TokenizerManagerScoreMixin:
         )
 
         # Query placeholder positions are invariant across items -- resolve once.
+        # (No-op returning ([], []) if has_embeds is False or query_embed_overrides is None.)
         q_embeds, q_positions = self._resolve_overrides_for_sequence(
             query,
             query_embed_overrides,
@@ -444,6 +447,9 @@ class TokenizerManagerScoreMixin:
         Supports two model types:
         - Generation (CausalLM): Requires label_token_ids; returns logprob-based scores.
         - SequenceClassification: label_token_ids is optional; returns pooled class logits.
+
+        return_pooled_hidden_states is only supported for non-generation models
+        (SequenceClassification, RewardModel); raises ValueError for CausalLM.
         """
         is_generation = self.is_generation
 
