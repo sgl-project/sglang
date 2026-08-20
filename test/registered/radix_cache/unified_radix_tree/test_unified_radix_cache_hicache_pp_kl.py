@@ -36,7 +36,6 @@ class TestUnifiedQwen3HiCachePP(UnifiedRadixTreeTestMixin, CustomTestCase):
     kl_threshold = 0.005
     gsm8k_threshold = 0.7
     num_gsm8k_questions = 50
-    mmlu_threshold = 0.7
     decode_cache_assert = staticmethod(_assert_pp_decode_cached_tokens)
 
     def test_gsm8k(self):
