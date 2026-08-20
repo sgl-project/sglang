@@ -928,6 +928,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.indexer_compress_state_pools: List[Optional[CompressStatePool]] = [
             None
         ] * total_L
+        # Built on first clear_c128_req_state(); see _build_c128_clear_plan().
+        # ``None`` after the build means "not usable here", so keep a separate
+        # flag rather than rescanning the pool list on every call.
+        self._c128_clear_plan_built = False
+        self._c128_clear_plan: Optional[
+            Tuple[List[torch.Tensor], torch.Tensor, int]
+        ] = None
 
         for idx in range(self._stage_start, self._stage_end):
             ratio = self.compression_ratios[idx]
@@ -1004,8 +1011,69 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.online_c128_mtp_pending_seq_lens is not None
         return self.online_c128_mtp_pending_seq_lens
 
+    def _build_c128_clear_plan(
+        self,
+    ) -> Optional[Tuple[List[torch.Tensor], torch.Tensor, int]]:
+        """Precompute the per-request C128 reset as one templated copy per pool.
+
+        The old form issued two kernels per C128 pool (``fill_(-inf)`` + ``zero_``
+        on the two halves of the slot), i.e. ~40 launches per admitted request.
+        The written constants never change, so bake them into one template block
+        and let a single ``_foreach_copy_`` cover every pool: the destinations are
+        row slices of contiguous buffers, so the foreach fast path applies and the
+        whole reset collapses to one kernel.
+
+        Returns None when the C128 pools are not homogeneous, in which case the
+        caller falls back to the per-pool loop.
+        """
+        states: List[torch.Tensor] = []
+        ring_size = 0
+        for pool in self.compress_state_pools:
+            if pool is None or pool.ratio != 128:
+                continue
+            state = pool.kv_score_buffer.kv_score
+            if states and (
+                state.shape[1:] != states[0].shape[1:]
+                or state.dtype != states[0].dtype
+                or pool.ring_size != ring_size
+            ):
+                return None
+            states.append(state)
+            ring_size = pool.ring_size
+        if not states:
+            return None
+
+        # Build the template with the very same ops the old path used, so the
+        # stored bytes match bit for bit even for dtypes where -inf saturates.
+        ref = states[0]
+        if ONLINE_C128:
+            template = torch.empty_like(ref[0])
+            head_dim = template.shape[-1] // 3
+            template[:head_dim].fill_(float("-inf"))
+            template[head_dim:].zero_()
+        else:
+            template = torch.empty_like(ref[:ring_size])
+            half = template.shape[-1] // 2
+            template[:, :half].zero_()
+            template[:, half:].fill_(float("-inf"))
+        return states, template, ring_size
+
     def clear_c128_req_state(self, req_pool_idx: int) -> None:
         """Reset request-scoped C128 state for one req slot."""
+        if not self._c128_clear_plan_built:
+            self._c128_clear_plan = self._build_c128_clear_plan()
+            self._c128_clear_plan_built = True
+        if self._c128_clear_plan is not None:
+            states, template, ring_size = self._c128_clear_plan
+            if ONLINE_C128:
+                dsts = [state[req_pool_idx] for state in states]
+            else:
+                start = req_pool_idx * ring_size
+                stop = start + ring_size
+                dsts = [state[start:stop] for state in states]
+            torch._foreach_copy_(dsts, [template] * len(dsts))
+            return
+
         for pool in self.compress_state_pools:
             if pool is None or pool.ratio != 128:
                 continue

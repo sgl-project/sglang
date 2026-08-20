@@ -49,20 +49,20 @@ def page_align_floor(length: int, page_size: int) -> int:
     return (length // page_size) * page_size
 
 
-def free_swa_out_of_window_slots(
+def _swa_evict_frontier(
     req: Req,
     pre_len: int,
     *,
     sliding_window_size: int,
     page_size: int,
-    req_to_token_pool: ReqToTokenPool,
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-    is_chunk_cache: bool = False,
+    is_chunk_cache: bool,
     retain_floor: int | None = None,
-) -> None:
-    if req.kv is None:
-        return
+) -> Optional[int]:
+    """Host-only half of SWA eviction: advance the protected floor and return
+    the new eviction frontier, or ``None`` when nothing can be freed yet.
 
+    Split out so the batched variant below shares one copy of the boundary math.
+    """
     # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
     assert (
         req.cache_protected_len % page_size == 0
@@ -96,11 +96,157 @@ def free_swa_out_of_window_slots(
     if page_size > 1:
         new_swa_evicted_seqlen = (new_swa_evicted_seqlen // page_size) * page_size
 
-    if new_swa_evicted_seqlen > req.kv.swa_evicted_seqlen:
-        free_slots = req_to_token_pool.req_to_token[
-            req.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
-        ]
+    if new_swa_evicted_seqlen <= req.kv.swa_evicted_seqlen:
+        return None
+    return new_swa_evicted_seqlen
+
+
+def free_swa_out_of_window_slots(
+    req: Req,
+    pre_len: int,
+    *,
+    sliding_window_size: int,
+    page_size: int,
+    req_to_token_pool: ReqToTokenPool,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    is_chunk_cache: bool = False,
+    retain_floor: int | None = None,
+) -> None:
+    if req.kv is None:
+        return
+
+    new_swa_evicted_seqlen = _swa_evict_frontier(
+        req,
+        pre_len,
+        sliding_window_size=sliding_window_size,
+        page_size=page_size,
+        is_chunk_cache=is_chunk_cache,
+        retain_floor=retain_floor,
+    )
+    if new_swa_evicted_seqlen is None:
+        return
+
+    free_slots = req_to_token_pool.req_to_token[
+        req.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
+    ]
+    # Both bounds are page-aligned and the whole range is still SWA-mapped, so
+    # name the pages positionally instead of rediscovering them: free_swa()
+    # masks the mapping, whose data-dependent shape forces a device sync.
+    free_swa_segment = getattr(token_to_kv_pool_allocator, "free_swa_segment", None)
+    if free_swa_segment is not None:
+        free_swa_segment(free_slots, start_pos=req.kv.swa_evicted_seqlen)
+    else:
         token_to_kv_pool_allocator.free_swa(free_slots)
+    req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
+
+
+def _gather_slot_ranges(
+    req_to_token: torch.Tensor,
+    ranges: list[tuple[int, int, int]],
+    *,
+    step: int = 1,
+) -> torch.Tensor:
+    """One gather for ``cat(req_to_token[row, start:end:step] for row, start, end)``.
+
+    The index math runs on the device off one small host->device copy, so the
+    number of gathered slots never turns into host work.
+
+    ``step`` lets the caller gather one token per page instead of every token,
+    which is what the sync-free release path needs (see
+    ``free_swa_out_of_window_slots_batch``). At ``step=1`` the emitted ops are
+    the same as before.
+    """
+    stride = req_to_token.shape[1]
+    device = req_to_token.device
+    lengths = [-(-(end - start) // step) for _, start, end in ranges]
+
+    if len(ranges) == 1:
+        # Single request (e.g. one-request prefill batch): a plain slice beats
+        # building index tensors for it.
+        row, start, end = ranges[0]
+        return req_to_token[row, start:end:step]
+
+    base = torch.tensor(
+        [row * stride + start for row, start, _ in ranges],
+        dtype=torch.int64,
+        device=device,
+    )
+    if len(set(lengths)) == 1:
+        # Common case: every request frees the same number of slots — one token
+        # or one page per decode step, one chunk per prefill chunk.
+        offsets = torch.arange(
+            0, lengths[0] * step, step, dtype=torch.int64, device=device
+        )
+        flat = (base.unsqueeze(1) + offsets).view(-1)
+    else:
+        lengths_t = torch.tensor(lengths, dtype=torch.int64, device=device)
+        range_start = torch.cumsum(lengths_t, 0) - lengths_t
+        # base_i + (k - range_start_i) * step, folded so the per-element index
+        # still costs one arange and one repeat_interleave.
+        flat = torch.arange(
+            int(sum(lengths)), dtype=torch.int64, device=device
+        ) * step - torch.repeat_interleave(range_start * step - base, lengths_t)
+    return req_to_token.view(-1)[flat]
+
+
+def free_swa_out_of_window_slots_batch(
+    reqs: list[Req],
+    pre_lens: list[int],
+    *,
+    sliding_window_size: int,
+    page_size: int,
+    req_to_token_pool: ReqToTokenPool,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    is_chunk_cache: bool = False,
+    retain_floors: list[int | None] | None = None,
+) -> None:
+    """``free_swa_out_of_window_slots`` for a whole batch, in one release call.
+
+    Two costs are being removed here, and they are independent.
+
+    Calling per request puts O(batch_size) release calls on the scheduler thread
+    right before it can launch the next forward — ~90us per request, i.e. ~185ms
+    for a 2048-request decode batch. Gathering the whole batch's out-of-window
+    range in one indexed read collapses that to one call.
+
+    That one call still syncs if it is ``free_swa()``, which rediscovers the SWA
+    pages by reading the mapping back (``unique`` + a ``> 0`` mask); both shapes
+    are data-dependent, so the host blocks -- and behind the WAR-fenced schedule
+    stream that means waiting out the whole in-flight forward, not the ~90us.
+    Every range here is page-aligned at both ends (``_swa_evict_frontier`` floors
+    the frontier and the previous frontier was floored the same way) and still
+    fully SWA-mapped, so gather one token per page instead and let the allocator
+    name the pages positionally: one op, no sync.
+    """
+    plan = []
+    if retain_floors is None:
+        retain_floors = [None] * len(reqs)
+    for req, pre_len, retain_floor in zip(reqs, pre_lens, retain_floors):
+        if req.kv is None:
+            continue
+        new_swa_evicted_seqlen = _swa_evict_frontier(
+            req,
+            pre_len,
+            sliding_window_size=sliding_window_size,
+            page_size=page_size,
+            is_chunk_cache=is_chunk_cache,
+            retain_floor=retain_floor,
+        )
+        if new_swa_evicted_seqlen is None:
+            continue
+        plan.append((req, req.kv.swa_evicted_seqlen, new_swa_evicted_seqlen))
+
+    if not plan:
+        return
+
+    req_to_token = req_to_token_pool.req_to_token
+    ranges = [(req.req_pool_idx, start, end) for req, start, end in plan]
+    free_swa_page_reps = getattr(token_to_kv_pool_allocator, "free_swa_page_reps", None)
+    if free_swa_page_reps is not None and page_size > 1:
+        free_swa_page_reps(_gather_slot_ranges(req_to_token, ranges, step=page_size))
+    else:
+        token_to_kv_pool_allocator.free_swa(_gather_slot_ranges(req_to_token, ranges))
+    for req, _, new_swa_evicted_seqlen in plan:
         req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 
@@ -264,7 +410,23 @@ def _release_overallocated_kv_indices(
         ]
         # start_p is aligned to the allocator's physical page size above, so it
         # never shares a page with cache_finished_req's tail free in this group.
-        allocator.free_segment(indices_to_free, start_pos=start_p)
+        free_swa_segment = getattr(allocator, "free_swa_segment", None)
+        if (
+            free_swa_segment is not None
+            and page_size > 1
+            and tree_cache.is_chunk_cache()
+        ):
+            # This tail sits at the end of the sequence, i.e. inside the SWA
+            # window, so both pools still hold it and can be named positionally
+            # (free_segment would fall back to the syncing discovery path).
+            # Gated on page_size > 1: that is where naming the pages pays, and it
+            # also excludes PureSWATokenToKVPoolAllocator (always page_size == 1),
+            # whose full_attn_allocator IS its swa_attn_allocator -- splitting the
+            # release there would push the same slots onto the free list twice.
+            allocator.free_full_segment(indices_to_free, start_pos=start_p)
+            free_swa_segment(indices_to_free, start_pos=start_p)
+        else:
+            allocator.free_segment(indices_to_free, start_pos=start_p)
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:

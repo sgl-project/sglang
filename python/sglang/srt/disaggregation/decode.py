@@ -20,13 +20,14 @@ Life cycle of a request in the decode server
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -73,7 +74,6 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.common import (
-    kv_to_page_indices,
     page_align_floor,
     release_kv_cache,
     retraction_discard,
@@ -93,7 +93,7 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
-from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
+from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method, scheduler_nvtx_range
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -293,6 +293,45 @@ class DecodeRequest:
         return self.req.priority
 
 
+class _PendingMetadataSend:
+    """A preallocated request whose transfer metadata still needs its D2H read.
+
+    ``page_indices`` and the tensor entries of ``state_indices`` are produced on
+    the scheduler stream by the preallocation; they are read back (and the
+    metadata sent to prefill) only after the next forward has been launched.
+    """
+
+    __slots__ = (
+        "decode_req",
+        "page_indices",
+        "state_indices",
+        "decode_prefix_len",
+        "device_kv_indices",
+    )
+
+    def __init__(
+        self,
+        decode_req: DecodeRequest,
+        page_indices: torch.Tensor,
+        state_indices: Optional[List],
+        decode_prefix_len: int,
+        device_kv_indices: Optional[torch.Tensor] = None,
+    ):
+        self.decode_req = decode_req
+        self.page_indices = page_indices
+        self.state_indices = state_indices
+        self.decode_prefix_len = decode_prefix_len
+        self.device_kv_indices = device_kv_indices
+
+
+def _page_indices_device(kv_indices: torch.Tensor, page_size: int) -> torch.Tensor:
+    """Device half of ``kv_to_page_indices``; the D2H is deferred by the caller.
+
+    int32 to match the ZMQ wire format (``from_zmq`` reads np.int32).
+    """
+    return (kv_indices[::page_size] // page_size).to(torch.int32)
+
+
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     """
     Store the requests that are preallocating.
@@ -371,6 +410,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
 
+        # Transfer metadata whose page/state indices are still on device. The
+        # preallocation kernels run on the scheduler stream, which the WAR
+        # barrier fences behind the in-flight forward, so reading them back
+        # inline stalls the host in the path that must launch the next forward.
+        # We defer the D2H to ``flush_pending_metadata()``, called after that
+        # launch, and run it on a private stream gated on ``_prealloc_done``.
+        self._pending_metadata: List[_PendingMetadataSend] = []
+        self._metadata_stream = None
+        self._prealloc_done = None
+        self._metadata_stream_ready = False
+
         if (
             self.scheduler.tp_worker.is_hybrid_swa
             and not self._uses_swa_tail_prealloc()
@@ -381,6 +431,38 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.max_total_num_tokens,
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
             )
+
+    def _ensure_metadata_stream(self) -> None:
+        """Lazily create the metadata readback stream.
+
+        The scheduler's ``device_module`` and streams are set up after the
+        disaggregation queues are constructed, so this can't run in __init__.
+        """
+        if self._metadata_stream_ready:
+            return
+        self._metadata_stream_ready = True
+        device_module = getattr(self.scheduler, "device_module", None)
+        if device_module is None or self.scheduler.device != "cuda":
+            return
+        # Redraw if the pooled stream aliases a stream we must stay off of,
+        # which would put the readback back behind the WAR barrier.
+        busy = {
+            s.cuda_stream
+            for s in (
+                getattr(self.scheduler, "forward_stream", None),
+                getattr(self.scheduler, "schedule_stream", None),
+            )
+            if s is not None and hasattr(s, "cuda_stream")
+        }
+        stream = device_module.Stream(priority=0)
+        redraws = 0
+        while stream.cuda_stream in busy and redraws < 64:
+            stream = device_module.Stream(priority=0)
+            redraws += 1
+        if stream.cuda_stream in busy:
+            return
+        self._metadata_stream = stream
+        self._prealloc_done = device_module.Event()
 
     def _uses_swa_tail_prealloc(self) -> bool:
         return (
@@ -715,6 +797,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if hasattr(self.kv_manager, "register_buffer_to_engine"):
             self.kv_manager.register_buffer_to_engine()
 
+    @scheduler_nvtx_method("decode_queue.resume_retracted_reqs")
     def resume_retracted_reqs(
         self, rids_to_check: Optional[List[str]] = None
     ) -> List[Req]:
@@ -754,13 +837,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if uses_swa_tail_prealloc:
                 swa_allocatable_tokens -= swa_required
 
-            retraction_restore(
-                req,
-                self.tree_cache,
-                self.req_to_token_pool,
-                self.token_to_kv_pool_allocator,
-                get_disagg().disaggregation_decode_retraction_backup,
-            )
+            # load from cpu, release the cpu copy
+            with scheduler_nvtx_range("decode_queue.load_kv_cache"):
+                retraction_restore(
+                    req,
+                    self.tree_cache,
+                    self.req_to_token_pool,
+                    self.token_to_kv_pool_allocator,
+                    get_disagg().disaggregation_decode_retraction_backup,
+                )
 
         self.retracted_queue = [
             entry
@@ -988,6 +1073,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         for decode_req, prefill_dp_rank in resolved:
             decode_req.kv_receiver.init(prefill_dp_rank)
 
+    @scheduler_nvtx_method("decode_queue.pop_preallocated")
     def pop_preallocated(
         self,
         rids_to_check: Optional[List[str]] = None,
@@ -995,6 +1081,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         pp_bad_rids: Optional[List[str]] = None,
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
+        self._ensure_metadata_stream()
         is_pp_mode = self.pp_size > 1
         if is_pp_mode and (pp_good_rids is None or pp_bad_rids is None):
             raise ValueError("PP consensus is required when pp_size > 1")
@@ -1258,7 +1345,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         window_kv_indices_full
                     )
                 )
-                return kv_to_page_indices(window_kv_indices_swa, page_size)
+                return _page_indices_device(window_kv_indices_swa, page_size)
 
             def _dsa_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
@@ -1266,7 +1353,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 ]
                 # Indexer lives on device pool; always use device page_size
                 device_page_size = self.token_to_kv_pool.page_size
-                return kv_to_page_indices(kv_indices_full, device_page_size)
+                return _page_indices_device(kv_indices_full, device_page_size)
 
             def _swa_ring_payload():
                 # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
@@ -1328,10 +1415,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert decode_req.metadata_buffer_index is not None
-            # int32 for ZMQ serialization -- from_zmq reads np.int32.
-            page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
-                np.int32
-            )
+            page_indices = _page_indices_device(kv_indices, kv_transfer_page_size)
             device_page_indices = None
             if (
                 self.scheduler.enable_hisparse
@@ -1346,18 +1430,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     decode_req.req.req_pool_idx,
                     prefix_len:origin_input_len,
                 ]
-                device_page_indices = kv_to_page_indices(
+                device_page_indices = _page_indices_device(
                     full_kv_indices,
                     page_size,
-                ).astype(np.int32)
+                )
                 if self.transfer_backend != TransferBackend.MOONCAKE:
                     raise NotImplementedError(
                         "DSV4 HiSparse direct PD transfer currently requires "
                         "the Mooncake backend"
                     )
-            metadata_kwargs = {"decode_prefix_len": total_prefix_len}
-            if device_page_indices is not None:
-                metadata_kwargs["device_kv_indices"] = device_page_indices
             if (
                 self.transfer_queue.enable_staging
                 and hasattr(decode_req.kv_receiver, "require_staging")
@@ -1368,17 +1449,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.transfer_queue.staging_handler.register_decode_req(
                     decode_req.req.bootstrap_room, decode_req
                 )
-            decode_req.kv_receiver.send_metadata(
-                page_indices,
-                decode_req.metadata_buffer_index,
-                state_indices,
-                **metadata_kwargs,
-            )
-            if decode_req.is_rebootstrap:
-                self.kv_manager.submit_prefill_recompute(
-                    decode_req.kv_receiver,
-                    decode_req.req.build_rebootstrap_payload(),
+            # send_metadata needs these indices on the host; deferred to
+            # flush_pending_metadata() so the D2H doesn't stall this path.
+            self._pending_metadata.append(
+                _PendingMetadataSend(
+                    decode_req,
+                    page_indices,
+                    state_indices,
+                    total_prefix_len,
+                    device_page_indices,
                 )
+            )
+            # Counted at preallocation, not at flush: the gate this feeds only has
+            # to be conservative, and the request enters the transfer queue in
+            # this same iteration.
             self._num_published_destinations += 1
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
@@ -1388,7 +1472,98 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
 
+        if self._pending_metadata and self._prealloc_done is not None:
+            # Gate the deferred readback on the preallocation writes above.
+            self._prealloc_done.record()
+
         return preallocated_reqs, failed_reqs
+
+    @scheduler_nvtx_method("decode_queue.flush_pending_metadata")
+    def flush_pending_metadata(self) -> None:
+        """Read back the preallocation's page/state indices and send metadata.
+
+        Call after the next forward has been launched: the copies are gated on
+        ``_prealloc_done`` and by then their producers have long finished, so the
+        host sync returns immediately instead of waiting out a forward.
+        """
+        pending = self._pending_metadata
+        if not pending:
+            return
+        self._pending_metadata = []
+
+        stream = self._metadata_stream
+        if stream is not None:
+            stream.wait_event(self._prealloc_done)
+        ctx = (
+            self.scheduler.device_module.stream(stream)
+            if stream is not None
+            else contextlib.nullcontext()
+        )
+        hosts: List[Tuple[torch.Tensor, Optional[List], Optional[torch.Tensor]]] = []
+        with ctx:
+            for p in pending:
+                hosts.append(
+                    (
+                        self._to_host(p.page_indices, stream),
+                        (
+                            None
+                            if p.state_indices is None
+                            else [
+                                (
+                                    self._to_host(s, stream)
+                                    if isinstance(s, torch.Tensor)
+                                    else s
+                                )
+                                for s in p.state_indices
+                            ]
+                        ),
+                        (
+                            None
+                            if p.device_kv_indices is None
+                            else self._to_host(p.device_kv_indices, stream)
+                        ),
+                    )
+                )
+        if stream is not None:
+            stream.synchronize()
+
+        for p, (page_indices, state_indices, device_kv_indices) in zip(pending, hosts):
+            decode_req = p.decode_req
+            metadata_kwargs = {"decode_prefix_len": p.decode_prefix_len}
+            if device_kv_indices is not None:
+                metadata_kwargs["device_kv_indices"] = device_kv_indices.numpy()
+            decode_req.kv_receiver.send_metadata(
+                page_indices.numpy(),
+                decode_req.metadata_buffer_index,
+                (
+                    None
+                    if state_indices is None
+                    else [
+                        s.numpy() if isinstance(s, torch.Tensor) else s
+                        for s in state_indices
+                    ]
+                ),
+                **metadata_kwargs,
+            )
+            if decode_req.is_rebootstrap:
+                self.kv_manager.submit_prefill_recompute(
+                    decode_req.kv_receiver,
+                    decode_req.req.build_rebootstrap_payload(),
+                )
+
+    @staticmethod
+    def _to_host(t: torch.Tensor, stream) -> torch.Tensor:
+        """Async D2H into pinned memory (pageable destinations sync the stream)."""
+        if t.device.type == "cpu":
+            return t
+        if stream is None:
+            return t.to("cpu")
+        # The tensor was allocated on the scheduler stream; keep the caching
+        # allocator from reusing its memory while this stream reads it.
+        t.record_stream(stream)
+        host = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+        host.copy_(t, non_blocking=True)
+        return host
 
     @property
     def has_published_destinations(self) -> bool:
@@ -1779,6 +1954,34 @@ def alloc_for_decode_prealloc_hisparse(
     return kv_loc
 
 
+def _pinned_int64_pair(
+    values: List[int], device: Union[str, torch.device]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build the (cpu, device) int64 tensor pair the allocators expect.
+
+    ``torch.tensor(..., device=cuda)`` copies from pageable memory, which aten
+    implements as cudaMemcpyAsync + cudaStreamSynchronize; on the scheduler
+    stream that stalls the host until the in-flight forward drains. Staging
+    through pinned memory keeps the copy asynchronous, and it stays ordered
+    before the allocator kernel that reads it on the same stream.
+    """
+    if torch.device(device).type == "cpu":
+        host = torch.tensor(values, dtype=torch.int64)
+        return host, host
+    host = torch.tensor(values, dtype=torch.int64, pin_memory=True)
+    return host, host.to(device, non_blocking=True)
+
+
+def _pinned_to_device_int64(
+    t: torch.Tensor, device: Union[str, torch.device]
+) -> torch.Tensor:
+    """Async int64 copy of ``t`` onto ``device``; see _pinned_int64_pair."""
+    t = t.to(dtype=torch.int64)
+    if t.device.type != "cpu" or torch.device(device).type == "cpu":
+        return t.to(device)
+    return t.pin_memory().to(device, non_blocking=True)
+
+
 def alloc_for_decode_prealloc(
     allocator: BaseTokenToKVPoolAllocator,
     *,
@@ -1801,9 +2004,9 @@ def alloc_for_decode_prealloc(
     else:
         device = allocator.device
         last_loc = (
-            prefix_indices[-1:].to(dtype=torch.int64, device=device)
+            _pinned_to_device_int64(prefix_indices[-1:], device)
             if prefix_len > 0
-            else torch.tensor([-1], dtype=torch.int64, device=device)
+            else _pinned_int64_pair([-1], device)[1]
         )
         extra_kwargs = {}
         dsv4_unwrap_prealloc = None
@@ -1826,11 +2029,13 @@ def alloc_for_decode_prealloc(
             # When prefix_len > 0 (radix cache hit), we fall back to
             # alloc_extend which allocates SWA at full page count; the
             # SWA budget in that case may slightly under-estimate.
+            prefix_lens_cpu, prefix_lens = _pinned_int64_pair([0], device)
+            seq_lens_cpu, seq_lens = _pinned_int64_pair([fill_len], device)
             kv_loc = allocator.alloc_extend_swa_tail(
-                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                prefix_lens=prefix_lens,
+                prefix_lens_cpu=prefix_lens_cpu,
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
                 last_loc=last_loc,
                 extend_num_tokens=fill_len,
                 swa_tail_len=swa_tail_len,
@@ -1843,13 +2048,15 @@ def alloc_for_decode_prealloc(
             )
             req.kv.swa_evicted_seqlen = swa_evicted_seqlen
         else:
+            prefix_lens_cpu, prefix_lens = _pinned_int64_pair(
+                [total_prefix_len], device
+            )
+            seq_lens_cpu, seq_lens = _pinned_int64_pair([fill_len], device)
             kv_loc = allocator.alloc_extend(
-                prefix_lens=torch.tensor(
-                    [total_prefix_len], dtype=torch.int64, device=device
-                ),
-                prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                prefix_lens=prefix_lens,
+                prefix_lens_cpu=prefix_lens_cpu,
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
                 last_loc=last_loc,
                 extend_num_tokens=delta_len,
                 **extra_kwargs,
@@ -2093,6 +2300,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         kv_manager._staging_handler = self.staging_handler
 
+    @scheduler_nvtx_method("decode_queue.pop_transferred")
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
             return []
@@ -2332,6 +2540,8 @@ class SchedulerDisaggregationDecodeMixin:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
 
+            self.disagg_decode_prealloc_queue.flush_pending_metadata()
+
             # Update last_batch
             self.last_batch = batch
 
@@ -2393,6 +2603,10 @@ class SchedulerDisaggregationDecodeMixin:
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result, batch)
 
+            # The forward is launched: read back this iteration's preallocation
+            # metadata and hand it to prefill without stalling the launch path.
+            self.disagg_decode_prealloc_queue.flush_pending_metadata()
+
             # Update last_batch
             self.last_batch = batch
 
@@ -2413,12 +2627,14 @@ class SchedulerDisaggregationDecodeMixin:
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
         # Process pending prebuilt batch: output processing + filter + merge
-        new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
+        with scheduler_nvtx_range("gnb.get_new_prebuilt_batch"):
+            new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
         if new_prebuilt_batch:
             assert self.chunked_req is None
-            self.batch_result_processor.process_batch_result_prebuilt(
-                new_prebuilt_batch
-            )
+            with scheduler_nvtx_range("gnb.process_batch_result_prebuilt"):
+                self.batch_result_processor.process_batch_result_prebuilt(
+                    new_prebuilt_batch
+                )
             new_prebuilt_batch.filter_batch()
             if not new_prebuilt_batch.is_empty():
                 if running_batch.is_empty():
@@ -2432,10 +2648,12 @@ class SchedulerDisaggregationDecodeMixin:
         if running_batch.is_empty():
             ret = None
         else:
-            running_batch = self.update_running_batch(running_batch)
+            with scheduler_nvtx_range("gnb.update_running_batch"):
+                running_batch = self.update_running_batch(running_batch)
             ret = running_batch if not running_batch.is_empty() else None
 
-        ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
+        with scheduler_nvtx_range("gnb.mlp_sync_all_gather", color="yellow"):
+            ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
         if ret:
             set_schedule_time_batch(ret)
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
@@ -2509,7 +2727,14 @@ class SchedulerDisaggregationDecodeMixin:
 
         return new_batch
 
+    @scheduler_nvtx_method("scheduler.process_decode_queue", color="orange")
     def process_decode_queue(self: Scheduler):
+        # Safety net for iterations that returned early after pop_preallocated()
+        # without reaching the post-launch flush (e.g. the paused-engine path).
+        # A no-op on the normal path, where the previous iteration flushed. The
+        # PP loop doesn't come through here and flushes in process_prealloc_queue().
+        self.disagg_decode_prealloc_queue.flush_pending_metadata()
+
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 
