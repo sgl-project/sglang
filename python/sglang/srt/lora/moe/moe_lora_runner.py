@@ -561,9 +561,6 @@ class MoeLoraRunner:
                 raise ValueError(
                     "mapped down-A pair_to_row must have one entry per routed pair"
                 )
-        # The route defines the pair domain, so read the row count off it
-        # rather than off input, whose first dimension means tokens for gate/up,
-        # pairs for down, and provider rows for mapped down.
         num_output_rows = (
             route.topk_ids.shape[0]
             if spec.output_layout is BridgeLayout.TOKEN_MAJOR
