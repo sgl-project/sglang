@@ -713,6 +713,18 @@ class KimiK3MoE(nn.Module):
             self.routed_expert_norm = None
             self.routed_expert_up_proj = None
 
+        # The NPU checkpoint uses different precisions for the two independent
+        # front projections (bf16 router gate, dynamic-int8 latent down), so
+        # they cannot use the CUDA merged-weight kernel. They can still run on
+        # separate streams without changing either projection's numerics.
+        self._npu_front_overlap = (
+            _is_npu
+            and envs.SGLANG_NPU_K3_FRONT_OVERLAP.get()
+            and self.use_latent_moe
+            and self.routed_expert_down_proj is not None
+            and self.alt_stream is not None
+        )
+
         # Static eligibility for fusing the fused-front latent all-reduce with
         # the RMSNorm epilogue (SGLANG_K3_AR_FUSION). The kernel views the flat
         # [latent | shared] buffer as [3N, NORM_DIM] rows and norms the first N,
@@ -1069,6 +1081,29 @@ class KimiK3MoE(nn.Module):
                 value.record_stream(current_stream)
         return topk_output, routed_input
 
+    def _npu_ep_front_overlap(self, hidden_states: torch.Tensor):
+        """Overlap the exact NPU router with the quantized latent projection.
+
+        Enqueue the main-stream projection first so graph capture keeps the
+        main chain on one internal stream. The router and top-k use the side
+        stream, join immediately, and leave it free for shared-expert SBO.
+        """
+        if not self._npu_front_overlap or hidden_states.shape[0] == 0:
+            return None
+
+        current_stream = torch.cuda.current_stream()
+        self.alt_stream.wait_stream(current_stream)
+        routed_input, _ = self.routed_expert_down_proj(hidden_states)
+        with torch.cuda.stream(self.alt_stream):
+            router_logits = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+
+        current_stream.wait_stream(self.alt_stream)
+        for value in topk_output:
+            if isinstance(value, torch.Tensor):
+                value.record_stream(current_stream)
+        return topk_output, routed_input
+
     def _reduce_latent(
         self, latent: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -1247,6 +1282,8 @@ class KimiK3MoE(nn.Module):
         routed_input = self._ep_front(hidden_states)
         if routed_input is None:
             routed_input = self._ep_front_overlap(hidden_states)
+        if routed_input is None:
+            routed_input = self._npu_ep_front_overlap(hidden_states)
         topk_output = None
         if routed_input is not None:
             topk_output, routed_input = routed_input

@@ -873,6 +873,8 @@ class Envs:
     SGLANG_NPU_FUSED_COLLECTIVE_MATMUL = EnvBool(False)
     # Fuse K3 latent RMSNorm with the dynamic-int8 quantization for up-proj.
     SGLANG_NPU_FUSED_RMS_QUANT = EnvBool(False)
+    # Overlap the K3 router gate/top-k with the quantized latent down projection.
+    SGLANG_NPU_K3_FRONT_OVERLAP = EnvBool(False)
     SGLANG_NPU_FUSED_KDA_VERIFY_GATES = EnvBool(False)
     SGLANG_NPU_FUSED_KDA_RAGGED_IO = EnvBool(False)
     SGLANG_NPU_FUSED_KDA_ONORM = EnvBool(False)
