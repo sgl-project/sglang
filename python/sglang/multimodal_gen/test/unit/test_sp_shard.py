@@ -13,10 +13,9 @@ from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
 )
 
 
-def _fake_sp(monkeypatch, sp_size, sp_rank=0, ring=1):
+def _fake_sp(monkeypatch, sp_size, sp_rank=0):
     monkeypatch.setattr(sps, "get_sp_world_size", lambda: sp_size)
     monkeypatch.setattr(sps, "get_sp_parallel_rank", lambda: sp_rank)
-    monkeypatch.setattr(sps, "get_ring_parallel_world_size", lambda: ring)
 
 
 # --- build_shard_plan math --------------------------------------------------------
@@ -150,10 +149,12 @@ def test_strategy_replicates_when_padding_spans_multiple_shards(monkeypatch):
     assert sps.plan_text_strategy(14) == "shard"
 
 
-def test_strategy_ring_blocks_padded_shard(monkeypatch):
-    _fake_sp(monkeypatch, 2, ring=2)
-    assert sps.plan_text_strategy(15) == "replicate"  # padded shard needs mask
-    assert sps.plan_text_strategy(16) == "shard"  # divisible: no mask needed
+def test_strategy_shards_padded_text_under_ring(monkeypatch):
+    # Tail-padded shards ride the ring kernel now; the strategy no longer
+    # consults the ring degree at all.
+    _fake_sp(monkeypatch, 2)
+    assert sps.plan_text_strategy(15) == "shard"
+    assert sps.plan_text_strategy(16) == "shard"
 
 
 def test_strategy_min_len_threshold(monkeypatch):

@@ -26,7 +26,7 @@ import triton.language as tl
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.communication.all_reduce import (
     fused_parallel_qknorm,
     get_fused_parallel_qknorm_max_occupancy,
@@ -85,7 +85,7 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
     get_schedule,
-    get_server_args,
+    process_model_config,
 )
 
 # get_bool_env_var is defined in sglang.srt.utils.common, not sglang.srt.distributed.
@@ -431,10 +431,9 @@ class MiniMaxM2QKRMSNorm:
 
         props = torch.cuda.get_device_properties(device)
         # probe the maximum tokens for one prefill
-        server_args = get_server_args()
         max_tokens = get_schedule().chunked_prefill_size
         if max_tokens is None:
-            max_tokens = server_args.model_config.context_len
+            max_tokens = process_model_config().context_len
         max_tokens = max(max_tokens, get_schedule().max_prefill_tokens)
         logger.info(f"[AR] Using CustomAllReduceV2 for MiniMaxM2 with {max_tokens = }")
         ALIGN = 512
@@ -483,10 +482,26 @@ class MiniMaxM2QKRMSNorm:
         return q, k
 
     def _forward_cpu(self, q: torch.Tensor, k: torch.Tensor):
-        # TODO: add c++ kernel for cpu
-        q = self._q_norm(q.contiguous())
-        k = self._k_norm(k.contiguous())
-        return q, k
+        if self._world_size > 1:
+            sum_sq = torch.ops.sgl_kernel.fused_qk_rmsnorm_sumsq_cpu(q, k)
+            sum_sq = attn_tp_all_reduce(sum_sq)
+            return torch.ops.sgl_kernel.fused_qk_rmsnorm_apply_from_stats_cpu(
+                q,
+                k,
+                self._q_norm.weight,
+                self._k_norm.weight,
+                sum_sq,
+                self._world_size,
+                self._eps,
+            )
+
+        return torch.ops.sgl_kernel.fused_qk_rmsnorm_cpu(
+            q,
+            k,
+            self._q_norm.weight,
+            self._k_norm.weight,
+            self._eps,
+        )
 
 
 class MiniMaxM2MoE(nn.Module):
