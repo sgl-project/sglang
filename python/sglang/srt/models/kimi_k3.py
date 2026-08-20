@@ -655,6 +655,10 @@ class KimiK3MoE(nn.Module):
             self._npu_quant_shared_input = supports_npu_prequantized_input(
                 self.shared_experts.gate_up_proj
             )
+        self._npu_packed_quant_shared_input = (
+            self._npu_quant_shared_input
+            and envs.SGLANG_NPU_PACKED_QUANT_SHARED_AG.get()
+        )
 
         # SBO (single batch overlap): the shared experts read a fixed slab of
         # weights the routed path never touches (bf16 — the checkpoint leaves
@@ -1098,32 +1102,57 @@ class KimiK3MoE(nn.Module):
             quant_hidden_states, dynamic_scale = (
                 torch.ops.npu.npu_dynamic_quant(hidden_states)
             )
-            gathered_hidden_states = torch.empty(
-                (
-                    quant_hidden_states.shape[0] * group.world_size,
-                    *quant_hidden_states.shape[1:],
-                ),
-                dtype=quant_hidden_states.dtype,
-                device=quant_hidden_states.device,
-            )
-            gathered_scale = torch.empty(
-                (
-                    dynamic_scale.shape[0] * group.world_size,
-                    *dynamic_scale.shape[1:],
-                ),
-                dtype=dynamic_scale.dtype,
-                device=dynamic_scale.device,
-            )
-            if group is get_parallel().attn_tp_group:
-                attn_tp_all_gather_into_tensor(
-                    gathered_hidden_states, quant_hidden_states
+            if self._npu_packed_quant_shared_input:
+                from sgl_kernel_npu.kimi_k3.quant_comm import (
+                    pack_quant_scale,
+                    unpack_gathered_quant_scale,
                 )
-                attn_tp_all_gather_into_tensor(gathered_scale, dynamic_scale)
+
+                packed = pack_quant_scale(quant_hidden_states, dynamic_scale)
+                gathered_packed = torch.empty(
+                    packed.numel() * group.world_size,
+                    dtype=packed.dtype,
+                    device=packed.device,
+                )
+                if group is get_parallel().attn_tp_group:
+                    attn_tp_all_gather_into_tensor(gathered_packed, packed)
+                else:
+                    group.all_gather_into_tensor(gathered_packed, packed)
+                gathered_hidden_states, gathered_scale = (
+                    unpack_gathered_quant_scale(
+                        gathered_packed,
+                        quant_hidden_states.shape,
+                        dynamic_scale.shape,
+                        group.world_size,
+                    )
+                )
             else:
-                group.all_gather_into_tensor(
-                    gathered_hidden_states, quant_hidden_states
+                gathered_hidden_states = torch.empty(
+                    (
+                        quant_hidden_states.shape[0] * group.world_size,
+                        *quant_hidden_states.shape[1:],
+                    ),
+                    dtype=quant_hidden_states.dtype,
+                    device=quant_hidden_states.device,
                 )
-                group.all_gather_into_tensor(gathered_scale, dynamic_scale)
+                gathered_scale = torch.empty(
+                    (
+                        dynamic_scale.shape[0] * group.world_size,
+                        *dynamic_scale.shape[1:],
+                    ),
+                    dtype=dynamic_scale.dtype,
+                    device=dynamic_scale.device,
+                )
+                if group is get_parallel().attn_tp_group:
+                    attn_tp_all_gather_into_tensor(
+                        gathered_hidden_states, quant_hidden_states
+                    )
+                    attn_tp_all_gather_into_tensor(gathered_scale, dynamic_scale)
+                else:
+                    group.all_gather_into_tensor(
+                        gathered_hidden_states, quant_hidden_states
+                    )
+                    group.all_gather_into_tensor(gathered_scale, dynamic_scale)
             return (gathered_hidden_states, gathered_scale), True
 
         # SP-MoE presents one contiguous token shard per attention-TP rank;
