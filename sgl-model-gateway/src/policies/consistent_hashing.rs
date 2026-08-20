@@ -514,6 +514,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_strict_consistent_hashing_ignores_active_load() {
+        let policy = ConsistentHashingPolicy::new();
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let ring = Arc::new(HashRing::new(&workers));
+        let key = "strict-active-load-key";
+
+        let explicit_headers = headers_with_routing_key(key);
+        let explicit_info = SelectWorkerInfo {
+            headers: Some(&explicit_headers),
+            hash_ring: Some(Arc::clone(&ring)),
+            ..Default::default()
+        };
+        let explicit_before = policy.select_worker_impl(&workers, &explicit_info);
+
+        let implicit_before: Vec<_> = ["authorization", "x-forwarded-for", "cookie"]
+            .into_iter()
+            .map(|header_name| {
+                let mut headers = http::HeaderMap::new();
+                headers.insert(header_name, key.parse().unwrap());
+                let info = SelectWorkerInfo {
+                    headers: Some(&headers),
+                    hash_ring: Some(Arc::clone(&ring)),
+                    ..Default::default()
+                };
+                policy.select_worker_impl(&workers, &info)
+            })
+            .collect();
+
+        let target_headers = headers_with_target_worker(1);
+        let target_info = SelectWorkerInfo {
+            headers: Some(&target_headers),
+            hash_ring: Some(Arc::clone(&ring)),
+            ..Default::default()
+        };
+        let target_before = policy.select_worker_impl(&workers, &target_info);
+
+        for (worker, load) in workers.iter().zip([31usize, 7, 1]) {
+            for _ in 0..load {
+                worker.increment_load();
+            }
+        }
+
+        assert_eq!(
+            policy.select_worker_impl(&workers, &explicit_info),
+            explicit_before
+        );
+        for (header_name, expected) in ["authorization", "x-forwarded-for", "cookie"]
+            .into_iter()
+            .zip(implicit_before)
+        {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(header_name, key.parse().unwrap());
+            let info = SelectWorkerInfo {
+                headers: Some(&headers),
+                hash_ring: Some(Arc::clone(&ring)),
+                ..Default::default()
+            };
+            assert_eq!(policy.select_worker_impl(&workers, &info), expected);
+        }
+        assert_eq!(
+            policy.select_worker_impl(&workers, &target_info),
+            target_before
+        );
+
+        for (worker, load) in workers.iter().zip([31usize, 7, 1]) {
+            for _ in 0..load {
+                worker.decrement_load();
+            }
+            assert_eq!(worker.load(), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn test_policy_name() {
         let policy = ConsistentHashingPolicy::new();
         assert_eq!(policy.name(), "consistent_hashing");

@@ -165,7 +165,7 @@ async fn non_igw_bounded_spill_uses_key_relative_clockwise_ring() {
     }
 
     let mean_load = ARTIFICIAL_PREFERRED_LOAD as f64 / available.len() as f64;
-    assert!(ARTIFICIAL_PREFERRED_LOAD > 1);
+    assert!(preferred_worker.load() > 1);
     assert!((ARTIFICIAL_PREFERRED_LOAD as f64) > mean_load * 1.5);
 
     let request: GenerateRequest = serde_json::from_value(json!({
