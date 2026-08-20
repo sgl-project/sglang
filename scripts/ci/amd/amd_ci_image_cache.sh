@@ -51,6 +51,10 @@ image_cache_init() {
   fi
   IMAGE_CACHE_DIR="${cache_host}/docker-images"
   echo "Image tarball cache: ${IMAGE_CACHE_DIR} (suffix '.tar${IMAGE_CACHE_EXT}')"
+  # Prune here rather than only before a seed: a job that hits the cache never
+  # calls image_cache_save, so pruning from there alone would leave stale
+  # tarballs behind whenever the image tag stops advancing.
+  image_cache_prune
 }
 
 # image_cache_path <image_ref>
@@ -96,8 +100,6 @@ image_cache_save() {
   [[ -n "${IMAGE_CACHE_DIR}" ]] || return 0
   path=$(image_cache_path "${image}")
   [[ -f "${path}" ]] && return 0
-
-  image_cache_prune
 
   avail=$(df -BG --output=avail "${IMAGE_CACHE_DIR}" 2>/dev/null | tail -n 1 | tr -dc '0-9')
   if [[ -z "${avail}" ]]; then
