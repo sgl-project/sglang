@@ -485,6 +485,9 @@ class Envs:
     SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH = EnvStr("")
     SGLANG_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL = EnvInt(0)
     SGLANG_DSPARK_ENABLE_SPS_RECORD = EnvBool(False)
+    # Optional compact-verify graph token buckets (for example "4,8,12").
+    # Empty preserves the default request-batch-derived capture grid.
+    SGLANG_DSPARK_RAGGED_CAPTURE_TOKEN_BUCKETS = EnvTuple(tuple())
     SGLANG_DSPARK_FAST_KERNEL = EnvBool(True)
     SGLANG_DSPARK_FUSED_LOCAL_TOP1 = EnvBool(False)
     SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)

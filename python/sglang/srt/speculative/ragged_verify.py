@@ -216,6 +216,38 @@ def build_capture_verify_lens(
     return [base + 1] * rem + [base] * (num_slots - rem)
 
 
+def build_ragged_capture_token_buckets(
+    *,
+    capture_bs: Sequence[int],
+    num_draft_tokens: int,
+    extra_token_buckets: Sequence[str] = (),
+) -> list[int]:
+    """Build a compact-verify token grid while preserving all default tiers."""
+    buckets = {int(bs) * int(num_draft_tokens) for bs in capture_bs}
+    if not buckets or min(buckets) <= 0:
+        raise ValueError(
+            "ragged capture requires positive capture_bs and num_draft_tokens, "
+            f"got capture_bs={list(capture_bs)}, num_draft_tokens={num_draft_tokens}"
+        )
+
+    max_num_tokens = max(buckets)
+    for raw_bucket in extra_token_buckets:
+        try:
+            bucket = int(raw_bucket)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "SGLANG_DSPARK_RAGGED_CAPTURE_TOKEN_BUCKETS must contain integers, "
+                f"got {raw_bucket!r}"
+            ) from exc
+        if not 0 < bucket <= max_num_tokens:
+            raise ValueError(
+                "SGLANG_DSPARK_RAGGED_CAPTURE_TOKEN_BUCKETS entries must be in "
+                f"[1, {max_num_tokens}], got {bucket}"
+            )
+        buckets.add(bucket)
+    return sorted(buckets)
+
+
 def resolve_ragged_verify_layout(forward_batch) -> Optional[RaggedVerifyLayout]:
     """Layout riding the batch's spec input, or None. Tolerates the runner's
     ad-hoc replay batch views, which may not carry spec_info at all."""

@@ -74,7 +74,7 @@ do
         export SGLANG_NPU_QUANT_SHARED_AG=${SGLANG_NPU_QUANT_SHARED_AG:-1}
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
-        export SGLANG_RAGGED_VERIFY_MODE=static
+        export SGLANG_RAGGED_VERIFY_MODE=${SGLANG_RAGGED_VERIFY_MODE:-static}
         # Maximum #35266 + #34944 stack: fused K3 target projection is selected
         # by the model code, while the proposal-side fast paths stay explicit
         # here so an inherited environment cannot silently disable them.

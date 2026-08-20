@@ -128,5 +128,46 @@ class TestCaptureVerifyLens(CustomTestCase):
             build_capture_verify_lens(num_tokens=4, num_slots=8, num_draft_tokens=8)
 
 
+class TestRaggedCaptureTokenBuckets(CustomTestCase):
+    def test_default_grid_is_unchanged(self):
+        from sglang.srt.speculative.ragged_verify import (
+            build_ragged_capture_token_buckets,
+        )
+
+        self.assertEqual(
+            build_ragged_capture_token_buckets(
+                capture_bs=[1, 2, 4, 8], num_draft_tokens=16
+            ),
+            [16, 32, 64, 128],
+        )
+
+    def test_extra_token_buckets_are_merged(self):
+        from sglang.srt.speculative.ragged_verify import (
+            build_ragged_capture_token_buckets,
+        )
+
+        self.assertEqual(
+            build_ragged_capture_token_buckets(
+                capture_bs=[1, 2, 4, 8],
+                num_draft_tokens=16,
+                extra_token_buckets=("4", "8", "12", "16"),
+            ),
+            [4, 8, 12, 16, 32, 64, 128],
+        )
+
+    def test_extra_token_bucket_range_is_validated(self):
+        from sglang.srt.speculative.ragged_verify import (
+            build_ragged_capture_token_buckets,
+        )
+
+        for invalid in ("0", "129", "not-an-int"):
+            with self.assertRaises(ValueError):
+                build_ragged_capture_token_buckets(
+                    capture_bs=[1, 2, 4, 8],
+                    num_draft_tokens=16,
+                    extra_token_buckets=(invalid,),
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

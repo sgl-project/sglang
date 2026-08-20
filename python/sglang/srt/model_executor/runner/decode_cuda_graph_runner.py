@@ -509,9 +509,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.shared_read_done_event = read_done
 
     def _build_ragged_verify_token_buckets(self) -> list[int]:
-        buckets = sorted({bs * self.captured_req_width for bs in self.capture_bs})
-        assert buckets and buckets[0] > 0, f"{buckets=}"
-        return buckets
+        from sglang.srt.speculative.ragged_verify import (
+            build_ragged_capture_token_buckets,
+        )
+
+        return build_ragged_capture_token_buckets(
+            capture_bs=self.capture_bs,
+            num_draft_tokens=self.captured_req_width,
+            extra_token_buckets=envs.SGLANG_DSPARK_RAGGED_CAPTURE_TOKEN_BUCKETS.get(),
+        )
 
     def _autotune_buffers(self):
         """Reuse these static decode buffers (sized to max_bs) for the warmup
@@ -1063,10 +1069,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             empty_cache=False,
         )
         # Reverse so cuda graphs share memory better.
+        capture_sizes = (
+            self.capture_num_tokens if self.ragged_verify_mode else self.capture_bs
+        )
         capture_range = (
-            tqdm.tqdm(list(reversed(self.capture_bs)))
+            tqdm.tqdm(list(reversed(capture_sizes)))
             if get_parallel().tp_rank == 0
-            else reversed(self.capture_bs)
+            else reversed(capture_sizes)
         )
         lora_variants = (
             [("lora", True), ("nolora", False)]
@@ -1084,7 +1093,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         dsa_variants = (
             ["dense", "sparse"] if getattr(self, "dsa_dual_graph", False) else [None]
         )
-        for bs in capture_range:
+        for size in capture_range:
+            num_tokens = (
+                size if self.ragged_verify_mode else size * self.captured_req_width
+            )
+            nominal_bs = (
+                num_tokens // self.captured_req_width
+                if num_tokens % self.captured_req_width == 0
+                else -1
+            )
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
                     self.model_runner.device,
@@ -1092,7 +1109,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     empty_cache=False,
                 )
                 capture_range.set_description(
-                    f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
+                    f"Capturing batches ({size=} {num_tokens=} {avail_mem=:.2f} GB)"
                 )
 
             for variant_label, _variant_has_lora in lora_variants:
@@ -1101,17 +1118,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     _set_capture_dsa_variant(dsa_variant)
                     with torch_compile_decoration.patch_model(
                         self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.captured_req_width,
+                        nominal_bs in self.compile_bs,
+                        num_tokens=num_tokens,
                         tp_group=self.model_runner.tp_group,
                     ) as forward:
                         if dsa_variant is None:
                             self.capture_one_shape(
-                                bs, forward, stream_idx, variant_label
+                                size, forward, stream_idx, variant_label
                             )
                         else:
                             self.capture_one_shape(
-                                bs, forward, stream_idx, variant_label, dsa_variant
+                                size, forward, stream_idx, variant_label, dsa_variant
                             )
         _set_capture_dsa_variant(None)
 
@@ -1123,7 +1140,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         variant_label: Optional[str] = None,
         dsa_variant: Optional[str] = None,
     ):
-        num_tokens = size * self.captured_req_width
+        num_tokens = (
+            size if self.ragged_verify_mode else size * self.captured_req_width
+        )
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
