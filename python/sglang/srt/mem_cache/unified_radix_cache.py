@@ -823,7 +823,10 @@ class UnifiedRadixCache(BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_len_to_handle
             ]
-            self.token_to_kv_pool_allocator.free_segment(kv_indices, start_pos=0)
+            self.token_to_kv_pool_allocator.free_request_segments(
+                [(kv_indices, 0)],
+                swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
+            )
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
@@ -880,11 +883,14 @@ class UnifiedRadixCache(BasePrefixCache):
             segments = [(kv_indices[page_aligned_len:], page_aligned_len)]
             if tail_free_start is not None:
                 segments.append((kv_indices_full[tail_free_start:], tail_free_start))
-            self.token_to_kv_pool_allocator.free_segments(segments)
+            self.token_to_kv_pool_allocator.free_request_segments(
+                segments,
+                swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
+            )
         else:
-            self.token_to_kv_pool_allocator.free_segment(
-                kv_indices[req.cache_protected_len :],
-                start_pos=req.cache_protected_len,
+            self.token_to_kv_pool_allocator.free_request_segments(
+                [(kv_indices[req.cache_protected_len :], req.cache_protected_len)],
+                swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
             )
 
         self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)

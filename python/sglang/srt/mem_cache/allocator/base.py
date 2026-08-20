@@ -164,3 +164,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
                 start_pos = boundary
             prev_end = seg_end
             self.free_segment(free_index, start_pos=start_pos)
+
+    def free_request_segments(self, segments, *, swa_evicted_seqlen: int):
+        """Free request-row segments using CPU-known per-request state.
+
+        Non-SWA allocators have no auxiliary mapping frontier, so this is the
+        ordinary segment release. SWA allocators override it to avoid global
+        sparse-mapping discovery on the scheduler thread.
+        """
+        self.free_segments(segments)

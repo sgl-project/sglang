@@ -101,6 +101,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.swa_free_group = []
         self.free_segments_group = []
         self.swa_free_segments_group = []
+        self.request_free_segments_group = []
         self._segment_release_has_dense_swa_mapping = True
 
         self._kvcache = kvcache
@@ -410,8 +411,69 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_attn_allocator.free_segment(free_index, start_pos=start_pos)
         self.swa_attn_allocator.free_segment(swa_indices, start_pos=start_pos)
 
+        self._clear_full_mapping_pages(free_index, start_pos=start_pos)
+
+    def free_request_segments(self, segments, *, swa_evicted_seqlen: int):
+        """Release one request without discovering its mapped SWA pages.
+
+        ``swa_evicted_seqlen`` is maintained on CPU and page-aligned. Full KV
+        owns every requested segment; SWA KV owns only the suffix at or after
+        that frontier. This per-request fact remains valid even when another
+        request made the allocator's global mapping sparse.
+        """
+        request_segments = [
+            (indices, start_pos)
+            for indices, start_pos in segments
+            if indices.numel() > 0
+        ]
+        if not request_segments:
+            return
+        if not self.is_not_in_free_group:
+            self.request_free_segments_group.append(
+                (
+                    [
+                        (self._copy_for_free_group(indices), start_pos)
+                        for indices, start_pos in request_segments
+                    ],
+                    swa_evicted_seqlen,
+                )
+            )
+            return
+        if self.page_size == 1:
+            self.free_segments(request_segments)
+            return
+
+        self.full_attn_allocator.free_segments(request_segments)
+
+        live_swa_segments = []
+        live_full_segments = []
+        for free_index, start_pos in request_segments:
+            end_pos = start_pos + free_index.numel()
+            live_start = max(start_pos, swa_evicted_seqlen)
+            if live_start >= end_pos:
+                continue
+            live_full = free_index[live_start - start_pos :]
+            live_swa = torch.index_select(
+                self.full_to_swa_index_mapping,
+                0,
+                live_full.to(torch.int64),
+            )
+            if getattr(self.swa_attn_allocator, "debug_mode", False):
+                assert torch.all(
+                    live_swa > 0
+                ).item(), "request SWA suffix contains an unmapped token"
+            live_swa_segments.append((live_swa, live_start))
+            live_full_segments.append((live_full, live_start))
+
+        self.swa_attn_allocator.free_segments(live_swa_segments)
+        for live_full, live_start in live_full_segments:
+            self._clear_full_mapping_pages(live_full, start_pos=live_start)
+
+    def _clear_full_mapping_pages(
+        self, full_indices: torch.Tensor, *, start_pos: int
+    ) -> None:
         representatives = page_representatives_from_segment(
-            free_index, start_pos=start_pos, page_size=self.page_size
+            full_indices, start_pos=start_pos, page_size=self.page_size
         )
         full_page_ids = torch.cat(
             [
@@ -420,12 +482,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             ]
         )
         page_offsets = torch.arange(
-            self.page_size, dtype=torch.int64, device=free_index.device
+            self.page_size, dtype=torch.int64, device=full_indices.device
         )
         mapping_indices = (
             full_page_ids[:, None] * self.page_size + page_offsets[None, :]
         ).reshape(-1)
-        self.clear_full_to_swa_mapping(mapping_indices)
+        self.full_to_swa_index_mapping.index_fill_(0, mapping_indices, 0)
 
     def free_swa(self, free_index: torch.Tensor):
         self._segment_release_has_dense_swa_mapping = False
@@ -459,7 +521,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 swa_indices > 0
             ).item(), "dense SWA window release encountered an unmapped token"
         self.swa_attn_allocator.free_segment(swa_indices, start_pos=start_pos)
-        self.clear_full_to_swa_mapping(full_indices)
+        self.full_to_swa_index_mapping.index_fill_(0, full_indices, 0)
 
     def _free_swa_legacy(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
@@ -482,6 +544,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_group_begin(self):
         super().free_group_begin()
         self.swa_free_group = []
+        self.request_free_segments_group = []
 
     def free_group_end(self):
         super().free_group_end()
@@ -489,6 +552,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             swa_free_group = self.swa_free_group
             self.swa_free_group = []
             self.free_swa(torch.cat(swa_free_group))
+        if self.request_free_segments_group:
+            request_groups = self.request_free_segments_group
+            self.request_free_segments_group = []
+            for segments, swa_evicted_seqlen in request_groups:
+                self.free_request_segments(
+                    segments, swa_evicted_seqlen=swa_evicted_seqlen
+                )
 
     def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
         pages = torch.unique(indices // self.page_size)
@@ -521,6 +591,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.swa_free_group = []
         self.free_segments_group = []
         self.swa_free_segments_group = []
+        self.request_free_segments_group = []
         self._segment_release_has_dense_swa_mapping = True
 
     def get_cpu_copy(self, indices, mamba_indices=None):

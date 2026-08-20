@@ -244,6 +244,7 @@ class TestSWADenseSegmentRelease(unittest.TestCase):
         alloc.swa_free_group = []
         alloc.free_segments_group = []
         alloc.swa_free_segments_group = []
+        alloc.request_free_segments_group = []
         alloc._segment_release_has_dense_swa_mapping = True
         return alloc
 
@@ -334,6 +335,44 @@ class TestSWADenseSegmentRelease(unittest.TestCase):
                 expected_full_pages,
             )
         )
+
+    def test_request_frontier_bypasses_global_sparse_fallback(self):
+        alloc = self._make_swa_allocator()
+        full_row = alloc.full_attn_allocator.alloc(3 * PAGE_SIZE)
+        swa_row = alloc.swa_attn_allocator.alloc(3 * PAGE_SIZE)
+        alloc.full_to_swa_index_mapping[full_row] = swa_row
+
+        # Another request's eviction makes the global mapping sparse. This
+        # request's own CPU frontier still identifies its live SWA suffix.
+        alloc._segment_release_has_dense_swa_mapping = False
+        alloc.full_to_swa_index_mapping[full_row[:PAGE_SIZE]] = 0
+
+        with patch("torch.unique", side_effect=AssertionError("unexpected unique")):
+            alloc.free_request_segments([(full_row, 0)], swa_evicted_seqlen=PAGE_SIZE)
+
+        self.assertEqual(len(alloc.full_attn_allocator.release_pages), 3)
+        self.assertEqual(len(alloc.swa_attn_allocator.release_pages), 2)
+        self.assertTrue(torch.all(alloc.full_to_swa_index_mapping[full_row] == 0))
+
+    def test_grouped_request_release_owns_input(self):
+        alloc = self._make_swa_allocator()
+        full_row = alloc.full_attn_allocator.alloc(2 * PAGE_SIZE)
+        swa_row = alloc.swa_attn_allocator.alloc(2 * PAGE_SIZE)
+        alloc.full_to_swa_index_mapping[full_row] = swa_row
+        expected_full_pages = torch.unique(full_row // PAGE_SIZE)
+
+        alloc.free_group_begin()
+        alloc.free_request_segments([(full_row, 0)], swa_evicted_seqlen=0)
+        full_row.zero_()
+        alloc.free_group_end()
+
+        self.assertTrue(
+            torch.equal(
+                torch.sort(alloc.full_attn_allocator.release_pages)[0],
+                expected_full_pages,
+            )
+        )
+        self.assertEqual(len(alloc.swa_attn_allocator.release_pages), 2)
 
 
 if __name__ == "__main__":
