@@ -1,10 +1,8 @@
 """Large-batch dLLM coverage on Ascend.
 
 test_npu_llada2_mini.py pins the single-request latency recipe: one running
-request and synchronous denoise (`--no-dllm-fdfo`). That leaves the FDFO
-scheduler -- the default, and the one a rollout deployment runs -- with no NPU
-e2e coverage at all, and several scheduler and denoise paths only exist above a
-row-count threshold that bs=1 cannot reach.
+request and synchronous denoise (`--no-dllm-fdfo`). This file covers the FDFO
+scheduler at a batch wide enough to reach the row-count thresholds.
 
 This runs the same gsm8k check on the throughput recipe instead: FDFO, a wide
 batch, and (in the second case) prefill and decode rows scheduled into one
@@ -105,9 +103,7 @@ class TestLLaDA2MiniMixedRound(GSM8KAscendMixin, CustomTestCase):
     env = {**GSM8KAscendMixin.env, "SGLANG_ENABLE_DLLM_MIXED_BATCH": "1"}
 
     def test_gsm8k(self):
-        # Override rather than assert in a sibling test method: the round
-        # counters only mean something after traffic, and unittest's
-        # alphabetical ordering is not a contract to lean on.
+        # See TestLLaDA2MiniLargeBatch.test_gsm8k.
         super().test_gsm8k()
         assert_mixed_rounds(self, True)
 

@@ -8,10 +8,8 @@ decode row to coexist at all. None of that is reachable at bs=4, so this runs
 the same gsm8k check at a batch wide enough to enter them -- the RL-rollout
 shape this model is served in.
 
-The mixed-round flag is parametrized here rather than unit-tested: the round
-composition needs a live Scheduler, PrefillAdder and both memory pools, and the
-one existing dLLM test of that shape rotted into a module-level skip when its
-fixtures drifted from the code. A server test cannot drift the same way.
+The mixed-round flag is parametrized here rather than unit-tested: round
+composition needs a live Scheduler, PrefillAdder and both memory pools.
 """
 
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -39,16 +37,11 @@ MODEL = "inclusionAI/LLaDA2.0-mini"
 # 64 concurrent requests x a 32-token denoise block = 2048 rows per forward,
 # past every row-count threshold on the dLLM path. Larger would be more
 # representative of a rollout but would not cover anything more.
-# Each concurrent request costs roughly 50 MB outside the static pool: its
-# 32-row slice of the persistent fp32 [rows, vocab] logits buffer, of the fp32
-# softmax the denoise step allocates on top of it, and of the bf16 lm_head
-# output in the graph pool. At 64 that is ~3.2 GB against the ~8 GB that
-# mem-fraction-static 0.9 leaves free on an 80 GB card. Raising this past 64
-# means lowering mem-fraction-static with it.
+# Each concurrent request costs memory outside the static pool, so raising
+# this means lowering --mem-fraction-static with it.
 MAX_RUNNING_REQUESTS = 64
-# 400 rather than the 200 the bs=4 tests use: one flipped example moves the
-# score by 0.0025 instead of 0.005, and unmask order near LowConfidence's 0.95
-# gate does shift when the GEMM goes from 128 rows to 2048.
+# 400 (not the 200 the bs=4 tests use): unmask order near LowConfidence's
+# gate shifts at this batch, so halve the per-example score granularity.
 GSM8K_NUM_EXAMPLES = 400
 GSM8K_SCORE_THRESHOLD = 0.88
 
