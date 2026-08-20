@@ -24,6 +24,7 @@ from sglang.srt.function_call.kimik3_format import (
     ARGUMENT_CLOSE,
     CALL_CLOSE,
     CALL_OPEN,
+    RESPONSE_CLOSE,
     THINK_CLOSE,
     THINK_OPEN,
     TOOLS_CLOSE,
@@ -685,7 +686,16 @@ def get_kimik3_structural_tag(
     tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
     thinking_mode: bool = False,
     parallel_tool_calls: bool = True,
+    response_channel_open: bool = False,
 ) -> StructuralTag:
+    """Build the K3 tool-call constraint.
+
+    ``response_channel_open`` says the generation prompt already opened the
+    response channel, which is what the encoder emits when thinking is off. It
+    decides how a forced call reaches the tools section: from inside an open
+    response channel the model must close it first, otherwise the tools section
+    comes immediately.
+    """
     selected_tools, at_least_one = _select_tools(tools, tool_choice)
     if not selected_tools:
         raise ValueError("Kimi K3 structural tags require at least one tool")
@@ -693,10 +703,21 @@ def get_kimik3_structural_tag(
     call_tags = [_tool_call_tag(tool) for tool in selected_tools]
     tools_tag = _tool_calls_tag(call_tags, parallel_tool_calls)
     if at_least_one:
+        # Inside an already-open response channel the model must close it before
+        # the tools section, and the close comes first: left free, the model
+        # answers in that channel and never reaches the tools section, and since
+        # the grammar still requires one it cannot stop either -- generation runs
+        # to max_tokens with no tool call at all. With the channel not yet open
+        # (reasoning on, so the model closes think first) a complete response
+        # block before the call is legitimate and stays allowed.
         suffix: Format = SequenceFormat(
             elements=[
-                AnyTextFormat(
-                    excludes=[TOOLS_OPEN, THINK_OPEN, THINK_CLOSE, CALL_OPEN]
+                (
+                    ConstStringFormat(value=RESPONSE_CLOSE)
+                    if response_channel_open
+                    else AnyTextFormat(
+                        excludes=[TOOLS_OPEN, THINK_OPEN, THINK_CLOSE, CALL_OPEN]
+                    )
                 ),
                 tools_tag,
             ]
