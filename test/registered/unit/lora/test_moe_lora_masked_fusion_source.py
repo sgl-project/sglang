@@ -18,7 +18,6 @@ from unittest import mock
 import msgspec
 import torch
 
-from sglang.srt.lora.moe.activation import ActivationFn
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-c-test-cpu")
@@ -223,27 +222,25 @@ class TestMaskedFusionSource(unittest.TestCase):
         row = _source("masked_row_domain.py")
         runner = (LORA_MOE / "moe_lora_runner.py").read_text()
         for method in (
-            "fused_act_implementations",
-            "supports_fused_act",
             "run_fused_act",
-            "fused_finalize_implementations",
-            "supports_fused_finalize",
             "run_shared_rank_finalize",
             "run_shared_rank_reduce",
             "finish_shared_rank_finalize",
             "mapped_down_lora_a_input",
         ):
             self.assertIn(f"def {method}(", base)
-        for method in (
-            "fused_act_implementations",
-            "run_fused_act",
-            "fused_finalize_implementations",
-            "run_shared_rank_finalize",
-            "run_shared_rank_reduce",
-            "finish_shared_rank_finalize",
-            "mapped_down_lora_a_input",
-        ):
             self.assertIn(f"def {method}(", row)
+        # Every fused stage has exactly one implementation, so no stage takes
+        # an implementation name and no provider enumerates or installs one.
+        for gone in (
+            "implementation: str",
+            "def supports_fused_act(",
+            "def supports_fused_finalize(",
+            "def fused_act_implementations(",
+            "def install_fused_act_implementation(",
+        ):
+            self.assertNotIn(gone, base)
+            self.assertNotIn(gone, row)
 
         body = _function(row, "run_fused_act")
         self.assertIn("row_state.src2dst", body)
@@ -268,13 +265,12 @@ class TestMaskedFusionSource(unittest.TestCase):
         # physical row only through src2dst.
         contiguous = _source("contiguous_row_domain.py")
         for method in (
-            "fused_finalize_implementations",
-            "install_fused_finalize_implementation",
             "run_shared_rank_finalize",
             "run_shared_rank_reduce",
             "finish_shared_rank_finalize",
         ):
             self.assertIn(f"def {method}(", contiguous)
+        self.assertNotIn("implementation: str", contiguous)
         contiguous_finish = _function(contiguous, "finish_shared_rank_finalize")
         self.assertIn("invoke(", contiguous_finish)
         self.assertIn("down_masked=down_masked", contiguous_finish)
@@ -386,17 +382,6 @@ class TestMaskedFusionSource(unittest.TestCase):
         self.assertIn('"reduce"', finalize)
         self.assertIn('"tail"', finalize)
 
-    def test_provider_can_force_injected_implementation(self):
-        row = _source("masked_row_domain.py")
-        self.assertIn("def install_fused_act_implementation(", row)
-        self.assertIn("def install_fused_finalize_implementation(", row)
-        self.assertIn(
-            "self._fused_act_impls[(family, activation, implementation)]",
-            row,
-        )
-        self.assertIn("self._shared_reduce_impls[implementation]", row)
-        self.assertIn("self._shared_tail_impls[implementation]", row)
-
     def test_provider_constructs_every_builtin_capability_from_shared_constants(self):
         """Catch missing runtime imports in the attach-time registry builder."""
         packages = {}
@@ -486,17 +471,11 @@ class TestMaskedFusionSource(unittest.TestCase):
                 )
             )
 
-        for family in act.MASKED_ACT_FAMILIES:
-            for candidate_activation in ActivationFn:
-                self.assertTrue(
-                    provider.supports_fused_act(
-                        family,
-                        activation=candidate_activation,
-                    )
-                )
-        self.assertIn(
-            "triton",
-            provider.fused_finalize_implementations("shared_rank_reduce", "shared"),
+        # One callable per fused stage, bound at construction.
+        self.assertIs(provider._fused_act, act.run_masked_fused_act)
+        self.assertIs(provider._shared_reduce, finalize.invoke_shared_rank_reduce)
+        self.assertIs(
+            provider._shared_tail, finalize.invoke_shared_from_scratch_finalize
         )
 
         provider.contract = SimpleNamespace(lora_activation_dtype=torch.bfloat16)

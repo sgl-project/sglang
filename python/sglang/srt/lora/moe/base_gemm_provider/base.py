@@ -135,26 +135,11 @@ class MoeBaseProvider:
         """
         raise NotImplementedError
 
-    # Each implementation has a name. A config or a benchmark then selects
-    # Triton or an injected CuTe kernel.
-    def fused_act_implementations(self, family: str) -> tuple[str, ...]:
-        return ()
-
-    def supports_fused_act(
-        self,
-        family: str,
-        *,
-        activation: str,
-        implementation: str = "triton",
-    ) -> bool:
-        return implementation in self.fused_act_implementations(family)
-
     def run_fused_act(
         self,
         row_state,
         family: str,
         *,
-        implementation: str,
         activation: str,
         base_gateup: torch.Tensor,
         act_masked: torch.Tensor,
@@ -167,8 +152,7 @@ class MoeBaseProvider:
         consume_base_pdl: bool = False,
     ) -> None:
         raise NotImplementedError(
-            f"{self.contract.key} has no {implementation!r} fused-act "
-            f"implementation for {family!r}"
+            f"{self.contract.key} has no fused-act implementation for {family!r}"
         )
 
     def mapped_down_lora_a_input(
@@ -183,20 +167,6 @@ class MoeBaseProvider:
         """
 
         return None
-
-    def fused_finalize_implementations(
-        self, family: str, ownership: str
-    ) -> tuple[str, ...]:
-        return ()
-
-    def supports_fused_finalize(
-        self,
-        family: str,
-        ownership: str,
-        *,
-        implementation: str = "triton",
-    ) -> bool:
-        return implementation in self.fused_finalize_implementations(family, ownership)
 
     def supports_down_b_into_base(self) -> bool:
         """Report whether the down rows accept the down-B into-base add.
@@ -231,7 +201,6 @@ class MoeBaseProvider:
         self,
         row_state,
         *,
-        implementation: str,
         down_masked: torch.Tensor,
         bridge: torch.Tensor,
         b_down: torch.Tensor,
@@ -242,15 +211,12 @@ class MoeBaseProvider:
         token_rank: torch.Tensor,
         config: Mapping[str, Mapping[str, int]],
     ) -> None:
-        raise NotImplementedError(
-            f"{self.contract.key} has no {implementation!r} shared-rank finalizer"
-        )
+        raise NotImplementedError(f"{self.contract.key} has no shared-rank finalizer")
 
     def run_shared_rank_reduce(
         self,
         row_state,
         *,
-        implementation: str,
         bridge: torch.Tensor,
         routing: RouteView,
         topk_weights: torch.Tensor,
@@ -259,15 +225,12 @@ class MoeBaseProvider:
         config: Mapping[str, int],
     ) -> None:
         """Launch the shared-rank reduction. It does not wait for the base W2 GEMM."""
-        raise NotImplementedError(
-            f"{self.contract.key} has no {implementation!r} shared-rank reduction"
-        )
+        raise NotImplementedError(f"{self.contract.key} has no shared-rank reduction")
 
     def finish_shared_rank_finalize(
         self,
         row_state,
         *,
-        implementation: str,
         down_masked: torch.Tensor,
         b_down: torch.Tensor,
         routing: RouteView,
@@ -282,9 +245,7 @@ class MoeBaseProvider:
         Wait for the base W2 GEMM and the reduction. Then finalize the base
         rows and add the shared-B tail.
         """
-        raise NotImplementedError(
-            f"{self.contract.key} has no {implementation!r} shared B tail"
-        )
+        raise NotImplementedError(f"{self.contract.key} has no shared B tail")
 
     # The runner allocates every buffer, so it asks the provider for the shapes.
     def gateup_out_shape(self, row_state) -> tuple[int, ...]:

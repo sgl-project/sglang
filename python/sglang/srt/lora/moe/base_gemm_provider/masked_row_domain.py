@@ -9,13 +9,12 @@ DeepGEMM subclass and the CuTeDSL subclass add only ``gateup`` and ``down``.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import msgspec
 import torch
 
-from sglang.srt.lora.moe.activation import ActivationFn
 from sglang.srt.lora.moe.base_gemm_provider.base import (
     MappedLoraAInput,
     MoeBaseProvider,
@@ -91,32 +90,19 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         self._act_kernel = act_delta_masked
 
         from sglang.srt.lora.moe.base_gemm_provider.masked_finalize import (
-            MASKED_FINALIZE_TRITON,
             invoke_shared_from_scratch_finalize,
             invoke_shared_rank_reduce,
         )
         from sglang.srt.lora.moe.base_gemm_provider.masked_fused_act import (
-            MASKED_ACT_FAMILIES,
-            MASKED_ACT_TRITON,
             run_masked_fused_act,
         )
         from sglang.srt.lora.moe.lora_b import (
             invoke_down_b_into_base,
         )
 
-        # A port can install another callable under a new name. The method
-        # signatures do not change.
-        self._fused_act_impls: dict[tuple[str, str, str], Callable] = {
-            (family, activation, MASKED_ACT_TRITON): run_masked_fused_act
-            for family in MASKED_ACT_FAMILIES
-            for activation in ActivationFn
-        }
-        self._shared_reduce_impls: dict[str, Callable] = {
-            MASKED_FINALIZE_TRITON: invoke_shared_rank_reduce
-        }
-        self._shared_tail_impls: dict[str, Callable] = {
-            MASKED_FINALIZE_TRITON: invoke_shared_from_scratch_finalize
-        }
+        self._fused_act = run_masked_fused_act
+        self._shared_reduce = invoke_shared_rank_reduce
+        self._shared_tail = invoke_shared_from_scratch_finalize
         self._down_b_into_base = invoke_down_b_into_base
 
     @property
@@ -261,88 +247,11 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             pair_to_row=row_state.src2dst,
         )
 
-    def install_fused_act_implementation(
-        self,
-        family: str,
-        activation: str,
-        name: str,
-        implementation: Callable,
-    ) -> None:
-        if family != "b_activation":
-            raise ValueError(f"unknown fused-act family {family!r}")
-        if not name or not callable(implementation):
-            raise ValueError("a fused-act implementation needs a name and callable")
-        self._fused_act_impls[(family, activation, name)] = implementation
-
-    def install_fused_finalize_implementation(
-        self,
-        family: str,
-        ownership: str,
-        name: str,
-        implementation: Callable | tuple[Callable, Callable],
-    ) -> None:
-        if not name:
-            raise ValueError("a fused-finalize implementation needs a name")
-        if ownership not in ("per_expert", "shared"):
-            raise ValueError(f"unknown fused-finalize ownership {ownership!r}")
-        if family == "shared_rank_reduce":
-            if ownership != "shared":
-                raise ValueError("shared_rank_reduce requires shared ownership")
-            if (
-                not isinstance(implementation, tuple)
-                or len(implementation) != 2
-                or not all(callable(item) for item in implementation)
-            ):
-                raise ValueError(
-                    "shared_rank_reduce implementation must be a "
-                    "(reduce, tail) callable pair"
-                )
-            self._shared_reduce_impls[name], self._shared_tail_impls[name] = (
-                implementation
-            )
-        else:
-            raise ValueError(f"unknown fused-finalize family {family!r}")
-
-    def fused_act_implementations(self, family: str) -> tuple[str, ...]:
-        return tuple(
-            sorted(
-                {
-                    name
-                    for candidate_family, _activation, name in self._fused_act_impls
-                    if candidate_family == family
-                }
-            )
-        )
-
-    def supports_fused_act(
-        self,
-        family: str,
-        *,
-        activation: str,
-        implementation: str = "triton",
-    ) -> bool:
-        return (family, activation, implementation) in self._fused_act_impls
-
-    def _fused_act_implementation(
-        self,
-        family: str,
-        activation: str,
-        implementation: str,
-    ) -> Callable:
-        try:
-            return self._fused_act_impls[(family, activation, implementation)]
-        except KeyError as exc:
-            raise NotImplementedError(
-                f"{self.contract.key} has no {implementation!r} masked-act "
-                f"implementation for {family!r}/{activation!r}"
-            ) from exc
-
     def run_fused_act(
         self,
         row_state: MaskedRowState,
         family: str,
         *,
-        implementation: str,
         activation: str,
         base_gateup: torch.Tensor,
         act_masked: torch.Tensor,
@@ -354,12 +263,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         bridge_top_k: int = 1,
         consume_base_pdl: bool = False,
     ) -> None:
-        invoke = self._fused_act_implementation(
-            family,
-            activation,
-            implementation,
-        )
-        invoke(
+        self._fused_act(
             family,
             activation=activation,
             base_gateup=base_gateup,
@@ -376,17 +280,6 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             bridge_top_k=bridge_top_k,
             consume_base_pdl=consume_base_pdl,
         )
-
-    def fused_finalize_implementations(
-        self, family: str, ownership: str
-    ) -> tuple[str, ...]:
-        if family == "shared_rank_reduce" and ownership == "shared":
-            return tuple(
-                name
-                for name in self._shared_reduce_impls
-                if name in self._shared_tail_impls
-            )
-        return ()
 
     def supports_down_b_into_base(self) -> bool:
         return True
@@ -414,7 +307,6 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         self,
         row_state: MaskedRowState,
         *,
-        implementation: str,
         down_masked: torch.Tensor,
         bridge: torch.Tensor,
         b_down: torch.Tensor,
@@ -427,7 +319,6 @@ class MaskedRowDomainProvider(MoeBaseProvider):
     ) -> None:
         self.run_shared_rank_reduce(
             row_state,
-            implementation=implementation,
             bridge=bridge,
             routing=routing,
             topk_weights=topk_weights,
@@ -437,7 +328,6 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         )
         self.finish_shared_rank_finalize(
             row_state,
-            implementation=implementation,
             down_masked=down_masked,
             b_down=b_down,
             routing=routing,
@@ -452,7 +342,6 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         self,
         row_state: MaskedRowState,
         *,
-        implementation: str,
         bridge: torch.Tensor,
         routing: RouteView,
         topk_weights: torch.Tensor,
@@ -460,12 +349,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         token_rank: torch.Tensor,
         config: Mapping[str, int],
     ) -> None:
-        try:
-            invoke = self._shared_reduce_impls[implementation]
-        except KeyError as exc:
-            raise NotImplementedError(
-                f"{self.contract.key} has no {implementation!r} shared-rank reduction"
-            ) from exc
+        invoke = self._shared_reduce
         # This launch reads pair data only. ``row_state`` stays in the
         # signature so that every stage takes the same arguments.
         del row_state
@@ -482,7 +366,6 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         self,
         row_state: MaskedRowState,
         *,
-        implementation: str,
         down_masked: torch.Tensor,
         b_down: torch.Tensor,
         routing: RouteView,
@@ -492,12 +375,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         token_rank: torch.Tensor,
         config: Mapping[str, int],
     ) -> None:
-        try:
-            invoke = self._shared_tail_impls[implementation]
-        except KeyError as exc:
-            raise NotImplementedError(
-                f"{self.contract.key} has no {implementation!r} shared B tail"
-            ) from exc
+        invoke = self._shared_tail
         invoke(
             down_masked=down_masked,
             src2dst=row_state.src2dst,

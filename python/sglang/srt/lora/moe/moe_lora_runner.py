@@ -65,11 +65,6 @@ if TYPE_CHECKING:
     )
 
 
-# Providers can carry more than one implementation of a fused stage, and
-# ``install_fused_act_implementation`` injects them. Serving asks for Triton.
-_IMPLEMENTATION = "triton"
-
-
 @dataclass(slots=True)
 class _LoraStageState:
     rank: torch.Tensor | None = None
@@ -306,33 +301,11 @@ class MoeLoraRunner:
                 f"but is_gated={self.is_gated} needs {expected_slices}"
             )
 
-        if plan.act.family is not ActFamily.MATERIALIZED:
-            if not provider.supports_fused_act(
-                plan.act.family.value,
-                activation=self.activation.value,
-                implementation=_IMPLEMENTATION,
-            ):
-                raise NotImplementedError(
-                    f"{provider.contract.key} does not implement "
-                    f"{plan.act.family.value}/{_IMPLEMENTATION}"
-                )
         if plan.down_b_into_base and not provider.supports_down_b_into_base():
             raise NotImplementedError(
                 f"{provider.contract.key} does not implement the down-B "
                 "into-base epilogue"
             )
-        if plan.finalize.family is not FinalizeFamily.MATERIALIZED:
-            ownership_name = "shared" if plan.finalize.is_shared_outer else "per_expert"
-            if not provider.supports_fused_finalize(
-                plan.finalize.family.value,
-                ownership_name,
-                implementation=_IMPLEMENTATION,
-            ):
-                raise NotImplementedError(
-                    f"{provider.contract.key} does not implement "
-                    f"{plan.finalize.family.value}/{ownership_name}/"
-                    f"{_IMPLEMENTATION}"
-                )
 
     def run_plan(
         self,
@@ -671,7 +644,6 @@ class MoeLoraRunner:
         provider.run_fused_act(
             base_gemm_state,
             plan.act.family.value,
-            implementation=_IMPLEMENTATION,
             activation=self.activation.value,
             base_gateup=gateup_out,
             act_masked=act_out,
@@ -874,7 +846,6 @@ class MoeLoraRunner:
         b_down = batch.down_lora_b.flatten(0, 1)
         provider.run_shared_rank_finalize(
             base_gemm_state,
-            implementation=_IMPLEMENTATION,
             down_masked=down_out,
             bridge=down_rank,
             b_down=b_down,

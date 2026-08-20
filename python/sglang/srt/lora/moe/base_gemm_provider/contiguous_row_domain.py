@@ -11,7 +11,7 @@ masked domain on GB300, so decode keeps the masked domain.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import msgspec
@@ -29,7 +29,6 @@ from sglang.srt.lora.moe.base_gemm_provider.masked_activation import (
 )
 from sglang.srt.lora.moe.base_gemm_provider.masked_fused_act import (
     MASKED_ACT_FAMILIES,
-    MASKED_ACT_TRITON,
     _b_act_kernel,
     _is_power_of_two,
     _require_config,
@@ -795,7 +794,6 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         # because it reaches every row through src2dst over a flat row view.
         from sglang.kernels.ops.moe.ep_moe_kernels import post_reorder_deepgemm
         from sglang.srt.lora.moe.base_gemm_provider.masked_finalize import (
-            MASKED_FINALIZE_TRITON,
             invoke_shared_from_scratch_finalize,
             invoke_shared_rank_reduce,
         )
@@ -805,12 +803,8 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
 
         self._post_reorder = post_reorder_deepgemm
         self._down_b_into_base = invoke_down_b_into_base
-        self._shared_reduce_impls: dict[str, Callable] = {
-            MASKED_FINALIZE_TRITON: invoke_shared_rank_reduce
-        }
-        self._shared_tail_impls: dict[str, Callable] = {
-            MASKED_FINALIZE_TRITON: invoke_shared_from_scratch_finalize
-        }
+        self._shared_reduce = invoke_shared_rank_reduce
+        self._shared_tail = invoke_shared_from_scratch_finalize
 
     @property
     def num_local_experts(self) -> int:
@@ -999,30 +993,11 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
             pair_to_row=row_state.src2dst,
         )
 
-    def fused_act_implementations(self, family: str) -> tuple[str, ...]:
-        if family in MASKED_ACT_FAMILIES:
-            return (MASKED_ACT_TRITON,)
-        return ()
-
-    def supports_fused_act(
-        self,
-        family: str,
-        *,
-        activation: str,
-        implementation: str = "triton",
-    ) -> bool:
-        return (
-            family in MASKED_ACT_FAMILIES
-            and activation in ActivationFn
-            and implementation == MASKED_ACT_TRITON
-        )
-
     def run_fused_act(
         self,
         row_state: ContiguousRowState,
         family: str,
         *,
-        implementation: str,
         activation: str,
         base_gateup: torch.Tensor,
         act_masked: torch.Tensor,
@@ -1036,13 +1011,6 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
     ) -> None:
         # ``act_masked`` is the parameter name in the provider interface. Here
         # it holds the compact 2-D activation buffer.
-        if not self.supports_fused_act(
-            family, activation=activation, implementation=implementation
-        ):
-            raise NotImplementedError(
-                f"{self.contract.key} has no {implementation!r} fused-act "
-                f"implementation for {family!r}/{activation!r}"
-            )
         fused_b_act_contiguous(
             family,
             activation=activation,
@@ -1060,46 +1028,6 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
             bridge_top_k=bridge_top_k,
             consume_base_pdl=consume_base_pdl,
         )
-
-    def install_fused_finalize_implementation(
-        self,
-        family: str,
-        ownership: str,
-        name: str,
-        implementation: Callable | tuple[Callable, Callable],
-    ) -> None:
-        if not name:
-            raise ValueError("a fused-finalize implementation needs a name")
-        if ownership not in ("per_expert", "shared"):
-            raise ValueError(f"unknown fused-finalize ownership {ownership!r}")
-        if family == "shared_rank_reduce":
-            if ownership != "shared":
-                raise ValueError("shared_rank_reduce requires shared ownership")
-            if (
-                not isinstance(implementation, tuple)
-                or len(implementation) != 2
-                or not all(callable(item) for item in implementation)
-            ):
-                raise ValueError(
-                    "shared_rank_reduce implementation must be a "
-                    "(reduce, tail) callable pair"
-                )
-            self._shared_reduce_impls[name], self._shared_tail_impls[name] = (
-                implementation
-            )
-        else:
-            raise ValueError(f"unknown fused-finalize family {family!r}")
-
-    def fused_finalize_implementations(
-        self, family: str, ownership: str
-    ) -> tuple[str, ...]:
-        if family == "shared_rank_reduce" and ownership == "shared":
-            return tuple(
-                name
-                for name in self._shared_reduce_impls
-                if name in self._shared_tail_impls
-            )
-        return ()
 
     def supports_down_b_into_base(self) -> bool:
         return True
@@ -1127,7 +1055,6 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         self,
         row_state: ContiguousRowState,
         *,
-        implementation: str,
         down_masked: torch.Tensor,
         bridge: torch.Tensor,
         b_down: torch.Tensor,
@@ -1140,7 +1067,6 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
     ) -> None:
         self.run_shared_rank_reduce(
             row_state,
-            implementation=implementation,
             bridge=bridge,
             routing=routing,
             topk_weights=topk_weights,
@@ -1150,7 +1076,6 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         )
         self.finish_shared_rank_finalize(
             row_state,
-            implementation=implementation,
             down_masked=down_masked,
             b_down=b_down,
             routing=routing,
@@ -1165,7 +1090,6 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         self,
         row_state: ContiguousRowState,
         *,
-        implementation: str,
         bridge: torch.Tensor,
         routing: RouteView,
         topk_weights: torch.Tensor,
@@ -1173,7 +1097,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         token_rank: torch.Tensor,
         config: Mapping[str, int],
     ) -> None:
-        invoke = self._shared_reduce_impls[implementation]
+        invoke = self._shared_reduce
         # This launch works on pairs and does not need the row state. The
         # parameter stays so that every stage takes the same arguments.
         del row_state
@@ -1190,7 +1114,6 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         self,
         row_state: ContiguousRowState,
         *,
-        implementation: str,
         down_masked: torch.Tensor,
         b_down: torch.Tensor,
         routing: RouteView,
@@ -1202,7 +1125,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
     ) -> None:
         # ``down_masked`` is the parameter name in the provider interface. Here
         # it holds the compact [m_pad_ceiling, hidden] down output.
-        invoke = self._shared_tail_impls[implementation]
+        invoke = self._shared_tail
         invoke(
             down_masked=down_masked,
             src2dst=row_state.src2dst,
