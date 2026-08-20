@@ -117,7 +117,7 @@ def _register_legacy_hicache_draft(
     # so that host indices stay 1-to-1 between target and draft KV caches.
     primary_host_pool = tree_cache.cache_controller.mem_pool_host
     host_pool_kwargs = dict(
-        host_to_device_ratio=primary_host_pool.size / pool.size,
+        host_to_device_ratio=primary_host_pool.logical_size / pool.size,
         host_size=0,
         page_size=page_size,
         layout=server_args.hicache_mem_layout,
@@ -137,6 +137,12 @@ def _register_legacy_hicache_draft(
         return
 
     tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
+
+
+# Host slots a backup-only retraction pool gets, as a fraction of the device
+# pool. Sized well under 1.0 because a retraction burst touches a fraction of
+# the device tokens; overflow aborts the request rather than pre-reserving.
+BACKUP_ONLY_HICACHE_RATIO = 0.2
 
 
 def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
@@ -180,10 +186,14 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
         fields["disaggregation_decode_retraction_backup"] = backend
 
     if memory.hicache_ratio is None:
-        # Only a decode server reaches resolution with the ratio unset; host-pool
-        # retraction sizes the host pool 1:1 with the device pool, everything
-        # else keeps the standard default.
-        fields["hicache_ratio"] = 1.0 if backend == "host_pool" else 2.0
+        # Only a decode server reaches resolution with the ratio unset. A
+        # backup-only pool can be small: retractions that overflow it abort their
+        # request instead of crashing the scheduler. Sharing the pool with
+        # HiCache keeps the standard default.
+        if backend == "host_pool" and not memory.enable_hierarchical_cache:
+            fields["hicache_ratio"] = BACKUP_ONLY_HICACHE_RATIO
+        else:
+            fields["hicache_ratio"] = 2.0
 
     source = "kv_cache_builder.decode_retraction"
     get_context().override(source, **fields)

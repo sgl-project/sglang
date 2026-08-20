@@ -306,6 +306,20 @@ for (const path of walk(CONFIGS)) {
       }
     }
   };
+  // A cell may report its badge per selection (`verificationStatus` as a
+  // function of sel), so it has to survive the same space the predicates do —
+  // it renders on every pick, and an unrecognized return silently downgrades
+  // the badge to "Not Verified" rather than erroring in the browser.
+  const VERIFY_STATES = ["verified", "in-progress", "unverified"];
+  for (const [i, cell] of (config.cells || []).entries()) {
+    if (typeof cell.verificationStatus !== "function") continue;
+    probe((sel) => {
+      const out = cell.verificationStatus(sel);
+      if (out !== undefined && !VERIFY_STATES.includes(out)) {
+        throw new Error(`returned ${JSON.stringify(out)}, expected one of [${VERIFY_STATES}]`);
+      }
+    }, `cells[${i}].verificationStatus`);
+  }
   for (const dim of [...(config.matchDims || []), ...(config.overlayDims || [])]) {
     if (typeof dim.showWhen === "function") probe(dim.showWhen, `${dim.id}.showWhen`);
     if (typeof dim.verifiedWhen === "function") probe(dim.verifiedWhen, `${dim.id}.verifiedWhen`);

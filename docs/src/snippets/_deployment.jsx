@@ -57,7 +57,10 @@
 //                      `verified` is the boolean badge baseline.
 //                      `verificationStatus` overrides it with a third state —
 //                      "verified" | "in-progress" | "unverified" — for a recipe
-//                      whose verification round is open rather than absent.
+//                      whose verification round is open rather than absent. It
+//                      may also be a function of the selection, for a cell whose
+//                      verification depends on an overlay pick (e.g. one
+//                      speculative option still being validated).
 //   modelNames         HF slug lookup, `hw|variant|quant`, `variant|quant`,
 //                      `hw|quant`, `quant`, `hw`, then `default`
 //   placeholders       {{KEY}} → {target: 'command'|'curl', label, default?}
@@ -462,8 +465,14 @@ export const Deployment = ({ config, benchmarks }) => {
     typeof v === "string"
       ? (VERIFY_LABEL[v] ? v : "unverified")
       : (v ? "verified" : "unverified");
-  const cellVerifyStatus = (c) =>
-    c ? verifyStatusOf(c.verificationStatus ?? c.verified) : "unverified";
+  const cellVerifyStatus = (c, sel) => {
+    if (!c) return "unverified";
+    const v =
+      typeof c.verificationStatus === "function"
+        ? c.verificationStatus(sel)
+        : c.verificationStatus;
+    return verifyStatusOf(v ?? c.verified);
+  };
 
   // Two kinds of selector row:
   //   match dims    participate in cell lookup (cell.match[dim] === sel[dim])
@@ -1337,7 +1346,7 @@ export const Deployment = ({ config, benchmarks }) => {
     ? commandBuilder.resolveDeployment(sel)
     : findCell(config.cells, sel);
   const builderMeta = (cell && cell.builder) || {};
-  const verifyStatus = cellVerifyStatus(cell);
+  const verifyStatus = cellVerifyStatus(cell, sel);
   // Pin the calculator-computed ratio into the rendered command (before the
   // host/port tail); cells themselves stay ratio-free.
   const cellWithRatio = (() => {
