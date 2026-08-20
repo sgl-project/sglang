@@ -185,10 +185,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
         else:
             target_model = self.target_worker.model_runner.model
-            # The draft projects through these modules, so hand it the base
-            # layers: a LoRA-wrapped module would apply the target's adapter
-            # deltas using the target's batch metadata. Unwrap before the
-            # weight check, which the wrapper does not forward.
             lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
             if lm_head is None or not hasattr(lm_head, "weight"):
                 raise RuntimeError(

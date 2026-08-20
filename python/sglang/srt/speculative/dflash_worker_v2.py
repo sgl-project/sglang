@@ -1750,9 +1750,6 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
-        # Both modules are invoked on draft-shaped inputs below, so take the
-        # base layers: a LoRA-wrapped module would apply the target's adapter
-        # deltas using the target's batch metadata.
         embed_module = unwrap_lora_layer(target_model.get_input_embeddings())
         lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
         if lm_head is None or not (

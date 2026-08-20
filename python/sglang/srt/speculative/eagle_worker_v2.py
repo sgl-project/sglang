@@ -281,9 +281,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         from sglang.srt.lora.layers import unwrap_lora_layer
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
-        # A draft sharing a LoRA-wrapped lm_head would apply the target's
-        # adapter deltas against the target's batch metadata, whose shape does
-        # not match the draft's activations.
         target_lm_head = unwrap_lora_layer(
             getattr(self.target_worker.model_runner.model, "lm_head", None)
         )

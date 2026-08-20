@@ -754,9 +754,7 @@ class ModelRunner:
             self.apply_torch_tp()
 
     def maybe_init_lora_manager(self):
-        # Adapters apply to the target model only; the draft runs unadapted,
-        # so it never builds a manager and every LoRA path below keys off
-        # `lora_manager is not None` rather than the process-wide config.
+        # Adapters apply to the target model only; the draft runs unadapted.
         if get_lora().enable_lora and not self.is_draft_worker:
             self.init_lora_manager()
 
