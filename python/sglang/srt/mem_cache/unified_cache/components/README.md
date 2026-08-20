@@ -74,10 +74,10 @@ node.component_data[ComponentType.MAMBA]  # MambaComponent data
 | `../unified_cache/unified_tree_core.py` | `UnifiedTreeCore` — the tree, LRUs, and size counters; `UnifiedTreeNode`, `UnifiedLRUList` |
 | `../unified_cache/unified_tree_core_interface.py` | `UnifiedTreeCoreInterface`, `NodeId` — the tree/cache boundary contract |
 | `../unified_cache/cache_action.py` | Deferred `CacheAction`/`ComponentAction` types emitted by the tree |
-| `tree_component.py` | `TreeComponent` ABC, `ComponentType`, `ComponentData`, `get_and_increase_time_counter`, `next_component_uuid` |
-| `full_component.py` | `FullComponent` — standard full-attention KV cache component |
-| `swa_component.py` | `SWAComponent` — sliding-window attention component with tombstone/window tracking |
-| `mamba_component.py` | `MambaComponent` — Mamba/SSM state component with copy-on-write |
+| `base.py` | `TreeComponent` ABC, `ComponentType`, `ComponentData`, `get_and_increase_time_counter`, `next_component_uuid` |
+| `full.py` | `FullComponent` — standard full-attention KV cache component |
+| `swa.py` | `SWAComponent` — sliding-window attention component with tombstone/window tracking |
+| `mamba.py` | `MambaComponent` — Mamba/SSM state component with copy-on-write |
 | `../hybrid_cache/hybrid_cache_controller.py` | `HybridCacheController` — HiCache multi-pool controller (L1 GPU → L2 CPU, optional L3 storage) |
 | `__init__.py` | Re-exports: `ComponentType`, `ComponentData`, `TreeComponent`, `FullComponent`, `SWAComponent`, `MambaComponent` |
 
@@ -259,7 +259,7 @@ Cache an in-progress request's partial KV data (chunked prefill).
 
 ## TreeComponent Hook Reference
 
-Each component implements these hooks. See `tree_component.py` for the ABC and docstrings.
+Each component implements these hooks. See `base.py` for the ABC and docstrings.
 
 ### Match Phase
 
