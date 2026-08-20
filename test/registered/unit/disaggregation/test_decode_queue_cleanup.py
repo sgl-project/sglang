@@ -1,4 +1,5 @@
 import unittest
+from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -188,6 +189,51 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         self.assertEqual(ready, {})
         self.assertEqual(remaining, [])
+
+    def test_prefetches_prefill_dp_rank_query(self):
+        addr = "127.0.0.1:11500"
+        executor = MagicMock()
+        future = Future()
+        future.set_result({"7": 1})
+        executor.submit.return_value = future
+
+        def decode_req(room):
+            return SimpleNamespace(
+                req=SimpleNamespace(
+                    bootstrap_host="127.0.0.1",
+                    bootstrap_port=11500,
+                    bootstrap_room=room,
+                ),
+                kv_receiver=MagicMock(),
+            )
+
+        first = decode_req(7)
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pending_reqs = [first]
+        queue._prefill_dp_rank_queries = {}
+        queue.kv_manager = SimpleNamespace(
+            prefill_info_table={addr: object()},
+            _ensure_prefill_recompute_executor=lambda: executor,
+        )
+        queue._resolve_prefill_dp_rank = MagicMock(return_value=None)
+        queue._ensure_prefill_info = lambda groups: (groups, [])
+
+        queue.prefetch_prefill_dp_rank_queries()
+        tail = decode_req(8)
+        queue.pending_reqs.append(tail)
+        with patch(
+            "sglang.srt.disaggregation.decode."
+            "CommonKVReceiver.query_prefill_dp_ranks",
+            return_value={"8": 2},
+        ) as query:
+            queue._resolve_pending_reqs()
+
+        _, called_addr, called_rooms = executor.submit.call_args.args
+        self.assertEqual((called_addr, called_rooms), (addr, [7]))
+        query.assert_called_once_with(addr, [8])
+        first.kv_receiver.init.assert_called_once_with(1)
+        tail.kv_receiver.init.assert_called_once_with(2)
+        self.assertEqual(queue.pending_reqs, [])
 
     @patch("sglang.srt.disaggregation.decode.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
