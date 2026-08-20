@@ -3584,21 +3584,19 @@ class KimiK3ThinkingTestCase(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._template_kwargs(reasoning_effort=0.5)
 
-    def test_keep_other_than_all_rejected_when_enabled(self):
-        request = ChatCompletionRequest(
-            model="x",
-            messages=self.MESSAGES,
-            thinking={"type": "enabled", "keep": "none"},
-        )
-        self.assertIn("thinking.keep", self.chat._validate_request(request))
-
-    def test_keep_ignored_when_disabled(self):
-        request = ChatCompletionRequest(
-            model="x",
-            messages=self.MESSAGES,
-            thinking={"type": "disabled", "keep": "none"},
-        )
-        self.assertIsNone(self.chat._validate_request(request))
+    def test_keep_is_normalized_not_rejected(self):
+        """ "all" is the only retention mode implemented, and a deployment is
+        expected to force it. Rejecting instead fails a request the reference
+        service answers."""
+        for keep in ("all", "none", "some-future-mode"):
+            for thinking_type in ("enabled", "disabled"):
+                with self.subTest(keep=keep, type=thinking_type):
+                    request = ChatCompletionRequest(
+                        model="x",
+                        messages=self.MESSAGES,
+                        thinking={"type": thinking_type, "keep": keep},
+                    )
+                    self.assertIsNone(self.chat._validate_request(request))
 
     def test_response_channel_flag_tracks_the_resolved_thinking_mode(self):
         """The constraint has to know which channel the prompt left open."""

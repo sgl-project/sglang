@@ -773,16 +773,20 @@ _TOOL_NAME_MAX_LEN = 256
 class ThinkingParam(BaseModel):
     """Moonshot-style thinking control, as Kimi K3 and compatible surfaces send it.
 
-    ``type`` gates reasoning, ``effort`` outranks ``reasoning_effort``, and
-    ``keep`` selects how much earlier reasoning is replayed. ``keep`` is checked
-    by the serving layer, which knows whether the active model supports anything
-    other than "all". ``adaptive`` is accepted as an alias for enabled so an
-    Anthropic-shaped value reaching this surface does not 400.
+    ``type`` gates reasoning and ``effort`` outranks ``reasoning_effort``.
+
+    ``keep`` selects how much earlier reasoning is replayed; "all" is the only
+    mode implemented here, and any other value is normalized to it rather than
+    rejected. A deployment is expected to force "all" this way -- rejecting the
+    request would fail one the reference service answers. ``adaptive`` is
+    accepted as an alias for enabled so an Anthropic-shaped value reaching this
+    surface does not 400.
     """
 
     model_config = ConfigDict(extra="allow")
 
     type: Optional[Literal["enabled", "disabled", "adaptive"]] = None
+    # Accepted and normalized to "all"; see the class docstring.
     keep: Optional[str] = None
     effort: ReasoningEffortType = None
 
@@ -867,7 +871,8 @@ class ChatCompletionRequest(BaseModel):
         default=None,
         description="Moonshot thinking control: {type: enabled|disabled, "
         "keep: all, effort: low|high|max}. 'effort' takes precedence over "
-        "reasoning_effort; 'type: disabled' turns reasoning off.",
+        "reasoning_effort; 'type: disabled' turns reasoning off; 'keep' is "
+        "normalized to 'all'.",
     )
     task: Optional[
         Literal["action", "query", "authority", "domain", "title", "read_url"]

@@ -859,17 +859,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 kimi_k3_thinking_effort(request.reasoning_effort)
             except ValueError as exc:
                 return str(exc)
-            # K3 replays every retained reasoning block or none; there is no
-            # partial-retention mode to honor, so anything else is a client error.
-            if (
-                request.thinking is not None
-                and request.thinking.enabled
-                and request.thinking.keep not in (None, "all")
-            ):
-                return (
-                    "thinking.keep must be 'all' unless thinking.type is "
-                    f"'disabled'; got {request.thinking.keep!r}."
-                )
 
         effective_tools = self._effective_tools(request)
         has_message_tools = any(
