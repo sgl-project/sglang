@@ -443,12 +443,9 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        # dLLM runs one init per denoise step (overlap schedule is off), so its
-        # per-step host stalls are fully exposed as device idle. seq_lens_cpu and
-        # extend_seq_lens_cpu are the host mirrors the scheduler already holds, so
-        # take seq_lens_max and extend_seq_lens_cpu_int from them and skip the two
-        # D2H syncs (seq_lens.max() and extend_seq_lens.cpu()). Gated on dLLM to
-        # leave the decode/prefill path byte-identical.
+        # dLLM has no overlap schedule, so these two D2H syncs are exposed as
+        # device idle. Take them from the host mirrors instead. Gated on dLLM so
+        # the decode/prefill path stays byte-identical.
         is_dllm = forward_batch.forward_mode.is_dllm_extend()
         if is_dllm:
             seq_lens_max = int(forward_batch.seq_lens_cpu.max())

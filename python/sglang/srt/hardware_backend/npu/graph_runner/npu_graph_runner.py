@@ -243,11 +243,6 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             # device tensor: .cpu() here is a blocking D2H behind whatever is
             # already queued on the stream, once per replay.
             #
-            # seq_lens_cpu is the authoritative host mirror on this path -- the
-            # ascend attention backend already derives its own seq_lens_cpu_int
-            # from it for every forward mode, and likewise adds the draft width
-            # on target-verify. Reading the device tensor here made the two
-            # disagree on their source; this aligns them.
             seq_lens_cpu = (
                 forward_batch.seq_lens_cpu
                 if forward_batch.seq_lens_cpu is not None

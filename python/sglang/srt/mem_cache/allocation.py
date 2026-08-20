@@ -382,9 +382,7 @@ def alloc_for_extend(
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 
 
-# Break-even row count for the batched gather on Ascend, where it was measured
-# (~6 rows; 8 leaves margin). Other backends stay on the per-row path unless
-# SGLANG_DLLM_BATCHED_GATHER_MIN_ROWS is set, since their break-even is unmeasured.
+# Ascend break-even for the batched gather (measured ~6; 8 leaves margin).
 _NPU_MIN_ROWS_FOR_BATCHED_GATHER = 8
 
 
@@ -412,8 +410,7 @@ def _gather_reused_block_locs(
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
     """Re-read the retained KV block of every reuse row from ``req_to_token``
-    in one flat index op (rows share ``block_len``), instead of one slice +
-    cast kernel per row.
+    in one flat index op (rows share ``block_len``).
     """
     width = req_to_token.shape[1]
     flat_cpu = torch.tensor(
@@ -490,11 +487,6 @@ def _alloc_extend_loc_with_kv_reuse(
     reuse_rows = [i for i in range(len(reuse_kv)) if reuse_kv[i]]
     req_pool_indices_list = req_pool_indices_cpu.tolist()
     reuse_gathered = None
-    # The batched gather replaces one kernel launch per reuse row with a fixed
-    # index build + H2D, so it pays off on wide batches and loses on narrow ones.
-    # The row count is the gate: it is re-evaluated every round, so a batch that
-    # shrinks falls back on its own. The default comes from the backend; the env
-    # var overrides it (see SGLANG_DLLM_BATCHED_GATHER_MIN_ROWS).
     min_rows_for_batched_gather = envs.SGLANG_DLLM_BATCHED_GATHER_MIN_ROWS.get()
     if min_rows_for_batched_gather is None:
         min_rows_for_batched_gather = _auto_min_rows_for_batched_gather()
