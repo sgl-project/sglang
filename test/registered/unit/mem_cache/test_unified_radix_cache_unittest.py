@@ -258,7 +258,7 @@ class TestUnifiedTreeNodeGetPrefixHashValues(CustomTestCase):
 
 class TestUnifiedTreeCoreLoadBackPending(CustomTestCase):
     def _build_core(self, *, is_write_back: bool):
-        component_types = (ComponentType.FULL,)
+        component_types = (ComponentType.FULL, ComponentType.SWA)
         root = UnifiedTreeNode(component_types)
         shared = UnifiedTreeNode(component_types)
         anchor_a = UnifiedTreeNode(component_types)
@@ -272,7 +272,9 @@ class TestUnifiedTreeCoreLoadBackPending(CustomTestCase):
         core.is_write_back = is_write_back
         core.root_node = root
         core.node_by_id.side_effect = nodes.__getitem__
-        core.components_by_type = {ComponentType.FULL: mock.Mock()}
+        core.components_by_type = {
+            component_type: mock.Mock() for component_type in component_types
+        }
         core.full_host_duplicates = {}
         core._is_settled_full_host_duplicate.side_effect = (
             lambda node: UnifiedTreeCore._is_settled_full_host_duplicate(core, node)
@@ -282,18 +284,29 @@ class TestUnifiedTreeCoreLoadBackPending(CustomTestCase):
         )
         return core, shared, anchor_a, anchor_b
 
-    def _commit_load_back(self, core, anchor, source):
-        transfer = PoolTransfer(
+    def _commit_load_back(self, core, anchor, *, full_nodes=(), swa_nodes=()):
+        kv_xfer = PoolTransfer(
             name=PoolName.KV,
-            host_indices=torch.tensor([1], dtype=torch.int64),
-            nodes_to_load=[source.id],
+            host_indices=torch.tensor([1] * len(full_nodes), dtype=torch.int64),
+            nodes_to_load=[node.id for node in full_nodes],
         )
+        comp_xfers = {}
+        if swa_nodes:
+            comp_xfers[ComponentType.SWA] = [
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    host_indices=torch.tensor(
+                        [2] * len(swa_nodes), dtype=torch.int64
+                    ),
+                    nodes_to_load=[node.id for node in swa_nodes],
+                )
+            ]
         return UnifiedTreeCore.commit_load_back(
             core,
             anchor.id,
-            torch.tensor([2], dtype=torch.int64),
-            transfer,
-            {},
+            torch.tensor([3] * len(full_nodes), dtype=torch.int64),
+            kv_xfer,
+            comp_xfers,
         )
 
     def test_write_through_different_anchors_track_duplicate_without_pending(self):
@@ -302,8 +315,8 @@ class TestUnifiedTreeCoreLoadBackPending(CustomTestCase):
         full.value = torch.tensor([1], dtype=torch.int64)
         full.host_value = torch.tensor([2], dtype=torch.int64)
 
-        self._commit_load_back(core, anchor_a, shared)
-        self._commit_load_back(core, anchor_b, shared)
+        self._commit_load_back(core, anchor_a, full_nodes=(shared,))
+        self._commit_load_back(core, anchor_b, full_nodes=(shared,))
         UnifiedTreeCore.finish_load_back(core, anchor_a.id)
 
         self.assertIsNone(shared.load_back_pending_id)
@@ -318,18 +331,43 @@ class TestUnifiedTreeCoreLoadBackPending(CustomTestCase):
         full.value = torch.tensor([1], dtype=torch.int64)
         full.host_value = torch.tensor([2], dtype=torch.int64)
 
-        self._commit_load_back(core, anchor_a, shared)
+        self._commit_load_back(core, anchor_a, full_nodes=(shared,))
 
         self.assertEqual(shared.load_back_pending_id, anchor_a.id)
         self.assertFalse(UnifiedTreeCore._can_reclaim_full_host_duplicate(core, shared))
         with self.assertRaisesRegex(AssertionError, "new anchor"):
-            self._commit_load_back(core, anchor_b, shared)
+            self._commit_load_back(core, anchor_b, full_nodes=(shared,))
 
         UnifiedTreeCore.finish_load_back(core, anchor_a.id)
 
         self.assertIsNone(shared.load_back_pending_id)
         self.assertTrue(UnifiedTreeCore._can_reclaim_full_host_duplicate(core, shared))
         core._update_duplicate_tracking.assert_called_once_with(shared)
+
+    def test_auxiliary_overlap_does_not_replace_full_pending_anchor(self):
+        core, shared, descendant, _ = self._build_core(is_write_back=True)
+        full = shared.component_data[ComponentType.FULL]
+        full.value = torch.tensor([1], dtype=torch.int64)
+        full.host_value = torch.tensor([2], dtype=torch.int64)
+
+        self._commit_load_back(core, descendant, full_nodes=(shared,))
+        self.assertEqual(shared.load_back_pending_id, descendant.id)
+
+        # A later request may load an auxiliary pool for the shared ancestor
+        # while the descendant's Full KV DMA is still in flight.
+        self._commit_load_back(core, shared, swa_nodes=(shared,))
+        UnifiedTreeCore.finish_load_back(core, shared.id)
+        self.assertEqual(shared.load_back_pending_id, descendant.id)
+
+        UnifiedTreeCore.finish_load_back(core, descendant.id)
+        self.assertIsNone(shared.load_back_pending_id)
+
+    def test_full_overlap_with_different_anchor_is_still_rejected(self):
+        core, shared, descendant, _ = self._build_core(is_write_back=True)
+        self._commit_load_back(core, descendant, full_nodes=(shared,))
+
+        with self.assertRaisesRegex(AssertionError, "new anchor"):
+            self._commit_load_back(core, shared, full_nodes=(shared,))
 
 
 def _write_backup(cache, node, write_back: bool = False) -> int:
