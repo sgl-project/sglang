@@ -168,6 +168,7 @@ from sglang.srt.model_executor.runner import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    ensure_published,
     get_context,
     get_exec,
     get_global_dwdp_manager,
@@ -188,7 +189,6 @@ from sglang.srt.server_args import (  # noqa: F401  (re-export)
     ServerArgs,
     add_chunked_prefix_cache_attention_backend,
     get_global_server_args,
-    set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -336,7 +336,7 @@ class ModelRunner:
         # construction (benchmark/one_batch, the manual runner tests) has no
         # earlier publish.
         if not is_draft_worker:
-            set_global_server_args_for_scheduler(server_args)
+            ensure_published(server_args, role="scheduler")
         # Set by maybe_init_lora_manager; stays None when LoRA is off and on
         # draft runners, which serve adapters' target model unadapted.
         self.lora_manager: Optional[LoRAManager] = None
