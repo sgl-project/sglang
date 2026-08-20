@@ -13,9 +13,19 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 class _FakeAllocator:
     def __init__(self):
         self.freed = []
+        self.swa_freed = []
 
+    # Mirrors the real contract: free() is the sum of the two pool-specific
+    # halves, so `freed` records every full-attention release either way.
     def free(self, free_index: torch.Tensor):
+        self.free_full(free_index)
+        self.free_swa(free_index)
+
+    def free_full(self, free_index: torch.Tensor):
         self.freed.append(free_index.clone())
+
+    def free_swa(self, free_index: torch.Tensor):
+        self.swa_freed.append(free_index.clone())
 
 
 class _FakeInnerCache:
@@ -259,6 +269,10 @@ def test_trim_overshoot_postcondition():
     # Tail [38, 44) freed by _free_kv_aligned.
     assert len(allocator.freed) == 1
     assert allocator.freed[0].tolist() == list(range(38, 44))
+    # The SWA side stops at the pre-trim eviction floor (42): [38, 42) already
+    # gave its peers back, so only [42, 44) is released here.
+    assert len(allocator.swa_freed) == 1
+    assert allocator.swa_freed[0].tolist() == list(range(42, 44))
 
 
 if __name__ == "__main__":
