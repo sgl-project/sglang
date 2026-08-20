@@ -1,9 +1,7 @@
-"""Unit tests for LoRA + speculative decoding compatibility validation.
+"""LoRA + speculative decoding compatibility validation.
 
-The matrix lives in ServerArgs._check_lora_speculative_compatibility, which
-runs at engine-launch validation, after __post_init__ resolved speculative
-aliases — so it matches resolved names only ("NEXTN" has collapsed to "EAGLE",
-Gemma4 promotions to "FROZEN_KV_MTP").
+_check_lora_speculative_compatibility runs after __post_init__ resolved the
+aliases, so it matches resolved names only ("NEXTN" has collapsed to "EAGLE").
 """
 
 import unittest
@@ -36,9 +34,8 @@ def _args(**kwargs) -> ServerArgs:
 
 class TestLoRASpeculativeCompatibility(CustomTestCase):
     def test_ngram_and_no_spec_pass_with_any_backend(self):
-        """NGRAM support predates the EAGLE path and has no backend
-        restriction; a diff that tightened the early return would break
-        existing NGRAM+LoRA deployments."""
+        """NGRAM predates the EAGLE path and has no backend restriction;
+        tightening the early return would break existing deployments."""
         for algo in [None, "NGRAM"]:
             for backend in ["csgmv", "triton"]:
                 _args(
@@ -53,19 +50,11 @@ class TestLoRASpeculativeCompatibility(CustomTestCase):
                         speculative_algorithm="EAGLE", **overrides
                     )._check_lora_speculative_compatibility()
 
-    def test_supported_algorithms_pass(self):
-        """Every algorithm whose verify presents a uniform per-request width,
-        which is what the LoRA segment layout assumes."""
-        for algo in ["EAGLE", "EAGLE3", "DFLASH", "DSPARK"]:
-            with self.subTest(algo=algo):
-                _args(
-                    speculative_algorithm=algo
-                )._check_lora_speculative_compatibility()
-
-    def test_dspark_ragged_modes_are_rejected(self):
-        """cap-accept and compact schedule per-request verify lengths from the
-        draft confidence head, so the uniform-width segment layout no longer
-        describes the batch. Only DSPARK reads this mode."""
+    def test_env_gated_settings_are_rejected(self):
+        """Ragged verify schedules per-request lengths the uniform-width
+        segment layout cannot express, and only DSPARK reads it. LoRA prep
+        runs in ForwardBatch.init_new, which EAGLE calls on the plan stream,
+        unordered against in-flight forwards."""
         for mode in ["cap-accept", "compact"]:
             with self.subTest(mode=mode):
                 with envs.SGLANG_RAGGED_VERIFY_MODE.override(mode):
@@ -77,13 +66,16 @@ class TestLoRASpeculativeCompatibility(CustomTestCase):
                     _args(
                         speculative_algorithm="EAGLE"
                     )._check_lora_speculative_compatibility()
+        with envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.override(True):
+            with self.assertRaisesRegex(ValueError, "PLAN_STREAM"):
+                _args(
+                    speculative_algorithm="EAGLE"
+                )._check_lora_speculative_compatibility()
 
     def test_unsupported_algorithms_are_rejected(self):
-        """STANDALONE's draft is an independent LM, so it has no verify width
-        contract to rely on. FROZEN_KV_MTP matters differently: EAGLE/NEXTN
-        with a Gemma4 assistant draft is silently promoted to it during
-        resolution, so the error has to name the promotion or the user sees an
-        algorithm they never typed."""
+        """STANDALONE's draft is an independent LM with no verify-width
+        contract. FROZEN_KV_MTP is a silent promotion of EAGLE/NEXTN, so its
+        error must name the promotion or the user sees an unfamiliar name."""
         with self.assertRaisesRegex(ValueError, "only compatible"):
             _args(
                 speculative_algorithm="STANDALONE"
@@ -93,22 +85,11 @@ class TestLoRASpeculativeCompatibility(CustomTestCase):
                 speculative_algorithm="FROZEN_KV_MTP"
             )._check_lora_speculative_compatibility()
 
-    def test_overlap_plan_stream_env_is_rejected(self):
-        """LoRA prep runs inside ForwardBatch.init_new, which EAGLE calls
-        under the plan stream; that stream has no ordering against in-flight
-        forwards, so LoRA's buffer writes could race a reader."""
-        with envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.override(True):
-            with self.assertRaisesRegex(ValueError, "PLAN_STREAM"):
-                _args(
-                    speculative_algorithm="EAGLE"
-                )._check_lora_speculative_compatibility()
-
-    def test_multi_adapter_eagle_passes_full_validation(self):
-        """Goes through the public check_lora_server_args, so it also guards
-        the wiring: the old NGRAM-only gate raised here for EAGLE. A
-        regression restoring it, adding a single-adapter cap, or restricting
-        the kernel backend turns this red."""
-        for algo in ["EAGLE", "EAGLE3"]:
+    def test_multi_adapter_passes_full_validation(self):
+        """Public entry, so it guards the wiring too: the old NGRAM-only gate
+        raised here. Restoring it, capping adapters, dropping an algorithm
+        from the allowlist, or restricting the kernel backend turns this red."""
+        for algo in ["EAGLE", "EAGLE3", "DFLASH", "DSPARK"]:
             for backend in ["triton", "csgmv"]:
                 with self.subTest(algo=algo, backend=backend):
                     args = _args(

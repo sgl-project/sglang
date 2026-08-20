@@ -495,12 +495,7 @@ def get_lm_head_lora_b_shard_size(output_dim: int, shard_indices=None) -> int:
 
 
 def get_batch_token_counts(forward_batch: ForwardBatch) -> Tuple[int, int]:
-    """(total tokens, max tokens per request) for LoRA segment math.
-
-    Shared by every backend so the forward-mode dispatch lives in one place;
-    TARGET_VERIFY must precede is_extend(), which it reports while leaving
-    the extend_seq_lens fields unset.
-    """
+    """(total tokens, max tokens per request) for LoRA segment math."""
     mode = forward_batch.forward_mode
     if mode.is_decode():
         return forward_batch.batch_size, 1

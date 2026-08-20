@@ -107,9 +107,6 @@ class LoRAManager:
         self.lora_strict_loading: bool = getattr(
             server_args, "lora_strict_loading", False
         )
-        # The resolved name, not the supplied one: resolution collapses NEXTN
-        # into EAGLE (and can pick FROZEN_KV_MTP), so the raw instance would
-        # miss the warning for a NEXTN run.
         self.speculative_algorithm: Optional[str] = get_spec().speculative_algorithm
 
         # LoRA backend for running sgemm kernels
