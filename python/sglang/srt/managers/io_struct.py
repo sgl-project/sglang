@@ -169,9 +169,18 @@ class GenerateReqInput:
         Optional[Union[List[List[int]], List[int]]],
         PlainValidator(validate_optional_list_i64_1d_2d),
     ] = None
+    # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
+    # The image input. It can be an image instance, file name, URL, or base64 encoded string.
+    # Can be formatted as:
+    # - Single image for a single request
+    # - List of images (one per request in a batch)
+    # - List of lists of images (multiple images per request)
+    # See also python/sglang/srt/utils.py:load_image for more details.
     image_data: Optional[MultimodalDataInputFormat] = None
+    # The video input. Like image data, it can be a file name, a url, or base64 encoded string.
     video_data: Optional[MultimodalDataInputFormat] = None
+    # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
     audio_data: Optional[MultimodalDataInputFormat] = None
     # Optional per-image hashes the caller has already computed (hex strings).
     # Single request: one hash per image. Batch request: either one hash per
@@ -218,6 +227,7 @@ class GenerateReqInput:
     routed_experts_start_len: int = 0
     return_indexer_topk: bool = False
 
+    # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
     session_params: Optional[Dict[str, Any]] = None
 
@@ -239,6 +249,7 @@ class GenerateReqInput:
     bootstrap_pair_key: Optional[Union[List[Optional[str]], str]] = None
     decode_tp_size: Optional[Union[List[Optional[int]], int]] = None
 
+    # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
     # Deprecated alias for `routed_dp_rank`, still accepted because
     # sgl-model-gateway's dp-aware mode injects this spelling into every
@@ -518,6 +529,7 @@ class GenerateReqInput:
             if len(self.image_data) > 0 and isinstance(self.image_data[0], list):
                 for i in range(len(self.image_data)):
                     if self.image_data[i] is None or self.image_data[i] == [None]:
+                        # Ensure len(self.modalities) == len(self.image_data)
                         self.modalities.append(None)
                     elif len(self.image_data[i]) == 1:
                         self.modalities.append("image")
@@ -804,6 +816,7 @@ class GenerateReqInput:
                 else None
             ),
             positional_embed_overrides=self._get_positional_embed_overrides_item(i),
+            # If `__getitem__` is called, these bootstrap fields must be lists.
             bootstrap_host=(
                 self.bootstrap_host[i] if self.bootstrap_host is not None else None
             ),
@@ -960,10 +973,19 @@ class EmbeddingReqInput:
     # requests, a string is expanded to per-item IDs using it as a prefix.
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
     text: Optional[Union[List[List[str]], List[str], str]] = None
+    # The token ids for text; one can either specify text or input_ids.
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
+    # The image input. It can be an image instance, file name, URL, or base64 encoded string.
+    # Can be formatted as:
+    # - Single image for a single request
+    # - List of images (one per request in a batch)
+    # - List of lists of images (multiple images per request)
+    # See also python/sglang/srt/utils.py:load_image for more details.
     image_data: Optional[MultimodalDataInputFormat] = None
+    # The video input. Like image data, it can be a file name, a url, or base64 encoded string.
     video_data: Optional[MultimodalDataInputFormat] = None
+    # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
     audio_data: Optional[MultimodalDataInputFormat] = None
     # Placeholder token ID used to locate embedding override positions in input token IDs.
     embed_override_token_id: Optional[int] = None
@@ -977,6 +999,7 @@ class EmbeddingReqInput:
     sampling_params: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
+    # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
     is_cross_encoder_request: bool = False
     lora_path: Optional[Union[List[Optional[str]], str]] = None
@@ -1022,11 +1045,13 @@ class EmbeddingReqInput:
             )
 
     def normalize_batch_and_arguments(self):
+        # at least one of text, input_ids, or image should be provided
         if self.text is None and self.input_ids is None and self.image_data is None:
             raise ValueError(
                 "At least one of text, input_ids, or image should be provided"
             )
 
+        # text and input_ids cannot be provided at the same time
         if self.text is not None and self.input_ids is not None:
             raise ValueError("text and input_ids cannot be provided at the same time")
 
