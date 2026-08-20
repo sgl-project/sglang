@@ -57,6 +57,7 @@ sys.modules.setdefault("sglang.srt.speculative.eagle_utils", _eagle_stub)
 
 from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     CompressorAscendBackendMixin,
+    DeepseekV4AscendAttnBackend,
     DeepseekV4AscendMultiStepDraftBackend,
     _apply_hadamard,
     _build_cycle_state_block_table,
@@ -197,6 +198,171 @@ class TestCompressorStateTableABI(unittest.TestCase):
     def test_a5_cycle_table_rejects_explicit_shape(self):
         with self.assertRaises(ValueError):
             _build_cycle_state_block_table(torch.zeros((2, 8), dtype=torch.int32))
+
+    @patch(
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_atlas_a5",
+        return_value=True,
+    )
+    def test_a5_eager_metadata_builds_cycle_table(self, _):
+        backend = CompressorAscendBackendMixin.__new__(CompressorAscendBackendMixin)
+        backend.forward_metadata = SimpleNamespace()
+        backend.token_to_kv_pool = MagicMock()
+        backend.req_to_token = torch.empty((0, 0), dtype=torch.int32)
+        backend.req_to_token_pool = MagicMock()
+        backend._dsv4_compress_ratios = ()
+        backend._compute_compress_locs = MagicMock(return_value={})
+
+        forward_mode = MagicMock()
+        forward_mode.is_decode.return_value = True
+        forward_mode.is_target_verify.return_value = False
+        forward_batch = SimpleNamespace(
+            forward_mode=forward_mode,
+            req_pool_indices=torch.tensor([7, 3], dtype=torch.int64),
+            seq_lens=torch.tensor([5, 9], dtype=torch.int32),
+            out_cache_loc=torch.empty(0, dtype=torch.int64),
+            out_cache_loc_dsv4=None,
+            batch_size=2,
+        )
+
+        backend._build_npu_compress_metadata(forward_batch)
+
+        table = getattr(backend.forward_metadata, "dsv4_cycle_state_block_table", None)
+        self.assertIsNotNone(table)
+        self.assertEqual(table.tolist(), [7, 3])
+        self.assertEqual(table.dtype, torch.int32)
+
+    @patch(
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_atlas_a5",
+        return_value=True,
+    )
+    def test_a5_graph_replay_updates_cycle_table_in_place(self, _):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        table = torch.zeros(2, dtype=torch.int32)
+        graph_mode = MagicMock()
+        graph_mode.is_decode.return_value = False
+        graph_mode.is_target_verify.return_value = False
+        ctx = SimpleNamespace(
+            fm=SimpleNamespace(dsv4_cycle_state_block_table=table),
+            forward_batch=SimpleNamespace(
+                req_pool_indices=torch.tensor([7, 3], dtype=torch.int64)
+            ),
+            graph_mode=graph_mode,
+        )
+        backend._build_dsv4_graph_replay_ctx = MagicMock(return_value=ctx)
+        for name in (
+            "_refresh_graph_seq_metadata",
+            "_refresh_graph_compress_page_tables_direct",
+            "_refresh_graph_explicit_state_block_tables",
+            "_refresh_graph_swa_metadata_direct",
+            "_refresh_graph_dspark_sparse_metadata",
+            "_refresh_graph_kernel_metadata",
+        ):
+            setattr(backend, name, MagicMock())
+
+        backend._apply_dsv4_graph_metadata(SimpleNamespace())
+
+        self.assertIs(backend.forward_metadata.dsv4_cycle_state_block_table, table)
+        self.assertEqual(table.tolist(), [7, 3])
+
+    @patch(
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_atlas_a5",
+        return_value=True,
+    )
+    def test_a5_graph_capture_allocates_cycle_table_buffer(self, _):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        metadata = SimpleNamespace()
+        backend.device = "cpu"
+        backend.graph_metadata = {
+            2: metadata,
+            "swa_page_table": torch.full((2, 4), -1, dtype=torch.int32),
+            "c4_page_table": torch.full((2, 4), -1, dtype=torch.int32),
+            "c128_page_table": torch.full((2, 4), -1, dtype=torch.int32),
+            "kernel_metadata_c1a": torch.zeros(1024, dtype=torch.int32),
+            "kernel_metadata_c4a": torch.zeros(1024, dtype=torch.int32),
+            "kernel_metadata_c128a": torch.zeros(1024, dtype=torch.int32),
+            "kernel_metadata_li_quant": torch.zeros(1024, dtype=torch.int32),
+            "c4_topk_indices": torch.full((2, 1), -1, dtype=torch.int32),
+        }
+        backend._dsv4_graph_tokens_per_req = 1
+        backend._dsv4_index_topk = 1
+        backend._dsv4_state_pools_by_ratio = {}
+        backend._dsv4_sliding_window_size = 128
+        backend._is_dspark_draft_worker = False
+        forward_mode = MagicMock()
+        forward_mode.is_target_verify.return_value = False
+        forward_mode.is_draft_extend_v2.return_value = False
+
+        backend._init_dsv4_graph_metadata(2, forward_mode)
+
+        table = getattr(metadata, "dsv4_cycle_state_block_table", None)
+        self.assertIsNotNone(table)
+        self.assertEqual(tuple(table.shape), (2,))
+        self.assertEqual(table.dtype, torch.int32)
+
+    @patch(
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_atlas_a5",
+        return_value=True,
+    )
+    def test_a5_forward_reuses_batch_cycle_table(self, _):
+        table = torch.tensor([7, 3], dtype=torch.int32)
+        backend = CompressorAscendBackendMixin.__new__(CompressorAscendBackendMixin)
+        backend.graph_mode = False
+        backend.forward_metadata = SimpleNamespace(
+            dsv4_cycle_state_block_table=table,
+            positions_cmp_padding_c128=torch.empty(0, dtype=torch.int64),
+            actual_seq_lengths_q_pa=torch.tensor([0, 1, 2], dtype=torch.int32),
+            seqused=torch.ones(2, dtype=torch.int32),
+            start_pos=torch.zeros(2, dtype=torch.int32),
+            c128_loc=None,
+        )
+        backend.token_to_kv_pool = MagicMock()
+        backend.token_to_kv_pool._get_state_pool.return_value = SimpleNamespace(
+            state_cache_3d=torch.empty(0)
+        )
+        backend._ensure_compressor_hadamard = MagicMock()
+        backend._ensure_fused_caches = MagicMock()
+        backend._compressor_epilog_npu = MagicMock()
+
+        compressor = SimpleNamespace(
+            ratio=128,
+            overlap=False,
+            layer_id=0,
+            is_in_indexer=False,
+            freqs_cis=None,
+            rotary_emb=None,
+            _fused_wkv_w=torch.empty(0),
+            _fused_wgate_w=torch.empty(0),
+            ape=torch.empty(0),
+            _fused_norm_weight_fp32=torch.empty(0),
+            rope_head_dim=64,
+            norm=SimpleNamespace(variance_epsilon=1e-6),
+            rotate=False,
+        )
+        forward_mode = MagicMock()
+        forward_mode.is_prefill.return_value = False
+        forward_mode.is_target_verify.return_value = False
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([7, 3], dtype=torch.int64),
+            forward_mode=forward_mode,
+        )
+        rope = MagicMock()
+        rope.get_cos_sin.return_value = (torch.empty(0), torch.empty(0))
+
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend."
+            "Dsv4NpuRoPE.for_freqs",
+            return_value=rope,
+        ), patch("torch.ops.custom", MagicMock(), create=True) as custom_ops:
+            custom_ops.compressor.return_value = torch.empty((0, 1))
+            backend.forward_compress(compressor, torch.empty((2, 1)), forward_batch)
+            backend.forward_compress(compressor, torch.empty((2, 1)), forward_batch)
+
+        self.assertIs(
+            custom_ops.compressor.call_args_list[0].kwargs["state_block_table"], table
+        )
+        self.assertIs(
+            custom_ops.compressor.call_args_list[1].kwargs["state_block_table"], table
+        )
 
 
 class TestAtlasA5SparseAttentionDispatch(unittest.TestCase):
