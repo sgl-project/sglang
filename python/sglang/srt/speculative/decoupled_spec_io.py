@@ -7,7 +7,7 @@ from typing import Callable, Optional
 
 class DraftMeshMessageType(str, Enum):
     CONTROL_BATCH = "control_batch"
-    TAIL_STREAM_OUTPUT_BATCH = "tail_stream_output_batch"
+    ENUMERATION_BUFFER_BATCH = "enumeration_buffer_batch"
 
 
 @dataclass(frozen=True)
@@ -67,14 +67,13 @@ class DraftSync:
 class VerifyCommit:
     """
     Sent from verifier to drafter to commit a portion of the draft outputs.
+    committed_tokens is the verifier-committed contiguous segment output_ids[
+    pre_verify_committed_len : pre_verify_committed_len + len(committed_tokens)];
+    the drafter aligns its reqs to it, sometimes truncating / reprefilling.
 
-    committed_tokens is the verifier-committed contiguous output segment:
-    output_ids[
-        pre_verify_committed_len:
-        pre_verify_committed_len + len(committed_tokens)
-    ].
-    Drafter must align its reqs to these committed tokens,
-    and sometimes needs to truncate tokens / reprefill.
+    Enumeration: committed_tokens is the accepted draft tokens followed by the
+    bonus token, so accept_len = len(committed_tokens) - 1 and bonus =
+    committed_tokens[-1]. A fallback round commits exactly [bonus] (accept_len == 0).
     """
 
     request_id: str
@@ -121,30 +120,102 @@ class DraftClose:
 
 
 @dataclass
-class DraftTailStreamOutput:
-    """
-    Drafter sends one output token to the verifier-side DraftTailBuffer.
+class DraftEnumerationBufferBatch:
+    """One drafter -> one verifier, one scheduler step: a parallel-array batch
+    (SGLang IPC convention, token ids only). The drafter pre-enumerates, from
+    each request's committed base, every chain the verifier could select in the
+    next round; the verifier GPU-selects the matching row, so a wrong guess is
+    never committed.
 
-    base_committed_len records the verifier prefix length that the drafter used
-    as the base when this token was emitted. The verifier compares it with its
-    stale-base boundary before accepting the token as tail data or as
-    pending-prefix confirmation.
+    Dims (batch-uniform scalars): num_steps (K) = draft chain length per case,
+    fanout (F) = bonus-token guesses per accept case; K + 1 = the previous
+    round's possible accept lengths (0..K).
 
-    new_token_pos is the 0-based output token position for new_token. Normal
-    decode streams send the latest generated token.
+    tokens: a flat B * (K + 1) * F * K tuple of vocab ids; row i starts at
+    i * row_stride, row_stride = (K + 1) * F * K, and within a row is indexed
+    [accept_case][guess][step] via flat = (accept_case * F + guess) * K + step.
+
+    base_committed_lens[i] is the staleness version (committed length row i was
+    drafted from) the verifier judges usability on entirely on GPU.
+
+    src_drafter_rank / dst_verifier_rank are scalars because a wire message has
+    one sender and one destination; aggregation across drafters happens on the
+    verifier, collecting the messages it receives keyed on src_drafter_rank.
     """
 
     src_drafter_rank: int
     dst_verifier_rank: int
-    request_id: str
-    base_committed_len: int
-    new_token_pos: int
-    new_token: int
+    num_steps: int
+    fanout: int
+    rids: list[str] = field(default_factory=list)
+    base_committed_lens: list[int] = field(default_factory=list)
+    tokens: tuple[int, ...] = ()
 
+    @property
+    def row_stride(self) -> int:
+        return (int(self.num_steps) + 1) * int(self.fanout) * int(self.num_steps)
 
-@dataclass
-class DraftTailStreamOutputBatch:
-    outputs: list[DraftTailStreamOutput] = field(default_factory=list)
+    @property
+    def batch_size(self) -> int:
+        return len(self.rids)
+
+    @property
+    def num_tokens(self) -> int:
+        return self.batch_size * self.row_stride
+
+    def draft_key(self, i: int) -> DraftReqKey:
+        return DraftReqKey(
+            src_verifier_rank=int(self.dst_verifier_rank),
+            request_id=self.rids[i],
+        )
+
+    def row_tokens(self, i: int) -> tuple[int, ...]:
+        return self.tokens[i * self.row_stride : (i + 1) * self.row_stride]
+
+    def validate(self) -> None:
+        if int(self.num_steps) < 1:
+            raise ValueError(
+                "DraftEnumerationBufferBatch num_steps must be >= 1: "
+                f"batch_size={self.batch_size} num_steps={self.num_steps}"
+            )
+        if int(self.fanout) < 1:
+            raise ValueError(
+                "DraftEnumerationBufferBatch fanout must be >= 1: "
+                f"batch_size={self.batch_size} fanout={self.fanout}"
+            )
+        if len(self.rids) != len(self.base_committed_lens):
+            raise ValueError(
+                "DraftEnumerationBufferBatch rids and base_committed_lens must "
+                "have equal length: "
+                f"len(rids)={len(self.rids)} "
+                f"len(base_committed_lens)={len(self.base_committed_lens)}"
+            )
+        seen_rids: set[str] = set()
+        for rid in self.rids:
+            if rid in seen_rids:
+                raise ValueError(
+                    "DraftEnumerationBufferBatch rids must be unique (one row "
+                    "per request): duplicate rows resolve to the same seat and "
+                    "make the verifier-side scatter's winner nondeterministic: "
+                    f"batch_size={self.batch_size} duplicate_rid={rid}"
+                )
+            seen_rids.add(rid)
+        for i, base_committed_len in enumerate(self.base_committed_lens):
+            if int(base_committed_len) < 0:
+                raise ValueError(
+                    "DraftEnumerationBufferBatch base_committed_lens must be "
+                    "non-negative: "
+                    f"request_id={self.rids[i]} "
+                    f"base_committed_len={base_committed_len}"
+                )
+        if len(self.tokens) != self.num_tokens:
+            raise ValueError(
+                "DraftEnumerationBufferBatch tokens length must equal "
+                "batch_size * (num_steps + 1) * fanout * num_steps: "
+                f"batch_size={self.batch_size} "
+                f"num_steps={self.num_steps} fanout={self.fanout} "
+                f"expected={self.num_tokens} actual={len(self.tokens)}"
+            )
 
 
 @dataclass
@@ -358,7 +429,7 @@ class ReadyDraftControls:
 class DraftMeshMessage:
     message_type: DraftMeshMessageType
     control_batch: Optional[DraftControlBatch] = None
-    tail_stream_output_batch: Optional[DraftTailStreamOutputBatch] = None
+    enumeration_buffer_batch: Optional[DraftEnumerationBufferBatch] = None
 
     @staticmethod
     def from_control_batch(message: DraftControlBatch) -> DraftMeshMessage:
@@ -368,12 +439,12 @@ class DraftMeshMessage:
         )
 
     @staticmethod
-    def from_tail_stream_output_batch(
-        message: DraftTailStreamOutputBatch,
+    def from_enumeration_buffer_batch(
+        message: DraftEnumerationBufferBatch,
     ) -> DraftMeshMessage:
         return DraftMeshMessage(
-            message_type=DraftMeshMessageType.TAIL_STREAM_OUTPUT_BATCH,
-            tail_stream_output_batch=message,
+            message_type=DraftMeshMessageType.ENUMERATION_BUFFER_BATCH,
+            enumeration_buffer_batch=message,
         )
 
 
