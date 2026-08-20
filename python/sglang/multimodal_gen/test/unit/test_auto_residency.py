@@ -156,10 +156,37 @@ class TestEstimateDefaultWorkloadPeak:
         )
         assert estimate == high.peak_reserved_bytes
 
-    def test_failed_warmup_disables_estimation(self):
-        records = [_record(), _record(succeeded=False)]
+    def test_failure_at_the_target_size_disables_estimation(self):
+        good = _record(num_frames=9, peak_gib=8)
+        failed = _record(num_frames=17, succeeded=False)
         assert (
-            estimate_default_workload_peak_bytes(records=records, target_units=None)
+            estimate_default_workload_peak_bytes(
+                records=[good, failed], target_units=failed.workload_units()
+            )
+            is None
+        )
+
+    def test_failure_below_the_target_size_disables_estimation(self):
+        good = _record(num_frames=9, peak_gib=8)
+        failed = _record(num_frames=17, succeeded=False)
+        assert (
+            estimate_default_workload_peak_bytes(
+                records=[good, failed], target_units=failed.workload_units() * 2
+            )
+            is None
+        )
+
+    def test_failure_above_the_target_size_is_dropped(self):
+        good = _record(num_frames=9, peak_gib=8)
+        failed = _record(num_frames=81, succeeded=False)
+        estimate = estimate_default_workload_peak_bytes(
+            records=[good, failed], target_units=good.workload_units()
+        )
+        assert estimate == good.peak_reserved_bytes
+
+    def test_unknown_target_disables_estimation(self):
+        assert (
+            estimate_default_workload_peak_bytes(records=[_record()], target_units=None)
             is None
         )
 
@@ -230,6 +257,12 @@ class TestPlanAutoResidency:
         # 10% of a 20 GiB budget is 2 GiB; the floor must lift it to 4 GiB.
         plan = plan_auto_residency(reports=[_report(budget_gib=20, estimated_gib=10)])
         assert plan.reserve_bytes == MIN_VRAM_RESERVE_BYTES
+
+    def test_reserve_floor_is_capped_on_a_small_card(self):
+        # A flat 4 GiB would fence off a third of a 12 GiB card; the cap keeps
+        # the floor at a fifth of what is actually there.
+        plan = plan_auto_residency(reports=[_report(budget_gib=10, estimated_gib=4)])
+        assert plan.reserve_bytes == 2 * GIB_BYTES
 
     def test_greedy_promotion_by_h2d_savings(self):
         # dit saves 25 GiB x 50 steps per request; text_encoder saves 30 GiB
