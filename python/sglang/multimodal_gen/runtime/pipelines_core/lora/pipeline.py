@@ -288,10 +288,12 @@ class LoRAPipeline(ComposedPipelineBase):
             yield []
             return
 
-        # clear device cache to free up unused memory
-        if torch.get_device_module().is_available():
-            torch.get_device_module().synchronize()
-            torch.get_device_module().empty_cache()
+        # Clear device cache to free unused memory on backends that expose it.
+        device_module = torch.get_device_module()
+        if device_module.is_available() and hasattr(device_module, "empty_cache"):
+            if hasattr(device_module, "synchronize"):
+                device_module.synchronize()
+            device_module.empty_cache()
 
         offload_disabled_modules = []
         for module_name in module_names:
