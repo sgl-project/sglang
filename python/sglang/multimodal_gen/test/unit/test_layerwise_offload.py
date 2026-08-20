@@ -17,6 +17,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers import (
     component_residency_strategies as component_residency_strategies_mod,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
+    host_memory_budget,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers import (
     layerwise_offload as layerwise_offload_mod,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -1305,11 +1308,13 @@ def _mapped_manager(tmp_path, monkeypatch, *, available_gib):
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
     )
     monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
-    monkeypatch.setattr(
-        layerwise_offload_mod,
-        "host_memory_available_bytes",
-        lambda: int(available_gib * 1024**3),
-    )
+    # Two bindings for one fact: the budget module's copy is what decides
+    # whether the copies fit, and layerwise_offload's own is what the log reports.
+    available_bytes = int(available_gib * 1024**3)
+    for module in (host_memory_budget, layerwise_offload_mod):
+        monkeypatch.setattr(
+            module, "host_memory_available_bytes", lambda: available_bytes
+        )
     model = _FileBackedModel(tmp_path / "weights.bin")
     return LayerwiseOffloadManager(
         model=model,

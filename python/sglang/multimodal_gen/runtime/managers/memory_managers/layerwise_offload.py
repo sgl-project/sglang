@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
     HostPinBudget,
     describe_host_memory,
+    host_copies_would_not_fit,
     host_memory_available_bytes,
     module_weight_bytes,
     pin_benefit_bytes,
@@ -92,11 +93,6 @@ def compute_streamed_layers(
 # Below this a table is not worth a per-request round trip; above it the ratio
 # of table size to rows actually read makes residency clearly wasteful.
 HOST_RESIDENT_TABLE_MIN_BYTES = 256 * 1024**2
-
-# Left free when deciding whether host copies of the weights fit: the process
-# still needs activations, staging buffers and whatever the allocator asks for
-# mid-request, none of which are in the weight total.
-HOST_COPY_RESERVE_BYTES = 4 * 1024**3
 
 
 def _resolve_submodule(root: torch.nn.Module, path: str) -> torch.nn.Module | None:
@@ -422,9 +418,9 @@ class LayerwiseOffloadManager:
             return False
         # The copies land in host memory on top of the page cache already holding
         # these bytes, so the room needed is the copy itself plus a reserve.
-        available = host_memory_available_bytes()
-        if mapped_bytes < available - HOST_COPY_RESERVE_BYTES:
+        if not host_copies_would_not_fit(mapped_bytes):
             return False
+        available = host_memory_available_bytes()
         logger.info(
             "Layerwise offload: leaving %.2f GiB of weights on the checkpoint "
             "mapping -- copying them into host memory needs more than the "
