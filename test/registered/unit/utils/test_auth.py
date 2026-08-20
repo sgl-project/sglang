@@ -115,6 +115,42 @@ class TestDecideRequestAuth(CustomTestCase):
         )
         self.assertTrue(decision.allowed)
 
+    def test_normal_with_anthropic_api_key_correct(self):
+        decision = decide_request_auth(
+            method="POST",
+            path="/v1/messages",
+            authorization_header=None,
+            api_key_header="my-api-key",
+            api_key="my-api-key",
+            admin_api_key=None,
+            auth_level=AuthLevel.NORMAL,
+        )
+        self.assertTrue(decision.allowed)
+
+    def test_normal_with_anthropic_api_key_wrong(self):
+        decision = decide_request_auth(
+            method="POST",
+            path="/v1/messages",
+            authorization_header=None,
+            api_key_header="wrong-key",
+            api_key="my-api-key",
+            admin_api_key=None,
+            auth_level=AuthLevel.NORMAL,
+        )
+        self.assertFalse(decision.allowed)
+
+    def test_valid_anthropic_api_key_falls_back_from_malformed_bearer(self):
+        decision = decide_request_auth(
+            method="POST",
+            path="/v1/messages",
+            authorization_header="Basic invalid",
+            api_key_header="my-api-key",
+            api_key="my-api-key",
+            admin_api_key=None,
+            auth_level=AuthLevel.NORMAL,
+        )
+        self.assertTrue(decision.allowed)
+
     def test_normal_with_api_key_wrong(self):
         decision = decide_request_auth(
             method="POST",
@@ -193,6 +229,18 @@ class TestDecideRequestAuth(CustomTestCase):
             method="POST",
             path="/admin/endpoint",
             authorization_header="Bearer my-api-key",
+            api_key="my-api-key",
+            admin_api_key="admin-secret",
+            auth_level=AuthLevel.ADMIN_FORCE,
+        )
+        self.assertFalse(decision.allowed)
+
+    def test_admin_force_rejects_normal_key_from_anthropic_header(self):
+        decision = decide_request_auth(
+            method="POST",
+            path="/admin/endpoint",
+            authorization_header=None,
+            api_key_header="my-api-key",
             api_key="my-api-key",
             admin_api_key="admin-secret",
             auth_level=AuthLevel.ADMIN_FORCE,
