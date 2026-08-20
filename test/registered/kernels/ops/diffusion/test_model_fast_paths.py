@@ -37,6 +37,9 @@ import sglang.multimodal_gen.runtime.models.dits.glm_image as glm_image
 import sglang.multimodal_gen.runtime.models.dits.ltx_2 as ltx2_module
 import sglang.multimodal_gen.runtime.models.dits.sana as sana
 from sglang.kernels.ops.diffusion import (
+    can_use_fused_layernorm_modulate,
+    can_use_fused_qk_head_layernorm,
+    can_use_fused_rmsnorm_scale_shift,
     can_use_wan_rmsnorm_silu,
     fused_ltx2_rms_norm_modulate,
     mark_fused_ln_modulate_site,
@@ -49,6 +52,7 @@ from sglang.kernels.ops.diffusion import (
     unmount_ltx2_rms_norm_modulate,
     wan_rmsnorm_silu,
 )
+from sglang.kernels.ops.diffusion.common.platform import is_cuda
 from sglang.multimodal_gen.configs.models.vaes.stablediffusion3 import (
     StableDiffusion3VAEConfig,
 )
@@ -104,12 +108,34 @@ register_amd_ci(est_time=8, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
+# The bit-exact LayerNorm/RMSNorm fusions are NVIDIA inline PTX, so their
+# guards reject on ROCm and these sites serve eager there; only the subtests
+# asserting a fused outcome are CUDA-only.
+requires_inline_ptx = pytest.mark.skipif(
+    not is_cuda(), reason="bit-exact norm fusions are NVIDIA PTX"
+)
+
 
 @pytest.fixture(autouse=True)
 def _seed_cuda():
     """Every wrapper below asserts against a reference computed from the same
     random draw, so the seed must be fixed per test, not per module."""
     torch.cuda.manual_seed(0)
+
+
+def test_bitexact_norm_guards_follow_platform():
+    # Runs on both lanes, with shapes inside every guard's contract so only the
+    # platform decides: engaged on CUDA, rejected on ROCm.  A fatal LLVM error
+    # there kills the process, so the sites' own try/except cannot be what
+    # catches it -- the guards have to.
+    x = torch.randn(1, 256, 4096, device="cuda", dtype=torch.bfloat16)
+    row = torch.randn(1, 4096, device="cuda", dtype=torch.bfloat16)
+    vec = torch.randn(1, 1, 4096, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(4096, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(1, 256, 32, 128, device="cuda", dtype=torch.bfloat16)
+    assert can_use_fused_layernorm_modulate(x, row, row) is is_cuda()
+    assert can_use_fused_qk_head_layernorm(q, q) is is_cuda()
+    assert can_use_fused_rmsnorm_scale_shift(x, weight, vec, vec) is is_cuda()
 
 
 # -------------------------------------------------------------------------
@@ -131,6 +157,7 @@ def _flux_site_inputs(shape, chunks, seed):
     return norm, x, parts[0], parts[1]
 
 
+@requires_inline_ptx
 @pytest.mark.parametrize(
     "shape,chunks",
     [
@@ -151,6 +178,7 @@ def test_flux_fused_ln_modulate_is_bit_exact(shape, chunks):
     assert flux._FLUX_LN_MOD.verified
 
 
+@requires_inline_ptx
 def test_flux_norm_modulate_bitexact_supersedes_high_fold():
     # With the quality="high" affine fold mounted, the bit-exact kernel
     # still takes priority, so the site output stays lossless.
@@ -183,6 +211,7 @@ class TestFlux2EagerFusions(CustomTestCase):
         flux2._FLUX2_SWIGLU.verified = False
         flux2._FLUX2_SWIGLU_SIGS.clear()
 
+    @requires_inline_ptx
     def test_norm_modulate_is_bit_exact_across_sequence_lengths(self):
         torch.manual_seed(0)
         hidden = 256
@@ -258,6 +287,7 @@ class TestFlux2EagerFusions(CustomTestCase):
 # -------------------------------------------------------------------------
 
 
+@requires_inline_ptx
 @pytest.mark.parametrize("shape", [(1, 4096, 4096), (2, 301, 4096), (1, 1, 2560)])
 def test_glm_ln_modulate_is_bit_exact(shape):
     # (1, 4096, 4096) is the real GLM-Image image-stream shape (1024^2,
@@ -275,6 +305,7 @@ def test_glm_ln_modulate_is_bit_exact(shape):
     assert not glm_image._GLM_LN_MOD.disabled
 
 
+@requires_inline_ptx
 @pytest.mark.parametrize("shape", [(1, 4360, 32, 128), (2, 37, 3, 40), (1, 129, 5, 64)])
 def test_glm_qk_head_layernorm_is_bit_exact(shape):
     # (1, 4360, 32, 128) is the real GLM-Image q/k shape (text + image
@@ -297,6 +328,7 @@ def test_glm_qk_head_layernorm_is_bit_exact(shape):
 # -------------------------------------------------------------------------
 
 
+@requires_inline_ptx
 @pytest.mark.parametrize(
     "shape,nmod,transposed",
     [
@@ -346,6 +378,7 @@ def test_sana_fused_ln_modulate_is_bit_exact(shape, nmod, transposed):
 # -------------------------------------------------------------------------
 
 
+@requires_inline_ptx
 @pytest.mark.parametrize("shape", [(1, 4216, 4096), (2, 1140, 4096), (1, 128, 2048)])
 def test_ernie_norm_scale_shift_is_bit_exact(shape):
     # (1, 4216, 4096) is the real ERNIE-Image shape (1024^2 image + text
@@ -501,6 +534,7 @@ def test_ltx2_lossless_compile_keeps_expression_visible_to_inductor(monkeypatch)
     assert torch.equal(out, _ltx2_eager(rms, x, scale, shift, 1e-6))
 
 
+@requires_inline_ptx
 @pytest.mark.parametrize("hidden", [4096, 2048])
 def test_ltx2_mounted_high_uses_fused_kernel(hidden):
     block = nn.Module()

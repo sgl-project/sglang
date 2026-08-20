@@ -26,46 +26,44 @@ _BLOCK_SIZE = 1024
 
 
 @triton.jit
-def _masked_row_sum_kernel(
+def _mask_and_partial_sum_kernel(
     probs_ptr,
     pivots_ptr,
-    partial_ptr,
-    vocab_size,
-    num_chunks,
+    out_ptr,
+    partial_sums_ptr,
+    vocab_size: tl.constexpr,
+    num_chunks: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    row = tl.program_id(0).to(tl.int64)
+    row = tl.program_id(0)
     chunk = tl.program_id(1).to(tl.int64)
     offsets = chunk * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < vocab_size
+    row_offsets = row.to(tl.int64) * vocab_size + offsets
 
-    probs = tl.load(probs_ptr + row * vocab_size + offsets, mask=mask, other=0.0)
+    probs = tl.load(probs_ptr + row_offsets, mask=mask, other=0.0).to(tl.float32)
     pivot = tl.load(pivots_ptr + row)
     kept = tl.where(mask & (probs >= pivot), probs, 0.0)
-    tl.store(partial_ptr + row * num_chunks + chunk, tl.sum(kept, axis=0))
+
+    tl.store(out_ptr + row_offsets, kept, mask=mask)
+    tl.store(partial_sums_ptr + row * num_chunks + chunk, tl.sum(kept, axis=0))
 
 
 @triton.jit
-def _masked_scale_kernel(
-    probs_ptr,
-    pivots_ptr,
-    row_sums_ptr,
+def _normalize_kernel(
     out_ptr,
-    vocab_size,
+    row_sums_ptr,
+    numel,
+    vocab_size: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    row = tl.program_id(0).to(tl.int64)
-    chunk = tl.program_id(1).to(tl.int64)
-    offsets = chunk * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < vocab_size
-    indices = row * vocab_size + offsets
-
-    probs = tl.load(probs_ptr + indices, mask=mask, other=0.0)
-    pivot = tl.load(pivots_ptr + row)
-    total = tl.load(row_sums_ptr + row)
-    # A row can be entirely zero; emit zeros rather than dividing by it.
-    scale = tl.where(total > 0.0, 1.0 / total, 0.0)
-    tl.store(out_ptr + indices, tl.where(probs >= pivot, probs * scale, 0.0), mask=mask)
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < numel
+    row = offsets // vocab_size
+    values = tl.load(out_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    denominator = tl.load(row_sums_ptr + row, mask=mask, other=1.0)
+    scale = tl.where(denominator > 0.0, 1.0 / denominator, 0.0)
+    tl.store(out_ptr + offsets, values * scale, mask=mask)
 
 
 def apply_pivot_triton(probs: torch.Tensor, pivots: torch.Tensor) -> torch.Tensor:
@@ -74,16 +72,29 @@ def apply_pivot_triton(probs: torch.Tensor, pivots: torch.Tensor) -> torch.Tenso
     num_chunks = triton.cdiv(vocab_size, _BLOCK_SIZE)
     grid = (batch_size, num_chunks)
 
+    out = torch.empty_like(probs)
     partial_sums = torch.empty(
         (batch_size, num_chunks), device=probs.device, dtype=torch.float32
     )
-    _masked_row_sum_kernel[grid](
-        probs, pivots, partial_sums, vocab_size, num_chunks, BLOCK_SIZE=_BLOCK_SIZE
+    _mask_and_partial_sum_kernel[grid](
+        probs,
+        pivots,
+        out,
+        partial_sums,
+        vocab_size=vocab_size,
+        num_chunks=num_chunks,
+        BLOCK_SIZE=_BLOCK_SIZE,
+        num_warps=8,
     )
 
-    out = torch.empty_like(probs)
-    _masked_scale_kernel[grid](
-        probs, pivots, partial_sums.sum(dim=1), out, vocab_size, BLOCK_SIZE=_BLOCK_SIZE
+    row_sums = partial_sums.sum(dim=1)
+    _normalize_kernel[(triton.cdiv(out.numel(), _BLOCK_SIZE),)](
+        out,
+        row_sums,
+        out.numel(),
+        vocab_size=vocab_size,
+        BLOCK_SIZE=_BLOCK_SIZE,
+        num_warps=8,
     )
     return out
 
