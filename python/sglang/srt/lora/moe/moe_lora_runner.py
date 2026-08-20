@@ -65,6 +65,11 @@ if TYPE_CHECKING:
     )
 
 
+# Providers can carry more than one implementation of a fused stage, and
+# ``install_fused_act_implementation`` injects them. Serving asks for Triton.
+_IMPLEMENTATION = "triton"
+
+
 @dataclass(slots=True)
 class _LoraStageState:
     rank: torch.Tensor | None = None
@@ -302,15 +307,14 @@ class MoeLoraRunner:
             )
 
         if plan.act.family is not ActFamily.MATERIALIZED:
-            family, implementation = self._act_implementation(plan)
             if not provider.supports_fused_act(
-                family,
+                plan.act.family.value,
                 activation=self.activation.value,
-                implementation=implementation,
+                implementation=_IMPLEMENTATION,
             ):
                 raise NotImplementedError(
                     f"{provider.contract.key} does not implement "
-                    f"{family}/{implementation}"
+                    f"{plan.act.family.value}/{_IMPLEMENTATION}"
                 )
         if plan.down_b_into_base and not provider.supports_down_b_into_base():
             raise NotImplementedError(
@@ -318,29 +322,17 @@ class MoeLoraRunner:
                 "into-base epilogue"
             )
         if plan.finalize.family is not FinalizeFamily.MATERIALIZED:
-            family, implementation = self._finalize_implementation(plan)
             ownership_name = "shared" if plan.finalize.is_shared_outer else "per_expert"
             if not provider.supports_fused_finalize(
-                family,
+                plan.finalize.family.value,
                 ownership_name,
-                implementation=implementation,
+                implementation=_IMPLEMENTATION,
             ):
                 raise NotImplementedError(
                     f"{provider.contract.key} does not implement "
-                    f"{family}/{ownership_name}/{implementation}"
+                    f"{plan.finalize.family.value}/{ownership_name}/"
+                    f"{_IMPLEMENTATION}"
                 )
-
-    @staticmethod
-    def _act_implementation(
-        plan: MoeLoraExecutionPlan,
-    ) -> tuple[str, str]:
-        return plan.act.family.value, "triton"
-
-    @staticmethod
-    def _finalize_implementation(
-        plan: MoeLoraExecutionPlan,
-    ) -> tuple[str, str]:
-        return plan.finalize.family.value, "triton"
 
     def run_plan(
         self,
@@ -676,11 +668,10 @@ class MoeLoraRunner:
         # The act stage runs the gate/up B GEMM. That GEMM always reads the
         # per-expert route.
         route = routes.aligned(False)
-        family, implementation = self._act_implementation(plan)
         provider.run_fused_act(
             base_gemm_state,
-            family,
-            implementation=implementation,
+            plan.act.family.value,
+            implementation=_IMPLEMENTATION,
             activation=self.activation.value,
             base_gateup=gateup_out,
             act_masked=act_out,
@@ -881,10 +872,9 @@ class MoeLoraRunner:
 
         route = routes.raw(plan.finalize.is_shared_outer)
         b_down = batch.down_lora_b.flatten(0, 1)
-        _, implementation = self._finalize_implementation(plan)
         provider.run_shared_rank_finalize(
             base_gemm_state,
-            implementation=implementation,
+            implementation=_IMPLEMENTATION,
             down_masked=down_out,
             bridge=down_rank,
             b_down=b_down,
