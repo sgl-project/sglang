@@ -2749,6 +2749,8 @@
             "expected_e2e_ms": 0.0,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
+            "load_peak_vram_mb": 43056.0,
+            "runtime_peak_vram_mb": 74396.0,
             "estimated_full_test_time_s": 126.0
         },
         "ltx_2_3_hq_pipeline": {
