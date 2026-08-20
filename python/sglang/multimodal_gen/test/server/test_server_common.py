@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server import conftest
 from sglang.multimodal_gen.test.server.realtime_consistency import (
+    RealtimeChunkStats,
     pop_realtime_key_frames,
     pop_realtime_perf_stats,
     validate_realtime_perf_stats,
@@ -479,6 +480,85 @@ class DiffusionServerBase:
                 self._dump_baseline_for_testcase(case, summary, missing_scenario)
                 raise
 
+        self._record_performance_result(case, summary)
+
+    def _validate_realtime_performance(
+        self,
+        ctx: ServerContext,
+        case: DiffusionTestCase,
+        chunk_stats: list[RealtimeChunkStats],
+    ) -> None:
+        validate_realtime_perf_stats(
+            case.id,
+            chunk_stats,
+            case.sampling_params.realtime_perf_thresholds,
+            ignore_initial_chunks=(
+                case.sampling_params.realtime_perf_ignore_initial_chunks
+            ),
+        )
+        if not case.run_perf_check or not current_platform.is_cuda():
+            return
+
+        request_id = next(
+            (stat.request_id for stat in reversed(chunk_stats) if stat.request_id),
+            None,
+        )
+        if request_id is None:
+            pytest.fail(f"{case.id}: realtime chunk stats are missing request IDs")
+
+        perf_record = wait_for_req_perf_record(
+            request_id,
+            ctx.perf_log_path,
+            timeout=30,
+        )
+        if perf_record is None:
+            pytest.fail(f"{case.id}: realtime request performance record is missing")
+
+        scenario = BASELINE_CONFIG.scenarios.get(case.id)
+        if scenario is None:
+            pytest.fail(f"Testcase '{case.id}' not found in {get_perf_baseline_path()}")
+
+        validator = PerformanceValidator(
+            scenario=scenario,
+            tolerances=BASELINE_CONFIG.tolerances,
+            step_fractions=BASELINE_CONFIG.step_fractions,
+        )
+        summary = validator.collect_metrics(perf_record)
+        self._print_performance_log(case, summary, scenario)
+        self._record_performance_result(case, summary)
+
+        if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
+            logger.info(
+                "%s realtime peak VRAM baseline: load=%.0fMiB, runtime=%.0fMiB",
+                case.id,
+                summary.load_peak_vram_mb,
+                summary.runtime_peak_vram_mb,
+            )
+            return
+
+        if scenario.load_peak_vram_mb is None or scenario.runtime_peak_vram_mb is None:
+            pytest.fail(
+                f"Testcase '{case.id}' is missing a load/runtime peak VRAM "
+                f"baseline in {get_perf_baseline_path()}; measured "
+                f"load={summary.load_peak_vram_mb:.0f}MiB, "
+                f"runtime={summary.runtime_peak_vram_mb:.0f}MiB"
+            )
+
+        try:
+            validator.validate_peak_vram(
+                summary,
+                scenario.load_peak_vram_mb,
+                scenario.runtime_peak_vram_mb,
+            )
+        except AssertionError as e:
+            logger.error(f"Peak VRAM validation failed for {case.id}:\n{e}")
+            raise
+
+    def _record_performance_result(
+        self,
+        case: DiffusionTestCase,
+        summary: PerformanceSummary,
+    ) -> None:
         result = {
             "test_name": case.id,
             "modality": case.server_args.modality,
@@ -1491,15 +1571,13 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                 failures.append((name, str(exc)))
 
         if is_realtime_case:
+            chunk_stats = pop_realtime_perf_stats(case.id)
             run_case_check(
                 "performance",
-                lambda: validate_realtime_perf_stats(
-                    case.id,
-                    pop_realtime_perf_stats(case.id),
-                    case.sampling_params.realtime_perf_thresholds,
-                    ignore_initial_chunks=(
-                        case.sampling_params.realtime_perf_ignore_initial_chunks
-                    ),
+                lambda: self._validate_realtime_performance(
+                    diffusion_server,
+                    case,
+                    chunk_stats,
                 ),
             )
         else:

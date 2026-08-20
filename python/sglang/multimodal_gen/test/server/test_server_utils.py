@@ -1426,7 +1426,7 @@ def get_generate_fn(
                 init_payload=init_payload,
                 events=list(sampling_params.realtime_events),
                 num_chunks=sampling_params.realtime_num_chunks,
-                require_chunk_stats=bool(sampling_params.realtime_perf_thresholds),
+                require_chunk_stats=True,
             )
         )
         record_realtime_perf_stats(case_id, realtime_output.chunk_stats)
