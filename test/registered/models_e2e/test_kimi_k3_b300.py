@@ -20,10 +20,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=1200, stage="base-c", runner_config="8-gpu-b300")
 
-MODEL_PATH = (
-    "/data/radixark/model-cache/hub/models--moonshotai--Kimi-K3/"
-    "snapshots/9f62e4e9fffbd0a83ddd60e1c209d828994b3569"
-)
+MODEL_PATH = "moonshotai/Kimi-K3"
 DSPARK_DRAFT_MODEL = "RadixArk/Kimi-K3-DSpark"
 MEGAMOE_URL = "http://0.0.0.0:30000"
 MEGAMOE_ENV = {
