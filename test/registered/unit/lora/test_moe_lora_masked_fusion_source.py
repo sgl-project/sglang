@@ -465,10 +465,10 @@ class TestMaskedFusionSource(unittest.TestCase):
         act.MASKED_ACT_FAMILIES = ("b_activation",)
         act.MASKED_ACT_TRITON = "triton"
         act.run_masked_fused_act = lambda *_args, **_kwargs: None
-        scatter = types.ModuleType(
-            "sglang.srt.lora.moe.base_gemm_provider.down_b_scatter"
+        into_base = types.ModuleType(
+            "sglang.srt.lora.moe.base_gemm_provider.down_b_into_base"
         )
-        scatter.invoke_down_b_scatter = lambda *_args, **_kwargs: None
+        into_base.invoke_down_b_into_base = lambda *_args, **_kwargs: None
 
         spec = importlib.util.spec_from_file_location(
             "_cpu_masked_row_domain", PROVIDER / "masked_row_domain.py"
@@ -485,7 +485,7 @@ class TestMaskedFusionSource(unittest.TestCase):
             dispatch.__name__: dispatch,
             finalize.__name__: finalize,
             act.__name__: act,
-            scatter.__name__: scatter,
+            into_base.__name__: into_base,
         }
         with mock.patch.dict(sys.modules, injected):
             spec.loader.exec_module(module)

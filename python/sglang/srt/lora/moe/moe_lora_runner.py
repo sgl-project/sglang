@@ -397,10 +397,10 @@ class MoeLoraRunner:
                     f"{provider.contract.key} does not implement "
                     f"{family}/{implementation}"
                 )
-        if plan.down_b_scatter and not provider.supports_down_b_scatter():
+        if plan.down_b_into_base and not provider.supports_down_b_into_base():
             raise NotImplementedError(
                 f"{provider.contract.key} does not implement the down-B "
-                "scatter-into-base epilogue"
+                "into-base epilogue"
             )
         if plan.finalize.family is not FinalizeFamily.MATERIALIZED:
             family, implementation = self._finalize_implementation(plan)
@@ -846,11 +846,11 @@ class MoeLoraRunner:
 
         if plan.down_overlap is DownOverlap.NONE:
             down_a()
-            if plan.down_b_scatter:
+            if plan.down_b_into_base:
                 # base writes its rows first, then down-B adds into
                 # them through src2dst rather than into a delta of its own.
                 down_out = base()
-                provider.run_down_b_scatter(
+                provider.run_down_b_into_base(
                     base_gemm_state,
                     down_out=down_out,
                     bridge=state.rank,
@@ -932,7 +932,7 @@ class MoeLoraRunner:
         num_tokens: int,
     ) -> torch.Tensor:
         if plan.finalize.family is FinalizeFamily.MATERIALIZED:
-            if plan.down_b_scatter:
+            if plan.down_b_into_base:
                 # No-pair-delta mode: the unweighted delta was already
                 # scatter-added into the base down rows.  NUMERICS: the delta
                 # is rounded to BF16 JOINTLY with the base row before this

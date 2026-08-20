@@ -227,7 +227,7 @@ class TestRowDomainConfig:
         assert routed.name == "prefill.serial"
         assert routed.base_gemm_rows == "route_major"
         assert not routed.plan.is_fully_serial_materialized()
-        assert routed.plan.down_b_scatter is True
+        assert routed.plan.down_b_into_base is True
 
     def test_runner_accepts_the_contiguous_provider_keys(self) -> None:
         from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
@@ -942,7 +942,9 @@ def test_contiguous_prefill_replays_in_a_real_cuda_graph(
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = _run_once(contiguous, gpu, token_lora_mapping, layout, use_cuda_graph=True)
+        captured = _run_once(
+            contiguous, gpu, token_lora_mapping, layout, use_cuda_graph=True
+        )
     output = captured.hidden_states
     output_ptr = output.data_ptr()
 

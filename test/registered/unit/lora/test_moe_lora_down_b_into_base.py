@@ -1,11 +1,11 @@
-"""Down-B "scatter-into-base" (``down_b_scatter``) coverage for the SGL
+"""Down-B into-base (``down_b_into_base``) coverage for the SGL
 MoE-LoRA engine.
 
 CPU cases pin the plan flag's invariants (built directly from the
 execution-plan spec classes) and the shipped config structure: every serial
 per-expert prefill choice — the GB300 and H200 in-domain prefill scenarios
 plus the per-expert out-of-domain prefill fallback — ships its down tail
-reordered to down-A -> base down GEMM -> down-B(scatter) -> materialized
+reordered to down-A -> base down GEMM -> down-B(into base) -> materialized
 finalize in no-pair-delta mode.  The standalone one-launch down-B stage is
 retained — only its output addressing changes — and the ``[T, K, H]``
 pair-major delta buffer is never allocated.  Decode choices, overlapped
@@ -13,7 +13,7 @@ prefill, and shared-outer down-B are never scattered.
 
 CUDA cases split by dependency:
 
-* Kernel equality needs only Triton: ``invoke_down_b_scatter`` into a copy of
+* Kernel equality needs only Triton: ``invoke_down_b_into_base`` into a copy of
   the base rows followed by no-pair-delta ``post_reorder_deepgemm`` against
   the exact shipped tail — ``one_launch_sliced_lora_b`` writing a
   materialized LoRA delta that ``post_reorder_deepgemm`` re-reads — on random
@@ -28,7 +28,7 @@ CUDA cases split by dependency:
   the whole launch a no-op), and an independent FP32 oracle pins the
   mathematical ``scale * sum(weight * (base + bridge @ B))`` contract.
 * The runner-level oracle needs DeepGEMM: the SAME random inputs through the
-  serial materialized plan and its scatter reordering must agree, on the
+  serial materialized plan and its into-base reordering must agree, on the
   masked provider and on the contiguous provider (row-domain agnosticism at
   the seam), and the scatter runner's workspace must never allocate the
   ``down_b:delta`` buffer.
@@ -154,12 +154,12 @@ def _serial_plan():
 # ---- CPU: plan flag invariants --------------------------------------------------
 
 
-class TestDownBScatterPlan:
+class TestDownBIntoBasePlan:
     def test_raw_serial_plan_admits_the_flag(self) -> None:
         plan = _serial_plan()
-        assert plan.down_b_scatter is False
-        assert plan.down_b_scatter_eligible()
-        reordered = replace(plan, down_b_scatter=True)
+        assert plan.down_b_into_base is False
+        assert plan.down_b_into_base_eligible()
+        reordered = replace(plan, down_b_into_base=True)
         # The standalone one-launch stage is RETAINED — only its output
         # addressing changes — and the finalize stays materialized.
         assert reordered.down_b is not None
@@ -171,11 +171,11 @@ class TestDownBScatterPlan:
         # re-qualify for conversions keyed on the plain serial shape.
         plan = _serial_plan()
         assert plan.is_fully_serial_materialized()
-        assert not replace(plan, down_b_scatter=True).is_fully_serial_materialized()
+        assert not replace(plan, down_b_into_base=True).is_fully_serial_materialized()
 
     def test_flag_leaves_the_b_family_to_provider_capability(self) -> None:
         # Which down-B kernel implements the scatter epilogue is asked of the
-        # provider (supports_down_b_scatter), not pinned by the plan.
+        # provider (supports_down_b_into_base), not pinned by the plan.
         indexed = replace(
             _serial_plan(),
             down_b=LoraBSpec(
@@ -185,7 +185,7 @@ class TestDownBScatterPlan:
                 BridgeLayout.PAIR_MAJOR,
             ),
         )
-        assert replace(indexed, down_b_scatter=True).down_b_scatter is True
+        assert replace(indexed, down_b_into_base=True).down_b_into_base is True
 
     def test_flag_requires_a_standalone_down_b(self) -> None:
         # A finalize-consumed down-B (shared-rank reduce) has no standalone
@@ -197,26 +197,26 @@ class TestDownBScatterPlan:
             finalize_family=FinalizeFamily.SHARED_RANK_REDUCE,
         )
         assert consumed.down_b is None
-        with pytest.raises(ValueError, match="down-B scatter"):
-            replace(consumed, down_b_scatter=True)
+        with pytest.raises(ValueError, match="down-B into-base"):
+            replace(consumed, down_b_into_base=True)
 
     def test_flag_rejects_down_overlap_windows(self) -> None:
         overlapped = _build_plan(down_overlap=DownOverlap.DOWN_B)
-        with pytest.raises(ValueError, match="down-B scatter"):
-            replace(overlapped, down_b_scatter=True)
+        with pytest.raises(ValueError, match="down-B into-base"):
+            replace(overlapped, down_b_into_base=True)
 
 
 # ---- CPU: shipped config structure -----------------------------------------------
 
 
-def _scatter_expected(name: str, layout) -> bool:
-    """The scatter ships on per-expert prefill serial shapes only."""
+def _into_base_expected(name: str, layout) -> bool:
+    """The into-base epilogue ships on per-expert prefill serial shapes only."""
     if layout != False:
         return False
     return name in ("prefill.serial", "fallback.serial_prefill")
 
 
-class TestDownBScatterConfig:
+class TestDownBIntoBaseConfig:
     def test_config_never_touches_decode_shared_or_overlapped(self) -> None:
         cases = (
             ("gb300_pe", _GB300, False, _SWIGLU),
@@ -230,13 +230,13 @@ class TestDownBScatterConfig:
         )
         for name, architecture, layout, activation in cases:
             for row_name, choice in _menu(architecture, layout, activation).items():
-                assert choice.plan.down_b_scatter is _scatter_expected(
+                assert choice.plan.down_b_into_base is _into_base_expected(
                     row_name, layout
                 ), (name, row_name)
 
 
-class TestProviderScatterSurface:
-    def test_both_row_domains_implement_the_scatter_epilogue(self) -> None:
+class TestProviderIntoBaseSurface:
+    def test_both_row_domains_implement_the_into_base_epilogue(self) -> None:
         from sglang.srt.lora.moe.base_gemm_provider.contiguous_row_domain import (
             ContiguousRowDomainProvider,
         )
@@ -252,10 +252,10 @@ class TestProviderScatterSurface:
             intermediate_size=8,
             hidden_size=16,
         )
-        assert MaskedRowDomainProvider(quant_info).supports_down_b_scatter()
+        assert MaskedRowDomainProvider(quant_info).supports_down_b_into_base()
         assert ContiguousRowDomainProvider(
             quant_info, m_alignment=128
-        ).supports_down_b_scatter()
+        ).supports_down_b_into_base()
 
     def test_the_base_seam_fails_closed(self) -> None:
         from sglang.srt.lora.moe.base_gemm_provider.base import (
@@ -272,9 +272,9 @@ class TestProviderScatterSurface:
             lora_delta_dtype=torch.bfloat16,
             lora_activation_dtype=torch.bfloat16,
         )
-        assert provider.supports_down_b_scatter() is False
-        with pytest.raises(NotImplementedError, match="scatter"):
-            provider.run_down_b_scatter(
+        assert provider.supports_down_b_into_base() is False
+        with pytest.raises(NotImplementedError, match="into-base"):
+            provider.run_down_b_into_base(
                 None,
                 down_out=torch.zeros(1),
                 bridge=torch.zeros(1),
@@ -416,7 +416,7 @@ _DOWN_B_CONFIG = {
 # the FP32 delta to BF16 jointly with the base row, the shipped tail rounds
 # the delta to BF16 separately before the FP32 combine — the same rounding
 # class as the shared-rank/b_activation contract notes.
-_SCATTER_TOLERANCE = {"atol": 1e-2, "rtol": 0.05}
+_INTO_BASE_TOLERANCE = {"atol": 1e-2, "rtol": 0.05}
 
 
 def _post_reorder(down_rows, output, src2dst, topk_ids, topk_weights, lora_delta=None):
@@ -444,14 +444,14 @@ def _post_reorder(down_rows, output, src2dst, topk_ids, topk_weights, lora_delta
     ((64, 2, 4), (13, 3, 4)),
     ids=("even", "partial"),
 )
-def test_scatter_matches_the_standalone_downb_plus_post_reorder(
+def test_into_base_matches_the_standalone_downb_plus_post_reorder(
     row_domain: str, num_tokens: int, top_k: int, num_experts: int
 ) -> None:
     """Scatter-add + no-pair-delta post_reorder must reproduce the shipped
     tail (one-launch LoRA delta + delta-reading post_reorder), on both row
     domains' src2dst shapes, under one shared down-B tiling config."""
-    from sglang.srt.lora.moe.base_gemm_provider.down_b_scatter import (
-        invoke_down_b_scatter,
+    from sglang.srt.lora.moe.base_gemm_provider.down_b_into_base import (
+        invoke_down_b_into_base,
     )
     from sglang.srt.lora.moe.lora_b import one_launch_sliced_lora_b
     from sglang.srt.lora.moe.route_view import RouteViewKind
@@ -512,7 +512,7 @@ def test_scatter_matches_the_standalone_downb_plus_post_reorder(
     # Scatter tail: the SAME tiling adds the delta into a copy of the base
     # rows; post_reorder then runs in no-pair-delta mode.
     scattered = gpu["down_rows"].clone()
-    invoke_down_b_scatter(
+    invoke_down_b_into_base(
         down_rows=scattered,
         src2dst=gpu["src2dst"],
         bridge=gpu["bridge"],
@@ -524,7 +524,7 @@ def test_scatter_matches_the_standalone_downb_plus_post_reorder(
     _post_reorder(
         scattered, output, gpu["src2dst"], gpu["topk_ids"], gpu["topk_weights"]
     )
-    torch.testing.assert_close(output, reference, **_SCATTER_TOLERANCE)
+    torch.testing.assert_close(output, reference, **_INTO_BASE_TOLERANCE)
 
     # Rows no LoRA-active pair targets are BITWISE untouched: base-only and
     # sentinel pairs contribute no add and their (poisoned or unwritten)
@@ -564,7 +564,7 @@ def test_scatter_matches_the_standalone_downb_plus_post_reorder(
         view=RouteViewKind.ALIGNED,
     )
     scattered_base = gpu["down_rows"].clone()
-    invoke_down_b_scatter(
+    invoke_down_b_into_base(
         down_rows=scattered_base,
         src2dst=gpu["src2dst"],
         bridge=gpu["bridge"],
@@ -578,9 +578,9 @@ def test_scatter_matches_the_standalone_downb_plus_post_reorder(
 
 
 @cuda_only
-def test_scatter_rejects_a_mismatched_route_block() -> None:
-    from sglang.srt.lora.moe.base_gemm_provider.down_b_scatter import (
-        invoke_down_b_scatter,
+def test_into_base_rejects_a_mismatched_route_block() -> None:
+    from sglang.srt.lora.moe.base_gemm_provider.down_b_into_base import (
+        invoke_down_b_into_base,
     )
     from sglang.srt.lora.moe.route_view import RouteViewKind
     from sglang.srt.lora.moe.routing import (
@@ -599,7 +599,7 @@ def test_scatter_rejects_a_mismatched_route_block() -> None:
         view=RouteViewKind.ALIGNED,
     )
     with pytest.raises(ValueError, match="BLOCK_SIZE_M"):
-        invoke_down_b_scatter(
+        invoke_down_b_into_base(
             down_rows=down_rows.to(device),
             src2dst=src2dst.to(device),
             bridge=bridge.to(device),
@@ -670,8 +670,8 @@ def _standalone_output_allocation(runner, *, num_tokens, dtype, device):
     return torch.empty((num_tokens, runner.hidden_size), dtype=dtype, device=device)
 
 
-def _scatter_pair():
-    """The serial materialized plan and its scatter reordering, with ONE
+def _into_base_pair():
+    """The serial materialized plan and its into-base reordering, with ONE
     shipped launch config driving both.
 
     The shipped menu carries the two forms composed with the b_act middle
@@ -681,10 +681,10 @@ def _scatter_pair():
     complete tuned config — and the reordering is the same plan with the
     flag flipped."""
     reference = _menu(_GB300, False)["fallback.serial"]
-    assert reference.plan.down_b_scatter is False
+    assert reference.plan.down_b_into_base is False
     assert reference.plan.act.family is ActFamily.MATERIALIZED
     assert reference.plan == _serial_plan()
-    reordered_plan = replace(reference.plan, down_b_scatter=True)
+    reordered_plan = replace(reference.plan, down_b_into_base=True)
     assert reordered_plan.act.family is ActFamily.MATERIALIZED
     return reference.plan, reordered_plan, _shipped_launch(_GB300, reference)
 
@@ -752,7 +752,7 @@ def _workspace_buffer_names(runner) -> set[str]:
 
 @deepgemm_cuda_only
 @pytest.mark.parametrize("base_gemm_rows", ("expert_major", "route_major"))
-def test_runner_scatter_matches_the_materialized_reference(
+def test_runner_into_base_matches_the_materialized_reference(
     base_gemm_rows: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """One serial prefill batch, shipped tail vs the scatter reordering — on
@@ -764,32 +764,35 @@ def test_runner_scatter_matches_the_materialized_reference(
     monkeypatch.setattr(
         MoeLoraRunner, "_allocate_output", _standalone_output_allocation
     )
-    serial_plan, reordered_plan, launch_config = _scatter_pair()
+    serial_plan, reordered_plan, launch_config = _into_base_pair()
     num_tokens, num_experts = 64, 4
     gpu = _make_gpu_tensors(num_tokens, num_experts, device)
     reference_runner = _build_runner(
         serial_plan, launch_config, "expert_major", gpu, num_experts
     )
-    scatter_runner = _build_runner(
+    into_base_runner = _build_runner(
         reordered_plan, launch_config, base_gemm_rows, gpu, num_experts
     )
 
     for traffic in ("active", "mixed", "base_only"):
         token_lora_mapping = _token_lora_mapping(traffic, num_tokens).to(device)
         reference = _run_once(reference_runner, gpu, token_lora_mapping).hidden_states
-        scatter = _run_once(scatter_runner, gpu, token_lora_mapping).hidden_states
+        into_base = _run_once(into_base_runner, gpu, token_lora_mapping).hidden_states
         torch.testing.assert_close(
-            scatter, reference, **_SCATTER_TOLERANCE, msg=f"{base_gemm_rows}: {traffic}"
+            into_base,
+            reference,
+            **_INTO_BASE_TOLERANCE,
+            msg=f"{base_gemm_rows}: {traffic}",
         )
 
-    # The disappearing allocation: the scatter path never materializes the
+    # The disappearing allocation: the into-base path never materializes the
     # pair-major [T*K, H] down delta, while the shipped tail always does.
     assert "down_b:delta" in _workspace_buffer_names(reference_runner)
-    assert "down_b:delta" not in _workspace_buffer_names(scatter_runner)
+    assert "down_b:delta" not in _workspace_buffer_names(into_base_runner)
 
 
 @deepgemm_cuda_only
-def test_scatter_pipeline_replays_correctly_in_a_real_cuda_graph(
+def test_into_base_pipeline_replays_correctly_in_a_real_cuda_graph(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Capture the reordered pipeline and replay it against the eager
@@ -800,25 +803,25 @@ def test_scatter_pipeline_replays_correctly_in_a_real_cuda_graph(
     monkeypatch.setattr(
         MoeLoraRunner, "_allocate_output", _standalone_output_allocation
     )
-    serial_plan, reordered_plan, launch_config = _scatter_pair()
+    serial_plan, reordered_plan, launch_config = _into_base_pair()
     num_tokens, num_experts = 64, 4
     gpu = _make_gpu_tensors(num_tokens, num_experts, device)
     reference_runner = _build_runner(
         serial_plan, launch_config, "expert_major", gpu, num_experts
     )
-    scatter_runner = _build_runner(
+    into_base_runner = _build_runner(
         reordered_plan, launch_config, "expert_major", gpu, num_experts
     )
     token_lora_mapping = _token_lora_mapping("active", num_tokens).to(device)
 
     for _ in range(2):  # JIT + workspace graph-buffer retention before capture
-        _run_once(scatter_runner, gpu, token_lora_mapping, use_cuda_graph=True)
+        _run_once(into_base_runner, gpu, token_lora_mapping, use_cuda_graph=True)
     torch.cuda.synchronize(device)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = _run_once(
-            scatter_runner, gpu, token_lora_mapping, use_cuda_graph=True
+            into_base_runner, gpu, token_lora_mapping, use_cuda_graph=True
         )
     output = captured.hidden_states
     output_ptr = output.data_ptr()
@@ -826,7 +829,7 @@ def test_scatter_pipeline_replays_correctly_in_a_real_cuda_graph(
     graph.replay()
     torch.cuda.synchronize(device)
     reference = _run_once(reference_runner, gpu, token_lora_mapping).hidden_states
-    torch.testing.assert_close(output, reference, **_SCATTER_TOLERANCE)
+    torch.testing.assert_close(output, reference, **_INTO_BASE_TOLERANCE)
 
     # Replay 2: the whole batch flips to base-only through the sentinel.
     token_lora_mapping.fill_(-1)
@@ -834,7 +837,7 @@ def test_scatter_pipeline_replays_correctly_in_a_real_cuda_graph(
     torch.cuda.synchronize(device)
     assert output.data_ptr() == output_ptr
     reference = _run_once(reference_runner, gpu, token_lora_mapping).hidden_states
-    torch.testing.assert_close(output, reference, **_SCATTER_TOLERANCE)
+    torch.testing.assert_close(output, reference, **_INTO_BASE_TOLERANCE)
 
     # Replay 3: new routing and activations arrive in place, adapters return.
     gpu["topk_ids"].copy_(gpu["topk_ids"].flip(dims=(1,)))
@@ -844,6 +847,6 @@ def test_scatter_pipeline_replays_correctly_in_a_real_cuda_graph(
     torch.cuda.synchronize(device)
     assert output.data_ptr() == output_ptr
     reference = _run_once(reference_runner, gpu, token_lora_mapping).hidden_states
-    torch.testing.assert_close(output, reference, **_SCATTER_TOLERANCE)
+    torch.testing.assert_close(output, reference, **_INTO_BASE_TOLERANCE)
 
-    assert "down_b:delta" not in _workspace_buffer_names(scatter_runner)
+    assert "down_b:delta" not in _workspace_buffer_names(into_base_runner)

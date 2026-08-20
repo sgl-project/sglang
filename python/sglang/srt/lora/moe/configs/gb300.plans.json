@@ -32,7 +32,7 @@
     "down_b_family": "one_launch_sliced",
     "act_family": "b_activation",
     "finalize_family": "materialized",
-    "down_b_scatter": true
+    "down_b_into_base": true
    }
   },
   {
@@ -92,7 +92,7 @@
     "down_b_family": "one_launch_sliced",
     "act_family": "b_activation",
     "finalize_family": "materialized",
-    "down_b_scatter": true
+    "down_b_into_base": true
    }
   },
   {

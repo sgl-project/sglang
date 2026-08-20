@@ -253,22 +253,15 @@ class MoeLoraExecutionPlan:
     """One immutable whole-pipeline MoE-LoRA execution strategy."""
 
     gate_up_a: LoraASpec
-    down_a: LoraASpec
-    act: ActSpec
-    finalize: FinalizeSpec
     gate_up_b: LoraBSpec | None = None
+    act: ActSpec
+    down_a: LoraASpec
     down_b: LoraBSpec | None = None
+    finalize: FinalizeSpec
     gate_up_overlap: GateUpOverlap = GateUpOverlap.NONE
     down_overlap: DownOverlap = DownOverlap.NONE
+    down_b_into_base: bool = False
     route_builder: RouteBuilderFamily = RouteBuilderFamily.STANDARD
-    # Down-tail reordering experiment: the standalone one-launch sliced
-    # down-B runs AFTER the base down GEMM and read-modify-write adds its
-    # unweighted delta into the provider's down output rows through the
-    # provider's pair-to-row mapping (indirect row addressing; the GEMM
-    # tiling itself is unchanged), and the materialized finalize then runs in
-    # no-pair-delta mode.  The [T, K, H] pair-major delta buffer is never
-    # allocated on this path.
-    down_b_scatter: bool = False
 
     def __post_init__(self) -> None:
         self.validate()
@@ -325,11 +318,11 @@ class MoeLoraExecutionPlan:
                 f"{self.down_overlap.value} overlap requires standalone down B"
             )
 
-        if self.down_b_scatter and not self.down_b_scatter_eligible():
+        if self.down_b_into_base and not self.down_b_into_base_eligible():
             raise ValueError(
-                "down-B scatter requires a standalone down-B stage and no "
-                "late overlap window (the scatter read-modify-writes the "
-                "base down output)"
+                "down-B into-base requires a standalone down-B stage and no "
+                "late overlap window (it read-modify-writes the base down "
+                "output)"
             )
 
         return self
@@ -349,10 +342,10 @@ class MoeLoraExecutionPlan:
             self.gate_up_overlap is GateUpOverlap.NONE
             and self.down_overlap is DownOverlap.NONE
             and self.down_a.family is LoraAFamily.GROUPED
-            # The scatter reordering couples down-B to the base down output;
+            # The into-base reordering couples down-B to the base down output;
             # it is applied ON TOP of a fully serial materialized shape and
             # must not re-qualify for shape-keyed conversions.
-            and not self.down_b_scatter
+            and not self.down_b_into_base
         )
 
     def is_fully_serial_materialized(self) -> bool:
@@ -360,15 +353,15 @@ class MoeLoraExecutionPlan:
 
         The MATERIALIZED finalize recombines base and LoRA delta in one
         standalone launch, so this is the shape the act-swap and
-        scatter config steps key on.
+        into-base config steps key on.
         """
         return (
             self.is_fully_serial()
             and self.finalize.family is FinalizeFamily.MATERIALIZED
         )
 
-    def down_b_scatter_eligible(self) -> bool:
-        """Whether the down tail admits the scatter-into-base reordering."""
+    def down_b_into_base_eligible(self) -> bool:
+        """Whether the down tail admits the into-base reordering."""
 
         # A standalone down-B implies the materialized finalize (any other
         # finalize consumes it).  Which B kernel implements the epilogue is a
@@ -459,7 +452,7 @@ class _PlanSpecModel(pydantic.BaseModel):
     gate_up_overlap: GateUpOverlap = GateUpOverlap.NONE
     down_overlap: DownOverlap = DownOverlap.NONE
     route_builder: RouteBuilderFamily = RouteBuilderFamily.STANDARD
-    down_b_scatter: bool = False
+    down_b_into_base: bool = False
 
 
 class _PlanRowModel(pydantic.BaseModel):
@@ -618,7 +611,7 @@ def build_plan(
         gate_up_overlap=spec.gate_up_overlap,
         down_overlap=spec.down_overlap,
         route_builder=spec.route_builder,
-        down_b_scatter=spec.down_b_scatter,
+        down_b_into_base=spec.down_b_into_base,
     )
     return plan
 

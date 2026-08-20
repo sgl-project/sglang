@@ -920,8 +920,8 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         # finalize is the SAME post_reorder kernel (it indexes rows only
         # through src2dst, which now carries compact rows).
         from sglang.kernels.ops.moe.ep_moe_kernels import post_reorder_deepgemm
-        from sglang.srt.lora.moe.base_gemm_provider.down_b_scatter import (
-            invoke_down_b_scatter,
+        from sglang.srt.lora.moe.base_gemm_provider.down_b_into_base import (
+            invoke_down_b_into_base,
         )
         from sglang.srt.lora.moe.base_gemm_provider.masked_finalize import (
             MASKED_FINALIZE_TRITON,
@@ -930,10 +930,10 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         )
 
         self._post_reorder = post_reorder_deepgemm
-        # The down-B scatter epilogue is row-domain-agnostic for the same
+        # The down-B into-base epilogue is row-domain-agnostic for the same
         # reason post_reorder is: every physical row access goes through
         # src2dst over a flat row view.
-        self._down_b_scatter = invoke_down_b_scatter
+        self._down_b_into_base = invoke_down_b_into_base
         # The shared-rank finalize pair is reused verbatim: the reduce is
         # pure pair-domain and the tail reads base rows only through
         # src2dst over a flat row view (compact rows here).
@@ -1238,10 +1238,10 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
             )
         return ()
 
-    def supports_down_b_scatter(self) -> bool:
+    def supports_down_b_into_base(self) -> bool:
         return True
 
-    def run_down_b_scatter(
+    def run_down_b_into_base(
         self,
         row_state: ContiguousRowState,
         *,
@@ -1255,7 +1255,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         # through src2dst, which here carries compact rows
         # seg_offsets[e] + slot.  src2dst is only READ, so the documented
         # in-place-src2dst-store hazard does not apply.
-        self._down_b_scatter(
+        self._down_b_into_base(
             down_rows=down_out.view(-1, self.hidden_size),
             src2dst=row_state.src2dst,
             bridge=bridge,

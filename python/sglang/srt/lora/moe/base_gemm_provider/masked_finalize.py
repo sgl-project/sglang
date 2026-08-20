@@ -14,7 +14,7 @@ providers verbatim: the rank reduction is pure pair-domain (it reads the
 pair-major down-A bridge and never touches a physical row), and
 the tail reads base down rows exclusively through ``src2dst`` over a flat
 row view — the same lever that makes ``post_reorder`` and the down-B
-scatter portable.  Only the tail's host validation distinguishes the
+into-base epilogue portable.  Only the tail's host validation distinguishes the
 masked ``[E_local, m_max, hidden]`` slab from the contiguous compact
 ``[m_pad_ceiling, hidden]`` buffer.
 

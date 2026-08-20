@@ -5,12 +5,12 @@ per-expert SWIGLU prefill choice — the GB300 and H200 in-domain prefill
 scenarios plus the per-expert out-of-domain prefill fallback: the standalone
 one-launch gate/up LoRA-B stage disappears and the route-block-tiled
 activation join applies the same per-expert pair-major delta inline, with
-the down tail reordered by the composed ``down_b_scatter``.  CPU cases pin
+the down tail reordered by the composed ``down_b_into_base``.  CPU cases pin
 that config structure through the public resolver only (no menu internals).
 
 CUDA cases are runner-level oracles on the DeepGEMM providers: the SAME
 random inputs through the serial materialized reference plan versus the
-b_act-swapped plan (and versus b_act + scatter, the full shipped
+b_act-swapped plan (and versus b_act + into-base, the full shipped
 composition) must agree.  The reference plan/config pair is the shipped
 decode fallback choice — exactly the serial materialized shape with a
 complete tuned config — and the swapped plans are built directly from the
@@ -19,7 +19,7 @@ change is isolated.  Agreement is allclose rather than bitwise BY
 JUSTIFICATION: the b_act middle rounds each pair's gate/up delta into the
 activation join's FP32 arithmetic instead of materializing a BF16 delta that
 the standalone join re-reads — the same rounding class as the shared-rank
-and scatter contract notes.
+and into-base contract notes.
 """
 
 from __future__ import annotations
@@ -92,7 +92,7 @@ def _build_plan(
     activation=_SWIGLU,
     is_shared_outer=False,
     act_family=ActFamily.MATERIALIZED,
-    down_b_scatter=False,
+    down_b_into_base=False,
 ) -> MoeLoraExecutionPlan:
     """The serial one-launch plan shape, built the way
     ``execution_plan.build_plan`` materializes a table row (spec classes
@@ -125,7 +125,7 @@ def _build_plan(
             BridgeLayout.PAIR_MAJOR,
         ),
         finalize=FinalizeSpec(FinalizeFamily.MATERIALIZED),
-        down_b_scatter=down_b_scatter,
+        down_b_into_base=down_b_into_base,
     )
 
 
@@ -139,7 +139,7 @@ class TestBActConfig:
         serial = _menu(_H200, False)["prefill.serial"]
         assert serial.plan.act.family is ActFamily.B_ACTIVATION
         assert serial.plan.gate_up_b is None
-        assert serial.plan.down_b_scatter is True
+        assert serial.plan.down_b_into_base is True
         assert serial.base_gemm_rows == "route_major"
 
     def test_decode_choices_keep_the_materialized_act(self) -> None:
@@ -177,15 +177,15 @@ class TestBActConfig:
         # fused middle with its own activation injected.
         assert per_expert.plan.act.family is ActFamily.B_ACTIVATION
         assert per_expert.plan.gate_up_b is None
-        assert per_expert.plan.down_b_scatter is True
+        assert per_expert.plan.down_b_into_base is True
         assert per_expert.base_gemm_rows == "route_major"
         assert shared.plan.act.family is ActFamily.B_ACTIVATION
         assert shared.plan.gate_up_b is None
-        assert shared.plan.down_b_scatter is False
+        assert shared.plan.down_b_into_base is False
         assert shared.base_gemm_rows == "expert_major"
         assert relu2.plan.act.family is ActFamily.B_ACTIVATION
         assert relu2.plan.act.activation is ActivationFn.RELU2
-        assert relu2.plan.down_b_scatter is True
+        assert relu2.plan.down_b_into_base is True
 
 
 # ---- CUDA: runner-level oracle ---------------------------------------------------
@@ -286,7 +286,7 @@ def _reference_choice():
     choice = _menu(_GB300, False)["fallback.serial"]
     assert choice.plan.act.family is ActFamily.MATERIALIZED
     assert choice.plan.gate_up_b is not None
-    assert choice.plan.down_b_scatter is False
+    assert choice.plan.down_b_into_base is False
     assert choice.plan == _build_plan()
     return choice
 
@@ -347,12 +347,12 @@ def _run_once(runner, gpu, token_lora_mapping):
 
 @deepgemm_cuda_only
 @pytest.mark.parametrize("base_gemm_rows", ("expert_major", "route_major"))
-@pytest.mark.parametrize("scatter", (False, True))
+@pytest.mark.parametrize("into_base", (False, True))
 def test_runner_b_act_matches_the_materialized_reference(
-    base_gemm_rows: str, scatter: bool, monkeypatch: pytest.MonkeyPatch
+    base_gemm_rows: str, into_base: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """One serial prefill batch, serial materialized middle vs the b_act swap
-    (and vs b_act + scatter, the full shipped composition) — on the masked
+    (and vs b_act + into-base, the full shipped composition) — on the masked
     provider and on the contiguous provider (row-domain agnosticism at the
     seam), under ONE shared launch config so only the plan changes."""
     from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
@@ -363,11 +363,11 @@ def test_runner_b_act_matches_the_materialized_reference(
     )
     reference_choice = _reference_choice()
     swapped_plan = _build_plan(
-        act_family=ActFamily.B_ACTIVATION, down_b_scatter=scatter
+        act_family=ActFamily.B_ACTIVATION, down_b_into_base=into_base
     )
     assert swapped_plan.act.family is ActFamily.B_ACTIVATION
     assert swapped_plan.gate_up_b is None
-    assert swapped_plan.down_b_scatter is scatter
+    assert swapped_plan.down_b_into_base is into_base
     num_tokens, num_experts = 64, 4
     gpu = _make_gpu_tensors(num_tokens, num_experts, device)
     shared_launch = _shipped_launch(_GB300, reference_choice)
@@ -394,5 +394,5 @@ def test_runner_b_act_matches_the_materialized_reference(
             b_act,
             reference,
             **_B_ACT_TOLERANCE,
-            msg=f"{base_gemm_rows}: scatter={scatter} {traffic}",
+            msg=f"{base_gemm_rows}: into_base={into_base} {traffic}",
         )

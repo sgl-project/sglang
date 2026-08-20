@@ -92,7 +92,7 @@ class TestSm100PerExpert:
         assert c.base_gemm_rows == "route_major"
         assert c.plan.act.family is ActFamily.B_ACTIVATION
         assert c.plan.gate_up_b is None  # consumed by the b_activation middle
-        assert c.plan.down_b_scatter
+        assert c.plan.down_b_into_base
         assert c.plan.gate_up_overlap is GateUpOverlap.NONE
         assert c.plan.down_overlap is DownOverlap.NONE
 

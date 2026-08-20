@@ -222,16 +222,16 @@ class MoeBaseProvider:
     ) -> bool:
         return implementation in self.fused_finalize_implementations(family, ownership)
 
-    def supports_down_b_scatter(self) -> bool:
-        """Whether S4's output rows admit the down-B scatter-add epilogue.
+    def supports_down_b_into_base(self) -> bool:
+        """Whether S4's output rows admit the down-B into-base epilogue.
 
         True only when the provider's physical row domain has a stable
-        pair-to-row mapping it can hand the scatter launch, the
+        pair-to-row mapping it can hand the into-base launch, the
         same property behind ``mapped_down_lora_a_input``.
         """
         return False
 
-    def run_down_b_scatter(
+    def run_down_b_into_base(
         self,
         row_state,
         *,
@@ -251,7 +251,7 @@ class MoeBaseProvider:
         the flattened per-virtual-expert down-B groups.
         """
         raise NotImplementedError(
-            f"{self.contract.key} has no down-B scatter-into-base epilogue"
+            f"{self.contract.key} has no down-B into-base epilogue"
         )
 
     def run_shared_rank_finalize(

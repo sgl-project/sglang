@@ -103,8 +103,8 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         self._post_reorder = post_reorder_deepgemm
         self._act_kernel = act_delta_masked
 
-        from sglang.srt.lora.moe.base_gemm_provider.down_b_scatter import (
-            invoke_down_b_scatter,
+        from sglang.srt.lora.moe.base_gemm_provider.down_b_into_base import (
+            invoke_down_b_into_base,
         )
         from sglang.srt.lora.moe.base_gemm_provider.masked_finalize import (
             MASKED_FINALIZE_TRITON,
@@ -130,7 +130,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         self._shared_tail_impls: dict[str, Callable] = {
             MASKED_FINALIZE_TRITON: invoke_shared_from_scratch_finalize
         }
-        self._down_b_scatter = invoke_down_b_scatter
+        self._down_b_into_base = invoke_down_b_into_base
 
     @property
     def num_local_experts(self) -> int:
@@ -409,10 +409,10 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             )
         return ()
 
-    def supports_down_b_scatter(self) -> bool:
+    def supports_down_b_into_base(self) -> bool:
         return True
 
-    def run_down_b_scatter(
+    def run_down_b_into_base(
         self,
         row_state: MaskedRowState,
         *,
@@ -426,7 +426,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         # addressed only through src2dst over the flat [rows, H] view (masked
         # rows e * m_max + slot).  src2dst is only READ, so the documented
         # in-place-src2dst-store hazard does not apply.
-        self._down_b_scatter(
+        self._down_b_into_base(
             down_rows=down_out.view(-1, self.hidden_size),
             src2dst=row_state.src2dst,
             bridge=bridge,

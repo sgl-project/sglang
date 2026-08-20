@@ -1,5 +1,5 @@
-"""Down-B "scatter-into-base" GEMM for the BF16 MoE row domains (the
-``down_b_scatter`` experiment).
+"""Down-B GEMM that adds into the base down output, for the BF16 MoE row
+domains (the ``down_b_into_base`` experiment).
 
 Sibling of ``lora_b._one_launch_sliced_lora_b_kernel`` — the shipping kernel
 is untouched — with only the OUTPUT ADDRESSING changed.  The whole point
@@ -62,7 +62,7 @@ from sglang.srt.lora.moe.route_view import RouteView, RouteViewKind
 
 
 @triton.jit
-def _down_b_scatter_kernel(
+def _down_b_into_base_kernel(
     bridge_ptr,
     weight_ptr,
     down_rows_ptr,
@@ -155,7 +155,7 @@ def _down_b_scatter_kernel(
     )
 
 
-def invoke_down_b_scatter(
+def invoke_down_b_into_base(
     *,
     down_rows: torch.Tensor,
     src2dst: torch.Tensor,
@@ -177,7 +177,7 @@ def invoke_down_b_scatter(
     """
     if routing.view is not RouteViewKind.ALIGNED:
         raise ValueError(
-            f"down-B scatter needs route view {RouteViewKind.ALIGNED.value!r}, got "
+            f"down-B into-base needs route view {RouteViewKind.ALIGNED.value!r}, got "
             f"{routing.view!r}"
         )
     num_tokens, top_k = routing.topk_ids.shape
@@ -205,12 +205,12 @@ def invoke_down_b_scatter(
         or bridge.dtype != torch.bfloat16
         or b_down.dtype != torch.bfloat16
     ):
-        raise TypeError("down-B scatter requires BF16 base rows, bridge, and down-B")
+        raise TypeError("down-B into-base requires BF16 base rows, bridge, and down-B")
     if "BLOCK_SIZE_M" in config:
         configured_block = int(config["BLOCK_SIZE_M"])
         if configured_block != routing.block_size:
             raise ValueError(
-                "down-B scatter consumes the aligned route's exact "
+                "down-B into-base consumes the aligned route's exact "
                 f"BLOCK_SIZE_M: config declares {configured_block}, route "
                 f"uses {routing.block_size}"
             )
@@ -226,12 +226,12 @@ def invoke_down_b_scatter(
         routing.num_pairs_post_padded,
     )
     if len({item.device for item in tensors}) != 1:
-        raise ValueError("down-B scatter tensors must share one device")
+        raise ValueError("down-B into-base tensors must share one device")
 
     block_size_n = int(config["BLOCK_SIZE_N"])
     num_m_blocks = triton.cdiv(routing.sorted_pair_ids.numel(), routing.block_size)
     num_pid_n = triton.cdiv(hidden, block_size_n)
-    _down_b_scatter_kernel[(num_m_blocks * num_pid_n,)](
+    _down_b_into_base_kernel[(num_m_blocks * num_pid_n,)](
         bridge,
         b_down,
         down_rows,

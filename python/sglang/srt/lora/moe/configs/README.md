@@ -55,9 +55,9 @@ measured rows, so a ReLU2 MoE is now served by the SwiGLU winners:
   where the ReLU2 row was not);
 - per-expert prefill on SM100: materially different — the retired
   `prefill.relu2` ran the expert-major (masked) rows with an early gate/up-A
-  window and a late down-A+B window and no scatter, where `prefill.serial`
-  runs the route-major (contiguous) rows strictly serially with the scatter
-  epilogue.
+  window and a late down-A+B window and no into-base epilogue, where
+  `prefill.serial` runs the route-major (contiguous) rows strictly serially
+  with down-B adding into the base down output.
 
 Both are numerically correct (every provider registers relu2 for the fused
 middle); the ReLU2-tuned schedules are simply no longer served. Re-adding
