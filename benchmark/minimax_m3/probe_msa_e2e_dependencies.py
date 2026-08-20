@@ -26,6 +26,8 @@ REQUIRED_SGLANG_KERNEL_VERSION = "0.4.6.post1"
 REQUIRED_TORCH_VERSION = "2.13.0"
 REQUIRED_DEEP_GEMM_VERSION = "0.1.5.post3"
 REQUIRED_TVM_FFI_VERSION = "0.1.11"
+REQUIRED_LONGBENCH_MIN_TOKENS = 32768
+REQUIRED_LONGBENCH_MAX_TOKENS = 131072
 
 
 def sha256(path: Path) -> str:
@@ -107,8 +109,14 @@ def probe_datasets(longbench_subset: Path, gpqa_dataset: Path) -> dict:
         raise RuntimeError("LongBench-v2 subset SHA-256 does not match its manifest")
     if int(manifest.get("num_examples", 0)) != 100:
         raise RuntimeError("LongBench-v2 subset must contain exactly 100 examples")
-    if int(manifest.get("minimum_observed_tokens", 0)) < 32768:
+    if int(manifest.get("minimum_tokens", 0)) != REQUIRED_LONGBENCH_MIN_TOKENS:
+        raise RuntimeError("LongBench-v2 subset minimum-token policy drifted")
+    if int(manifest.get("maximum_tokens", 0)) != REQUIRED_LONGBENCH_MAX_TOKENS:
+        raise RuntimeError("LongBench-v2 subset maximum-token policy drifted")
+    if int(manifest.get("minimum_observed_tokens", 0)) < REQUIRED_LONGBENCH_MIN_TOKENS:
         raise RuntimeError("LongBench-v2 subset contains a prompt shorter than 32K")
+    if int(manifest.get("maximum_observed_tokens", 0)) > REQUIRED_LONGBENCH_MAX_TOKENS:
+        raise RuntimeError("LongBench-v2 subset contains a prompt longer than 128K")
 
     with gpqa_dataset.open(newline="") as source:
         reader = csv.DictReader(source)
@@ -125,6 +133,7 @@ def probe_datasets(longbench_subset: Path, gpqa_dataset: Path) -> dict:
             "sha256": observed_subset_sha,
             "num_examples": 100,
             "minimum_observed_tokens": manifest["minimum_observed_tokens"],
+            "maximum_observed_tokens": manifest["maximum_observed_tokens"],
         },
         "gpqa_diamond": {
             "path": str(gpqa_dataset.resolve()),
