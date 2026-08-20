@@ -1287,6 +1287,7 @@ def test_layerwise_tuning_accepts_json_and_pair_forms():
     as_json = _server_args(layerwise_resident_layers='{"vae": 6}')
     assert as_json.layerwise_tuning_for("vae", dit_group=False)[1] == 6.0
 
+
 class _FileBackedBlock(torch.nn.Module):
     """A block whose weight is a view into a file, as a loaded checkpoint is."""
 
