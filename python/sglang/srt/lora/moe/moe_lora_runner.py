@@ -404,10 +404,7 @@ class MoeLoraRunner:
             )
         if plan.finalize.family is not FinalizeFamily.MATERIALIZED:
             family, implementation = self._finalize_implementation(plan)
-            consumed_down_b = plan.finalize.consumed_down_b
-            ownership_name = (
-                "shared" if consumed_down_b.is_shared_outer else "per_expert"
-            )
+            ownership_name = "shared" if plan.finalize.is_shared_outer else "per_expert"
             if not provider.supports_fused_finalize(
                 family,
                 ownership_name,
@@ -762,8 +759,8 @@ class MoeLoraRunner:
             )
             return act_out, _DownAInput(act_pairs)
 
-        consumed_route = plan.act.consumed_gate_up_b
-        route = routes.aligned(consumed_route.is_shared_outer)
+        # The gate/up B the act stage absorbs is always per-expert.
+        route = routes.aligned(False)
         family, implementation = self._act_implementation(plan)
         provider.run_fused_act(
             base_gemm_state,
@@ -850,7 +847,7 @@ class MoeLoraRunner:
         if plan.down_overlap is DownOverlap.NONE:
             down_a()
             if plan.down_b_scatter:
-                # Inverted: base writes its rows first, then down-B adds into
+                # base writes its rows first, then down-B adds into
                 # them through src2dst rather than into a delta of its own.
                 down_out = base()
                 provider.run_down_b_scatter(
@@ -965,8 +962,7 @@ class MoeLoraRunner:
             )
             return output
 
-        consumed = plan.finalize.consumed_down_b
-        route = routes.raw(consumed.is_shared_outer)
+        route = routes.raw(plan.finalize.is_shared_outer)
         b_down = batch.down_lora_b.flatten(0, 1)
         _, implementation = self._finalize_implementation(plan)
         provider.run_shared_rank_finalize(

@@ -59,7 +59,6 @@ from sglang.srt.lora.moe.execution_plan import (
     MoeLoraExecutionPlan,
     SelectedPlan,
     Site,
-    StageContract,
     build_plan,
     load_plans,
 )
@@ -115,7 +114,6 @@ def _build_plan(
     directly)."""
     pe = False
     consumes_down_b = finalize_family is not FinalizeFamily.MATERIALIZED
-    down_b_contract = StageContract(Site.DOWN, is_shared_outer, BridgeLayout.PAIR_MAJOR)
     return MoeLoraExecutionPlan(
         gate_up_a=LoraASpec(
             Site.GATE_UP,
@@ -142,7 +140,7 @@ def _build_plan(
             )
         ),
         finalize=FinalizeSpec(
-            finalize_family, down_b_contract if consumes_down_b else None
+            finalize_family, is_shared_outer if consumes_down_b else False
         ),
         down_overlap=down_overlap,
     )

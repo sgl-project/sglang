@@ -43,7 +43,6 @@ from sglang.srt.lora.moe.execution_plan import (
     Phase,
     SelectedPlan,
     Site,
-    StageContract,
     build_plan,
     load_plans,
     resolve_plans,
@@ -100,7 +99,6 @@ def _build_plan(
     directly)."""
     pe = False
     consumes_gate_up_b = act_family is ActFamily.B_ACTIVATION
-    gate_up_b_contract = StageContract(Site.GATE_UP, pe, BridgeLayout.PAIR_MAJOR)
     return MoeLoraExecutionPlan(
         gate_up_a=LoraASpec(
             Site.GATE_UP,
@@ -118,11 +116,7 @@ def _build_plan(
                 BridgeLayout.PAIR_MAJOR,
             )
         ),
-        act=ActSpec(
-            act_family,
-            activation,
-            gate_up_b_contract if consumes_gate_up_b else None,
-        ),
+        act=ActSpec(act_family, activation),
         down_a=LoraASpec(Site.DOWN, LoraAFamily.GROUPED, pe, BridgeLayout.PAIR_MAJOR),
         down_b=LoraBSpec(
             Site.DOWN,

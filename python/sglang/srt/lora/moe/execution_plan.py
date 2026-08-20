@@ -14,8 +14,8 @@ bridge contract is explicit at each site:
 * ``TOKEN_MAJOR`` is the shared-outer gate/up form, one row per token.
 
 Fusion is represented by ownership, not by pretending that a consumed stage
-still runs independently.  For example, ``B_ACTIVATION`` carries the
-``consumed_gate_up_b`` factor contract and requires ``plan.gate_up_b is None``.
+still runs independently.  For example, ``B_ACTIVATION`` requires
+``plan.gate_up_b is None``: the act family alone says who owns gate/up B.
 This makes illegal combinations such as gate/up-A+B overlap plus B+activation
 fusion fail before CUDA work.
 """
@@ -123,24 +123,12 @@ def _aligned_requirement(is_shared_outer: bool) -> RouteRequirement:
     return RouteRequirement.ALIGNED_PER_EXPERT
 
 
-@pydantic_dataclass(frozen=True, slots=True, config=_STRICT)
-class StageContract:
-    """The factor and bridge contract of one logical A or B stage."""
-
-    site: Site
-    is_shared_outer: bool
-    layout: BridgeLayout
-
-    def __post_init__(self) -> None:
-        self.validate()
-
-    def validate(self) -> StageContract:
-        if self.site is Site.DOWN and self.layout is BridgeLayout.TOKEN_MAJOR:
-            raise ValueError(
-                "the down bridge is inherently pair-major: each routed expert "
-                "produces a different activation"
-            )
-        return self
+def _check_down_bridge_layout(site: Site, layout: BridgeLayout) -> None:
+    if site is Site.DOWN and layout is BridgeLayout.TOKEN_MAJOR:
+        raise ValueError(
+            "the down bridge is inherently pair-major: each routed expert "
+            "produces a different activation"
+        )
 
 
 @pydantic_dataclass(frozen=True, slots=True, config=_STRICT)
@@ -155,12 +143,8 @@ class LoraASpec:
     def __post_init__(self) -> None:
         self.validate()
 
-    @property
-    def contract(self) -> StageContract:
-        return StageContract(self.site, self.is_shared_outer, self.output_layout)
-
     def validate(self) -> LoraASpec:
-        self.contract.validate()
+        _check_down_bridge_layout(self.site, self.output_layout)
         if self.family is LoraAFamily.GROUPED:
             if self.output_layout is not BridgeLayout.PAIR_MAJOR:
                 raise ValueError("grouped A writes a pair-major bridge")
@@ -198,12 +182,8 @@ class LoraBSpec:
     def __post_init__(self) -> None:
         self.validate()
 
-    @property
-    def contract(self) -> StageContract:
-        return StageContract(self.site, self.is_shared_outer, self.input_layout)
-
     def validate(self) -> LoraBSpec:
-        self.contract.validate()
+        _check_down_bridge_layout(self.site, self.input_layout)
         if self.family is LoraBFamily.INDEXED_PAIRS:
             # The pair-indexed expand visits one routed pair at a time, so
             # its bridge is inherently pair-major.
@@ -223,62 +203,37 @@ class LoraBSpec:
 class ActSpec:
     """Activation boundary and the gate/up B stage optionally fused into it.
 
-    A consumed factor names its data contract, while ``family`` names the
-    fused implementation.  It is intentionally not an executable
-    ``LoraBSpec`` because the standalone family does not run.
+    ``family`` alone names the ownership: B_ACTIVATION absorbs gate/up B.
+    The absorbed stage records nothing of its own -- it is per-expert, and
+    it reads whatever bridge gate/up A wrote.
     """
 
     family: ActFamily
     activation: ActivationFn
-    consumed_gate_up_b: StageContract | None = None
-
-    def __post_init__(self) -> None:
-        self.validate()
-
-    def validate(self) -> ActSpec:
-        if self.consumed_gate_up_b is not None:
-            if self.consumed_gate_up_b.site is not Site.GATE_UP:
-                raise ValueError("consumed_gate_up_b must describe the gate/up site")
-
-        expected_gate_up_b = self.family is ActFamily.B_ACTIVATION
-        if (self.consumed_gate_up_b is not None) != expected_gate_up_b:
-            raise ValueError(
-                f"act family {self.family.value} "
-                f"{'requires' if expected_gate_up_b else 'does not consume'} gate/up B"
-            )
-        return self
 
     def route_requirements(self) -> frozenset[RouteRequirement]:
-        if self.consumed_gate_up_b is None:
+        if self.family is not ActFamily.B_ACTIVATION:
             return frozenset()
-        return frozenset(
-            (_aligned_requirement(self.consumed_gate_up_b.is_shared_outer),)
-        )
+        return frozenset((_aligned_requirement(False),))
 
 
 @pydantic_dataclass(frozen=True, slots=True, config=_STRICT)
 class FinalizeSpec:
-    """Final combine family and an optional down-B stage consumed by it."""
+    """Final combine family, and the ownership of the down B it consumes.
+
+    A materialized finalize consumes no down B and so records no ownership.
+    """
 
     family: FinalizeFamily
-    consumed_down_b: StageContract | None = None
+    is_shared_outer: bool = False
 
     def __post_init__(self) -> None:
         self.validate()
 
     def validate(self) -> FinalizeSpec:
-        consumes_down_b = self.family is not FinalizeFamily.MATERIALIZED
-        if (self.consumed_down_b is not None) != consumes_down_b:
-            raise ValueError(
-                f"finalize family {self.family.value} "
-                f"{'requires' if consumes_down_b else 'does not consume'} down B"
-            )
-        if self.consumed_down_b is not None:
-            if self.consumed_down_b.site is not Site.DOWN:
-                raise ValueError("consumed_down_b must describe the down site")
         if (
             self.family is FinalizeFamily.SHARED_RANK_REDUCE
-            and not self.consumed_down_b.is_shared_outer
+            and not self.is_shared_outer
         ):
             raise ValueError(
                 f"{self.family.value} requires shared-outer down-B ownership"
@@ -289,10 +244,8 @@ class FinalizeSpec:
         if self.family is FinalizeFamily.MATERIALIZED:
             return frozenset()
         # The shared-rank finalizer derives its fixed-top-k keys from the raw
-        # route; it never consumes LoRABatchInfo. consumed_down_b is set here
-        # by the exactly-one-owner rule, and its ownership is the one the
-        # finalizer reads back.
-        return frozenset((_raw_requirement(self.consumed_down_b.is_shared_outer),))
+        # route; it never consumes LoRABatchInfo.
+        return frozenset((_raw_requirement(self.is_shared_outer),))
 
 
 @pydantic_dataclass(frozen=True, slots=True, kw_only=True, config=_STRICT)
@@ -320,21 +273,6 @@ class MoeLoraExecutionPlan:
     def __post_init__(self) -> None:
         self.validate()
 
-    def _gate_up_b_contract(self) -> StageContract:
-        if self.gate_up_b is not None:
-            return self.gate_up_b.contract
-        # The exactly-one-owner parity check runs first, so falling past
-        # the branch above means the act stage consumed it.
-        return self.act.consumed_gate_up_b
-
-    def _down_a_contract(self) -> StageContract:
-        return self.down_a.contract
-
-    def _down_b_contract(self) -> StageContract:
-        if self.down_b is not None:
-            return self.down_b.contract
-        return self.finalize.consumed_down_b
-
     def validate(self) -> MoeLoraExecutionPlan:
         if self.gate_up_a.site is not Site.GATE_UP:
             raise ValueError("gate_up_a must describe the gate/up site")
@@ -345,25 +283,30 @@ class MoeLoraExecutionPlan:
         if self.down_b is not None and self.down_b.site is not Site.DOWN:
             raise ValueError("down_b must describe the down site")
 
-        gate_up_b_consumed = self.act.consumed_gate_up_b is not None
+        gate_up_b_consumed = self.act.family is ActFamily.B_ACTIVATION
         if gate_up_b_consumed == (self.gate_up_b is not None):
             raise ValueError(
                 "gate/up B must have exactly one owner: standalone gate_up_b or the act stage"
             )
-        down_b_consumed = self.finalize.consumed_down_b is not None
+        down_b_consumed = self.finalize.family is not FinalizeFamily.MATERIALIZED
         if down_b_consumed == (self.down_b is not None):
             raise ValueError(
                 "down B must have exactly one owner: standalone down_b or finalize"
             )
 
-        gate_up_b_contract = self._gate_up_b_contract()
-        down_a_contract = self._down_a_contract()
-        down_b_contract = self._down_b_contract()
-        if self.gate_up_a.output_layout is not gate_up_b_contract.layout:
+        # A consumed B reads whatever its A wrote, so only a standalone B
+        # carries a layout of its own that could disagree.
+        if (
+            self.gate_up_b is not None
+            and self.gate_up_a.output_layout is not self.gate_up_b.input_layout
+        ):
             raise ValueError(
                 "gate/up A output layout must match the gate/up B input layout"
             )
-        if down_a_contract.layout is not down_b_contract.layout:
+        if (
+            self.down_b is not None
+            and self.down_a.output_layout is not self.down_b.input_layout
+        ):
             raise ValueError("down A output layout must match the down B input layout")
 
         if self.gate_up_overlap is GateUpOverlap.GATE_UP_A_B and self.gate_up_b is None:
@@ -641,8 +584,6 @@ def build_plan(
     )
     act_family = spec.act_family
     finalize_family = spec.finalize_family
-    gate_up_b_contract = StageContract(Site.GATE_UP, False, gate_up_layout)
-    down_b_contract = StageContract(Site.DOWN, is_shared_outer, BridgeLayout.PAIR_MAJOR)
     consumes_gate_up_b = act_family is ActFamily.B_ACTIVATION
     consumes_down_b = finalize_family is not FinalizeFamily.MATERIALIZED
     plan = MoeLoraExecutionPlan(
@@ -654,11 +595,7 @@ def build_plan(
             if consumes_gate_up_b
             else LoraBSpec(Site.GATE_UP, spec.gate_up_b_family, False, gate_up_layout)
         ),
-        act=ActSpec(
-            act_family,
-            activation,
-            gate_up_b_contract if consumes_gate_up_b else None,
-        ),
+        act=ActSpec(act_family, activation),
         down_a=LoraASpec(
             Site.DOWN,
             spec.down_a_family,
@@ -676,7 +613,7 @@ def build_plan(
             )
         ),
         finalize=FinalizeSpec(
-            finalize_family, down_b_contract if consumes_down_b else None
+            finalize_family, is_shared_outer if consumes_down_b else False
         ),
         gate_up_overlap=spec.gate_up_overlap,
         down_overlap=spec.down_overlap,
