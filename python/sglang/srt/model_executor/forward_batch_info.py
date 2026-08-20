@@ -1318,12 +1318,25 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # graph; larger prefills fall back to eager and keep the
         # memory-efficient SUM_LEN. global_num_tokens is identical across ranks
         # (all-gathered), so the decision is consistent cluster-wide.
+        #
+        # Also require every DP rank to hold real tokens. Under MAX_LEN an
+        # idle rank fabricates a dummy EXTEND request whose tokens are
+        # counted as real (num_token_non_padded, deliberately: a zero-token
+        # rank starves the MoE all-to-all), so they bypass the topk_ids=-1
+        # dispatch mask and enter the shared EP grouped GEMMs. That changes
+        # per-expert batch sizes for every rank's real tokens; the resulting
+        # reduction-order noise flips near-boundary top-k routing decisions
+        # and compounds across layers into nats-scale, run-to-run
+        # nondeterministic logit shifts on LIVE requests (#31125). Fall back
+        # to SUM_LEN (eager prefill) for idle-rank steps until a zero-token
+        # rank can participate in the A2A with masked padding.
         prefill_cg = model_runner.server_args.cuda_graph_config.prefill
         if (
             self.can_run_dp_breakable_cuda_graph
             and self.is_extend_in_batch
             and prefill_cg.bs
             and max(global_num_tokens) <= max(prefill_cg.bs)
+            and min(global_num_tokens) > 0
         ):
             dp_padding_mode = DpPaddingMode.MAX_LEN
         self.dp_padding_mode = dp_padding_mode
