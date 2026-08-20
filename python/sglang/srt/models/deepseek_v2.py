@@ -1496,7 +1496,6 @@ class DeepseekV2MoE(nn.Module):
 
         if fine_grained_dual_stream:
             shared_intermediate = None
-            shared_fc1_done = None
             shared_fc2_done = None
 
             def _fine_grained_pre_dispatch_hook(
@@ -1505,23 +1504,14 @@ class DeepseekV2MoE(nn.Module):
                 _dispatch_topk_output: TopKOutput,
             ):
                 """Overlap shared FC1+SwiGLU with the full dispatch."""
-                nonlocal shared_intermediate, shared_fc1_done
+                nonlocal shared_intermediate
                 self.alt_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self.alt_stream):
                     shared_intermediate = self.shared_experts.forward_gate_up_act(
                         dispatch_hidden_states
                     )
                     shared_intermediate.record_stream(self.alt_stream)
-                    shared_fc1_done = self.alt_stream.record_event()
                 fine_pre_dispatch_hook_handle.remove()
-
-            def _fine_grained_post_dispatch_hook(
-                dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
-            ):
-                """Do not allow routed expert GEMMs to overlap shared FC1."""
-                assert shared_fc1_done is not None
-                torch.cuda.current_stream().wait_event(shared_fc1_done)
-                fine_post_dispatch_hook_handle.remove()
 
             def _fine_grained_pre_combine_hook(
                 dispatcher: BaseDispatcher, combine_input: CombineInput
@@ -1549,11 +1539,6 @@ class DeepseekV2MoE(nn.Module):
             fine_pre_dispatch_hook_handle = (
                 self.experts.dispatcher.register_pre_dispatch_hook(
                     _fine_grained_pre_dispatch_hook
-                )
-            )
-            fine_post_dispatch_hook_handle = (
-                self.experts.dispatcher.register_post_dispatch_hook(
-                    _fine_grained_post_dispatch_hook
                 )
             )
             fine_pre_combine_hook_handle = (
