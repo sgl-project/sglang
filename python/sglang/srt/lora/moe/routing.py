@@ -124,148 +124,104 @@ def _build_aligned(
     block_size: int,
     workspace: MoeLoraWorkspace,
     tensor_prefix: str,
-    need_per_expert: bool,
-    need_shared: bool,
-) -> tuple[RouteView | None, RouteView | None]:
+    is_shared_outer: bool,
+) -> RouteView:
+    """Sort the pairs into whole blocks, keyed by virtual expert or adapter."""
     from sglang.kernels.jit.utils import is_arch_support_pdl
 
     num_pairs = topk_ids.numel()
-    scratch: dict[str, dict[str, object]] = {}
-    for name, virtual, wanted in (
-        ("per_expert", num_local_experts * max_loras, need_per_expert),
-        ("shared", max_loras, need_shared),
-    ):
-        if not wanted:
-            continue
-        capacity = _routing_capacity(num_pairs, block_size, virtual)
-        if virtual + 1 >= 2**31 or capacity >= 2**31:
-            raise ValueError(
-                f"aligned routes use int32 plan math: {name} needs {virtual + 1} "
-                f"buckets and {capacity} slots, both must be < 2**31"
-            )
-        scratch[name] = _plan_scratch(
-            workspace,
-            prefix=f"{tensor_prefix}:{name}",
-            num_buckets=virtual + 1,
-            capacity=capacity,
-            block_size=block_size,
-            device=topk_ids.device,
+    name = "shared" if is_shared_outer else "per_expert"
+    virtual = max_loras if is_shared_outer else num_local_experts * max_loras
+    capacity = _routing_capacity(num_pairs, block_size, virtual)
+    if virtual + 1 >= 2**31 or capacity >= 2**31:
+        raise ValueError(
+            f"aligned routes use int32 plan math: {name} needs {virtual + 1} "
+            f"buckets and {capacity} slots, both must be < 2**31"
         )
-    # An unbuilt route's slot mirrors the built one; its branches are compiled
-    # out, so those pointers are never read.
-    per_expert = scratch.get("per_expert") or scratch["shared"]
-    shared = scratch.get("shared") or scratch["per_expert"]
-    pe_buckets = per_expert["num_buckets"]
-    sh_buckets = shared["num_buckets"]
+    own = _plan_scratch(
+        workspace,
+        prefix=f"{tensor_prefix}:{name}",
+        num_buckets=virtual + 1,
+        capacity=capacity,
+        block_size=block_size,
+        device=topk_ids.device,
+    )
+    num_buckets = own["num_buckets"]
+    bound = num_local_experts if is_shared_outer else 0
+    experts_per_adapter = 1 if is_shared_outer else num_local_experts
 
     use_pdl = is_arch_support_pdl()
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
-    num_pairs = topk_ids.numel()
-    pe_buckets = per_expert["num_buckets"]
-    sh_buckets = shared["num_buckets"]
-    shape = dict(
-        NEED_PER_EXPERT=need_per_expert,
-        NEED_SHARED=need_shared,
-        NUM_PER_EXPERT_BUCKETS=pe_buckets,
-        NUM_SHARED_BUCKETS=sh_buckets,
-        E_LOCAL=num_local_experts,
-        MAX_LORAS=max_loras,
-        TOP_K=topk_ids.shape[1],
-        USE_PDL=use_pdl,
-    )
-
     _hist_kernel[(triton.cdiv(max(num_pairs, 1), HIST_BLOCK),)](
         topk_ids,
         token_lora_mapping,
-        per_expert["counts"],
-        shared["counts"],
+        own["counts"],
         num_pairs,
-        num_local_experts,
+        bound,
+        NUM_BUCKETS=num_buckets,
+        LORA_EXPERTS_PER_ADAPTER=experts_per_adapter,
+        MAX_LORAS=max_loras,
+        TOP_K=topk_ids.shape[1],
+        SHARED_OUTER=is_shared_outer,
         BLOCK=HIST_BLOCK,
-        PER_EXPERT_BINS=count_bins(pe_buckets, num_pairs),
-        SHARED_BINS=count_bins(sh_buckets, num_pairs),
+        BINS=count_bins(num_buckets, num_pairs),
+        USE_PDL=use_pdl,
         num_warps=HIST_WARPS,
-        **shape,
     )
-    _scan_kernel[(int(need_per_expert) + int(need_shared),)](
-        per_expert["counts"],
-        per_expert["block_cumulative"],
-        per_expert["cursor"],
-        per_expert["bucket_end"],
-        per_expert["padded_pairs"],
-        pe_buckets,
-        shared["counts"],
-        shared["block_cumulative"],
-        shared["cursor"],
-        shared["bucket_end"],
-        shared["padded_pairs"],
-        sh_buckets,
-        NEED_PER_EXPERT=need_per_expert,
-        NEED_SHARED=need_shared,
+    _scan_kernel[(1,)](
+        own["counts"],
+        own["block_cumulative"],
+        own["cursor"],
+        own["bucket_end"],
+        own["padded_pairs"],
+        num_buckets,
         BLOCK_SIZE_M=block_size,
         CHUNK=SCAN_CHUNK,
         USE_PDL=use_pdl,
         num_warps=SCAN_WARPS,
         **pdl_kwargs,
     )
-    pe_blocks = per_expert["capacity"] // block_size
-    sh_blocks = shared["capacity"] // block_size
-    pe_labels = triton.cdiv(max(pe_blocks, 1), EXPAND_BLOCK) if need_per_expert else 0
-    sh_labels = triton.cdiv(max(sh_blocks, 1), EXPAND_BLOCK) if need_shared else 0
-    _place_kernel[
-        (pe_labels + sh_labels + triton.cdiv(max(num_pairs, 1), EXPAND_BLOCK),)
-    ](
+    num_blocks = own["capacity"] // block_size
+    label_programs = triton.cdiv(max(num_blocks, 1), EXPAND_BLOCK)
+    _place_kernel[(label_programs + triton.cdiv(max(num_pairs, 1), EXPAND_BLOCK),)](
         topk_ids,
         token_lora_mapping,
-        per_expert["cursor"],
-        per_expert["bucket_end"],
-        per_expert["block_cumulative"],
-        per_expert["sorted"],
-        per_expert["block_ids"],
-        pe_blocks,
-        pe_labels,
-        shared["cursor"],
-        shared["bucket_end"],
-        shared["block_cumulative"],
-        shared["sorted"],
-        shared["block_ids"],
-        sh_blocks,
-        sh_labels,
+        own["cursor"],
+        own["bucket_end"],
+        own["block_cumulative"],
+        own["sorted"],
+        own["block_ids"],
+        num_blocks,
+        label_programs,
         num_pairs,
-        num_local_experts,
-        NUM_PER_EXPERT_VIRTUAL=pe_buckets - 1,
-        NUM_SHARED_VIRTUAL=sh_buckets - 1,
+        bound,
+        NUM_BUCKETS=num_buckets,
+        NUM_VIRTUAL=num_buckets - 1,
+        LORA_EXPERTS_PER_ADAPTER=experts_per_adapter,
+        MAX_LORAS=max_loras,
+        TOP_K=topk_ids.shape[1],
+        SHARED_OUTER=is_shared_outer,
         BLOCK=EXPAND_BLOCK,
         BLOCK_SIZE_M=block_size,
         # The search picks one of NUM_BUCKETS + 1 answers, so it needs
         # num_buckets.bit_length() steps -- one fewer and a sentinel reads as 0.
-        PER_EXPERT_SEARCH_STEPS=pe_buckets.bit_length(),
-        SHARED_SEARCH_STEPS=sh_buckets.bit_length(),
-        PER_EXPERT_CLAIM_PER_BLOCK=num_pairs >= CLAIM_MIN_PAIRS_PER_BUCKET * pe_buckets,
-        SHARED_CLAIM_PER_BLOCK=num_pairs >= CLAIM_MIN_PAIRS_PER_BUCKET * sh_buckets,
+        SEARCH_STEPS=num_buckets.bit_length(),
+        CLAIM_PER_BLOCK=num_pairs >= CLAIM_MIN_PAIRS_PER_BUCKET * num_buckets,
+        USE_PDL=use_pdl,
         num_warps=EXPAND_WARPS,
         **pdl_kwargs,
-        **shape,
     )
-
-    def route(name: str, *, is_shared_outer: bool) -> RouteView:
-        own = scratch[name]
-        return RouteView(
-            view=RouteViewKind.ALIGNED,
-            block_size=block_size,
-            topk_ids=topk_ids,
-            token_lora_mapping=token_lora_mapping,
-            num_local_experts=num_local_experts,
-            is_shared_outer=is_shared_outer,
-            max_loras=max_loras,
-            maybe_sorted_pair_ids=own["sorted"],
-            maybe_block_virtual_expert_ids=own["block_ids"],
-            maybe_num_pairs_post_padded=own["padded_pairs"],
-        )
-
-    return (
-        route("per_expert", is_shared_outer=False) if need_per_expert else None,
-        route("shared", is_shared_outer=True) if need_shared else None,
+    return RouteView(
+        view=RouteViewKind.ALIGNED,
+        block_size=block_size,
+        topk_ids=topk_ids,
+        token_lora_mapping=token_lora_mapping,
+        num_local_experts=num_local_experts,
+        is_shared_outer=is_shared_outer,
+        max_loras=max_loras,
+        maybe_sorted_pair_ids=own["sorted"],
+        maybe_block_virtual_expert_ids=own["block_ids"],
+        maybe_num_pairs_post_padded=own["padded_pairs"],
     )
 
 
@@ -305,7 +261,6 @@ def build_virtual_expert_routing(
     max_loras: int,
     block_size: int,
     is_shared_outer: bool = False,
-    is_joint_routing: bool = False,
     view: RouteViewKind = RouteViewKind.ALIGNED,
     workspace: MoeLoraWorkspace | None = None,
     tensor_prefix: str | None = None,
@@ -339,8 +294,7 @@ def build_virtual_expert_routing(
 
     num_virtual = lora_experts_per_adapter * max_loras
     if (
-        is_joint_routing
-        or num_virtual >= FUSED_ALIGN_MIN_VIRTUAL_EXPERTS
+        num_virtual >= FUSED_ALIGN_MIN_VIRTUAL_EXPERTS
         or topk_ids.numel() >= FUSED_ALIGN_MIN_PAIRS
     ):
         if workspace is None or tensor_prefix is None:
@@ -349,7 +303,7 @@ def build_virtual_expert_routing(
                 f"(view={view.value}, virtual experts={num_virtual}, "
                 f"pairs={topk_ids.numel()})"
             )
-        return _build_aligned(
+        route = _build_aligned(
             topk_ids,
             token_lora_mapping,
             num_local_experts=num_local_experts,
@@ -357,9 +311,9 @@ def build_virtual_expert_routing(
             block_size=block_size,
             workspace=workspace,
             tensor_prefix=tensor_prefix,
-            need_per_expert=is_joint_routing or not is_shared_outer,
-            need_shared=is_joint_routing or is_shared_outer,
+            is_shared_outer=is_shared_outer,
         )
+        return (None, route) if is_shared_outer else (route, None)
 
     virtual_topk_ids = _build_virtual_topk_ids(
         topk_ids,
@@ -437,19 +391,40 @@ def build_routes(
             view=RouteViewKind.RAW,
         )
 
-    if plan.route_builder is RouteBuilderFamily.JOINT_SHARED_OUTER:
-        per_expert, shared = build_virtual_expert_routing(
-            topk_ids,
-            token_lora_mapping,
-            num_local_experts=num_local_experts,
-            max_loras=max_loras,
-            block_size=block_size,
-            is_joint_routing=True,
-            workspace=workspace,
-            tensor_prefix="joint_route",
+    if plan.route_builder is RouteBuilderFamily.PARALLEL_SHARED_OUTER:
+
+        def _build_per_expert() -> RouteView:
+            route, _ = build_virtual_expert_routing(
+                topk_ids,
+                token_lora_mapping,
+                num_local_experts=num_local_experts,
+                max_loras=max_loras,
+                block_size=block_size,
+                view=RouteViewKind.ALIGNED,
+                workspace=workspace,
+                tensor_prefix="route:aligned_per_expert",
+            )
+            return route
+
+        def _build_shared() -> None:
+            _, values["aligned_shared_outer"] = build_virtual_expert_routing(
+                topk_ids,
+                token_lora_mapping,
+                num_local_experts=num_local_experts,
+                is_shared_outer=True,
+                max_loras=max_loras,
+                block_size=block_size,
+                view=RouteViewKind.ALIGNED,
+                workspace=workspace,
+                tensor_prefix="route:aligned_shared_outer",
+            )
+
+        values["aligned_per_expert"] = workspace.run_parallel(
+            name="route:parallel",
+            device=topk_ids.device,
+            compute=_build_per_expert,
+            side=_build_shared,
         )
-        values["aligned_per_expert"] = per_expert
-        values["aligned_shared_outer"] = shared
     else:
         if RouteRequirement.ALIGNED_PER_EXPERT in requirements:
             values["aligned_per_expert"], _ = build_virtual_expert_routing(

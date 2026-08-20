@@ -419,6 +419,43 @@ into-base measured -2.06% (B200) and -2.03% (GB300) for Qwen3.5-397B, while at
 plan table cannot express -- `max_rank` is its only predicate -- so it is a lead,
 not a change.
 
+Route-builder sweep: joint vs parallel-two-stream vs serial (2026-08-20, all
+three architectures, shared layout, the five shipped joint rows' shapes).
+Same instrument discipline as the down-tail sweep above: shipped row, captured
+graphs, every config captured twice, deltas vs the joint arm. 48 cells
+(3 models x {decode bs 1/8/16/32, prefill 2048/8192} x 3 archs; H200
+contributes decode only -- its rank-16 shared prefill row already uses the
+standard builder).
+
+- Serial two builds: clearly worse, +1% to +15% (worst at decode bs1) --
+  the joint builder was genuinely earning its keep against serial.
+- Parallel two-stream (`parallel_shared_outer`: the two standard aligned
+  builds forked on the workspace side stream): matches or beats joint.
+  20 wins / 19 washes / 9 losses; every loss <= +1.5%; decode median -0.46%
+  (mean -1.01%), prefill median -0.10%. Biggest win: Qwen3.5-397B decode bs1
+  on GB300, -7.95% of layer time (noise 0.08%) -- at E=512 the joint fused
+  chain drags 2049 buckets of label metadata for a 10-pair forward, while the
+  parallel arm's tiny builds fall through the fused-align thresholds to the
+  JIT align path. That per-route builder choice is structural to the parallel
+  form: each route picks its own builder, which one dual-headed launch cannot.
+
+Content equivalence was proven separately (bucket -> pair-set identical at
+1..8192 tokens). Two representation differences are benign by construction:
+intra-bucket pair order is atomic-claim nondeterministic even between two runs
+of the SAME builder, and the JIT align path lays sentinel blocks first where
+the fused path lays them last -- consumers skip `-1` blocks wherever they sit.
+
+e2e sanity at the runbook protocol (B200, shared layout, joint vs parallel,
+override proven to flip the resolved builder): decode moved positive in all
+eight cells -- Qwen3.5-35B +0.7..+1.3%, Qwen3.5-397B +0.5..+2.6% with the
+largest gain at bs1, exactly where the layer-level route-build win is biggest.
+Prefill flat within noise. On this evidence every shipped joint row moved to
+`parallel_shared_outer`, and the dual-headed joint machinery was deleted from
+the route kernels: `_hist`/`_scan`/`_place` are single-route (the constexpr
+NEED branches compiled to exactly these instantiations before, verified by a
+post-deletion timing spot check matching to the microsecond), and
+`_build_aligned` builds one route per call.
+
 To onboard a model whose geometry the shipped `domain`/rows do not cover:
 
 ```

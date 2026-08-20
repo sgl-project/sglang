@@ -15,12 +15,12 @@ from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
-def test_joint_route_counts_are_initialized_only_on_first_allocation() -> None:
+def test_route_counts_are_initialized_only_on_first_allocation() -> None:
     """Reusing count storage must not hide a missing scan-side reset."""
     workspace = MoeLoraWorkspace()
     first = _plan_scratch(
         workspace,
-        prefix="joint_route:test",
+        prefix="route:test",
         num_buckets=7,
         capacity=32,
         block_size=8,
@@ -31,7 +31,7 @@ def test_joint_route_counts_are_initialized_only_on_first_allocation() -> None:
     first["counts"].fill_(9)
     second = _plan_scratch(
         workspace,
-        prefix="joint_route:test",
+        prefix="route:test",
         num_buckets=7,
         capacity=32,
         block_size=8,
@@ -43,7 +43,7 @@ def test_joint_route_counts_are_initialized_only_on_first_allocation() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA route kernel required")
-def test_joint_route_scan_restores_both_count_buffers_between_calls() -> None:
+def test_route_scan_restores_both_count_buffers_between_calls() -> None:
     device = torch.device("cuda")
     workspace = MoeLoraWorkspace()
     num_local_experts = 3
@@ -60,27 +60,27 @@ def test_joint_route_scan_restores_both_count_buffers_between_calls() -> None:
         torch.tensor([1, -1, 0, 1, -1, 0], dtype=torch.int32, device=device),
     )
     for token_lora_mapping in traffic:
-        _build_aligned(
-            topk_ids,
-            token_lora_mapping,
-            num_local_experts=num_local_experts,
-            max_loras=max_loras,
-            block_size=block_size,
-            workspace=workspace,
-            tensor_prefix="joint_route",
-            need_per_expert=True,
-            need_shared=True,
-        )
+        for is_shared_outer in (False, True):
+            _build_aligned(
+                topk_ids,
+                token_lora_mapping,
+                num_local_experts=num_local_experts,
+                max_loras=max_loras,
+                block_size=block_size,
+                workspace=workspace,
+                tensor_prefix="route:aligned",
+                is_shared_outer=is_shared_outer,
+            )
 
         per_expert_counts = workspace.tensor(
-            "joint_route:per_expert:counts",
+            "route:aligned:per_expert:counts",
             (num_local_experts * max_loras + 1,),
             dtype=torch.int32,
             device=device,
             zero_on_first_allocation=True,
         )
         shared_counts = workspace.tensor(
-            "joint_route:shared:counts",
+            "route:aligned:shared:counts",
             (max_loras + 1,),
             dtype=torch.int32,
             device=device,

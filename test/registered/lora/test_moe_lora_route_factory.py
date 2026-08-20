@@ -228,6 +228,11 @@ class _Workspace:
     def __init__(self):
         self.tensors: dict[str, torch.Tensor] = {}
 
+    def run_parallel(self, *, name, device, compute, side):
+        # The real CPU fallback: side first, then compute, fully joined.
+        side()
+        return compute()
+
     def tensor(self, name, shape, *, dtype, device, **_kwargs):
         factory = (
             torch.zeros if _kwargs.get("zero_on_first_allocation") else torch.empty
@@ -304,14 +309,12 @@ class TestRoutePdlWiring(unittest.TestCase):
             block_size,
             view,
             is_shared_outer=False,
-            is_joint_routing=False,
             workspace=None,
             tensor_prefix=None,
         ):
             # Every route gets the SAME local expert count; only the flag
             # differs, and it has to match the route being built.
             self.assertEqual(num_local_experts, 2)
-            self.assertFalse(is_joint_routing, "a standard plan must not go joint")
             calls.append((tensor_prefix, is_shared_outer))
             built = _route(
                 topk_ids,
@@ -344,7 +347,7 @@ class TestRoutePdlWiring(unittest.TestCase):
             },
         )
 
-    def test_joint_plan_builds_joint_routes_plus_the_shared_token_follow_on(self):
+    def test_parallel_plan_builds_both_routes_plus_the_shared_token_follow_on(self):
         reference = SERIAL_MATERIALIZED_REFERENCE
         plan = dataclasses.replace(
             reference,
@@ -359,10 +362,9 @@ class TestRoutePdlWiring(unittest.TestCase):
                 input_layout=PLAN.BridgeLayout.TOKEN_MAJOR,
             ),
             down_b=dataclasses.replace(reference.down_b, is_shared_outer=True),
-            route_builder=PLAN.RouteBuilderFamily.JOINT_SHARED_OUTER,
+            route_builder=PLAN.RouteBuilderFamily.PARALLEL_SHARED_OUTER,
         )
-        joint_calls = []
-        standard_calls = []
+        calls = []
 
         def fake_route(
             topk_ids,
@@ -373,7 +375,6 @@ class TestRoutePdlWiring(unittest.TestCase):
             block_size,
             view=None,
             is_shared_outer=False,
-            is_joint_routing=False,
             workspace=None,
             tensor_prefix=None,
         ):
@@ -385,11 +386,7 @@ class TestRoutePdlWiring(unittest.TestCase):
                 block_size=block_size,
                 padded_count=padded,
             )
-            # One front door serves both, so the flag is what separates them.
-            if is_joint_routing:
-                joint_calls.append(block_size)
-                return built, built
-            standard_calls.append(view)
+            calls.append((tensor_prefix, is_shared_outer))
             return (None, built) if is_shared_outer else (built, None)
 
         with mock.patch.object(
@@ -405,10 +402,18 @@ class TestRoutePdlWiring(unittest.TestCase):
                 workspace=_Workspace(),
             )
 
-        self.assertEqual(joint_calls, [16])
-        self.assertEqual(standard_calls, ["aligned"])
+        # The fork builds both aligned routes; the shared-token follow-on is a
+        # third standard call.
+        self.assertEqual(
+            set(calls),
+            {
+                ("route:aligned_per_expert", False),
+                ("route:aligned_shared_outer", True),
+                ("route:shared_token", True),
+            },
+        )
 
-    def _run_joint(self, *, use_pdl):
+    def _run_route(self, *, use_pdl, is_shared_outer=False):
         recorders = [_KernelRecorder() for _ in range(3)]
         with (
             _arch_pdl(bool(use_pdl)),
@@ -416,36 +421,35 @@ class TestRoutePdlWiring(unittest.TestCase):
             mock.patch.object(ROUTING, "_scan_kernel", recorders[1]),
             mock.patch.object(ROUTING, "_place_kernel", recorders[2]),
         ):
-            routes = ROUTING._build_aligned(
+            route = ROUTING._build_aligned(
                 torch.tensor([[0, 1]], dtype=torch.int32),
                 torch.tensor([0], dtype=torch.int32),
                 num_local_experts=2,
                 max_loras=2,
                 block_size=16,
                 workspace=_Workspace(),
-                tensor_prefix="joint_route",
-                need_per_expert=True,
-                need_shared=True,
+                tensor_prefix="test:route",
+                is_shared_outer=is_shared_outer,
             )
-        return routes, recorders
+        return route, recorders
 
-    def test_joint_route_launches_real_pdl_chain(self):
-        routes, (hist, scan, expand) = self._run_joint(use_pdl=True)
+    def test_route_launches_real_pdl_chain(self):
+        route, (hist, scan, expand) = self._run_route(use_pdl=True)
 
-        self.assertEqual(len(routes), 2)
+        self.assertIsNotNone(route)
         self.assertTrue(hist.calls[0][2]["USE_PDL"])
         self.assertNotIn("launch_pdl", hist.calls[0][2])
         for consumer in (scan, expand):
             self.assertTrue(consumer.calls[0][2]["USE_PDL"])
             self.assertTrue(consumer.calls[0][2]["launch_pdl"])
 
-    def test_joint_route_pdl_off_leaves_launches_unarmed(self):
-        _, recorders = self._run_joint(use_pdl=False)
+    def test_route_pdl_off_leaves_launches_unarmed(self):
+        _, recorders = self._run_route(use_pdl=False)
         for recorder in recorders:
             self.assertFalse(recorder.calls[0][2]["USE_PDL"])
             self.assertNotIn("launch_pdl", recorder.calls[0][2])
 
-    def test_joint_kernel_dependency_operations_are_complete(self):
+    def test_kernel_dependency_operations_are_complete(self):
         source = (LORA_MOE / "route_kernels.py").read_text()
         tree = ast.parse(source)
         function_nodes = {
@@ -463,22 +467,22 @@ class TestRoutePdlWiring(unittest.TestCase):
         self.assertIn("gdc_wait", expand)
         self.assertNotIn("gdc_launch_dependents", expand)
 
-        # K3 must be released before either scan body, so its pair path can
-        # overlap scan work while still waiting before cursor consumption.
+        # K3 must be released before the scan body, so the place kernel's pair
+        # path can overlap scan work while still waiting before cursor
+        # consumption.
         scan_ifs = [
             node
             for node in function_nodes["_scan_kernel"].body
             if isinstance(node, ast.If)
         ]
-        self.assertEqual(len(scan_ifs), 2)
+        self.assertEqual(len(scan_ifs), 1)
         self.assertEqual(ast.unparse(scan_ifs[0].test), "USE_PDL")
         pdl_body = ast.unparse(scan_ifs[0])
         self.assertLess(
             pdl_body.index("gdc_wait"),
             pdl_body.index("gdc_launch_dependents"),
         )
-        self.assertIn("tl.program_id", scan)
-        self.assertTrue(scan_ifs[1].orelse)
+        self.assertIn("tl.program_id", expand)
 
 
 class TestSharedTokenRoute(unittest.TestCase):

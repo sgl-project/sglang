@@ -120,61 +120,38 @@ def _build_virtual_topk_ids_kernel(
 def _hist_kernel(
     topk_ids_ptr,
     token_lora_mapping_ptr,
-    per_expert_counts_ptr,
-    shared_counts_ptr,
+    counts_ptr,
     num_pairs,
-    num_local_experts,
-    NEED_PER_EXPERT: tl.constexpr,
-    NEED_SHARED: tl.constexpr,
-    NUM_PER_EXPERT_BUCKETS: tl.constexpr,
-    NUM_SHARED_BUCKETS: tl.constexpr,
-    E_LOCAL: tl.constexpr,
+    routed_expert_id_bound,
+    NUM_BUCKETS: tl.constexpr,
+    LORA_EXPERTS_PER_ADAPTER: tl.constexpr,
     MAX_LORAS: tl.constexpr,
     TOP_K: tl.constexpr,
+    SHARED_OUTER: tl.constexpr,
     BLOCK: tl.constexpr,
-    PER_EXPERT_BINS: tl.constexpr,
-    SHARED_BINS: tl.constexpr,
+    BINS: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
     """Count each group's pairs; counts arrive zeroed, so there is no memset."""
     pair_ids = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     pair_mask = pair_ids < num_pairs
-    if NEED_PER_EXPERT:
-        add_counts_inline(
-            per_expert_counts_ptr,
-            virtual_expert_ids_inline(
-                topk_ids_ptr,
-                token_lora_mapping_ptr,
-                pair_ids,
-                pair_mask,
-                0,
-                LORA_EXPERTS_PER_ADAPTER=E_LOCAL,
-                MAX_LORAS=MAX_LORAS,
-                TOP_K=TOP_K,
-                SHARED_OUTER=False,
-            ),
+    add_counts_inline(
+        counts_ptr,
+        virtual_expert_ids_inline(
+            topk_ids_ptr,
+            token_lora_mapping_ptr,
+            pair_ids,
             pair_mask,
-            NUM_BUCKETS=NUM_PER_EXPERT_BUCKETS,
-            BINS=PER_EXPERT_BINS,
-        )
-    if NEED_SHARED:
-        add_counts_inline(
-            shared_counts_ptr,
-            virtual_expert_ids_inline(
-                topk_ids_ptr,
-                token_lora_mapping_ptr,
-                pair_ids,
-                pair_mask,
-                num_local_experts,
-                LORA_EXPERTS_PER_ADAPTER=1,
-                MAX_LORAS=MAX_LORAS,
-                TOP_K=TOP_K,
-                SHARED_OUTER=True,
-            ),
-            pair_mask,
-            NUM_BUCKETS=NUM_SHARED_BUCKETS,
-            BINS=SHARED_BINS,
-        )
+            routed_expert_id_bound,
+            LORA_EXPERTS_PER_ADAPTER=LORA_EXPERTS_PER_ADAPTER,
+            MAX_LORAS=MAX_LORAS,
+            TOP_K=TOP_K,
+            SHARED_OUTER=SHARED_OUTER,
+        ),
+        pair_mask,
+        NUM_BUCKETS=NUM_BUCKETS,
+        BINS=BINS,
+    )
     if USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -212,55 +189,31 @@ def _scan_one(
 
 @triton.jit
 def _scan_kernel(
-    per_expert_counts_ptr,
-    per_expert_block_cumulative_ptr,
-    per_expert_cursor_ptr,
-    per_expert_bucket_end_ptr,
-    per_expert_padded_pairs_ptr,
-    num_per_expert_buckets,
-    shared_counts_ptr,
-    shared_block_cumulative_ptr,
-    shared_cursor_ptr,
-    shared_bucket_end_ptr,
-    shared_padded_pairs_ptr,
-    num_shared_buckets,
-    NEED_PER_EXPERT: tl.constexpr,
-    NEED_SHARED: tl.constexpr,
+    counts_ptr,
+    block_cumulative_ptr,
+    cursor_ptr,
+    bucket_end_ptr,
+    padded_pairs_ptr,
+    num_buckets,
     BLOCK_SIZE_M: tl.constexpr,
     CHUNK: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
-    """Scan every requested group, one program each."""
     if USE_PDL:
         tl.extra.cuda.gdc_wait()
         # Safe to start the place kernel now: every path there waits before its
         # first read of scan output.
         tl.extra.cuda.gdc_launch_dependents()
-    scan_per_expert = (
-        tl.program_id(0) == 0 if NEED_PER_EXPERT and NEED_SHARED else NEED_PER_EXPERT
+    _scan_one(
+        counts_ptr,
+        block_cumulative_ptr,
+        cursor_ptr,
+        bucket_end_ptr,
+        padded_pairs_ptr,
+        num_buckets,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        CHUNK=CHUNK,
     )
-    if scan_per_expert:
-        _scan_one(
-            per_expert_counts_ptr,
-            per_expert_block_cumulative_ptr,
-            per_expert_cursor_ptr,
-            per_expert_bucket_end_ptr,
-            per_expert_padded_pairs_ptr,
-            num_per_expert_buckets,
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            CHUNK=CHUNK,
-        )
-    else:
-        _scan_one(
-            shared_counts_ptr,
-            shared_block_cumulative_ptr,
-            shared_cursor_ptr,
-            shared_bucket_end_ptr,
-            shared_padded_pairs_ptr,
-            num_shared_buckets,
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            CHUNK=CHUNK,
-        )
 
 
 @triton.jit
@@ -316,129 +269,72 @@ def _label_blocks(
 def _place_kernel(
     topk_ids_ptr,
     token_lora_mapping_ptr,
-    per_expert_cursor_ptr,
-    per_expert_bucket_end_ptr,
-    per_expert_block_cumulative_ptr,
-    per_expert_sorted_ptr,
-    per_expert_block_ids_ptr,
-    num_per_expert_blocks,
-    per_expert_label_programs,
-    shared_cursor_ptr,
-    shared_bucket_end_ptr,
-    shared_block_cumulative_ptr,
-    shared_sorted_ptr,
-    shared_block_ids_ptr,
-    num_shared_blocks,
-    shared_label_programs,
+    cursor_ptr,
+    bucket_end_ptr,
+    block_cumulative_ptr,
+    sorted_ptr,
+    block_ids_ptr,
+    num_blocks,
+    label_programs,
     num_pairs,
-    num_local_experts,
-    NEED_PER_EXPERT: tl.constexpr,
-    NEED_SHARED: tl.constexpr,
-    NUM_PER_EXPERT_BUCKETS: tl.constexpr,
-    NUM_PER_EXPERT_VIRTUAL: tl.constexpr,
-    NUM_SHARED_BUCKETS: tl.constexpr,
-    NUM_SHARED_VIRTUAL: tl.constexpr,
-    E_LOCAL: tl.constexpr,
+    routed_expert_id_bound,
+    NUM_BUCKETS: tl.constexpr,
+    NUM_VIRTUAL: tl.constexpr,
+    LORA_EXPERTS_PER_ADAPTER: tl.constexpr,
     MAX_LORAS: tl.constexpr,
     TOP_K: tl.constexpr,
+    SHARED_OUTER: tl.constexpr,
     BLOCK: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
-    PER_EXPERT_SEARCH_STEPS: tl.constexpr,
-    SHARED_SEARCH_STEPS: tl.constexpr,
-    PER_EXPERT_CLAIM_PER_BLOCK: tl.constexpr,
-    SHARED_CLAIM_PER_BLOCK: tl.constexpr,
+    SEARCH_STEPS: tl.constexpr,
+    CLAIM_PER_BLOCK: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
     """Every scan consumer on one grid, split by program id: labels, then pairs."""
     pid = tl.program_id(0)
-    if NEED_PER_EXPERT:
-        if pid < per_expert_label_programs:
-            if USE_PDL:
-                # The label path immediately consumes scan outputs.
-                tl.extra.cuda.gdc_wait()
-            _label_blocks(
-                pid,
-                per_expert_block_cumulative_ptr,
-                per_expert_bucket_end_ptr,
-                per_expert_sorted_ptr,
-                per_expert_block_ids_ptr,
-                num_per_expert_blocks,
-                num_pairs,
-                NUM_BUCKETS=NUM_PER_EXPERT_BUCKETS,
-                NUM_VIRTUAL_EXPERTS=NUM_PER_EXPERT_VIRTUAL,
-                BLOCK=BLOCK,
-                BLOCK_SIZE_M=BLOCK_SIZE_M,
-                SEARCH_STEPS=PER_EXPERT_SEARCH_STEPS,
-            )
-            return
-    if NEED_SHARED:
-        if pid < per_expert_label_programs + shared_label_programs:
-            if USE_PDL:
-                tl.extra.cuda.gdc_wait()
-            _label_blocks(
-                pid - per_expert_label_programs,
-                shared_block_cumulative_ptr,
-                shared_bucket_end_ptr,
-                shared_sorted_ptr,
-                shared_block_ids_ptr,
-                num_shared_blocks,
-                num_pairs,
-                NUM_BUCKETS=NUM_SHARED_BUCKETS,
-                NUM_VIRTUAL_EXPERTS=NUM_SHARED_VIRTUAL,
-                BLOCK=BLOCK,
-                BLOCK_SIZE_M=BLOCK_SIZE_M,
-                SEARCH_STEPS=SHARED_SEARCH_STEPS,
-            )
-            return
+    if pid < label_programs:
+        if USE_PDL:
+            # The label path immediately consumes scan outputs.
+            tl.extra.cuda.gdc_wait()
+        _label_blocks(
+            pid,
+            block_cumulative_ptr,
+            bucket_end_ptr,
+            sorted_ptr,
+            block_ids_ptr,
+            num_blocks,
+            num_pairs,
+            NUM_BUCKETS=NUM_BUCKETS,
+            NUM_VIRTUAL_EXPERTS=NUM_VIRTUAL,
+            BLOCK=BLOCK,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            SEARCH_STEPS=SEARCH_STEPS,
+        )
+        return
 
     # Recomputing the key beats a [T, K] round trip and needs no scan, so it runs
     # before the wait below.
-    pair_ids = (
-        pid - per_expert_label_programs - shared_label_programs
-    ) * BLOCK + tl.arange(0, BLOCK)
+    pair_ids = (pid - label_programs) * BLOCK + tl.arange(0, BLOCK)
     pair_mask = pair_ids < num_pairs
-    if NEED_PER_EXPERT:
-        per_expert_ids = virtual_expert_ids_inline(
-            topk_ids_ptr,
-            token_lora_mapping_ptr,
-            pair_ids,
-            pair_mask,
-            0,
-            LORA_EXPERTS_PER_ADAPTER=E_LOCAL,
-            MAX_LORAS=MAX_LORAS,
-            TOP_K=TOP_K,
-            SHARED_OUTER=False,
-        )
-    if NEED_SHARED:
-        shared_ids = virtual_expert_ids_inline(
-            topk_ids_ptr,
-            token_lora_mapping_ptr,
-            pair_ids,
-            pair_mask,
-            num_local_experts,
-            LORA_EXPERTS_PER_ADAPTER=1,
-            MAX_LORAS=MAX_LORAS,
-            TOP_K=TOP_K,
-            SHARED_OUTER=True,
-        )
+    virtual_ids = virtual_expert_ids_inline(
+        topk_ids_ptr,
+        token_lora_mapping_ptr,
+        pair_ids,
+        pair_mask,
+        routed_expert_id_bound,
+        LORA_EXPERTS_PER_ADAPTER=LORA_EXPERTS_PER_ADAPTER,
+        MAX_LORAS=MAX_LORAS,
+        TOP_K=TOP_K,
+        SHARED_OUTER=SHARED_OUTER,
+    )
     if USE_PDL:
         # Cursors below are the first scan-produced values this path consumes.
         tl.extra.cuda.gdc_wait()
-    if NEED_PER_EXPERT:
-        per_expert_slots = claim_slots_inline(
-            per_expert_cursor_ptr,
-            per_expert_ids,
-            pair_mask,
-            NUM_BUCKETS=NUM_PER_EXPERT_BUCKETS,
-            PER_BLOCK=PER_EXPERT_CLAIM_PER_BLOCK,
-        )
-        tl.store(per_expert_sorted_ptr + per_expert_slots, pair_ids, mask=pair_mask)
-    if NEED_SHARED:
-        shared_slots = claim_slots_inline(
-            shared_cursor_ptr,
-            shared_ids,
-            pair_mask,
-            NUM_BUCKETS=NUM_SHARED_BUCKETS,
-            PER_BLOCK=SHARED_CLAIM_PER_BLOCK,
-        )
-        tl.store(shared_sorted_ptr + shared_slots, pair_ids, mask=pair_mask)
+    slots = claim_slots_inline(
+        cursor_ptr,
+        virtual_ids,
+        pair_mask,
+        NUM_BUCKETS=NUM_BUCKETS,
+        PER_BLOCK=CLAIM_PER_BLOCK,
+    )
+    tl.store(sorted_ptr + slots, pair_ids, mask=pair_mask)

@@ -57,7 +57,8 @@ class RouteRequirement(str, Enum):
 
 class RouteBuilderFamily(str, Enum):
     STANDARD = "standard"
-    JOINT_SHARED_OUTER = "joint_shared_outer"
+    # The two standard aligned builds forked on the workspace side stream.
+    PARALLEL_SHARED_OUTER = "parallel_shared_outer"
 
 
 class LoraAFamily(str, Enum):

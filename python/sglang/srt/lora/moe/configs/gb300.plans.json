@@ -49,7 +49,7 @@
     "finalize_family": "materialized",
     "gate_up_overlap": "gate_up_a_b",
     "down_overlap": "down_a_b",
-    "route_builder": "joint_shared_outer"
+    "route_builder": "parallel_shared_outer"
    }
   },
   {
@@ -63,7 +63,7 @@
     "down_b_family": "one_launch_sliced",
     "act_family": "b_activation",
     "finalize_family": "materialized",
-    "route_builder": "joint_shared_outer",
+    "route_builder": "parallel_shared_outer",
     "down_b_into_base": true
    }
   }

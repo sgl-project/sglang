@@ -129,14 +129,14 @@ class TestSm100Shared:
         assert c.plan.finalize.family is FinalizeFamily.MATERIALIZED
         assert c.plan.gate_up_b.family is LoraBFamily.ONE_LAUNCH_SLICED
         assert c.plan.down_b.family is LoraBFamily.ONE_LAUNCH_SLICED
-        assert c.plan.route_builder is RouteBuilderFamily.JOINT_SHARED_OUTER
+        assert c.plan.route_builder is RouteBuilderFamily.PARALLEL_SHARED_OUTER
 
     def test_prefill_ships_token_dedup_serial(self):
         c = _resolve(layout=True, rank=32)[Phase.PREFILL]
         assert c.base_gemm_rows == "route_major"
         assert c.plan.gate_up_a.family is LoraAFamily.TOKEN_DEDUP_GROUPED
         assert c.plan.act.family is ActFamily.B_ACTIVATION
-        assert c.plan.route_builder is RouteBuilderFamily.JOINT_SHARED_OUTER
+        assert c.plan.route_builder is RouteBuilderFamily.PARALLEL_SHARED_OUTER
         assert c.plan.gate_up_overlap is GateUpOverlap.NONE
         assert c.plan.down_overlap is DownOverlap.NONE
 

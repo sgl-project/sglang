@@ -27,7 +27,6 @@ _SPEC.loader.exec_module(_MODULE)
 
 ActivationFn = _MODULE.ActivationFn
 GateUpOverlap = _MODULE.GateUpOverlap
-StageContract = _MODULE.StageContract
 BridgeLayout = _MODULE.BridgeLayout
 Site = _MODULE.Site
 FinalizeFamily = _MODULE.FinalizeFamily
@@ -60,14 +59,6 @@ def _b(
     layout: BridgeLayout = BridgeLayout.PAIR_MAJOR,
 ) -> LoraBSpec:
     return LoraBSpec(site, family, is_shared_outer, layout)
-
-
-def _factor(
-    site: Site,
-    is_shared_outer: bool = False,
-    layout: BridgeLayout = BridgeLayout.PAIR_MAJOR,
-) -> StageContract:
-    return StageContract(site, is_shared_outer, layout)
 
 
 def _plan(**changes) -> MoeLoraExecutionPlan:
@@ -184,39 +175,19 @@ class TestFactorAndKernelSpecs(unittest.TestCase):
 
 
 class TestFusionOwnership(unittest.TestCase):
-    def test_act_rejects_missing_duplicate_and_wrong_site_consumers(self):
-        with self.assertRaisesRegex(ValueError, "requires.*gate/up B"):
-            ActSpec(ActFamily.B_ACTIVATION, ActivationFn.SILU)
-        with self.assertRaisesRegex(ValueError, "does not consume.*gate/up B"):
-            ActSpec(
-                ActFamily.MATERIALIZED,
-                ActivationFn.SILU,
-                consumed_gate_up_b=_factor(Site.GATE_UP),
-            )
-        with self.assertRaisesRegex(ValueError, "gate/up site"):
-            ActSpec(
-                ActFamily.B_ACTIVATION,
-                ActivationFn.SILU,
-                consumed_gate_up_b=_factor(Site.DOWN),
-            )
-        # The consumed contract's ownership is the adapter weight format,
-        # validated at weight load; the act stage only needs it to name the
-        # gate/up site.
-        self.assertIsNotNone(
-            ActSpec(
-                ActFamily.B_ACTIVATION,
-                ActivationFn.SILU,
-                consumed_gate_up_b=_factor(Site.GATE_UP, True),
-            ).consumed_gate_up_b
-        )
+    def test_ownership_lives_on_the_family_alone(self):
+        # A consuming family records nothing of the absorbed stage; the
+        # exactly-one-owner rules are plan-level (tested below).
+        self.assertIsNotNone(ActSpec(ActFamily.B_ACTIVATION, ActivationFn.SILU))
 
-    def test_finalize_rejects_missing_or_wrong_ownership_consumer(self):
-        with self.assertRaisesRegex(ValueError, "requires.*down B"):
-            FinalizeSpec(FinalizeFamily.SHARED_RANK_REDUCE)
-        with self.assertRaisesRegex(ValueError, "does not consume.*down B"):
-            FinalizeSpec(FinalizeFamily.MATERIALIZED, _factor(Site.DOWN))
+    def test_shared_rank_finalize_requires_shared_ownership(self):
         with self.assertRaisesRegex(ValueError, "shared-outer"):
-            FinalizeSpec(FinalizeFamily.SHARED_RANK_REDUCE, _factor(Site.DOWN))
+            FinalizeSpec(FinalizeFamily.SHARED_RANK_REDUCE)
+        self.assertTrue(
+            FinalizeSpec(
+                FinalizeFamily.SHARED_RANK_REDUCE, is_shared_outer=True
+            ).is_shared_outer
+        )
 
 
 class TestWholePipelineValidation(unittest.TestCase):
@@ -233,48 +204,36 @@ class TestWholePipelineValidation(unittest.TestCase):
             SERIAL_MATERIALIZED_REFERENCE.gate_up_b = None  # type: ignore[misc]
 
     def test_every_required_act_and_finalize_composition_constructs(self):
-        gate = _factor(Site.GATE_UP)
-        shared_down = _factor(Site.DOWN, is_shared_outer=True)
         plans = (
             _plan(
                 gate_up_b=None,
-                act=ActSpec(
-                    ActFamily.B_ACTIVATION,
-                    ActivationFn.SILU,
-                    consumed_gate_up_b=gate,
-                ),
+                act=ActSpec(ActFamily.B_ACTIVATION, ActivationFn.SILU),
             ),
             _plan(
                 gate_up_b=None,
-                act=ActSpec(
-                    ActFamily.B_ACTIVATION,
-                    ActivationFn.SILU,
-                    consumed_gate_up_b=gate,
-                ),
+                act=ActSpec(ActFamily.B_ACTIVATION, ActivationFn.SILU),
                 down_b=None,
-                finalize=FinalizeSpec(FinalizeFamily.SHARED_RANK_REDUCE, shared_down),
+                finalize=FinalizeSpec(
+                    FinalizeFamily.SHARED_RANK_REDUCE, is_shared_outer=True
+                ),
             ),
         )
         for plan in plans:
             self.assertIs(plan.validate(), plan)
 
     def test_exactly_one_stage_owner_is_required(self):
-        gate = _factor(Site.GATE_UP)
-        shared_down = _factor(Site.DOWN, is_shared_outer=True)
         with self.assertRaisesRegex(ValueError, "exactly one owner"):
-            _plan(
-                act=ActSpec(
-                    ActFamily.B_ACTIVATION,
-                    ActivationFn.SILU,
-                    consumed_gate_up_b=gate,
-                )
-            )
+            _plan(act=ActSpec(ActFamily.B_ACTIVATION, ActivationFn.SILU))
         with self.assertRaisesRegex(ValueError, "exactly one owner"):
             _plan(gate_up_b=None)
         with self.assertRaises(pydantic.ValidationError):
             _plan(down_a=None)  # required field: down A always runs standalone
         with self.assertRaisesRegex(ValueError, "exactly one owner"):
-            _plan(finalize=FinalizeSpec(FinalizeFamily.SHARED_RANK_REDUCE, shared_down))
+            _plan(
+                finalize=FinalizeSpec(
+                    FinalizeFamily.SHARED_RANK_REDUCE, is_shared_outer=True
+                )
+            )
 
     def test_bridge_layouts_must_match_at_both_sites(self):
         token_gate_up_a = _a(
@@ -296,22 +255,18 @@ class TestWholePipelineValidation(unittest.TestCase):
         self.assertIs(plan.validate(), plan)
 
     def test_overlaps_reject_consumed_stages(self):
-        gate = _factor(Site.GATE_UP)
-        shared_down = _factor(Site.DOWN, is_shared_outer=True)
         with self.assertRaisesRegex(ValueError, "gate/up-A\\+B"):
             _plan(
                 gate_up_b=None,
-                act=ActSpec(
-                    ActFamily.B_ACTIVATION,
-                    ActivationFn.SILU,
-                    consumed_gate_up_b=gate,
-                ),
+                act=ActSpec(ActFamily.B_ACTIVATION, ActivationFn.SILU),
                 gate_up_overlap=GateUpOverlap.GATE_UP_A_B,
             )
         with self.assertRaisesRegex(ValueError, "standalone down B"):
             _plan(
                 down_b=None,
-                finalize=FinalizeSpec(FinalizeFamily.SHARED_RANK_REDUCE, shared_down),
+                finalize=FinalizeSpec(
+                    FinalizeFamily.SHARED_RANK_REDUCE, is_shared_outer=True
+                ),
                 down_overlap=DownOverlap.DOWN_B,
             )
 
@@ -365,18 +320,18 @@ class TestRouteRequirementUnion(unittest.TestCase):
             ),
         )
 
-    def test_joint_builder_yields_both_aligned_pair_plans(self):
+    def test_parallel_builder_yields_both_aligned_pair_plans(self):
         shared_down_b = _b(
             Site.DOWN,
             LoraBFamily.ONE_LAUNCH_SLICED,
             True,
         )
-        joint = _plan(
+        parallel = _plan(
             down_b=shared_down_b,
-            route_builder=RouteBuilderFamily.JOINT_SHARED_OUTER,
+            route_builder=RouteBuilderFamily.PARALLEL_SHARED_OUTER,
         )
         self.assertEqual(
-            joint.route_requirements(),
+            parallel.route_requirements(),
             frozenset(
                 (
                     RouteRequirement.ALIGNED_PER_EXPERT,
@@ -386,10 +341,11 @@ class TestRouteRequirementUnion(unittest.TestCase):
         )
 
     def test_shared_finalize_adds_raw_without_hiding_aligned_routes(self):
-        shared_down = _factor(Site.DOWN, is_shared_outer=True)
         plan = _plan(
             down_b=None,
-            finalize=FinalizeSpec(FinalizeFamily.SHARED_RANK_REDUCE, shared_down),
+            finalize=FinalizeSpec(
+                FinalizeFamily.SHARED_RANK_REDUCE, is_shared_outer=True
+            ),
         )
         self.assertEqual(
             plan.route_requirements(),
