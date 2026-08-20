@@ -138,6 +138,7 @@ CPU_QUANTIZATION_METHODS = {
     "awq": AWQCPUConfig,
     "gptq": CPUGPTQConfig,
     "mxfp4": Mxfp4Config,
+    "auto-round": AutoRoundConfig,
 }
 
 QUANTIZATION_METHODS = {**BASE_QUANTIZATION_METHODS}

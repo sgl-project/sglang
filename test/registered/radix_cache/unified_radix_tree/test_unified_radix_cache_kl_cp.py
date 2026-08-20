@@ -24,7 +24,6 @@ class TestUnifiedQwen3HiCacheCP(UnifiedRadixTreeTestMixin, CustomTestCase):
     max_running_requests = 32
     kl_threshold = 0.005
     gsm8k_threshold = 0.7
-    mmlu_threshold = 0.7
 
     @classmethod
     def setUpClass(cls):
