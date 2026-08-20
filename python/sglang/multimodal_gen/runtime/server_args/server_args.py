@@ -299,7 +299,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # Optional LTX-2.5 decoder is large enough to load only when requested.
     load_diffusion_decoder: bool = False
 
-    # path to pre-quantized transformer weights (single .safetensors or directory).
+    # Pre-quantized transformer weights: safetensors file/directory or GGUF file.
     transformer_weights_path: str | None = None
     # path to precomputed MiniMax H3 AdaLN outputs for inference-only serving.
     minimax_h3_adaln_cache_path: str | None = None
@@ -340,6 +340,15 @@ class ServerArgs(DisaggServerArgsMixin):
     dit_layerwise_resident_layers: float = 0.0
     # Which layers those are: the leading ones, or spread evenly over the stack.
     dit_layerwise_residency_policy: str = RESIDENCY_POLICY_LEADING
+    # Per-component overrides of the three knobs above; an entry wins for that
+    # component.
+    layerwise_prefetch_size: dict[str, float] | str | None = field(default_factory=dict)
+    layerwise_resident_layers: dict[str, float] | str | None = field(
+        default_factory=dict
+    )
+    layerwise_residency_policy: dict[str, str] | str | None = field(
+        default_factory=dict
+    )
     offload_during_compile: bool = True
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
@@ -987,6 +996,71 @@ class ServerArgs(DisaggServerArgsMixin):
             ) from None
 
     @staticmethod
+    def _parse_component_value_map(
+        value: dict[str, Any] | str | None, *, option: str
+    ) -> dict[str, str]:
+        """Parse a ``component=value`` map, the same shape as component backends."""
+        if value is None or value == "":
+            return {}
+        if isinstance(value, dict):
+            return {str(k): str(v) for k, v in value.items()}
+        if not isinstance(value, str):
+            raise ValueError(
+                f"{option} must be a dict or a comma-separated component=value string"
+            )
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return {str(k): str(v) for k, v in parsed.items()}
+        except json.JSONDecodeError:
+            pass
+        result: dict[str, str] = {}
+        for pair in value.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" not in pair:
+                raise ValueError(f"{option} must use component=value entries")
+            component, entry = pair.split("=", 1)
+            result[component.strip()] = entry.strip()
+        return result
+
+    def layerwise_tuning_for(
+        self, component_name: str | None, *, dit_group: bool
+    ) -> tuple[float, float, str]:
+        """Prefetch size, resident layers and residency policy for one component."""
+        prefetch_map = self._parse_component_value_map(
+            self.layerwise_prefetch_size, option="--layerwise-prefetch-size"
+        )
+        resident_map = self._parse_component_value_map(
+            self.layerwise_resident_layers, option="--layerwise-resident-layers"
+        )
+        policy_map = self._parse_component_value_map(
+            self.layerwise_residency_policy, option="--layerwise-residency-policy"
+        )
+
+        def _pick(mapping: dict[str, str], group_default, aux_default):
+            if component_name is not None and component_name in mapping:
+                return mapping[component_name]
+            return group_default if dit_group else aux_default
+
+        prefetch = float(_pick(prefetch_map, self.dit_offload_prefetch_size, 0.0))
+        resident = float(_pick(resident_map, self.dit_layerwise_resident_layers, 0.0))
+        policy = str(
+            _pick(
+                policy_map,
+                self.dit_layerwise_residency_policy,
+                RESIDENCY_POLICY_LEADING,
+            )
+        )
+        if policy not in RESIDENCY_POLICIES:
+            raise ValueError(
+                f"unknown residency policy {policy!r} for component "
+                f"{component_name!r}, expected one of {RESIDENCY_POLICIES}"
+            )
+        return prefetch, resident, policy
+
+    @staticmethod
     def _parse_component_attention_backend_map(
         value: dict[str, str] | str | None,
     ) -> dict[str, str]:
@@ -1310,31 +1384,17 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def _adjust_platform_specific(self):
         if current_platform.is_mps():
+            if self.num_gpus != 1:
+                raise ValueError("MPS currently supports only --num-gpus 1")
             if self.component_residency is not None and any(
-                mode != RESIDENT for mode in self.component_residency.values()
+                mode not in (RESIDENT, LAYERWISE_OFFLOAD)
+                for mode in self.component_residency.values()
             ):
                 raise ValueError(
-                    "--component-residency offload modes require CUDA; "
-                    "MPS supports only resident components"
+                    "MPS supports only resident or layerwise-offload component "
+                    "residency"
                 )
             self.use_fsdp_inference = False
-            self.dit_layerwise_offload = False
-            self.layerwise_offload_components = None
-            if (
-                self.dit_cpu_offload
-                or self.text_encoder_cpu_offload
-                or self.image_encoder_cpu_offload
-                or self.vae_cpu_offload
-            ):
-                logger.warning(
-                    "Disabling component CPU offload on MPS because the component "
-                    "residency offload strategy is only validated on CUDA."
-                )
-            self.dit_cpu_offload = False
-            self.text_encoder_cpu_offload = False
-            self.image_encoder_cpu_offload = False
-            self.vae_cpu_offload = False
-            self.cpu_offload_components = None
 
     def is_arg_explicitly_set(self, arg_name: str) -> bool:
         return arg_name in self._explicit_arg_names
@@ -2166,6 +2226,37 @@ class ServerArgs(DisaggServerArgsMixin):
             "count. Unlike raising the prefetch size, resident layers are transferred "
             "once (not re-streamed every step), so this trades VRAM for lower denoise "
             "latency when memory is available.",
+        )
+        parser.add_argument(
+            "--layerwise-prefetch-size",
+            type=str,
+            default=None,
+            help="Per-component override of --dit-offload-prefetch-size, as "
+            "component=value entries, e.g. --layerwise-prefetch-size "
+            "text_encoder=2,vae=2. Same units as the DiT flag. Components with "
+            "no entry keep their group default. Prefetch overlaps a layer's "
+            "transfer with the previous layer's compute, which happens within a "
+            "single pass, so it is worth tuning on any streamed component.",
+        )
+        parser.add_argument(
+            "--layerwise-resident-layers",
+            type=str,
+            default=None,
+            help="Per-component override of --dit-layerwise-resident-layers, as "
+            "component=value entries, e.g. --layerwise-resident-layers "
+            "text_encoder=4. Resident layers are transferred once at startup "
+            "rather than streamed, so they cut the transfer of every pass "
+            "including the first -- an auxiliary component that runs once per "
+            "request still benefits, it just recovers the VRAM once per request "
+            "instead of once per denoising step.",
+        )
+        parser.add_argument(
+            "--layerwise-residency-policy",
+            type=str,
+            default=None,
+            help="Per-component override of --dit-layerwise-residency-policy, as "
+            "component=value entries, e.g. --layerwise-residency-policy "
+            "text_encoder=strided.",
         )
         parser.add_argument(
             "--dit-layerwise-residency-policy",

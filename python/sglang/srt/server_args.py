@@ -312,7 +312,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "marlin",
 ]
 
-BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "torch"]
+BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "gemv", "torch"]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
 RETRACTION_POLICY_CHOICES = ["length", "priority"]
@@ -358,6 +358,12 @@ DSA_CHOICES = [
     "trtllm",
 ]
 NSA_CHOICES = DSA_CHOICES  # deprecated alias
+
+DSV4_PREFILL_BACKEND_CHOICES = [
+    "auto",
+    "flashmla_sparse",
+    "flashmla_sparse_q8",
+]
 
 DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
 
@@ -803,6 +809,11 @@ class ServerArgs:
         "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         NS("schedule"),
     ] = None
+    prefill_decode_interval: A[
+        int,
+        "The number of decode rounds to run after a prefill batch before scheduling the next prefill. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.",
+        NS("schedule"),
+    ] = 0
     enable_dynamic_chunking: A[
         bool,
         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
@@ -1800,6 +1811,18 @@ class ServerArgs:
         ),
         NS("exec.kernel"),
     ] = None
+    dsv4_prefill_backend: A[
+        str,
+        Arg(
+            help=(
+                "DeepSeek-V4 sparse prefill backend. 'auto' and "
+                "'flashmla_sparse' use the existing BF16 sparse prefill path; "
+                "'flashmla_sparse_q8' enables the Q8KV8 sparse prefill path."
+            ),
+            choices=DSV4_PREFILL_BACKEND_CHOICES,
+        ),
+        NS("exec.kernel"),
+    ] = "auto"
     dsa_decode_backend: A[
         Optional[str],
         Arg(
@@ -2678,7 +2701,7 @@ class ServerArgs:
     ] = "cache"
     hicache_ratio: A[
         Optional[float],
-        "The ratio of the size of host KV cache memory pool to the size of device pool. Defaults to 2.0 in cache mode, 1.2 in buffer_only mode, or 1.0 for host-pool decode retraction.",
+        "The ratio of the size of host KV cache memory pool to the size of device pool. Defaults to 2.0 in cache mode, 1.2 in buffer_only mode, or 0.2 for backup-only host-pool decode retraction.",
         NS("memory"),
     ] = None
     hicache_size: A[
@@ -3628,6 +3651,7 @@ class ServerArgs:
         self._handle_return_hidden_states_mode()
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
+        self._validate_prefill_decode_interval()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -7502,11 +7526,11 @@ class ServerArgs:
                 "backup and the storage keys must become dcp_rank-aware "
                 "first. Run HiCache+DCP with L1/L2 only."
             )
-        if self.speculative_algorithm is not None:
+        if self.speculative_algorithm not in (None, "DSPARK"):
             raise NotImplementedError(
-                "HiCache with --dcp-size > 1 does not support speculative "
-                "decoding yet (the draft-model host pool has no DCP index "
-                "translation)."
+                "HiCache with --dcp-size > 1 only supports DSPARK speculative "
+                "decoding; other draft-model host pools have no DCP index "
+                "translation."
             )
         if self.enable_lmcache:
             raise NotImplementedError(
@@ -8588,6 +8612,10 @@ class ServerArgs:
                 f"--asr-max-concurrent-sessions must be positive "
                 f"(got {self.asr_max_concurrent_sessions})."
             )
+
+    def _validate_prefill_decode_interval(self):
+        if self.prefill_decode_interval < 0:
+            raise ValueError("--prefill-decode-interval must be non-negative.")
 
     def _handle_other_validations(self):
         if self.default_chat_template_kwargs is not None and not isinstance(

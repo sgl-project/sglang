@@ -544,7 +544,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             apply_attention_backend_override(layer, target)
         self.attn_backend = stage_backend
         self._attention_backend_active_override = target
-        logger.info(
+        logger.debug(
             "Attention backend for this batch: %s (%d layers switched)",
             target.name.lower() if target else "server default",
             len(layers),
@@ -1636,7 +1636,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # deallocate transformer if on mps
         pipeline = self.pipeline() if self.pipeline else None
-        if torch.backends.mps.is_available() and not is_warmup:
+        if (
+            torch.backends.mps.is_available()
+            and not is_warmup
+            and not is_layerwise_offloaded_module(self.transformer)
+        ):
             logger.info(
                 "Memory before deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
