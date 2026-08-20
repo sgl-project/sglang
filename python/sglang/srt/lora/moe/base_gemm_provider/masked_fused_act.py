@@ -285,11 +285,6 @@ def _b_act_kernel(
     store_pair_act: tl.constexpr,
     consume_base_pdl: tl.constexpr,
 ):
-    # Provenance: production-domain adaptation of
-    # benchmark/kernels/lora_moe/fused_middle_candidates.py::
-    # _fused_b_act_kernel + invoke_fused_b_act. The dot/config schedule is
-    # unchanged; src2dst, provider column order, and the second act store are
-    # the required masked-domain additions.
     pid = tl.program_id(0)
     # Keep the schedule arithmetic in Triton's constexpr/Python domain. Using
     # tl.cdiv here produces a tensor-like value on current Triton and makes
