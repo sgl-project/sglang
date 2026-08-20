@@ -26,12 +26,12 @@ register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-large")
 flashinfer_fused_moe = pytest.importorskip("flashinfer.fused_moe")
 from flashinfer import __version__ as flashinfer_version
 
-_fi_release = Version(flashinfer_version).release
-_fi_release = _fi_release + (0,) * (3 - len(_fi_release))
+# Full Version compare (mirrors the production gate): the release tuple would
+# drop prerelease markers and accept 0.6.18rc*/dev*.
 HAS_CORRECTED_HUMMING_API = hasattr(
     flashinfer_fused_moe,
     "preprocess_moe_weights_for_sm90_mixed_gemm_humming",
-) and _fi_release[:3] >= (0, 6, 18)
+) and Version(flashinfer_version) >= Version("0.6.18")
 preprocess_humming = getattr(
     flashinfer_fused_moe,
     "preprocess_moe_weights_for_sm90_mixed_gemm_humming",
@@ -491,7 +491,6 @@ def test_humming_padding_preserves_per_expert_residual():
 
     assert torch.equal(layer.w13_humming_residual_scale, expected_w13_residual * 64.0)
     assert torch.equal(layer.w2_humming_residual_scale, expected_w2_residual * 64.0)
-
 
 
 def _build_prerounded_case(E, hidden_real, hidden_rounded, inter, tail_fill, seed=0):
