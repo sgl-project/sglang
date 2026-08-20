@@ -2,7 +2,13 @@ name: Nightly Test (AMD ROCm 7.2)
 
 on:
   schedule:
-    - cron: '30 17 * * *'
+    # Two flavors share this workflow. The release nightly publishes both
+    # images at 12:00 UTC and takes ~2.5h, so 17:30 picks up the same day's
+    # rocm724 build; the 05:30 rocm720 run uses the previous day's. Running
+    # them 12h apart keeps rocm720 covered without doubling the concurrent
+    # GPU load, which matrixing all ~47 jobs would have done.
+    - cron: '30 17 * * *'   # rocm724
+    - cron: '30 5 * * *'    # rocm720
   push:
     branches:
       - main
@@ -10,6 +16,14 @@ on:
       - "python/sglang/version.py"
   workflow_dispatch:
     inputs:
+      rocm_version:
+        description: 'ROCm image version'
+        required: false
+        type: choice
+        default: rocm724
+        options:
+          - rocm724
+          - rocm720
       aiter_ref:
         description: 'Override AITER commit (optional, leave empty to use Dockerfile default)'
         required: false
@@ -102,6 +116,11 @@ on:
         default: ''
   workflow_call:
     inputs:
+      rocm_version:
+        description: 'ROCm image version'
+        required: false
+        type: string
+        default: rocm724
       ref:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
         required: false
@@ -125,6 +144,9 @@ on:
 
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
+  # `inputs` is empty on schedule and push, so the default has to live here
+  # rather than only on the inputs above. The 05:30 cron is the rocm720 leg.
+  ROCM_VERSION: ${{ inputs.rocm_version || (github.event.schedule == '30 5 * * *' && 'rocm720' || 'rocm724') }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
@@ -133,7 +155,9 @@ concurrency:
   # collisions with direct schedule/push triggers. We use inputs.ref (not github.event_name)
   # to detect this, because github.event_name inherits from the caller in workflow_call.
   # Manual dispatch runs also get unique groups so they never cancel each other.
-  group: nightly-test-amd-rocm720-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || inputs.ref && format('caller-{0}', github.run_id) || github.ref }}
+  # The scheduled legs also carry the flavor, so a rocm720 run and a rocm724
+  # run can never cancel each other if one overruns into the other's slot.
+  group: nightly-test-amd-rocm720-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || inputs.ref && format('caller-{0}', github.run_id) || format('{0}-{1}', github.ref, github.event.schedule == '30 5 * * *' && 'rocm720' || 'rocm724') }}
   cancel-in-progress: ${{ !inputs.ref && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
@@ -159,7 +183,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -189,7 +213,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -219,7 +243,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -254,7 +278,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -284,7 +308,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -318,7 +342,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -353,7 +377,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -384,7 +408,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -416,7 +440,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -448,7 +472,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -484,7 +508,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -532,7 +556,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -584,7 +608,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -629,7 +653,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -681,7 +705,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -726,7 +750,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -778,7 +802,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -824,7 +848,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -868,7 +892,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -912,7 +936,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -949,7 +973,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -985,7 +1009,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1021,7 +1045,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1057,7 +1081,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1097,7 +1121,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1144,7 +1168,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1190,7 +1214,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1237,7 +1261,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1284,7 +1308,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1322,7 +1346,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1373,7 +1397,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1424,7 +1448,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1475,7 +1499,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1520,7 +1544,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1557,7 +1581,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1616,7 +1640,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1650,7 +1674,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1689,7 +1713,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1737,7 +1761,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1784,7 +1808,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1822,7 +1846,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1867,7 +1891,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1916,7 +1940,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1967,7 +1991,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -2006,7 +2030,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -2044,7 +2068,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -2094,7 +2118,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
