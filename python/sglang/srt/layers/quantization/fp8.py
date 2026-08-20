@@ -55,6 +55,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
+    block_quant_dequant,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
@@ -62,6 +63,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     dispatch_w8a8_mxfp8_linear,
     get_fp8_gemm_runner_backend,
     input_to_float8,
+    inverse_transform_scale_ue8m0,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_block_scale_ue8m0_for_deepgemm,
@@ -93,6 +95,7 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
+    is_xpu,
     log_info_on_rank0,
     mxfp8_block_convert_required,
     print_warning_once,
@@ -154,6 +157,11 @@ if _use_aiter:
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
+
+_is_xpu = is_xpu()
+
+# Off by default, so the block-scaled path stays the default and the two can be compared.
+_xpu_fp8_to_bf16_gemm = get_bool_env_var("XPU_FP8_TO_BF16_GEMM")
 
 DSV4_DEQUANT_FP4_TABLE = torch.tensor(
     [
@@ -652,6 +660,23 @@ class Fp8LinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if getattr(layer, "xpu_dense_bf16", False):
+            return
+        if _is_xpu and _xpu_fp8_to_bf16_gemm and not self.use_mxfp8:
+            block_size = getattr(self.quant_config, "weight_block_size", None)
+            if block_size is not None and layer.weight.dtype == torch.float8_e4m3fn:
+                layer.weight = Parameter(
+                    _xpu_dequant_block_fp8(
+                        layer.weight.data,
+                        layer.weight_scale_inv.data,
+                        block_size,
+                        getattr(layer, "orig_dtype", torch.bfloat16),
+                    ),
+                    requires_grad=False,
+                )
+                del layer.weight_scale_inv
+                layer.xpu_dense_bf16 = True
+                return
         if self.convert_mxfp8_to_block:
             from sglang.srt.layers.quantization.mxfp8_block_convert import (
                 convert_mxfp8_weight_to_block_fp8,
@@ -1003,6 +1028,14 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
+        if getattr(layer, "xpu_dense_bf16", False):
+            if isinstance(x, tuple):
+                raise RuntimeError(
+                    "The dequantized bf16 dense path requires unquantized "
+                    "activations, but received a pre-quantized tuple."
+                )
+            return torch.nn.functional.linear(x, layer.weight, bias)
+
         if self.block_quant:
             if use_intel_amx_backend(layer):
                 return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
@@ -1043,6 +1076,20 @@ class Fp8LinearMethod(LinearMethodBase):
             cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=self.use_per_token_if_dynamic,
         )
+
+
+def _xpu_dequant_block_fp8(
+    weight: torch.Tensor, scale: torch.Tensor, block_size, out_dtype=torch.bfloat16
+) -> torch.Tensor:
+    """Materialise a block-fp8 weight so oneDNN can serve the GEMM.
+
+    Folding the per-[block_n, block_k] scale into the weight once at load turns
+    the runtime op into a plain mm, which oneDNN serves directly instead of
+    falling back to the Triton block-fp8 kernel.
+    """
+    if getattr(scale, "format_ue8m0", False):
+        scale = inverse_transform_scale_ue8m0(scale, mn=weight.shape[-2])
+    return block_quant_dequant(weight, scale, block_size, out_dtype)
 
 
 class Fp8MoEMethod(FusedMoEMethodBase):
