@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Utilities for selecting and loading models."""
 
+import bisect
 import contextlib
 import glob
 import json
@@ -333,8 +334,41 @@ def get_memory_usage_of_component(module) -> float | None:
     return round(usage, 2)
 
 
+def _read_process_mappings() -> tuple[list[int], list[int], list[bool]] | None:
+    """Sorted (start, end, is_file_backed) of this process's address space.
+
+    Linux only; returns None where /proc is unavailable, and the caller then
+    reports host bytes without splitting file-backed from anonymous.
+    """
+    try:
+        with open("/proc/self/maps") as handle:
+            rows = []
+            for line in handle:
+                fields = line.split(maxsplit=5)
+                low, _, high = fields[0].partition("-")
+                path = fields[5].strip() if len(fields) > 5 else ""
+                # pseudo-paths like [heap] and [stack] are anonymous
+                rows.append(
+                    (int(low, 16), int(high, 16), bool(path) and path[0] != "[")
+                )
+    except OSError:
+        return None
+    rows.sort()
+    return [r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows]
+
+
 def component_residency_bytes(module) -> Dict[str, int]:
     """Where a component's weights actually sit, in bytes.
+
+    Four buckets, ordered by what the kernel can do with them: device memory,
+    pinned host memory (which it cannot reclaim at all), file-backed host
+    memory (which it can drop without swapping), and anonymous host memory.
+
+    Two caveats. `host_mapped` counts the size of the file mapping, not the
+    pages currently resident in it -- a mapped safetensors file is faulted in
+    lazily, so the real footprint is at most this. And pinned is tested first
+    because CUDA's host allocator sits behind a named mapping, which the
+    file-backed check alone would misread.
 
     Layerwise-offloaded weights are absent from parameters()/buffers(): the
     module keeps (1,) placeholders while its offload managers own the host
@@ -344,8 +378,18 @@ def component_residency_bytes(module) -> Dict[str, int]:
     if not isinstance(module, nn.Module):
         return {}
 
-    totals = {"vram": 0, "host_pinned": 0, "host": 0}
+    totals = {"vram": 0, "host_pinned": 0, "host_mapped": 0, "host": 0}
     seen: set[int] = set()
+    mappings = _read_process_mappings()
+
+    def is_file_backed(pointer: int) -> bool:
+        if mappings is None:
+            return False
+        starts, ends, backed = mappings
+        index = bisect.bisect_right(starts, pointer) - 1
+        if index < 0 or pointer >= ends[index]:
+            return False
+        return backed[index]
 
     def add(tensor: torch.Tensor) -> None:
         try:
@@ -364,7 +408,13 @@ def component_residency_bytes(module) -> Dict[str, int]:
             pinned = tensor.is_pinned()
         except Exception:
             pinned = False
-        totals["host_pinned" if pinned else "host"] += storage.nbytes()
+        if pinned:
+            bucket = "host_pinned"
+        elif is_file_backed(pointer):
+            bucket = "host_mapped"
+        else:
+            bucket = "host"
+        totals[bucket] += storage.nbytes()
 
     for tensor in module.parameters():
         add(tensor)
@@ -387,7 +437,12 @@ def format_component_residency(module) -> str:
     the point; saying so beats reporting a zero delta that reads as free.
     """
     totals = component_residency_bytes(module)
-    labels = (("vram", "vram"), ("host_pinned", "host pinned"), ("host", "host"))
+    labels = (
+        ("vram", "vram"),
+        ("host_pinned", "host pinned"),
+        ("host_mapped", "host mapped"),
+        ("host", "host"),
+    )
     parts = [
         f"{label} {totals[key] / BYTES_PER_GB:.2f} GB"
         for key, label in labels

@@ -1,5 +1,7 @@
 """The loader reports where a component's weights are, not a zero delta."""
 
+import pathlib
+
 import pytest
 import torch
 import torch.nn as nn
@@ -52,8 +54,33 @@ class TestComponentResidencyBytes:
         assert component_residency_bytes(module) == {
             "vram": 0,
             "host_pinned": 0,
+            "host_mapped": 0,
             "host": 0,
         }
+
+    def test_a_file_backed_tensor_is_separated_from_anonymous(self, tmp_path):
+        if not pathlib.Path("/proc/self/maps").exists():
+            pytest.skip("needs /proc to tell a mapping from anonymous memory")
+        backing = tmp_path / "weights.bin"
+        backing.write_bytes(b"\0" * 4096)
+        mapped = torch.from_file(
+            str(backing), shared=True, size=1024, dtype=torch.float32
+        )
+        module = _Streamed([_FakeOffloadManager([mapped])])
+        totals = component_residency_bytes(module)
+        assert totals["host_mapped"] == 4096
+        assert totals["host"] == 0
+
+    def test_pinned_wins_over_the_file_backed_check(self):
+        if not torch.cuda.is_available():
+            pytest.skip("pinning needs CUDA")
+        # CUDA's host allocator sits behind a named mapping, so the
+        # file-backed check alone would call this one mapped
+        pinned = torch.empty(1024, dtype=torch.float32, pin_memory=True)
+        module = _Streamed([_FakeOffloadManager([pinned])])
+        totals = component_residency_bytes(module)
+        assert totals["host_pinned"] == 4096
+        assert totals["host_mapped"] == 0
 
     def test_resident_parameters_land_in_vram(self):
         if not torch.cuda.is_available():
