@@ -521,5 +521,41 @@ def test_grouped_dispatch_flag_matches_default(
     )
 
 
+@pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("scoring_func", ["sigmoid", "sqrtsoftplus"])
+def test_moe_fused_gate_accepts_non_fp32_bias(
+    bias_dtype: torch.dtype, scoring_func: str
+) -> None:
+    """A non-fp32 correction bias must route identically to its fp32 copy.
+
+    DeepSeek-V4 stores ``e_score_correction_bias`` in bf16 and topk.py now passes
+    it straight through (no host-side fp32 copy per MoE invocation). The kernel
+    upcasts the bias to fp32 on load, so a bf16/fp16 bias must be bit-identical to
+    casting it to fp32 first -- this guards both the relaxed dtype assertion and
+    the removed per-call cast. (top-6 exercises the DSV4 non-pow2 routing width.)
+    """
+    M, num_experts, topk = 256, 128, 6
+    torch.manual_seed(num_experts * 11 + topk)
+    gating = torch.randn(M, num_experts, dtype=torch.float32, device=DEVICE) * 2.0
+    bias_lowp = torch.randn(num_experts, dtype=bias_dtype, device=DEVICE) * 0.5
+    bias_fp32 = bias_lowp.to(torch.float32)
+
+    lowp_w, lowp_i = moe_fused_gate(
+        gating, bias_lowp, topk=topk, scoring_func=scoring_func, renormalize=True
+    )
+    fp32_w, fp32_i = moe_fused_gate(
+        gating, bias_fp32, topk=topk, scoring_func=scoring_func, renormalize=True
+    )
+    torch.cuda.synchronize()
+
+    # Widening bf16/fp16 -> fp32 is exact, so the two routings must match exactly.
+    torch.testing.assert_close(
+        _scatter_by_expert(lowp_w, lowp_i, num_experts),
+        _scatter_by_expert(fp32_w, fp32_i, num_experts),
+        rtol=0,
+        atol=0,
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
