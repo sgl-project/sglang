@@ -437,6 +437,13 @@ class DbrxForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         expert_params_mapping = [
             (
                 "ws" if weight_name in ["w1", "v1"] else "w2s",
@@ -463,6 +470,35 @@ class DbrxForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        expert_params_mapping = (
+            ("ws", "experts.mlp.w1"),
+            ("ws", "experts.mlp.v1"),
+            ("w2s", "experts.mlp.w2"),
+        )
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        loaded_params: set[str] = set()
+
+        for name, loaded_weight in weights:
+            for param_name, weight_name in expert_params_mapping:
+                if weight_name not in name:
+                    continue
+                target = name.replace(weight_name, param_name)
+                param = params_dict[target]
+                param.weight_loader(param, loaded_weight, weight_name)
+                loaded_params.add(target)
+                break
+            else:
+                target = maybe_remap_kv_scale_name(name, params_dict)
+                if target is None:
+                    continue
+                param = params_dict[target]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(target)
+
+        return loaded_params
 
 
 EntryClass = DbrxForCausalLM

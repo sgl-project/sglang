@@ -474,6 +474,13 @@ class ArceeForCausalLM(nn.Module):
         return self.model.embed_tokens
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
@@ -522,6 +529,55 @@ class ArceeForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
                 else:
                     logger.warning(f"Parameter {name} not found in model.")
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import StackedParamsDispatch
+
+        dispatch = StackedParamsDispatch(mappings=tuple(self.stacked_params_mapping))
+        params_dict = dict(self.named_parameters())
+        loaded: set[str] = set()
+        for name, loaded_weight in weights:
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self.model, "start_layer")
+                and not self.model.start_layer <= layer_id < self.model.end_layer
+            ):
+                continue
+            if (
+                "rotary_emb.inv_freq" in name
+                or "projector" in name
+                or "rotary_emb.cos_cached" in name
+                or "rotary_emb.sin_cached" in name
+            ):
+                continue
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
+            stacked = next(
+                (
+                    (name.replace(source_name, fused_name), shard_id)
+                    for fused_name, source_name, shard_id in dispatch.mappings
+                    if source_name in name
+                    and name.replace(source_name, fused_name) in params_dict
+                ),
+                None,
+            )
+            if stacked is not None:
+                target, shard_id = stacked
+                param = params_dict[target]
+                param.weight_loader(param, loaded_weight, shard_id)
+                loaded.add(target)
+                continue
+            param = params_dict.get(name)
+            if param is None:
+                logger.warning("Parameter %s not found in model.", name)
+                continue
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded.add(name)
+        return loaded
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)

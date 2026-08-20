@@ -100,7 +100,9 @@ class ExaoneMoEForCausalLMMTP(ExaoneMoEForCausalLM):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
-        super().load_weights(weights, is_mtp=True)
+        # Keep the wrapper paired with the parent loader so both legacy and
+        # SGLANG_ENABLE_WEIGHT_LOADER_V2 paths apply the MTP name remaps.
+        return super().load_weights(weights, is_mtp=True)
 
 
 EntryClass = ExaoneMoEForCausalLMMTP

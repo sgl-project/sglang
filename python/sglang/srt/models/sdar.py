@@ -80,6 +80,14 @@ class SDARMLP(nn.Module):
         hidden_states, _ = self.down_proj(hidden_states)
         return hidden_states
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            STANDARD_GATE_UP_MAPPING,
+            load_with_stacked_dispatch,
+        )
+
+        return load_with_stacked_dispatch(self, weights, STANDARD_GATE_UP_MAPPING)
+
 
 class SDARAttention(nn.Module):
     def __init__(
@@ -243,6 +251,14 @@ class SDARAttention(nn.Module):
         )
         out, _ = self.o_proj(context_layer)
         return out
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            STANDARD_QKV_MAPPING,
+            load_with_stacked_dispatch,
+        )
+
+        return load_with_stacked_dispatch(self, weights, STANDARD_QKV_MAPPING)
 
 
 class SDARBlock(nn.Module):
@@ -509,6 +525,13 @@ class SDARForCausalLM(nn.Module):
             return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -581,6 +604,57 @@ class SDARForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            AutoWeightsLoader,
+            WeightsMapper,
+            filter_pp_weights,
+        )
+
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+
+        def _prepare(
+            src: Iterable[Tuple[str, torch.Tensor]],
+        ) -> Iterable[Tuple[str, torch.Tensor]]:
+            for name, loaded_weight in src:
+                if "scale" in name:
+                    name = maybe_remap_kv_scale_name(name, params_dict)
+                    if name is None:
+                        continue
+                yield name, loaded_weight
+
+        weights = filter_pp_weights(
+            _prepare(weights), self.model.start_layer, self.model.end_layer
+        )
+        mapper = WeightsMapper(
+            orig_to_new_prefix={
+                "layers.": "model.layers.",
+                "embed_tokens.": "model.embed_tokens.",
+                "norm.": "model.norm.",
+            }
+        )
+        skip_prefixes = []
+        if self.config.tie_word_embeddings:
+            skip_prefixes.append("lm_head.")
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=skip_prefixes,
+            skip_substrs=["projector", "model.vision_tower"],
+            ignore_unexpected_suffixes=[".bias", ".kv_scale"],
+        )
+        loaded = loader.load_weights(weights, mapper=mapper)
+
+        if self.config.tie_word_embeddings and self.pp_group.is_last_rank:
+            embed = dict(self.model.named_parameters()).get("embed_tokens.weight")
+            lm_head = params_dict.get("lm_head.weight")
+            if embed is not None and lm_head is not None:
+                weight_loader = getattr(
+                    lm_head, "weight_loader", default_weight_loader
+                )
+                weight_loader(lm_head, embed.data)
+                loaded.add("lm_head.weight")
+        return loaded
 
 
 EntryClass = SDARForCausalLM

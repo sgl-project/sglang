@@ -322,6 +322,13 @@ class Starcoder2ForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -354,6 +361,28 @@ class Starcoder2ForCausalLM(nn.Module):
 
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import STANDARD_QKV_MAPPING
+
+        params_dict = dict(self.named_parameters())
+        loaded: set[str] = set()
+        for name, loaded_weight in weights:
+            if "rotary_emb.inv_freqs" in name:
+                continue
+            target = STANDARD_QKV_MAPPING.try_load(name, loaded_weight, params_dict)
+            if target is not None:
+                if target not in params_dict:
+                    raise ValueError(f"Mapped parameter {target!r} not found")
+                loaded.add(target)
+                continue
+            param = params_dict.get(name)
+            if param is None:
+                continue
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded.add(name)
+        return loaded
 
 
 EntryClass = Starcoder2ForCausalLM

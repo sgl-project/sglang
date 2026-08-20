@@ -472,7 +472,13 @@ class SolarForCausalLM(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
 
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
 
@@ -501,6 +507,43 @@ class SolarForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+    def _load_weights_v2(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import filter_pp_weights
+
+        weights = filter_pp_weights(
+            weights, self.model.start_layer, self.model.end_layer
+        )
+        params_dict = dict(self.named_parameters())
+        loaded: set[str] = set()
+        for name, loaded_weight in weights:
+            packed = False
+            for packed_name, sources in self.packed_modules_mapping.items():
+                for source_name, shard_id in sources:
+                    if source_name not in name:
+                        continue
+                    target = name.replace(source_name, packed_name)
+                    param = params_dict.get(target)
+                    if param is None:
+                        continue
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight, shard_id)
+                    loaded.add(target)
+                    packed = True
+                    break
+                if packed:
+                    break
+            if packed:
+                continue
+            param = params_dict.get(name)
+            if param is None:
+                continue
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded.add(name)
+        return loaded
 
 
 EntryClass = SolarForCausalLM

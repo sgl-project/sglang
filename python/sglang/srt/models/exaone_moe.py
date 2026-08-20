@@ -756,6 +756,15 @@ class ExaoneMoEForCausalLM(nn.Module):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights, is_mtp=is_mtp)
+        return self._legacy_load_weights(weights, is_mtp=is_mtp)
+
+    def _legacy_load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
+    ):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -847,6 +856,103 @@ class ExaoneMoEForCausalLM(nn.Module):
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
+
+    def _load_weights_v2(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
+    ) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            AutoWeightsLoader,
+            ExpertParamsDispatch,
+            STANDARD_GATE_UP_MAPPING,
+            STANDARD_QKV_MAPPING,
+            filter_pp_weights,
+        )
+
+        if not is_mtp and hasattr(self.model, "start_layer"):
+            weights = filter_pp_weights(
+                weights, self.model.start_layer, self.model.end_layer
+            )
+
+        params_dict = dict(self.named_parameters())
+        expert_dispatch = ExpertParamsDispatch.from_gate_up_down(
+            num_experts=self.config.num_experts
+        )
+        dispatched: set[str] = set()
+
+        def remaining_weights():
+            for name, loaded_weight in weights:
+                if is_mtp:
+                    if "mtp" not in name:
+                        continue
+                    if name in (
+                        "mtp.fc.weight",
+                        "mtp.pre_fc_norm_embedding.weight",
+                        "mtp.pre_fc_norm_hidden.weight",
+                    ):
+                        name = name.replace("mtp.", "")
+                    else:
+                        name = name.replace("mtp", "model")
+                elif "mtp" in name:
+                    continue
+
+                if (
+                    "rotary_emb.inv_freq" in name
+                    or "projector" in name
+                    or "rotary_emb.cos_cached" in name
+                    or "rotary_emb.sin_cached" in name
+                ):
+                    continue
+                if name.startswith("model.vision_tower") and name not in params_dict:
+                    continue
+                if name.endswith(".bias") and name not in params_dict:
+                    stacked_bias = any(
+                        source_name in name
+                        and name.replace(source_name, fused_name) in params_dict
+                        for dispatch in (
+                            STANDARD_QKV_MAPPING,
+                            STANDARD_GATE_UP_MAPPING,
+                        )
+                        for fused_name, source_name, _ in dispatch.mappings
+                        if "mlp.experts" not in name
+                    )
+                    expert_bias = any(
+                        weight_name in name
+                        and name.replace(weight_name, param_name) in params_dict
+                        for param_name, weight_name, _, _ in expert_dispatch.mappings
+                    )
+                    if not stacked_bias and not expert_bias:
+                        continue
+
+                target = STANDARD_QKV_MAPPING.try_load(
+                    name, loaded_weight, params_dict
+                )
+                if target is not None:
+                    if target in params_dict:
+                        dispatched.add(target)
+                    continue
+
+                if "mlp.experts" not in name:
+                    target = STANDARD_GATE_UP_MAPPING.try_load(
+                        name, loaded_weight, params_dict
+                    )
+                    if target is not None:
+                        if target in params_dict:
+                            dispatched.add(target)
+                        continue
+
+                target = expert_dispatch.try_load(name, loaded_weight, params_dict)
+                if target is not None:
+                    if target in params_dict:
+                        dispatched.add(target)
+                    continue
+
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name in params_dict:
+                    yield name, loaded_weight
+
+        loaded = AutoWeightsLoader(self).load_weights(remaining_weights())
+        return loaded | dispatched
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

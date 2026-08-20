@@ -548,6 +548,13 @@ class JetNemotronForCausalLM(nn.Module):
         return self.model.embed_tokens
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping: list[tuple[str, str, str | int]] = [
             # (param_name, shard_weight_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -593,6 +600,42 @@ class JetNemotronForCausalLM(nn.Module):
                 param = params_dict[param_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+    def _load_weights_v2(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        stacked_params_mapping: tuple[tuple[str, str, str | int], ...] = (
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+            ("qkvabz_proj", "q_proj", 0),
+            ("qkvabz_proj", "k_proj", 1),
+            ("qkvabz_proj", "v_proj", 2),
+            ("qkvabz_proj", "a_proj", 3),
+            ("qkvabz_proj", "b_proj", 4),
+            ("qkvabz_proj", "g_proj", 5),
+        )
+        params_dict = dict(self.named_parameters())
+        loaded: set[str] = set()
+        for name, loaded_weight in weights:
+            parts = name.split(".")
+            for fused_name, source_name, shard_id in stacked_params_mapping:
+                if source_name not in parts:
+                    continue
+                target = name.replace(source_name, fused_name)
+                param = params_dict.get(target)
+                if param is None:
+                    continue
+                weight_loader = getattr(param, "weight_loader")
+                weight_loader(param, loaded_weight, shard_id)
+                loaded.add(target)
+                break
+            else:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded.add(name)
+        return loaded
 
 
 EntryClass = JetNemotronForCausalLM

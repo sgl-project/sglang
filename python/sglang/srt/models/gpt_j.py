@@ -280,6 +280,13 @@ class GPTJForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -324,6 +331,50 @@ class GPTJForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import STANDARD_QKV_MAPPING
+
+        params_dict = dict(self.named_parameters())
+        loaded: set[str] = set()
+        for name, loaded_weight in weights:
+            if "attn.bias" in name or "attn.masked_bias" in name:
+                continue
+            if self.quant_config is not None and (
+                scale_name := self.quant_config.get_cache_scale(name)
+            ):
+                param = params_dict[scale_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                loaded_weight = (
+                    loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
+                )
+                weight_loader(param, loaded_weight)
+                loaded.add(scale_name)
+                continue
+            if name.endswith(".bias") and name not in params_dict:
+                mapped_bias = any(
+                    source_name in name
+                    and name.replace(source_name, fused_name) in params_dict
+                    for fused_name, source_name, _ in STANDARD_QKV_MAPPING.mappings
+                )
+                if not mapped_bias:
+                    continue
+            target = STANDARD_QKV_MAPPING.try_load(name, loaded_weight, params_dict)
+            if target is not None:
+                if target not in params_dict:
+                    if target.endswith(".bias"):
+                        continue
+                    raise ValueError(f"Mapped parameter {target!r} not found")
+                loaded.add(target)
+                continue
+            name = maybe_remap_kv_scale_name(name, params_dict)
+            if name is None:
+                continue
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded.add(name)
+        return loaded
 
 
 EntryClass = GPTJForCausalLM

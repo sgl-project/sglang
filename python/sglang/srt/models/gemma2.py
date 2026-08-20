@@ -92,6 +92,14 @@ class Gemma2MLP(nn.Module):
         x, _ = self.down_proj(x)
         return x
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            STANDARD_GATE_UP_MAPPING,
+            load_with_stacked_dispatch,
+        )
+
+        return load_with_stacked_dispatch(self, weights, STANDARD_GATE_UP_MAPPING)
+
 
 class Gemma2Attention(nn.Module):
     def __init__(
@@ -199,6 +207,14 @@ class Gemma2Attention(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            STANDARD_QKV_MAPPING,
+            load_with_stacked_dispatch,
+        )
+
+        return load_with_stacked_dispatch(self, weights, STANDARD_QKV_MAPPING)
 
 
 class Gemma2DecoderLayer(nn.Module):
@@ -458,6 +474,13 @@ class Gemma2ForCausalLM(nn.Module):
         return get_attention_sliding_window_size(self.config)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -497,6 +520,27 @@ class Gemma2ForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import AutoWeightsLoader
+
+        params_dict = dict(self.named_parameters())
+
+        def _prepare(
+            src: Iterable[Tuple[str, torch.Tensor]],
+        ) -> Iterable[Tuple[str, torch.Tensor]]:
+            for name, loaded_weight in src:
+                remapped = maybe_remap_kv_scale_name(name, params_dict)
+                if remapped is None:
+                    continue
+                yield remapped, loaded_weight
+
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=["lm_head."],
+            ignore_unexpected_suffixes=[".bias", ".kv_scale"],
+        )
+        return loader.load_weights(_prepare(weights))
 
 
 EntryClass = Gemma2ForCausalLM

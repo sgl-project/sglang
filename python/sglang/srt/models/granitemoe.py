@@ -51,6 +51,7 @@ class GraniteMoeMoE(nn.Module):
     ):
         super().__init__()
         self.hidden_size = hidden_size
+        self._ckpt_num_experts = num_experts
 
         # Gate always runs at half / full precision for now.
         self.gate = ReplicatedLinear(
@@ -88,9 +89,28 @@ class GraniteMoeMoE(nn.Module):
         final_hidden_states = self.experts(hidden_states, topk_output)
         return final_hidden_states.view(orig_shape)
 
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            ExpertParamsDispatch,
+            StackedParamsDispatch,
+            load_moe_sparse_block_weights,
+        )
+
+        expert = ExpertParamsDispatch.from_gate_up_down(
+            num_experts=self._ckpt_num_experts,
+            ckpt_gate_proj_name="w1",
+            ckpt_down_proj_name="w2",
+            ckpt_up_proj_name="w3",
+        )
+        return load_moe_sparse_block_weights(
+            self,
+            weights,
+            expert_dispatch=expert,
+            dense_stacked=StackedParamsDispatch(),
+        )
+
 
 class GraniteMoeAttention(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -175,9 +195,16 @@ class GraniteMoeAttention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            STANDARD_QKV_MAPPING,
+            load_with_stacked_dispatch,
+        )
+
+        return load_with_stacked_dispatch(self, weights, STANDARD_QKV_MAPPING)
+
 
 class GraniteMoeDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: GraniteConfig,
@@ -240,7 +267,6 @@ class GraniteMoeDecoderLayer(nn.Module):
 
 
 class GraniteMoeModel(nn.Module):
-
     def __init__(
         self,
         config: GraniteConfig,
@@ -296,7 +322,6 @@ class GraniteMoeModel(nn.Module):
 
 
 class GraniteMoeForCausalLM(nn.Module):
-
     def __init__(
         self,
         config: GraniteConfig,
@@ -381,7 +406,24 @@ class GraniteMoeForCausalLM(nn.Module):
                 new_weights[gate_name] = p
             else:
                 new_weights[n] = p
-        mixtral.MixtralForCausalLM.load_weights(self, new_weights.items())
+
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(new_weights.items())
+        return mixtral.MixtralForCausalLM._legacy_load_weights(
+            self, new_weights.items()
+        )
+
+    def _load_weights_v2(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import AutoWeightsLoader
+
+        loader = AutoWeightsLoader(
+            self,
+            skip_substrs=["rotary_emb.inv_freq"],
+            ignore_unexpected_suffixes=[".bias", ".kv_scale"],
+        )
+        return loader.load_weights(weights)
 
 
 EntryClass = [GraniteMoeForCausalLM]

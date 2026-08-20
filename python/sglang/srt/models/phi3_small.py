@@ -459,7 +459,13 @@ class Phi3SmallForCausalLM(nn.Module):
             return self.pooler(hidden_states, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
 
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -475,6 +481,19 @@ class Phi3SmallForCausalLM(nn.Module):
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import AutoWeightsLoader
+
+        skip_prefixes = (
+            ["lm_head."] if getattr(self.config, "tie_word_embeddings", True) else []
+        )
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=skip_prefixes,
+            ignore_unexpected_suffixes=[".bias"],
+        )
+        return loader.load_weights(weights)
 
 
 EntryClass = Phi3SmallForCausalLM

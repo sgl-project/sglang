@@ -595,6 +595,16 @@ class AfmoeForCausalLM(nn.Module):
         return get_attention_sliding_window_size(self.config)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            self._load_weights_v2(weights)
+            return
+        self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]]
+    ) -> None:
         stacked_params_mapping = [
             # (param_name, weight_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -643,6 +653,64 @@ class AfmoeForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+    def _load_weights_v2(
+        self, weights: Iterable[Tuple[str, torch.Tensor]]
+    ) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            AutoWeightsLoader,
+            STANDARD_GATE_UP_MAPPING,
+            STANDARD_QKV_MAPPING,
+        )
+
+        params_dict = dict(self.named_parameters())
+        dispatched: set[str] = set()
+
+        def remaining_weights():
+            for name, loaded_weight in weights:
+                if "rotary_emb.inv_freq" in name:
+                    continue
+                if ".mlp.router.gate." in name:
+                    name = name.replace(".mlp.router.gate.", ".mlp.gate.")
+                if name.endswith(".bias") and name not in params_dict:
+                    stacked_bias = any(
+                        source_name in name
+                        and name.replace(source_name, fused_name) in params_dict
+                        for dispatch in (
+                            STANDARD_QKV_MAPPING,
+                            STANDARD_GATE_UP_MAPPING,
+                        )
+                        for fused_name, source_name, _ in dispatch.mappings
+                        if not (
+                            ".self_attn." in name
+                            and source_name in {"gate_proj", "up_proj"}
+                        )
+                    )
+                    if not stacked_bias:
+                        continue
+
+                target = STANDARD_QKV_MAPPING.try_load(
+                    name, loaded_weight, params_dict
+                )
+                if target is not None:
+                    if target in params_dict:
+                        dispatched.add(target)
+                    continue
+
+                if ".self_attn." not in name:
+                    target = STANDARD_GATE_UP_MAPPING.try_load(
+                        name, loaded_weight, params_dict
+                    )
+                    if target is not None:
+                        if target in params_dict:
+                            dispatched.add(target)
+                        continue
+
+                if name in params_dict:
+                    yield name, loaded_weight
+
+        loaded = AutoWeightsLoader(self).load_weights(remaining_weights())
+        return loaded | dispatched
 
 
 EntryClass = AfmoeForCausalLM

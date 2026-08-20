@@ -565,6 +565,13 @@ class ApertusForCausalLM(nn.Module):
         return len(params_dict)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -633,6 +640,69 @@ class ApertusForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import StackedParamsDispatch
+
+        dispatch = StackedParamsDispatch(
+            mappings=(
+                (".qkv_proj", ".q_proj", "q"),
+                (".qkv_proj", ".k_proj", "k"),
+                (".qkv_proj", ".v_proj", "v"),
+            )
+        )
+        params_dict = dict(self.named_parameters())
+        params_dict.update(
+            (name, buffer)
+            for name, buffer in self.named_buffers()
+            if name.endswith((".beta", ".eps"))
+        )
+        loaded: set[str] = set()
+        for name, loaded_weight in weights:
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self.model, "start_layer")
+                and not self.model.start_layer <= layer_id < self.model.end_layer
+            ):
+                continue
+            if (
+                "rotary_emb.inv_freq" in name
+                or "projector" in name
+                or "rotary_emb.cos_cached" in name
+                or "rotary_emb.sin_cached" in name
+                or (name.startswith("model.vision_tower") and name not in params_dict)
+                or (self.config.tie_word_embeddings and "lm_head.weight" in name)
+            ):
+                continue
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
+            mapped_target = next(
+                (
+                    name.replace(source_name, fused_name)
+                    for fused_name, source_name, _ in dispatch.mappings
+                    if source_name in name
+                ),
+                None,
+            )
+            if mapped_target is not None and mapped_target not in params_dict:
+                continue
+            target = dispatch.try_load(name, loaded_weight, params_dict)
+            if target is not None:
+                loaded.add(target)
+                continue
+            if name.endswith((".bias", ".kv_scale")) and name not in params_dict:
+                continue
+            param = params_dict.get(name)
+            if param is None:
+                logger.warning("Parameter %s not found in params_dict", name)
+                continue
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded.add(name)
+        return loaded
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

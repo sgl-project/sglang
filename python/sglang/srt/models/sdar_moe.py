@@ -595,6 +595,13 @@ class SDARMoeForCausalLM(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -718,6 +725,117 @@ class SDARMoeForCausalLM(nn.Module):
                     if isinstance(self.model.layers[lid].mlp, SDARMoeSparseMoeBlock)
                 }
             )
+
+    def _load_weights_v2(
+        self, weights: Iterable[Tuple[str, torch.Tensor]]
+    ) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            AutoWeightsLoader,
+            ExpertParamsDispatch,
+            STANDARD_GATE_UP_MAPPING,
+            STANDARD_QKV_MAPPING,
+        )
+
+        params_dict = dict(self.named_parameters())
+        expert_dispatch = ExpertParamsDispatch.from_gate_up_down(
+            num_experts=self.config.num_experts
+        )
+        dispatched: set[str] = set()
+
+        def remaining_weights():
+            for name, loaded_weight in weights:
+                if not name.startswith("model.") and name.startswith(
+                    ("layers.", "embed_tokens.", "norm.")
+                ):
+                    name = add_prefix(name, "model")
+
+                if (
+                    name == "model.embed_tokens.weight"
+                    and self.pp_group.is_last_rank
+                    and getattr(self.config, "tie_word_embeddings", False)
+                    and "lm_head.weight" in params_dict
+                ):
+                    param = params_dict["lm_head.weight"]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                    dispatched.add("lm_head.weight")
+
+                layer_id = get_layer_id(name)
+                if layer_id is not None and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                ):
+                    continue
+                if (
+                    "rotary_emb.inv_freq" in name
+                    or "projector" in name
+                    or "rotary_emb.cos_cached" in name
+                    or "rotary_emb.sin_cached" in name
+                ):
+                    continue
+                if "scale" in name:
+                    name = maybe_remap_kv_scale_name(name, params_dict)
+                    if name is None:
+                        continue
+                if name.endswith(".bias") and name not in params_dict:
+                    stacked_bias = any(
+                        source_name in name
+                        and name.replace(source_name, fused_name) in params_dict
+                        for dispatch in (
+                            STANDARD_QKV_MAPPING,
+                            STANDARD_GATE_UP_MAPPING,
+                        )
+                        for fused_name, source_name, _ in dispatch.mappings
+                        if "mlp.experts" not in name
+                    )
+                    expert_bias = any(
+                        weight_name in name
+                        and name.replace(weight_name, param_name) in params_dict
+                        for param_name, weight_name, _, _ in expert_dispatch.mappings
+                    )
+                    if not stacked_bias and not expert_bias:
+                        continue
+
+                target = STANDARD_QKV_MAPPING.try_load(
+                    name, loaded_weight, params_dict
+                )
+                if target is not None:
+                    if target in params_dict:
+                        dispatched.add(target)
+                    continue
+
+                if "mlp.experts" not in name:
+                    target = STANDARD_GATE_UP_MAPPING.try_load(
+                        name, loaded_weight, params_dict
+                    )
+                    if target is not None:
+                        if target in params_dict:
+                            dispatched.add(target)
+                        continue
+
+                target = expert_dispatch.try_load(name, loaded_weight, params_dict)
+                if target is not None:
+                    if target in params_dict:
+                        dispatched.add(target)
+                    continue
+
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name in params_dict:
+                    yield name, loaded_weight
+
+        loaded = AutoWeightsLoader(self).load_weights(remaining_weights())
+        if not hasattr(self, "routed_experts_weights_of_layer"):
+            self.routed_experts_weights_of_layer = LazyValue(
+                lambda: {
+                    lid: self.model.layers[lid].mlp.get_moe_weights()
+                    for lid in range(self.start_layer, self.end_layer)
+                    if isinstance(self.model.layers[lid].mlp, SDARMoeSparseMoeBlock)
+                }
+            )
+        return loaded | dispatched
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

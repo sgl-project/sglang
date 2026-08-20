@@ -138,10 +138,23 @@ class Qwen2ForCausalLMEagle(Qwen2ForCausalLM):
         self.capture_aux_hidden_states = False
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        for name, loaded_weight in weights:
-            if "lm_head" not in name:
-                name = "model." + name
-                super().load_weights([(name, loaded_weight)])
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            for name, loaded_weight in weights:
+                if "lm_head" not in name:
+                    name = "model." + name
+                    Qwen2ForCausalLM._legacy_load_weights(
+                        self, [(name, loaded_weight)]
+                    )
+            return
+
+        def prepare_weights():
+            for name, loaded_weight in weights:
+                if "lm_head" not in name:
+                    yield "model." + name, loaded_weight
+
+        return Qwen2ForCausalLM._load_weights_v2(self, prepare_weights())
 
 
 EntryClass = [Qwen2ForCausalLMEagle]

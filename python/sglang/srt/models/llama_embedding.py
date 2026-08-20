@@ -33,13 +33,20 @@ class LlamaEmbeddingModel(nn.Module):
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
-        assert (
-            get_embedding
-        ), "LlamaEmbeddingModel / MistralModel is only used for embedding"
+        assert get_embedding, (
+            "LlamaEmbeddingModel / MistralModel is only used for embedding"
+        )
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.pooler(hidden_states, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -78,6 +85,27 @@ class LlamaEmbeddingModel(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import AutoWeightsLoader
+
+        def normalize_names():
+            for name, loaded_weight in weights:
+                if name.endswith(".activation_scale"):
+                    name = name.replace(".activation_scale", ".input_scale")
+                elif name.endswith(".weight_scale_inv"):
+                    name = name.replace(".weight_scale_inv", ".weight_scale")
+                if not name.startswith("model."):
+                    name = add_prefix(name, "model")
+                yield name, loaded_weight
+
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=["lm_head."],
+            skip_substrs=["rotary_emb.inv_freq", "projector", "model.vision_tower"],
+            ignore_unexpected_suffixes=[".bias", ".kv_scale"],
+        )
+        return loader.load_weights(normalize_names())
 
 
 class MistralModel(LlamaEmbeddingModel):
