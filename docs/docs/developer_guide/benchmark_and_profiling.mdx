@@ -380,7 +380,7 @@ python -m sglang.bench_offline_throughput --model-path meta-llama/Llama-3.1-8B-I
 
 ### Missing GPU kernels on ROCm 7.2.0 images
 
-On ROCm 7.2.0, the roctracer backend behind PyTorch Profiler can drop kernel-dispatch events for work submitted through `hipGraphLaunch`. Traces taken on the `rocm720` images (`lmsysorg/sglang:*-rocm720-*` and `lmsysorg/sglang-rocm:*-rocm720-*`) then show prefill kernels and the host-side graph launch of every decode step, but no GPU kernels under the decode launches. The same combination can also deadlock the HIP runtime inside the replay. ROCm resolved the roctracer reporting failure in 7.2.2 ([ROCm/ROCm#6102](https://github.com/ROCm/ROCm/issues/6102)).
+On ROCm 7.2.0, the roctracer backend behind PyTorch Profiler drops kernel-dispatch events for work submitted through `hipGraphLaunch`. Traces then under-report the decode steps, which run from replayed graphs: prefill kernels and the host-side graph launches are there, but kernels are missing underneath. The loss is partial rather than total, so a trace can look plausible and still be wrong. The same combination can also deadlock the HIP runtime inside the replay. ROCm resolved the reporting failure in 7.2.2 ([ROCm/ROCm#6102](https://github.com/ROCm/ROCm/issues/6102)).
 
 To check whether an image traces graph-launched kernels, run this inside it on a GPU host:
 
@@ -388,9 +388,16 @@ To check whether an image traces graph-launched kernels, run this inside it on a
 python3 scripts/ci/amd/check_hip_graph_profiling.py
 ```
 
-The `rocm724` images (`lmsysorg/sglang-rocm:*-rocm724-*` daily, `lmsysorg/sglang:*-rocm724-*` per release) run ROCm 7.2.4 and carry the fix, so switching images is the way to keep CUDA graphs and get complete traces.
+The `rocm724` images (`lmsysorg/sglang-rocm:*-rocm724-*` daily, `lmsysorg/sglang:*-rocm724-*` per release) install ROCm 7.2.4, which carries the fix — but installing it is not the same as using it. The torch wheel vendors its own HIP and roctracer under `torch/lib` and `libtorch_hip.so` has `RPATH $ORIGIN`, so the profiler runs through those 7.2.0 copies unless you preload the image's, and `LD_LIBRARY_PATH` does not override an `RPATH`. Set this before starting the process — after `import torch` is too late:
 
-If you have to stay on a `rocm720` image, profile with CUDA graphs disabled so that every kernel is launched eagerly and reaches the trace. Decode numbers collected this way exclude the graph-replay path, so use them to attribute kernel time rather than to measure decode latency.
+```bash Command
+export LD_PRELOAD=/opt/rocm/lib/libamdhip64.so.7.2.70204:/opt/rocm/lib/libroctracer64.so.4.1.70204
+python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
+```
+
+The probe above prints which libraries torch actually mapped, so use it to confirm the preload took effect rather than assuming it did.
+
+On a `rocm720` image, or wherever preloading is not an option, profile with CUDA graphs disabled so that every kernel is launched eagerly and reaches the trace. Decode numbers collected this way exclude the graph-replay path, so use them to attribute kernel time rather than to measure decode latency.
 
 ```bash Command
 python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --disable-cuda-graph

@@ -3,26 +3,33 @@
 
 ROCm 7.2.0 (roctracer 4.1.70200) loses kernel-dispatch events for work submitted
 through hipGraphLaunch: a trace captured while SGLang decodes -- which replays HIP
-graphs -- shows the host-side launch but no GPU kernels under it. ROCm resolved the
-roctracer reporting failure in 7.2.2 (https://github.com/ROCm/ROCm/issues/6102); the
-rocm724 flavors carry that fix, and this probe is what confirms an image has it.
+graphs -- comes back missing kernels. ROCm resolved the roctracer reporting failure
+in 7.2.2 (https://github.com/ROCm/ROCm/issues/6102).
 
-On 7.2.0 the same combination can also wedge the HIP runtime inside
-hipGraphLaunch instead of losing events, so each phase runs in a child process
-under a timeout rather than inline.
+Having the fix in the image is not the same as running it. The torch wheels vendor
+their own HIP and roctracer in torch/lib, and libtorch_hip.so carries RPATH $ORIGIN,
+so a ROCm 7.2.4 image can still profile through 7.2.0 libraries; LD_LIBRARY_PATH
+does not override that. This probe reports which libraries torch actually mapped and
+prints the LD_PRELOAD that forces the ROCm install's copies.
 
 Run inside the image under evaluation, on a machine with at least one GPU:
 
     python3 scripts/ci/amd/check_hip_graph_profiling.py
 
-The eager phase is a control: it separates "this runtime cannot trace graph replay"
-from "this runtime cannot trace anything". Exit status is 0 when graph-replay
-kernels reach the trace, 1 otherwise.
+The loss is partial, not total: on ROCm 7.2.0 a 4-node graph is traced correctly
+while a 64-node graph drops events, so the check counts every dispatch it asked
+for rather than looking for a non-empty trace. The eager phase is a control,
+separating "this runtime cannot trace graph replay" from "this runtime cannot
+trace anything", and each phase runs in a child process under a timeout because
+7.2.0 can also wedge inside hipGraphLaunch instead of losing events.
+
+Exit status is 0 when every graph-replay kernel reaches the trace, 1 otherwise.
 """
 
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import re
@@ -34,18 +41,56 @@ import tempfile
 RESULT_MARKER = "PROBE_RESULT "
 DEVICE_CATEGORIES = ("kernel", "gpu_memcpy", "gpu_memset")
 TRACING_LIB_PATTERN = re.compile(
-    r"lib(amdhip64|roctracer64|rocprofiler-sdk|rocprofiler-register|hsa-runtime64)[^/\s]*\.so[^/\s]*"
+    r"\S*lib(?:amdhip64|roctracer64|rocprofiler-sdk|rocprofiler-register|hsa-runtime64)[^/\s]*\.so[^/\s]*"
 )
+# The libraries whose version decides whether graph replay is traced.
+RUNTIME_LIBS = ("libamdhip64", "libroctracer64")
 
 
 def loaded_tracing_libs() -> list[str]:
-    """Sonames of the HIP/tracing libraries mapped into this process."""
+    """Paths of the HIP/tracing libraries mapped into this process.
+
+    Paths, not sonames: a ROCm 7.2.4 image can still be running the 7.2.0 copies
+    that the torch wheel vendors in torch/lib, and only the path shows that.
+    """
     try:
         with open("/proc/self/maps") as f:
             maps = f.read()
     except OSError:
         return []
     return sorted({m.group(0) for m in TRACING_LIB_PATTERN.finditer(maps)})
+
+
+def vendored_runtime_libs(libs: list[str]) -> list[str]:
+    """Mapped HIP/tracing libraries that did not come from the ROCm install.
+
+    `libtorch_hip.so` carries `RPATH $ORIGIN` and needs `libamdhip64.so` /
+    `libroctracer64.so`, so the loader takes the wheel's copies and
+    LD_LIBRARY_PATH does not override them. The image's ROCm version then says
+    nothing about what torch.profiler is actually using.
+    """
+    return [
+        lib
+        for lib in libs
+        if any(name in lib for name in RUNTIME_LIBS) and not lib.startswith("/opt/rocm")
+    ]
+
+
+def rocm_runtime_preload(lib_dir: str = "/opt/rocm/lib") -> str | None:
+    """LD_PRELOAD value that forces the ROCm install's HIP and roctracer."""
+    resolved = []
+    for name in RUNTIME_LIBS:
+        # The unversioned names are symlinks; preload needs the real files, and
+        # naming them keeps the value correct across ROCm patch releases.
+        versioned = [
+            path
+            for path in sorted(glob.glob(os.path.join(lib_dir, f"{name}.so.*")))
+            if not os.path.islink(path)
+        ]
+        if not versioned:
+            return None
+        resolved.append(versioned[-1])
+    return ":".join(resolved)
 
 
 def rocm_version() -> str | None:
@@ -94,7 +139,7 @@ def count_device_events(events: list[dict]) -> dict[str, int]:
     return counts
 
 
-def phase_profile(use_graph: bool, replays: int, size: int) -> dict:
+def phase_profile(use_graph: bool, replays: int, size: int, nodes: int) -> dict:
     import torch
 
     if not torch.cuda.is_available():
@@ -118,13 +163,13 @@ def phase_profile(use_graph: bool, replays: int, size: int) -> dict:
     if use_graph:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            for _ in range(4):
+            for _ in range(nodes):
                 torch.matmul(a, b, out=out)
         launch = graph.replay
     else:
 
         def launch() -> None:
-            for _ in range(4):
+            for _ in range(nodes):
                 torch.matmul(a, b, out=out)
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -150,6 +195,11 @@ def phase_profile(use_graph: bool, replays: int, size: int) -> dict:
     )
     return {
         "kernels": counts.get("kernel", 0),
+        # One matmul is one dispatch, so a healthy runtime reports every one of
+        # them. Loss under graph replay is partial -- 448 of 512 in the ROCm
+        # 7.2.0 measurement on #35390 -- so a threshold of "more than zero"
+        # would call a broken runtime healthy.
+        "expected_kernels": nodes * replays,
         "event_counts": counts,
         "trace_events": len(events),
         "self_device_time_us": device_time_us,
@@ -201,7 +251,7 @@ def report(label: str, result: dict) -> None:
         print(f"{prefix}ERROR {result.get('error', '')}".rstrip())
     else:
         print(
-            f"{prefix}{result['kernels']} kernel events, "
+            f"{prefix}{result['kernels']}/{result['expected_kernels']} kernel events, "
             f"{result['self_device_time_us']:.0f} us device time, "
             f"{result['trace_events']} trace events"
         )
@@ -210,6 +260,11 @@ def report(label: str, result: dict) -> None:
         print("--- phase output ---")
         print(result["output"].rstrip())
         print("--- end phase output ---")
+
+
+def traced_everything(result: dict) -> bool:
+    kernels, expected = result.get("kernels"), result.get("expected_kernels")
+    return kernels is not None and expected is not None and kernels >= expected
 
 
 def main() -> int:
@@ -223,19 +278,42 @@ def main() -> int:
     parser.add_argument("--replays", type=int, default=8)
     parser.add_argument("--matmul-size", type=int, default=1024)
     parser.add_argument(
+        "--graph-nodes",
+        type=int,
+        default=64,
+        help="dispatches per graph; ROCm 7.2.0 traces a 4-node graph correctly and "
+        "only starts dropping events on larger ones, so keep this well above that",
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=300.0,
         help="seconds allowed per phase; a wedged graph launch is reported as a timeout",
     )
+    parser.add_argument(
+        "--print-ld-preload",
+        action="store_true",
+        help="print the LD_PRELOAD that forces the ROCm install's HIP and roctracer, "
+        "for callers that have to set it before starting the process, and exit",
+    )
     args = parser.parse_args()
+
+    if args.print_ld_preload:
+        preload = rocm_runtime_preload()
+        if not preload:
+            print("no versioned HIP/roctracer under /opt/rocm/lib", file=sys.stderr)
+            return 1
+        print(preload)
+        return 0
 
     if args.phase == "env":
         info = phase_env()
         print(RESULT_MARKER + json.dumps(info))
         return 1 if "error" in info else 0
     if args.phase in ("eager", "graph"):
-        result = phase_profile(args.phase == "graph", args.replays, args.matmul_size)
+        result = phase_profile(
+            args.phase == "graph", args.replays, args.matmul_size, args.graph_nodes
+        )
         print(RESULT_MARKER + json.dumps(result))
         return 1 if "error" in result else 0
 
@@ -261,14 +339,26 @@ def main() -> int:
     report("eager launch:", eager)
     graph = run_child("graph", args)
     report("graph replay:", graph)
-    if graph.get("libs"):
-        print("tracing libs while profiling: " + ", ".join(graph["libs"]))
 
-    if not eager.get("kernels"):
+    vendored = vendored_runtime_libs(graph.get("libs") or env.get("libs") or [])
+    if graph.get("libs") and graph["libs"] != env.get("libs"):
+        print("tracing libs while profiling: " + ", ".join(graph["libs"]))
+    if vendored:
+        preload = rocm_runtime_preload()
         print(
-            "\nVERDICT: FAIL -- the profiler records no kernels even for eager launches, "
-            "so this runtime cannot trace GPU work at all and the graph phase says nothing "
-            "about graph support."
+            "note: torch is using its own HIP/roctracer, not the ROCm install's: "
+            + ", ".join(vendored)
+        )
+        if preload:
+            print(f'      export LD_PRELOAD="{preload}${{LD_PRELOAD:+:$LD_PRELOAD}}"')
+            print("      must be set before the process starts; LD_LIBRARY_PATH cannot")
+            print("      override the RPATH the wheel's libtorch_hip.so carries")
+
+    if not traced_everything(eager):
+        print(
+            "\nVERDICT: FAIL -- the profiler did not record every eager launch, so this "
+            "runtime cannot trace GPU work reliably at all and the graph phase says "
+            "nothing about graph support."
         )
         return 1
     if graph.get("status") == "timeout":
@@ -284,16 +374,28 @@ def main() -> int:
             "phase output above."
         )
         return 1
-    if graph["kernels"] == 0:
+    if not traced_everything(graph):
+        missing = graph["expected_kernels"] - graph["kernels"]
         print(
-            "\nVERDICT: FAIL -- eager kernels are traced but graph-replay kernels are "
-            "missing, which is the roctracer reporting failure fixed in ROCm 7.2.2 "
-            "(https://github.com/ROCm/ROCm/issues/6102). Profile with --disable-cuda-graph "
-            "on this image, or move to a ROCm 7.2.2 or newer runtime."
+            f"\nVERDICT: FAIL -- eager launches are traced in full but {missing} of "
+            f"{graph['expected_kernels']} graph-replay kernels never reached the trace. "
+            "That is the roctracer reporting failure fixed in ROCm 7.2.2 "
+            "(https://github.com/ROCm/ROCm/issues/6102)."
         )
+        if vendored:
+            print(
+                "The ROCm install is not what torch loaded, so preload its HIP and "
+                "roctracer as printed above and re-run before concluding the image is "
+                "unfixable."
+            )
+        else:
+            print(
+                "Profile with --disable-cuda-graph on this image, or move to a ROCm 7.2.2 "
+                "or newer runtime."
+            )
         return 1
 
-    print("\nVERDICT: PASS -- graph-replay kernels reach the trace.")
+    print("\nVERDICT: PASS -- every graph-replay kernel reached the trace.")
     return 0
 
 
