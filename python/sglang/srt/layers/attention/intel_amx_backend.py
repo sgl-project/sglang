@@ -215,7 +215,11 @@ class IntelAMXAttnBackend(AttentionBackend):
         seq_lens, extend_seq_lens, extend_start_loc, tree_mask = self.extend_metadata
 
         _, max_extend_len = self.forward_metadata
-        seq_lens = forward_batch.seq_lens
+        # NOTE: keep the metadata `seq_lens`. In TARGET_VERIFY mode it is
+        # `forward_batch.seq_lens + draft_token_num`, because the verify batch
+        # writes its draft KV into [seq_lens, seq_lens + draft_token_num)
+        # without bumping seq_lens; the kernel needs the extended length to see
+        # those entries. Outside verify it is `forward_batch.seq_lens`.
         if seq_lens.dtype != torch.int64:
             seq_lens = seq_lens.to(torch.int64)
 
@@ -262,7 +266,11 @@ class IntelAMXAttnBackend(AttentionBackend):
             seq_lens = forward_batch.seq_lens
 
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
-        seq_lens = forward_batch.seq_lens
+        # NOTE: keep the unpacked `seq_lens`. Draft decode hands each step an
+        # expanded triple sized `batch_size * topk`; taking
+        # `forward_batch.seq_lens` here would keep the expanded req_to_token and
+        # req_pool_indices but pair them with the unexpanded lengths, and the
+        # kernel derives num_seqs from seq_lens.
         if seq_lens.dtype != torch.int64:
             seq_lens = seq_lens.to(torch.int64)
 
