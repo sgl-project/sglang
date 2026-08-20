@@ -1955,12 +1955,20 @@ class DeepseekV2AttentionMLA(
         self._q_b_proj_verified_shape = self.has_q_b_proj and (
             tuple(self.q_b_proj.weight.shape) in q_b_proj_verified_shapes
         )
+
         self._use_min_latency_q_b_gemm: bool | None = None
 
         self.init_mha_forward()
         self.init_mla_forward()
         self.init_mla_fused_rope_rocm_forward()
         self.init_mla_fused_rope_cpu_forward()
+
+    def named_startup_weight_load_derived_tensors(self):
+        """Expose post-load MLA operands whose storage CUDA graphs capture."""
+        for name in ("w_kc", "w_vc", "w_scale", "w_scale_k", "w_scale_v"):
+            tensor = getattr(self, name)
+            if isinstance(tensor, torch.Tensor):
+                yield name, tensor
 
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):

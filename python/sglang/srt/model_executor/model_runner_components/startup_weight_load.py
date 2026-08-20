@@ -47,6 +47,7 @@ _QWEN3_5_MOE_HYBRID_VLM_ARCHITECTURES = frozenset(
     {"Qwen3_5MoeForConditionalGeneration"}
 )
 _QWEN3_MOE_ARCHITECTURES = frozenset({"Qwen3MoeForCausalLM"})
+_GLM_MOE_DSA_ARCHITECTURES = frozenset({"GlmMoeDsaForCausalLM"})
 _SUPPORTED_DTYPES = frozenset({torch.float16, torch.bfloat16})
 
 
@@ -75,6 +76,10 @@ def _get_canonical_model_class(architecture: str):
         from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
 
         return Qwen3MoeForCausalLM
+    if architecture == "GlmMoeDsaForCausalLM":
+        from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLM
+
+        return GlmMoeDsaForCausalLM
     raise ValueError(f"Unsupported startup-overlap architecture: {architecture}")
 
 
@@ -92,12 +97,14 @@ class StartupWeightLoadProfile(str, enum.Enum):
     QWEN3_5_HYBRID_VLM = "qwen3_5_hybrid_vlm"
     QWEN3_5_MOE_HYBRID_VLM = "qwen3_5_moe_hybrid_vlm"
     QWEN3_MOE_EP = "qwen3_moe_ep"
+    GLM_5_2_DSA_FP8 = "glm_5_2_dsa_fp8"
 
 
 @dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
 class StartupWeightLoadOptions:
     device: str
     is_cuda_platform: bool
+    cuda_device_capability: Optional[Tuple[int, int]]
     cuda_graph_enabled: bool
     prefill_cuda_graph_backend: Backend
     is_draft_worker: bool
@@ -111,6 +118,13 @@ class StartupWeightLoadOptions:
     moe_dp_size: int
     moe_a2a_backend: str
     moe_runner_backend: str
+    fp8_gemm_runner_backend: str
+    prefill_attention_backend: Optional[str]
+    decode_attention_backend: Optional[str]
+    dsa_prefill_backend: Optional[str]
+    dsa_decode_backend: Optional[str]
+    kv_cache_dtype: str
+    disable_shared_experts_fusion: bool
     enable_dp_attention: bool
     enable_two_batch_overlap: bool
     enable_eplb: bool
@@ -143,13 +157,23 @@ class StartupWeightLoadOptions:
         is_draft_worker: bool,
     ) -> StartupWeightLoadOptions:
         cuda_graph_config = server_args.cuda_graph_config
+        is_cuda_platform = current_platform.is_cuda()
+        device_capability = (
+            current_platform.get_device_capability() if is_cuda_platform else None
+        )
+        prefill_attention_backend, decode_attention_backend = (
+            server_args.get_attention_backends()
+        )
         cuda_graph_enabled = any(
             getattr(cuda_graph_config, phase).backend != Backend.DISABLED
             for phase in Phase.ALL
         )
         return cls(
             device=server_args.device,
-            is_cuda_platform=current_platform.is_cuda(),
+            is_cuda_platform=is_cuda_platform,
+            cuda_device_capability=(
+                tuple(device_capability) if device_capability is not None else None
+            ),
             cuda_graph_enabled=cuda_graph_enabled,
             prefill_cuda_graph_backend=cuda_graph_config.prefill.backend,
             is_draft_worker=is_draft_worker,
@@ -163,6 +187,13 @@ class StartupWeightLoadOptions:
             moe_dp_size=server_args.moe_dp_size,
             moe_a2a_backend=server_args.moe_a2a_backend,
             moe_runner_backend=server_args.moe_runner_backend,
+            fp8_gemm_runner_backend=server_args.fp8_gemm_runner_backend,
+            prefill_attention_backend=prefill_attention_backend,
+            decode_attention_backend=decode_attention_backend,
+            dsa_prefill_backend=server_args.dsa_prefill_backend,
+            dsa_decode_backend=server_args.dsa_decode_backend,
+            kv_cache_dtype=server_args.kv_cache_dtype,
+            disable_shared_experts_fusion=(server_args.disable_shared_experts_fusion),
             enable_dp_attention=server_args.enable_dp_attention,
             enable_two_batch_overlap=server_args.enable_two_batch_overlap,
             enable_eplb=server_args.enable_eplb,
@@ -226,6 +257,8 @@ def _get_startup_weight_load_profile(
         return StartupWeightLoadProfile.QWEN3_5_MOE_HYBRID_VLM
     if architecture in _QWEN3_MOE_ARCHITECTURES:
         return StartupWeightLoadProfile.QWEN3_MOE_EP
+    if architecture in _GLM_MOE_DSA_ARCHITECTURES:
+        return StartupWeightLoadProfile.GLM_5_2_DSA_FP8
     return None
 
 
@@ -457,6 +490,169 @@ def _get_profile_rejections(
                 "multimodal models are not supported",
             ),
         )
+    elif profile == StartupWeightLoadProfile.GLM_5_2_DSA_FP8:
+        quantization_config = getattr(
+            model_config.hf_config, "quantization_config", None
+        )
+        weight_block_size = (
+            tuple(quantization_config.get("weight_block_size") or ())
+            if isinstance(quantization_config, dict)
+            else ()
+        )
+        checkpoint_quant_method = (
+            quantization_config.get("quant_method")
+            if isinstance(quantization_config, dict)
+            else None
+        )
+        checkpoint_activation_scheme = (
+            quantization_config.get("activation_scheme")
+            if isinstance(quantization_config, dict)
+            else None
+        )
+        checkpoint_fp8_format = (
+            quantization_config.get("fmt")
+            if isinstance(quantization_config, dict)
+            else None
+        )
+        cli_factor = getattr(model_config.hf_config, "cli_factor", 1)
+        if cli_factor is None:
+            cli_factor = 1
+        is_glm_5_2 = (
+            cli_factor == 1
+            and getattr(model_config.hf_config, "index_topk_pattern", None) is None
+            and getattr(model_config.hf_config, "index_topk_freq", None) == 4
+            and getattr(model_config.hf_config, "index_skip_topk_offset", None) == 3
+        )
+        rules = (
+            (
+                "model_variant",
+                not is_glm_5_2,
+                "startup overlap is validated only for the GLM-5.2 DSA architecture",
+            ),
+            (
+                "cuda_device_capability",
+                options.cuda_device_capability != (9, 0),
+                "GLM-5.2 DSA FP8 startup overlap is validated only on NVIDIA Hopper (SM90)",
+            ),
+            (
+                "tensor_parallelism",
+                options.tp_size not in (8, 16),
+                "GLM-5.2 DSA FP8 startup overlap requires TP8 or TP16",
+            ),
+            (
+                "dtype",
+                model_config.dtype != torch.bfloat16,
+                "GLM-5.2 DSA FP8 startup overlap requires --dtype bfloat16",
+            ),
+            (
+                "quantization",
+                model_config.quantization != "fp8"
+                or checkpoint_quant_method != "fp8"
+                or checkpoint_activation_scheme != "dynamic"
+                or checkpoint_fp8_format != "e4m3",
+                "GLM-5.2 DSA startup overlap requires its serialized dynamic E4M3 FP8 checkpoint",
+            ),
+            (
+                "fp8_weight_block_size",
+                weight_block_size != (128, 128),
+                "GLM-5.2 DSA FP8 startup overlap requires 128x128 block scales",
+            ),
+            (
+                "modelopt",
+                bool(getattr(model_config, "modelopt_quant", False)),
+                "ModelOpt is not supported",
+            ),
+            (
+                "expert_parallelism",
+                options.ep_size != 1,
+                "GLM-5.2 DSA FP8 startup overlap does not yet support expert parallelism",
+            ),
+            (
+                "moe_data_parallelism",
+                options.moe_dp_size != 1,
+                "MoE data parallelism is not supported",
+            ),
+            (
+                "moe_a2a_backend",
+                options.moe_a2a_backend != "none",
+                "GLM-5.2 DSA FP8 startup overlap requires --moe-a2a-backend none",
+            ),
+            (
+                "moe_runner_backend",
+                options.moe_runner_backend != "triton",
+                "GLM-5.2 DSA FP8 startup overlap requires --moe-runner-backend triton",
+            ),
+            (
+                "fp8_gemm_backend",
+                options.fp8_gemm_runner_backend != "triton",
+                "GLM-5.2 DSA FP8 startup overlap requires --fp8-gemm-backend triton",
+            ),
+            (
+                "attention_backend",
+                options.prefill_attention_backend != "dsa"
+                or options.decode_attention_backend != "dsa",
+                "GLM-5.2 DSA FP8 startup overlap requires DSA for prefill and decode attention",
+            ),
+            (
+                "dsa_attention_backend",
+                options.dsa_prefill_backend != "fa3"
+                or options.dsa_decode_backend != "fa3",
+                "GLM-5.2 DSA FP8 startup overlap requires FA3 for DSA prefill and decode",
+            ),
+            (
+                "kv_cache_dtype",
+                options.kv_cache_dtype != "bfloat16",
+                "GLM-5.2 DSA FP8 startup overlap requires --kv-cache-dtype bfloat16",
+            ),
+            (
+                "prefill_cuda_graph",
+                options.prefill_cuda_graph_backend != Backend.DISABLED,
+                "GLM-5.2 DSA FP8 startup overlap requires prefill CUDA graphs disabled",
+            ),
+            (
+                "shared_experts_fusion",
+                not options.disable_shared_experts_fusion,
+                "GLM-5.2 DSA FP8 startup overlap requires --disable-shared-experts-fusion",
+            ),
+            (
+                "dp_attention",
+                options.enable_dp_attention,
+                "DP attention is not supported",
+            ),
+            (
+                "two_batch_overlap",
+                options.enable_two_batch_overlap,
+                "two-batch overlap is not supported",
+            ),
+            (
+                "eplb",
+                options.enable_eplb,
+                "EPLB is not supported",
+            ),
+            (
+                "redundant_experts",
+                options.ep_num_redundant_experts != 0,
+                "redundant experts are not supported",
+            ),
+            (
+                "expert_placement",
+                options.init_expert_location != "trivial",
+                "non-trivial expert placement is not supported",
+            ),
+            (
+                "elastic_expert_parallelism",
+                options.elastic_ep_backend is not None
+                or options.enable_elastic_expert_backup
+                or options.ep_join_mode is not None
+                or options.max_ep_size is not None,
+                "elastic expert parallelism is not supported",
+            ),
+            (
+                "multimodal",
+                model_config.is_multimodal,
+                "multimodal models are not supported",
+            ),
+        )
     else:
         raise ValueError(f"Unknown startup weight-load profile: {profile}")
 
@@ -603,11 +799,14 @@ class ModelStorageManifest:
         """Return floating-point parameters still entirely equal to ``value``.
 
         This is the capture-sentinel check, and it is deliberately strict: every
-        floating-point parameter must be rewritten by ``model.load_weights()``.
-        A model that keeps an ``__init__``-computed floating-point parameter with
-        no checkpoint entry will fail startup here rather than silently serve the
-        sentinel, so this doubles as the admission gate for widening
-        ``_NATIVE_DENSE_ARCHITECTURES``. Buffers are excluded because
+        floating-point parameter that requires a checkpoint entry must be
+        rewritten by ``model.load_weights()``. Parameters marked
+        ``_skip_weight_check`` are optional checkpoint state, so capture-safe
+        initialization preserves their constructor values and this check omits
+        them. A model that keeps any other ``__init__``-computed floating-point
+        parameter with no checkpoint entry will fail startup here rather than
+        silently serve the sentinel, so this doubles as the admission gate for
+        widening ``_NATIVE_DENSE_ARCHITECTURES``. Buffers are excluded because
         ``initialize_capture_safe_weights`` never overwrites them.
         """
         names = []
@@ -618,6 +817,7 @@ class ModelStorageManifest:
             if (
                 not name.startswith("parameter:")
                 or not torch.is_floating_point(tensor)
+                or getattr(tensor, "_skip_weight_check", False)
                 or id(tensor) in seen_tensor_ids
             ):
                 continue
@@ -816,7 +1016,7 @@ def evaluate_startup_weight_load_admission(
 
 
 class StartupWeightLoadManager:
-    """Coordinate native CPU staging with capture and post-capture commit.
+    """Coordinate checkpoint prefetch with capture and post-capture commit.
 
     Model commit and validation failures after capture-safe preparation are
     terminal startup failures: the manager fails closed instead of rolling a
@@ -846,6 +1046,7 @@ class StartupWeightLoadManager:
         self._capture_ready_at: Optional[float] = None
         self._prefetch_started_at: Optional[float] = None
         self._prefetch_failure_reported = False
+        self._prefetch_stop_timed_out = False
         self._timings: Optional[StartupWeightLoadTimings] = None
 
     @classmethod
@@ -1037,9 +1238,10 @@ class StartupWeightLoadManager:
         assert self._capture_ready_at is not None
         assert self._prefetch_started_at is not None
         self._state = StartupWeightLoadState.COMMITTING
-        commit_started_at = time.perf_counter()
         manifest = ModelStorageManifest.capture(self._model)
+        prefetch_window_finished_at = time.perf_counter()
         startup_prefetch_active = self._prepare_prefetch_for_commit()
+        commit_started_at = time.perf_counter()
         monkey_patch_vllm_parallel_state()
         self._loader.commit_model_weights(
             model=self._model,
@@ -1074,9 +1276,16 @@ class StartupWeightLoadManager:
             prefetch_start_delay_seconds=(
                 self._prefetch_started_at - self._capture_ready_at
             ),
-            prefetch_window_seconds=commit_started_at - self._prefetch_started_at,
+            prefetch_window_seconds=(
+                prefetch_window_finished_at - self._prefetch_started_at
+            ),
             commit_seconds=commit_finished_at - commit_started_at,
-            prefetch_cleanup_seconds=cleanup_finished_at - commit_finished_at,
+            prefetch_cleanup_seconds=(
+                commit_started_at
+                - prefetch_window_finished_at
+                + cleanup_finished_at
+                - commit_finished_at
+            ),
             total_seconds=cleanup_finished_at - self._created_at,
         )
         self._state = StartupWeightLoadState.READY
@@ -1096,30 +1305,57 @@ class StartupWeightLoadManager:
         return self._timings
 
     def _prepare_prefetch_for_commit(self) -> bool:
-        assert self._prefetch_handle is not None
-        if not self._prefetch_handle.failed:
-            return not self._prefetch_handle.done
+        handle = self._prefetch_handle
+        assert handle is not None
 
-        self._prefetch_handle.cancel()
+        if handle.done:
+            handle.wait()
+            self._report_prefetch_failure(falling_back=True)
+            self._prefetch_handle = None
+            return False
+
+        try:
+            handle.stop()
+        except TimeoutError:
+            # Cancellation is cooperative because Python cannot safely stop a
+            # thread blocked in a file read. If it completed at the timeout
+            # boundary, normal loading is safe; otherwise keep reporting the
+            # active worker so iterator dispatch can apply its configured
+            # concurrency policy during the real commit.
+            if handle.done:
+                handle.wait()
+                self._report_prefetch_failure(falling_back=True)
+                self._prefetch_handle = None
+                return False
+
+            self._prefetch_stop_timed_out = True
+            self._report_prefetch_failure(falling_back=True)
+            logger.warning(
+                "Checkpoint prefetch did not stop before the weight commit; "
+                "continuing weight loading while the cancelled checkpoint "
+                "prefetch worker exits."
+            )
+            return True
+
         self._report_prefetch_failure(falling_back=True)
-        return not self._prefetch_handle.done
+        self._prefetch_handle = None
+        return False
 
     def _stop_prefetch(self) -> None:
-        if self._prefetch_handle is None:
+        handle = self._prefetch_handle
+        if handle is None:
             return
-        try:
-            if self._prefetch_handle.done:
-                self._prefetch_handle.wait()
-            else:
-                self._prefetch_handle.stop()
-        except TimeoutError:
-            # Only reached after the real weights are committed and validated,
-            # so a stager that outlives its stop timeout must not fail an
-            # otherwise-successful startup. The worker is a daemon thread and
-            # cannot keep the process alive.
+        assert self._prefetch_stop_timed_out
+        if handle.done:
+            handle.wait()
+        else:
+            # Do not spend the same timeout twice. The first stop already set
+            # the cancellation event, and the daemon worker cannot keep the
+            # process alive after startup.
             logger.warning(
-                "Checkpoint prefetch did not stop within its timeout after the "
-                "weight commit; leaving the daemon stager to exit on its own."
+                "Checkpoint prefetch is still exiting after the weight commit; "
+                "leaving the cancelled daemon prefetch worker to finish on "
+                "its own."
             )
         self._report_prefetch_failure(falling_back=False)
         self._prefetch_handle = None
@@ -1139,7 +1375,7 @@ class StartupWeightLoadManager:
         action = (
             "falling back to normal weight loading"
             if falling_back
-            else "real weight loading completed despite incomplete staging"
+            else "real weight loading completed despite incomplete prefetch"
         )
         logger.warning(
             "Checkpoint prefetch was incomplete because %s; %s",
