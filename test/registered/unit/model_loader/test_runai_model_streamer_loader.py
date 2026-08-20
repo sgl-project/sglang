@@ -67,6 +67,7 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
 
         self.assertIs(model, fake_model)
         self.assertIs(mock_load_weights.call_args.args[0], fake_model)
+        self.assertIs(mock_load_weights.call_args.kwargs["model_config"], model_config)
         self.assertIs(mock_initialize_model.call_args.args[2], quant_config)
 
     def test_marks_streamer_tensors(self):
