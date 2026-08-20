@@ -45,6 +45,10 @@ def _jit_topk_v2_module():
     )
 
 
+def _has_dsv4_topk_aot() -> bool:
+    return hasattr(torch.ops.sgl_kernel, "deepseek_v4_topk_transform_512")
+
+
 def topk_transform_512(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -53,7 +57,7 @@ def topk_transform_512(
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
-    if is_hip_runtime():
+    if is_hip_runtime() and _has_dsv4_topk_aot():
         torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
         )
