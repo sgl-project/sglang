@@ -14,7 +14,7 @@
 
 import logging
 import threading
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -39,8 +39,11 @@ class EngineInfoBootstrapServer:
         self.host = host
         self.port = port
 
-        # Storage: {tp_rank: (session_id, weights_info_dict)}
-        self.transfer_engine_info: Dict[int, Tuple] = {}
+        # Storage: {tp_rank: transfer_engine_info_dict}
+        # Value is a backend-tagged dict (e.g. for Mooncake:
+        # {"session_id", "weights_info_dict"}; for NIXL:
+        # {"backend", "agent_name", "agent_metadata", "weights_info_dict"}).
+        self.transfer_engine_info: Dict[int, dict] = {}
         # Storage: {tp_rank: parallelism_config_dict}
         self.parallelism_config: Dict[int, dict] = {}
         self.lock = threading.Lock()
@@ -56,18 +59,16 @@ class EngineInfoBootstrapServer:
             try:
                 tp_rank = data["tp_rank"]
                 info = data["transfer_engine_info"]
-                session_id = info["session_id"]
-                weights_info_dict = info["weights_info_dict"]
 
+                # Store the backend-tagged dict as-is (no positional unpacking),
+                # so backend-specific identity fields (Mooncake session_id vs
+                # NIXL agent_name/agent_metadata) all round-trip unchanged.
                 with self.lock:
-                    self.transfer_engine_info[tp_rank] = (
-                        session_id,
-                        weights_info_dict,
-                    )
+                    self.transfer_engine_info[tp_rank] = info
 
                 logger.info(
                     f"Registered transfer engine info for tp_rank={tp_rank}, "
-                    f"session_id={session_id}"
+                    f"backend={info.get('backend')}"
                 )
                 return PlainTextResponse("OK")
             except Exception as e:
@@ -88,7 +89,7 @@ class EngineInfoBootstrapServer:
                     detail=f"No transfer engine info for rank {rank}",
                 )
 
-            return {"rank": rank, "remote_instance_transfer_engine_info": list(info)}
+            return {"rank": rank, "remote_instance_transfer_engine_info": info}
 
         config = uvicorn.Config(app, host=host, port=port, log_level="warning")
         self._server = uvicorn.Server(config)
@@ -135,7 +136,7 @@ class EngineInfoBootstrapServer:
         self._server.should_exit = True
         self._thread.join(timeout=5)
 
-    def get_transfer_engine_info(self, rank: int) -> Optional[Tuple]:
+    def get_transfer_engine_info(self, rank: int) -> Optional[dict]:
         """Direct in-process access for co-located HTTP server (no HTTP round-trip)."""
         return self.transfer_engine_info.get(rank)
 
