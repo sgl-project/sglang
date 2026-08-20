@@ -21,7 +21,9 @@ from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding_,
 )
 from sglang.kernels.ops.diffusion import (
+    can_use_fused_indexed_rmsnorm_scale_shift,
     can_use_fused_inplace_qknorm_rope,
+    fused_indexed_rmsnorm_scale_shift,
     fused_inplace_qknorm_rope,
     indexed_gate_bf16,
     indexed_gate_bf16_,
@@ -234,6 +236,29 @@ def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> nn.RMSN
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = torch.chunk(x, 2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
+
+
+def _modulate_rmsnorm_scale_shift(
+    x: torch.Tensor,
+    norm: nn.RMSNorm,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """RMSNorm + indexed AdaLN without materializing the normalized tensor."""
+    if (
+        not torch.compiler.is_compiling()
+        and dtype == _BF16_DTYPE
+        and can_use_fused_indexed_rmsnorm_scale_shift(
+            x, norm.weight, shift, scale, indices
+        )
+    ):
+        return fused_indexed_rmsnorm_scale_shift(
+            x, norm.weight, shift, scale, indices, float(norm.eps)
+        )
+    return _modulate_scale_shift(norm(x), shift, scale, indices, dtype=dtype)
 
 
 def _modulate_scale_shift(
@@ -1405,9 +1430,13 @@ class MiniMaxH3DiTBlock(nn.Module):
         # first gated residual writes to that tensor; the second one operates on
         # a block-local buffer.
         residual = x
-        h = self.norm1(x)
-        h = _modulate_scale_shift(
-            h, shift_msa, scale_msa, combined_indices, dtype=_BF16_DTYPE
+        h = _modulate_rmsnorm_scale_shift(
+            x,
+            self.norm1,
+            shift_msa,
+            scale_msa,
+            combined_indices,
+            dtype=_BF16_DTYPE,
         )
         h = self.attn(
             h,
@@ -1428,9 +1457,13 @@ class MiniMaxH3DiTBlock(nn.Module):
         )
 
         residual = x
-        h = self.norm2(x)
-        h = _modulate_scale_shift(
-            h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE
+        h = _modulate_rmsnorm_scale_shift(
+            x,
+            self.norm2,
+            shift_mlp,
+            scale_mlp,
+            combined_indices,
+            dtype=_BF16_DTYPE,
         )
         h = self.mlp(h)
         # `residual` is block-local here (see above), so this stays in-place
@@ -1516,9 +1549,9 @@ class MiniMaxH3FinalLayer(nn.Module):
             video = audio = None
             for start in range(0, x.shape[0], _MPS_MLP_TOKEN_CHUNK_SIZE):
                 stop = min(start + _MPS_MLP_TOKEN_CHUNK_SIZE, x.shape[0])
-                h = self.norm(x[start:stop])
-                h = _modulate_scale_shift(
-                    h,
+                h = _modulate_rmsnorm_scale_shift(
+                    x[start:stop],
+                    self.norm,
                     shift,
                     scale,
                     inverse_indices[start:stop],
@@ -1544,8 +1577,9 @@ class MiniMaxH3FinalLayer(nn.Module):
                 torch.mps.empty_cache()
             assert video is not None and audio is not None
             return video, audio
-        h = self.norm(x)
-        h = _modulate_scale_shift(h, shift, scale, inverse_indices, dtype=_BF16_DTYPE)
+        h = _modulate_rmsnorm_scale_shift(
+            x, self.norm, shift, scale, inverse_indices, dtype=_BF16_DTYPE
+        )
         # Preserve full precision through both final output projections.
         h = h.to(_FP32_DTYPE)
         video, _ = self.video_out(h)

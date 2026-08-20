@@ -187,6 +187,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "LTX-2 nine-way adaLN value split.",
     ),
     (
+        "diffusion.fused_indexed_rmsnorm_scale_shift",
+        KernelBackend.TRITON,
+        "modulate.indexed_modulation_triton:fused_indexed_rmsnorm_scale_shift",
+        _CUDA,
+        "Indexed RMSNorm + adaLN scale/shift (MiniMax-H3).",
+    ),
+    (
         "diffusion.fused_inplace_qknorm_rope",
         KernelBackend.JIT,
         "rope.qknorm_rope_jit:fused_inplace_qknorm_rope",
@@ -364,6 +371,8 @@ _EXPORTS: dict[str, str] = {
     "can_use_qk_rmsnorm_native": "norm.zimage_qk_rmsnorm_triton",
     "zimage_qk_rmsnorm_native": "norm.zimage_qk_rmsnorm_triton",
     # adaLN modulation, gating and timestep conditioning
+    "can_use_fused_indexed_rmsnorm_scale_shift": "modulate.indexed_modulation_triton",
+    "fused_indexed_rmsnorm_scale_shift": "modulate.indexed_modulation_triton",
     "indexed_gate_bf16": "modulate.indexed_modulation_triton",
     "indexed_gate_bf16_": "modulate.indexed_modulation_triton",
     "indexed_scale_shift_bf16_": "modulate.indexed_modulation_triton",
