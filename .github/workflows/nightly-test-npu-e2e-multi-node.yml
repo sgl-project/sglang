@@ -270,14 +270,14 @@ jobs:
             if kubectl get pods -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
               echo "Found remaining sglang pods, retry $((retry_count+1))/${max_retries} (sleeping 30s)..."
               sleep 30
-              while read -r pod_name; do
+              kubectl get pods -n $NAMESPACE | grep "${pod_name_prefix}" | awk '{print $1}' | while read -r pod_name; do
                 [ -z "$pod_name" ] && continue
                 if kubectl delete pod "$pod_name" -n $NAMESPACE --force --ignore-not-found=true; then
                   echo "  $pod_name: SUCCESS"
                 else
                   echo "  $pod_name: WARNING (delete failed)"
                 fi
-              done < <(kubectl get pods -n $NAMESPACE | grep "${pod_name_prefix}" | awk '{print $1}')
+              done
               retry_count=$((retry_count+1))
             else
               echo "No sglang pods remain."
