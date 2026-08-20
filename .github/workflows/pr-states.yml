@@ -5,13 +5,10 @@ name: PR States
 #
 # Three triggers, each covering a gap:
 #   - pull_request_target: push / open / label change (all PRs incl forks).
-#   - workflow_run: initial pr-test* completion (incl fork PRs; the
-#     notify-job below can't fire on forks — their pull_request
-#     GITHUB_TOKEN is forced read-only). Does NOT re-fire for rerun
-#     attempts, which is why workflow_dispatch is needed too.
-#   - workflow_dispatch: rerun completions for non-fork PRs, dispatched by
-#     pr-test*'s notify-pr-states job. workflow_dispatch is the only event
-#     GITHUB_TOKEN can cascade-create.
+#   - workflow_run: pr-test* requested / completed events (incl fork PRs).
+#     `requested` is absent on reruns, but `completed` still fires.
+#   - workflow_dispatch: explicit refreshes for a provided PR number. This
+#     is the only event here that GITHUB_TOKEN can cascade-create.
 
 on:
   pull_request_target:
@@ -177,11 +174,10 @@ jobs:
             const peBlockedByCIText = ':x: **Blocked** -- `run-ci` is required first.';
             const notExtraEnabledText = ':warning: **Not enabled** -- add `run-ci-extra` label to opt in.';
             const stalePushText = ':warning: **Not run on latest push** -- push again to dispatch.';
-            // No label-based branch here: the paths filter is what withholds
-            // this workflow. Without `run-ci` a path-matching PR still gets a
-            // run (call-gate fails it), so a missing run means the paths
-            // filter excluded the PR, not that the label is missing.
-            const amdNotTriggeredText = ':heavy_minus_sign: **Not triggered** -- no ROCm-relevant paths changed.';
+            // A missing run usually means the paths filter excluded the PR,
+            // but pull_request workflows can also be suppressed by GitHub
+            // (for example, for merge conflicts or skip annotations).
+            const amdNotTriggeredText = ':heavy_minus_sign: **No AMD PR run found for this commit**.';
 
             // Status icon: body otherwise looks uniformly "dispatched" even
             // for gate-failed runs (call-gate exits on missing label).
