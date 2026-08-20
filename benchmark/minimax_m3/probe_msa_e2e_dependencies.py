@@ -139,12 +139,18 @@ def probe_flashinfer(source: Path, expected_head: str) -> dict:
         raise RuntimeError(
             "FlashInfer tracked source differs from HEAD; evidence needs exact source"
         )
-    public_module = source / "flashinfer" / "msa_ops.py"
+    public_module = source / "flashinfer" / "msa_ops" / "__init__.py"
     if not public_module.is_file():
         raise RuntimeError(f"FlashInfer source API is missing: {public_module}")
 
     flashinfer = importlib.import_module("flashinfer")
     msa_ops = importlib.import_module("flashinfer.msa_ops")
+    installed_path = Path(inspect.getfile(msa_ops)).resolve()
+    expected_package = (source / "flashinfer" / "msa_ops").resolve()
+    if not installed_path.is_relative_to(expected_package):
+        raise RuntimeError(
+            f"imported flashinfer.msa_ops from {installed_path}, expected {expected_package}"
+        )
     required = {
         "msa_sparse_attention",
         "msa_sparse_decode_attention",
@@ -157,7 +163,7 @@ def probe_flashinfer(source: Path, expected_head: str) -> dict:
     return {
         "source_path": str(source),
         "source_head": head,
-        "installed_path": str(Path(inspect.getfile(msa_ops)).resolve()),
+        "installed_path": str(installed_path),
         "version": getattr(flashinfer, "__version__", None),
         "prefill_signature": str(inspect.signature(msa_ops.msa_sparse_attention)),
         "decode_signature": str(inspect.signature(msa_ops.msa_sparse_decode_attention)),
