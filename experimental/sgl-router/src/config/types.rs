@@ -155,6 +155,31 @@ pub struct ModelConfig {
     /// The chat handler reads `sticky.header_name` to populate
     /// [`crate::policies::SelectionContext::routing_key`].
     pub sticky: Option<StickyConfig>,
+    /// Segment tokenize-cache tuning. `Some` when `--segment-cache` is set,
+    /// `None` (default) leaves the chat path re-tokenizing every request as
+    /// before. Applies only to chat requests on a model with a Jinja chat
+    /// template (markers are derived from the template). See
+    /// [`crate::tokenizer::segment`].
+    pub segment_cache: Option<SegmentCacheConfig>,
+}
+
+/// Per-model segment tokenize-cache tuning (opt-in via `--segment-cache`).
+#[derive(Debug, Clone, Copy)]
+pub struct SegmentCacheConfig {
+    /// Max number of cached segments (store entry cap). Default 131072.
+    pub capacity: u64,
+    /// Prompts shorter than this many bytes skip the cache and encode whole —
+    /// below it the per-segment bookkeeping outweighs re-tokenizing. Default 4096.
+    pub min_bytes: usize,
+}
+
+impl Default for SegmentCacheConfig {
+    fn default() -> Self {
+        Self {
+            capacity: 131_072,
+            min_bytes: 4096,
+        }
+    }
 }
 
 /// Per-model cache-aware-ZMQ tuning.

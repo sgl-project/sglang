@@ -54,6 +54,7 @@ mod tests {
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
+            segment_cache: None,
         };
         let app = crate::server::app::build_router(std::sync::Arc::new(ctx));
         let res = app

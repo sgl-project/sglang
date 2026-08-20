@@ -4,11 +4,13 @@
 pub mod adapter;
 pub mod chat_template;
 pub mod dsv4;
+pub mod segment;
 
 use anyhow::Result;
 use chat_template::ChatTemplate;
 use dashmap::DashMap;
 use dynamo_tokenizers::Tokenizer;
+use segment::{SegmentCache, SegmentEncoder};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -34,14 +36,36 @@ impl ChatEncoder {
     }
 }
 
+/// Per-model bundle implementing the segment cache's [`SegmentEncoder`] contract:
+/// render via the model's chat encoder, tokenize via its tokenizer, markers from
+/// its added tokens. The `chat` encoder is shared (`Arc`) with the registry's
+/// [`ChatEncoderEntry`] so there is exactly one encoder per model.
+struct ModelSegmentEncoder {
+    chat: Arc<ChatEncoder>,
+    tokenizer: Arc<Tokenizer>,
+    added_tokens: Vec<String>,
+}
+
+impl SegmentEncoder for ModelSegmentEncoder {
+    fn render(&self, messages: &serde_json::Value) -> Option<String> {
+        self.chat.render(messages).ok()
+    }
+    fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        adapter::encode(&self.tokenizer, text)
+    }
+    fn marker_candidates(&self) -> &[String] {
+        &self.added_tokens
+    }
+}
+
 /// A model's chat encoder plus its fallback-logging state.
 struct ChatEncoderEntry {
-    encoder: ChatEncoder,
+    encoder: Arc<ChatEncoder>,
     fallback_warned: AtomicBool,
 }
 
 impl ChatEncoderEntry {
-    fn new(encoder: ChatEncoder) -> Self {
+    fn new(encoder: Arc<ChatEncoder>) -> Self {
         Self {
             encoder,
             fallback_warned: AtomicBool::new(false),
@@ -74,6 +98,12 @@ pub struct TokenizerRegistry {
     /// requests the way the engine does; models without one fall back to raw
     /// prompt-text tokenization.
     encoders: DashMap<String, Arc<ChatEncoderEntry>>,
+    /// Per-model segment tokenize-cache, present only when `--segment-cache` is
+    /// set for the model. Its [`SegmentEncoder`] is a [`ModelSegmentEncoder`]
+    /// bundling this model's chat encoder + tokenizer, so it works for any
+    /// encoder (Jinja or the DeepSeek-V4 code encoder). [`Self::encode_chat`]
+    /// routes through it when present. See [`segment`].
+    segment_caches: DashMap<String, Arc<SegmentCache>>,
 }
 
 impl std::fmt::Debug for TokenizerRegistry {
@@ -89,7 +119,7 @@ impl TokenizerRegistry {
         let me = TokenizerRegistry::default();
         let m = &cfg.model;
         let t = adapter::load(&m.tokenizer_path)?;
-        me.inner.insert(m.id.clone(), t);
+        me.inner.insert(m.id.clone(), Arc::clone(&t));
         // Resolve the chat encoder, best-effort: a Jinja template from
         // tokenizer_config.json, else a built-in encoder for a recognized model
         // (DeepSeek-V4), else none (chat traffic routes via raw text). Every
@@ -98,8 +128,24 @@ impl TokenizerRegistry {
         // routing degraded to overlap=0 on chat traffic", so it must never be
         // silent.
         if let Some(encoder) = me.resolve_chat_encoder(&m.id, &m.tokenizer_path) {
+            // One chat encoder per model, shared (Arc) between the render path
+            // (ChatEncoderEntry) and the segment cache's SegmentEncoder.
+            let chat = Arc::new(encoder);
+            // Segment tokenize-cache (opt-in, per-model). The ModelSegmentEncoder
+            // bundles render (chat) + encode (tokenizer) + markers (added tokens),
+            // so segmentation works for any encoder — Jinja or DeepSeek-V4 code.
+            if let Some(sc_cfg) = m.segment_cache.as_ref() {
+                let added = adapter::load_added_special_tokens(&m.tokenizer_path);
+                let seg_encoder: Arc<dyn SegmentEncoder> = Arc::new(ModelSegmentEncoder {
+                    chat: Arc::clone(&chat),
+                    tokenizer: Arc::clone(&t),
+                    added_tokens: added,
+                });
+                let sc = SegmentCache::new(&m.id, seg_encoder, sc_cfg);
+                me.segment_caches.insert(m.id.clone(), Arc::new(sc));
+            }
             me.encoders
-                .insert(m.id.clone(), Arc::new(ChatEncoderEntry::new(encoder)));
+                .insert(m.id.clone(), Arc::new(ChatEncoderEntry::new(chat)));
         }
         Ok(me)
     }
@@ -161,7 +207,14 @@ impl TokenizerRegistry {
                 entry.log_fallback(model_id, &format!("render failed: {e:#}"))
             })
             .ok()?;
-        match adapter::encode(&tokenizer, &rendered) {
+        // Route through the segment cache when one is configured for this model;
+        // it is byte-identical to `adapter::encode(&tokenizer, &rendered)` but
+        // reuses cached per-segment ids across turns. Absent → encode whole.
+        let encoded = match self.segment_caches.get(model_id) {
+            Some(sc) => sc.encode_cached(&rendered),
+            None => adapter::encode(&tokenizer, &rendered),
+        };
+        match encoded {
             Ok(ids) if !ids.is_empty() => Some(ids),
             Ok(_) => {
                 entry.log_fallback(model_id, "rendered prompt tokenized to zero tokens");
@@ -185,7 +238,7 @@ impl TokenizerRegistry {
     pub(crate) fn attach_chat_encoder_for_test(&self, model_id: &str, encoder: ChatEncoder) {
         self.encoders.insert(
             model_id.to_string(),
-            Arc::new(ChatEncoderEntry::new(encoder)),
+            Arc::new(ChatEncoderEntry::new(Arc::new(encoder))),
         );
     }
 
@@ -235,6 +288,7 @@ mod tests {
                 circuit_breaker: None,
                 cache_aware: None,
                 sticky: None,
+                segment_cache: None,
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(
                 crate::config::StaticUrlsDiscoveryConfig {

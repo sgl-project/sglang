@@ -53,6 +53,13 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 # `strftime_now` chat-template helper (some templates inject the current date).
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
+# Segment tokenize-cache (opt-in via --segment-cache): a chat prompt is split at
+# its chat-template marker tokens (turn boundaries) and each segment's token ids
+# are cached, so multi-turn conversations only re-tokenize the newest turn.
+# `moka` is the in-process L1, keyed by the segment bytes themselves (moka
+# compares keys, so lookups are collision-free with no manual hashing).
+moka = { version = "0.12", features = ["sync"] }
+
 # Utilities
 anyhow = "1"
 thiserror = "2"
