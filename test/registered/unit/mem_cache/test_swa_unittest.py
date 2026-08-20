@@ -231,6 +231,33 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(allocator.swa_available_size(), 16)
         self.assertEqual(allocator.full_available_size(), full_available + page_size)
 
+    def test_paged_free_swa_tolerates_a_partially_mapped_page(self):
+        """A paged full page can own slots that never got an SWA peer (a partial
+        extend, or a HiCache load-back that re-paired the page). free_swa must
+        skip those instead of handing the SWA padding slot back to the pool.
+        """
+        page_size = 4
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            page_size=page_size,
+            kv_size=16,
+            kv_size_swa=16,
+            sliding_window_size=page_size,
+        )
+
+        full_indices = _swa_alloc(allocator, page_size)
+        # Leave the tail of the page without an SWA peer.
+        allocator.full_to_swa_index_mapping[full_indices[2:].to(torch.int64)] = 0
+        swa_available = allocator.swa_available_size()
+
+        allocator.free_swa(full_indices[:2])
+
+        # Exactly the one page comes back, and the padding slot never does.
+        self.assertEqual(allocator.swa_available_size(), swa_available + page_size)
+        self.assertLessEqual(
+            allocator.swa_available_size(), allocator.swa_attn_allocator.size
+        )
+
     def test_free_full_defers_inside_a_free_group(self):
         page_size = 4
         _, allocator, _ = _build_swa_tree(
