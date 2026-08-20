@@ -11,6 +11,7 @@ import inspect
 import json
 import os
 import subprocess
+from importlib import metadata
 from pathlib import Path
 
 
@@ -21,6 +22,7 @@ REQUIRED_GPQA_COLUMNS = {
     "Incorrect Answer 2",
     "Incorrect Answer 3",
 }
+REQUIRED_SGLANG_KERNEL_VERSION = "0.4.6.post1"
 
 
 def sha256(path: Path) -> str:
@@ -187,10 +189,17 @@ def probe_sglang(repo: Path) -> dict:
             f"Python imports SGLang from {installed_path}, not this checkout "
             f"({expected_package})"
         )
+    kernel_version = metadata.version("sglang-kernel")
+    if kernel_version != REQUIRED_SGLANG_KERNEL_VERSION:
+        raise RuntimeError(
+            f"sglang-kernel is {kernel_version}, expected "
+            f"{REQUIRED_SGLANG_KERNEL_VERSION}"
+        )
     return {
         "repo": str(repo.resolve()),
         "head": git(repo, "rev-parse", "HEAD"),
         "installed_path": str(installed_path),
+        "sglang_kernel_version": kernel_version,
     }
 
 
