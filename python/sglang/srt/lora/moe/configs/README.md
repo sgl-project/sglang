@@ -510,6 +510,32 @@ NEED branches compiled to exactly these instantiations before, verified by a
 post-deletion timing spot check matching to the microsecond), and
 `_build_aligned` builds one route per call.
 
+Route builder on the H200 prefill rows (2026-08-20, added after the flip). The
+48-cell sweep above reached one prefill row only, `prefill.token_dedup`, where
+parallel against joint was a wash: 12 cells, median +0.10%, range -0.87% to
++1.70%. It reached no H200 prefill row at all, because that sweep used rank 16,
+and rank 16 on H200 selects `prefill.shared_rank`, which does not use the joint
+builder. So two H200 prefill rows changed builder with no measurement. This
+closes that gap. Joint is deleted, so the comparison is parallel against
+serial:
+
+| rank | row | median | range |
+|---:|---|---:|---:|
+| 8 | prefill.materialized.small_rank | +0.80% | +0.26% .. +1.22% |
+| 128 | prefill.materialized | +0.90% | -0.18% .. +0.99% |
+
+Here `+` means parallel is faster. Parallel wins 11 of 12 cells. The one loss
+is -0.18%, inside that cell's 0.54% noise floor.
+
+The honest summary for prefill: parallel matches joint, and it beats serial by
+about 1%. Decode is where parallel gains over joint. Prefill keeps parallel
+because joint no longer exists and serial is worse, not because parallel is
+faster than what it replaced.
+
+A general lesson from this sweep and the into-base sweep: rank 16 selects a
+different row from rank 8 or rank 128 on H200. A sweep at one rank does not
+cover a table whose rows carry `max_rank`.
+
 To onboard a model whose geometry the shipped `domain`/rows do not cover:
 
 ```

@@ -501,8 +501,6 @@ def invoke_down_b_into_base(
     hidden = down_rows.shape[1]
     rank = bridge.shape[1]
     if "BLOCK_SIZE_M" in config:
-        # The tile tables do not pin this to the route, and a mismatch reads
-        # the wrong stride of sorted_pair_ids without an error.
         configured_block = int(config["BLOCK_SIZE_M"])
         if configured_block != routing.block_size:
             raise ValueError(

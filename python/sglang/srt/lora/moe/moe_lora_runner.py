@@ -854,8 +854,7 @@ class MoeLoraRunner:
                 # The down-B kernel adds the delta into the base down rows, so
                 # finalize gets no pair delta. The base row and the delta then
                 # round to BF16 together. The shipped path rounds the delta on
-                # its own. Thus you must compare the two paths with allclose,
-                # not with an exact test.
+                # its own.
                 provider.finalize(
                     base_gemm_state,
                     down_out,
