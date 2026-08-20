@@ -503,6 +503,12 @@
         "cooldown_interval_minutes": 0,
         "reason": "top contributor"
     },
+    "chromecast56": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "custom override"
+    },
     "chunyuan-w": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -522,6 +528,12 @@
         "reason": "custom override"
     },
     "cyxlily": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "custom override"
+    },
+    "dcw02": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,
@@ -570,6 +582,12 @@
         "reason": "top contributor"
     },
     "gaopengff": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "custom override"
+    },
+    "gilfordting": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,
@@ -699,6 +717,12 @@
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 60,
+        "reason": "custom override"
+    },
+    "jason136": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
         "reason": "custom override"
     },
     "jasonjk-park": {
