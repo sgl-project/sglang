@@ -78,12 +78,10 @@ def merge_rounding_loss(lora_layers: dict) -> float | None:
     return (lost / total) ** 0.5 if total > 0 else None
 
 
-def _swap_peft_swiglu_fc1_lora_b(
+def swap_peft_swiglu_fc1_lora_b(
     source_name: str, target_name: str, weight: torch.Tensor
 ) -> torch.Tensor:
-    # Only the PEFT -> native H3 FFN rewrite: ff.net.0.proj [value; gate]
-    # onto mlp.fc1 [gate; value]. Native fused mlp.fc1 and other models'
-    # ff.net.0.proj (e.g. Flux) must not match.
+    """Rewrite PEFT H3 FFN lora_B from [value; gate] to native [gate; value]."""
     if (
         weight.dim() != 2
         or ".ff.net.0.proj.lora_B" not in source_name
@@ -1038,7 +1036,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 else:
                     continue
 
-            weight = _swap_peft_swiglu_fc1_lora_b(name, target_name, weight)
+            weight = swap_peft_swiglu_fc1_lora_b(name, target_name, weight)
             if target_name in self.lora_adapters[lora_nickname]:
                 raise ValueError(
                     f"Dit target weight name {target_name} already exists in lora_adapters[{lora_nickname}]"
