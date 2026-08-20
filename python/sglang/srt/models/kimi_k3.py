@@ -1986,8 +1986,8 @@ class KimiK3DeltaAttention(nn.Module):
     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
         if self.use_full_rank_gate:
             if (
-                self._kda_group64_weight is not None
-                and self._kda_group64_scale is not None
+                getattr(self, "_kda_group64_weight", None) is not None
+                and getattr(self, "_kda_group64_scale", None) is not None
             ):
                 from sglang.kernels.ops.kimi_k3 import (
                     kda_group64_aiter_hip,

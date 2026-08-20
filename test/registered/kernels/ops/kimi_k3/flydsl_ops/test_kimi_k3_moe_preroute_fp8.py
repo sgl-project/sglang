@@ -21,7 +21,7 @@ from sglang.kernels.ops.kimi_k3.flydsl.kimi_k3_moe_preroute_fp8 import (
 )
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=120, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 _FP8_MAX = 448.0
 
