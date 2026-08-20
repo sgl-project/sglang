@@ -22,6 +22,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     NunchakuConfig,
     _patch_nunchaku_scales,
 )
+from sglang.multimodal_gen.runtime.loader.gguf_weights import (
+    names_gguf_checkpoint,
+    read_gguf_tensor_meta,
+)
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     filter_duplicate_safetensors_files,
@@ -30,6 +34,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
     COMPONENT_OFFLOAD,
     ComponentResidencyError,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model,
@@ -42,6 +47,10 @@ from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     get_metadata_from_safetensors_file,
     get_quant_config,
     get_quant_config_from_safetensors_metadata,
+)
+from sglang.srt.utils.hf_transformers import (
+    check_gguf_file,
+    resolve_hf_gguf_reference,
 )
 
 logger = init_logger(__name__)
@@ -132,6 +141,8 @@ class TransformerQuantLoadSpec:
     param_dtype: Optional[torch.dtype]
     needs_device_weight_postprocess: bool = False
     post_load_hooks: list[PostLoadHook] = field(default_factory=list)
+    # Set instead of ``safetensors_list`` when the transformer comes from GGUF.
+    gguf_file: Optional[str] = None
 
     @property
     def runtime_quant_config(self) -> Optional[object]:
@@ -440,6 +451,114 @@ class _BitsAndBytes4BitAdapter(_TransformerQuantAdapter):
         )
 
 
+def _validate_gguf_runtime_support(
+    server_args: ServerArgs, component_name: str | None = None
+) -> None:
+    """Reject configurations a GGUF transformer cannot serve.
+
+    Called before the checkpoint is downloaded or read, so an unsupported
+    combination costs a second rather than a multi-gigabyte fetch.
+
+    ``component_name`` selects the FSDP decision to check. FSDP is resolved per
+    component, so a globally enabled ``--use-fsdp-inference`` does not shard a
+    transformer that is offloaded; only the component actually holding the
+    packed weights matters.
+    """
+    # The quantization comes from the file, so an explicit --quantization is
+    # either redundant (gguf) or a conflicting request that would otherwise be
+    # dropped without a word.
+    if server_args.quantization == "gguf":
+        raise ValueError(
+            "GGUF is selected by passing the checkpoint itself, not "
+            "`--quantization gguf`. Drop the flag; "
+            "`--transformer-weights-path <file.gguf>` is what enables it."
+        )
+    if server_args.quantization is not None:
+        raise ValueError(
+            f"--quantization {server_args.quantization} cannot be combined with "
+            "a GGUF transformer, whose quantization is fixed by the checkpoint. "
+            "Drop the flag, or use an unquantized checkpoint to quantize online."
+        )
+    # Nunchaku shares --transformer-weights-path with GGUF, and the GGUF plan is
+    # resolved first, so without this the SVDQuant request would be dropped in
+    # silence rather than refused.
+    if server_args.nunchaku_config is not None:
+        raise ValueError(
+            "--enable-svdquant cannot be combined with a GGUF transformer: both "
+            "supply the transformer weights. Point "
+            "--transformer-weights-path at either an SVDQuant checkpoint or a "
+            ".gguf, not one while requesting the other."
+        )
+    if not current_platform.is_cuda():
+        raise ValueError(
+            "GGUF diffusion checkpoints require CUDA; the GGML kernels have no "
+            f"{current_platform.device_type} implementation."
+        )
+    uses_fsdp = (
+        server_args.should_use_fsdp_for_component(component_name)
+        if component_name is not None
+        else server_args.use_fsdp_inference
+    )
+    if uses_fsdp:
+        raise ValueError(
+            "GGUF diffusion checkpoints are incompatible with FSDP inference. "
+            "Run without --use-fsdp-inference, or keep this component offloaded "
+            "so FSDP does not manage it."
+        )
+    if server_args.lora_path is not None:
+        raise ValueError(
+            "LoRA is not supported on a GGUF transformer: an adapter cannot be "
+            "merged into packed GGML blocks. Use the unquantized checkpoint to "
+            "serve LoRA."
+        )
+    # H3's AdaLN paths read the transformer's safetensors directly -- the cache
+    # builder needs unquantized weights, and the online rebuild is handed the
+    # safetensors file list, which is empty for a GGUF load.
+    if server_args.minimax_h3_adaln_online:
+        raise ValueError(
+            "--minimax-h3-adaln-online rebuilds AdaLN outputs from the "
+            "safetensors checkpoint and cannot read a GGUF transformer."
+        )
+    if server_args.minimax_h3_adaln_cache_path is not None:
+        raise ValueError(
+            "--minimax-h3-adaln-cache-path requires the unquantized "
+            "transformer and cannot be combined with a GGUF checkpoint."
+        )
+
+
+def resolve_transformer_gguf_to_load(
+    server_args: ServerArgs, component_name: str | None = None
+) -> Optional[str]:
+    """Resolve ``--transformer-weights-path`` to a local ``.gguf``, if it is one.
+
+    Returns ``None`` when the override is absent or is not GGUF, so the caller
+    falls through to the safetensors path.
+    """
+    override = server_args.transformer_weights_path
+    if not override:
+        return None
+    # A `~` can reach us unexpanded from a config file or a quoted argument.
+    override = os.path.expanduser(override)
+    if not names_gguf_checkpoint(override):
+        return None
+
+    # Before any download: a Hub reference would otherwise fetch gigabytes and
+    # only then hit an unsupported-configuration error.
+    _validate_gguf_runtime_support(server_args, component_name)
+
+    is_local_reference = os.path.isabs(override) or override.startswith(".")
+    resolved = (
+        override
+        if is_local_reference
+        else resolve_hf_gguf_reference(override, revision=server_args.revision)
+        or override
+    )
+    if not check_gguf_file(resolved):
+        raise ValueError(f"Resolved GGUF path is not a GGUF file: {resolved}")
+    logger.info("using GGUF transformer weights from: %s", resolved)
+    return resolved
+
+
 def resolve_transformer_safetensors_to_load(
     server_args: ServerArgs, component_model_path: str
 ) -> list[str]:
@@ -574,7 +693,16 @@ def resolve_transformer_quant_load_spec(
     model_cls: type[nn.Module],
     cls_name: str,
     component_name: str | None = None,
+    gguf_file: str | None = None,
 ) -> TransformerQuantLoadSpec:
+    if gguf_file is not None:
+        return _resolve_gguf_quant_load_spec(
+            gguf_file=gguf_file,
+            server_args=server_args,
+            model_cls=model_cls,
+            component_name=component_name,
+        )
+
     if getattr(model_cls, "handles_checkpoint_quantization", False):
         quant_config = None
     else:
@@ -623,6 +751,40 @@ def resolve_transformer_quant_load_spec(
         param_dtype=param_dtype,
         needs_device_weight_postprocess=_needs_device_weight_postprocess(quant_config),
         post_load_hooks=post_load_hooks,
+    )
+
+
+def _resolve_gguf_quant_load_spec(
+    *,
+    gguf_file: str,
+    server_args: ServerArgs,
+    model_cls: type[nn.Module],
+    component_name: str | None = None,
+) -> TransformerQuantLoadSpec:
+    """Build the load plan for a GGUF transformer checkpoint."""
+    from sglang.multimodal_gen.runtime.layers.quantization.gguf import GGUFConfig
+
+    _validate_gguf_runtime_support(server_args, component_name)
+
+    quant_config = GGUFConfig(
+        gguf_file=gguf_file,
+        tensor_meta=read_gguf_tensor_meta(gguf_file),
+    )
+    packed = getattr(model_cls, "packed_modules_mapping", None)
+    if packed:
+        quant_config.packed_modules_mapping = packed
+
+    return TransformerQuantLoadSpec(
+        safetensors_list=[],
+        quant_config=quant_config,
+        nunchaku_config=None,
+        # No single dtype for the load: each parameter keeps the dtype the model
+        # declared for it, which the generic loader casts to. Packed weights are
+        # registered uint8, so that cast is a no-op for them. Note this matches
+        # every other quant path -- _resolve_target_param_dtype returns None
+        # whenever a quant_config is present.
+        param_dtype=None,
+        gguf_file=gguf_file,
     )
 
 
@@ -741,6 +903,16 @@ def _resolve_quant_config(
         # the component directory rather than constructing an empty config.
         if server_args.quantization == "modelslim":
             return get_quant_config(hf_config, component_model_path)
+
+        # GGUF is selected by pointing at the file, not by this flag: the config
+        # has to be built from that file's header.
+        if server_args.quantization == "gguf":
+            raise ValueError(
+                "GGUF is selected by passing the checkpoint itself, not "
+                "`--quantization gguf`. Use "
+                "`--transformer-weights-path <file.gguf>` (or a Hub reference "
+                "such as owner/repo:Q4_K_M)."
+            )
 
         # Online-quant convention: for `fp8`, `mxfp4` and `kitchen_int8`, a
         # no-arg QuantizationConfig() selects the post-load path -- weights

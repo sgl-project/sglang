@@ -238,6 +238,7 @@ def maybe_load_fsdp_model(
     strict: bool = True,
     weight_load_plan: WeightLoadPlan | None = None,
     checkpoint_key_filter: Callable[[str], bool] | None = None,
+    weights_iterator: Generator[tuple[str, torch.Tensor], None, None] | None = None,
 ) -> torch.nn.Module:
     """Load a model with optional FSDP (Fully Sharded Data Parallel) support.
 
@@ -255,6 +256,9 @@ def maybe_load_fsdp_model(
             Runtime residency strategies move it to the compute device before use.
         strict: If True, enforce strict state dict loading (all keys must match).
         weight_load_plan: Optional checkpoint/postprocess device plan for this load.
+        weights_iterator: Optional pre-built ``(name, tensor)`` source, used
+            instead of reading ``weight_dir_list`` as safetensors. Set by callers
+            whose checkpoint is not safetensors at all, such as GGUF.
     """
     # NOTE(will): cast_forward_inputs=True shouldn't be needed as we are
     # manually casting the inputs to the model
@@ -354,6 +358,7 @@ def maybe_load_fsdp_model(
         not weight_load_plan.load_full_state_dict_on_device
         and use_fsdp
         and weight_dir_list
+        and weights_iterator is None
         and preprocess_loaded_state_dict is None
         and checkpoint_key_filter is None
         and not is_bnb_quantized
@@ -369,6 +374,7 @@ def maybe_load_fsdp_model(
         not weight_load_plan.load_full_state_dict_on_device
         and not use_fsdp
         and weight_dir_list
+        and weights_iterator is None
         and preprocess_loaded_state_dict is None
         and checkpoint_key_filter is None
         and not is_bnb_quantized
@@ -382,7 +388,9 @@ def maybe_load_fsdp_model(
         )
 
     if preconverted_state_dict is None:
-        if weight_load_plan.load_full_state_dict_on_device:
+        if weights_iterator is not None:
+            weight_iterator = weights_iterator
+        elif weight_load_plan.load_full_state_dict_on_device:
             weight_iterator = safetensors_weights_iterator(
                 weight_dir_list,
                 key_filter=checkpoint_key_filter,
