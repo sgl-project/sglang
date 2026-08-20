@@ -211,6 +211,9 @@ def _server_args(**kwargs):
         dit_layerwise_resident_layers=0.0,
         dit_layerwise_residency_policy=RESIDENCY_POLICY_LEADING,
         pin_cpu_memory=False,
+        # the pin budget ranks candidates by bytes x steps, and reads the step
+        # count off the pipeline's sampling defaults
+        pipeline_class_name=None,
     )
     defaults.update(kwargs)
     return _TestServerArgs(**defaults)
