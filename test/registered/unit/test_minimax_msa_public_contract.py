@@ -48,6 +48,17 @@ def test_topk16_only_provider_selection(monkeypatch):
         msa.selected_msa_backend(torch.bfloat16, 1, 8)
 
 
+def test_explicit_provider_selection_disables_runtime_fallback(monkeypatch):
+    monkeypatch.setenv("SGLANG_MINIMAX_MSA_BACKEND", "auto")
+    assert msa.msa_runtime_fallback_allowed()
+
+    monkeypatch.setenv("SGLANG_MINIMAX_MSA_BACKEND", "flashinfer")
+    assert not msa.msa_runtime_fallback_allowed()
+
+    monkeypatch.setenv("SGLANG_MINIMAX_MSA_BACKEND", "fmha_sm100")
+    assert not msa.msa_runtime_fallback_allowed()
+
+
 def test_prefill_forwards_tp4_public_contract(monkeypatch):
     q, k, v, q2k, page_table, seq_lens = _production_inputs()
     public_prefill = Mock(return_value=q)

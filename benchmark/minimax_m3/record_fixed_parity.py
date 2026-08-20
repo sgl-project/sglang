@@ -9,12 +9,13 @@ import json
 import urllib.request
 from pathlib import Path
 
+from transformers import AutoTokenizer
 
-def long_prompt(approx_tokens: int) -> tuple[str, str]:
-    marker = f"MSA-{approx_tokens}-C7F29A"
+
+def _render_long_prompt(repetitions: int, target_tokens: int) -> tuple[str, str]:
+    marker = f"MSA-{target_tokens}-C7F29A"
     sentence = "Archive row 314159 contains ordinary calibration material. "
-    target_chars = approx_tokens * 4
-    filler = (sentence * (target_chars // len(sentence) + 1))[:target_chars]
+    filler = sentence * repetitions
     insert_at = len(filler) * 2 // 3
     context = filler[:insert_at] + f"\nSECRET CODE: {marker}\n" + filler[insert_at:]
     prompt = (
@@ -22,6 +23,31 @@ def long_prompt(approx_tokens: int) -> tuple[str, str]:
         f"<archive>\n{context}\n</archive>"
     )
     return prompt, marker
+
+
+def long_prompt(tokenizer, target_tokens: int) -> tuple[str, str, int]:
+    """Build a prompt whose measured tokenizer length reaches ``target_tokens``."""
+
+    low, high = 0, max(1, target_tokens // 8)
+    while True:
+        prompt, _ = _render_long_prompt(high, target_tokens)
+        if len(tokenizer.encode(prompt, add_special_tokens=False)) >= target_tokens:
+            break
+        high *= 2
+    while low + 1 < high:
+        middle = (low + high) // 2
+        prompt, _ = _render_long_prompt(middle, target_tokens)
+        if len(tokenizer.encode(prompt, add_special_tokens=False)) >= target_tokens:
+            high = middle
+        else:
+            low = middle
+    prompt, marker = _render_long_prompt(high, target_tokens)
+    measured_tokens = len(tokenizer.encode(prompt, add_special_tokens=False))
+    if measured_tokens < target_tokens:
+        raise RuntimeError(
+            f"failed to construct a {target_tokens}-token prompt: {measured_tokens}"
+        )
+    return prompt, marker, measured_tokens
 
 
 def post_json(url: str, payload: dict) -> dict:
@@ -56,18 +82,22 @@ def main() -> None:
     parser.add_argument("--long-tokens", type=int, nargs="+", default=[32768, 65536])
     args = parser.parse_args()
 
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    short_prompt = "Return only the string MSA-SHORT-4B19. Do not add punctuation."
     cases = [
         (
             "short",
-            "Return only the string MSA-SHORT-4B19. Do not add punctuation.",
+            short_prompt,
             "MSA-SHORT-4B19",
+            len(tokenizer.encode(short_prompt, add_special_tokens=False)),
         )
     ]
     cases.extend(
-        (f"long_{tokens}", *long_prompt(tokens)) for tokens in args.long_tokens
+        (f"long_{tokens}", *long_prompt(tokenizer, tokens))
+        for tokens in args.long_tokens
     )
     records = []
-    for name, prompt, expected in cases:
+    for name, prompt, expected, prompt_tokens in cases:
         body = post_json(
             args.base_url.rstrip("/") + "/v1/chat/completions",
             {
@@ -84,6 +114,7 @@ def main() -> None:
                 "name": name,
                 "expected": expected,
                 "exact_expected": content == expected,
+                "prompt_tokens": prompt_tokens,
                 "reasoning_content": reasoning,
                 "content": content,
                 "response_sha256": hashlib.sha256(canonical.encode()).hexdigest(),
