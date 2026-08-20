@@ -817,6 +817,10 @@ class DeepseekV4AscendAttnBackend(
             getattr(model_runner, "is_draft_worker", False)
             and self._is_dspark_algorithm
         )
+        # The host metadata op is selected in _kernel_metadata_from_parts exactly
+        # on the DSpark draft worker; the CPU mirrors that feed it are built under
+        # the same condition.
+        self._use_host_sparse_metadata = self._is_dspark_draft_worker
         self._dsv4_graph_tokens_per_req = int(model_runner.decode_num_tokens_per_req())
         self._dsv4_state_pools_by_ratio = {
             pool.ratio: pool
