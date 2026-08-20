@@ -1130,6 +1130,41 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
         controller.move_hybrid_indices.assert_not_called()
 
+    def test_cache_controller_can_defer_write_submission_for_batching(self):
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.mem_pool_host = mock.Mock()
+        controller.mem_pool_host.alloc.return_value = _indices(8, 12)
+        controller.write_queue = []
+        controller.start_writing = mock.Mock()
+        device_indices = _indices(0, 4)
+
+        host_indices = controller.write(
+            device_indices, node_id=7, defer_start=True
+        )
+
+        self.assertTrue(torch.equal(host_indices, _indices(8, 12)))
+        self.assertEqual(len(controller.write_queue), 1)
+        self.assertEqual(controller.write_queue[0].node_ids, [7])
+        controller.start_writing.assert_not_called()
+
+    def test_hybrid_controller_can_defer_write_submission_for_batching(self):
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mem_pool_host = mock.Mock()
+        controller.mem_pool_host.alloc.return_value = _indices(8, 12)
+        controller._resolve_pool_transfers_allocation = mock.Mock(return_value=[])
+        controller.write_queue = []
+        controller.start_writing = mock.Mock()
+        device_indices = _indices(0, 4)
+
+        host_indices = controller.write(
+            device_indices, node_id=9, defer_start=True
+        )
+
+        self.assertTrue(torch.equal(host_indices, _indices(8, 12)))
+        self.assertEqual(len(controller.write_queue), 1)
+        self.assertEqual(controller.write_queue[0].node_ids, [9])
+        controller.start_writing.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -117,6 +117,11 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 
 logger = logging.getLogger(__name__)
 
+# Write-back eviction can visit hundreds of small radix leaves in one scheduler
+# pass. Submit several leaves together so the L2 backend can merge their index
+# ranges into one transfer operation, while keeping each batch bounded.
+_WRITE_BACK_EVICTION_BATCH_SIZE = 32
+
 
 class _OngoingWriteThrough(NamedTuple):
     """Tracks an in-flight D→H write-through operation."""
@@ -617,6 +622,33 @@ class UnifiedRadixCache(BasePrefixCache):
         self._accumulate_tracker(tracker, result.tracker)
         return result.is_dropped
 
+    def _flush_write_back_eviction_batch(
+        self,
+        node_ids: list[NodeId],
+        tracker: dict[ComponentType, int],
+    ) -> None:
+        """Submit queued leaf backups together, then safely demote them."""
+        # The common eviction driver also serves caches without HiCache.  Such
+        # passes cannot have deferred write-back work and need no flush.
+        if self.cache_controller is None:
+            assert not node_ids and not self.ongoing_write_through
+            return
+        if (
+            not node_ids
+            and not self.cache_controller.write_queue
+            and not self.ongoing_write_through
+        ):
+            return
+
+        # CacheController.write(..., defer_start=True) leaves the operations in
+        # write_queue. start_writing merges those operations so each host pool
+        # receives one larger transfer instead of one transfer per radix leaf.
+        self.cache_controller.start_writing()
+        self.writing_check(write_back=True)
+        for node_id in node_ids:
+            self._demote(node_id, tracker)
+        node_ids.clear()
+
     def _evict_components(
         self,
         request_by_type: dict[ComponentType, int],
@@ -631,21 +663,59 @@ class UnifiedRadixCache(BasePrefixCache):
             if tracker[ct] >= request_cnt:
                 continue
             self.tree_core.evict_device_start(ct, request_cnt)
+            pending_node_ids: list[NodeId] = []
+            pending_tokens = 0
             try:
-                while (
-                    node_id := self._evict_device_next_node(ct, tracker)
-                ) is not None:
+                while tracker[ct] + pending_tokens < request_cnt:
+                    node_id = self._evict_device_next_node(ct, tracker)
+                    if node_id is None:
+                        if pending_node_ids:
+                            # A Full eviction cursor discovers a parent only
+                            # after its last device-resident child is demoted.
+                            # Deferred demotion can therefore exhaust the
+                            # current frontier even though flushing this batch
+                            # immediately exposes more candidates.  Rebuild the
+                            # cursor after the flush so deep radix chains keep
+                            # the same eviction semantics as the unbatched
+                            # path, while independent leaves still share one
+                            # transfer.
+                            self._flush_write_back_eviction_batch(
+                                pending_node_ids, tracker
+                            )
+                            pending_tokens = 0
+                            if tracker[ct] < request_cnt:
+                                self.tree_core.evict_device_end(ct)
+                                self.tree_core.evict_device_start(ct, request_cnt)
+                                continue
+                        break
                     backup_kv = self._evict_device_leaf(node_id, tracker)
                     if backup_kv is not None:
-                        # Deferred demote: run the D->H backup, demote only on success.
-                        written = self._execute_and_commit_kv_backup(
-                            backup_kv, write_back=True
+                        # Keep the leaf resident until its D->H batch completes.
+                        value = (
+                            self.tree_core.node_by_id(node_id).component_data[ct].value
                         )
-                        freed_before_drop = dict(tracker)
+                        assert value is not None
+                        written = self._execute_and_commit_kv_backup(
+                            backup_kv,
+                            write_back=True,
+                            defer_start=True,
+                        )
                         if written > 0:
-                            self.writing_check(write_back=True)
-                            self._demote(node_id, tracker)
-                        elif self._drop_subtree_no_host(node_id, tracker):
+                            pending_node_ids.append(node_id)
+                            pending_tokens += len(value)
+                            if len(pending_node_ids) >= _WRITE_BACK_EVICTION_BATCH_SIZE:
+                                self._flush_write_back_eviction_batch(
+                                    pending_node_ids, tracker
+                                )
+                                pending_tokens = 0
+                            continue
+
+                        # A failed host allocation must not strand backups that
+                        # were already committed earlier in this batch.
+                        self._flush_write_back_eviction_batch(pending_node_ids, tracker)
+                        pending_tokens = 0
+                        freed_before_drop = dict(tracker)
+                        if self._drop_subtree_no_host(node_id, tracker):
                             self._record_dropped_tokens(tracker, freed_before_drop)
                             logger.warning(
                                 "write_back: KV subtree dropped without backup "
@@ -661,7 +731,10 @@ class UnifiedRadixCache(BasePrefixCache):
                                 node_id,
                             )
             finally:
-                self.tree_core.evict_device_end(ct)
+                try:
+                    self._flush_write_back_eviction_batch(pending_node_ids, tracker)
+                finally:
+                    self.tree_core.evict_device_end(ct)
 
     def _record_dropped_tokens(
         self,
@@ -1238,7 +1311,11 @@ class UnifiedRadixCache(BasePrefixCache):
     # ---- HiCache: Backup / LoadBack ----
 
     def _execute_and_commit_kv_backup(
-        self, action: BackupKV, write_back: bool = False
+        self,
+        action: BackupKV,
+        write_back: bool = False,
+        *,
+        defer_start: bool = False,
     ) -> int:
         """Run a backup action top-down, stopping at the first failed backup."""
         if self.buffer_pipeline is not None:
@@ -1260,7 +1337,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 continue
             sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
             host_indices = self._execute_kv_backup(
-                node_id, device_value, comp_xfers, sidecar_xfers
+                node_id,
+                device_value,
+                comp_xfers,
+                sidecar_xfers,
+                defer_start=defer_start,
             )
             if host_indices is None:
                 return 0
@@ -1279,7 +1360,15 @@ class UnifiedRadixCache(BasePrefixCache):
             CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
         )
 
-    def _execute_kv_backup(self, node_id, device_value, comp_xfers, sidecar_xfers):
+    def _execute_kv_backup(
+        self,
+        node_id,
+        device_value,
+        comp_xfers,
+        sidecar_xfers,
+        *,
+        defer_start: bool = False,
+    ):
         """Execute Backup action."""
         kv_tokens = len(device_value)
         host_avail = self.cache_controller.mem_pool_host.available_size()
@@ -1290,7 +1379,10 @@ class UnifiedRadixCache(BasePrefixCache):
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
         return self.cache_controller.write(
-            device_value, node_id=node_id, extra_pools=aux_xfers or None
+            device_value,
+            node_id=node_id,
+            extra_pools=aux_xfers or None,
+            defer_start=defer_start,
         )
 
     def _track_write_through_node(
