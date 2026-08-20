@@ -2596,15 +2596,17 @@ def initialize_model_parallel(
             max_world_size=max_world_size,
         )
 
-    # Current CANN collective-matmul kernels support at most eight ranks.
-    # When attention TP is wider, replicate only the K3 shared-expert weights
-    # across contiguous TP8 subgroups. Each subgroup owns disjoint token rows,
-    # so this preserves DP4/attention-TP16 while making AG+MM and MM+RS legal.
+    # Keep K3 shared-expert collectives inside contiguous TP8 subgroups on NPU.
+    # Each subgroup owns disjoint token rows, so this preserves DP4/attention-
+    # TP16 while avoiding cross-node collectives. The same group also makes
+    # the optional CANN collective-matmul operators legal (maximum TP8).
     global _NPU_FUSED_MATMUL_TP
     assert _NPU_FUSED_MATMUL_TP is None, (
         "NPU fused-matmul tensor parallel group is already initialized"
     )
-    if envs.SGLANG_NPU_FUSED_COLLECTIVE_MATMUL.get():
+    if envs.SGLANG_NPU_FUSED_COLLECTIVE_MATMUL.get() or (
+        _is_npu and envs.SGLANG_K3_SHARED_EXPERTS_ATTN_TP.get()
+    ):
         fused_tp_size = min(attn_tp_size, 8)
         if attn_tp_size % fused_tp_size != 0:
             raise RuntimeError(
