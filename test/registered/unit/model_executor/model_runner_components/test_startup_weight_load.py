@@ -35,7 +35,10 @@ from sglang.srt.model_executor.model_runner_components.startup_weight_load impor
     evaluate_startup_weight_load_admission,
 )
 from sglang.srt.model_loader.loader import DefaultModelLoader
-from sglang.srt.model_loader.weight_utils import initialize_capture_safe_weights
+from sglang.srt.model_loader.weight_utils import (
+    initialize_capture_safe_weights,
+    restore_optional_checkpoint_parameter_values,
+)
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 
@@ -62,6 +65,7 @@ def _make_options(**overrides):
     options = StartupWeightLoadOptions(
         device="cuda",
         is_cuda_platform=True,
+        cuda_device_capability=(9, 0),
         cuda_graph_enabled=True,
         prefill_cuda_graph_backend=Backend.FULL,
         is_draft_worker=False,
@@ -75,6 +79,13 @@ def _make_options(**overrides):
         moe_dp_size=1,
         moe_a2a_backend="none",
         moe_runner_backend="triton",
+        fp8_gemm_runner_backend="triton",
+        prefill_attention_backend="dsa",
+        decode_attention_backend="dsa",
+        dsa_prefill_backend=None,
+        dsa_decode_backend=None,
+        kv_cache_dtype="bfloat16",
+        disable_shared_experts_fusion=False,
         enable_dp_attention=False,
         enable_two_batch_overlap=False,
         enable_eplb=False,
@@ -161,6 +172,30 @@ def _make_qwen3_moe_model_config(**overrides):
     return _make_model_config(**values)
 
 
+def _make_glm_moe_dsa_fp8_model_config(**overrides):
+    hf_config_overrides = overrides.pop("hf_config_overrides", {})
+    hf_config_values = dict(
+        architectures=["GlmMoeDsaForCausalLM"],
+        cli_factor=1,
+        index_topk_pattern=None,
+        index_skip_topk_offset=3,
+        index_topk_freq=4,
+        quantization_config={
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+        },
+    )
+    hf_config_values.update(hf_config_overrides)
+    values = dict(
+        hf_config=SimpleNamespace(**hf_config_values),
+        quantization="fp8",
+    )
+    values.update(overrides)
+    return _make_model_config(**values)
+
+
 class _RecordingPrefetchHandle:
     def __init__(self, trace, *, done=False, succeeded=True, errors=()):
         self._trace = trace
@@ -190,6 +225,7 @@ class _RecordingLoader:
         self._model = model
         self._trace = trace
         self.use_safetensors = True
+        self.hf_folder = "/dummy"
         self.prefetch_handle = _RecordingPrefetchHandle(trace)
 
     def initialize_model_for_startup(self, *, model_config, device_config):
@@ -199,7 +235,11 @@ class _RecordingLoader:
     def resolve_model_weights(self, model_config, model):
         self._trace.append("resolve")
         return tuple(
-            SimpleNamespace(use_safetensors=self.use_safetensors, source=object())
+            SimpleNamespace(
+                use_safetensors=self.use_safetensors,
+                source=object(),
+                hf_folder=self.hf_folder,
+            )
             for _ in range(getattr(self, "num_resolved_sources", 1))
         )
 
@@ -720,6 +760,269 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                         ),
                     )
 
+    def test_glm_moe_dsa_fp8_profile_is_admitted(self):
+        for tp_size in (8, 16):
+            with self.subTest(tp_size=tp_size):
+                manager = self._create(
+                    options=_make_options(
+                        tp_size=tp_size,
+                        prefill_cuda_graph_backend=Backend.DISABLED,
+                        dsa_prefill_backend="fa3",
+                        dsa_decode_backend="fa3",
+                        disable_shared_experts_fusion=True,
+                    ),
+                    model_config=_make_glm_moe_dsa_fp8_model_config(),
+                )
+
+                self.assertEqual(
+                    manager._plan.profile,
+                    StartupWeightLoadProfile.GLM_5_2_DSA_FP8,
+                )
+
+    def test_glm_moe_dsa_fp8_profile_rejects_near_misses(self):
+        valid_options = _make_options(
+            tp_size=16,
+            prefill_cuda_graph_backend=Backend.DISABLED,
+            dsa_prefill_backend="fa3",
+            dsa_decode_backend="fa3",
+            disable_shared_experts_fusion=True,
+        )
+        cases = (
+            (
+                "glm5_config",
+                dict(
+                    options=valid_options,
+                    model_config=_make_glm_moe_dsa_fp8_model_config(
+                        hf_config_overrides={
+                            "index_topk_freq": None,
+                            "index_skip_topk_offset": None,
+                        }
+                    ),
+                ),
+                "validated only for the GLM-5.2 DSA architecture",
+            ),
+            (
+                "custom_index_topk_frequency",
+                dict(
+                    options=valid_options,
+                    model_config=_make_glm_moe_dsa_fp8_model_config(
+                        hf_config_overrides={"index_topk_freq": 2}
+                    ),
+                ),
+                "validated only for the GLM-5.2 DSA architecture",
+            ),
+            (
+                "custom_index_topk_offset",
+                dict(
+                    options=valid_options,
+                    model_config=_make_glm_moe_dsa_fp8_model_config(
+                        hf_config_overrides={"index_skip_topk_offset": 1}
+                    ),
+                ),
+                "validated only for the GLM-5.2 DSA architecture",
+            ),
+            (
+                "custom_index_topk_pattern",
+                dict(
+                    options=valid_options,
+                    model_config=_make_glm_moe_dsa_fp8_model_config(
+                        hf_config_overrides={"index_topk_pattern": [0, 1]}
+                    ),
+                ),
+                "validated only for the GLM-5.2 DSA architecture",
+            ),
+            (
+                "custom_cli_factor",
+                dict(
+                    options=valid_options,
+                    model_config=_make_glm_moe_dsa_fp8_model_config(
+                        hf_config_overrides={"cli_factor": 2}
+                    ),
+                ),
+                "validated only for the GLM-5.2 DSA architecture",
+            ),
+            (
+                "blackwell",
+                dict(
+                    options=dataclasses.replace(
+                        valid_options, cuda_device_capability=(10, 0)
+                    )
+                ),
+                "validated only on NVIDIA Hopper",
+            ),
+            (
+                "tp4",
+                dict(options=dataclasses.replace(valid_options, tp_size=4)),
+                "requires TP8 or TP16",
+            ),
+            (
+                "fp16",
+                dict(
+                    options=valid_options,
+                    model_config=_make_glm_moe_dsa_fp8_model_config(
+                        dtype=torch.float16
+                    ),
+                ),
+                "requires --dtype bfloat16",
+            ),
+            (
+                "unquantized",
+                dict(
+                    options=valid_options,
+                    model_config=_make_glm_moe_dsa_fp8_model_config(quantization=None),
+                ),
+                "requires its serialized dynamic E4M3 FP8 checkpoint",
+            ),
+            (
+                "checkpoint_quant_method",
+                dict(
+                    options=valid_options,
+                    model_config=_make_glm_moe_dsa_fp8_model_config(
+                        hf_config=SimpleNamespace(
+                            architectures=["GlmMoeDsaForCausalLM"],
+                            cli_factor=1,
+                            index_topk_pattern=None,
+                            index_skip_topk_offset=3,
+                            index_topk_freq=4,
+                            quantization_config={
+                                "activation_scheme": "dynamic",
+                                "fmt": "e4m3",
+                                "quant_method": "compressed-tensors",
+                                "weight_block_size": [128, 128],
+                            },
+                        )
+                    ),
+                ),
+                "requires its serialized dynamic E4M3 FP8 checkpoint",
+            ),
+            (
+                "wrong_block_size",
+                dict(
+                    options=valid_options,
+                    model_config=_make_glm_moe_dsa_fp8_model_config(
+                        hf_config=SimpleNamespace(
+                            architectures=["GlmMoeDsaForCausalLM"],
+                            cli_factor=1,
+                            index_topk_pattern=None,
+                            index_skip_topk_offset=3,
+                            index_topk_freq=4,
+                            quantization_config={
+                                "activation_scheme": "dynamic",
+                                "fmt": "e4m3",
+                                "quant_method": "fp8",
+                                "weight_block_size": [64, 128],
+                            },
+                        )
+                    ),
+                ),
+                "requires 128x128 block scales",
+            ),
+            (
+                "expert_parallelism",
+                dict(options=dataclasses.replace(valid_options, ep_size=16)),
+                "does not yet support expert parallelism",
+            ),
+            (
+                "deepep",
+                dict(
+                    options=dataclasses.replace(valid_options, moe_a2a_backend="deepep")
+                ),
+                "requires --moe-a2a-backend none",
+            ),
+            (
+                "flashinfer_moe",
+                dict(
+                    options=dataclasses.replace(
+                        valid_options, moe_runner_backend="flashinfer_trtllm"
+                    )
+                ),
+                "requires --moe-runner-backend triton",
+            ),
+            (
+                "deep_gemm",
+                dict(
+                    options=dataclasses.replace(
+                        valid_options, fp8_gemm_runner_backend="deep_gemm"
+                    )
+                ),
+                "requires --fp8-gemm-backend triton",
+            ),
+            (
+                "base_attention_backend",
+                dict(
+                    options=dataclasses.replace(
+                        valid_options,
+                        prefill_attention_backend="fa3",
+                        decode_attention_backend="fa3",
+                    )
+                ),
+                "requires DSA for prefill and decode attention",
+            ),
+            (
+                "split_attention_backend",
+                dict(
+                    options=dataclasses.replace(
+                        valid_options, prefill_attention_backend="fa3"
+                    )
+                ),
+                "requires DSA for prefill and decode attention",
+            ),
+            (
+                "flashmla_sparse",
+                dict(
+                    options=dataclasses.replace(
+                        valid_options, dsa_prefill_backend="flashmla_sparse"
+                    )
+                ),
+                "requires FA3 for DSA prefill and decode",
+            ),
+            (
+                "dsa_decode_backend",
+                dict(
+                    options=dataclasses.replace(
+                        valid_options, dsa_decode_backend="flashmla_sparse"
+                    )
+                ),
+                "requires FA3 for DSA prefill and decode",
+            ),
+            (
+                "fp8_kv_cache",
+                dict(
+                    options=dataclasses.replace(
+                        valid_options, kv_cache_dtype="fp8_e4m3"
+                    )
+                ),
+                "requires --kv-cache-dtype bfloat16",
+            ),
+            (
+                "breakable_prefill_graph",
+                dict(
+                    options=dataclasses.replace(
+                        valid_options,
+                        prefill_cuda_graph_backend=Backend.BREAKABLE,
+                    )
+                ),
+                "requires prefill CUDA graphs disabled",
+            ),
+            (
+                "shared_experts_fusion",
+                dict(
+                    options=dataclasses.replace(
+                        valid_options, disable_shared_experts_fusion=False
+                    )
+                ),
+                "requires --disable-shared-experts-fusion",
+            ),
+        )
+        for name, kwargs, reason in cases:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, re.escape(reason)):
+                    create_kwargs = dict(
+                        model_config=_make_glm_moe_dsa_fp8_model_config()
+                    )
+                    create_kwargs.update(kwargs)
+                    self._create(**create_kwargs)
+
     def test_admission_collects_all_rejections_in_rule_order(self):
         model_config = _make_model_config(quantization="fp8")
         with (
@@ -807,10 +1110,11 @@ class TestStartupWeightLoadSelector(CustomTestCase):
         # The parallel sizes come from the bags, so the config has to be published.
         publish(server_args, role="test")
         self.addCleanup(reset_context)
-        options = StartupWeightLoadOptions.from_server_args(
-            server_args=server_args,
-            is_draft_worker=False,
-        )
+        with patch(f"{_STARTUP_MODULE}.current_platform.is_cuda", return_value=False):
+            options = StartupWeightLoadOptions.from_server_args(
+                server_args=server_args,
+                is_draft_worker=False,
+            )
 
         self.assertIsInstance(options, StartupWeightLoadOptions)
         self.assertEqual(options.linear_attn_backend, "triton")
@@ -818,6 +1122,49 @@ class TestStartupWeightLoadSelector(CustomTestCase):
         self.assertIsNone(options.linear_attn_prefill_backend)
         self.assertEqual(options.moe_a2a_backend, "none")
         self.assertEqual(options.moe_runner_backend, "auto")
+        self.assertEqual(
+            options.fp8_gemm_runner_backend, server_args.fp8_gemm_runner_backend
+        )
+        self.assertEqual(
+            (options.prefill_attention_backend, options.decode_attention_backend),
+            server_args.get_attention_backends(),
+        )
+        self.assertEqual(options.dsa_prefill_backend, server_args.dsa_prefill_backend)
+        self.assertEqual(options.dsa_decode_backend, server_args.dsa_decode_backend)
+        self.assertEqual(options.kv_cache_dtype, server_args.kv_cache_dtype)
+        self.assertEqual(
+            options.disable_shared_experts_fusion,
+            server_args.disable_shared_experts_fusion,
+        )
+        self.assertIsNone(options.cuda_device_capability)
+
+        with (
+            patch(f"{_STARTUP_MODULE}.current_platform.is_cuda", return_value=True),
+            patch(
+                f"{_STARTUP_MODULE}.current_platform.get_device_capability",
+                return_value=(9, 0),
+            ),
+        ):
+            cuda_options = StartupWeightLoadOptions.from_server_args(
+                server_args=server_args,
+                is_draft_worker=False,
+            )
+        self.assertEqual(cuda_options.cuda_device_capability, (9, 0))
+
+        server_args.attention_backend = "dsa"
+        server_args.prefill_attention_backend = "fa3"
+        with patch(f"{_STARTUP_MODULE}.current_platform.is_cuda", return_value=False):
+            split_options = StartupWeightLoadOptions.from_server_args(
+                server_args=server_args,
+                is_draft_worker=False,
+            )
+        self.assertEqual(
+            (
+                split_options.prefill_attention_backend,
+                split_options.decode_attention_backend,
+            ),
+            ("fa3", "dsa"),
+        )
 
         for mode, expected_overlap, expected_attempt in (
             ("serial", False, False),
@@ -995,6 +1342,23 @@ class TestStartupWeightLoadManager(CustomTestCase):
         self.assertEqual(manager.state, StartupWeightLoadState.READY)
         self.assertFalse(manager.is_deferred)
 
+    def test_auto_supported_safetensors_source_overlaps_regardless_of_path(self):
+        for hf_folder in ("/local/model", "/remote/model"):
+            with self.subTest(hf_folder=hf_folder):
+                trace = []
+                loader = _RecordingLoader(_TiedWeightModel(), trace)
+                loader.hf_folder = hf_folder
+                manager = self._manager(loader, fallback_to_serial=True)
+
+                manager.prepare()
+
+                self.assertEqual(
+                    trace,
+                    ["initialize", "resolve", "prepare_capture"],
+                )
+                self.assertEqual(manager.state, StartupWeightLoadState.CAPTURE_READY)
+                self.assertTrue(manager.is_deferred)
+
     def test_plan_prefetch_thread_count_reaches_the_loader(self):
         trace = []
         loader = _RecordingLoader(_TiedWeightModel(), trace)
@@ -1039,10 +1403,10 @@ class TestStartupWeightLoadManager(CustomTestCase):
                 "prepare_capture",
                 "start_prefetch",
                 "capture",
-                "commit",
                 "stop_prefetch",
                 "cancel_prefetch",
                 "wait_prefetch",
+                "commit",
             ],
         )
 
@@ -1052,7 +1416,7 @@ class TestStartupWeightLoadManager(CustomTestCase):
         self.assertIs(model.weight, model.tied_weight)
         torch.testing.assert_close(model.weight, torch.full_like(model.weight, 3))
         self.assertTrue(log_info.call_args.args[0].startswith("Load weight end."))
-        self.assertTrue(manager._loader.startup_prefetch_active)
+        self.assertFalse(manager._loader.startup_prefetch_active)
         self.assertEqual(
             parallel_state_patch.call_args_list,
             [call(), call(reverse=True)],
@@ -1063,7 +1427,7 @@ class TestStartupWeightLoadManager(CustomTestCase):
         model = _TiedWeightModel()
         with patch(
             f"{_STARTUP_MODULE}.time.perf_counter",
-            side_effect=(0.0, 2.0, 3.0, 7.0, 11.0, 13.0),
+            side_effect=(0.0, 2.0, 3.0, 7.0, 8.0, 11.0, 13.0),
         ):
             manager = self._manager(_RecordingLoader(model, trace))
             manager.prepare()
@@ -1080,8 +1444,8 @@ class TestStartupWeightLoadManager(CustomTestCase):
                 prepare_seconds=2.0,
                 prefetch_start_delay_seconds=1.0,
                 prefetch_window_seconds=4.0,
-                commit_seconds=4.0,
-                prefetch_cleanup_seconds=2.0,
+                commit_seconds=3.0,
+                prefetch_cleanup_seconds=3.0,
                 total_seconds=13.0,
             ),
         )
@@ -1205,11 +1569,11 @@ class TestStartupWeightLoadManager(CustomTestCase):
         ):
             manager.finalize()
 
-        self.assertTrue(loader.startup_prefetch_active)
+        self.assertFalse(loader.startup_prefetch_active)
         warning.assert_called_once()
         self.assertIn("falling back", warning.call_args.args[2])
+        self.assertLess(trace.index("stop_prefetch"), trace.index("commit"))
         self.assertLess(trace.index("cancel_prefetch"), trace.index("commit"))
-        self.assertLess(trace.index("commit"), trace.index("stop_prefetch"))
 
     def test_failed_completed_prefetch_does_not_disable_multithread_loading(self):
         trace = []
@@ -1229,7 +1593,8 @@ class TestStartupWeightLoadManager(CustomTestCase):
             manager.finalize()
 
         self.assertFalse(loader.startup_prefetch_active)
-        self.assertLess(trace.index("cancel_prefetch"), trace.index("commit"))
+        self.assertLess(trace.index("wait_prefetch"), trace.index("commit"))
+        self.assertNotIn("cancel_prefetch", trace)
         self.assertIn("wait_prefetch", trace)
         self.assertNotIn("stop_prefetch", trace)
 
@@ -1255,16 +1620,22 @@ class TestStartupWeightLoadManager(CustomTestCase):
         self.assertIn("terminated before completion", warning.call_args.args[1])
         self.assertIn("falling back", warning.call_args.args[2])
 
-    def test_prefetch_failure_during_commit_is_reported_after_real_load(self):
+    def test_prefetch_failure_during_commit_after_stop_timeout_is_reported(self):
         trace = []
         model = _TiedWeightModel()
         loader = _RecordingLoader(model, trace)
         original_commit = loader.commit_model_weights
 
+        def stop_times_out(timeout=None):
+            trace.append("stop_prefetch")
+            loader.prefetch_handle.cancel()
+            raise TimeoutError("Timed out waiting for checkpoint prefetching")
+
         def fail_prefetch_during_commit(**kwargs):
             original_commit(**kwargs)
             loader.prefetch_handle.errors = (("late.safetensors", OSError("failed")),)
 
+        loader.prefetch_handle.stop = stop_times_out
         loader.commit_model_weights = fail_prefetch_during_commit
         manager = self._manager(loader)
         manager.prepare()
@@ -1277,20 +1648,24 @@ class TestStartupWeightLoadManager(CustomTestCase):
         ):
             manager.finalize()
 
-        warning.assert_called_once()
-        self.assertIn("completed despite", warning.call_args.args[2])
-        self.assertLess(trace.index("commit"), trace.index("stop_prefetch"))
+        self.assertIn(
+            "completed despite",
+            warning.call_args_list[-1].args[2],
+        )
+        self.assertLess(trace.index("stop_prefetch"), trace.index("commit"))
+        self.assertEqual(trace.count("stop_prefetch"), 1)
 
-    def test_stop_timeout_after_commit_does_not_fail_startup(self):
+    def test_stop_timeout_before_commit_falls_back_without_second_wait(self):
         trace = []
         model = _TiedWeightModel()
         loader = _RecordingLoader(model, trace)
 
-        def _stop_times_out(timeout=None):
+        def stop_times_out(timeout=None):
             trace.append("stop_prefetch")
+            loader.prefetch_handle.cancel()
             raise TimeoutError("Timed out waiting for checkpoint prefetching")
 
-        loader.prefetch_handle.stop = _stop_times_out
+        loader.prefetch_handle.stop = stop_times_out
         manager = self._manager(loader)
         manager.prepare()
         manager.start_prefetch()
@@ -1303,9 +1678,38 @@ class TestStartupWeightLoadManager(CustomTestCase):
             manager.finalize()
 
         self.assertEqual(manager.state, StartupWeightLoadState.READY)
-        self.assertIn("stop_prefetch", trace)
-        warning.assert_called_once()
-        self.assertIn("did not stop within its timeout", warning.call_args.args[0])
+        self.assertTrue(loader.startup_prefetch_active)
+        self.assertEqual(trace.count("stop_prefetch"), 1)
+        self.assertLess(trace.index("stop_prefetch"), trace.index("commit"))
+        self.assertEqual(warning.call_count, 2)
+        self.assertIn("did not stop before", warning.call_args_list[0].args[0])
+        self.assertIn("still exiting after", warning.call_args_list[1].args[0])
+
+    def test_worker_finishing_at_stop_timeout_restores_normal_loader(self):
+        trace = []
+        model = _TiedWeightModel()
+        loader = _RecordingLoader(model, trace)
+
+        def finish_at_timeout(timeout=None):
+            trace.append("stop_prefetch")
+            loader.prefetch_handle.cancel()
+            loader.prefetch_handle.done = True
+            raise TimeoutError("Timed out waiting for checkpoint prefetching")
+
+        loader.prefetch_handle.stop = finish_at_timeout
+        manager = self._manager(loader)
+        manager.prepare()
+        manager.start_prefetch()
+
+        with (
+            patch(f"{_STARTUP_MODULE}.monkey_patch_vllm_parallel_state"),
+            patch(f"{_STARTUP_MODULE}.torch.cuda.synchronize"),
+        ):
+            manager.finalize()
+
+        self.assertFalse(loader.startup_prefetch_active)
+        self.assertLess(trace.index("wait_prefetch"), trace.index("commit"))
+        self.assertEqual(trace.count("wait_prefetch"), 1)
 
     def test_start_prefetch_requires_capture_ready_and_starts_once(self):
         trace = []
@@ -1508,6 +1912,35 @@ class TestModelStorageManifest(CustomTestCase):
                 with self.assertRaisesRegex(error_type, message):
                     ModelStorageManifest.capture(model)
 
+    def test_deepseek_mla_exposes_graph_visible_post_load_operands(self):
+        from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
+        w_kc = torch.ones(2, 3)
+        w_vc = torch.ones(3, 2)
+        w_scale = torch.ones(1)
+        w_scale_k = torch.ones(1)
+        w_scale_v = torch.ones(1)
+        attention = SimpleNamespace(
+            w_kc=w_kc,
+            w_vc=w_vc,
+            w_scale=w_scale,
+            w_scale_k=w_scale_k,
+            w_scale_v=w_scale_v,
+        )
+
+        derived = dict(
+            DeepseekV2AttentionMLA.named_startup_weight_load_derived_tensors(attention)
+        )
+        self.assertEqual(
+            tuple(derived),
+            ("w_kc", "w_vc", "w_scale", "w_scale_k", "w_scale_v"),
+        )
+        self.assertIs(derived["w_kc"], w_kc)
+        self.assertIs(derived["w_vc"], w_vc)
+        self.assertIs(derived["w_scale"], w_scale)
+        self.assertIs(derived["w_scale_k"], w_scale_k)
+        self.assertIs(derived["w_scale_v"], w_scale_v)
+
 
 class TestCaptureSafeWeightInitialization(CustomTestCase):
     def test_only_parameters_are_filled(self):
@@ -1517,6 +1950,126 @@ class TestCaptureSafeWeightInitialization(CustomTestCase):
 
         torch.testing.assert_close(model.weight, torch.full_like(model.weight, 0.125))
         torch.testing.assert_close(model.scale, torch.ones_like(model.scale))
+
+    def test_optional_checkpoint_parameters_keep_post_load_defaults(self):
+        from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+
+        layer = nn.Module()
+        method = BaseKVCacheMethod(quant_config=None)
+        method.create_weights(layer)
+
+        optional_values = initialize_capture_safe_weights(layer, value=0.125)
+
+        self.assertEqual(layer.k_scale.item(), -1.0)
+        self.assertEqual(layer.v_scale.item(), -1.0)
+        method.process_weights_after_loading(layer)
+        self.assertEqual(layer.k_scale.item(), 1.0)
+        self.assertEqual(layer.v_scale.item(), 1.0)
+
+        # Restore the constructor values before the real checkpoint commit so
+        # optional-weight post-load logic observes the same inputs as serial.
+        k_scale_ptr = layer.k_scale.data_ptr()
+        v_scale_ptr = layer.v_scale.data_ptr()
+        restore_optional_checkpoint_parameter_values(optional_values)
+        method.process_weights_after_loading(layer)
+        self.assertEqual(layer.k_scale.data_ptr(), k_scale_ptr)
+        self.assertEqual(layer.v_scale.data_ptr(), v_scale_ptr)
+        self.assertEqual(layer.k_scale.item(), 1.0)
+        self.assertEqual(layer.v_scale.item(), 1.0)
+
+    def test_single_checkpoint_kv_scale_keeps_serial_post_load_semantics(self):
+        from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+
+        layer = nn.Module()
+        method = BaseKVCacheMethod(quant_config=None)
+        method.create_weights(layer)
+        k_scale_ptr = layer.k_scale.data_ptr()
+        v_scale_ptr = layer.v_scale.data_ptr()
+        optional_values = initialize_capture_safe_weights(layer)
+        method.process_weights_after_loading(layer)
+
+        restore_optional_checkpoint_parameter_values(optional_values)
+        layer.k_scale.copy_(0.5)
+        method.process_weights_after_loading(layer)
+
+        self.assertEqual(layer.k_scale.item(), 0.5)
+        self.assertEqual(layer.v_scale.item(), 0.5)
+        self.assertEqual(layer.k_scale.data_ptr(), k_scale_ptr)
+        self.assertEqual(layer.v_scale.data_ptr(), v_scale_ptr)
+
+    def test_separate_checkpoint_kv_scales_survive_capture_post_load(self):
+        from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+
+        layer = nn.Module()
+        method = BaseKVCacheMethod(quant_config=None)
+        method.create_weights(layer)
+        optional_values = initialize_capture_safe_weights(layer)
+        method.process_weights_after_loading(layer)
+
+        restore_optional_checkpoint_parameter_values(optional_values)
+        layer.k_scale.copy_(0.5)
+        layer.v_scale.copy_(0.25)
+        method.process_weights_after_loading(layer)
+
+        self.assertEqual(layer.k_scale.item(), 0.5)
+        self.assertEqual(layer.v_scale.item(), 0.25)
+
+    def test_default_loader_restores_optional_values_before_real_load(self):
+        from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+
+        model = nn.Module()
+        model.attn = nn.Module()
+        method = BaseKVCacheMethod(quant_config=None)
+        method.create_weights(model.attn)
+        model.attn.quant_method = method
+        model_config = SimpleNamespace(dtype=torch.float32)
+        loader = DefaultModelLoader(LoadConfig(load_format=LoadFormat.SAFETENSORS))
+
+        loader.prepare_model_for_capture(model=model, model_config=model_config)
+        k_scale_ptr = model.attn.k_scale.data_ptr()
+        v_scale_ptr = model.attn.v_scale.data_ptr()
+        self.assertEqual(model.attn.k_scale.item(), 1.0)
+        self.assertEqual(model.attn.v_scale.item(), 1.0)
+
+        def load_real_scale(model, weights, target_device):
+            self.assertEqual(model.attn.k_scale.item(), -1.0)
+            self.assertEqual(model.attn.v_scale.item(), -1.0)
+            model.attn.k_scale.copy_(0.5)
+            method.process_weights_after_loading(model.attn)
+
+        with patch.object(
+            loader,
+            "load_weights_and_postprocess",
+            side_effect=load_real_scale,
+        ):
+            loader.commit_model_weights(
+                model=model,
+                model_config=model_config,
+                resolved_sources=(),
+                target_device=torch.device("cpu"),
+                startup_prefetch_active=False,
+            )
+
+        self.assertEqual(model.attn.k_scale.data_ptr(), k_scale_ptr)
+        self.assertEqual(model.attn.v_scale.data_ptr(), v_scale_ptr)
+        self.assertEqual(model.attn.k_scale.item(), 0.5)
+        self.assertEqual(model.attn.v_scale.item(), 0.5)
+        self.assertEqual(model.attn.k_scale_float, 0.5)
+        self.assertEqual(model.attn.v_scale_float, 0.5)
+        self.assertIsNone(loader._startup_optional_parameter_values)
+
+    def test_manifest_sentinel_check_omits_optional_parameters(self):
+        model = _TiedWeightModel()
+        model.optional_weight = nn.Parameter(torch.full((1,), 0.125))
+        model.optional_weight._skip_weight_check = True
+        with torch.no_grad():
+            model.weight.fill_(0.125)
+        manifest = ModelStorageManifest.capture(model)
+
+        self.assertEqual(
+            manifest.unchanged_parameter_names(0.125),
+            ("parameter:tied_weight",),
+        )
 
 
 class _LifecycleRunner:
