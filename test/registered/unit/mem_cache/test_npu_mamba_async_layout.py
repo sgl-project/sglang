@@ -5,8 +5,8 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-import sglang.srt.mem_cache.memory_pool_host as memory_pool_host
-from sglang.srt.mem_cache.memory_pool_host import (
+import sglang.srt.mem_cache.pool_host.mamba as mamba_pool_host
+from sglang.srt.mem_cache.pool_host.mamba import (
     MambaPoolHost,
     _npu_hicache_mamba_io_mode,
 )
@@ -29,14 +29,14 @@ class TestNPUMambaAsyncConfig(unittest.TestCase):
         ), self.assertRaisesRegex(ValueError, "must be one of"):
             _npu_hicache_mamba_io_mode()
 
-    @patch.object(memory_pool_host, "_is_npu", True)
+    @patch.object(mamba_pool_host, "_is_npu", True)
     @patch.object(
-        memory_pool_host,
+        mamba_pool_host,
         "_npu_hicache_mamba_io_mode",
         return_value="async",
     )
-    @patch.object(memory_pool_host, "transfer_state_per_layer_direct_pf_lf", None)
-    @patch.object(memory_pool_host, "transfer_state_all_layer_direct_lf_pf", None)
+    @patch.object(mamba_pool_host, "transfer_state_per_layer_direct_pf_lf", None)
+    @patch.object(mamba_pool_host, "transfer_state_all_layer_direct_lf_pf", None)
     def test_async_requires_native_operator(self, _mock_mode):
         pool = MambaPoolHost.__new__(MambaPoolHost)
 
@@ -54,11 +54,11 @@ class TestNPUMambaAsyncConfig(unittest.TestCase):
 
         transfer_op = MagicMock()
         with patch.object(
-            memory_pool_host,
+            mamba_pool_host,
             "transfer_state_per_layer_direct_pf_lf",
             transfer_op,
         ), patch.object(
-            memory_pool_host,
+            mamba_pool_host,
             "_npu_hicache_mamba_io_mode",
             return_value="async",
         ):
@@ -89,11 +89,11 @@ class TestNPUMambaAsyncConfig(unittest.TestCase):
 
         transfer_op = MagicMock()
         with patch.object(
-            memory_pool_host,
+            mamba_pool_host,
             "transfer_state_all_layer_direct_lf_pf",
             transfer_op,
         ), patch.object(
-            memory_pool_host,
+            mamba_pool_host,
             "_npu_hicache_mamba_io_mode",
             return_value="async",
         ):
@@ -122,7 +122,7 @@ class TestNPUMambaAsyncConfig(unittest.TestCase):
         device_indices = torch.tensor([0, 4])
 
         with patch.object(
-            memory_pool_host,
+            mamba_pool_host,
             "_npu_hicache_mamba_io_mode",
             return_value="sync",
         ):

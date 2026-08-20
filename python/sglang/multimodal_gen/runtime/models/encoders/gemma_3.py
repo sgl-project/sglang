@@ -4,7 +4,6 @@
 # Adapted from sglang: python/sglang/srt/models/gemma3_causal.py
 
 import logging
-from contextlib import nullcontext
 from typing import Any, Iterable, Optional, Set, Tuple
 
 import torch
@@ -12,10 +11,7 @@ from torch import nn
 
 from sglang.multimodal_gen.configs.models.encoders.base import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.gemma_3 import Gemma3Config
-from sglang.multimodal_gen.runtime.distributed import get_tp_group, get_tp_world_size
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    patch_tensor_parallel_group,
-)
+from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.activation import GeluAndMul
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
@@ -27,6 +23,9 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import get_rope
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
+)
+from sglang.multimodal_gen.runtime.models.encoders.base import (
+    EncoderTensorParallelMixin,
 )
 from sglang.multimodal_gen.runtime.utils.common import add_prefix
 from sglang.srt.models.siglip import SiglipVisionModel
@@ -678,7 +677,9 @@ class Gemma3TextModel(nn.Module):
         return loaded_params
 
 
-class Gemma3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixin):
+class Gemma3ForConditionalGeneration(
+    EncoderTensorParallelMixin, nn.Module, LayerwiseOffloadableModuleMixin
+):
     # transformers 5.6.0 flattened SiglipVisionModel, dropping the
     # `vision_model` intermediate wrapper. Our reimpl keeps it, so remap
     # HF source keys back into our nested namespace when transferring weights.
@@ -704,7 +705,6 @@ class Gemma3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixin)
         self.config = config
         self.quant_config = quant_config
         self.text_config = config.text_config
-        self._vision_tensor_parallel_group = get_tp_group()
 
         # Vision Tower
         self.vision_tower = SiglipVisionModel(
@@ -719,11 +719,6 @@ class Gemma3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixin)
 
         # Text Model
         self.language_model = Gemma3TextModel(config)
-
-    def _vision_parallel_context(self):
-        if get_tp_group() is self._vision_tensor_parallel_group:
-            return nullcontext()
-        return patch_tensor_parallel_group(self._vision_tensor_parallel_group)
 
     def get_placeholder_mask(
         self,
@@ -777,8 +772,7 @@ class Gemma3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixin)
             elif pixel_values.dim() != 4:
                 raise ValueError(f"Unexpected pixel_values shape: {pixel_values.shape}")
 
-            with self._vision_parallel_context():
-                vision_outputs = self.vision_tower(pixel_values)
+            vision_outputs = self.vision_tower(pixel_values)
             image_features = self.multi_modal_projector(vision_outputs)
             image_features = image_features.to(
                 device=inputs_embeds.device, dtype=inputs_embeds.dtype

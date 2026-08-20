@@ -203,17 +203,24 @@ def rocm_absorb_v_bmm(
     else:
         _bmm_buf = None
         if _use_aiter_gfx95 and attn.w_kc.dtype == torch.float8_e4m3fn:
-            attn_bmm_output = (
-                batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
-                    X=attn_output,
-                    WQ=attn.w_vc.transpose(-1, -2),
-                    w_scale=attn.w_scale,
-                    group_size=128,
-                    YQ=None,
-                    transpose_bm=False,
-                    transpose_bm_in=True,
-                    dtype=torch.bfloat16,
-                )
+            # As in the mxfp4 path above, write (batch, heads, dim) so the
+            # post-GEMM flatten is a free view instead of a copy.
+            _bmm_buf = torch.empty(
+                attn_output.shape[0],
+                attn.num_local_heads,
+                attn.w_vc.shape[-1],
+                device=attn_output.device,
+                dtype=torch.bfloat16,
+            )
+            batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
+                X=attn_output,
+                WQ=attn.w_vc.transpose(-1, -2),
+                w_scale=attn.w_scale,
+                group_size=128,
+                YQ=_bmm_buf,
+                transpose_bm=True,
+                transpose_bm_in=True,
+                dtype=torch.bfloat16,
             )
         else:
             attn_bmm_output = torch.bmm(
