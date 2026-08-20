@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 indexer_weight_stream = None
 gva_is_inited = False
-_disable_torch_npu_transfer = False
 
 
 class NPUACLFormat(IntEnum):
@@ -87,12 +86,6 @@ def set_default_server_args(args: "ServerArgs"):
             args.hicache_mem_layout = "page_first_direct"
 
 
-def disable_torch_npu_transfer() -> None:
-    """Prevent torch_npu's CUDA compatibility shim in diffusion workers."""
-    global _disable_torch_npu_transfer
-    _disable_torch_npu_transfer = True
-
-
 @_call_once
 def init_npu_backend():
     """
@@ -109,7 +102,7 @@ def init_npu_backend():
 
     import torch_npu
 
-    if not _disable_torch_npu_transfer:
+    if "sglang.multimodal_gen" not in sys.modules:
         from torch_npu.contrib import transfer_to_npu  # noqa: F401
 
         # Re-mock torch.cuda.is_available because transfer_to_npu mocks it True.

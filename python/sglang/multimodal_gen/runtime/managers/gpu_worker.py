@@ -1128,10 +1128,6 @@ def run_scheduler_process(
     kill_itself_when_parent_died()
     configure_logger(server_args)
     globally_suppress_loggers()
-    if current_platform.is_npu():
-        from sglang.srt.hardware_backend.npu.utils import disable_torch_npu_transfer
-
-        disable_torch_npu_transfer()
     if current_platform.is_cuda():
         set_cuda_arch()
     elif current_platform.is_musa():

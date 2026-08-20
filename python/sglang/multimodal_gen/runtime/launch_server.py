@@ -173,13 +173,6 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     Args:
         launch_http_server: False for offline local mode
     """
-    from sglang.srt.utils import is_npu
-
-    if is_npu():
-        from sglang.srt.hardware_backend.npu.utils import disable_torch_npu_transfer
-
-        disable_torch_npu_transfer()
-
     configure_logger(server_args)
 
     # Start a new server with multiple worker processes
