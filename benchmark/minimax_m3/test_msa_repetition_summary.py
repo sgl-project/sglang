@@ -13,9 +13,27 @@ from summarize_msa_repetitions import (
     build_summary,
     expected_order,
 )
+from precompile_fmha_sm100 import runtime_variants
 
 
 class MSARepetitionSummaryTest(unittest.TestCase):
+    def test_precompile_variants_cover_tp4_sparse_paged_routes(self) -> None:
+        dtype_code = 42
+        variants = runtime_variants(dtype_code)
+
+        self.assertEqual(len(variants), 9)
+        self.assertEqual(len(set(variants)), 9)
+        self.assertEqual(
+            set(variants),
+            {
+                (dtype_code, 128, single_wg, 0, 128, split_kv, pack_factor)
+                for single_wg in (True, False)
+                for split_kv in (False, True)
+                for pack_factor in (1, 16)
+            }
+            | {(dtype_code, 256, False, 0, 128, False, 1)},
+        )
+
     def write_json(self, path: Path, payload: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload))
