@@ -1713,14 +1713,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             HTTPStatus.SERVICE_UNAVAILABLE,
             HTTPStatus.INTERNAL_SERVER_ERROR,
         ):
-            # Delete the key to prevent resending abort request to the scheduler and
-            # to ensure aborted request state is cleaned up.
-            if state.obj.rid in self.rid_to_state:
+            # Batch and direct-abort handlers normally remove the state and release
+            # its LoRA reference before notifying the waiter. Keep this as a fallback
+            # only when this handler still owns the same request state.
+            if self.rid_to_state.get(state.obj.rid) is state:
                 del self.rid_to_state[state.obj.rid]
-
-            # Mark ongoing LoRA request as finished.
-            if self.enable_lora and state.obj.lora_path:
-                await self.lora_registry.release(state.obj.lora_id)
+                if self.enable_lora and state.obj.lora_path:
+                    await self.lora_registry.release(state.obj.lora_id)
             if not is_stream:
                 raise fastapi.HTTPException(
                     status_code=finish_reason["status_code"],
@@ -3216,6 +3215,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "meta_info": meta_info,
         }
         del self.rid_to_state[recv_obj.rid]
+
+        # Mark an aborted LoRA request as finished.
+        if self.enable_lora and state.obj.lora_path:
+            asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
         state.out_list.append(out)
         state.event.set()
