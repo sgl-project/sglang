@@ -81,6 +81,16 @@
     "change": "Use a 128-wide feature tile only when speculative verification saves intermediate convolution windows; eager and non-speculative paths retain the 256-wide tile.",
     "targeted_validation": "GB300 job 3159210: output bitwise at B24/B28/B30/B32; candidate saves 0.0919 ms per target step at B28 in the isolated micro. Layer-2 matched-state serving validation is pending."
   },
+  "layer2_stage_nvtx_overlay": {
+    "parent_commit": "32a1a9047f44c69c7e22a4a9468696845d4b7e94",
+    "files": {
+      "python/sglang/srt/disaggregation/decode.py": "03611b7f4a626de0afe2d5b724b157770862f208b3044eed3e3b225aca54c69b",
+      "python/sglang/srt/managers/scheduler_components/request_receiver.py": "8afa6a5f6ce94604711fa07fa8cad4b96e59dbf524cab755b442b2ddfcc65142",
+      "python/sglang/srt/utils/nvtx_utils.py": "2677f54d48e40ffee01e2ee3320d1c608fb5ec924a515d1fa948ca671a51e062"
+    },
+    "change": "Add profiler-gated NVTX ranges around Layer-2 receive, DP-rank query, admission, running-batch update, and DP-sync stages. Default execution remains a shared no-op when scheduler NVTX and torch profiling are disabled.",
+    "scope": "Diagnostic source only; no performance result or production optimization claim."
+  },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
     "tree": "b0161fbca98775c0f79999f4970de1f14a4426fb"
