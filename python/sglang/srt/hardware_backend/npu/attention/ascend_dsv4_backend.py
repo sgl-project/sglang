@@ -187,6 +187,11 @@ class CompressorAscendBackendMixin:
 
     def _build_npu_compress_metadata(self, forward_batch: ForwardBatch) -> None:
         fm = self.forward_metadata
+        fm.dsv4_cycle_state_block_table = (
+            _build_cycle_state_block_table(forward_batch.req_pool_indices)
+            if _is_atlas_a5()
+            else None
+        )
         is_decode = forward_batch.forward_mode.is_decode()
         is_verify = forward_batch.forward_mode.is_target_verify()
         fm.dsv4_explicit_state_block_tables = {}
@@ -435,9 +440,7 @@ class CompressorAscendBackendMixin:
             # A5 cache_mode=2 is CYCLE: one request bank per row.  The
             # compressor derives the in-bank offset from start_pos; passing
             # the A3 explicit [B, width] table here would be an ABI violation.
-            state_block_table = _build_cycle_state_block_table(
-                forward_batch.req_pool_indices
-            )
+            state_block_table = fm.dsv4_cycle_state_block_table
             cache_mode = 2
         else:
             table_cache = fm.dsv4_explicit_state_block_tables
@@ -1442,6 +1445,11 @@ class DeepseekV4AscendAttnBackend(
         metadata.c4_loc = torch.zeros(c4_pad, dtype=torch.int64, device=device)
         metadata.c128_loc = torch.zeros(c128_pad, dtype=torch.int64, device=device)
         metadata.dsv4_max_input_capacity = tokens_per_req
+        metadata.dsv4_cycle_state_block_table = (
+            torch.zeros(bs, dtype=torch.int32, device=device)
+            if _is_atlas_a5()
+            else None
+        )
         metadata.dsv4_explicit_state_block_tables = {
             ratio: torch.full(
                 (
@@ -1816,6 +1824,11 @@ class DeepseekV4AscendAttnBackend(
 
     def _apply_dsv4_graph_metadata(self, forward_batch: ForwardBatch) -> None:
         ctx = self._build_dsv4_graph_replay_ctx(forward_batch)
+
+        if _is_atlas_a5():
+            ctx.fm.dsv4_cycle_state_block_table.copy_(
+                ctx.forward_batch.req_pool_indices
+            )
 
         self._refresh_graph_seq_metadata(ctx)
         self._refresh_graph_compress_page_tables_direct(ctx)
