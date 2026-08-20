@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for disaggregation role-based module filtering."""
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -244,6 +247,39 @@ class _FakeStage:
 
 
 class TestPipelineStageRoleFilter(unittest.TestCase):
+    def test_load_config_passes_server_revision_to_model_download(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            (tmp_path / "model_index.json").write_text(
+                json.dumps(
+                    {
+                        "_class_name": "FakePipeline",
+                        "_diffusers_version": "0.34.0",
+                        "transformer": ["diffusers", "FakeTransformer"],
+                    }
+                )
+            )
+            (tmp_path / "transformer").mkdir()
+
+            pipeline = object.__new__(_FakePipeline)
+            pipeline.model_path = "org/repo"
+            pipeline.server_args = SimpleNamespace(
+                model_subfolder=None,
+                revision="a" * 40,
+            )
+
+            with patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base.maybe_download_model",
+                return_value=str(tmp_path),
+            ) as download_model:
+                pipeline._load_config()
+
+        download_model.assert_called_once_with(
+            "org/repo",
+            force_diffusers_model=True,
+            revision="a" * 40,
+        )
+
     def test_stage_factory_skips_without_constructing_for_other_role(self):
         pipeline = _make_pipeline(RoleType.ENCODER)
 
