@@ -2180,8 +2180,22 @@ class DeepseekV4DecoderLayer(nn.Module):
         _cp_must_hoist_shared = (
             _use_cp and get_moe_a2a_backend().is_none() and _has_tp1_shared
         )
-        _do_shared_local = _cp_must_hoist_shared or (
-            _SHARED_EXPERT_LOCAL and _use_tp_moe_gather and _has_tp1_shared
+        # Same requirement on the DP path, for the same reason: reduce_scatterv
+        # and the equal-chunk reduce_scatter both SUM across TP ranks, replacing
+        # the MoE-internal all-reduce that the TP1 shared expert was supposed to
+        # be added after. Until now the only thing preventing that was
+        # _SHARED_EXPERT_LOCAL -- a perf PoC env var that defaults to FALSE
+        # (get_bool_env_var default "false"), so the corrupting configuration was
+        # the default one. dp_scatter (the remaining branch) is not a sum and
+        # leaves mlp_reduce_scatter False, so the MoE's own guard still holds
+        # there.
+        _dp_must_hoist_shared = (
+            _use_reduce_scatterv or _use_reduce_scatter
+        ) and _has_tp1_shared
+        _do_shared_local = (
+            _cp_must_hoist_shared
+            or _dp_must_hoist_shared
+            or (_SHARED_EXPERT_LOCAL and _use_tp_moe_gather and _has_tp1_shared)
         )
         if _use_cp:
             moe_a2a_backend = get_moe_a2a_backend()

@@ -125,5 +125,50 @@ class TestFusionGatedOnReplicatedSharedExpert(CustomTestCase):
                 )
 
 
+class TestMandatoryHoistNotGatedOnPerfEnvVar(CustomTestCase):
+    """Ratchet: DSV4's shared-expert hoist must not depend only on
+    ``SGLANG_DP_SHARED_EXPERT_LOCAL``.
+
+    That variable is a perf PoC and defaults to FALSE (``get_bool_env_var``
+    default ``"false"``). But the hoist is also the only thing standing between
+    a replicated shared expert and a collective that SUMs it: under CP,
+    ``dsa_cp_reduce_scatter_hidden_states``; on the DP path, reduce_scatterv and
+    the equal-chunk reduce_scatter. Both replace the MoE-internal all-reduce
+    that the TP1 shared expert was supposed to be added after, so gating the
+    hoist on a perf switch makes the default configuration the corrupting one.
+
+    Source-level rather than behavioural because reaching the real path needs a
+    multi-GPU TP group.
+    """
+
+    def test_do_shared_local_includes_the_mandatory_terms(self):
+        import importlib
+
+        module = importlib.import_module("sglang.srt.models.deepseek_v4")
+        source = inspect.getsource(module)
+        found = False
+        for node in ast.walk(ast.parse(source)):
+            if not (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "_do_shared_local"
+            ):
+                continue
+            found = True
+            dumped = ast.dump(node.value)
+            for term in ("_cp_must_hoist_shared", "_dp_must_hoist_shared"):
+                self.assertIn(
+                    term,
+                    dumped,
+                    "_do_shared_local must include "
+                    f"{term}: the hoist is mandatory for correctness whenever a "
+                    "downstream collective sums the MoE output, and must not be "
+                    "reachable only via _SHARED_EXPERT_LOCAL (a perf env var "
+                    "that defaults to false).",
+                )
+        self.assertTrue(found, "_do_shared_local assignment not found in deepseek_v4")
+
+
 if __name__ == "__main__":
     unittest.main()
