@@ -220,6 +220,15 @@ checkpoint's calibration scales automatically.
   `--enable-linear-replayssm-spec` its draft intermediates move onto a fixed
   ring, so `D = 0` and the ratio returns to the no-spec value. The
   [calculator](#mamba-ratio-calculator) applies both rules.
+- **DFlash2**: the Z Lab block-diffusion drafter is a separate checkpoint — add
+  `--speculative-algorithm DFLASH --speculative-draft-model-path
+  z-lab/Qwen3.8-27B-DFlash2 --speculative-num-draft-tokens 8` (block size 8 =
+  7 draft tokens per verify step). DFLASH forces `num_steps`/`topk` to 1 and
+  does not support DP attention or PP > 1. **CUDA-only for now**: the DFlash2
+  selector verify path depends on the Triton chain-speculative-sampling kernel
+  without a device fallback, so it does not run on Ascend NPUs yet (first
+  generation DFlash drafts such as `z-lab/Qwen3-8B-DFlash-b16` do). NPU
+  adaptation is tracked in [#TODO-PR]().
 - **Hardware fit**: FP8 weights ~28.5GB (not serviceable beyond bs≤2 on
   32GB cards); NVFP4 weights ~16.5GB (recommended for RTX 5090-class GPUs).
 - `--mamba-radix-cache-strategy extra_buffer_lazy` lowers the state cost per
