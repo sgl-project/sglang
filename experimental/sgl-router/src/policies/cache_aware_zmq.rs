@@ -880,7 +880,7 @@ impl CacheAwareZmqPolicy {
                         );
                         return Self::pick_min_load(
                             workers,
-                            &loads,
+                            loads,
                             &self.config.load_gate,
                             self.config.min_load_choices,
                         );
@@ -897,7 +897,7 @@ impl CacheAwareZmqPolicy {
                         );
                         return Self::pick_min_load(
                             workers,
-                            &loads,
+                            loads,
                             &self.config.load_gate,
                             self.config.min_load_choices,
                         );
@@ -913,7 +913,7 @@ impl CacheAwareZmqPolicy {
                     }
                     return Self::pick_min_load(
                         workers,
-                        &loads,
+                        loads,
                         &self.config.load_gate,
                         self.config.min_load_choices,
                     );
@@ -944,7 +944,7 @@ impl CacheAwareZmqPolicy {
             }
             return Self::pick_min_load(
                 workers,
-                &loads,
+                loads,
                 &self.config.load_gate,
                 self.config.min_load_choices,
             );
@@ -957,7 +957,7 @@ impl CacheAwareZmqPolicy {
             self.record_decision(model_id, CacheAwareDecision::NoHashBlocks);
             return Self::pick_min_load(
                 workers,
-                &loads,
+                loads,
                 &self.config.load_gate,
                 self.config.min_load_choices,
             );
@@ -996,7 +996,7 @@ impl CacheAwareZmqPolicy {
             );
             let fallback = Self::pick_min_load(
                 workers,
-                &loads,
+                loads,
                 &self.config.load_gate,
                 self.config.min_load_choices,
             );
@@ -1039,7 +1039,7 @@ impl CacheAwareZmqPolicy {
             // no reading under the floor.
             if owners_present {
                 if let Some(floor) = self.config.saturation_queue_floor {
-                    if !Self::fleet_has_idle_worker(workers, &loads, floor) {
+                    if !Self::fleet_has_idle_worker(workers, loads, floor) {
                         let pinned = workers
                             .iter()
                             .filter(|w| matched_urls.contains(w.url.as_str()))
@@ -1080,7 +1080,7 @@ impl CacheAwareZmqPolicy {
             // instead of failing every request.
             let fallback = Self::pick_min_load(
                 workers,
-                &loads,
+                loads,
                 &self.config.load_gate,
                 self.config.min_load_choices,
             );
