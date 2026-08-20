@@ -92,7 +92,7 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
-from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
+from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method, scheduler_nvtx_range
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -866,6 +866,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         return ready, remaining
 
+    @scheduler_nvtx_method("scheduler.pd.prefetch_dp_rank_queries")
     def prefetch_prefill_dp_rank_queries(self) -> None:
         """Start authoritative DP-rank lookups before their normal consume point.
 
@@ -921,6 +922,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             future.cancel()
         queries.clear()
 
+    @scheduler_nvtx_method("scheduler.pd.resolve_pending_reqs")
     def _resolve_pending_reqs(self) -> None:
         """Batch-resolve prefill_dp_ranks for pending requests and initialize receivers."""
         if not self.pending_reqs:
@@ -960,27 +962,30 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     # This is intentionally a blocking result() at the original
                     # synchronous query site.  It can shorten this step, but can
                     # never move receiver.init() to the next step.
-                    room_to_rank = prefetched[1].result()
+                    with scheduler_nvtx_range("scheduler.pd.prefetch_query_wait"):
+                        room_to_rank = prefetched[1].result()
                     remaining_rooms = rooms[len(prefetched_rooms) :]
                     if remaining_rooms:
                         # Requests appended after prefetch use the same
                         # authoritative endpoint.  Wait for both batches before
                         # any receiver is initialized, retaining FIFO consume
                         # order and the original same-step admission contract.
-                        room_to_rank.update(
-                            CommonKVReceiver.query_prefill_dp_ranks(
-                                bootstrap_addr, remaining_rooms
+                        with scheduler_nvtx_range("scheduler.pd.sync_dp_rank_query"):
+                            room_to_rank.update(
+                                CommonKVReceiver.query_prefill_dp_ranks(
+                                    bootstrap_addr, remaining_rooms
+                                )
                             )
-                        )
                 else:
                     # The pending batch changed (abort, pause, or newly appended
                     # request).  Do not consume a differently shaped answer;
                     # preserve the original single-batch query and FIFO order.
                     if prefetched is not None:
                         prefetched[1].cancel()
-                    room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
-                        bootstrap_addr, rooms
-                    )
+                    with scheduler_nvtx_range("scheduler.pd.sync_dp_rank_query"):
+                        room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
+                            bootstrap_addr, rooms
+                        )
                 for decode_req in need_query:
                     prefill_dp_rank = room_to_rank.get(
                         str(decode_req.req.bootstrap_room)
@@ -998,8 +1003,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         self.pending_reqs = remaining
 
-        for decode_req, prefill_dp_rank in resolved:
-            decode_req.kv_receiver.init(prefill_dp_rank)
+        with scheduler_nvtx_range("scheduler.pd.receiver_init"):
+            for decode_req, prefill_dp_rank in resolved:
+                decode_req.kv_receiver.init(prefill_dp_rank)
 
     def pop_preallocated(
         self,
@@ -2333,7 +2339,8 @@ class SchedulerDisaggregationDecodeMixin:
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
         # Process pending prebuilt batch: output processing + filter + merge
-        new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
+        with scheduler_nvtx_range("scheduler.pd.get_new_prebuilt_batch"):
+            new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
         if new_prebuilt_batch:
             assert self.chunked_req is None
             self.batch_result_processor.process_batch_result_prebuilt(
@@ -2352,10 +2359,12 @@ class SchedulerDisaggregationDecodeMixin:
         if running_batch.is_empty():
             ret = None
         else:
-            running_batch = self.update_running_batch(running_batch)
+            with scheduler_nvtx_range("scheduler.pd.update_running_batch"):
+                running_batch = self.update_running_batch(running_batch)
             ret = running_batch if not running_batch.is_empty() else None
 
-        ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
+        with scheduler_nvtx_range("scheduler.pd.dp_sync"):
+            ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
         if ret:
             set_schedule_time_batch(ret)
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
@@ -2429,6 +2438,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         return new_batch
 
+    @scheduler_nvtx_method("scheduler.pd.process_decode_queue")
     def process_decode_queue(self: Scheduler):
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()

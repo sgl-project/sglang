@@ -150,6 +150,7 @@ class SchedulerRequestReceiver:
                 recv_reqs = None
         return recv_reqs
 
+    @scheduler_nvtx_method("scheduler.recv_requests.broadcast")
     def _broadcast_reqs_across_ranks(self, recv_reqs: Optional[List]) -> List:
         if get_parallel().enable_dp_attention:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
