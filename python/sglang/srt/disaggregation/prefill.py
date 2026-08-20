@@ -294,6 +294,12 @@ class PrefillBootstrapQueue:
                     kv_pool.v_buffer,
                     kv_pool.page_size,
                 )
+        if hasattr(kv_manager, "set_mla_kv_buffers"):
+            kv_pool = self.token_to_kv_pool
+            if hasattr(kv_pool, "full_kv_pool"):
+                kv_pool = kv_pool.full_kv_pool
+            if hasattr(kv_pool, "kv_buffer"):
+                kv_manager.set_mla_kv_buffers(kv_pool.kv_buffer)
         return kv_manager
 
     def create_sender(self, req: Req, num_kv_heads: int) -> bool:
