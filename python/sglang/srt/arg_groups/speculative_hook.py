@@ -21,6 +21,28 @@ def _disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
     )
 
 
+def _reject_cpu_tree_spec_for_linear_attn(server_args: ServerArgs) -> None:
+    """Tree verify needs tree-aware conv/SSM state rollback, which the CPU
+    causal-conv and gated-delta-rule kernels do not implement."""
+    if server_args.device != "cpu" or (server_args.speculative_eagle_topk or 0) <= 1:
+        return
+
+    from sglang.srt.arg_groups.overrides import _MAMBA_RADIX_CACHE_ARCHS
+    from sglang.srt.configs.linear_attn_model_registry import (
+        get_linear_attn_spec_by_arch,
+    )
+
+    model_arch = server_args.get_model_config().hf_config.architectures[0]
+    if (
+        model_arch in _MAMBA_RADIX_CACHE_ARCHS
+        or get_linear_attn_spec_by_arch(model_arch) is not None
+    ):
+        raise ValueError(
+            "speculative_eagle_topk > 1 is not supported for hybrid "
+            "linear-attention (GDN) models on CPU."
+        )
+
+
 def _resolve_speculative_algorithm_alias(
     speculative_algorithm: Optional[str],
     speculative_draft_model_path: Optional[str],
@@ -624,6 +646,8 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "trtllm_mha backend only supports topk = 1 for speculative decoding."
             )
 
+    _reject_cpu_tree_spec_for_linear_attn(server_args)
+
     if server_args.speculative_use_rejection_sampling:
         # Resolved alias by now: NEXTN -> EAGLE, Gemma4 draft -> FROZEN_KV_MTP.
         # Only the EAGLE/EAGLE3 draft workers emit a target-vocab proposal that
@@ -715,6 +739,7 @@ def _handle_ngram(server_args: ServerArgs) -> None:
 
     server_args.enable_mixed_chunk = False
     server_args.speculative_eagle_topk = server_args.speculative_ngram_max_bfs_breadth
+    _reject_cpu_tree_spec_for_linear_attn(server_args)
     if server_args.speculative_num_draft_tokens is None:
         server_args.speculative_num_draft_tokens = 12
         logger.warning(

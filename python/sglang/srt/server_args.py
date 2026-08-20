@@ -5871,8 +5871,27 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import (
             _mamba_radix_cache_resolution,
             mamba_extra_buffer_of,
+            routes_mamba_radix_cache,
             run_post_process_pass,
         )
+
+        if (
+            self.speculative_algorithm is not None
+            and not self.disable_radix_cache
+            and not (is_cuda() or is_musa() or is_npu())
+            and routes_mamba_radix_cache(self.get_model_config().hf_config, model_arch)
+        ):
+            # Speculative decoding combines with the mamba radix cache only via
+            # the extra_buffer strategy, which needs the CUDA/MUSA/NPU FLA
+            # kernels; the no_buffer strategy has no spec-aware state tracking.
+            # On other devices (CPU/ROCm/XPU) drop the radix cache instead of
+            # failing, mirroring the historical ROCm behavior.
+            logger.warning(
+                f"Speculative decoding for {model_arch} is not compatible with "
+                "the mamba radix cache without the extra_buffer strategy "
+                "(CUDA/MUSA/NPU-only). Automatically disabling radix cache."
+            )
+            self.disable_radix_cache = True
 
         run_post_process_pass(self, _mamba_radix_cache_resolution)
         view = resolved_view(self)

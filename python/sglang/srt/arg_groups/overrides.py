@@ -1541,9 +1541,30 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
 def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
     """Whether ``model_arch`` supports the extra_buffer strategy on the
     configured linear-attention backend (pure read)."""
+    # extra_buffer needs the CUDA/MUSA/NPU FLA kernels (see
+    # _validate_mamba_extra_buffer); other devices fall back to no_buffer.
+    if not (is_cuda() or is_musa() or is_npu()):
+        return False
     if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS:
         return view.linear_attn_backend == "triton"
     return False
+
+
+def routes_mamba_radix_cache(hf_config: Any, model_arch: str) -> bool:
+    """Whether ``model_arch`` routes through the hybrid-mamba radix cache
+    handling (pure read). Union of the legacy per-arch call-site guards."""
+    from sglang.srt.configs.linear_attn_model_registry import (
+        get_linear_attn_spec_by_arch,
+    )
+
+    in_branch = model_arch in _MAMBA_RADIX_CACHE_ARCHS
+    if model_arch == "GraniteMoeHybridForCausalLM":
+        in_branch = any(
+            layer_type == "mamba"
+            for layer_type in getattr(hf_config, "layer_types", [])
+        )
+    spec = get_linear_attn_spec_by_arch(model_arch)
+    return (spec is not None and spec.uses_mamba_radix_cache) or in_branch
 
 
 @register_post_process
@@ -1557,21 +1578,10 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
     guard replicates the union of the legacy call-site guards so the pass is
     self-sufficient in the end-state pass list.
     """
-    from sglang.srt.configs.linear_attn_model_registry import (
-        get_linear_attn_spec_by_arch,
-    )
-
     hf_config = view.get_model_config().hf_config
     model_arch = hf_config.architectures[0]
 
-    in_branch = model_arch in _MAMBA_RADIX_CACHE_ARCHS
-    if model_arch == "GraniteMoeHybridForCausalLM":
-        in_branch = any(
-            layer_type == "mamba"
-            for layer_type in getattr(hf_config, "layer_types", [])
-        )
-    spec = get_linear_attn_spec_by_arch(model_arch)
-    if not ((spec is not None and spec.uses_mamba_radix_cache) or in_branch):
+    if not routes_mamba_radix_cache(hf_config, model_arch):
         return {}
 
     if view.disable_radix_cache:
