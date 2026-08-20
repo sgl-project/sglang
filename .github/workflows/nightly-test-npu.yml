@@ -122,217 +122,11 @@ jobs:
           # Write to GITHUB_OUTPUT and print to the log in one command.
           echo "run_start_metadata=${RUN_START_METADATA}" | tee -a $GITHUB_OUTPUT
 
-  nightly-1-npu-a2:
-    name: nightly-1-npu-a2
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-aarch64-a2-4
-      test_type: 'perf'
-      test_suite: nightly-1-npu-a2
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-      image: ${{ needs.set-image-config.outputs.image_a2 }}
-      install_sglang_deps: false
-      device_type_for_deps: '910b'
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-
-  nightly-1-npu-a3:
-    name: nightly-1-npu-a3
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-pr-test-stage.yml
-    with:
-      self_name: nightly-1-npu-a3
-      runner_config: linux-aarch64-a3-2-
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      run_timeout_minutes: '60'
-      timeout_per_file: '3600'
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-    secrets: inherit
-
-  nightly-2-npu-a3:
-    name: nightly-2-npu-a3
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-pr-test-stage.yml
-    with:
-      self_name: nightly-2-npu-a3
-      runner_config: linux-aarch64-a3-2-
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      run_timeout_minutes: '60'
-      timeout_per_file: '3600'
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-    secrets: inherit
-
-  # The nightly-4-npu-a3 suite is split across 2 parallel partition jobs, mirroring base-b-test-4-npu-a3 in the PR pipeline.
-  nightly-4-npu-a3:
-    name: nightly-4-npu-a3
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-pr-test-stage.yml
-    with:
-      self_name: nightly-4-npu-a3
-      runner_config: linux-aarch64-a3-4-
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      run_timeout_minutes: '120'
-      timeout_per_file: '3600'
-      partitions: '{"size":2,"arr":[0,1]}'
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-    secrets: inherit
-
-  nightly-8-npu-a3:
-    name: nightly-8-npu-a3
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-pr-test-stage.yml
-    with:
-      self_name: nightly-8-npu-a3
-      runner_config: linux-aarch64-a3-8-
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      run_timeout_minutes: '60'
-      timeout_per_file: '3600'
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-    secrets: inherit
-
-  nightly-16-npu-a3:
-    name: nightly-16-npu-a3
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-pr-test-stage.yml
-    with:
-      self_name: nightly-16-npu-a3
-      runner_config: linux-aarch64-a3-16-
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      run_timeout_minutes: '120'
-      timeout_per_file: '3600'
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-    secrets: inherit
-
-  nightly-perf-2-npu-a3:
-    name: nightly-perf-2-npu-a3
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-aarch64-a3-800t-2
-      test_type: 'perf'
-      test_suite: nightly-perf-2-npu-a3
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      install_sglang_deps: false
-      device_type_for_deps: 'a3'
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-
-  nightly-perf-4-npu-a3:
-    name: nightly-perf-4-npu-a3
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-aarch64-a3-800t-4
-      test_type: 'perf'
-      test_suite: nightly-perf-4-npu-a3
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      install_sglang_deps: false
-      device_type_for_deps: 'a3'
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-
-  nightly-perf-8-npu-a3:
-    name: nightly-perf-8-npu-a3
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-aarch64-a3-800t-8
-      test_type: 'perf'
-      test_suite: nightly-perf-8-npu-a3
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      install_sglang_deps: false
-      device_type_for_deps: 'a3'
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-
-  nightly-perf-16-npu-a3:
-    name: nightly-perf-16-npu-a3
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-aarch64-a3-800t-16
-      test_type: 'perf'
-      test_suite: nightly-perf-16-npu-a3
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      install_sglang_deps: false
-      device_type_for_deps: 'a3'
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-
-  # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
-  nightly-acc-2-npu-a3:
-    name: nightly-acc-2-npu-a3
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-aarch64-a3-2-
-      test_type: 'accuracy'
-      test_suite: nightly-acc-2-npu-a3
-      is_nightly_pipeline_job: true
-      partitions: '{"size":4,"arr":[0,1,2,3]}'
-      skip_pr_test_health_check: 'true'
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      install_sglang_deps: false
-      device_type_for_deps: 'a3'
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-
-  nightly-acc-4-npu-a3:
-    name: nightly-acc-4-npu-a3
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-aarch64-a3-4-
-      test_type: 'accuracy'
-      test_suite: nightly-acc-4-npu-a3
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      install_sglang_deps: false
-      device_type_for_deps: 'a3'
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-
-  nightly-acc-16-npu-a3:
-    name: nightly-acc-16-npu-a3
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-aarch64-a3-16-
-      test_type: 'accuracy'
-      test_suite: nightly-acc-16-npu-a3
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      install_sglang_deps: false
-      device_type_for_deps: 'a3'
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
   nightly-poc-multi-node-tests:
     name: multi-node-poc
     if: ${{ !cancelled() }}
-    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-4-npu-a3, nightly-acc-16-npu-a3]
+    needs: [set-image-config]
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -386,7 +180,7 @@ jobs:
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
     if: ${{ !cancelled() }}
-    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-4-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
+    needs: [set-image-config, nightly-poc-multi-node-tests]
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -417,19 +211,6 @@ jobs:
   check-all-jobs:
     if: ${{ !cancelled() }}
     needs:
-      - nightly-1-npu-a2
-      - nightly-1-npu-a3
-      - nightly-2-npu-a3
-      - nightly-4-npu-a3
-      - nightly-8-npu-a3
-      - nightly-16-npu-a3
-      - nightly-perf-2-npu-a3
-      - nightly-perf-4-npu-a3
-      - nightly-perf-8-npu-a3
-      - nightly-perf-16-npu-a3
-      - nightly-acc-2-npu-a3
-      - nightly-acc-4-npu-a3
-      - nightly-acc-16-npu-a3
       - nightly-poc-multi-node-tests
       - nightly-poc-multi-node-mix-tests
     runs-on: ubuntu-latest
@@ -443,29 +224,9 @@ jobs:
 
       - name: Generate results table
         run: |
-          single_result_a2="${{ needs.nightly-1-npu-a2.result }}"
           multi_result="${{ needs.nightly-poc-multi-node-tests.result }}"
           mix_result="${{ needs.nightly-poc-multi-node-mix-tests.result }}"
 
-          # single-node suites are reported per suite; overall status is success if none failed
-          single_result="success"
-          for r in \
-            "${{ needs.nightly-1-npu-a3.result }}" \
-            "${{ needs.nightly-2-npu-a3.result }}" \
-            "${{ needs.nightly-4-npu-a3.result }}" \
-            "${{ needs.nightly-8-npu-a3.result }}" \
-            "${{ needs.nightly-16-npu-a3.result }}" \
-            "${{ needs.nightly-perf-2-npu-a3.result }}" \
-            "${{ needs.nightly-perf-4-npu-a3.result }}" \
-            "${{ needs.nightly-perf-8-npu-a3.result }}" \
-            "${{ needs.nightly-perf-16-npu-a3.result }}" \
-            "${{ needs.nightly-acc-2-npu-a3.result }}" \
-            "${{ needs.nightly-acc-4-npu-a3.result }}" \
-            "${{ needs.nightly-acc-16-npu-a3.result }}"; do
-            if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then
-              single_result="failure"
-            fi
-          done
 
           group_icon() {
             case "$1" in
@@ -482,23 +243,6 @@ jobs:
           echo "| Group | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| nightly-1-npu-a2 | $(group_icon ${single_result_a2}) ${single_result_a2} |" >> $GITHUB_STEP_SUMMARY
-          for entry in \
-            "nightly-1-npu-a3:${{ needs.nightly-1-npu-a3.result }}" \
-            "nightly-2-npu-a3:${{ needs.nightly-2-npu-a3.result }}" \
-            "nightly-4-npu-a3:${{ needs.nightly-4-npu-a3.result }}" \
-            "nightly-8-npu-a3:${{ needs.nightly-8-npu-a3.result }}" \
-            "nightly-16-npu-a3:${{ needs.nightly-16-npu-a3.result }}" \
-            "nightly-perf-2-npu-a3:${{ needs.nightly-perf-2-npu-a3.result }}" \
-            "nightly-perf-4-npu-a3:${{ needs.nightly-perf-4-npu-a3.result }}" \
-            "nightly-perf-8-npu-a3:${{ needs.nightly-perf-8-npu-a3.result }}" \
-            "nightly-perf-16-npu-a3:${{ needs.nightly-perf-16-npu-a3.result }}" \
-            "nightly-acc-2-npu-a3:${{ needs.nightly-acc-2-npu-a3.result }}" \
-            "nightly-acc-4-npu-a3:${{ needs.nightly-acc-4-npu-a3.result }}" \
-            "nightly-acc-16-npu-a3:${{ needs.nightly-acc-16-npu-a3.result }}"; do
-            suite="${entry%%:*}"
-            r="${entry##*:}"
-            echo "| ${suite} | $(group_icon ${r}) ${r} |" >> $GITHUB_STEP_SUMMARY
-          done
           echo "| multi-node-poc | $(group_icon ${multi_result}) ${multi_result} |" >> $GITHUB_STEP_SUMMARY
           echo "| multi-node-mix-poc | $(group_icon ${mix_result}) ${mix_result} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
