@@ -241,6 +241,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         self.addCleanup(override.restore)
         model_runner = SimpleNamespace(
             is_draft_worker=False,
+            lora_manager=None,
             model=object(),
             spec_algorithm=SimpleNamespace(is_eagle=lambda: True),
             server_args=SimpleNamespace(
@@ -273,7 +274,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         override = get_context().override_server_args(
             chunked_prefill_size=16, cuda_graph_config=graph_config
         )
-        published = override.install()
+        override.install()
         self.addCleanup(override.restore)
         model_runner = SimpleNamespace(
             server_args=SimpleNamespace(),
