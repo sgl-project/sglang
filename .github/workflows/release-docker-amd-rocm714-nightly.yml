@@ -21,6 +21,11 @@ on:
   push:
     branches:
       - bingxche/rocm714-ci-test
+    # Only rebuild when something that lands in the image changes; edits to the
+    # test wiring or to this file should not kick off another two-hour build.
+    paths:
+      - docker/rocm.Dockerfile
+      - python/pyproject_other.toml
 
 concurrency:
   # A PR number if a pull request and otherwise the commit hash. This cancels

@@ -24,6 +24,7 @@ on:
         options:
           - rocm720
           - rocm724
+          - rocm714
       target_stage_select:
         description: "Select a stage to run from dropdown (leave empty for auto-detect)"
         required: false
