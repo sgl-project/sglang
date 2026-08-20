@@ -76,7 +76,6 @@ class MaskedRowDomainProvider(MoeBaseProvider):
 
         # This constructor runs once, when the LoRA attaches. These imports run
         # here so that no forward pass runs an import.
-        from sglang.kernels.ops.moe.ep_moe_kernels import post_reorder_deepgemm
         from sglang.srt.lora.moe.base_gemm_provider.masked_activation import (
             act_delta_masked,
         )
@@ -85,36 +84,13 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         )
 
         self._preprocess = fused_masked_preprocess
-        self._post_reorder = post_reorder_deepgemm
         self._act_kernel = act_delta_masked
 
-        from sglang.srt.lora.moe.base_gemm_provider.masked_finalize import (
-            invoke_shared_from_scratch_finalize,
-            invoke_shared_rank_reduce,
-        )
         from sglang.srt.lora.moe.base_gemm_provider.masked_fused_act import (
             run_masked_fused_act,
         )
 
         self._fused_act = run_masked_fused_act
-        self._shared_reduce = invoke_shared_rank_reduce
-        self._shared_tail = invoke_shared_from_scratch_finalize
-
-    @property
-    def num_local_experts(self) -> int:
-        return self.quant_info.num_local_experts
-
-    @property
-    def intermediate_size(self) -> int:
-        return self.quant_info.intermediate_size
-
-    @property
-    def hidden_size(self) -> int:
-        return self.quant_info.hidden_size
-
-    @property
-    def gate_up_slices(self) -> int:
-        return self._gate_up_slices
 
     def prepare(
         self,
@@ -239,117 +215,6 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             b_gate_up=b_gate_up,
             bridge_top_k=bridge_top_k,
             consume_base_pdl=consume_base_pdl,
-        )
-
-    def run_shared_rank_finalize(
-        self,
-        row_state: MaskedRowState,
-        *,
-        down_masked: torch.Tensor,
-        bridge: torch.Tensor,
-        b_down: torch.Tensor,
-        routing: RouteView,
-        topk_weights: torch.Tensor,
-        routed_scaling_factor: float | None,
-        output: torch.Tensor,
-        token_rank: torch.Tensor,
-        config: Mapping[str, Mapping[str, int]],
-    ) -> None:
-        self.run_shared_rank_reduce(
-            row_state,
-            bridge=bridge,
-            routing=routing,
-            topk_weights=topk_weights,
-            routed_scaling_factor=routed_scaling_factor,
-            token_rank=token_rank,
-            config=config["reduce"],
-        )
-        self.finish_shared_rank_finalize(
-            row_state,
-            down_masked=down_masked,
-            b_down=b_down,
-            routing=routing,
-            topk_weights=topk_weights,
-            routed_scaling_factor=routed_scaling_factor,
-            output=output,
-            token_rank=token_rank,
-            config=config["tail"],
-        )
-
-    def run_shared_rank_reduce(
-        self,
-        row_state: MaskedRowState,
-        *,
-        bridge: torch.Tensor,
-        routing: RouteView,
-        topk_weights: torch.Tensor,
-        routed_scaling_factor: float | None,
-        token_rank: torch.Tensor,
-        config: Mapping[str, int],
-    ) -> None:
-        invoke = self._shared_reduce
-        # This launch reads pair data only. ``row_state`` stays in the
-        # signature so that every stage takes the same arguments.
-        del row_state
-        invoke(
-            bridge=bridge,
-            routing=routing,
-            topk_weights=topk_weights,
-            routed_scaling_factor=routed_scaling_factor,
-            token_rank=token_rank,
-            config=config,
-        )
-
-    def finish_shared_rank_finalize(
-        self,
-        row_state: MaskedRowState,
-        *,
-        down_masked: torch.Tensor,
-        b_down: torch.Tensor,
-        routing: RouteView,
-        topk_weights: torch.Tensor,
-        routed_scaling_factor: float | None,
-        output: torch.Tensor,
-        token_rank: torch.Tensor,
-        config: Mapping[str, int],
-    ) -> None:
-        invoke = self._shared_tail
-        invoke(
-            down_masked=down_masked,
-            src2dst=row_state.src2dst,
-            token_rank=token_rank,
-            b_down=b_down,
-            routing=routing,
-            topk_weights=topk_weights,
-            routed_scaling_factor=routed_scaling_factor,
-            output=output,
-            num_local_experts=self.num_local_experts,
-            config=config,
-        )
-
-    def finalize(
-        self,
-        row_state: MaskedRowState,
-        down_out: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-        routed_scaling_factor: float | None,
-        output: torch.Tensor,
-        *,
-        lora_delta: torch.Tensor | None = None,
-    ) -> None:
-        num_tokens, hidden = output.shape
-        self._post_reorder(
-            down_out.view(-1, hidden),
-            output,
-            row_state.src2dst,
-            topk_ids,
-            topk_weights,
-            topk_ids.shape[1],
-            num_tokens,
-            hidden,
-            routed_scaling_factor if routed_scaling_factor is not None else 1.0,
-            lora_delta=lora_delta,
         )
 
     def gateup_out_shape(self, row_state: MaskedRowState) -> tuple[int, ...]:

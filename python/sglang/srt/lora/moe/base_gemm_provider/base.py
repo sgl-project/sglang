@@ -47,30 +47,35 @@ class MappedLoraAInput(msgspec.Struct, frozen=True, kw_only=True):
 class MoeBaseProvider:
     """One instance for each layer and quantization type.
 
-    Each instance binds to one ``quant_info``. This interface declares the four
-    size properties below. A packed FP8 or NVFP4 provider cannot report them
-    from its resident tensors. Those tensors have packed shapes. A packed shape
-    does not give these sizes.
+    Each instance binds one ``quant_info``, which carries the logical sizes as
+    plain integers. A packed FP8 or NVFP4 provider cannot read those sizes off
+    its resident tensors, because a packed shape does not give them - so they
+    are reported from ``quant_info`` here rather than from the weights.
     """
 
     contract: MoeBaseProviderContract
 
+    # The shared kernels are imported inside the methods below, not at module
+    # scope. This module must stay on msgspec and torch: a unit test loads it
+    # standalone, and the row domains import it. A repeat import is a
+    # sys.modules lookup, and a captured graph replays without running Python.
+
     @property
     def num_local_experts(self) -> int:
-        raise NotImplementedError
+        return self.quant_info.num_local_experts
 
     @property
     def intermediate_size(self) -> int:
         """The intermediate width of one tensor-parallel shard, in logical elements."""
-        raise NotImplementedError
+        return self.quant_info.intermediate_size
 
     @property
     def hidden_size(self) -> int:
-        raise NotImplementedError
+        return self.quant_info.hidden_size
 
     @property
     def gate_up_slices(self) -> int:
-        raise NotImplementedError
+        return self._gate_up_slices
 
     def prepare(
         self,
@@ -133,7 +138,21 @@ class MoeBaseProvider:
         base pair and ``lora_delta``. ``lora_delta`` holds the unweighted
         down-LoRA result in ``[T, K, H]`` pair order.
         """
-        raise NotImplementedError
+        from sglang.kernels.ops.moe.ep_moe_kernels import post_reorder_deepgemm
+
+        num_tokens, hidden = output.shape
+        post_reorder_deepgemm(
+            down_out.view(-1, hidden),
+            output,
+            row_state.src2dst,
+            topk_ids,
+            topk_weights,
+            topk_ids.shape[1],
+            num_tokens,
+            hidden,
+            routed_scaling_factor if routed_scaling_factor is not None else 1.0,
+            lora_delta=lora_delta,
+        )
 
     def run_fused_act(
         self,
@@ -239,7 +258,26 @@ class MoeBaseProvider:
         token_rank: torch.Tensor,
         config: Mapping[str, Mapping[str, int]],
     ) -> None:
-        raise NotImplementedError(f"{self.contract.key} has no shared-rank finalizer")
+        self.run_shared_rank_reduce(
+            row_state,
+            bridge=bridge,
+            routing=routing,
+            topk_weights=topk_weights,
+            routed_scaling_factor=routed_scaling_factor,
+            token_rank=token_rank,
+            config=config["reduce"],
+        )
+        self.finish_shared_rank_finalize(
+            row_state,
+            down_masked=down_masked,
+            b_down=b_down,
+            routing=routing,
+            topk_weights=topk_weights,
+            routed_scaling_factor=routed_scaling_factor,
+            output=output,
+            token_rank=token_rank,
+            config=config["tail"],
+        )
 
     def run_shared_rank_reduce(
         self,
@@ -253,7 +291,21 @@ class MoeBaseProvider:
         config: Mapping[str, int],
     ) -> None:
         """Launch the shared-rank reduction. It does not wait for the base W2 GEMM."""
-        raise NotImplementedError(f"{self.contract.key} has no shared-rank reduction")
+        from sglang.srt.lora.moe.base_gemm_provider.masked_finalize import (
+            invoke_shared_rank_reduce,
+        )
+
+        # This launch reads pair data only. ``row_state`` stays in the
+        # signature so that every stage takes the same arguments.
+        del row_state
+        invoke_shared_rank_reduce(
+            bridge=bridge,
+            routing=routing,
+            topk_weights=topk_weights,
+            routed_scaling_factor=routed_scaling_factor,
+            token_rank=token_rank,
+            config=config,
+        )
 
     def finish_shared_rank_finalize(
         self,
@@ -273,7 +325,22 @@ class MoeBaseProvider:
         Wait for the base W2 GEMM and the reduction. Then finalize the base
         rows and add the shared-B tail.
         """
-        raise NotImplementedError(f"{self.contract.key} has no shared B tail")
+        from sglang.srt.lora.moe.base_gemm_provider.masked_finalize import (
+            invoke_shared_from_scratch_finalize,
+        )
+
+        invoke_shared_from_scratch_finalize(
+            down_masked=down_masked,
+            src2dst=row_state.src2dst,
+            token_rank=token_rank,
+            b_down=b_down,
+            routing=routing,
+            topk_weights=topk_weights,
+            routed_scaling_factor=routed_scaling_factor,
+            output=output,
+            num_local_experts=self.num_local_experts,
+            config=config,
+        )
 
     # The runner allocates every buffer, so it asks the provider for the shapes.
     def gateup_out_shape(self, row_state) -> tuple[int, ...]:

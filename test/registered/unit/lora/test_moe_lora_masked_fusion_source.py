@@ -221,15 +221,26 @@ class TestMaskedFusionSource(unittest.TestCase):
         base = _source("base.py")
         row = _source("masked_row_domain.py")
         runner = (LORA_MOE / "moe_lora_runner.py").read_text()
+        # run_fused_act stays per row domain: its body differs.
+        self.assertIn("def run_fused_act(", base)
+        self.assertIn("def run_fused_act(", row)
+        # These have one body, on the base.
+        contiguous_src = _source("contiguous_row_domain.py")
         for method in (
-            "run_fused_act",
             "run_shared_rank_finalize",
             "run_shared_rank_reduce",
             "finish_shared_rank_finalize",
+            "mapped_down_lora_a_input",
+            "run_down_b_into_base",
+            "finalize",
+            "num_local_experts",
+            "intermediate_size",
+            "hidden_size",
+            "gate_up_slices",
         ):
             self.assertIn(f"def {method}(", base)
-            self.assertIn(f"def {method}(", row)
-        self.assertIn("def mapped_down_lora_a_input(", base)
+            self.assertNotIn(f"    def {method}(", row)
+            self.assertNotIn(f"    def {method}(", contiguous_src)
         # Every fused stage has exactly one implementation, so no stage takes
         # an implementation name and no provider enumerates or installs one.
         for gone in (
@@ -246,40 +257,24 @@ class TestMaskedFusionSource(unittest.TestCase):
         self.assertIn("row_state.src2dst", body)
         self.assertNotIn("row_state.hidden_permuted", body)
         self.assertNotIn("row_state.masked_m", body)
-        shared = _function(row, "run_shared_rank_finalize")
+        # The shared-rank path is one body on the base. It reaches a physical
+        # row only through src2dst, and never through a masked-only field.
+        shared = _function(base, "run_shared_rank_finalize")
         self.assertIn("self.run_shared_rank_reduce(", shared)
         self.assertIn("self.finish_shared_rank_finalize(", shared)
-        self.assertNotIn("row_state.hidden_permuted", shared)
-        self.assertNotIn("row_state.masked_m", shared)
-        finish = _function(row, "finish_shared_rank_finalize")
+        finish = _function(base, "finish_shared_rank_finalize")
         self.assertNotIn("self.finalize(", finish)
-        self.assertIn("invoke(", finish)
+        self.assertIn("invoke_shared_from_scratch_finalize(", finish)
         self.assertIn("down_masked=down_masked", finish)
         self.assertIn("src2dst=row_state.src2dst", finish)
-        # One copy, on the base: both row domains carry src2dst.
+        reduce_body = _function(base, "run_shared_rank_reduce")
+        self.assertIn("del row_state", reduce_body)
         mapped = _function(base, "mapped_down_lora_a_input")
         self.assertIn("pair_to_row=row_state.src2dst", mapped)
-        for row_domain in (row, _source("contiguous_row_domain.py")):
-            self.assertNotIn("def mapped_down_lora_a_input(", row_domain)
+        for body in (shared, finish, reduce_body, mapped):
+            self.assertNotIn("row_state.hidden_permuted", body)
+            self.assertNotIn("row_state.masked_m", body)
         self.assertNotIn("base_gemm_state.src2dst", runner)
-
-        # The contiguous domain offers the same shared-rank finalize methods.
-        # Its reduce step works on pairs only. Its tail step reaches a
-        # physical row only through src2dst.
-        contiguous = _source("contiguous_row_domain.py")
-        for method in (
-            "run_shared_rank_finalize",
-            "run_shared_rank_reduce",
-            "finish_shared_rank_finalize",
-        ):
-            self.assertIn(f"def {method}(", contiguous)
-        self.assertNotIn("implementation: str", contiguous)
-        contiguous_finish = _function(contiguous, "finish_shared_rank_finalize")
-        self.assertIn("invoke(", contiguous_finish)
-        self.assertIn("down_masked=down_masked", contiguous_finish)
-        self.assertIn("src2dst=row_state.src2dst", contiguous_finish)
-        contiguous_reduce = _function(contiguous, "run_shared_rank_reduce")
-        self.assertIn("del row_state", contiguous_reduce)
 
     def test_act_pair_store_is_optional_and_masked_store_is_unconditional(self):
         source = _source("masked_fused_act.py")
@@ -353,8 +348,8 @@ class TestMaskedFusionSource(unittest.TestCase):
 
     def test_shared_rank_finalize_is_fail_closed_and_two_stage(self):
         source = _source("masked_finalize.py")
-        provider = _source("masked_row_domain.py")
-        wrapper = _function(provider, "run_shared_rank_finalize")
+        # The wrapper is on the base: both row domains ran it identically.
+        wrapper = _function(_source("base.py"), "run_shared_rank_finalize")
         validator = _function(source, "_validate_shared_route")
         self.assertIn("not routing.is_shared_outer", validator)
         self.assertIn("lora_experts_per_adapter != 1", validator)
@@ -468,10 +463,6 @@ class TestMaskedFusionSource(unittest.TestCase):
 
         # One callable per fused stage, bound at construction.
         self.assertIs(provider._fused_act, act.run_masked_fused_act)
-        self.assertIs(provider._shared_reduce, finalize.invoke_shared_rank_reduce)
-        self.assertIs(
-            provider._shared_tail, finalize.invoke_shared_from_scratch_finalize
-        )
 
         provider.contract = SimpleNamespace(lora_activation_dtype=torch.bfloat16)
         src2dst = torch.tensor([2, 0, -1, 3], dtype=torch.int32)
