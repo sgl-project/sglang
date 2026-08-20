@@ -189,6 +189,9 @@ from sglang.srt.server_args import (  # noqa: F401  (re-export)
     get_global_server_args,
     set_global_server_args_for_scheduler,
 )
+from sglang.srt.speculative.adaptive_spec_params import (
+    resolve_candidate_steps_from_config,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.state_capturer.base import TopkCaptureOutput
@@ -792,11 +795,23 @@ class ModelRunner:
 
     def max_decode_logits_rows(self) -> int:
         """Rows the shared logits buffer needs."""
-        num_tokens_per_req = self.decode_num_tokens_per_req(
-            num_draft_tokens=self.server_args.max_speculative_num_draft_tokens
-        )
-        capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_req)
-        return max(capture_bs) * num_tokens_per_req
+        draft_token_counts = [self.server_args.max_speculative_num_draft_tokens]
+        if self.server_args.speculative_adaptive:
+            draft_token_counts.extend(
+                steps + 1
+                for steps in resolve_candidate_steps_from_config(
+                    self.server_args.speculative_adaptive_config
+                )
+            )
+
+        max_rows = 0
+        for draft_tokens in draft_token_counts:
+            num_tokens_per_req = self.decode_num_tokens_per_req(
+                num_draft_tokens=draft_tokens
+            )
+            capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_req)
+            max_rows = max(max_rows, max(capture_bs) * num_tokens_per_req)
+        return max_rows
 
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
