@@ -1042,24 +1042,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 "an MHA or hybrid-SWA HiCache host stack."
             )
 
-        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        device_pools = {PoolName.KV: kv_cache}
-        if isinstance(kv_cache, SWAKVPool):
-            device_pools = {
-                PoolName.KV: kv_cache.full_kv_pool,
-                PoolName.SWA: kv_cache.swa_kv_pool,
-            }
-
-        for name, device_pool in device_pools.items():
-            host_pool = self.host_pool_group.entry_map[name].host_pool
-            if host_pool.logical_size < device_pool.size:
-                raise ValueError(
-                    "Retraction host pool is smaller than its device pool: "
-                    f"pool={name}, host_slots={host_pool.logical_size}, "
-                    f"device_slots={device_pool.size}. Increase --hicache-ratio "
-                    "or --hicache-size."
-                )
-
         for spec in self.sidecar_pool_specs:
             source_size = self.host_pool_group.entry_map[
                 spec.indices_from_pool
@@ -1138,7 +1120,8 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         return self.evict_host(num_tokens)
 
-    def retraction_backup(self, req: Req) -> RetractionBackup:
+    def retraction_backup(self, req: Req) -> Optional[RetractionBackup]:
+        """Back up device KV to the host pool; None when it cannot fit after reclaim."""
         assert req.seqlen > 1
 
         device_indices, extra_transfers = self._retraction_device_transfers(req)
@@ -1147,11 +1130,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self._reclaim_retraction_host(len(device_indices))
             host_indices = self.host_pool_group.alloc(len(device_indices))
         if host_indices is None:
-            raise RuntimeError(
-                "Retraction host KV pool exhausted after reclaim: "
-                f"request={req.rid}, required_slots={len(device_indices)}, "
-                f"available_slots={self.host_pool_group.available_size()}."
-            )
+            return None
 
         resolved = self.cache_controller._resolve_pool_transfers_allocation(
             extra_transfers or None,
@@ -1161,10 +1140,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         if resolved is None and extra_transfers:
             self.host_pool_group.free(host_indices)
-            raise RuntimeError(
-                "Retraction auxiliary host allocation failed after atomic rollback: "
-                f"request={req.rid}, pools={[x.name for x in extra_transfers]}."
-            )
+            return None
 
         backup = RetractionBackup(
             host_indices=host_indices,
