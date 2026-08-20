@@ -22,44 +22,6 @@ if TYPE_CHECKING:
     from sglang.srt.lora.moe.execution_plan import LoraBSpec
 
 
-def _validate_b_call(
-    bridge: torch.Tensor,
-    weight: torch.Tensor,
-    destination: torch.Tensor,
-    routing: RouteView,
-    *,
-    destination_offsets: Sequence[int],
-    intermediate_top_k: int,
-) -> tuple[int, int, int]:
-    """Cross-check the weights, bridge and destination agree; derive the slicing."""
-    num_groups, weight_rows, rank = weight.shape
-    num_slices = len(destination_offsets)
-    slice_width = weight_rows // num_slices
-
-    expected_groups = routing.max_loras * routing.lora_experts_per_adapter
-    if num_groups != expected_groups:
-        raise ValueError(
-            f"weight groups {num_groups} != max_loras * "
-            f"lora_experts_per_adapter {expected_groups}"
-        )
-    num_pairs = routing.topk_ids.numel()
-    expected_rows = num_pairs if intermediate_top_k == 1 else routing.topk_ids.shape[0]
-    if bridge.shape != (expected_rows, num_slices * rank):
-        raise ValueError(
-            f"bridge must have shape {(expected_rows, num_slices * rank)}, "
-            f"got {tuple(bridge.shape)}"
-        )
-    if destination.shape[0] != num_pairs:
-        raise ValueError(f"destination must have {num_pairs} rows")
-    last = max(destination_offsets)
-    if last + slice_width > destination.shape[1]:
-        raise ValueError(
-            f"destination slice at {last} + width {slice_width} exceeds "
-            f"{destination.shape[1]} columns"
-        )
-    return num_slices, slice_width, rank
-
-
 @triton.jit
 def _one_launch_sliced_lora_b_kernel(
     bridge_ptr,
@@ -179,14 +141,9 @@ def one_launch_sliced_lora_b(
     intermediate_top_k: int = 1,
     consume_pdl: bool = False,
 ) -> None:
-    num_slices, slice_width, rank = _validate_b_call(
-        bridge,
-        weight,
-        destination,
-        routing,
-        destination_offsets=destination_offsets,
-        intermediate_top_k=intermediate_top_k,
-    )
+    _, weight_rows, rank = weight.shape
+    num_slices = len(destination_offsets)
+    slice_width = weight_rows // num_slices
     num_pairs = routing.topk_ids.numel()
     if num_pairs == 0:
         return
@@ -345,14 +302,9 @@ def indexed_pairs_lora_b(
     intermediate_top_k: int = 1,
 ) -> None:
     """Raw-route B: no aligned plan built, static grid per capture bucket, no PDL."""
-    num_slices, slice_width, rank = _validate_b_call(
-        bridge,
-        weight,
-        destination,
-        routing,
-        destination_offsets=destination_offsets,
-        intermediate_top_k=intermediate_top_k,
-    )
+    _, weight_rows, rank = weight.shape
+    num_slices = len(destination_offsets)
+    slice_width = weight_rows // num_slices
     num_pairs = routing.topk_ids.numel()
     if num_pairs == 0:
         return

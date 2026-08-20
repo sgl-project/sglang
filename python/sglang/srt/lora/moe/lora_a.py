@@ -22,29 +22,6 @@ if TYPE_CHECKING:
     from sglang.srt.lora.moe.execution_plan import LoraASpec
 
 
-def _validate_pair_gemm(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    output: torch.Tensor,
-    routing: RouteView,
-    *,
-    pair_input: bool,
-) -> None:
-    num_pairs = routing.topk_ids.numel()
-    num_groups, width, input_width = weight.shape
-    expected_groups = routing.max_loras * routing.lora_experts_per_adapter
-    if num_groups != expected_groups:
-        raise ValueError(
-            f"weight groups {num_groups} != max_loras * "
-            f"lora_experts_per_adapter {expected_groups}"
-        )
-    expected_rows = num_pairs if pair_input else routing.topk_ids.shape[0]
-    if input.ndim != 2 or input.shape != (expected_rows, input_width):
-        raise ValueError(f"input must have shape {(expected_rows, input_width)}")
-    if output.ndim != 2 or output.shape != (num_pairs, width):
-        raise ValueError(f"output must have shape {(num_pairs, width)}")
-
-
 @triton.jit
 def _grouped_lora_a_kernel(
     input_ptr,
@@ -288,7 +265,6 @@ def indexed_lora_a(
     num_pairs = routing.topk_ids.numel()
     if num_pairs == 0:
         return
-    _validate_pair_gemm(input, weight, output, routing, pair_input=pair_input)
     shared_outer = routing.is_shared_outer
     routed_bound = routing.num_local_experts
     block_size_n = int(config["BLOCK_SIZE_N"])
@@ -339,7 +315,6 @@ def token_dedup_grouped_lora_a(
         raise ValueError(
             "token-deduplicated grouped A requires one shared factor per adapter"
         )
-    _validate_pair_gemm(input, weight, output, token_routing, pair_input=False)
     grouped_lora_a(
         input,
         weight,
