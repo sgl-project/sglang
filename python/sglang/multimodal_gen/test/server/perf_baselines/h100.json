@@ -2903,6 +2903,14 @@
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 55.4
         },
+        "minimax_h3_ref2va_video_audio_2gpu_h100": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 266.7
+        },
         "minimax_h3_t2va_2gpu_h100": {
             "stages_ms": {
                 "InputValidationStage": 0.05,
