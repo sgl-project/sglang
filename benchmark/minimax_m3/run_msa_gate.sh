@@ -20,6 +20,7 @@ python -m sglang.test.run_eval \
   --base-url "${BASE_URL}" \
   --model "${MODEL}" \
   --eval-name gpqa \
+  --num-examples 198 \
   --num-threads "${NUM_THREADS}" \
   --max-tokens 8192 \
   --temperature 0 \
@@ -31,11 +32,13 @@ python -m sglang.test.run_eval \
   --model "${MODEL}" \
   --eval-name longbench_v2 \
   --dataset-path "${LONGBENCH_SUBSET}" \
+  --num-examples 100 \
   --num-threads "${NUM_THREADS}" \
   --max-tokens 4096 \
   --temperature 0 \
   | tee "${OUTPUT_DIR}/longbench_v2.log"
 cp "/tmp/longbench_v2_${MODEL//\//_}.json" "${OUTPUT_DIR}/longbench_v2.json"
+cp "${LONGBENCH_SUBSET}.manifest.json" "${OUTPUT_DIR}/longbench_v2_subset_manifest.json"
 
 for concurrency in 1 8 32 128; do
   python -m sglang.benchmark.serving \

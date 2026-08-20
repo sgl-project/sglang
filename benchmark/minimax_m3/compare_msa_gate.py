@@ -45,13 +45,56 @@ def main() -> None:
     candidate_parity = load(args.candidate_dir / "fixed_parity.json")
     baseline_records = {row["name"]: row for row in baseline_parity["records"]}
     candidate_records = {row["name"]: row for row in candidate_parity["records"]}
+    expected_fixed_names = {"short", "long_32768", "long_65536"}
+    if set(baseline_records) != expected_fixed_names:
+        failures.append(
+            f"baseline fixed probes are incomplete: {sorted(baseline_records)}"
+        )
+    if set(candidate_records) != expected_fixed_names:
+        failures.append(
+            f"candidate fixed probes are incomplete: {sorted(candidate_records)}"
+        )
     for name, baseline in baseline_records.items():
         candidate = candidate_records.get(name)
+        if not baseline.get("exact_expected", False):
+            failures.append(f"baseline fixed probe failed its expected answer: {name}")
+        if candidate is not None and not candidate.get("exact_expected", False):
+            failures.append(f"candidate fixed probe failed its expected answer: {name}")
         if (
             candidate is None
             or candidate["response_sha256"] != baseline["response_sha256"]
         ):
             failures.append(f"fixed output mismatch: {name}")
+        if name.startswith("long_"):
+            minimum_tokens = int(name.removeprefix("long_"))
+            if int(baseline.get("prompt_tokens", 0)) < minimum_tokens:
+                failures.append(f"baseline probe {name} is shorter than {minimum_tokens}")
+            if (
+                candidate is not None
+                and int(candidate.get("prompt_tokens", 0)) < minimum_tokens
+            ):
+                failures.append(
+                    f"candidate probe {name} is shorter than {minimum_tokens}"
+                )
+
+    baseline_subset = load(
+        args.baseline_dir / "longbench_v2_subset_manifest.json"
+    )
+    candidate_subset = load(
+        args.candidate_dir / "longbench_v2_subset_manifest.json"
+    )
+    if baseline_subset.get("subset_sha256") != candidate_subset.get("subset_sha256"):
+        failures.append("LongBench-v2 subset hashes differ")
+    for label, manifest in (
+        ("baseline", baseline_subset),
+        ("candidate", candidate_subset),
+    ):
+        if int(manifest.get("num_examples", 0)) != 100:
+            failures.append(
+                f"{label} LongBench-v2 subset does not contain 100 examples"
+            )
+        if int(manifest.get("minimum_observed_tokens", 0)) < 32768:
+            failures.append(f"{label} LongBench-v2 subset contains a sub-32K prompt")
 
     comparisons = {"accuracy": {}, "serving": {}}
     for eval_name in ("gpqa", "longbench_v2"):

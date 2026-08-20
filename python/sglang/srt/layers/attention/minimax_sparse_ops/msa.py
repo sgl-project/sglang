@@ -267,6 +267,19 @@ def selected_msa_backend(
     return None
 
 
+def msa_runtime_fallback_allowed() -> bool:
+    """Whether a provider failure may fall back to the Triton implementation.
+
+    ``auto`` is the production availability policy and may recover from a
+    provider-specific runtime rejection.  An explicitly selected provider is
+    also an A/B-validation contract: silently falling back there would label a
+    Triton run as FlashInfer/fmha_sm100 and invalidate correctness and speed
+    evidence, so explicit selections fail closed.
+    """
+
+    return envs.SGLANG_MINIMAX_MSA_BACKEND.get().lower() == "auto"
+
+
 @functools.lru_cache(maxsize=1)
 def msa_available() -> bool:
     """True iff either public FlashInfer MSA or the compatibility backend loads."""

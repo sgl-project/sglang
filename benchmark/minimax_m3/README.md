@@ -26,7 +26,8 @@ MiniMax-M3 value. Each sparse layer receives a distinct persistent public
 workspace for each CUDA Graph capture. Q, sparse indices, and length metadata
 are copied into capture-stable buffers; the page table is refreshed in place.
 The warmup stream is synchronized before capture, and replay invokes no Python
-planning API or private plan tuple.
+planning API or private plan tuple. Explicit provider selection fails closed on
+a runtime rejection, so an A/B run cannot silently turn into a Triton fallback.
 
 Run the two servers sequentially on the same idle node. Keep every launch flag
 identical except the provider. The compatibility baseline needs its existing
@@ -94,7 +95,8 @@ python benchmark/minimax_m3/compare_msa_gate.py \
 ```
 
 The mandatory accuracy gates are exact temperature-zero output parity for the
-fixed probes, no regression on all 198 GPQA-Diamond questions, and no regression
+fixed probes (with tokenizer-measured 32K and 64K prompt lengths), no regression
+on all 198 GPQA-Diamond questions, and no regression
 on the deterministic 100-example category-balanced LongBench-v2 subset whose
 prompts are at least 32K tokens. GPQA is materially harder than saturated GSM8K;
 LongBench directly exercises MSA's long-context page selection and decode replay.
