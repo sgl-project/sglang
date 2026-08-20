@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import torch
+
 from sglang.multimodal_gen.configs.pipeline_configs.sana_video import (
     SanaVideoPipelineConfig,
 )

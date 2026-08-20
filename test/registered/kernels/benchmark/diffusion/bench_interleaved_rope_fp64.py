@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 import torch
+
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.ops.diffusion import fused_interleaved_rope_fp64
 from sglang.test.ci.ci_register import register_cuda_ci
