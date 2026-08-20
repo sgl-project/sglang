@@ -135,13 +135,17 @@ def _grouped_gemm_mxfp8(
     out_dtype: torch.dtype,
     a_div: int,
     mul_weight_by: Optional[torch.Tensor] = None,
+    may_filter_routes: bool = True,
 ) -> torch.Tensor:
     M_routed = num_valid_tokens
     E, N, K = w.shape
     assert K % 128 == 0, f"MXFP8 native MoE requires K%128==0, got K={K}"
-    # Keep zero-fill: moe_align_block_size reserves an extra expert bucket for
-    # filtered routes, which should contribute zeros if present.
-    out = torch.zeros((M_routed, N), dtype=out_dtype, device=a_q.device)
+    # A route filtered to expert -1 can have its row left untouched -- its block sits in
+    # the extra bucket moe_align_block_size reserves, which the kernel may skip -- so the
+    # row has to start at zero. When no route can be filtered, every row is written by the
+    # GEMM and the fill is dead: one full-tensor kernel per GEMM per layer.
+    alloc = torch.zeros if may_filter_routes else torch.empty
+    out = alloc((M_routed, N), dtype=out_dtype, device=a_q.device)
     if a_div == top_k and M_routed <= 32 and K >= 3072:
         BLOCK_N = 64
         num_warps = 4
@@ -286,6 +290,10 @@ def fused_moe_mxfp8_native(
         # per MoE layer; `to` is a no-op when the ids are already int32.
         topk_ids = topk_ids.to(torch.int32)
 
+    # Only the two branches above can drop a route to expert -1. When neither can fire,
+    # every routed row is written by the grouped GEMM and its output zero-fill is dead.
+    may_filter_routes = expert_map is not None or filter_expert
+
     block_m = 64
     sorted_ids, expert_ids, num_post = moe_align_block_size(
         topk_ids, block_m, local_num_experts
@@ -307,6 +315,7 @@ def fused_moe_mxfp8_native(
         block_m,
         hidden_states.dtype,
         a_div=top_k,
+        may_filter_routes=may_filter_routes,
     )  # [M, 2I]
 
     if envs.SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8.get():
@@ -336,6 +345,7 @@ def fused_moe_mxfp8_native(
             block_m,
             hidden_states.dtype,
             a_div=1,
+            may_filter_routes=may_filter_routes,
         )
         return g2.view(T, top_k, H)
 
@@ -354,6 +364,7 @@ def fused_moe_mxfp8_native(
         torch.float32,
         a_div=1,
         mul_weight_by=topk_weights.reshape(-1).to(torch.float32),
+        may_filter_routes=may_filter_routes,
     )  # [M, H] == [T*top_k, H]
 
     if envs.SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE.get():
