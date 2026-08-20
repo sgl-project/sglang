@@ -2176,6 +2176,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
+    # Full DP token vector retained for Aiter MegaMoE even when the normal MLP
+    # TP gather path stores only this rank's token count.
+    mega_moe_global_num_tokens: Optional[List[int]] = None
+    mega_moe_sync_tokens: Optional[int] = None
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
 
     # === Compound crossing to ForwardBatch (carry their own device tensors) ===
@@ -3331,22 +3335,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
             eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
+            use_forward_interval_eviction = envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
+            swa_maintenance_step = (self.forward_iter or 0) % eviction_interval == 0
             self.token_to_kv_pool_allocator.free_group_begin()
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
                     # We set evict_swa condition here with two reasons:
                     # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
-                    # 2. Evict only once >= eviction_interval tokens have slid
-                    # out of the window, amortizing eviction work while keeping
-                    # each request's overshoot within the interval the pool
-                    # budget reserves. Gating on accumulated tokens (rather
-                    # than an iteration-counter phase) cannot starve because
-                    # seqlen progress is monotonic per KV handle.
-                    if (
-                        req.decode_batch_idx >= 1
-                        and req.kv is not None
-                        and req.seqlen - 1 - sliding_window_size
-                        >= req.kv.swa_evicted_seqlen + eviction_interval
+                    # 2. The Aiter MegaMoE DSV4 path retains the validated
+                    # forward-interval cadence. Per-request token gating causes
+                    # synchronized SWA pressure and a retraction/re-prefill
+                    # storm at high DP concurrency.
+                    if req.decode_batch_idx >= 1 and (
+                        (use_forward_interval_eviction and swa_maintenance_step)
+                        or (
+                            not use_forward_interval_eviction
+                            and req.kv is not None
+                            and req.seqlen - 1 - sliding_window_size
+                            >= req.kv.swa_evicted_seqlen + eviction_interval
+                        )
                     ):
                         self._evict_swa(req, req.seqlen - 1)
 

@@ -49,7 +49,7 @@ class NegotiateCall:
     running_batch: Optional[List[int]] = None
     max_prefill_bs: Optional[List[int]] = None
     waiting_queue_len: Optional[List[int]] = None
-    max_running_requests: Optional[int] = None
+    max_running_requests: Optional[int | List[int]] = None
     # Inter-call sleep (seconds). Used to exercise the queue-trigger
     # wall-clock timeout.
     sleep_before_s: float = 0.0
@@ -71,6 +71,7 @@ class NegotiateTestCase:
     # Expected accumulated wait surfaced on the final (release) outcome. When
     # set, asserts the wait histograms would observe this value instead of 0.
     expected_wait_forward_passes: Optional[int] = None
+    mixed_slot_guard: bool = False
 
 
 def _run_negotiate_test(rank, test_cases):
@@ -81,6 +82,9 @@ def _run_negotiate_test(rank, test_cases):
         # The DP-attention gate is a published config leaf.
         override = get_context().override_server_args(enable_dp_attention=True)
         override.install()
+        os.environ["SGLANG_PREFILL_DELAYER_MIXED_SLOT_GUARD"] = (
+            "1" if case.mixed_slot_guard else "0"
+        )
         delayer = PrefillDelayer(
             dp_size=world_size,
             attn_tp_size=1,
@@ -109,7 +113,11 @@ def _run_negotiate_test(rank, test_cases):
             if call.waiting_queue_len is not None:
                 extra_kwargs["waiting_queue_len"] = call.waiting_queue_len[rank]
             if call.max_running_requests is not None:
-                extra_kwargs["max_running_requests"] = call.max_running_requests
+                extra_kwargs["max_running_requests"] = (
+                    call.max_running_requests[rank]
+                    if isinstance(call.max_running_requests, list)
+                    else call.max_running_requests
+                )
 
             result = delayer._negotiate_should_allow_prefill(
                 local_prefillable=call.prefillable[rank],
@@ -260,6 +268,25 @@ _NEGOTIATE_TEST_CASES = [
         # Two delays accumulated before timing out; the timeout release must
         # still surface that wait to the histograms.
         expected_wait_forward_passes=2,
+    ),
+    NegotiateTestCase(
+        name="mixed_slot_guard_does_not_timeout_under_slot_pressure",
+        max_delay_passes=3,
+        token_usage_low_watermark=0.8,
+        mixed_slot_guard=True,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, False, True, False],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_prefill_bs=[950, 950, 950, 950],
+                waiting_queue_len=[10, 10, 10, 10],
+                max_running_requests=[1024, 0, 1024, 0],
+            )
+            for _ in range(3)
+        ],
+        expected_allow=False,
+        expected_reason="delay",
     ),
     # Queue-based trigger: waiting queue below queue_min = min(running * R,
     # max_prefill_bs) should defer prefill. With R=0.5, running=100 and
