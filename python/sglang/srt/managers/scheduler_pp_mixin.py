@@ -30,6 +30,7 @@ from sglang.srt.managers.utils import (
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
+from sglang.srt.mem_cache.common import free_kv_row_range
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
@@ -722,7 +723,12 @@ class SchedulerPPMixin:
                     kv_indices = self.req_to_token_pool.req_to_token[
                         req.req_pool_idx, : req.extend_range.end
                     ]
-                    self.token_to_kv_pool_allocator.free(kv_indices)
+                    free_kv_row_range(
+                        self.token_to_kv_pool_allocator,
+                        kv_indices,
+                        start_pos=0,
+                        swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
+                    )
                     if req.mamba_pool_idx is not None:
                         self.req_to_token_pool.free_mamba_cache(req)
                     self.req_to_token_pool.free(req)

@@ -223,8 +223,54 @@ class TestSWA(unittest.TestCase):
             )
         )
 
-        allocator.free_swa(full_indices[1:2])
+        # `free_swa` is deliberately not idempotent -- filtering the cleared
+        # mapping entries would need a device-side count. Once the SWA side is
+        # gone the caller releases the full side alone.
+        full_available = allocator.full_available_size()
+        allocator.free_full(full_indices)
         self.assertEqual(allocator.swa_available_size(), 16)
+        self.assertEqual(allocator.full_available_size(), full_available + page_size)
+
+    def test_free_full_defers_inside_a_free_group(self):
+        page_size = 4
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            page_size=page_size,
+            kv_size=16,
+            kv_size_swa=16,
+            sliding_window_size=page_size,
+        )
+
+        full_indices = _swa_alloc(allocator, page_size)
+        allocator.free_swa(full_indices)
+        full_available = allocator.full_available_size()
+
+        allocator.free_group_begin()
+        allocator.free_full(full_indices)
+        self.assertEqual(len(allocator.full_free_group), 1)
+        self.assertEqual(allocator.full_available_size(), full_available)
+        # The group owns a copy, so a caller reusing its buffer is harmless.
+        full_indices.zero_()
+        allocator.free_group_end()
+
+        self.assertEqual(allocator.full_available_size(), full_available + page_size)
+        self.assertEqual(allocator.swa_available_size(), 16)
+
+    def test_evicting_a_tombstoned_node_frees_swa_once(self):
+        tree, allocator, _ = _build_swa_tree(is_eagle=False, kv_size=32, kv_size_swa=32)
+        swa_size = allocator.swa_attn_allocator.size
+
+        _insert(tree, allocator, [1, 2, 3, 4])
+        _insert(tree, allocator, [1, 2, 3, 4, 5, 6])
+
+        # SWA-only eviction tombstones a node: its SWA slots are already back.
+        tree.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
+        swa_after_tombstone = allocator.swa_available_size()
+
+        # Full eviction of that same node must not hand the SWA slots back twice.
+        tree.evict(EvictParams(num_tokens=32, swa_num_tokens=0))
+        self.assertLessEqual(allocator.swa_available_size(), swa_size)
+        self.assertGreaterEqual(allocator.swa_available_size(), swa_after_tombstone)
 
     def test_free_swa_group_owns_deferred_indices(self):
         _, allocator, _ = _build_swa_tree(

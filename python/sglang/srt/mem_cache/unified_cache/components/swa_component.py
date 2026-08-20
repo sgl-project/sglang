@@ -484,9 +484,9 @@ class SWAComponent(TreeComponent):
 
         # Device layer
         if EvictLayer.DEVICE in target and cd.value is not None:
-            # Pass full indices to free_swa so slots with no SWA pair are
-            # skipped. Freeing swa_value directly would double free those
-            # entries since they all map to the same sentinel slot.
+            # Pass full indices, not swa_value: the allocator's mapping is the
+            # source of truth. `cd.value is not None` is what proves this node
+            # still owns its SWA slots -- `free_swa` no longer filters.
             device_frees[self.component_type].append(
                 node.component_data[BASE_COMPONENT_TYPE].value
             )

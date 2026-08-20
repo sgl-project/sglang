@@ -104,6 +104,31 @@ def free_swa_out_of_window_slots(
         req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 
+def free_kv_row_range(
+    allocator: BaseTokenToKVPoolAllocator,
+    kv_indices: torch.Tensor,
+    *,
+    start_pos: int,
+    swa_evicted_seqlen: int,
+) -> None:
+    """Free ``kv_row[start_pos : start_pos + len(kv_indices)]`` of one request.
+
+    ``kv_indices`` must hold the full-attention slots of consecutive row
+    positions, the first one sitting at ``start_pos``. The full side always goes
+    back whole; the SWA side skips the leading positions below
+    ``swa_evicted_seqlen``, which released their peers already -- by window
+    eviction, or as the deliberately unmapped prefix of a PD decode SWA-tail
+    prealloc. The boundary is page-aligned because ``swa_evicted_seqlen`` is.
+    """
+    num_indices = kv_indices.numel()
+    if num_indices == 0:
+        return
+    swa_already_freed = min(max(swa_evicted_seqlen - start_pos, 0), num_indices)
+    allocator.free_full(kv_indices)
+    if swa_already_freed < num_indices:
+        allocator.free_swa(kv_indices[swa_already_freed:])
+
+
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if getattr(req, "skip_radix_cache_insert", False):
         return
@@ -259,9 +284,17 @@ def _release_overallocated_kv_indices(
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
             start_p:end_p
         ]
-        # start_p is aligned to the allocator's physical page size above, so it
-        # never shares a page with cache_finished_req's tail free in this group.
-        allocator.free_segment(indices_to_free, start_pos=start_p)
+        # strip_thinking_cache can pull the committed length below the eviction
+        # floor, so the head of this range may already have lost its SWA peers.
+        swa_dead = min(max(req.kv.swa_evicted_seqlen - start_p, 0), end_p - start_p)
+        if swa_dead > 0:
+            allocator.free_full(indices_to_free[:swa_dead])
+        if swa_dead < end_p - start_p:
+            # start_p is aligned to the allocator's physical page size above, so it
+            # never shares a page with cache_finished_req's tail free in this group.
+            allocator.free_segment(
+                indices_to_free[swa_dead:], start_pos=start_p + swa_dead
+            )
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
