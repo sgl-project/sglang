@@ -2552,7 +2552,10 @@ class ServingChatTestCase(unittest.TestCase):
 
         response = self.chat._build_chat_response(req, ret, 1234567890)
 
-        self.assertIsNone(response.sglext)
+        self.assertIsNone(
+            response.sglext,
+            "sglext is absent only when routed_experts is the sole extension",
+        )
         self.assertEqual(
             [choice.meta_info for choice in response.choices],
             [ret_item["meta_info"] for ret_item in ret],
@@ -2566,7 +2569,7 @@ class ServingChatTestCase(unittest.TestCase):
         serialized_response = json.dumps(dumped_response)
         self.assertEqual(serialized_response.count('"routed_experts"'), 2)
 
-    def test_non_streaming_meta_info_preserves_other_sglext_fields(self):
+    def test_non_streaming_meta_info_preserves_cache_and_spec_in_sglext(self):
         req = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
@@ -2608,6 +2611,7 @@ class ServingChatTestCase(unittest.TestCase):
         )
         dumped_response = response.model_dump()
         self.assertIn("sglext", dumped_response)
+        self.assertIn("spec_tokens_details", dumped_response["sglext"])
         self.assertNotIn("routed_experts", dumped_response["sglext"])
         self.assertEqual(
             dumped_response["sglext"]["cached_tokens_details"],
