@@ -6,7 +6,7 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
 
-register_cuda_ci(est_time=3000, stage="nightly", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=1800, stage="nightly", runner_config="4-gpu-b200")
 
 LAGUNA_XS_NVFP4_MODEL = "poolside/Laguna-XS-2.1-NVFP4"
 LAGUNA_S_NVFP4_MODEL = "poolside/Laguna-S-2.1-NVFP4"
