@@ -1106,6 +1106,66 @@ class LayerwiseOffloadableModuleMixin:
     host_resident_table_names: List[str] = []
     layerwise_offload_managers: list[LayerwiseOffloadManager] = []
 
+    # Whether to park non-layer parameters on the host between uses. Costs a
+    # transfer per request and is worth it only when device memory is the
+    # binding constraint, so it follows --performance-mode memory.
+    park_non_layer_weights_between_uses: bool = False
+
+    def _managed_layer_parameter_names(self) -> set:
+        """Parameter names some layerwise manager already streams."""
+        return {
+            name
+            for manager in self.layerwise_offload_managers
+            for names in manager._weight_metadata.values()
+            for name in names
+        }
+
+    def park_non_layer_weights(self) -> None:
+        """Move the parameters no manager streams back to the host.
+
+        A layerwise component holds its non-layer parameters on the device for
+        the whole request. That is right while it is the component being used
+        and pure cost afterwards. Measured on H3 at 864x480 / 124 frames: the
+        DiT keeps 2.09 GB and the text encoder 1.40 GB through a VAE decode
+        that touches neither, and the decode is exactly where the budget runs
+        out -- with the VAE's blocks held resident it needs 11.86 GiB against a
+        12 GiB card, and fails for want of 20 MiB.
+
+        Buffers are left where they are. Layerwise offload keeps them resident
+        on purpose, because a shared buffer such as a RoPE cache is referenced
+        by many layers.
+        """
+        if not self.park_non_layer_weights_between_uses:
+            return
+        if current_platform.is_mps():
+            # MPS parks its own non-layer weights, scoped to subphases
+            return
+        managed = self._managed_layer_parameter_names()
+        parked = self._parked_non_layer_weights
+        with torch.inference_mode(False), torch.no_grad():
+            for name, parameter in self.named_parameters():
+                if name in managed or parameter.device.type == "cpu":
+                    continue
+                if name not in parked:
+                    parked[name] = parameter.detach().to("cpu", copy=True)
+                parameter.data = torch.empty(
+                    (1,), dtype=parameter.dtype, device=parameter.device
+                )
+
+    def restore_non_layer_weights(self) -> None:
+        """Bring parked parameters back before this component is used again."""
+        parked = self._parked_non_layer_weights
+        if not parked:
+            return
+        device = current_platform.get_local_torch_device()
+        parameters = dict(self.named_parameters())
+        with torch.inference_mode(False), torch.no_grad():
+            for name, host_tensor in parked.items():
+                parameter = parameters.get(name)
+                if parameter is None:
+                    continue
+                parameter.data = host_tensor.to(device, non_blocking=True)
+
     def _capture_mps_cpu_non_layer_weights(self) -> None:
         managed_names = {
             name
@@ -1198,6 +1258,14 @@ class LayerwiseOffloadableModuleMixin:
             for name, tensor in self._mps_cpu_buffers.items():
                 buffers[name].data = tensor
 
+    @property
+    def _parked_non_layer_weights(self) -> dict:
+        store = self.__dict__.get("_parked_non_layer_weight_store")
+        if store is None:
+            store = {}
+            self.__dict__["_parked_non_layer_weight_store"] = store
+        return store
+
     def configure_layerwise_offload(
         self,
         server_args: ServerArgs,
@@ -1205,6 +1273,9 @@ class LayerwiseOffloadableModuleMixin:
         pin_budget: HostPinBudget | None = None,
         component_name: str | None = None,
     ):
+        self.park_non_layer_weights_between_uses = (
+            server_args.performance_mode == "memory"
+        )
         self.layerwise_offload_managers = []
         named_modules = dict(self.named_modules())
         configured_layer_names = []
