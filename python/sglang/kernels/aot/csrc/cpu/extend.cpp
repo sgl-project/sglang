@@ -237,9 +237,7 @@ void extend_attention_kernel_impl(
             /* C     */ v_prime);
       }  // loop with seq_len_prefix
       if (!is_cross_attn && !kv_from_cache) {
-        // stage 2: compute the triangle part (or, when !is_causal, the full
-        // square: bidirectional encoder-only self-attention still needs every
-        // extend token to attend every other extend token, not just past ones).
+        // stage 2: compute the triangle part (or, when !is_causal, the full square)
         int num_keys = is_causal ? std::min(seq_len_extend, m + BLOCK_M) : seq_len_extend;
         for (int n = 0; n < num_keys; n += BLOCK_N) {
           int n_size = std::min(BLOCK_N, num_keys - n);
