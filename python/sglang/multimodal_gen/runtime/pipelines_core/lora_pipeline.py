@@ -39,6 +39,76 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 logger = init_logger(__name__)
 
 
+def _swap_peft_swiglu_fc1_lora_b(
+    source_name: str, target_name: str, weight: torch.Tensor
+) -> torch.Tensor:
+    # Only the PEFT -> native H3 FFN rewrite: ff.net.0.proj [value; gate]
+    # onto mlp.fc1 [gate; value]. Native fused mlp.fc1 and other models'
+    # ff.net.0.proj (e.g. Flux) must not match.
+    if (
+        weight.dim() != 2
+        or ".ff.net.0.proj.lora_B" not in source_name
+        or not target_name.endswith(".mlp.fc1.lora_B")
+    ):
+        return weight
+    value, gate = weight.chunk(2, dim=0)
+    return torch.cat([gate, value], dim=0)
+
+
+def stack_or_compose_fused_lora(
+    a_list: list[torch.Tensor],
+    b_list: list[torch.Tensor],
+    adapter_alpha: int | None,
+) -> tuple[torch.Tensor, torch.Tensor, int | None]:
+    """Equal sections stay 3D-stacked; GQA sections become one 2D pair."""
+    if len({t.shape for t in a_list}) == 1 and len({t.shape for t in b_list}) == 1:
+        return torch.stack(a_list), torch.stack(b_list), None
+    ranks = [a.shape[0] for a in a_list]
+    outs = [b.shape[0] for b in b_list]
+    a_2d = torch.cat(a_list, dim=0)
+    b_2d = b_list[0].new_zeros(sum(outs), sum(ranks))
+    row = col = 0
+    for a, b, rank, out in zip(a_list, b_list, ranks, outs):
+        scale = 1.0 if adapter_alpha is None else adapter_alpha / rank
+        b_2d[row : row + out, col : col + rank] = (
+            b if scale == 1.0 else (b.float() * scale).to(dtype=b.dtype)
+        )
+        row += out
+        col += rank
+    return a_2d, b_2d, a_2d.shape[0]
+
+
+def _store_fused_lora_groups(
+    adapter: dict[str, torch.Tensor],
+    to_merge_params: dict[Hashable, dict[Any, Any]],
+    adapter_alpha: int | None,
+    device: torch.device | str,
+) -> None:
+    """Write deferred fused lora_A/B groups into the adapter dict."""
+    for a_key, a_parts in list(to_merge_params.items()):
+        if not str(a_key).endswith(".lora_A"):
+            continue
+        base = str(a_key)[: -len(".lora_A")]
+        b_key = f"{base}.lora_B"
+        b_parts = to_merge_params.get(b_key)
+        n = max(a_parts) + 1
+        if (
+            b_parts is None
+            or set(a_parts) != set(range(n))
+            or set(b_parts) != set(range(n))
+        ):
+            continue
+        a, b, fused_alpha = stack_or_compose_fused_lora(
+            [a_parts[i] for i in range(n)],
+            [b_parts[i] for i in range(n)],
+            adapter_alpha,
+        )
+        adapter[str(a_key)] = a.to(device)
+        adapter[b_key] = b.to(device)
+        if fused_alpha is not None:
+            adapter[f"{base}.alpha"] = torch.tensor(float(fused_alpha), device=device)
+
+
 class LoRAPipeline(ComposedPipelineBase):
     """
     Pipeline that supports injecting LoRA adapters into the diffusion transformer.
@@ -114,7 +184,7 @@ class LoRAPipeline(ComposedPipelineBase):
             )  # type: ignore
 
     def is_target_layer(self, module_name: str) -> bool:
-        if self.lora_target_modules is None:
+        if getattr(self, "lora_target_modules", None) is None:
             return True
         return any(
             target_name in module_name for target_name in self.lora_target_modules
@@ -278,12 +348,38 @@ class LoRAPipeline(ComposedPipelineBase):
 
         return converted_count
 
+    def _reject_lora_on_packed_weights(self) -> None:
+        """Fail before any layer is replaced if a target has no plain weight.
+
+        ``BaseLayerWithLoRA`` reads ``base_layer.weight``, which a
+        weight-packing quantization (GGUF) does not expose -- it registers
+        ``qweight``. Checking up front keeps a rejected request from leaving the
+        model half converted, and covers the dynamic ``set_lora`` API as well as
+        a startup ``--lora-path``.
+        """
+        for module_name in ("transformer", "transformer_2"):
+            module = self.modules.get(module_name)
+            if module is None:
+                continue
+            for name, layer in module.named_modules():
+                if not self.is_target_layer(name):
+                    continue
+                params = dict(layer.named_parameters(recurse=False))
+                if "weight" not in params and "qweight" in params:
+                    raise ValueError(
+                        f"LoRA is not supported on {module_name}.{name}: its "
+                        "weights are stored packed (GGUF), which an adapter "
+                        "cannot be merged into or applied alongside. Serve the "
+                        "unquantized checkpoint to use LoRA."
+                    )
+
     def convert_to_lora_layers(self) -> None:
         """
         Unified method to convert the transformer to a LoRA transformer.
         """
         if self.lora_initialized:
             return
+        self._reject_lora_on_packed_weights()
         self.lora_initialized = True
 
         # Convert transformer
@@ -764,6 +860,9 @@ class LoRAPipeline(ComposedPipelineBase):
             # see param mapping in HunyuanVideoArchConfig
             if merge_index is not None:
                 to_merge_params[target_name][merge_index] = weight
+                # A/B of one fused layer must be laid out together (GQA B cannot stack).
+                if target_name.endswith((".lora_A", ".lora_B")):
+                    continue
                 if len(to_merge_params[target_name]) == num_params_to_merge:
                     sorted_tensors = [
                         to_merge_params[target_name][i]
@@ -775,11 +874,19 @@ class LoRAPipeline(ComposedPipelineBase):
                 else:
                     continue
 
+            weight = _swap_peft_swiglu_fc1_lora_b(name, target_name, weight)
             if target_name in self.lora_adapters[lora_nickname]:
                 raise ValueError(
                     f"Dit target weight name {target_name} already exists in lora_adapters[{lora_nickname}]"
                 )
             self.lora_adapters[lora_nickname][target_name] = weight.to(self.device)
+
+        _store_fused_lora_groups(
+            self.lora_adapters[lora_nickname],
+            to_merge_params,
+            adapter_lora_alpha,
+            self.device,
+        )
 
         self.loaded_adapter_paths[lora_nickname] = lora_path
         self.loaded_adapter_alphas[lora_nickname] = adapter_lora_alpha
@@ -814,6 +921,11 @@ class LoRAPipeline(ComposedPipelineBase):
             raise ValueError(
                 f"Invalid target(s): {invalid_targets}. Valid targets: {self.VALID_TARGETS}"
             )
+
+        # Checked before disabling offload, which materializes every layer: on a
+        # memory-constrained deployment that would OOM instead of returning the
+        # unsupported-LoRA error. Offloaded placeholders still carry the name.
+        self._reject_lora_on_packed_weights()
 
         # Disable layerwise offload before convert_to_lora_layers to ensure weights are accessible
         # This is critical because convert_to_lora_layers needs to save cpu_weight from actual weights,

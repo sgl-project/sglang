@@ -1,8 +1,10 @@
 from contextlib import nullcontext
 from types import SimpleNamespace
 
+import pytest
 import torch
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
@@ -11,7 +13,7 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     _ModelOptFp8OffloadAdapter,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
-    component_resident_strategies as component_resident_strategies_mod,
+    component_residency_strategies as component_residency_strategies_mod,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
     layerwise_offload as layerwise_offload_mod,
@@ -20,10 +22,16 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentUse,
     build_component_residency_strategy,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    COMPONENT_OFFLOAD,
+    LAYERWISE_OFFLOAD,
+    RESIDENT,
+    ComponentResidencyError,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+    ComponentOffloadStrategy,
     LayerwiseOffloadStrategy,
     ResidentStrategy,
-    VanillaD2HStrategy,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -168,21 +176,49 @@ class _LayerwiseComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
 
 
 class _TestServerArgs(SimpleNamespace):
+    canonical_residency_mode = ServerArgs.canonical_residency_mode
+    explicit_residency_mode = ServerArgs.explicit_residency_mode
+    _legacy_component_offload_flag = staticmethod(
+        ServerArgs._legacy_component_offload_flag
+    )
+    residency_mode = ServerArgs.residency_mode
+    is_arg_explicitly_set = ServerArgs.is_arg_explicitly_set
+    is_explicit_layerwise_offload_component = (
+        ServerArgs.is_explicit_layerwise_offload_component
+    )
     should_cpu_offload_component = ServerArgs.should_cpu_offload_component
+    record_component_layerwise_capability = (
+        ServerArgs.record_component_layerwise_capability
+    )
+    _parse_component_value_map = staticmethod(ServerArgs._parse_component_value_map)
+    layerwise_tuning_for = ServerArgs.layerwise_tuning_for
 
 
 def _server_args(**kwargs):
     defaults = dict(
+        component_residency=None,
+        disagg_role=RoleType.MONOLITHIC,
+        _required_resident_components=set(),
+        _component_layerwise_capabilities={},
+        _explicit_arg_names=set(),
         cpu_offload_components=None,
         use_fsdp_inference=False,
         dit_cpu_offload=False,
+        dit_layerwise_offload=False,
+        layerwise_offload_components=None,
         text_encoder_cpu_offload=False,
         image_encoder_cpu_offload=False,
         vae_cpu_offload=False,
         dit_offload_prefetch_size=1,
         dit_layerwise_resident_layers=0.0,
         dit_layerwise_residency_policy=RESIDENCY_POLICY_LEADING,
+        layerwise_prefetch_size={},
+        layerwise_resident_layers={},
+        layerwise_residency_policy={},
         pin_cpu_memory=False,
+        # the pin budget ranks candidates by bytes x steps, and reads the step
+        # count off the pipeline's sampling defaults
+        pipeline_class_name=None,
     )
     defaults.update(kwargs)
     return _TestServerArgs(**defaults)
@@ -501,16 +537,106 @@ def test_layerwise_configuration_all_selects_every_capable_component(monkeypatch
     assert is_layerwise_offloaded_module(transformer)
 
 
-def test_component_cpu_offload_strategy_remains_flag_driven():
+def test_explicit_layerwise_all_rejects_unsupported_modules():
+    modules = {
+        "text_encoder": _NestedEncoderDummyModel(),
+        "unsupported_adapter": torch.nn.Linear(2, 2),
+        "scheduler": object(),
+    }
+
+    with pytest.raises(ComponentResidencyError, match="unsupported_adapter"):
+        configure_layerwise_offload_modules(
+            modules, _server_args(), component_names=["all"]
+        )
+
+
+def test_explicit_layerwise_dit_rejects_unsupported_dit():
+    modules = {"transformer": torch.nn.Linear(2, 2)}
+
+    with pytest.raises(ComponentResidencyError, match="transformer"):
+        configure_layerwise_offload_modules(
+            modules, _server_args(), component_names=["dit"]
+        )
+
+
+def test_explicit_layerwise_exact_selector_rejects_non_module(monkeypatch):
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "is_cpu", lambda: False)
+    server_args = _server_args(component_residency={"scheduler": LAYERWISE_OFFLOAD})
+
+    with pytest.raises(ComponentResidencyError, match="scheduler"):
+        configure_layerwise_offload_modules(
+            {"scheduler": object()}, server_args, warn_missing=False
+        )
+
+
+def test_auto_layerwise_skips_unsupported_component(monkeypatch):
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "is_cpu", lambda: False)
+    server_args = _server_args(
+        layerwise_offload_components=["text_encoder"],
+        text_encoder_cpu_offload=True,
+    )
+
+    configured = configure_layerwise_offload_modules(
+        {"text_encoder": torch.nn.Linear(2, 2)},
+        server_args,
+        component_names=["text_encoder"],
+        warn_missing=False,
+    )
+
+    assert configured == []
+    assert server_args.residency_mode("text_encoder") == COMPONENT_OFFLOAD
+
+
+def test_canonical_selector_does_not_make_auto_layerwise_selection_strict(
+    monkeypatch,
+):
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "is_cpu", lambda: False)
+    server_args = _server_args(
+        component_residency={"transformer": RESIDENT},
+        layerwise_offload_components=["text_encoder"],
+        text_encoder_cpu_offload=True,
+    )
+
+    configured = configure_layerwise_offload_modules(
+        {"text_encoder": torch.nn.Linear(2, 2)},
+        server_args,
+        warn_missing=True,
+    )
+
+    assert configured == []
+    assert server_args.residency_mode("text_encoder") == COMPONENT_OFFLOAD
+
+
+def test_legacy_cpu_offload_flag_selects_component_offload_strategy():
     strategy = build_component_residency_strategy(
         "text_encoder", _DummyModel(), _server_args(text_encoder_cpu_offload=True)
     )
-    assert isinstance(strategy, VanillaD2HStrategy)
+    assert isinstance(strategy, ComponentOffloadStrategy)
 
     strategy = build_component_residency_strategy(
         "unknown_component", _DummyModel(), _server_args(text_encoder_cpu_offload=True)
     )
     assert isinstance(strategy, ResidentStrategy)
+
+
+def test_component_residency_strategy_selection_is_direct():
+    for mode, strategy_type in (
+        (RESIDENT, ResidentStrategy),
+        (COMPONENT_OFFLOAD, ComponentOffloadStrategy),
+    ):
+        strategy = build_component_residency_strategy(
+            "text_encoder",
+            _DummyModel(),
+            _server_args(component_residency={"text_encoder": mode}),
+        )
+        assert isinstance(strategy, strategy_type)
+
+
+def test_explicit_layerwise_requires_component_support():
+    server_args = _server_args(component_residency={"text_encoder": LAYERWISE_OFFLOAD})
+
+    with pytest.raises(ValueError, match="did not enable layerwise offload"):
+        build_component_residency_strategy("text_encoder", _DummyModel(), server_args)
 
 
 def test_resident_strategy_prepares_local_device_without_dtype(monkeypatch):
@@ -520,7 +646,7 @@ def test_resident_strategy_prepares_local_device_without_dtype(monkeypatch):
         calls.append((module, dtype))
 
     monkeypatch.setattr(
-        component_resident_strategies_mod,
+        component_residency_strategies_mod,
         "_module_to_local_device",
         fake_module_to_local_device,
     )
@@ -542,11 +668,16 @@ def test_resident_strategy_keeps_fsdp_managed_module_owned_by_fsdp(monkeypatch):
         calls.append((module, dtype))
 
     monkeypatch.setattr(
-        component_resident_strategies_mod,
+        component_residency_strategies_mod,
         "_module_to_local_device",
         fake_module_to_local_device,
     )
-    module = type("FSDPDummyModel", (_DummyModel,), {})()
+    monkeypatch.setattr(
+        component_residency_strategies_mod,
+        "is_fsdp_managed_module",
+        lambda _module: True,
+    )
+    module = _DummyModel()
 
     ResidentStrategy().prepare_for_use(
         module,
@@ -624,6 +755,25 @@ class _ResidentComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
 
 class _AuxiliaryResidentComponent(_ResidentComponent):
     layerwise_offload_dit_group_enabled = False
+
+
+class _MultiGroupComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
+    layer_names = ["small_blocks", "large_blocks"]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.small_blocks = torch.nn.ModuleList([_DummyBlock()])
+        self.large_blocks = torch.nn.ModuleList(
+            [_DummyBlock(), _DummyBlock(), _DummyBlock()]
+        )
+        self.non_layer = torch.nn.Parameter(torch.ones(2))
+        self.to_parameter_shapes = []
+
+    def to(self, *args, **kwargs):
+        self.to_parameter_shapes.append(
+            {name: tuple(param.shape) for name, param in self.named_parameters()}
+        )
+        return super().to(*args, **kwargs)
 
 
 def _patch_fake_device(monkeypatch):
@@ -793,6 +943,36 @@ def test_configure_resolves_residency_policy(monkeypatch):
     )
 
 
+def test_configure_offloads_all_layer_groups_before_moving_non_layers(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    model = _MultiGroupComponent()
+    initialization_order = []
+    initialize_layer_weights = LayerwiseOffloadManager._initialize_layer_weights
+
+    def record_initialization(manager):
+        initialization_order.append(manager.layers_attr_str)
+        initialize_layer_weights(manager)
+
+    monkeypatch.setattr(
+        LayerwiseOffloadManager,
+        "_initialize_layer_weights",
+        record_initialization,
+    )
+
+    model.configure_layerwise_offload(_server_args())
+
+    assert initialization_order == ["large_blocks", "small_blocks"]
+    assert [
+        manager.layers_attr_str for manager in model.layerwise_offload_managers
+    ] == ["small_blocks", "large_blocks"]
+    assert len(model.to_parameter_shapes) == 1
+    shapes_at_move = model.to_parameter_shapes[0]
+    assert shapes_at_move["non_layer"] == (2,)
+    for name, shape in shapes_at_move.items():
+        if name != "non_layer":
+            assert shape == (1,), name
+
+
 def test_holds_residents_reflects_configuration(monkeypatch):
     _patch_fake_device(monkeypatch)
     resident = _resident_manager(_MultiBlockModel(3), num_layers=3, resident_layers=2)
@@ -886,7 +1066,11 @@ def test_disable_offload_short_circuits_residency_release(monkeypatch):
         assert tuple(param.shape) != (1,), name
 
     # The exact call path the residency strategy takes on use-site switches.
-    LayerwiseOffloadStrategy().exit(model)
+    LayerwiseOffloadStrategy().finish_use(
+        model,
+        ComponentUse(stage_name="test", component_name="transformer"),
+        SimpleNamespace(),
+    )
     model.prepare_for_next_req()
     for name, param in model.named_parameters():
         assert tuple(param.shape) != (1,), name
@@ -1042,3 +1226,59 @@ def test_strided_forward_leaves_exactly_the_resident_set(monkeypatch):
     resident = set(range(8)) - set(manager._streamed_order)
     assert resident <= manager._gpu_layers
     assert len(manager._gpu_layers) <= len(resident) + manager.prefetch_size
+
+
+def test_layerwise_tuning_defaults_match_the_group():
+    """No per-component entry: the DiT group keeps its knobs, auxiliaries do not."""
+    args = _server_args(
+        dit_offload_prefetch_size=3,
+        dit_layerwise_resident_layers=20,
+        dit_layerwise_residency_policy=RESIDENCY_POLICY_STRIDED,
+    )
+    assert args.layerwise_tuning_for("transformer", dit_group=True) == (
+        3.0,
+        20.0,
+        RESIDENCY_POLICY_STRIDED,
+    )
+    assert args.layerwise_tuning_for("text_encoder", dit_group=False) == (
+        0.0,
+        0.0,
+        RESIDENCY_POLICY_LEADING,
+    )
+
+
+def test_layerwise_tuning_per_component_entry_wins():
+    """An auxiliary component can be tuned; its layers cost the same per pass."""
+    args = _server_args(
+        dit_offload_prefetch_size=3,
+        dit_layerwise_resident_layers=20,
+        layerwise_prefetch_size="text_encoder=2",
+        layerwise_resident_layers="text_encoder=4",
+        layerwise_residency_policy={"text_encoder": RESIDENCY_POLICY_STRIDED},
+    )
+    assert args.layerwise_tuning_for("text_encoder", dit_group=False) == (
+        2.0,
+        4.0,
+        RESIDENCY_POLICY_STRIDED,
+    )
+    # an entry for one component leaves every other component alone
+    assert args.layerwise_tuning_for("vae", dit_group=False) == (
+        0.0,
+        0.0,
+        RESIDENCY_POLICY_LEADING,
+    )
+    assert args.layerwise_tuning_for("transformer", dit_group=True)[:2] == (3.0, 20.0)
+
+
+def test_layerwise_tuning_rejects_unknown_policy():
+    args = _server_args(layerwise_residency_policy="vae=sideways")
+    with pytest.raises(ValueError, match="unknown residency policy"):
+        args.layerwise_tuning_for("vae", dit_group=False)
+
+
+def test_layerwise_tuning_accepts_json_and_pair_forms():
+    pair = _server_args(layerwise_resident_layers="vae=6,text_encoder=2")
+    assert pair.layerwise_tuning_for("vae", dit_group=False)[1] == 6.0
+    assert pair.layerwise_tuning_for("text_encoder", dit_group=False)[1] == 2.0
+    as_json = _server_args(layerwise_resident_layers='{"vae": 6}')
+    assert as_json.layerwise_tuning_for("vae", dit_group=False)[1] == 6.0

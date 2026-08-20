@@ -33,6 +33,51 @@ utilities, and common action-policy helpers. Model packages may call these
 helpers. Keep ownership in shared runtime folders unless the code is truly
 architecture-specific.
 
+## Out-of-Tree Models and Pipelines
+
+An installed package can register native component models and a pipeline
+without modifying SGLang-Diffusion. Register them in the package's
+`__init__.py`:
+
+```python
+from sglang.multimodal_gen.registry import register_pipeline
+from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
+
+from .configs import CustomPipelineConfig, CustomSamplingParams
+from .pipeline import CustomPipeline
+
+
+ModelRegistry.register_model(
+    "CustomTransformer2DModel",
+    "custom_diffusion.models:CustomTransformer2DModel",
+)
+register_pipeline(
+    CustomPipeline,
+    sampling_param_cls=CustomSamplingParams,
+    pipeline_config_cls=CustomPipelineConfig,
+    hf_model_paths=["my-org/custom-diffusion-model"],
+    model_detectors=[lambda value: "custom-diffusion" in value.lower()],
+)
+```
+
+Install the package in the server environment and set the same environment
+variable used by SRT plugins:
+
+```bash
+pip install -e /path/to/custom-diffusion
+SGLANG_EXTERNAL_MODEL_PACKAGE=custom_diffusion \
+  sglang serve --model-path my-org/custom-diffusion-model
+```
+
+Notes:
+
+- The string form of `register_model` keeps component imports lazy.
+- `hf_model_paths` also supports checkpoints without `model_index.json`. Other
+  Diffusers checkpoints can select the pipeline through `_class_name`.
+- For a standalone safetensors file, pass `--pipeline CustomPipeline`.
+- Set the environment variable before startup. Each process imports the package
+  once. Use `overwrite=True` only to intentionally replace a built-in pipeline.
+
 ## Start With the Smallest Change
 
 Before adding files, decide which path fits the model.
@@ -356,17 +401,29 @@ Required fields for `DenoisingStage`:
 | `batch.num_inference_steps` | Number of denoising iterations. |
 | `batch.raw_latent_shape` | Original latent shape before packing, if decode needs it. |
 
-### 5. Denoising Module
+### 5. Distributed and memory integration
 
-Add a file under `runtime/models/dits/` only when the architecture is new. Reuse
-existing encoders, VAEs, schedulers, normalization layers, and fused kernels
-whenever possible.
+Single-GPU parity is only the first milestone. Complete native support also
+requires:
 
-For multi-GPU serving, add TP/SP support after the single-GPU path is correct.
-Useful references:
+- **Encoder and DiT TP/SP:** use native parallel projections and sharded weight
+  loading for TP, and `USPAttention` for SP. Handle masks, RoPE, padding, and
+  output gathering without falling back to a replicated full model. TP and SP
+  must work together.
+- **VAE parallel decode:** subclass `ParallelTiledVAE`, or reuse an existing
+  native base with the same contract. Support tiled and `spatial_shard` decode
+  through `DecodingStage` and the shared decode group. Reuse
+  `runtime/layers/parallel_conv.py` and
+  `runtime/models/vaes/parallel/diffusers_spatial.py` where applicable.
+- **Layerwise offload:** every loaded neural module must inherit
+  `LayerwiseOffloadableModuleMixin` and list all repeated block paths in
+  `layer_names`. Set `layerwise_offload_dit_group_enabled = False` for non-DiT
+  modules. Component CPU offload is not a substitute.
 
-- `runtime/models/dits/wanvideo.py` for TP plus SP.
-- `runtime/models/dits/qwen_image.py` for USP attention.
+See `wanvideo.py` and `qwen_image.py` for DiT TP/SP, `gemma_3.py` for encoder TP
+and offload, and `autoencoder_kl_qwenimage.py` or `ltx_2_vae.py` for VAE decode.
+The Diffusers backend is compatibility-first and does not need to meet this
+native integration contract.
 
 ### 6. Registry
 
@@ -393,10 +450,13 @@ implementation.
    content.
 2. Compare latent scale and shift, timestep order, sigma values, and conditioning
    kwargs against Diffusers or the official implementation.
-3. Verify VAE decode and post-processing separately from denoising.
-4. If the model supports LoRA, CFG parallelism, TP, SP, or disaggregation, test
-   each feature explicitly.
-5. Add or update docs, examples, or the compatibility matrix when users need a
+3. Compare VAE decode separately, including tiled and multi-GPU `spatial_shard`.
+4. Run encoder and DiT TP, SP, combined TP x SP, and
+   `--layerwise-offload-components all`; compare with the single-GPU resident
+   baseline.
+5. If the model supports LoRA, CFG parallelism, or disaggregation, test each
+   feature explicitly.
+6. Add or update docs, examples, or the compatibility matrix when users need a
    new launch command.
 
 Common failure points:
@@ -419,5 +479,5 @@ Common failure points:
       `_class_name` when applicable.
 - [ ] Confirmed `_required_config_modules` matches the model repo.
 - [ ] Verified image or video quality against a reference output.
-- [ ] Tested multi-GPU paths if the PR claims TP, SP, CFG parallelism, or
-      distributed serving support.
+- [ ] Completed the distributed and memory integration checks above.
+- [ ] Tested CFG parallelism and distributed serving paths when they apply.
