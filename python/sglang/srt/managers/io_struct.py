@@ -1923,6 +1923,10 @@ class UpdateWeightVersionReqInput(BaseReq, kw_only=True):
     abort_all_requests: bool = True
 
 
+class UpdateWeightVersionReqOutput(BaseReq, kw_only=True):
+    pass
+
+
 class GetWeightsByNameReqInput(BaseReq, kw_only=True):
     name: str
     truncate_size: int = 100

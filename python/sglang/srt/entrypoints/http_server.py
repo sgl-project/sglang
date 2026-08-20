@@ -1441,9 +1441,7 @@ async def update_weight_version(
     # Use a simple approach without the complex lock mechanism for now
     # since weight_version update is a simple operation that doesn't affect model weights
     try:
-        _global_state.tokenizer_manager.record_config_updates(
-            "http.update_weight_version", weight_version=obj.new_version
-        )
+        await _global_state.tokenizer_manager.update_weight_version(obj)
 
         return ORJSONResponse(
             {
