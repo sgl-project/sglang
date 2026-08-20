@@ -3,11 +3,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
+from safetensors.torch import save_file
 
 from sglang.multimodal_gen.runtime.loader.artifact_resolver import (
     ArtifactFile,
     ArtifactInventory,
+    ArtifactRequest,
     parse_artifact_source,
+    resolve_artifact,
     resolve_artifact_inventory,
 )
 
@@ -87,3 +91,48 @@ def test_materialized_inventory_shape_is_serializable():
     )
 
     assert os.fspath(inventory.source.original) == "owner/repo"
+
+
+def test_weights_only_artifact_rejects_ambiguous_files(tmp_path):
+    (tmp_path / "a.safetensors").write_bytes(b"a")
+    (tmp_path / "b.safetensors").write_bytes(b"b")
+
+    with pytest.raises(ValueError, match="multiple independent weight files"):
+        resolve_artifact(
+            ArtifactRequest(
+                name="transformer",
+                role="component_weights",
+                component="transformer",
+                source=str(tmp_path),
+            )
+        )
+
+
+def test_lora_artifact_reports_tensor_and_quant_metadata(tmp_path):
+    (tmp_path / "config.json").write_text(
+        '{"quantization_config": {"quant_method": "bitsandbytes"}}'
+    )
+    save_file(
+        {
+            "blocks.0.to_q.lora_A.weight": torch.zeros(4, 8),
+            "blocks.0.to_q.lora_B.weight": torch.zeros(8, 4),
+        },
+        tmp_path / "adapter.safetensors",
+        metadata={"sampler_steps": "4"},
+    )
+
+    artifact = resolve_artifact(
+        ArtifactRequest(
+            name="startup_lora",
+            role="lora",
+            source=str(tmp_path),
+        )
+    )
+
+    assert artifact.selected_files == ("adapter.safetensors",)
+    assert artifact.quantization_method == "bitsandbytes"
+    assert artifact.quantization_source == "quantization_config"
+    assert artifact.tensor_summary is not None
+    assert artifact.tensor_summary.tensor_count == 2
+    assert artifact.tensor_summary.lora_ranks == (4,)
+    assert artifact.tensor_summary.metadata["sampler_steps"] == "4"
