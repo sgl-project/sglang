@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import shlex
@@ -35,7 +36,7 @@ def server_healthy(base_url: str, timeout: float = 2.0) -> bool:
             base_url.rstrip("/") + "/health_generate", timeout=timeout
         ) as response:
             return response.status == 200
-    except (OSError, urllib.error.URLError):
+    except (OSError, urllib.error.URLError, http.client.HTTPException):
         return False
 
 

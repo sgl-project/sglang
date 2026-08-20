@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from precompile_fmha_sm100 import runtime_variants
 from run_msa_ab_repetitions import (
     OFFLINE_THROUGHPUT_ARGS,
     OFFLINE_THROUGHPUT_DATASET,
+    server_healthy,
     validate_resume_manifest,
 )
 from summarize_msa_repetitions import (
@@ -29,6 +32,13 @@ class MSARepetitionSummaryTest(unittest.TestCase):
             OFFLINE_THROUGHPUT_ARGS,
             ("--dataset-name", "random-ids", "--tokenize-prompt"),
         )
+
+    def test_transient_http_protocol_error_is_not_healthy(self) -> None:
+        with mock.patch(
+            "run_msa_ab_repetitions.urllib.request.urlopen",
+            side_effect=http.client.BadStatusLine("GET /health_generate HTTP/1.1"),
+        ):
+            self.assertFalse(server_healthy("http://127.0.0.1:30000"))
 
     def test_precompile_variants_cover_tp4_sparse_paged_routes(self) -> None:
         dtype_code = 42
