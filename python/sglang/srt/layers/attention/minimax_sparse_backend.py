@@ -428,6 +428,19 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     // self.page_size
                 ).to(torch.int32)
 
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        # The public FlashInfer decode graph reads the persistent page table in
+        # every sparse layer, after the in-graph metadata marker.  The next
+        # replay refreshes that same table in out-of-graph metadata prep, so it
+        # must not overlap the preceding graph's attention kernels.
+        if (
+            fm.is_decode()
+            and self.msa_backend == "flashinfer"
+            and self._msa_owns_decode
+        ):
+            return SharedReadEnds.POST_REPLAY
+        return super().shared_read_ends(fm)
+
     def _prepare_msa_decode_meta(
         self, forward_batch: ForwardBatch, *, in_capture: bool = False
     ):

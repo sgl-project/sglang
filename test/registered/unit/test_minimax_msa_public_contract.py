@@ -4,7 +4,10 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
+from sglang.srt.layers.attention.minimax_sparse_backend import MiniMaxSparseAttnBackend
 from sglang.srt.layers.attention.minimax_sparse_ops import msa
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -237,6 +240,18 @@ def test_graph_state_and_page_table_keep_stable_addresses(monkeypatch):
     )
     assert result.data_ptr() == page_table.data_ptr()
     assert result.tolist() == [[1, 2], [4, 5]]
+
+
+def test_flashinfer_decode_page_table_remains_live_through_graph_replay():
+    backend = object.__new__(MiniMaxSparseAttnBackend)
+    backend.msa_backend = "flashinfer"
+    backend._msa_owns_decode = True
+
+    assert backend.shared_read_ends(ForwardMode.DECODE) is SharedReadEnds.POST_REPLAY
+    assert backend.shared_read_ends(ForwardMode.EXTEND) is SharedReadEnds.UNKNOWN
+
+    backend.msa_backend = "fmha_sm100"
+    assert backend.shared_read_ends(ForwardMode.DECODE) is SharedReadEnds.IN_REPLAY
 
 
 if __name__ == "__main__":
