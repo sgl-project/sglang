@@ -74,7 +74,10 @@ def maybe_register_hicache_draft(
 
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
-    if not isinstance(tree_cache, UnifiedRadixCache):
+    # Dedup keeps the potentially TP-sharded draft cache rank-local.
+    if server_args.enable_mla_hicache_host_dedup or not isinstance(
+        tree_cache, UnifiedRadixCache
+    ):
         _register_legacy_hicache_draft(
             tree_cache=tree_cache,
             draft_pool=draft_plan.device_pools[0],

@@ -559,6 +559,11 @@ class Scheduler(
         self.tree_cache = result.tree_cache
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
+        if (
+            self.enable_hierarchical_cache
+            and self.tree_cache.cache_controller.mla_dedup_enabled
+        ):
+            self.tree_cache.cache_controller.set_producer_stream(self.forward_stream)
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
@@ -3748,6 +3753,14 @@ class Scheduler(
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
+                    if (
+                        self.enable_hierarchical_cache
+                        and self.tree_cache.cache_controller.mla_dedup_enabled
+                    ):
+                        # Fence MLA dedup D2H before reusing its device slots.
+                        self.tree_cache.cache_controller.wait_for_last_write(
+                            self.forward_stream
+                        )
                     # resolve consumes SB staging (prefill_input_ids_cpu /
                     # mix_running_indices). Run OUTSIDE isolation so the
                     # snapshot captures the post-consume state — restoring

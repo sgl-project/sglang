@@ -7,7 +7,11 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
+from sglang.srt.environ import envs
+from sglang.srt.managers import cache_controller as manager_cache_controller
+from sglang.srt.managers.cache_controller import CacheOperation
+from sglang.srt.managers.cache_controller import CacheOperation as ManagerCacheOperation
+from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache import l2_transfer as transfer_module
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -16,6 +20,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
+    PrefetchOperation,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool_host import (
@@ -26,6 +31,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     LogicalHostPool,
     PoolEntry,
 )
+from sglang.srt.mem_cache.mla_host_dedup import MLAHostDedupBroadcaster
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -57,6 +63,16 @@ def _device_pool_stub(*, layer_num: int, **fields) -> SimpleNamespace:
         layer_num=layer_num,
         layer_shard_enabled=False,
         **fields,
+    )
+
+
+def _dedup_context(broadcaster, *, producer_stream=None) -> SimpleNamespace:
+    return SimpleNamespace(
+        broadcaster=broadcaster,
+        is_dummy_rank=not broadcaster.is_src,
+        producer_stream=producer_stream,
+        last_write_finish_event=None,
+        prefetch_sync_groups=None,
     )
 
 
@@ -177,12 +193,31 @@ class _FakeEvent:
         pass
 
 
+class _FakeStream:
+    def __init__(self, operations=None):
+        self.operations = operations
+        self.synchronize_count = 0
+        self.waited_streams = []
+        self.waited_events = []
+
+    def wait_stream(self, stream):
+        self.waited_streams.append(stream)
+
+    def wait_event(self, event):
+        self.waited_events.append(event)
+
+    def synchronize(self):
+        self.synchronize_count += 1
+        if self.operations is not None:
+            self.operations.append(("synchronize", None))
+
+
 class _FakeDeviceModule:
     Event = _FakeEvent
 
     @staticmethod
     def Stream():
-        return object()
+        return _FakeStream()
 
     @staticmethod
     @contextmanager
@@ -197,6 +232,8 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
     @staticmethod
     def _start_writing(controller):
+        if not hasattr(controller, "mla_dedup"):
+            controller.mla_dedup = None
         with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
             controller.l2_transfer_engine = L2TransferEngine("kernel")
             controller.start_writing()
@@ -223,6 +260,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.mem_pool_host = _host_group_stub([], can_use_write_back_jit=False)
         controller.has_draft = False
         controller.has_mtp_draft = False
+        controller.mla_dedup = None
+        controller.mla_dedup_enabled = False
+        controller._mla_skip_host_io = False
         controller._l2_transfers.side_effect = lambda *args: (
             HybridCacheController._l2_transfers(controller, *args)
         )
@@ -401,6 +441,64 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             ),
         )
 
+    def test_mla_dedup_dummy_host_pools_are_allocator_only(self):
+        mla_device_pool = _device_pool_stub(
+            layer_num=2,
+            store_dtype=torch.float16,
+            kv_lora_rank=4,
+            qk_rope_head_dim=2,
+            size=8,
+            start_layer=0,
+            end_layer=2,
+        )
+        mla_host = MLATokenToKVPoolHost(
+            mla_device_pool,
+            host_to_device_ratio=2,
+            host_size=0,
+            page_size=2,
+            layout="page_first",
+            pin_memory=False,
+            is_dummy=True,
+        )
+
+        self.assertTrue(mla_host._is_dummy)
+        self.assertIsNone(mla_host.kv_buffer)
+        self.assertIsNone(mla_host.data_ptrs)
+        self.assertEqual(mla_host.get_contiguous_buf_infos(), ([], [], []))
+        slots = mla_host.alloc(2)
+        self.assertIsNotNone(slots)
+        self.assertEqual(slots.tolist(), [0, 1])
+        with self.assertRaisesRegex(AssertionError, "load on a dummy"):
+            mla_host.load_to_device_per_layer(
+                mla_device_pool, slots, slots, layer_id=0, io_backend="kernel"
+            )
+
+        dsa_device_pool = _device_pool_stub(
+            layer_num=2,
+            store_dtype=torch.float16,
+            size=8,
+            start_layer=0,
+            end_layer=2,
+            index_head_dim=8,
+            quant_block_size=4,
+        )
+        indexer_host = DSAIndexerPoolHost(
+            dsa_device_pool,
+            mla_host,
+            layout="page_first",
+            pin_memory=False,
+            is_dummy=True,
+        )
+
+        self.assertTrue(indexer_host._is_dummy)
+        self.assertIsNone(indexer_host.index_k_with_scale_buffer)
+        self.assertIsNone(indexer_host.index_k_device_ptrs)
+        self.assertEqual(indexer_host.size, mla_host.size)
+        with self.assertRaisesRegex(AssertionError, "load on a dummy"):
+            indexer_host.load_to_device_per_layer(
+                dsa_device_pool, slots, slots, layer_id=0, io_backend="kernel"
+            )
+
     def test_mha_backup_then_load_roundtrip_uses_staged(self):
         layer_num = 2
         head_num = 1
@@ -544,6 +642,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         host.token_stride_size = kv_cache_dim
         host.layout_dim = host.token_stride_size * layer_num
         host.dtype = torch.uint8
+        host._is_dummy = False
         host.can_use_jit = True
         host.can_use_write_back_jit = True
         host.kv_buffer = torch.zeros(8, layer_num, 1, kv_cache_dim, dtype=torch.uint8)
@@ -838,6 +937,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         host.index_k_with_scale_buffer = torch.zeros(
             4, host.layer_num, 1, host.indexer_page_stride_size, dtype=torch.uint8
         )
+        host._is_dummy = False
         host.staging_buffer = torch.empty(
             4, host.layer_num, 1, host.indexer_page_stride_size, dtype=torch.uint8
         )
@@ -1052,6 +1152,561 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
         controller.move_indices.assert_called_once()
         self.assertEqual(captured["host_indices"].device.type, "cpu")
+
+    def test_mla_dedup_peer_still_writes_local_draft_pool(self):
+        target_writes = []
+        draft_writes = []
+
+        class FakeTargetHostPool:
+            layout = "page_first"
+            can_use_write_back_jit = False
+            size_per_token = 1
+
+            def backup_from_device_all_layer(self, *args):
+                target_writes.append(args)
+
+        class FakeDraftHostPool:
+            layout = "page_first"
+            can_use_write_back_jit = True
+            size_per_token = 1
+
+            def backup_from_device_all_layer(self, *args):
+                draft_writes.append(args)
+
+        op = ManagerCacheOperation(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+        )
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.write_queue = [op]
+        controller.io_backend = "kernel"
+        controller.mem_pool_host = FakeTargetHostPool()
+        controller.mem_pool_device = object()
+        controller.mem_pool_host_draft = FakeDraftHostPool()
+        controller.mem_pool_device_draft = object()
+        controller.has_draft = True
+        controller.mla_dedup = _dedup_context(SimpleNamespace(is_src=False))
+        controller.ack_write_queue = []
+        controller.move_indices = mock.Mock(
+            return_value=(op.host_indices, op.device_indices)
+        )
+
+        self._start_writing(controller)
+
+        self.assertEqual(target_writes, [])
+        self.assertEqual(len(draft_writes), 1)
+        self.assertEqual(draft_writes[0][1].device.type, "cpu")
+
+    def test_mla_dedup_load_restores_draft_on_every_rank(self):
+        draft_loads = []
+        broadcasts = []
+
+        class FakeDraftHostPool:
+            layer_num = 2
+
+            def load_to_device_per_layer(self, *args):
+                draft_loads.append(args)
+
+        class FakeProducerEvent:
+            start_event = _FakeEvent()
+            finish_event = _FakeEvent()
+
+            def __init__(self):
+                self.completed_layers = []
+
+            def complete(self, layer_index):
+                self.completed_layers.append(layer_index)
+
+        producer_event = FakeProducerEvent()
+        op = ManagerCacheOperation(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+        )
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.load_queue = [op]
+        controller.io_backend = "kernel"
+        controller.mem_pool_host_draft = FakeDraftHostPool()
+        controller.mem_pool_device_draft = object()
+        controller.has_draft = True
+        controller.layer_num = 3
+        controller.layer_done_counter = SimpleNamespace(
+            update_producer=lambda: 0, events=[producer_event]
+        )
+        controller.mla_dedup = _dedup_context(
+            SimpleNamespace(
+                is_src=False,
+                prepare_broadcast=lambda device_indices, stream: (
+                    device_indices,
+                    None,
+                ),
+                broadcast_loaded_layer=lambda layer_id, prepared: broadcasts.append(
+                    (layer_id, prepared)
+                ),
+            )
+        )
+        controller.load_stream = _FakeStream()
+        controller.l2_transfer_engine = SimpleNamespace(
+            host_to_device_stream=controller.load_stream
+        )
+        controller.ack_load_queue = []
+        controller.move_indices = mock.Mock(
+            return_value=(op.host_indices, op.device_indices)
+        )
+
+        with mock.patch.object(
+            manager_cache_controller, "device_module", _FakeDeviceModule
+        ):
+            controller.start_loading()
+
+        self.assertEqual([layer_id for layer_id, _ in broadcasts], [0, 1, 2])
+        self.assertEqual(len(draft_loads), 2)
+        self.assertEqual(producer_event.completed_layers, [0, 1, 2])
+        self.assertEqual(controller.load_stream.synchronize_count, 1)
+        self.assertEqual(len(controller.ack_load_queue), 1)
+        ack = controller.ack_load_queue[0]
+        self.assertEqual(ack.num_tokens, 4)
+        self.assertIsNot(ack.start_event, producer_event.start_event)
+        self.assertIsNot(ack.finish_event, producer_event.finish_event)
+
+    def test_mla_dedup_source_load_and_broadcast_are_layerwise(self):
+        operations = []
+
+        class FakeTargetHostPool:
+            def load_to_device_per_layer(
+                self,
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id,
+                io_backend,
+            ):
+                operations.append(("target", layer_id))
+
+        class FakeDraftHostPool:
+            layer_num = 2
+
+            def load_to_device_per_layer(
+                self,
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id,
+                io_backend,
+            ):
+                operations.append(("draft", layer_id))
+
+        class FakeProducerEvent:
+            start_event = _FakeEvent()
+            finish_event = _FakeEvent()
+
+            def complete(self, layer_index):
+                operations.append(("complete", layer_index))
+
+        op = ManagerCacheOperation(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+        )
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.load_queue = [op]
+        controller.io_backend = "kernel"
+        controller.mem_pool_host = FakeTargetHostPool()
+        controller.mem_pool_device = object()
+        controller.mem_pool_host_draft = FakeDraftHostPool()
+        controller.mem_pool_device_draft = object()
+        controller.has_draft = True
+        controller.layer_num = 3
+        controller.layer_done_counter = SimpleNamespace(
+            update_producer=lambda: 0, events=[FakeProducerEvent()]
+        )
+        controller.mla_dedup = _dedup_context(
+            SimpleNamespace(
+                is_src=True,
+                prepare_broadcast=lambda device_indices, stream: operations.append(
+                    ("prepare", None)
+                )
+                or (device_indices, None),
+                broadcast_loaded_layer=lambda layer_id, prepared: operations.append(
+                    ("broadcast", layer_id)
+                ),
+            )
+        )
+        controller.load_stream = _FakeStream(operations)
+        controller.l2_transfer_engine = SimpleNamespace(
+            host_to_device_stream=controller.load_stream
+        )
+        controller.ack_load_queue = []
+        controller.move_indices = mock.Mock(
+            return_value=(op.host_indices, op.device_indices)
+        )
+
+        with mock.patch.object(
+            manager_cache_controller, "device_module", _FakeDeviceModule
+        ):
+            controller.start_loading()
+
+        self.assertEqual(
+            operations,
+            [
+                ("prepare", None),
+                ("target", 0),
+                ("broadcast", 0),
+                ("draft", 0),
+                ("complete", 0),
+                ("target", 1),
+                ("broadcast", 1),
+                ("draft", 1),
+                ("complete", 1),
+                ("target", 2),
+                ("broadcast", 2),
+                ("complete", 2),
+                ("synchronize", None),
+            ],
+        )
+
+    def test_mla_layer_broadcast_reuses_full_staging_capacity(self):
+        broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)
+        broadcaster.is_src = True
+        broadcaster.src_global_rank = 0
+        broadcaster.group = object()
+
+        layer_buffers = [
+            torch.arange(24, dtype=torch.float32).reshape(6, 1, 4),
+            torch.arange(24, 48, dtype=torch.float32).reshape(6, 1, 4),
+        ]
+        target = torch.tensor([0, 2, 5], dtype=torch.int64)
+        # Capacity is six rows, modeling the retained 2 layers * 3-row chunk.
+        staging = torch.empty(2 * 3 * 4, dtype=torch.float32)
+
+        with mock.patch.object(torch.distributed, "broadcast") as broadcast:
+            broadcaster._bcast_layer(layer_buffers, staging, target, 4, layer_id=1)
+
+        broadcast.assert_called_once()
+        expected = layer_buffers[1].index_select(0, target)
+        torch.testing.assert_close(
+            staging[: expected.numel()].view_as(expected), expected
+        )
+
+        broadcaster.is_src = False
+        received = [torch.zeros_like(layer) for layer in layer_buffers]
+        with mock.patch.object(torch.distributed, "broadcast"):
+            broadcaster._bcast_layer(received, staging, target, 4, layer_id=1)
+        torch.testing.assert_close(received[1].index_select(0, target), expected)
+
+    def test_mla_dedup_chunk_tokens_uses_environment(self):
+        device_pool = _device_pool_stub(
+            layer_num=2,
+            device=torch.device("cpu"),
+            kv_cache_dim=4,
+            kv_buffer=[torch.empty(3, 1, 4), torch.empty(3, 1, 4)],
+        )
+
+        with (
+            envs.SGLANG_MLA_DEDUP_CHUNK_TOKENS.override(7),
+            mock.patch(
+                "sglang.srt.mem_cache.mla_host_dedup.mla_dedup_rank_and_size",
+                return_value=(0, 2),
+            ),
+        ):
+            broadcaster = MLAHostDedupBroadcaster(
+                device_pool, group=object(), src_global_rank=0
+            )
+
+        self.assertEqual(broadcaster.chunk_tokens, 7)
+        self.assertEqual(broadcaster.kv_staging.numel(), 2 * 7 * 4)
+
+    def test_mla_dedup_chunk_tokens_must_be_positive(self):
+        device_pool = _device_pool_stub(
+            layer_num=2,
+            device=torch.device("cpu"),
+            kv_cache_dim=4,
+            kv_buffer=[torch.empty(3, 1, 4), torch.empty(3, 1, 4)],
+        )
+
+        with (
+            envs.SGLANG_MLA_DEDUP_CHUNK_TOKENS.override(0),
+            mock.patch(
+                "sglang.srt.mem_cache.mla_host_dedup.mla_dedup_rank_and_size",
+                return_value=(0, 2),
+            ),
+            self.assertRaisesRegex(ValueError, "must be positive"),
+        ):
+            MLAHostDedupBroadcaster(device_pool, group=object(), src_global_rank=0)
+
+    def test_mla_dedup_peer_prefetch_uses_synchronized_increment(self):
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mla_dedup = _dedup_context(SimpleNamespace(is_src=False))
+        controller.page_size = 4
+        operation = PrefetchOperation(
+            request_id="request",
+            token_ids=[],
+            pool_transfers=[object()],
+        )
+        operation.hash_value = ["page-0", "page-1"]
+        operation.increment = mock.Mock(return_value=True)
+
+        controller._page_transfer(operation)
+
+        operation.increment.assert_called_once_with(8)
+        self.assertTrue(operation.pool_transfers_done)
+
+    def test_mla_dedup_build_eagerly_warms_dedicated_nccl_group(self):
+        tp_group = object()
+        dedicated_group = object()
+        device_pool = _device_pool_stub(
+            layer_num=2,
+            device=torch.device("cpu"),
+            kv_cache_dim=4,
+            kv_buffer=[torch.empty(3, 1, 4)],
+        )
+
+        with (
+            mock.patch(
+                "sglang.srt.mem_cache.mla_host_dedup.is_dp_attention_enabled",
+                return_value=False,
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.mla_host_dedup.mla_dedup_rank_and_size",
+                return_value=(0, 2),
+            ),
+            mock.patch.object(
+                torch.distributed,
+                "get_process_group_ranks",
+                return_value=[4, 5],
+            ),
+            mock.patch(
+                "sglang.srt.distributed.parallel_state.create_custom_parallel_group",
+                return_value=dedicated_group,
+            ) as create_group,
+            mock.patch.object(torch.distributed, "broadcast") as broadcast,
+            mock.patch.object(torch.cuda, "synchronize") as synchronize,
+        ):
+            broadcaster = MLAHostDedupBroadcaster.build(
+                device_pool, tp_group, attn_tp_group=None
+            )
+
+        create_group.assert_called_once_with(group_ranks=[4, 5], backend="nccl")
+        broadcast.assert_called_once()
+        warmup = broadcast.call_args.args[0]
+        self.assertEqual(warmup.numel(), 1)
+        self.assertIs(broadcast.call_args.kwargs["group"], dedicated_group)
+        self.assertEqual(broadcast.call_args.kwargs["src"], 4)
+        synchronize.assert_called_once_with(device_pool.device)
+        self.assertIs(broadcaster.group, dedicated_group)
+
+    def test_mla_dedup_indexer_pages_preserve_logical_order(self):
+        broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)
+        broadcaster.device = torch.device("cpu")
+        broadcaster.device_pool = SimpleNamespace(page_size=4)
+        broadcaster.idx_bufs = [object()]
+
+        # Logical page 0 is backed by physical page 2, while logical page 1 is
+        # backed by physical page 0. unique() would sort this to [0, 2] and
+        # swap the payload when another TP rank uses different physical pages.
+        device_indices = torch.tensor([8, 9, 10, 11, 0, 1, 2, 3], dtype=torch.int64)
+        prepared_indices, page_indices = broadcaster.prepare_broadcast(
+            device_indices, _FakeStream()
+        )
+
+        self.assertIs(prepared_indices, device_indices)
+        torch.testing.assert_close(page_indices, torch.tensor([2, 0]))
+
+    def test_mla_dedup_indexer_rejects_partial_pages(self):
+        broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)
+        broadcaster.device = torch.device("cpu")
+        broadcaster.device_pool = SimpleNamespace(page_size=4)
+        broadcaster.idx_bufs = [object()]
+
+        with self.assertRaisesRegex(ValueError, "page-aligned device indices"):
+            broadcaster.prepare_broadcast(torch.arange(7), _FakeStream())
+
+    def test_mla_dedup_write_fences_forward_stream_both_directions(self):
+        class FakeHostPool:
+            layout = "layer_first"
+            can_use_write_back_jit = False
+            size_per_token = 1
+
+            def backup_from_device_all_layer(self, *args):
+                pass
+
+        op = ManagerCacheOperation(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+        )
+        producer_stream = object()
+        write_stream = _FakeStream()
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.write_queue = [op]
+        controller.io_backend = "direct"
+        controller.mem_pool_host = FakeHostPool()
+        controller.mem_pool_device = object()
+        controller.has_draft = False
+        controller.mla_dedup = _dedup_context(
+            SimpleNamespace(is_src=True), producer_stream=producer_stream
+        )
+        controller.ack_write_queue = []
+        controller.move_indices = mock.Mock(
+            return_value=(op.host_indices, op.device_indices)
+        )
+
+        with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
+            controller.l2_transfer_engine = L2TransferEngine("direct")
+            controller.l2_transfer_engine.device_to_host_stream = write_stream
+            controller.start_writing()
+
+        self.assertEqual(write_stream.waited_streams, [producer_stream])
+        self.assertIs(
+            controller.mla_dedup.last_write_finish_event,
+            controller.ack_write_queue[0].finish_event,
+        )
+        forward_stream = _FakeStream()
+        controller.wait_for_last_write(forward_stream)
+        self.assertEqual(
+            forward_stream.waited_events,
+            [controller.ack_write_queue[0].finish_event],
+        )
+
+    def test_hybrid_mla_dedup_peer_still_writes_local_draft_pool(self):
+        target_writes = []
+        draft_writes = []
+
+        class FakeTargetHostPool:
+            layout = "page_first"
+            can_use_write_back_jit = False
+
+            def backup_from_device_all_layer(self, *args, **kwargs):
+                target_writes.append((args, kwargs))
+
+        class FakeDraftHostPool:
+            layout = "page_first"
+            can_use_write_back_jit = True
+
+            def backup_from_device_all_layer(self, *args):
+                draft_writes.append(args)
+
+        op = CacheOperation(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+        )
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.write_queue = [op]
+        controller.io_backend = "kernel"
+        target_host_pool = FakeTargetHostPool()
+        target_host_pool._is_dummy = True
+        controller.mem_pool_device = object()
+        controller.mem_pool_host = SimpleNamespace(
+            anchor_entry=SimpleNamespace(
+                host_pool=target_host_pool,
+                device_pool=controller.mem_pool_device,
+                layer_mapper=None,
+            ),
+            entry_map={},
+        )
+        controller.mem_pool_host_draft = FakeDraftHostPool()
+        controller.mem_pool_device_draft = object()
+        controller.has_draft = True
+        controller.mla_dedup = _dedup_context(SimpleNamespace(is_src=False))
+        controller.ack_write_queue = []
+        controller.move_hybrid_indices = mock.Mock(
+            return_value=(op.host_indices, op.device_indices, None)
+        )
+        controller._record_transfer_indices_on_stream = lambda *args: None
+        controller._num_tokens_by_pool = lambda op: {"kv": len(op.device_indices)}
+        controller._mla_transfer_num_bytes = lambda op: 0
+
+        self._start_writing(controller)
+
+        self.assertEqual(target_writes, [])
+        self.assertEqual(len(draft_writes), 1)
+        self.assertEqual(draft_writes[0][1].device.type, "cpu")
+
+    def test_hybrid_mla_dedup_loads_extra_pools_layerwise(self):
+        operations = []
+        pool_transfers = [mock.sentinel.pool_transfer]
+
+        class FakeTargetHostPool:
+            def load_to_device_per_layer(
+                self,
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id,
+                io_backend,
+                pool_transfers=None,
+            ):
+                operations.append(("load", layer_id, pool_transfers))
+
+        class FakeProducerEvent:
+            start_event = _FakeEvent()
+            finish_event = _FakeEvent()
+
+            def complete(self, layer_index):
+                operations.append(("complete", layer_index))
+
+        op = CacheOperation(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+        )
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.load_queue = [op]
+        controller.io_backend = "kernel"
+        controller.mem_pool_host = FakeTargetHostPool()
+        controller.mem_pool_device = object()
+        controller.has_draft = False
+        controller.layer_num = 2
+        controller.layer_done_counter = SimpleNamespace(
+            update_producer=lambda: 0, events=[FakeProducerEvent()]
+        )
+        controller.mla_dedup = _dedup_context(
+            SimpleNamespace(
+                is_src=True,
+                prepare_broadcast=lambda device_indices, stream: (
+                    device_indices,
+                    None,
+                ),
+                broadcast_loaded_layer=lambda layer_id, prepared: operations.append(
+                    ("broadcast", layer_id)
+                ),
+            )
+        )
+        controller.load_stream = _FakeStream(operations)
+        controller.l2_transfer_engine = SimpleNamespace(
+            host_to_device_stream=controller.load_stream
+        )
+        controller.ack_load_queue = []
+        controller.move_hybrid_indices = mock.Mock(
+            return_value=(op.host_indices, op.device_indices, pool_transfers)
+        )
+        controller._record_transfer_indices_on_stream = mock.Mock()
+
+        with mock.patch.object(
+            manager_cache_controller, "device_module", _FakeDeviceModule
+        ):
+            controller.start_loading()
+
+        self.assertEqual(
+            operations,
+            [
+                ("load", 0, pool_transfers),
+                ("broadcast", 0),
+                ("complete", 0),
+                ("load", 1, pool_transfers),
+                ("broadcast", 1),
+                ("complete", 1),
+                ("synchronize", None),
+            ],
+        )
+        controller._record_transfer_indices_on_stream.assert_called_once_with(
+            controller.l2_transfer_engine.host_to_device_stream,
+            op.host_indices,
+            op.device_indices,
+            pool_transfers,
+        )
 
 
 if __name__ == "__main__":
