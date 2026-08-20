@@ -114,13 +114,13 @@ def _ensure_fp8_quant_available() -> None:
 
 
 def _get_allow_hybrid_mode() -> bool:
-    # direct/hybrid is a communication-topology knob resolved from ServerArgs.
+    # direct/hybrid is a communication-topology knob fixed at server init.
     # Callers without a running server (synthetic/unit tests) pass
-    # allow_hybrid_mode to DeepEPv2Buffer.get_buffer instead (get_server_args()
-    # raises when the process-wide ServerArgs is not set).
-    from sglang.srt.runtime_context import get_server_args
+    # allow_hybrid_mode to DeepEPv2Buffer.get_buffer instead, since the
+    # process-wide config is not set up for them.
+    from sglang.srt.runtime_context import get_exec
 
-    return get_server_args().deepep_v2_mode == "hybrid"
+    return get_exec().moe.deepep_v2_mode == "hybrid"
 
 
 def _quantize_for_deepep_v2_dispatch(
