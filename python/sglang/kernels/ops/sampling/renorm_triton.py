@@ -91,6 +91,8 @@ def apply_pivot_triton(probs: torch.Tensor, pivots: torch.Tensor) -> torch.Tenso
 def top_k_renorm_probs_triton(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
+    *,
+    max_top_k: int | None = None,
 ) -> torch.Tensor:
     """Keep every entry at least as likely as the k-th largest, then renormalize."""
     assert probs.ndim == 2
@@ -102,7 +104,7 @@ def top_k_renorm_probs_triton(
     top_ks = per_row_threshold(top_k, probs=probs, dtype=torch.int64).clamp(
         1, probs.shape[1]
     )
-    return apply_pivot_triton(probs, top_k_pivots(probs, top_ks))
+    return apply_pivot_triton(probs, top_k_pivots(probs, top_ks, max_top_k=max_top_k))
 
 
 def top_p_renorm_probs_triton(

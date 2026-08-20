@@ -113,12 +113,17 @@ def _renorm_backend(probs: torch.Tensor) -> KernelBackend:
 
 
 def top_k_renorm_probs(
-    probs: torch.Tensor, top_k: Union[torch.Tensor, int]
+    probs: torch.Tensor,
+    top_k: Union[torch.Tensor, int],
+    *,
+    max_top_k: int | None = None,
 ) -> torch.Tensor:
     """Renormalize ``probs`` by top-k thresholding."""
-    return get_kernel("sampling.top_k_renorm_probs", _renorm_backend(probs))(
-        probs, top_k
-    )
+    backend = _renorm_backend(probs)
+    kernel = get_kernel("sampling.top_k_renorm_probs", backend)
+    if backend == KernelBackend.AOT:
+        return kernel(probs, top_k)
+    return kernel(probs, top_k, max_top_k=max_top_k)
 
 
 def top_p_renorm_probs(

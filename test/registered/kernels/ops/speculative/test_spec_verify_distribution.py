@@ -41,6 +41,40 @@ class TestSpecSamplingDispatch(CustomTestCase):
         sampling_fn = eagle_utils._get_spec_sampling_verify_fn(True)
         self.assertIs(sampling_fn, chain_speculative_sampling_triton)
 
+    def test_dflash_npu_renorm_precedes_portable_dispatch(self):
+        from sglang.srt.speculative import dflash_utils
+
+        probs = torch.tensor([[0.6, 0.4]], dtype=torch.float32)
+        top_ks = torch.tensor([1], dtype=torch.int32)
+        top_ps = torch.tensor([0.9], dtype=torch.float32)
+        npu_result = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+
+        with (
+            patch.object(
+                dflash_utils,
+                "_dflash_npu_top_k_top_p_renorm_prob",
+                return_value=npu_result,
+            ) as npu_renorm,
+            patch.object(
+                dflash_utils,
+                "top_k_renorm_prob",
+                side_effect=AssertionError("portable top-k should not run"),
+            ),
+            patch.object(
+                dflash_utils,
+                "top_p_renorm_prob",
+                side_effect=AssertionError("portable top-p should not run"),
+            ),
+        ):
+            self.assertIs(
+                dflash_utils._dflash_top_k_renorm_prob(probs, top_ks), npu_result
+            )
+            self.assertIs(
+                dflash_utils._dflash_top_p_renorm_prob(probs, top_ps), npu_result
+            )
+
+        self.assertEqual(npu_renorm.call_count, 2)
+
 
 def _chain_topology(batch_size: int, num_draft: int, device: torch.device):
     """Linear chain, i.e. `--speculative-eagle-topk 1`: slot i's child is slot i+1."""
@@ -197,6 +231,21 @@ class TestPortableSpecRenorm(CustomTestCase):
         self.assertEqual(torch.count_nonzero(renorm[0]).item(), 2)
         torch.testing.assert_close(renorm[1], probs[1])
 
+    def test_top_k_host_width_excludes_unbounded_rows(self):
+        from sglang.kernels.ops.sampling.renorm import top_k_renorm_probs_torch
+        from sglang.srt.sampling.sampling_params import TOP_K_ALL
+
+        probs = torch.tensor(
+            [[0.4, 0.3, 0.2, 0.1], [0.1, 0.2, 0.3, 0.4]],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        top_ks = torch.tensor([2, TOP_K_ALL], dtype=torch.int32, device=self.device)
+        renorm = top_k_renorm_probs_torch(probs, top_ks, max_top_k=2)
+
+        self.assertEqual(torch.count_nonzero(renorm[0]).item(), 2)
+        torch.testing.assert_close(renorm[1], probs[1])
+
     def test_top_p_per_row_and_zero_mass(self):
         from sglang.kernels.ops.sampling.renorm import top_p_renorm_probs_torch
 
@@ -213,6 +262,23 @@ class TestPortableSpecRenorm(CustomTestCase):
             device=self.device,
         )
         torch.testing.assert_close(renorm, expected)
+
+    def test_top_p_large_nucleus_device_fallback(self):
+        from sglang.kernels.ops.sampling.renorm import top_p_renorm_probs_torch
+
+        vocab_size = 5000
+        probs = torch.full(
+            (1, vocab_size),
+            1.0 / vocab_size,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        renorm = top_p_renorm_probs_torch(probs, 0.95)
+
+        torch.testing.assert_close(
+            renorm.sum(dim=-1), torch.ones(1, device=self.device)
+        )
+        self.assertGreater(torch.count_nonzero(renorm).item(), 4096)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "GPU is required for this test.")

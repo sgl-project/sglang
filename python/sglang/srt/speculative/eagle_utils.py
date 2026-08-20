@@ -798,6 +798,7 @@ def eagle_sample(
                     torch.repeat_interleave(
                         sampling_info.top_ks, verify_input.draft_token_num, dim=0
                     ),
+                    max_top_k=sampling_info.max_top_k,
                 )  # (bs * num_draft_tokens, vocab_size)
                 maybe_detect_nan(
                     target_probs, "v2 verify: target_probs after top_k_renorm"

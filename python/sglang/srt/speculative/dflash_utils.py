@@ -14,10 +14,7 @@ import triton.language as tl
 from sglang.kernels.ops.sampling import top_k_renorm_probs as top_k_renorm_prob
 from sglang.kernels.ops.sampling import top_p_renorm_probs as top_p_renorm_prob
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.layers.sampler import (
-    apply_custom_logit_processor,
-    top_p_normalize_probs_torch,
-)
+from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
@@ -102,35 +99,25 @@ def _dflash_npu_top_k_top_p_renorm_prob(
 
 
 def _dflash_top_k_renorm_prob(
-    probs: torch.Tensor, top_ks: torch.Tensor
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    *,
+    max_top_k: Optional[int] = None,
 ) -> torch.Tensor:
-    if top_k_renorm_prob is not None:
-        return top_k_renorm_prob(probs, top_ks)
-
     npu_probs = _dflash_npu_top_k_top_p_renorm_prob(probs, top_ks=top_ks)
     if npu_probs is not None:
         return npu_probs
 
-    vocab_size = probs.shape[-1]
-    top_ks = top_ks.reshape(-1).to(device=probs.device, dtype=torch.int64)
-    top_ks = top_ks.clamp(min=1, max=vocab_size)
-    max_top_k = int(top_ks.max().item())
-    topk_probs, topk_indices = torch.topk(probs, k=max_top_k, dim=-1)
-    ranks = torch.arange(max_top_k, device=probs.device)[None, :]
-    topk_probs.masked_fill_(ranks >= top_ks[:, None], 0.0)
-    topk_probs.div_(topk_probs.sum(dim=-1, keepdim=True))
-    return torch.zeros_like(probs).scatter_(1, topk_indices, topk_probs)
+    return top_k_renorm_prob(probs, top_ks, max_top_k=max_top_k)
 
 
 def _dflash_top_p_renorm_prob(
     probs: torch.Tensor, top_ps: torch.Tensor
 ) -> torch.Tensor:
-    if top_p_renorm_prob is not None:
-        return top_p_renorm_prob(probs, top_ps)
     npu_probs = _dflash_npu_top_k_top_p_renorm_prob(probs, top_ps=top_ps)
     if npu_probs is not None:
         return npu_probs
-    return top_p_normalize_probs_torch(probs, top_ps)
+    return top_p_renorm_prob(probs, top_ps)
 
 
 def dflash_draft_cell_size_per_token(
@@ -983,7 +970,7 @@ def build_dflash_verify_target_probs(
         vocab_size = int(scaled_logits.shape[-1])
         repeated_top_ks.clamp_(min=1, max=vocab_size)
         if max_top_k is None:
-            max_top_k = int(repeated_top_ks.max().item())
+            max_top_k = int(getattr(sampling_info, "max_top_k", vocab_size))
         else:
             max_top_k = int(max_top_k)
         if max_top_k < 1:
@@ -1018,6 +1005,11 @@ def build_dflash_verify_target_probs(
             target_probs = _dflash_top_k_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
+                max_top_k=(
+                    max_top_k
+                    if max_top_k is not None
+                    else getattr(sampling_info, "max_top_k", None)
+                ),
             )
         if need_top_p:
             target_probs = _dflash_top_p_renorm_prob(

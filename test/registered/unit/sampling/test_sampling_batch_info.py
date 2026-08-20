@@ -394,6 +394,14 @@ class TestMergeBatch(CustomTestCase):
         self.assertTrue(info1.need_top_k_sampling)  # OR semantics
         self.assertTrue(info1.need_min_p_sampling)  # OR semantics
 
+    def test_merge_preserves_largest_bounded_top_k(self):
+        info1 = _make_info(batch_size=1, max_top_k=4)
+        info2 = _make_info(batch_size=1, max_top_k=32)
+
+        info1.merge_batch(info2)
+
+        self.assertEqual(info1.max_top_k, 32)
+
     def test_merge_with_logit_bias(self):
         """Test that merge pads missing logit_bias with zeros before concatenation."""
         info1 = _make_info(batch_size=1)
@@ -565,6 +573,20 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertTrue(info.need_top_k_sampling)  # 50 != TOP_K_ALL
         self.assertTrue(info.need_min_p_sampling)  # 0.1 > 0
         self.assertFalse(info.is_all_greedy)  # top_k=50 > 1
+
+    def test_max_top_k_excludes_unbounded_requests(self):
+        reqs = [
+            self._make_req(top_k=TOP_K_ALL),
+            self._make_req(top_k=8),
+            self._make_req(top_k=32),
+        ]
+        batch = MagicMock()
+        batch.reqs = reqs
+        batch.device = DEVICE
+
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+
+        self.assertEqual(info.max_top_k, 32)
 
     def test_no_logit_bias_when_all_none(self):
         """Test that logit_bias stays None when no request has logit_bias set."""
