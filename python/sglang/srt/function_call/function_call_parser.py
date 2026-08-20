@@ -245,6 +245,7 @@ class FunctionCallParser:
         tool_choice: Union[ToolChoice, Literal["auto", "required"]],
         parallel_tool_calls: bool = True,
         thinking_mode: bool = False,
+        response_channel_open: bool = False,
     ) -> Optional[ToolCallConstraint]:
         """
         Returns the appropriate structure constraint for tool calls based on the tool_choice.
@@ -287,11 +288,23 @@ class FunctionCallParser:
                         )
                         for tool in self.tools
                     ]
+                # Only the K3 tag depends on which channel the generation
+                # prompt left open; the other detectors keep the narrower
+                # signature. Guarded like the `tokenizer` kwarg in __init__,
+                # because a TypeError here is swallowed below and would silently
+                # drop the constraint for whichever detector did not accept it.
+                tag_kwargs = {}
+                if (
+                    "response_channel_open"
+                    in inspect.signature(self.detector.get_structural_tag).parameters
+                ):
+                    tag_kwargs["response_channel_open"] = response_channel_open
                 structural_tag = self.detector.get_structural_tag(
                     tools=structural_tag_tools,
                     thinking_mode=thinking_mode,
                     tool_choice=tool_choice,
                     parallel_tool_calls=parallel_tool_calls,
+                    **tag_kwargs,
                 )
                 if structural_tag is not None:
                     return ("structural_tag", structural_tag)

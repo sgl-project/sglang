@@ -1150,6 +1150,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     request.tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls,
                     thinking_mode=xgrammar_reasoning,
+                    # With reasoning off, the K3 encoder's generation prompt
+                    # opens the response channel, so a forced call has to close
+                    # it before the tools section.
+                    response_channel_open=(
+                        self.chat_encoding_spec == "kimi_k3" and not thinking_mode
+                    ),
                 )
                 required_parsed_natively = parser.detector.parses_required_natively()
                 if self.chat_encoding_spec == "kimi_k3":

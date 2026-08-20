@@ -18,6 +18,7 @@ from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.kimik3_format import (
     ARGUMENT_CLOSE,
     CALL_CLOSE,
+    RESPONSE_CLOSE,
     THINK_CLOSE,
     TOOLS_CLOSE,
     TOOLS_OPEN,
@@ -97,12 +98,19 @@ def _tools_section(*calls):
     return TOOLS_OPEN + "".join(calls) + TOOLS_CLOSE
 
 
-def _grammar(tools, tool_choice="auto", thinking_mode=False, parallel_tool_calls=True):
+def _grammar(
+    tools,
+    tool_choice="auto",
+    thinking_mode=False,
+    parallel_tool_calls=True,
+    response_channel_open=False,
+):
     structural_tag = get_kimik3_structural_tag(
         tools,
         tool_choice=tool_choice,
         thinking_mode=thinking_mode,
         parallel_tool_calls=parallel_tool_calls,
+        response_channel_open=response_channel_open,
     )
     return xgr.Grammar.from_structural_tag(structural_tag)
 
@@ -200,6 +208,34 @@ def test_required_allows_response_prefix_but_requires_tools():
     response = "<|open|>response<|sep|>Checking." "<|close|>response<|sep|>"
 
     assert _accepts(grammar, response + _tools_section(_valid_weather_call()))
+    assert not _accepts(grammar, response)
+
+
+def test_required_inside_an_open_response_channel_must_close_it_first():
+    """With reasoning off the generation prompt leaves the response channel open.
+
+    Free text there is a trap: the model answers in that channel, never reaches
+    the tools section the grammar still requires, and so cannot stop either --
+    generation runs to max_tokens with no tool call.
+    """
+    grammar = _grammar([_tool()], tool_choice="required", response_channel_open=True)
+    call = _tools_section(_valid_weather_call())
+
+    assert _accepts(grammar, RESPONSE_CLOSE + call)
+    assert not _accepts(grammar, "Checking." + RESPONSE_CLOSE + call)
+    assert not _accepts(grammar, call)
+    assert not _accepts(grammar, RESPONSE_CLOSE)
+
+
+def test_required_without_an_open_response_channel_is_unchanged():
+    """Reasoning on: the model closes think itself, and a complete response block
+    before the call stays legitimate."""
+    grammar = _grammar([_tool()], tool_choice="required", response_channel_open=False)
+    response = "<|open|>response<|sep|>Checking.<|close|>response<|sep|>"
+    call = _tools_section(_valid_weather_call())
+
+    assert _accepts(grammar, response + call)
+    assert _accepts(grammar, call)
     assert not _accepts(grammar, response)
 
 

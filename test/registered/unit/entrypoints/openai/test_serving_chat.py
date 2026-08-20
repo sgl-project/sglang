@@ -3600,6 +3600,69 @@ class KimiK3ThinkingTestCase(unittest.TestCase):
         )
         self.assertIsNone(self.chat._validate_request(request))
 
+    def test_response_channel_flag_tracks_the_resolved_thinking_mode(self):
+        """The constraint has to know which channel the prompt left open."""
+        from unittest.mock import patch
+
+        for kwargs, expected in (
+            ({"thinking": {"type": "disabled"}}, True),
+            ({"thinking": {"type": "enabled"}}, False),
+            ({}, False),
+        ):
+            with self.subTest(request=kwargs):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=self.MESSAGES,
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "f",
+                                "parameters": {"type": "object", "properties": {}},
+                            },
+                        }
+                    ],
+                    tool_choice="required",
+                    **kwargs,
+                )
+                with patch(
+                    "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+                ) as ParserMock:
+                    parser = ParserMock.return_value
+                    parser.get_structure_constraint.return_value = None
+                    parser.detector.parses_required_natively.return_value = False
+                    parser.detector.eot_token = "<|close|>tools<|sep|>"
+                    self.chat._process_messages(request, is_multimodal=False)
+                self.assertEqual(
+                    parser.get_structure_constraint.call_args.kwargs[
+                        "response_channel_open"
+                    ],
+                    expected,
+                )
+
+    def test_draft07_identifier_in_tool_parameters_is_accepted(self):
+        """A `$id` with a fragment is draft-07 style: it fails the 2020-12
+        metaschema's URI form check but constrains nothing, and this stack
+        renders and constrains such a schema correctly."""
+        request = ChatCompletionRequest(
+            model="x",
+            messages=self.MESSAGES,
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "f",
+                        "parameters": {
+                            "$id": "#user",
+                            "type": "object",
+                            "properties": {"value": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+        )
+        self.assertIsNone(self.chat._validate_request(request))
+
     def test_keep_all_accepted(self):
         request = ChatCompletionRequest(
             model="x",
