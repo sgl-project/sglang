@@ -59,9 +59,12 @@ import { Qwen38MambaRatioCalculator } from "/src/snippets/_qwen38_mamba_ratio_ca
 <Note>
   The RTX 5090 and RTX PRO 6000 cells above — including every Speculative
   Decoding / Serving Strategy / SSM dtype combination — were validated at
-  ISL 8192 / OSL 1024, concurrency 1 (DFLASH2 is offered, and was validated,
-  only on these two cards with the NVFP4 checkpoint). The DGX Spark cells
-  cover that same combination set minus DFLASH2, but to a weaker standard: each was confirmed to **boot and
+  ISL 8192 / OSL 1024, concurrency 1 — for DFLASH2, to that full standard on
+  NVFP4, and to boot-and-serve on the RTX PRO 6000 BF16/FP8 cells. On the
+  remaining platforms the DFLASH2 pick is offered but not yet exercised, and
+  the cell's badge reports **Final Verification In Progress** while it is
+  selected. The DGX Spark cells cover that same combination set minus
+  DFLASH2, but to a weaker standard: each was confirmed to **boot and
   serve** at ISL 8192 / OSL 1024, concurrency 1, with no throughput or
   acceptance-length numbers taken. The remaining platforms' recipes carry their
   original validation, which covers the default overlay picks (plus MTP on
@@ -227,9 +230,12 @@ checkpoint's calibration scales automatically.
   incoai/Qwen3.8-27B-DFlash2 --speculative-num-draft-tokens 8` (8 is the
   draft's block size, and it is the `D` term in the ratio, same value as
   DSpark's). The selector projects candidates through the target `lm_head`,
-  including quantized heads, so it runs on the NVFP4 checkpoint; the panel
-  offers it where it was measured — RTX PRO 6000 and RTX 5090 with NVFP4.
-  The RTX PRO 6000 recipe needs no changes. On the 32GB RTX 5090 prefer
+  including quantized heads, so it runs on the NVFP4 checkpoint (whose head
+  is NVFP4-packed; the BF16 and FP8 checkpoints keep a dense head).
+  Validation: NVFP4 measured end-to-end on RTX PRO 6000 and RTX 5090; the
+  RTX PRO 6000 BF16/FP8 cells boot and serve; on H200, DGX Spark and GB300
+  the pick is offered with a **Final Verification In Progress** badge. The
+  RTX PRO 6000 recipe needs no changes. On the 32GB RTX 5090 prefer
   `--mamba-ssm-dtype bfloat16` at `--mem-fraction-static 0.90`: measured
   strictly better than float32 for this draft (6.1 vs 8.3 ms TPOT, accept
   3.30 vs 3.09) — the opposite of the EAGLE trade, so measure before assuming.

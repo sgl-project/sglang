@@ -120,12 +120,14 @@ export const config = {
           id: "dflash", label: "DFLASH2",
           // Trained block-diffusion draft, a separate checkpoint. The
           // selector projects through the target lm_head — including
-          // quantized heads — so it runs on the NVFP4 checkpoint. Offered
-          // only where it was measured: the SM120 pair with NVFP4.
-          disabled: (sel) =>
-            !(["rtx6000", "rtx5090"].includes(sel.hw) && sel.quant === "nvfp4"),
+          // quantized heads — so it runs on the NVFP4 checkpoint too.
+          // Validated on the SM120 pair (NVFP4 measured end to end; the
+          // RTX PRO 6000 BF16/FP8 cells boot-and-serve); the other
+          // platforms' cells report Final Verification In Progress for
+          // this pick (see their verificationStatus).
+          disabled: (sel) => sel.hw === "rtx5090" && sel.quant !== "nvfp4",
           disableReason:
-            "DFlash2 recipes are validated on RTX PRO 6000 / RTX 5090 with the NVFP4 checkpoint only",
+            "On the 32GB RTX 5090 the DFlash2 draft model only fits on top of the NVFP4 weights",
           // 5090: mem-fraction re-pins like DSPARK's, and fp32 additionally
           // re-pins the ratio — the balanced L=9216 value leaves the state
           // pool one slot short at every serviceable mem-fraction (see the
@@ -398,6 +400,9 @@ export const config = {
       // runnable, but not a recipe this page ships.
       match: { hw: "h200", variant: "default", quant: "fp8", nodes: "single" },
       verified: true,
+      // DFLASH2 has not been exercised on this platform yet; every other
+      // overlay pick keeps the cell's original validation.
+      verificationStatus: (sel) => (sel.spec === "dflash" ? "in-progress" : "verified"),
       env: [],
       flags: [
         "--trust-remote-code",
@@ -417,6 +422,9 @@ export const config = {
       // H200, BF16 reference checkpoint (~54GB of weights).
       match: { hw: "h200", variant: "default", quant: "bf16", nodes: "single" },
       verified: true,
+      // DFLASH2 has not been exercised on this platform yet; every other
+      // overlay pick keeps the cell's original validation.
+      verificationStatus: (sel) => (sel.spec === "dflash" ? "in-progress" : "verified"),
       env: [],
       flags: [
         "--trust-remote-code",
@@ -538,6 +546,9 @@ export const config = {
       // exercises the 4-bit `lm_head` this checkpoint quantizes, with no shape
       // error.
       verified: true,
+      // DFLASH2 has not been exercised on this platform yet; every other
+      // overlay pick keeps the cell's original validation.
+      verificationStatus: (sel) => (sel.spec === "dflash" ? "in-progress" : "verified"),
       env: [],
       flags: [
         "--trust-remote-code",
@@ -556,6 +567,9 @@ export const config = {
       match: { hw: "dgx-spark", variant: "default", quant: "fp8", nodes: "single" },
       // All 12 overlay combinations served on GB10.
       verified: true,
+      // DFLASH2 has not been exercised on this platform yet; every other
+      // overlay pick keeps the cell's original validation.
+      verificationStatus: (sel) => (sel.spec === "dflash" ? "in-progress" : "verified"),
       env: [],
       flags: [
         "--trust-remote-code",
@@ -575,6 +589,9 @@ export const config = {
       // All 12 overlay combinations served on GB10. Heaviest checkpoint, so
       // it holds the sweep's tightest cell: DSPARK + float32 + extra_buffer.
       verified: true,
+      // DFLASH2 has not been exercised on this platform yet; every other
+      // overlay pick keeps the cell's original validation.
+      verificationStatus: (sel) => (sel.spec === "dflash" ? "in-progress" : "verified"),
       env: [],
       flags: [
         "--trust-remote-code",
@@ -596,6 +613,9 @@ export const config = {
     {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", nodes: "single" },
       verified: true,
+      // DFLASH2 has not been exercised on this platform yet; every other
+      // overlay pick keeps the cell's original validation.
+      verificationStatus: (sel) => (sel.spec === "dflash" ? "in-progress" : "verified"),
       env: [],
       flags: [
         "--trust-remote-code",
@@ -612,6 +632,9 @@ export const config = {
     {
       match: { hw: "gb300", variant: "default", quant: "fp8", nodes: "single" },
       verified: true,
+      // DFLASH2 has not been exercised on this platform yet; every other
+      // overlay pick keeps the cell's original validation.
+      verificationStatus: (sel) => (sel.spec === "dflash" ? "in-progress" : "verified"),
       env: [],
       flags: [
         "--trust-remote-code",
@@ -628,6 +651,9 @@ export const config = {
     {
       match: { hw: "gb300", variant: "default", quant: "bf16", nodes: "single" },
       verified: true,
+      // DFLASH2 has not been exercised on this platform yet; every other
+      // overlay pick keeps the cell's original validation.
+      verificationStatus: (sel) => (sel.spec === "dflash" ? "in-progress" : "verified"),
       env: [],
       flags: [
         "--trust-remote-code",
