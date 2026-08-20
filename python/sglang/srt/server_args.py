@@ -2884,7 +2884,7 @@ class ServerArgs:
     ] = None
     mm_global_cache_size_gb: A[
         float,
-        "CPU host memory pool size in GiB per encoder rank for the multimodal "
+        "CPU host memory pool size in GiB per encoder TP group for the multimodal "
         "global embedding cache. This controls the L2 cache only, not the "
         "configured storage backend.",
         NS("mm"),

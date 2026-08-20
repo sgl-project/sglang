@@ -405,17 +405,10 @@ class EmbeddingCacheController:
             self.io_thread = threading.Thread(target=self._io_loop, daemon=True)
             self.io_thread.start()
 
-        if self.tp_world_size > 1:
+        if self.all_rank_get and self.tp_world_size > 1:
             if self.tp_group is None:
                 raise ValueError("tp_group must be provided when tp_size > 1")
-            from sglang.srt.distributed.parallel_state import (
-                create_custom_parallel_group,
-            )
-
-            group_ranks = torch.distributed.get_process_group_ranks(self.tp_group)
-            self.prefetch_tp_group = create_custom_parallel_group(
-                group_ranks=group_ranks, backend="gloo"
-            )
+            self.prefetch_tp_group = self.tp_group
         else:
             self.prefetch_tp_group = None
 
