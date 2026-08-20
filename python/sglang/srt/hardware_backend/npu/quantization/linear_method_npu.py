@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -51,6 +52,36 @@ def _get_float4_e2m1fn_x2_dtype():
         if npu_dtype is not None:
             return npu_dtype
     return getattr(torch, "float4_e2m1fn_x2", None)
+
+
+def get_block_diag_random_orthogonal_matrix(
+    dim: int,
+    block_size: int = 32,
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float32,
+    seed: Optional[int] = None,
+) -> torch.Tensor:
+    """Generate block-diagonal random orthogonal matrix via Householder reflections."""
+    if device is None:
+        device = torch.device("npu:0")
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    num_blocks = (dim + block_size - 1) // block_size
+    blocks = []
+
+    for i in range(num_blocks):
+        bs = min(block_size, dim - i * block_size)
+        # Householder reflection: H = I - 2*v*v^T/(v^T*v)
+        v = torch.randn(bs, 1, device=device, dtype=dtype)
+        v_norm = v.norm()
+        if v_norm < 1e-8:
+            Q = torch.eye(bs, device=device, dtype=dtype)
+        else:
+            v = v / v_norm
+            Q = torch.eye(bs, device=device, dtype=dtype) - 2 * (v @ v.T)
+        blocks.append(Q)
+    return torch.block_diag(*blocks)
 
 
 class _NPULinearMethodBase(LinearMethodBase):
@@ -827,6 +858,56 @@ class NPUDualLevelMXFP4LinearMethod(NPUSingleLevelMXFP4LinearMethod):
     ``DualLevelQuantBatchMatmul`` op is unavailable on A2/A3.
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._init_rotation_config()
+
+    def _init_rotation_config(self) -> None:
+        self._rot_enabled = os.environ.get("MXFP4_ENABLE_ROTATION", "0") == "1"
+        self._rot_block = int(os.environ.get("MXFP4_ROTATION_BLOCK_SIZE", "32"))
+        self._rot_seed = int(os.environ.get("MXFP4_ROTATION_SEED", "42"))
+        self._rot_cache = {}
+        targets = os.environ.get(
+            "MXFP4_ROTATION_TARGETS", "MergedColumnParallelLinear,QKVParallelLinear"
+        )
+        self._rot_targets = None if targets == "all" else targets.split(",")
+
+    def _should_rotate(self, name: str) -> bool:
+        return self._rot_enabled and (
+            self._rot_targets is None or any(t in name for t in self._rot_targets)
+        )
+
+    def _get_rotation_matrix(
+        self, dim: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        key = (dim, device, dtype, self._rot_seed)
+        if key not in self._rot_cache:
+            self._rot_cache[key] = get_block_diag_random_orthogonal_matrix(
+                dim=dim,
+                block_size=self._rot_block,
+                device=device,
+                dtype=dtype,
+                seed=self._rot_seed,
+            )
+        return self._rot_cache[key]
+
+    def _maybe_rotate_weight(
+        self, layer: torch.nn.Module, w: torch.Tensor
+    ) -> torch.Tensor:
+        if self._should_rotate(type(layer).__name__):
+            R = self._get_rotation_matrix(w.shape[1], w.device, w.dtype)
+            layer.rotation_matrix = R
+            return w @ R
+        return w
+
+    def _maybe_rotate_act(
+        self, layer: torch.nn.Module, x: torch.Tensor
+    ) -> torch.Tensor:
+        if self._should_rotate(type(layer).__name__):
+            R = getattr(layer, "rotation_matrix", None)
+            return x @ R if R is not None else x
+        return x
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight_fp = layer.weight.data
         if weight_fp.dtype not in (torch.float16, torch.bfloat16):
@@ -834,7 +915,8 @@ class NPUDualLevelMXFP4LinearMethod(NPUSingleLevelMXFP4LinearMethod):
         # Move to NPU if needed (cpu offload may have put it on CPU).
         if not weight_fp.is_npu:
             weight_fp = weight_fp.to(f"npu:{torch.npu.current_device()}")
-
+        # Optional rotate
+        weight_fp = self._maybe_rotate_weight(layer, weight_fp)
         # Dual-level MXFP4 weight quant: packed FP4 weight + L0 (fine, FP8 E4M3)
         # and L1 (coarse) block scales.
         qw, w_l0_scale, w_l1_scale = torch.ops.npu.npu_dynamic_dual_level_mx_quant(
@@ -870,7 +952,8 @@ class NPUDualLevelMXFP4LinearMethod(NPUSingleLevelMXFP4LinearMethod):
         # Flatten to 2D [tokens, hidden] for the quant operators.
         input_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1])
-
+        # Optional rotate
+        x_2d = self._maybe_rotate_act(layer, x_2d)
         # Dynamic dual-level MXFP4 activation quant (A4): packed FP4 + L0/L1 scales.
         qx, act_l0_scale, act_l1_scale = torch.ops.npu.npu_dynamic_dual_level_mx_quant(
             x_2d, smooth_scale=None
