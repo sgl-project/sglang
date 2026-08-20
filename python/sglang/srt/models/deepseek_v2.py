@@ -58,9 +58,6 @@ from sglang.srt.distributed.device_communicators.symm_mem_kernels import (
     maybe_fused_ag_shared_experts,
     maybe_fused_shared_add_rs,
 )
-from sglang.srt.distributed.device_communicators.torch_symm_mem import (
-    TorchSymmMemCommunicator,
-)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -1523,14 +1520,14 @@ class DeepseekV2MoE(nn.Module):
                     )
                     return ag_out, out[: hidden_states.shape[0]]
                 return ag_out, self.shared_experts(
-                    hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator,
+                    hidden_states,
+                    gemm_output_zero_allocator=gemm_output_zero_allocator,
                 )
             return None, self.shared_experts(
                 hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
             )
         else:
             return None, None
-
 
     def _moe_quant_once_enabled(self) -> bool:
         """SGLANG_OPT_MOE_QUANT_ONCE: quantize the (dp-gathered) MoE input to

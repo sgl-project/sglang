@@ -6,7 +6,6 @@ from typing import Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
-
 import triton
 import triton.language as tl
 
@@ -223,7 +222,7 @@ class MoEReduceRSSymmMemContext:
     """Context for symm_mem-based MoE reduce-scatter. Holds pre-allocated
     symmetric buffers and synchronization resources."""
 
-    max_M: int   # max tokens (NOT ntokens * topk)
+    max_M: int  # max tokens (NOT ntokens * topk)
     N: int
     num_experts: int
     topk: int
@@ -234,10 +233,10 @@ class MoEReduceRSSymmMemContext:
     num_local_ranks: int
     n_chunks_max: int
     # local sync primitives
-    grid_barrier: torch.Tensor   # [1] int32
-    gemm_counter: torch.Tensor   # [n_chunks_max] int32
-    gemm_done_flag: torch.Tensor # [n_chunks_max] int32
-    rs_counter: torch.Tensor     # [n_chunks_max * num_ranks] int32
+    grid_barrier: torch.Tensor  # [1] int32
+    gemm_counter: torch.Tensor  # [n_chunks_max] int32
+    gemm_done_flag: torch.Tensor  # [n_chunks_max] int32
+    rs_counter: torch.Tensor  # [n_chunks_max * num_ranks] int32
     group: Optional[object] = None
 
     # Computed in __post_init__
@@ -250,15 +249,19 @@ class MoEReduceRSSymmMemContext:
     symm_reduce_scatter_buffer: Optional[torch.Tensor] = field(default=None, init=False)
 
     buf_tuple: Optional[Tuple[torch.Tensor, ...]] = field(default=None, init=False)
-    signal_pad_tuple: Optional[Tuple[torch.Tensor, ...]] = field(default=None, init=False)
+    signal_pad_tuple: Optional[Tuple[torch.Tensor, ...]] = field(
+        default=None, init=False
+    )
 
     # GPU-side pointer arrays for Triton kernel (int64)
     buf_ptrs: Optional[torch.Tensor] = field(default=None, init=False)
     signal_pad_ptrs: Optional[torch.Tensor] = field(default=None, init=False)
 
     def __post_init__(self):
-        assert self.dtype in [torch.bfloat16, torch.float16], \
-            "Only float16 / bfloat16 are supported"
+        assert self.dtype in [
+            torch.bfloat16,
+            torch.float16,
+        ], "Only float16 / bfloat16 are supported"
 
         self.local_rank = self.rank % self.num_local_ranks
         self.nnodes = self.num_ranks // self.num_local_ranks
@@ -335,7 +338,8 @@ def create_moe_rs_symm_mem_context(
     gemm_counter = torch.zeros((n_chunks_max,), dtype=torch.int32, device=device)
     gemm_done_flag = torch.zeros((n_chunks_max,), dtype=torch.int32, device=device)
     rs_counter = torch.zeros(
-        (n_chunks_max * world_size,), dtype=torch.int32, device=device)
+        (n_chunks_max * world_size,), dtype=torch.int32, device=device
+    )
 
     return MoEReduceRSSymmMemContext(
         max_M=max_token_num,
@@ -358,16 +362,18 @@ def create_moe_rs_symm_mem_context(
 @triton.jit
 def moe_reduce_rs_symm_mem_kernel(
     # input
-    x_ptr,                          # [M * topk, N]
-    shared_expert_out_ptr,          # [M, N]
-    routed_scaling_factor,          # scalar float
+    x_ptr,  # [M * topk, N]
+    shared_expert_out_ptr,  # [M, N]
+    routed_scaling_factor,  # scalar float
     # symmetric buffer pointer array
-    buf_ptrs,                       # int64[world_size]
+    buf_ptrs,  # int64[world_size]
     # sync
-    signal_pad_ptrs,                # int64[world_size]
-    grid_barrier_ptr,               # int32[1]
+    signal_pad_ptrs,  # int64[world_size]
+    grid_barrier_ptr,  # int32[1]
     # problem sizes
-    M, N, topk,
+    M,
+    N,
+    topk,
     N_CHUNKS: tl.constexpr,
     # strides
     stride_xm: tl.constexpr,
@@ -424,33 +430,42 @@ def moe_reduce_rs_symm_mem_kernel(
             mask = mask_m[:, None] & mask_n[None, :]
 
             # topk reduce (fp32 accumulator for precision)
-            offs_in = offs_m[:, None].to(tl.int64) * stride_xm * TOPK + offs_n[None, :].to(tl.int64) * stride_xn
+            offs_in = (
+                offs_m[:, None].to(tl.int64) * stride_xm * TOPK
+                + offs_n[None, :].to(tl.int64) * stride_xn
+            )
             src_segment_offset = peer.to(tl.int64) * M_per_rank * TOPK * stride_xm
             input_ptrs = x_ptr + offs_n_chunk + src_segment_offset + offs_in
 
             reduced = tl.load(input_ptrs, mask=mask, other=0.0).to(tl.float32)
             for j in tl.static_range(1, TOPK):
-                reduced += tl.load(input_ptrs + j * stride_xm, mask=mask, other=0.0).to(tl.float32)
+                reduced += tl.load(input_ptrs + j * stride_xm, mask=mask, other=0.0).to(
+                    tl.float32
+                )
             reduced = reduced * routed_scaling_factor
 
             # add shared expert output
             se_segment_offset = peer.to(tl.int64) * M_per_rank * stride_se_m
-            se_ptrs = (shared_expert_out_ptr
-                       + offs_n_chunk
-                       + se_segment_offset
-                       + offs_m[:, None].to(tl.int64) * stride_se_m
-                       + offs_n[None, :].to(tl.int64) * stride_se_n)
+            se_ptrs = (
+                shared_expert_out_ptr
+                + offs_n_chunk
+                + se_segment_offset
+                + offs_m[:, None].to(tl.int64) * stride_se_m
+                + offs_n[None, :].to(tl.int64) * stride_se_n
+            )
             shared_expert_val = tl.load(se_ptrs, mask=mask, other=0.0).to(tl.float32)
             reduced = reduced + shared_expert_val
 
             # A2A push into peer's symm buffer
             peer_buf_ptr = tl.load(buf_ptrs + peer).to(tl.pointer_type(DTYPE))
             peer_buf_ptr = tl.multiple_of(peer_buf_ptr, 16)
-            dst_ptrs = (peer_buf_ptr
-                        + offs_n_chunk
-                        + dst_segment_offset
-                        + offs_m[:, None].to(tl.int64) * stride_bm
-                        + offs_n[None, :].to(tl.int64) * stride_bn)
+            dst_ptrs = (
+                peer_buf_ptr
+                + offs_n_chunk
+                + dst_segment_offset
+                + offs_m[:, None].to(tl.int64) * stride_bm
+                + offs_n[None, :].to(tl.int64) * stride_bn
+            )
             tl.store(dst_ptrs, reduced, mask=mask)
 
     # Grid barrier (all local CTAs done writing)

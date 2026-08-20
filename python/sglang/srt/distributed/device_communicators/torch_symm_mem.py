@@ -297,9 +297,7 @@ class TorchSymmMemCommunicator:
         )
 
         if self._ag_gemm_stream is None:
-            self._ag_gemm_stream = torch.cuda.Stream(
-                device=self.device, priority=-1
-            )
+            self._ag_gemm_stream = torch.cuda.Stream(device=self.device, priority=-1)
 
         max_M = self._get_max_forward_tokens()
 

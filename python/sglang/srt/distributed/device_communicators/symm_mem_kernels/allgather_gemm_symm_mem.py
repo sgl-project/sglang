@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import dataclasses
 import logging
+from typing import List, Optional, Tuple
+
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
-from torch._C._distributed_c10d import _SymmetricMemory
-import dataclasses
-from typing import List, Optional, Tuple
 import triton
 import triton.language as tl
+from torch._C._distributed_c10d import _SymmetricMemory
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ def __syncthreads():
         args=[],
         dtype=tl.int32,
         is_pure=False,
-        pack=1
+        pack=1,
     )
 
 
@@ -36,7 +37,7 @@ def tid(axis: tl.constexpr = 0):
             args=[],
             dtype=tl.int32,
             is_pure=True,
-            pack=1
+            pack=1,
         )
     elif axis == 1:
         return tl.inline_asm_elementwise(
@@ -45,7 +46,7 @@ def tid(axis: tl.constexpr = 0):
             args=[],
             dtype=tl.int32,
             is_pure=True,
-            pack=1
+            pack=1,
         )
     else:
         return tl.inline_asm_elementwise(
@@ -54,7 +55,7 @@ def tid(axis: tl.constexpr = 0):
             args=[],
             dtype=tl.int32,
             is_pure=True,
-            pack=1
+            pack=1,
         )
 
 
@@ -67,7 +68,7 @@ def ld_sys(ptr):
         args=[ptr],
         dtype=tl.int32,
         is_pure=False,
-        pack=1
+        pack=1,
     )
 
 
@@ -83,7 +84,7 @@ def st_sys(ptr, val):
         args=[ptr, val],
         dtype=tl.int32,
         is_pure=False,
-        pack=1
+        pack=1,
     )
 
 
@@ -97,9 +98,9 @@ class AllGatherGemmContextSymmMem:
     NUM_GEMM_SMS: int
     ag_stream: torch.cuda.Stream
 
-    symm_input_buf: torch.Tensor           # [world_size, M, K]
-    symm_ag_a_buf: torch.Tensor            # [M * world_size, K]
-    ag_signal_buf: torch.Tensor            # [world_size] uint32
+    symm_input_buf: torch.Tensor  # [world_size, M, K]
+    symm_ag_a_buf: torch.Tensor  # [M * world_size, K]
+    ag_signal_buf: torch.Tensor  # [world_size] uint32
 
     # symm_mem rendezvous handles
     input_hdl: object = None
@@ -146,19 +147,27 @@ def create_allgather_gemm_context_symm_mem(
         set to TP group when pipeline parallelism is used).
     """
     if not dist.is_initialized():
-        raise RuntimeError("torch.distributed must be initialized before creating the context.")
+        raise RuntimeError(
+            "torch.distributed must be initialized before creating the context."
+        )
 
     device = torch.cuda.current_device()
     rendezvous_group = group if group is not None else dist.group.WORLD
 
     symm_input_buf = symm_mem.empty(
-        (world_size, max_M, K), dtype=torch.bfloat16, device=device,
+        (world_size, max_M, K),
+        dtype=torch.bfloat16,
+        device=device,
     )
     symm_ag_a_buf = symm_mem.empty(
-        (max_M * world_size, K), dtype=torch.bfloat16, device=device,
+        (max_M * world_size, K),
+        dtype=torch.bfloat16,
+        device=device,
     )
     ag_signal_buf = symm_mem.empty(
-        (world_size,), dtype=torch.uint32, device=device,
+        (world_size,),
+        dtype=torch.uint32,
+        device=device,
     )
 
     symm_input_buf.zero_()
@@ -179,8 +188,10 @@ def create_allgather_gemm_context_symm_mem(
         )
 
     peer_signal_ptrs = torch.tensor(
-        [signal_hdl.get_buffer(r, (world_size,), torch.uint32).data_ptr()
-         for r in range(world_size)],
+        [
+            signal_hdl.get_buffer(r, (world_size,), torch.uint32).data_ptr()
+            for r in range(world_size)
+        ],
         dtype=torch.int64,
         device=device,
     )
@@ -247,22 +258,29 @@ def cp_engine_full_mesh_pull_ag(
 @triton.jit
 def consumer_bf16_a_block_fp8_matmul(
     # Pointers
-    A_ptr,           # bf16 [M, K] gathered A (symm_mem)
-    B_ptr,           # fp8 [N, K] weight (col-major)
-    C_ptr,           # output [M, N]
-    Bs_ptr,          # B scale [N//group_n, K//group_k]
-    ag_signal_ptr,   # [world_size] uint32
+    A_ptr,  # bf16 [M, K] gathered A (symm_mem)
+    B_ptr,  # fp8 [N, K] weight (col-major)
+    C_ptr,  # output [M, N]
+    Bs_ptr,  # B scale [N//group_n, K//group_k]
+    ag_signal_ptr,  # [world_size] uint32
     # Dimensions
-    M, N, K,
+    M,
+    N,
+    K,
     M_local,
     M_local_tiles,
     # Block quantization
-    group_n, group_k,
+    group_n,
+    group_k,
     # Strides
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    stride_Bs_k, stride_Bs_n,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_Bs_k,
+    stride_Bs_n,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -318,7 +336,9 @@ def consumer_bf16_a_block_fp8_matmul(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         if needs_masking:
-            a_bf16 = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+            a_bf16 = tl.load(
+                a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0
+            )
             b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
         else:
             a_bf16 = tl.load(a_ptrs)
@@ -344,7 +364,11 @@ def consumer_bf16_a_block_fp8_matmul(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = C_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     rank_row_end = (src_rank + 1) * M_local
-    c_mask = (offs_cm[:, None] < rank_row_end) & (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    c_mask = (
+        (offs_cm[:, None] < rank_row_end)
+        & (offs_cm[:, None] < M)
+        & (offs_cn[None, :] < N)
+    )
     tl.store(c_ptrs, c, mask=c_mask)
 
 
@@ -420,7 +444,9 @@ def allgather_gemm_op_symm_mem(
         c,
         b_scale,
         ag_signal,
-        M, N, K,
+        M,
+        N,
+        K,
         M_local,
         M_local_tiles,
         BLOCK_SIZE_N,  # group_n
@@ -446,7 +472,7 @@ def allgather_gemm_op_symm_mem(
 
     current_stream.wait_stream(ag_stream)
 
-    return symm_ag_a[:M_local*ctx.num_ranks,:], c
+    return symm_ag_a[: M_local * ctx.num_ranks, :], c
 
 
 def maybe_fused_ag_shared_experts(

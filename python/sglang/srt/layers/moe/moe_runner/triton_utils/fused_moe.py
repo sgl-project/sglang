@@ -271,6 +271,7 @@ def fused_experts(
         or moe_runner_config.num_experts != moe_runner_config.num_local_experts
     )
     from sglang.srt.distributed import get_tp_group
+
     comm = get_tp_group().torch_symm_mem_comm
     fused_topk_reduce_rs = comm is not None and comm.use_cp
     if fused_topk_reduce_rs:
@@ -833,9 +834,7 @@ def _fused_moe_kernel_sequence(
     )
 
     # LoRA hooks and no_topk_reduce both need intermediate_cache3.
-    _use_intermediate = not no_combine and not no_topk_reduce and (
-        topk != 1 or hooks 
-    )
+    _use_intermediate = not no_combine and not no_topk_reduce and (topk != 1 or hooks)
 
     out_slice = None
     if use_fused_moe_sum_all_reduce:

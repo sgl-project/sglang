@@ -400,9 +400,14 @@ def _freqs_cis_to_cos_sin(
     _FREQS_CIS_TO_COS_SIN[key] = (cos, sin)
     return cos, sin
 
+
 def _cp_fused_symm_mem_enabled() -> bool:
     """True when CP AG/RS should be handled by torch_symm_mem fused kernels."""
-    return envs.SGLANG_OPT_USE_TORCH_SYMM_MEM_FUSED_KERNEL.get() and not get_is_capture_mode()
+    return (
+        envs.SGLANG_OPT_USE_TORCH_SYMM_MEM_FUSED_KERNEL.get()
+        and not get_is_capture_mode()
+    )
+
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -2092,7 +2097,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         if _use_cp:
             moe_a2a_backend = get_moe_a2a_backend()
             if moe_a2a_backend.is_none():
-                if not _cp_fused_symm_mem_enabled() or not self.mlp.experts.moe_runner_config.inplace:
+                if (
+                    not _cp_fused_symm_mem_enabled()
+                    or not self.mlp.experts.moe_runner_config.inplace
+                ):
                     hidden_states = dsa_cp_gather_hidden_states(hidden_states)
             else:
                 assert moe_a2a_backend.is_deepep() or moe_a2a_backend.is_megamoe(), (
