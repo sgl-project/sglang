@@ -10,7 +10,8 @@ from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
 
 # NVFP4 needs Blackwell FP4 kernels, so this runs on the Blackwell leg of the
 # common 8-GPU suite (Hopper is skipped below).
-register_cuda_ci(est_time=3600, suite="nightly-8-gpu-common", nightly=True)
+register_cuda_ci(est_time=3600, stage="nightly", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=3600, stage="nightly", runner_config="8-gpu-b200")
 
 INKLING_NVFP4_MODEL = "thinkingmachines/Inkling-NVFP4"
 INKLING_SMALL_NVFP4_MODEL = "thinkingmachines/Inkling-Small-NVFP4"

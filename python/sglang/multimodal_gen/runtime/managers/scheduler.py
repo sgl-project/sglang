@@ -211,6 +211,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             req.target,
             req.strength,
             req.merge_mode,
+            req.lora_alpha,
         )
 
     def _handle_merge_lora(self, reqs: List[Any]):
