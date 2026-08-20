@@ -27,6 +27,7 @@ import sys
 import time
 from array import array
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
 import torch
@@ -44,6 +45,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
+    PartialPrefixMatch,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.utils import (
@@ -183,12 +185,13 @@ class RadixKey:
         other: RadixKey,
         page_size: int = 1,
         first_page_matched: bool = False,
+        return_exact: bool = False,
     ) -> int:
         """Return the logical-unit prefix length shared with ``other``.
 
         ``first_page_matched`` means the caller has already proved that the first
         ``page_size`` logical units match, so the galloping search can start after
-        that page. The result remains page aligned.
+        that page. The result remains page aligned unless ``return_exact=True``.
         """
         self._check_compatible(other)
         if page_size < 1:
@@ -229,7 +232,7 @@ class RadixKey:
         else:
             matched = min(matched_tokens, len(self), len(other))
 
-        if page_size == 1:
+        if return_exact or page_size == 1:
             return matched
         return matched // page_size * page_size
 
@@ -319,12 +322,21 @@ class TreeNode:
         return self.last_access_time < other.last_access_time
 
 
+@dataclass
+class _PartialPrefixCopyState:
+    source_indices: Optional[torch.Tensor]
+    destination_indices: Optional[torch.Tensor]
+    source_node: Optional[TreeNode]
+    page_indices: Optional[torch.Tensor]
+
+
 class RadixCache(BasePrefixCache):
     def __init__(self, params: CacheInitParams):
         self.disable = params.disable
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.page_size = params.page_size
+        self.enable_partial_prefix_reuse = params.enable_partial_prefix_reuse
         self.is_eagle = params.is_eagle
         self.disable_finished_insert = params.disable_finished_insert
         self.eviction_policy = params.eviction_policy.lower()
@@ -345,6 +357,8 @@ class RadixCache(BasePrefixCache):
         else:
             self.device = torch.device("cpu")
 
+        self._validate_partial_prefix_reuse_support(params)
+
         self.eviction_strategy = get_eviction_strategy(self.eviction_policy)
 
         self.evictable_leaves = set()
@@ -357,6 +371,7 @@ class RadixCache(BasePrefixCache):
         mock_allocator: Optional[Any] = None,
         page_size: int = 1,
         enable_kv_cache_events: bool = False,
+        enable_partial_prefix_reuse: bool = False,
     ) -> RadixCache:
         """Init a radix cache without memory pools for simulation purpose."""
         params = CacheInitParams(
@@ -365,6 +380,7 @@ class RadixCache(BasePrefixCache):
             token_to_kv_pool_allocator=mock_allocator,
             page_size=page_size,
             enable_kv_cache_events=enable_kv_cache_events,
+            enable_partial_prefix_reuse=enable_partial_prefix_reuse,
         )
         return RadixCache(params)
 
@@ -410,9 +426,9 @@ class RadixCache(BasePrefixCache):
         Args:
             params (MatchPrefixParams): Parameters containing the lookup key
                 with a list of token ids and an optional ``extra_key`` namespace tag.
-                If ``page_size > 1`` the length is internally truncated to a multiple
-                of ``page_size`` before matching. Passing an empty key returns an
-                empty result with the root as the last node.
+                Unless partial-prefix reuse is enabled, a ``page_size > 1`` key
+                is internally truncated to a page multiple. Passing an empty key
+                returns an empty result with the root as the last node.
 
         Returns:
             MatchResult: ``device_indices`` is a 1-D ``torch.int64`` tensor of
@@ -436,12 +452,25 @@ class RadixCache(BasePrefixCache):
         if self.disable or len(key) == 0:
             return self._empty_match_result
 
-        key = key.page_aligned(self.page_size)
+        if not self.enable_partial_prefix_reuse:
+            key = key.page_aligned(self.page_size)
+            if len(key) == 0:
+                return self._empty_match_result
+            value, last_node = self._match_prefix_helper(self.root_node, key)
+            if value:
+                value = torch.cat(value)
+            else:
+                value = self._empty_match_result.device_indices
+            return MatchResult(
+                device_indices=value,
+                last_device_node=last_node,
+                last_host_node=last_node,
+                best_match_node=last_node,
+            )
 
-        if len(key) == 0:
-            return self._empty_match_result
-
-        value, last_node = self._match_prefix_helper(self.root_node, key)
+        value, last_node, partial_prefix_match = (
+            self._match_prefix_with_partial_page_helper(self.root_node, key)
+        )
         if value:
             value = torch.cat(value)
         else:
@@ -451,7 +480,122 @@ class RadixCache(BasePrefixCache):
             last_device_node=last_node,
             last_host_node=last_node,
             best_match_node=last_node,
+            partial_prefix_match=partial_prefix_match,
         )
+
+    def materialize_partial_prefix(self, req: Req, match_result: MatchResult) -> bool:
+        if not self.enable_partial_prefix_reuse:
+            return False
+
+        partial_match = match_result.partial_prefix_match
+        if partial_match is None:
+            return False
+
+        aligned_match_len = len(match_result.device_indices)
+        partial_len = len(partial_match.source_indices)
+        assert self.page_size > 1
+        assert 0 < partial_len < self.page_size
+        assert partial_match.exact_match_len == aligned_match_len + partial_len
+        assert len(req.prefix_indices) == aligned_match_len
+        assert req.cache_protected_len == aligned_match_len
+        assert not hasattr(req, "_partial_prefix_copy_state")
+
+        # Keep the cached source page alive until the deferred GPU copy is done.
+        self.inc_lock_ref(partial_match.source_node)
+        try:
+            dst_page = self.token_to_kv_pool_allocator.alloc(self.page_size)
+            if dst_page is None:
+                self.evict(EvictParams(num_tokens=self.page_size))
+                dst_page = self.token_to_kv_pool_allocator.alloc(self.page_size)
+        except Exception:
+            self.dec_lock_ref(partial_match.source_node)
+            raise
+        if dst_page is None:
+            self.dec_lock_ref(partial_match.source_node)
+            return False
+
+        assert len(dst_page) == self.page_size
+        dst_prefix = dst_page[:partial_len]
+        req.prefix_indices = torch.cat([req.prefix_indices, dst_prefix])
+        req._partial_prefix_copy_state = _PartialPrefixCopyState(
+            source_indices=partial_match.source_indices,
+            destination_indices=dst_prefix,
+            source_node=partial_match.source_node,
+            page_indices=dst_page,
+        )
+        return True
+
+    def abort_partial_prefix(self, req: Req) -> None:
+        state = getattr(req, "_partial_prefix_copy_state", None)
+        if state is None:
+            return
+        if state.page_indices is not None:
+            self.token_to_kv_pool_allocator.free_segment(
+                state.page_indices, start_pos=0
+            )
+            req.prefix_indices = req.prefix_indices[: req.cache_protected_len]
+        if state.source_node is not None:
+            self.dec_lock_ref(state.source_node)
+        del req._partial_prefix_copy_state
+
+    def release_partial_prefix_source(self, req: Req) -> None:
+        state = getattr(req, "_partial_prefix_copy_state", None)
+        if state is None:
+            return
+        if state.source_node is not None:
+            self.dec_lock_ref(state.source_node)
+            state.source_node = None
+        if (
+            state.source_indices is None
+            and state.destination_indices is None
+            and state.page_indices is None
+        ):
+            del req._partial_prefix_copy_state
+
+    def _validate_partial_prefix_reuse_support(self, params: CacheInitParams) -> None:
+        if not self.enable_partial_prefix_reuse or self.page_size == 1:
+            return
+        # Simulated caches intentionally skip production pool/backend validation.
+        if params.req_to_token_pool is None:
+            return
+
+        from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        allocator = self.token_to_kv_pool_allocator
+        unsupported = []
+        if torch.version.hip is not None or self.device.type != "cuda":
+            unsupported.append(f"device {self.device} is not standard CUDA")
+        if type(allocator) is not PagedTokenToKVPoolAllocator:
+            unsupported.append(
+                f"allocator is {type(allocator).__name__}, not PagedTokenToKVPoolAllocator"
+            )
+            kv_pool = None
+        else:
+            kv_pool = allocator.get_kvcache()
+        if type(kv_pool) is not MHATokenToKVPool:
+            unsupported.append(
+                f"KV pool is {type(kv_pool).__name__}, not MHATokenToKVPool"
+            )
+        else:
+            if kv_pool.kv_cache_layout != "nhd" or kv_pool.use_hnd:
+                unsupported.append(
+                    f"KV layout is {kv_pool.kv_cache_layout!r}, not standard NHD"
+                )
+            if kv_pool.is_quantized_kv_cache:
+                unsupported.append("quantized KV cache is enabled")
+            if kv_pool._kv_copy_config is None:
+                unsupported.append("the all-layer KV copy primitive is not initialized")
+        if self.is_eagle:
+            unsupported.append("EAGLE/bigram radix keys are enabled")
+        if params.pp_size != 1:
+            unsupported.append(f"pipeline parallel size is {params.pp_size}, not 1")
+        if unsupported:
+            raise ValueError(
+                "enable_partial_prefix_reuse is unsupported for this cache setup: "
+                + "; ".join(unsupported)
+                + "."
+            )
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
@@ -724,6 +868,79 @@ class RadixCache(BasePrefixCache):
                     child_key = key.child_key(self.page_size)
 
         return value, node
+
+    def _match_prefix_with_partial_page_helper(self, node: TreeNode, key: RadixKey):
+        access_time = time.monotonic()
+        node.last_access_time = access_time
+
+        value = []
+        aligned_match_len = 0
+        partial_prefix_match = None
+
+        while len(key) >= self.page_size:
+            child_key = key.child_key(self.page_size)
+            if child_key not in node.children:
+                break
+            child = node.children[child_key]
+            child.last_access_time = access_time
+            exact_prefix_len = child.key.match(
+                key,
+                page_size=self.page_size,
+                first_page_matched=True,
+                return_exact=True,
+            )
+            prefix_len = exact_prefix_len // self.page_size * self.page_size
+            assert prefix_len >= self.page_size
+            if prefix_len < len(child.key):
+                new_node = self._split_node(child.key, child, prefix_len)
+                value.append(new_node.value)
+                aligned_match_len += prefix_len
+                node = new_node
+                key = key[prefix_len:]
+                partial_len = exact_prefix_len - prefix_len
+                if partial_len:
+                    partial_prefix_match = PartialPrefixMatch(
+                        exact_match_len=aligned_match_len + partial_len,
+                        source_indices=child.value[:partial_len].clone(),
+                        source_node=child,
+                        match_kind="legacy_reachable",
+                    )
+                break
+            else:
+                value.append(child.value)
+                aligned_match_len += prefix_len
+                node = child
+                key = key[prefix_len:]
+
+        if partial_prefix_match is None and self.page_size > 1 and len(key) > 0:
+            best_partial_len = 0
+            best_partial_node = None
+            for child in node.children.values():
+                if (
+                    child.key.extra_key != key.extra_key
+                    or child.key.cache_salt != key.cache_salt
+                ):
+                    continue
+                exact_prefix_len = child.key.match(
+                    key,
+                    page_size=self.page_size,
+                    return_exact=True,
+                )
+                if exact_prefix_len > best_partial_len:
+                    best_partial_len = exact_prefix_len
+                    best_partial_node = child
+
+            if best_partial_len:
+                assert best_partial_len < self.page_size
+                best_partial_node.last_access_time = access_time
+                partial_prefix_match = PartialPrefixMatch(
+                    exact_match_len=aligned_match_len + best_partial_len,
+                    source_indices=best_partial_node.value[:best_partial_len].clone(),
+                    source_node=best_partial_node,
+                    match_kind="fine_lookup",
+                )
+
+        return value, node, partial_prefix_match
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         # new_node -> child

@@ -294,6 +294,7 @@ def build_kv_cache(
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
+        enable_partial_prefix_reuse=server_args.enable_partial_prefix_reuse,
         enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
         enable_mamba_extra_buffer_lazy=server_args.enable_mamba_extra_buffer_lazy(),
         pp_rank=ps.pp_rank,

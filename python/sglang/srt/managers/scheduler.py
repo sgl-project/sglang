@@ -3418,6 +3418,8 @@ class Scheduler(
                 # lifecycle and freeing them here causes double-free.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
+                    if self.server_args.enable_partial_prefix_reuse:
+                        self.tree_cache.abort_partial_prefix(req)
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
                     req.mamba_cow_src_index = None

@@ -1638,6 +1638,18 @@ class ModelRunner:
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
 
+    def _execute_partial_prefix_copy(self, forward_batch: ForwardBatch) -> None:
+        """Copy a matched partial KV page on the forward stream before use."""
+        src = forward_batch.partial_prefix_copy_src_indices
+        if src is None or len(src) == 0:
+            return
+        dst = forward_batch.partial_prefix_copy_dst_indices
+        assert dst is not None and len(src) == len(dst)
+        with profile_range(f"partial_prefix_copy[len={len(src)}]"):
+            self.token_to_kv_pool.move_kv_cache(dst, src)
+        forward_batch.partial_prefix_copy_src_indices = None
+        forward_batch.partial_prefix_copy_dst_indices = None
+
     def _forward_raw(
         self,
         forward_batch: ForwardBatch,
@@ -1687,6 +1699,8 @@ class ModelRunner:
 
             # Deferred mamba COW/clear on the forward stream, before the extend
             # dispatch below reads the pool.
+            if self.server_args.enable_partial_prefix_reuse:
+                self._execute_partial_prefix_copy(forward_batch)
             self._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
 
             dwdp_mgr = get_global_dwdp_manager()

@@ -222,6 +222,12 @@ class SchedulerBatchResultProcessor:
 
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
+            if self.server_args.enable_partial_prefix_reuse:
+                # The KV copy is ordered before attention on the same forward
+                # stream. Materializing its dependent output on CPU above makes
+                # the source page safe to unlock and recycle.
+                for req in batch.reqs:
+                    self.tree_cache.release_partial_prefix_source(req)
             self.move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
 
             self._validate_pp_skip_output_comm(batch, result)
@@ -337,6 +343,12 @@ class SchedulerBatchResultProcessor:
                     phs = [t.cpu().detach() for t in phs]
                 else:
                     phs = phs.cpu().detach()
+
+            if self.server_args.enable_partial_prefix_reuse:
+                # The embedding output CPU transfer likewise synchronizes the
+                # forward stream that consumed the copied prefix.
+                for req in batch.reqs:
+                    self.tree_cache.release_partial_prefix_source(req)
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):

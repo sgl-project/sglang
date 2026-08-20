@@ -237,6 +237,31 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         cache = default_radix_cache_factory(ctx)
         source = "default"
 
+    if ctx.server_args.enable_partial_prefix_reuse:
+        from sglang.srt.mem_cache.radix_cache import RadixCache
+
+        unsupported_reasons = []
+        if ctx.server_args.radix_cache_backend is not None:
+            unsupported_reasons.append("a custom --radix-cache-backend is selected")
+        if type(cache) is not RadixCache:
+            unsupported_reasons.append(
+                f"the selected cache is {type(cache).__name__}, not ordinary RadixCache"
+            )
+        if ctx.disable_radix_cache:
+            unsupported_reasons.append("radix caching is disabled")
+        if ctx.server_args.disaggregation_mode != "null":
+            unsupported_reasons.append("disaggregation is enabled")
+        if ctx.server_args.speculative_algorithm is not None:
+            unsupported_reasons.append("speculative decoding is enabled")
+        if ctx.server_args.enable_streaming_session:
+            unsupported_reasons.append("streaming sessions are enabled")
+        if unsupported_reasons:
+            raise ValueError(
+                "Experimental partial-page prefix reuse currently supports only the "
+                "ordinary non-disaggregated, non-speculative Python RadixCache "
+                "path; " + "; ".join(unsupported_reasons) + "."
+            )
+
     if (
         ctx.server_args.enable_hierarchical_cache
         and ctx.server_args.hicache_host_memory_mode == "buffer_only"

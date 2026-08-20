@@ -32,6 +32,7 @@ class CacheInitParams:
     enable_metrics: bool = False
     enable_kv_cache_events: bool = False
     enable_session_radix_cache: bool = False
+    enable_partial_prefix_reuse: bool = False
 
     enable_mamba_extra_buffer: bool = False
     enable_mamba_extra_buffer_lazy: bool = False

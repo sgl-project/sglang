@@ -1598,7 +1598,10 @@ class KVCacheConfigurator:
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
             enable_alt_stream=not get_disagg().enable_pdmux,
-            enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
+            enable_kv_cache_copy=(
+                get_spec().speculative_algorithm is not None
+                or self.server_args.enable_partial_prefix_reuse
+            ),
             **pool_kwargs,
         )
         return token_to_kv_pool

@@ -909,6 +909,14 @@ class ServerArgs:
         "The physical page size of the NPU DSV4 C128 KV cache. Must be a positive multiple of 16.",
         NS("schedule"),
     ] = 16
+    enable_partial_prefix_reuse: A[
+        bool,
+        "Experimentally discover token-level partial-page prefix matches and "
+        "materialize them into a private request page with a KV copy so model "
+        "forward can skip those tokens. Initially supported only by ordinary "
+        "CUDA FULL-attention Python RadixCache.",
+        NS("memory"),
+    ] = False
     swa_full_tokens_ratio: A[
         float,
         Arg(

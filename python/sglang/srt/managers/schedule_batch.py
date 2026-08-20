@@ -1390,6 +1390,9 @@ class Req(ReqDllmMixin):
             else:
                 self.cache_protected_len = len(self.prefix_indices)
 
+            if tree_cache.enable_partial_prefix_reuse:
+                tree_cache.materialize_partial_prefix(self, match_result)
+
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
 
@@ -2109,6 +2112,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_cow_src_indices: torch.Tensor = None
     mamba_cow_dst_indices: torch.Tensor = None
     mamba_clear_indices: torch.Tensor = None
+    # Deferred paged-FULL partial-prefix copy pairs (performed on forward stream).
+    partial_prefix_copy_src_indices: torch.Tensor = None
+    partial_prefix_copy_dst_indices: torch.Tensor = None
 
     # Encoder-decoder device tensors (host fields in the host metadata group)
     encoder_lens: Optional[torch.Tensor] = None
@@ -2621,6 +2627,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Collect mamba init info for deferred ops on forward stream
         if any(req.mamba_pool_idx is not None for req in reqs):
             self._collect_deferred_mamba_cow_and_clear(reqs)
+        if self.tree_cache.enable_partial_prefix_reuse:
+            self._collect_deferred_partial_prefix_copy(reqs)
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_extend(input_ids, seq_lens)
@@ -2740,6 +2748,31 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             torch.cat(cow_dst_tensors) if cow_dst_tensors else None
         )
         self.mamba_clear_indices = torch.cat(clear_tensors) if clear_tensors else None
+
+    def _collect_deferred_partial_prefix_copy(self, reqs):
+        """Collect token-granular KV copy pairs for the forward stream."""
+        src_tensors = []
+        dst_tensors = []
+        for req in reqs:
+            state = getattr(req, "_partial_prefix_copy_state", None)
+            if state is None:
+                continue
+            src = state.source_indices
+            dst = state.destination_indices
+            assert src is not None and dst is not None and len(src) == len(dst)
+            assert state.source_node is not None
+            src_tensors.append(src)
+            dst_tensors.append(dst)
+            state.source_indices = None
+            state.destination_indices = None
+            # The page is now owned by req.prefix_indices / req_to_token.
+            state.page_indices = None
+        self.partial_prefix_copy_src_indices = (
+            torch.cat(src_tensors) if src_tensors else None
+        )
+        self.partial_prefix_copy_dst_indices = (
+            torch.cat(dst_tensors) if dst_tensors else None
+        )
 
     def prepare_for_split_prefill(self):
         self.prepare_for_extend()
@@ -3189,6 +3222,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
+        self.partial_prefix_copy_src_indices = None
+        self.partial_prefix_copy_dst_indices = None
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
