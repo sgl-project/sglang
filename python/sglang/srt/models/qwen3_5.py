@@ -68,7 +68,7 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -876,6 +876,35 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+def _fused_mrope_kwargs(rotary_emb, positions) -> Optional[dict]:
+    """Kernel kwargs for `positions`: {} for 1D, None when it must not fuse.
+
+    None means the caller falls back to the unfused RoPE path; it is not an
+    error. Anything the fused kernel does not implement must return None rather
+    than let [3, T] positions reach 1D indexing, which reads the temporal row
+    and silently drops height/width.
+    """
+    if positions.ndim == 1:
+        return {}
+    if positions.ndim != 2 or positions.shape[0] != 3:
+        return None
+    if not isinstance(rotary_emb, MRotaryEmbedding):
+        return None
+    if rotary_emb.mrope_interleaved_glm:
+        return None
+    mrope_section = rotary_emb.mrope_section
+    if not mrope_section or len(mrope_section) != 3:
+        return None
+    if sum(mrope_section) != rotary_emb.rotary_dim // 2:
+        return None
+    if positions.stride(1) != 1:
+        return None
+    return {
+        "mrope_section": list(mrope_section),
+        "mrope_interleaved": bool(rotary_emb.mrope_interleaved),
+    }
+
+
 class Qwen3_5AttentionDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Full Attention."""
 
@@ -1073,7 +1102,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         k = k_by_head.view(k.shape)
         return q, k
 
-    def forward_prepare_cuda_fused(self, positions, hidden_states):
+    def forward_prepare_cuda_fused(self, positions, hidden_states, mrope_kwargs=None):
         """Fused QK GemmaRMSNorm + NeoX RoPE + gate deinterleave."""
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn_output_gate:
@@ -1095,6 +1124,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.head_dim,
             self.rotary_emb.rotary_dim,
             has_gate=self.attn_output_gate,
+            **(mrope_kwargs or {}),
         )
         seq_len = hidden_states.shape[0]
         q = q_out.view(seq_len, -1)
@@ -1183,10 +1213,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        if _is_cuda and self.attn_output_gate:
+        fused_mrope_kwargs = (
+            _fused_mrope_kwargs(rotary_emb=self.rotary_emb, positions=positions)
+            if _is_cuda and self.attn_output_gate
+            else None
+        )
+        if fused_mrope_kwargs is not None:
             q, k, v, gate = self.forward_prepare_cuda_fused(
                 positions=positions,
                 hidden_states=hidden_states,
+                mrope_kwargs=fused_mrope_kwargs,
             )
         elif (_is_hip or _is_xpu or _is_cpu) and self.attn_output_gate:
             q, k, v, gate = self.forward_prepare_fused_gate(
