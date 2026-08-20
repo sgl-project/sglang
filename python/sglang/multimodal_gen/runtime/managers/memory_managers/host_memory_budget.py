@@ -134,6 +134,16 @@ class HostPinBudget:
         return False
 
 
+def pin_benefit_bytes(*, weight_bytes: int, uses_per_request: int) -> int:
+    """Host-to-device bytes a pin would cover for one request.
+
+    Ranking on this product rather than on "is it the DiT" matters for few-step
+    models: a 20 GB text encoder used once moves more per request than a 1 GB
+    DiT stepped four times, so it is the one that should claim the budget.
+    """
+    return max(0, weight_bytes) * max(1, uses_per_request)
+
+
 def module_weight_bytes(module) -> int:
     """Bytes of parameters and buffers a module would hand to the host."""
     seen: set[int] = set()

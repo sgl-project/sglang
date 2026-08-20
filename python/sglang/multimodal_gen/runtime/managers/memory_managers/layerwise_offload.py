@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget i
     HostPinBudget,
     describe_host_memory,
     module_weight_bytes,
+    pin_benefit_bytes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_ALL_COMPONENTS,
@@ -1356,20 +1357,45 @@ def configure_layerwise_offload_modules(
             sorted(unsupported_component_names),
         )
 
-    def _streams_every_step(name: str) -> bool:
+    def _default_num_inference_steps() -> int:
+        from sglang.multimodal_gen.registry import get_pipeline_config_classes
+
+        pipeline_class_name = server_args.pipeline_class_name
+        if not pipeline_class_name:
+            return 1
+        config_classes = get_pipeline_config_classes(pipeline_class_name)
+        if config_classes is None:
+            return 1
+        return max(1, int(config_classes[1]().num_inference_steps))
+
+    default_steps = _default_num_inference_steps()
+
+    def _h2d_bytes_a_pin_would_save(name: str) -> int:
+        """What pinning this component is worth, in bytes moved per request.
+
+        A DiT under layerwise offload re-streams its layers on every denoise
+        step; everything else transfers once. Ranking on the product rather
+        than on "is it the DiT" matters for few-step models, where a large
+        one-shot text encoder can move more bytes per request than a small DiT
+        stepped four times.
+        """
         module = modules[name]
-        return (
-            isinstance(module, LayerwiseOffloadableModuleMixin)
-            and module.layerwise_offload_dit_group_enabled
+        if not isinstance(module, LayerwiseOffloadableModuleMixin):
+            return 0
+        return pin_benefit_bytes(
+            weight_bytes=module_weight_bytes(module),
+            uses_per_request=(
+                default_steps if module.layerwise_offload_dit_group_enabled else 1
+            ),
         )
 
-    # Offer the pin budget to the denoise loop first: its layers re-stream on
-    # every step, so pinning them is worth num_inference_steps times as much as
-    # pinning a component that streams once per request. sorted() is stable, so
-    # components keep their relative order within each group.
+    # Offer the budget in descending order of what a pin saves, so the bytes
+    # that would move most often claim it first. sorted() is stable, so equal
+    # rankings keep their original order.
     selected_pipeline_component_names = sorted(
         selected_pipeline_component_names,
-        key=lambda name: not _streams_every_step(name),
+        key=_h2d_bytes_a_pin_would_save,
+        reverse=True,
     )
     pin_budget = HostPinBudget()
     logger.info("Layerwise offload: %s", describe_host_memory())

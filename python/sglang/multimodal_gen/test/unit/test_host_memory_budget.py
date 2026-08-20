@@ -10,6 +10,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget i
     cgroup_memory_limit_bytes,
     host_memory_available_bytes,
     module_weight_bytes,
+    pin_benefit_bytes,
 )
 
 
@@ -126,3 +127,30 @@ class TestModuleWeightBytes:
         module.register_buffer("a", backing[:512])
         module.register_buffer("b", backing[512:])
         assert module_weight_bytes(module) == 4096
+
+
+class TestPinBenefit:
+    def test_a_stepped_component_counts_every_step(self):
+        assert pin_benefit_bytes(weight_bytes=1000, uses_per_request=50) == 50_000
+
+    def test_a_one_shot_component_counts_once(self):
+        assert pin_benefit_bytes(weight_bytes=1000, uses_per_request=1) == 1000
+
+    def test_a_few_step_model_inverts_the_obvious_order(self):
+        # 1 GB DiT over 4 steps against a 20 GB one-shot text encoder: ranking
+        # by "is it the DiT" would hand the budget to the wrong one
+        dit = pin_benefit_bytes(weight_bytes=1 * GIB_BYTES, uses_per_request=4)
+        text_encoder = pin_benefit_bytes(
+            weight_bytes=20 * GIB_BYTES, uses_per_request=1
+        )
+        assert text_encoder > dit
+
+    def test_a_many_step_model_keeps_the_dit_first(self):
+        dit = pin_benefit_bytes(weight_bytes=3 * GIB_BYTES, uses_per_request=50)
+        text_encoder = pin_benefit_bytes(
+            weight_bytes=21 * GIB_BYTES, uses_per_request=1
+        )
+        assert dit > text_encoder
+
+    def test_missing_step_count_is_treated_as_one_use(self):
+        assert pin_benefit_bytes(weight_bytes=1000, uses_per_request=0) == 1000
