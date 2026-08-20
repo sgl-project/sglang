@@ -31,20 +31,15 @@ class SchedulerDllmMixin:
             else None
         )
         self.dllm_manager = DllmManager(dllm_config=self.dllm_config)
-        # Round composition, reported through get_internal_state: the enabled
-        # flag alone cannot distinguish a server that mixes from one that
-        # merely could. Counted unconditionally so the off case reads as a
-        # real zero rather than a missing field.
+        # Counted unconditionally so the disabled case reports a real zero
+        # rather than a missing field in get_internal_state.
         self.dllm_num_rounds = 0
         self.dllm_num_mixed_rounds = 0
         self.dllm_mixed_batch_enabled = False
         if self.dllm_config is not None and envs.SGLANG_ENABLE_DLLM_MIXED_BATCH.get():
-            # Only FDFO rounds can absorb a mixed round for free: a round there
-            # is one denoise step, so a prompt-only row self-finishes on it and
-            # costs what it would have cost in its own round. The synchronous
-            # loop instead forwards the whole batch until every block is
-            # resolved, so a prompt row mixed into a denoise round would ride
-            # tens of forwards it does not need.
+            # FDFO only: a round is one denoise step, so a prompt-only row
+            # self-finishes on it. The synchronous loop forwards until every
+            # block resolves, which a prompt row would ride for no reason.
             self.dllm_mixed_batch_enabled = self.dllm_config.first_done_first_out_mode
             if self.dllm_mixed_batch_enabled:
                 logger.info(
@@ -287,9 +282,6 @@ class SchedulerDllmMixin:
         The mixed path is a restriction of the either/or path, not a
         replacement: it walks the waiting queue in arrival order rather than
         prefill-first, and it does not attempt preemption when the round fills.
-        Those costs buy nothing on a round that holds only one phase, or on one
-        whose prefill rows already fill the round -- so such rounds stay on the
-        original path.
 
         Priority preemption is the one difference that is not just a
         trade-off: taking the mixed path would silently drop it. Until it is
