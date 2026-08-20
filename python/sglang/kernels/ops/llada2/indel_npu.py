@@ -71,6 +71,11 @@ def _fallback_and_scrub_argmax_kernel(
         tl.store(scrub_ptr + row, running_argmax)
 
 
+# The vocabulary tile must fit the unified buffer alongside the kernel's live
+# temporaries; 8192 f32 elements per tile overflows it on 910B.
+_BLOCK_V = 4096
+
+
 @lru_cache(maxsize=1)
 def _num_vector_cores() -> int:
     device = torch.npu.current_device()
@@ -102,7 +107,7 @@ def scrub_argmax_fused(
         mask_token_id=mask_token_id,
         delete_token_id=delete_token_id,
         split_token_id=split_token_id,
-        BLOCK_V=8192,
+        BLOCK_V=_BLOCK_V,
         multibuffer=False,
     )
     return fallback, scrub

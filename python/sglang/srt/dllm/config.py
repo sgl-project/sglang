@@ -37,8 +37,18 @@ class DllmConfig:
             model_path=server_args.model_path,
             model_revision=server_args.revision,
         )
+        # `delete_token_id`/`split_token_id` are the InDel edit tokens.  The
+        # released LLaDA2.2 checkpoints do not put them in `config.json`; the
+        # values below are the defaults declared by the checkpoint's own
+        # `modeling_llada2_moe.py` generate signature.  A config that declares
+        # them wins.
         DLLM_PARAMS = {
-            "LLaDA2MoeModelLM": {"block_size": 32, "mask_id": 156895},
+            "LLaDA2MoeModelLM": {
+                "block_size": 32,
+                "mask_id": 156895,
+                "delete_token_id": 156930,
+                "split_token_id": 156931,
+            },
             "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
             "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
         }
@@ -55,12 +65,16 @@ class DllmConfig:
         split_token_id = None
         if server_args.dllm_algorithm == "JointThresholdInDel":
             delete_token_id = getattr(model_config.hf_config, "delete_token_id", None)
+            if delete_token_id is None:
+                delete_token_id = params.get("delete_token_id")
             split_token_id = getattr(model_config.hf_config, "split_token_id", None)
+            if split_token_id is None:
+                split_token_id = params.get("split_token_id")
 
             if delete_token_id is None or split_token_id is None:
                 raise RuntimeError(
-                    "JointThresholdInDel requires delete_token_id and "
-                    "split_token_id in the model config"
+                    f"JointThresholdInDel is not supported for {arch}: the "
+                    "checkpoint must declare delete_token_id and split_token_id"
                 )
 
         max_running_requests = (
