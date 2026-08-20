@@ -17,8 +17,8 @@ import torch
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
 from sglang.multimodal_gen.runtime.distributed import (
+    get_encoder_data_parallel_group,
     get_local_torch_device,
-    get_world_group,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -46,12 +46,13 @@ logger = init_logger(__name__)
 
 
 def _data_parallel_text_encode(forward_fn, forward_kwargs: dict, group):
-    """each rank encodes its 1/world_size batch slice, then all-gathers
+    """Each encoder copy encodes a batch slice, then all-gathers the outputs.
 
-    every rank runs the full unsharded encoder on its slice, so each row is
-    computed by the same kernels as the replicated forward; the batch is padded
-    to a multiple of world_size and padding rows are dropped after the gather.
-    Requires a TextEncoder (BaseEncoderOutput) -- see _text_encode_dp_group.
+    An encoder copy may itself be TP-sharded. Corresponding TP ranks use the
+    same batch-DP rank, so every rank in that TP group receives the same slice;
+    the orthogonal batch-DP groups then gather the replicated encoder outputs.
+    The batch is padded to a multiple of the DP degree and padding rows are
+    dropped after the gather. Requires a TextEncoder (BaseEncoderOutput).
     """
     world = group.world_size
     rank = group.rank_in_group
@@ -515,29 +516,32 @@ class TextEncodingStage(ConditionEncodingStage):
     ):
         """group to data-parallel a batched text-encode over, or None
 
-        requires a replicated encoder (tp==1, dp==1, not folded): each rank
-        would otherwise redundantly encode the whole batch. Also requires a
-        TextEncoder, whose forward returns BaseEncoderOutput -- the gather needs
-        to know which fields carry the batch, and a raw transformers encoder
-        returns its own output type (e.g. Qwen2_5_VLCausalLMOutputWithPast).
+        DP splits the request batch across encoder copies and all-gathers the
+        outputs. A non-folded native encoder uses the DiT TP group, so this uses
+        the orthogonal non-TP ranks inside the same pipeline replica. It never
+        mixes requests across pipeline replicas and composes with DiT TP.
         """
-        policy = server_args.encoder_parallel
-        if (
-            policy not in ("auto", "dp")
-            # isinstance first: the loader can return a raw transformers
-            # encoder, which carries no such attribute
-            or not isinstance(text_encoder, TextEncoder)
-            or not text_encoder.supports_dp_encode
-            or (server_args.tp_size or 1) != 1
-            or (server_args.dp_size or 1) != 1
-            or encoder_config.parallel_folding_mode is not None
-        ):
+        if server_args.encoder_parallel not in ("auto", "dp"):
             return None
-        group = get_world_group()
-        if group.world_size <= 1:
+        # A folded encoder has one TP copy spanning its folding group, so there
+        # are no independent copies over which to split the batch.
+        if encoder_config.parallel_folding_mode is not None:
+            return None
+        # the gather rebuilds a BaseEncoderOutput, which only a TextEncoder
+        # forward produces -- a raw transformers encoder returns its own output
+        # type (e.g. Qwen2_5_VLCausalLMOutputWithPast). isinstance first: the
+        # loader can return such an encoder, which carries no dp attribute.
+        if not isinstance(text_encoder, TextEncoder):
+            return None
+        if not text_encoder.supports_dp_encode:
+            return None
+        group = get_encoder_data_parallel_group()
+        if group is None or group.world_size <= 1:
             return None
         # explicit dp trusts the operator on an unmeasured topology; auto does not
-        measured = policy == "dp" or group_has_measured_topology(group)
+        measured = server_args.encoder_parallel == "dp" or group_has_measured_topology(
+            group
+        )
         if not encoder_dp_worthwhile(encoder_config, batch_size, measured):
             return None
         self._log_dp_choice(batch_size, group.world_size)
@@ -548,7 +552,7 @@ class TextEncodingStage(ConditionEncodingStage):
             return
         self._dp_choice_logged = True
         logger.info(
-            "encoder_parallel: data-parallel text encode over %d ranks "
+            "encoder_parallel: data-parallel text encode over %d encoder copies "
             "(batch %d). Measured 1.9x on the encode stage at batch 2/4/8 "
             "(2xH100, T5-XXL width) with max_abs_diff=0 against the replicated "
             "forward.",

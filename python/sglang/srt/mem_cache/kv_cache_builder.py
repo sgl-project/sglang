@@ -117,7 +117,7 @@ def _register_legacy_hicache_draft(
     # so that host indices stay 1-to-1 between target and draft KV caches.
     primary_host_pool = tree_cache.cache_controller.mem_pool_host
     host_pool_kwargs = dict(
-        host_to_device_ratio=primary_host_pool.size / pool.size,
+        host_to_device_ratio=primary_host_pool.logical_size / pool.size,
         host_size=0,
         page_size=page_size,
         layout=server_args.hicache_mem_layout,
@@ -137,6 +137,12 @@ def _register_legacy_hicache_draft(
         return
 
     tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
+
+
+# Host slots a backup-only retraction pool gets, as a fraction of the device
+# pool. Sized well under 1.0 because a retraction burst touches a fraction of
+# the device tokens; overflow aborts the request rather than pre-reserving.
+BACKUP_ONLY_HICACHE_RATIO = 0.2
 
 
 def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
@@ -180,10 +186,14 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
         fields["disaggregation_decode_retraction_backup"] = backend
 
     if memory.hicache_ratio is None:
-        # Only a decode server reaches resolution with the ratio unset; host-pool
-        # retraction sizes the host pool 1:1 with the device pool, everything
-        # else keeps the standard default.
-        fields["hicache_ratio"] = 1.0 if backend == "host_pool" else 2.0
+        # Only a decode server reaches resolution with the ratio unset. A
+        # backup-only pool can be small: retractions that overflow it abort their
+        # request instead of crashing the scheduler. Sharing the pool with
+        # HiCache keeps the standard default.
+        if backend == "host_pool" and not memory.enable_hierarchical_cache:
+            fields["hicache_ratio"] = BACKUP_ONLY_HICACHE_RATIO
+        else:
+            fields["hicache_ratio"] = 2.0
 
     source = "kv_cache_builder.decode_retraction"
     get_context().override(source, **fields)
@@ -240,10 +250,10 @@ def build_kv_cache(
 
     retraction_backup = resolve_decode_retraction_backup(tp_worker=tp_worker)
 
-    disable_radix_cache = server_args.disable_radix_cache or (
+    disable_radix_cache = get_memory().disable_radix_cache or (
         model_config.is_multimodal and uses_transformers_backend
     )
-    if disable_radix_cache and not server_args.disable_radix_cache:
+    if disable_radix_cache and not get_memory().disable_radix_cache:
         logger.warning(
             "Radix cache is disabled for multimodal models with the "
             "Transformers backend to avoid multimodal prefix-cache mismatches."
@@ -253,8 +263,8 @@ def build_kv_cache(
     # these use specialized memory pools incompatible with the
     # prefix-match-and-lock allocation path.
     if (
-        server_args.disaggregation_decode_enable_radix_cache
-        and server_args.disaggregation_mode == "decode"
+        get_disagg().disaggregation_decode_enable_radix_cache
+        and get_disagg().disaggregation_mode == "decode"
     ):
         if is_hybrid_swa:
             raise ValueError(
@@ -285,15 +295,15 @@ def build_kv_cache(
         ),
         is_eagle=spec_algorithm.is_eagle(),
         tp_cache_group=(
-            attn_tp_cpu_group if server_args.enable_dp_attention else tp_cpu_group
+            attn_tp_cpu_group if get_parallel().enable_dp_attention else tp_cpu_group
         ),
         attn_cp_cache_group=attn_cp_cpu_group,
         attn_tp_cache_group=attn_tp_cpu_group,
         pp_cache_group=pp_group.cpu_group,
-        eviction_policy=server_args.radix_eviction_policy,
+        eviction_policy=get_memory().radix_eviction_policy,
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
-        enable_session_radix_cache=server_args.enable_session_radix_cache,
+        enable_session_radix_cache=get_memory().enable_session_radix_cache,
         enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
         enable_mamba_extra_buffer_lazy=server_args.enable_mamba_extra_buffer_lazy(),
         pp_rank=ps.pp_rank,
