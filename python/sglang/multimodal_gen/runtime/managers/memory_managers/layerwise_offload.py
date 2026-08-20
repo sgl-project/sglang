@@ -13,6 +13,11 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
     LAYERWISE_OFFLOAD,
     ComponentResidencyError,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    HostPinBudget,
+    describe_host_memory,
+    module_weight_bytes,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_ALL_COMPONENTS,
     LAYERWISE_OFFLOAD_DIT_GROUP,
@@ -986,7 +991,13 @@ class LayerwiseOffloadableModuleMixin:
             for name, tensor in self._mps_cpu_buffers.items():
                 buffers[name].data = tensor
 
-    def configure_layerwise_offload(self, server_args: ServerArgs):
+    def configure_layerwise_offload(
+        self,
+        server_args: ServerArgs,
+        *,
+        pin_budget: HostPinBudget | None = None,
+        component_name: str | None = None,
+    ):
         self.layerwise_offload_managers = []
         named_modules = dict(self.named_modules())
         configured_layer_names = []
@@ -1022,12 +1033,22 @@ class LayerwiseOffloadableModuleMixin:
             else:
                 resident_layers = min(num_layers, int(resident_value))
 
+            # Pinning these weights is what lets the copy stream run ahead of
+            # compute, but pinned pages are the ones the kernel cannot reclaim,
+            # so a component only gets them while the budget lasts.
+            pin_cpu_memory = server_args.pin_cpu_memory
+            if pin_cpu_memory and pin_budget is not None:
+                pin_cpu_memory = pin_budget.request(
+                    component_name=f"{component_name or type(self).__name__}.{layer_name}",
+                    weight_bytes=module_weight_bytes(module_list),
+                )
+
             manager = LayerwiseOffloadManager(
                 model=self,
                 layers_attr_str=layer_name,
                 num_layers=num_layers,
                 enabled=True,
-                pin_cpu_memory=server_args.pin_cpu_memory,
+                pin_cpu_memory=pin_cpu_memory,
                 prefetch_size=prefetch_size,
                 resident_layers=resident_layers,
                 initialize=False,
@@ -1335,6 +1356,24 @@ def configure_layerwise_offload_modules(
             sorted(unsupported_component_names),
         )
 
+    def _streams_every_step(name: str) -> bool:
+        module = modules[name]
+        return (
+            isinstance(module, LayerwiseOffloadableModuleMixin)
+            and module.layerwise_offload_dit_group_enabled
+        )
+
+    # Offer the pin budget to the denoise loop first: its layers re-stream on
+    # every step, so pinning them is worth num_inference_steps times as much as
+    # pinning a component that streams once per request. sorted() is stable, so
+    # components keep their relative order within each group.
+    selected_pipeline_component_names = sorted(
+        selected_pipeline_component_names,
+        key=lambda name: not _streams_every_step(name),
+    )
+    pin_budget = HostPinBudget()
+    logger.info("Layerwise offload: %s", describe_host_memory())
+
     for component_name in selected_pipeline_component_names:
         module = modules[component_name]
         if not isinstance(module, LayerwiseOffloadableModuleMixin):
@@ -1350,7 +1389,9 @@ def configure_layerwise_offload_modules(
         configured_module_ids.add(module_id)
 
         if not is_layerwise_offloaded_module(module):
-            module.configure_layerwise_offload(server_args)
+            module.configure_layerwise_offload(
+                server_args, pin_budget=pin_budget, component_name=component_name
+            )
         if not is_layerwise_offloaded_module(module):
             raise ComponentResidencyError(
                 f"Component {component_name!r} did not enable layerwise offload"
