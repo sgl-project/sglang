@@ -767,12 +767,6 @@ class Envs:
     # stays accuracy-gated and default OFF.
     SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(False)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
-    # AITER counterpart of Triton grouped-head shared-KV verify (PR #34517).
-    # Keep the true TP-local KV head count on unified target_verify so
-    # unified_attention sets num_queries_per_kv = tp_q_head_num. Default ON.
-    # Set False to restore the historical stride-0 .expand() to tp_q_head_num
-    # (fake MHA). Does not invoke the Triton verify_shared_kv kernel.
-    SGLANG_ENABLE_AITER_VERIFY_GQA_PACK = EnvBool(True)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned

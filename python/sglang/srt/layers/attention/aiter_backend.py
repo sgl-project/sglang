@@ -70,7 +70,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     scaled_fp8_quant,
 )
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
@@ -269,10 +268,6 @@ class AiterAttnBackend(AttentionBackend):
             and self.topk == 1
             and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
         )
-        # AITER counterpart of Triton grouped-head shared-KV verify (PR #34517):
-        # keep the true TP-local KV head count so unified_attention packs Q
-        # heads against one KV load. Set False to restore the old expand.
-        self._verify_gqa_pack = envs.SGLANG_ENABLE_AITER_VERIFY_GQA_PACK.get()
 
         # aiter kernel related initialization
         self.max_num_partitions = (
@@ -2283,6 +2278,8 @@ class AiterAttnBackend(AttentionBackend):
                         if self.forward_metadata.swa_page_table is not None:
                             page_table = self.forward_metadata.swa_page_table
 
+                    # True KV-head count, same layout as forward_decode.
+                    # unified_attention derives nqpkv from this axis.
                     q_unified = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
                     k_unified = k_cache.view(
                         -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
@@ -2290,16 +2287,6 @@ class AiterAttnBackend(AttentionBackend):
                     v_unified = v_cache.view(
                         -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                     )
-                    if (
-                        layer.tp_k_head_num == 1
-                        and layer.tp_q_head_num > 1
-                        and not self._verify_gqa_pack
-                    ):
-                        # Historical A/B path: expand the local KV head to
-                        # tp_q_head_num (fake MHA). Default packing skips this
-                        # so unified_attention sees num_queries_per_kv = H_q.
-                        k_unified = k_unified.expand(-1, -1, layer.tp_q_head_num, -1)
-                        v_unified = v_unified.expand(-1, -1, layer.tp_q_head_num, -1)
 
                     # The seq_lens + draft_num add has to run INSIDE the graph
                     # region; a host-side pre-add would allocate a new tensor

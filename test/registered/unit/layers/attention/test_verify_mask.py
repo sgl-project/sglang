@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -170,6 +171,31 @@ class TestTreeMaskNumel(CustomTestCase):
             tree_mask_numel(
                 TreeMaskMode.QLEN_ONLY_BITPACKING, 1, _DRAFT, _MAX_CONTEXT_LEN
             )
+
+
+class TestAiterUnifiedVerifyKvLayout(CustomTestCase):
+    def test_target_verify_does_not_expand_kv_to_q_heads(self):
+        """AITER unified target_verify must pass the true TP-local KV head
+        count. Expanding it to tp_q_head_num makes unified_attention run as
+        MHA and stalls MTP verify at high batch."""
+        source = (
+            Path(__file__).resolve().parents[5]
+            / "python"
+            / "sglang"
+            / "srt"
+            / "layers"
+            / "attention"
+            / "aiter_backend.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn(
+            "k_unified.expand(-1, -1, layer.tp_q_head_num, -1)",
+            source,
+        )
+        self.assertNotIn(
+            "v_unified.expand(-1, -1, layer.tp_q_head_num, -1)",
+            source,
+        )
+        self.assertNotIn("verify_shared_kv_fwd", source)
 
 
 if __name__ == "__main__":
