@@ -788,10 +788,8 @@ class MoeLoraRunner:
                 mapped_down_a.rows,
                 mapped_down_a.pair_to_row,
             )
-        elif act_pairs is not None:
-            down_a_input = _DownAInput(act_pairs)
         else:
-            down_a_input = None
+            down_a_input = _DownAInput(act_pairs)
         return act_out, down_a_input
 
     def _run_down(
@@ -802,7 +800,7 @@ class MoeLoraRunner:
         routes: MoeLoraRoutes,
         base_gemm_state,
         act_out: torch.Tensor,
-        down_a_input: _DownAInput | None,
+        down_a_input: _DownAInput,
         batch: MoeLoraBatch,
     ) -> tuple[
         torch.Tensor,
@@ -812,8 +810,6 @@ class MoeLoraRunner:
         state = _LoraStageState()
 
         def down_a() -> None:
-            if down_a_input is None:
-                raise RuntimeError("standalone down A requires pair activation")
             state.rank = self._run_a(
                 launch_config,
                 plan.down_a,
@@ -852,21 +848,11 @@ class MoeLoraRunner:
             return down_out
 
         if plan.down_overlap is DownOverlap.NONE:
-            if state.rank is None:
-                down_a()
+            down_a()
             if plan.down_b_scatter:
-                # Experiment reordering (plan-validated to this serial
-                # branch): the base down GEMM writes its rows FIRST, then the
-                # same one-launch down-B tiling scatter-adds the unweighted
-                # delta into them through src2dst, and the materialized
-                # finalize runs in no-pair-delta mode.  The [T, K, H]
-                # pair-major delta buffer is never allocated on this path.
+                # Inverted: base writes its rows first, then down-B adds into
+                # them through src2dst rather than into a delta of its own.
                 down_out = base()
-                assert state.rank is not None
-                # The same one-launch down-B tiling, the same site launch
-                # config and aligned route, but targeting
-                # down_out[src2dst[pair]] with a read-modify-write add instead
-                # of storing a dense pair-major delta.
                 provider.run_down_b_scatter(
                     base_gemm_state,
                     down_out=down_out,
@@ -889,8 +875,7 @@ class MoeLoraRunner:
             if plan.down_b is not None:
                 down_b()
         elif plan.down_overlap is DownOverlap.DOWN_B:
-            if state.rank is None:
-                down_a()
+            down_a()
             down_out = self.workspace.run_parallel(
                 name=plan.down_overlap.value,
                 device=act_out.device,
