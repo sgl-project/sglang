@@ -31,6 +31,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
+from sglang.srt.managers.mm_utils import determine_tensor_transport_mode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Modality, Req
 from sglang.srt.multimodal.cache import media_preprocess_kwargs
@@ -1696,16 +1697,6 @@ def _view_pool_buffer_by_modality(raw_buffer, embedding_data, dtype):
     }
 
 
-def _determine_tensor_transport_mode(server_args):
-    is_cross_node = server_args.dist_init_addr
-
-    if is_cross_node:
-        # Fallback to default CPU transport for multi-node
-        return "default"
-    else:
-        return "cuda_ipc"
-
-
 class MMReceiverBase(ABC):
     def __init__(
         self,
@@ -1835,7 +1826,7 @@ class MMReceiverBase(ABC):
         model_config=None,
     ):
         """Load processor and initialize mm_processor, shared by all backends."""
-        transport_mode = _determine_tensor_transport_mode(server_args)
+        transport_mode = determine_tensor_transport_mode(server_args)
         import_processors("sglang.srt.multimodal.processors")
 
         extra_kwargs = {}
