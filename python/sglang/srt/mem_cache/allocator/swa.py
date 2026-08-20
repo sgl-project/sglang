@@ -1,12 +1,19 @@
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import get_num_new_pages
+from sglang.srt.utils.invariants import (
+    Bucket,
+    Invariant,
+    InvariantCheckLevel,
+    IsTrue,
+    expect,
+    resolve_level,
+)
 
 _is_npu = is_npu()
 
@@ -16,6 +23,14 @@ if _is_npu:
     from sglang.srt.hardware_backend.npu.allocator_npu import (
         NPUPagedTokenToKVPoolAllocator,
     )
+
+
+# A full slot reaching free_swa must still own its SWA peer; a released one reads
+# as the padding slot, and handing that to the SWA pool corrupts an unrelated
+# request's KV with no containment. Callers use free_full for those.
+_SWA_PEER_MAPPED = Invariant(
+    "mem_cache.swa_peer_mapped", Bucket.FATAL_UNCONTAINABLE, IsTrue()
+)
 
 
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -90,8 +105,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 torch.tensor([-1], dtype=torch.int64, device=device),
             ]
         )
-
-        self.debug_mode = envs.SGLANG_DEBUG_MEMORY_POOL.get()
 
         self.need_sort = need_sort
         self.free_pages = None
@@ -370,12 +383,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # gathered mapping never holds the 0 padding slot. Masking would need a
         # device-side count and stall the schedule stream.
         swa_indices = self.full_to_swa_index_mapping[mapping_indices]
-        if self.debug_mode:
-            # Synchronizes; the whole point is to catch a caller that should have
-            # used free_full, which would otherwise push the padding slot.
-            assert bool(
-                (swa_indices > 0).all()
-            ), "free_swa on slots whose SWA peers are already released"
+        if resolve_level() >= InvariantCheckLevel.WARN:
+            expect(_SWA_PEER_MAPPED, swa_indices > 0, msg="caller wants free_full")
         self.swa_attn_allocator.free(swa_indices)
         # index_fill_ passes the 0 as a kernel argument; `mapping[...] = 0` would
         # copy a host-resident scalar and stall the stream until it drains.
