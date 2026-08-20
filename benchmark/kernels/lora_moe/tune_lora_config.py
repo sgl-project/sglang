@@ -301,12 +301,12 @@ def sweep(args, seed_path: str) -> None:
     results = {}
     # Axis: shared-layout decode overlap windows (skips cleanly if the
     # adapter is per-expert; the arm then just re-measures the same plan).
-    for early, late in SHARED_WINDOW_CANDIDATES:
+    for gate_up, down in SHARED_WINDOW_CANDIDATES:
         candidate = copy.deepcopy(table)
         for row in candidate["scenarios"]:
             if row.get("layout") == "shared" and row.get("phase") == "decode":
-                row["plan"]["early_overlap"] = early
-                row["plan"]["late_overlap"] = late
+                row["plan"]["gate_up_overlap"] = gate_up
+                row["plan"]["down_overlap"] = down
                 for k in ("early_overlap", "late_overlap"):
                     if row["plan"][k] == "none":
                         del row["plan"][k]
@@ -319,21 +319,21 @@ def sweep(args, seed_path: str) -> None:
                 json.load(open(tiles_src)),
                 open(os.path.join(variant_dir, f"{arch}.tiles.json"), "w"),
             )
-        tag = f"win_{early}-{late}"
-        results[(early, late)] = bench_once(
+        tag = f"win_{gate_up}-{down}"
+        results[(gate_up, down)] = bench_once(
             args, {"SGLANG_LORA_MOE_CONFIG_DIR": variant_dir}, tag
         )
-        print(tag, results[(early, late)])
-    early, late = max(results, key=lambda pair: sum(results[pair].values()))
-    print(f"window winner: early={early} late={late}")
+        print(tag, results[(gate_up, down)])
+    gate_up, down = max(results, key=lambda pair: sum(results[pair].values()))
+    print(f"window winner: early={gate_up} late={down}")
     for row in table["scenarios"]:
         if row.get("layout") == "shared" and row.get("phase") == "decode":
             for k in ("early_overlap", "late_overlap"):
                 row["plan"].pop(k, None)
-            if early != "none":
-                row["plan"]["early_overlap"] = early
-            if late != "none":
-                row["plan"]["late_overlap"] = late
+            if gate_up != "none":
+                row["plan"]["gate_up_overlap"] = gate_up
+            if down != "none":
+                row["plan"]["down_overlap"] = down
             row["provenance"] = f"swept:{date.today()} ({args.model_path})"
     json.dump(table, open(seed_path, "w"), indent=1)
     scored = {f"window-{e}-{l}": v for (e, l), v in results.items()}

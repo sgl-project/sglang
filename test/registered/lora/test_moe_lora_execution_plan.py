@@ -26,19 +26,19 @@ sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 
 ActivationFn = _MODULE.ActivationFn
-EarlyOverlap = _MODULE.EarlyOverlap
+GateUpOverlap = _MODULE.GateUpOverlap
 StageContract = _MODULE.StageContract
 BridgeLayout = _MODULE.BridgeLayout
 Site = _MODULE.Site
 FinalizeFamily = _MODULE.FinalizeFamily
 FinalizeSpec = _MODULE.FinalizeSpec
-LateOverlap = _MODULE.LateOverlap
+DownOverlap = _MODULE.DownOverlap
 LoraAFamily = _MODULE.LoraAFamily
 LoraASpec = _MODULE.LoraASpec
 LoraBFamily = _MODULE.LoraBFamily
 LoraBSpec = _MODULE.LoraBSpec
-MiddleFamily = _MODULE.MiddleFamily
-MiddleSpec = _MODULE.MiddleSpec
+ActFamily = _MODULE.ActFamily
+ActSpec = _MODULE.ActSpec
 MoeLoraExecutionPlan = _MODULE.MoeLoraExecutionPlan
 RouteBuilderFamily = _MODULE.RouteBuilderFamily
 RouteRequirement = _MODULE.RouteRequirement
@@ -74,7 +74,7 @@ def _plan(**changes) -> MoeLoraExecutionPlan:
     values = {
         "gate_up_a": _a(Site.GATE_UP),
         "gate_up_b": _b(Site.GATE_UP),
-        "middle": MiddleSpec(MiddleFamily.MATERIALIZED, ActivationFn.SILU),
+        "act": ActSpec(ActFamily.MATERIALIZED, ActivationFn.SILU),
         "down_a": _a(Site.DOWN),
         "down_b": _b(Site.DOWN),
         "finalize": FinalizeSpec(FinalizeFamily.MATERIALIZED),
@@ -184,27 +184,27 @@ class TestFactorAndKernelSpecs(unittest.TestCase):
 
 
 class TestFusionOwnership(unittest.TestCase):
-    def test_middle_rejects_missing_duplicate_and_wrong_site_consumers(self):
+    def test_act_rejects_missing_duplicate_and_wrong_site_consumers(self):
         with self.assertRaisesRegex(ValueError, "requires.*gate/up B"):
-            MiddleSpec(MiddleFamily.B_ACTIVATION, ActivationFn.SILU)
+            ActSpec(ActFamily.B_ACTIVATION, ActivationFn.SILU)
         with self.assertRaisesRegex(ValueError, "does not consume.*gate/up B"):
-            MiddleSpec(
-                MiddleFamily.MATERIALIZED,
+            ActSpec(
+                ActFamily.MATERIALIZED,
                 ActivationFn.SILU,
                 consumed_gate_up_b=_factor(Site.GATE_UP),
             )
         with self.assertRaisesRegex(ValueError, "gate/up site"):
-            MiddleSpec(
-                MiddleFamily.B_ACTIVATION,
+            ActSpec(
+                ActFamily.B_ACTIVATION,
                 ActivationFn.SILU,
                 consumed_gate_up_b=_factor(Site.DOWN),
             )
         # The consumed contract's ownership is the adapter weight format,
-        # validated at weight load; the middle only needs it to name the
+        # validated at weight load; the act stage only needs it to name the
         # gate/up site.
         self.assertIsNotNone(
-            MiddleSpec(
-                MiddleFamily.B_ACTIVATION,
+            ActSpec(
+                ActFamily.B_ACTIVATION,
                 ActivationFn.SILU,
                 consumed_gate_up_b=_factor(Site.GATE_UP, True),
             ).consumed_gate_up_b
@@ -232,22 +232,22 @@ class TestWholePipelineValidation(unittest.TestCase):
         with self.assertRaises(dataclasses.FrozenInstanceError):
             SERIAL_MATERIALIZED_REFERENCE.gate_up_b = None  # type: ignore[misc]
 
-    def test_every_required_middle_and_finalize_composition_constructs(self):
+    def test_every_required_act_and_finalize_composition_constructs(self):
         gate = _factor(Site.GATE_UP)
         shared_down = _factor(Site.DOWN, is_shared_outer=True)
         plans = (
             _plan(
                 gate_up_b=None,
-                middle=MiddleSpec(
-                    MiddleFamily.B_ACTIVATION,
+                act=ActSpec(
+                    ActFamily.B_ACTIVATION,
                     ActivationFn.SILU,
                     consumed_gate_up_b=gate,
                 ),
             ),
             _plan(
                 gate_up_b=None,
-                middle=MiddleSpec(
-                    MiddleFamily.B_ACTIVATION,
+                act=ActSpec(
+                    ActFamily.B_ACTIVATION,
                     ActivationFn.SILU,
                     consumed_gate_up_b=gate,
                 ),
@@ -263,8 +263,8 @@ class TestWholePipelineValidation(unittest.TestCase):
         shared_down = _factor(Site.DOWN, is_shared_outer=True)
         with self.assertRaisesRegex(ValueError, "exactly one owner"):
             _plan(
-                middle=MiddleSpec(
-                    MiddleFamily.B_ACTIVATION,
+                act=ActSpec(
+                    ActFamily.B_ACTIVATION,
                     ActivationFn.SILU,
                     consumed_gate_up_b=gate,
                 )
@@ -301,18 +301,18 @@ class TestWholePipelineValidation(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "gate/up-A\\+B"):
             _plan(
                 gate_up_b=None,
-                middle=MiddleSpec(
-                    MiddleFamily.B_ACTIVATION,
+                act=ActSpec(
+                    ActFamily.B_ACTIVATION,
                     ActivationFn.SILU,
                     consumed_gate_up_b=gate,
                 ),
-                early_overlap=EarlyOverlap.GATE_UP_A_B,
+                gate_up_overlap=GateUpOverlap.GATE_UP_A_B,
             )
         with self.assertRaisesRegex(ValueError, "standalone down B"):
             _plan(
                 down_b=None,
                 finalize=FinalizeSpec(FinalizeFamily.SHARED_RANK_REDUCE, shared_down),
-                late_overlap=LateOverlap.DOWN_B,
+                down_overlap=DownOverlap.DOWN_B,
             )
 
     def test_indexed_a_is_the_down_a_only_composition(self):

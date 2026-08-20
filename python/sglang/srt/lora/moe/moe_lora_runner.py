@@ -59,15 +59,15 @@ from sglang.srt.lora.moe.base_gemm_provider.base import (
     MoeBaseProvider,
 )
 from sglang.srt.lora.moe.execution_plan import (
+    ActFamily,
     BridgeLayout,
-    EarlyOverlap,
+    DownOverlap,
     FinalizeFamily,
-    LateOverlap,
+    GateUpOverlap,
     LoraAFamily,
     LoraASpec,
     LoraBFamily,
     LoraBSpec,
-    MiddleFamily,
     MoeLoraExecutionPlan,
     Phase,
     SelectedPlan,
@@ -374,9 +374,9 @@ class MoeLoraRunner:
         """
         provider = self.providers[base_gemm_rows]
         plan.validate()
-        if plan.middle.activation is not self.activation:
+        if plan.act.activation is not self.activation:
             raise ValueError(
-                f"plan activation {plan.middle.activation.value} does not match "
+                f"plan activation {plan.act.activation.value} does not match "
                 f"resident layer activation {self.activation.value}"
             )
         expected_slices = 2 if self.is_gated else 1
@@ -386,7 +386,7 @@ class MoeLoraRunner:
                 f"but is_gated={self.is_gated} needs {expected_slices}"
             )
 
-        if plan.middle.family is not MiddleFamily.MATERIALIZED:
+        if plan.act.family is not ActFamily.MATERIALIZED:
             family, implementation = self._middle_implementation(plan)
             if not provider.supports_fused_middle(
                 family,
@@ -422,7 +422,7 @@ class MoeLoraRunner:
     def _middle_implementation(
         plan: MoeLoraExecutionPlan,
     ) -> tuple[str, str]:
-        return plan.middle.family.value, "triton"
+        return plan.act.family.value, "triton"
 
     @staticmethod
     def _finalize_implementation(
@@ -473,7 +473,7 @@ class MoeLoraRunner:
             workspace=self.workspace,
         )
 
-        gate_up, base_gemm_state, gateup_out = self._run_early(
+        gate_up, base_gemm_state, gateup_out = self._run_gate_up(
             plan,
             launch_config,
             provider,
@@ -483,7 +483,7 @@ class MoeLoraRunner:
             batch,
             num_tokens,
         )
-        act_out, down_a_input = self._run_middle(
+        act_out, down_a_input = self._run_act(
             plan,
             launch_config,
             provider,
@@ -502,7 +502,7 @@ class MoeLoraRunner:
             dtype=hidden_states.dtype,
             device=act_out.device,
         )
-        down_out, down_rank, down_delta = self._run_late(
+        down_out, down_rank, down_delta = self._run_down(
             plan,
             launch_config,
             provider,
@@ -632,7 +632,7 @@ class MoeLoraRunner:
             ),
         )
 
-    def _run_early(
+    def _run_gate_up(
         self,
         plan: MoeLoraExecutionPlan,
         launch_config: MoeLoraLaunchConfig,
@@ -692,15 +692,15 @@ class MoeLoraRunner:
             provider.release_prepared_inputs(base_gemm_state)
             return base_gemm_state, gateup_out
 
-        if plan.early_overlap is EarlyOverlap.NONE:
+        if plan.gate_up_overlap is GateUpOverlap.NONE:
             gate_up_a()
             if plan.gate_up_b is not None:
                 gate_up_b()
             base_gemm_state, gateup = base()
-        elif plan.early_overlap is EarlyOverlap.GATE_UP_A:
+        elif plan.gate_up_overlap is GateUpOverlap.GATE_UP_A:
             base_gemm_state, gateup = run_parallel(
                 self.workspace,
-                name=plan.early_overlap.value,
+                name=plan.gate_up_overlap.value,
                 device=hidden_states.device,
                 compute=base,
                 side=gate_up_a,
@@ -715,14 +715,14 @@ class MoeLoraRunner:
 
             base_gemm_state, gateup = run_parallel(
                 self.workspace,
-                name=plan.early_overlap.value,
+                name=plan.gate_up_overlap.value,
                 device=hidden_states.device,
                 compute=base,
                 side=gate_up_a_b,
             )
         return state, base_gemm_state, gateup
 
-    def _run_middle(
+    def _run_act(
         self,
         plan: MoeLoraExecutionPlan,
         launch_config: MoeLoraLaunchConfig,
@@ -736,7 +736,7 @@ class MoeLoraRunner:
         num_tokens: int,
     ) -> tuple[torch.Tensor, _DownAInput | None]:
         act_out = self.workspace.tensor(
-            "middle:act_masked",
+            "act:masked",
             provider.act_out_shape(base_gemm_state),
             dtype=provider.contract.lora_activation_dtype,
             device=gateup_out.device,
@@ -744,7 +744,7 @@ class MoeLoraRunner:
         exposes_pair_activation = True
         mapped_down_a: MappedLoraAInput | None = None
         if (
-            plan.middle.family is MiddleFamily.B_ACTIVATION
+            plan.act.family is ActFamily.B_ACTIVATION
             and plan.down_a.family is LoraAFamily.GROUPED
         ):
             mapped_down_a = provider.mapped_down_lora_a_input(base_gemm_state, act_out)
@@ -752,7 +752,7 @@ class MoeLoraRunner:
                 exposes_pair_activation = False
         act_pairs = (
             self.workspace.tensor(
-                "middle:act_pairs",
+                "act:pairs",
                 (num_tokens, self.top_k, provider.intermediate_size),
                 dtype=provider.contract.lora_activation_dtype,
                 device=gateup_out.device,
@@ -760,7 +760,7 @@ class MoeLoraRunner:
             if exposes_pair_activation
             else None
         )
-        if plan.middle.family is MiddleFamily.MATERIALIZED:
+        if plan.act.family is ActFamily.MATERIALIZED:
             provider.act_with_delta(
                 base_gemm_state,
                 gateup_out,
@@ -776,7 +776,7 @@ class MoeLoraRunner:
             )
             return act_out, _DownAInput(act_pairs)
 
-        consumed_route = plan.middle.consumed_gate_up_b
+        consumed_route = plan.act.consumed_gate_up_b
         route = routes.aligned(consumed_route.is_shared_outer)
         family, implementation = self._middle_implementation(plan)
         provider.run_fused_middle(
@@ -788,7 +788,7 @@ class MoeLoraRunner:
             act_masked=act_out,
             act_pairs=act_pairs,
             routing=route,
-            config=launch_config.for_middle(plan.middle.family),
+            config=launch_config.for_middle(plan.act.family),
             bridge_gateup=gate_up.rank,
             b_gate_up=batch.gate_up_lora_b.flatten(0, 1),
             bridge_top_k=(
@@ -891,7 +891,7 @@ class MoeLoraRunner:
         provider.down(base_gemm_state, act_out, down_out)
         return down_out
 
-    def _run_late(
+    def _run_down(
         self,
         plan: MoeLoraExecutionPlan,
         launch_config: MoeLoraLaunchConfig,
@@ -931,7 +931,7 @@ class MoeLoraRunner:
         def base() -> torch.Tensor:
             return self._run_base_down(provider, base_gemm_state, act_out)
 
-        if plan.late_overlap is LateOverlap.NONE:
+        if plan.down_overlap is DownOverlap.NONE:
             if state.rank is None:
                 down_a()
             if plan.down_b_scatter:
@@ -957,22 +957,22 @@ class MoeLoraRunner:
                 if plan.down_b is not None:
                     down_b()
                 down_out = base()
-        elif plan.late_overlap is LateOverlap.DOWN_A:
+        elif plan.down_overlap is DownOverlap.DOWN_A:
             down_out = run_parallel(
                 self.workspace,
-                name=plan.late_overlap.value,
+                name=plan.down_overlap.value,
                 device=act_out.device,
                 compute=base,
                 side=down_a,
             )
             if plan.down_b is not None:
                 down_b()
-        elif plan.late_overlap is LateOverlap.DOWN_B:
+        elif plan.down_overlap is DownOverlap.DOWN_B:
             if state.rank is None:
                 down_a()
             down_out = run_parallel(
                 self.workspace,
-                name=plan.late_overlap.value,
+                name=plan.down_overlap.value,
                 device=act_out.device,
                 compute=base,
                 side=down_b,
@@ -985,7 +985,7 @@ class MoeLoraRunner:
 
             down_out = run_parallel(
                 self.workspace,
-                name=plan.late_overlap.value,
+                name=plan.down_overlap.value,
                 device=act_out.device,
                 compute=base,
                 side=down_a_b,

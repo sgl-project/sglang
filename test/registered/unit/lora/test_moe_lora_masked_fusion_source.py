@@ -80,7 +80,7 @@ class TestMaskedFusionSource(unittest.TestCase):
         sm100 = _source("cutedsl_masked/kernel.py")
         sm90 = _source("cutedsl_masked/kernel_sm90.py")
         activation = _source("masked_activation.py")
-        middle = _source("masked_fused_middle.py")
+        act = _source("masked_fused_middle.py")
         finalize = _source("masked_finalize.py")
         post_reorder = EP_MOE.read_text()
 
@@ -101,7 +101,7 @@ class TestMaskedFusionSource(unittest.TestCase):
                 "_activation_delta_masked_kernel",
                 "act_delta_masked",
             ),
-            (middle, "_b_act_kernel", "run_masked_fused_middle"),
+            (act, "_b_act_kernel", "run_masked_fused_middle"),
         ):
             self.assertIn("gdc_wait", _function(source, kernel_name))
             self.assertIn('"launch_pdl": True', _function(source, launcher_name))
@@ -372,7 +372,7 @@ class TestMaskedFusionSource(unittest.TestCase):
         )
 
     def test_config_names_match_the_execution_contract(self):
-        middle = _source("masked_fused_middle.py")
+        act = _source("masked_fused_middle.py")
         finalize = _source("masked_finalize.py")
         for key in (
             "BLOCK_SIZE_W",
@@ -381,7 +381,7 @@ class TestMaskedFusionSource(unittest.TestCase):
             "num_warps",
             "num_stages",
         ):
-            self.assertIn(f'"{key}"', middle)
+            self.assertIn(f'"{key}"', act)
         for key in ("BLOCK_SIZE_T", "BLOCK_SIZE_H", "BLOCK_SIZE_K"):
             self.assertIn(f'"{key}"', finalize)
         self.assertIn('"reduce"', finalize)
@@ -449,12 +449,12 @@ class TestMaskedFusionSource(unittest.TestCase):
         finalize.MASKED_FINALIZE_TRITON = "triton"
         finalize.invoke_shared_from_scratch_finalize = lambda **_kwargs: None
         finalize.invoke_shared_rank_reduce = lambda **_kwargs: None
-        middle = types.ModuleType(
+        act = types.ModuleType(
             "sglang.srt.lora.moe.base_gemm_provider.masked_fused_middle"
         )
-        middle.MASKED_MIDDLE_FAMILIES = ("b_activation",)
-        middle.MASKED_MIDDLE_TRITON = "triton"
-        middle.run_masked_fused_middle = lambda *_args, **_kwargs: None
+        act.MASKED_MIDDLE_FAMILIES = ("b_activation",)
+        act.MASKED_MIDDLE_TRITON = "triton"
+        act.run_masked_fused_middle = lambda *_args, **_kwargs: None
 
         spec = importlib.util.spec_from_file_location(
             "_cpu_masked_row_domain", PROVIDER / "masked_row_domain.py"
@@ -470,7 +470,7 @@ class TestMaskedFusionSource(unittest.TestCase):
             activation.__name__: activation,
             dispatch.__name__: dispatch,
             finalize.__name__: finalize,
-            middle.__name__: middle,
+            act.__name__: act,
         }
         with mock.patch.dict(sys.modules, injected):
             spec.loader.exec_module(module)
@@ -484,7 +484,7 @@ class TestMaskedFusionSource(unittest.TestCase):
                 )
             )
 
-        for family in middle.MASKED_MIDDLE_FAMILIES:
+        for family in act.MASKED_MIDDLE_FAMILIES:
             for candidate_activation in ActivationFn:
                 self.assertTrue(
                     provider.supports_fused_middle(

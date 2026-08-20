@@ -54,7 +54,7 @@ def _serial_materialized_reference():
             False,
             PLAN.BridgeLayout.PAIR_MAJOR,
         ),
-        middle=PLAN.MiddleSpec(PLAN.MiddleFamily.MATERIALIZED, PLAN.ActivationFn.SILU),
+        act=PLAN.ActSpec(PLAN.ActFamily.MATERIALIZED, PLAN.ActivationFn.SILU),
         down_a=PLAN.LoraASpec(
             PLAN.Site.DOWN,
             PLAN.LoraAFamily.GROUPED,
@@ -101,10 +101,8 @@ def _load_launch_config():
         "reduce": {"BLOCK_SIZE_T": 16},
         "tail": {"BLOCK_SIZE_H": 16},
     }
-    middle = types.ModuleType(
-        "sglang.srt.lora.moe.base_gemm_provider.masked_fused_middle"
-    )
-    middle.FUSED_B_ACT_DEFAULT_CONFIG = {"BLOCK_SIZE_W": 16}
+    act = types.ModuleType("sglang.srt.lora.moe.base_gemm_provider.masked_fused_middle")
+    act.FUSED_B_ACT_DEFAULT_CONFIG = {"BLOCK_SIZE_W": 16}
     module_name = "_host_launch_config"
     spec = importlib.util.spec_from_file_location(
         module_name, LORA_MOE / "launch_config.py"
@@ -117,7 +115,7 @@ def _load_launch_config():
             **packages,
             "sglang.srt.lora.moe.execution_plan": PLAN,
             finalize.__name__: finalize,
-            middle.__name__: middle,
+            act.__name__: act,
             module_name: module,
         },
     ):

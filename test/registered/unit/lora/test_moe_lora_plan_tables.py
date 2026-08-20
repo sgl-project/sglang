@@ -19,14 +19,14 @@ from sglang.srt.environ import envs
 from sglang.srt.lora.moe import execution_plan as ep
 from sglang.srt.lora.moe import launch_config as lc
 from sglang.srt.lora.moe.execution_plan import (
+    ActFamily,
     ActivationFn,
     DeviceArchitecture,
-    EarlyOverlap,
+    DownOverlap,
     FinalizeFamily,
-    LateOverlap,
+    GateUpOverlap,
     LoraAFamily,
     LoraBFamily,
-    MiddleFamily,
     Phase,
     RouteBuilderFamily,
     architecture_for_capability,
@@ -81,20 +81,20 @@ class TestSm100PerExpert:
         assert c.plan.gate_up_b.family is LoraBFamily.INDEXED_PAIRS
         assert c.plan.down_a.family is LoraAFamily.GROUPED
         assert c.plan.down_b.family is LoraBFamily.INDEXED_PAIRS
-        assert c.plan.middle.family is MiddleFamily.MATERIALIZED
+        assert c.plan.act.family is ActFamily.MATERIALIZED
         assert c.plan.finalize.family is FinalizeFamily.MATERIALIZED
-        assert c.plan.early_overlap is EarlyOverlap.GATE_UP_A_B
-        assert c.plan.late_overlap is LateOverlap.DOWN_A_B
+        assert c.plan.gate_up_overlap is GateUpOverlap.GATE_UP_A_B
+        assert c.plan.down_overlap is DownOverlap.DOWN_A_B
         assert c.plan.route_builder is RouteBuilderFamily.STANDARD
 
     def test_prefill_ships_serial_route_major_b_activation(self):
         c = _resolve()[Phase.PREFILL]
         assert c.base_gemm_rows == "route_major"
-        assert c.plan.middle.family is MiddleFamily.B_ACTIVATION
+        assert c.plan.act.family is ActFamily.B_ACTIVATION
         assert c.plan.gate_up_b is None  # consumed by the b_activation middle
         assert c.plan.down_b_scatter
-        assert c.plan.early_overlap is EarlyOverlap.NONE
-        assert c.plan.late_overlap is LateOverlap.NONE
+        assert c.plan.gate_up_overlap is GateUpOverlap.NONE
+        assert c.plan.down_overlap is DownOverlap.NONE
 
     def test_decode_tile_ladder_is_rank_then_token_bucketed(self):
         # gate_up_b BLOCK_SIZE_N names the tile set: 128 tiny, 512 mse,
@@ -133,9 +133,9 @@ class TestSm100Shared:
     def test_decode_ships_wide_window_materialized_joint(self):
         c = _resolve(layout=True, rank=32)[Phase.DECODE]
         assert c.base_gemm_rows == "expert_major"
-        assert c.plan.early_overlap is EarlyOverlap.GATE_UP_A_B
-        assert c.plan.late_overlap is LateOverlap.DOWN_A_B
-        assert c.plan.middle.family is MiddleFamily.MATERIALIZED
+        assert c.plan.gate_up_overlap is GateUpOverlap.GATE_UP_A_B
+        assert c.plan.down_overlap is DownOverlap.DOWN_A_B
+        assert c.plan.act.family is ActFamily.MATERIALIZED
         assert c.plan.finalize.family is FinalizeFamily.MATERIALIZED
         assert c.plan.gate_up_b.family is LoraBFamily.ONE_LAUNCH_SLICED
         assert c.plan.down_b.family is LoraBFamily.ONE_LAUNCH_SLICED
@@ -145,10 +145,10 @@ class TestSm100Shared:
         c = _resolve(layout=True, rank=32)[Phase.PREFILL]
         assert c.base_gemm_rows == "route_major"
         assert c.plan.gate_up_a.family is LoraAFamily.TOKEN_DEDUP_GROUPED
-        assert c.plan.middle.family is MiddleFamily.B_ACTIVATION
+        assert c.plan.act.family is ActFamily.B_ACTIVATION
         assert c.plan.route_builder is RouteBuilderFamily.JOINT_SHARED_OUTER
-        assert c.plan.early_overlap is EarlyOverlap.NONE
-        assert c.plan.late_overlap is LateOverlap.NONE
+        assert c.plan.gate_up_overlap is GateUpOverlap.NONE
+        assert c.plan.down_overlap is DownOverlap.NONE
 
 
 class TestH200:
@@ -191,16 +191,16 @@ class TestResolution:
                     p: s.name for p, s in swiglu.items()
                 }
                 for phase, sel in relu2.items():
-                    assert sel.plan.middle.activation is ActivationFn.RELU2
-                    assert swiglu[phase].plan.middle.activation is ActivationFn.SILU
+                    assert sel.plan.act.activation is ActivationFn.RELU2
+                    assert swiglu[phase].plan.act.activation is ActivationFn.SILU
 
     def test_out_of_domain_serves_the_serial_deepgemm_fallback(self):
         selected = _resolve(hidden=8192, experts=1024)
         decode = selected[Phase.DECODE]
         assert decode.name == "fallback.serial"
         assert decode.base_gemm_rows == "expert_major"
-        assert decode.plan.early_overlap is EarlyOverlap.NONE
-        assert decode.plan.late_overlap is LateOverlap.NONE
+        assert decode.plan.gate_up_overlap is GateUpOverlap.NONE
+        assert decode.plan.down_overlap is DownOverlap.NONE
         assert selected[Phase.PREFILL].name == "fallback.serial_prefill"
 
     def test_unknown_architecture_serves_the_default_table(self):

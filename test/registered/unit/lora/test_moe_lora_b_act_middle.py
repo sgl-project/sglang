@@ -28,7 +28,9 @@ import pytest
 import torch
 
 from sglang.srt.lora.moe.execution_plan import (
+    ActFamily,
     ActivationFn,
+    ActSpec,
     BridgeLayout,
     DeviceArchitecture,
     FinalizeFamily,
@@ -37,8 +39,6 @@ from sglang.srt.lora.moe.execution_plan import (
     LoraASpec,
     LoraBFamily,
     LoraBSpec,
-    MiddleFamily,
-    MiddleSpec,
     MoeLoraExecutionPlan,
     Phase,
     SelectedPlan,
@@ -92,14 +92,14 @@ def _build_plan(
     *,
     activation=_SWIGLU,
     is_shared_outer=False,
-    middle_family=MiddleFamily.MATERIALIZED,
+    act_family=ActFamily.MATERIALIZED,
     down_b_scatter=False,
 ) -> MoeLoraExecutionPlan:
     """The serial one-launch plan shape, built the way
     ``execution_plan.build_plan`` materializes a table row (spec classes
     directly)."""
     pe = False
-    consumes_gate_up_b = middle_family is MiddleFamily.B_ACTIVATION
+    consumes_gate_up_b = act_family is ActFamily.B_ACTIVATION
     gate_up_b_contract = StageContract(Site.GATE_UP, pe, BridgeLayout.PAIR_MAJOR)
     return MoeLoraExecutionPlan(
         gate_up_a=LoraASpec(
@@ -118,8 +118,8 @@ def _build_plan(
                 BridgeLayout.PAIR_MAJOR,
             )
         ),
-        middle=MiddleSpec(
-            middle_family,
+        act=ActSpec(
+            act_family,
             activation,
             gate_up_b_contract if consumes_gate_up_b else None,
         ),
@@ -143,7 +143,7 @@ class TestBActMiddleConfig:
         # The H200 serial prefill shape is the same eligible form, on the
         # SM90-capable DeepGEMM contiguous backend.
         serial = _menu(_H200, False)["prefill.serial"]
-        assert serial.plan.middle.family is MiddleFamily.B_ACTIVATION
+        assert serial.plan.act.family is ActFamily.B_ACTIVATION
         assert serial.plan.gate_up_b is None
         assert serial.plan.down_b_scatter is True
         assert serial.base_gemm_rows == "route_major"
@@ -158,9 +158,7 @@ class TestBActMiddleConfig:
                     for name, choice in _menu(architecture, layout, activation).items():
                         if not name.startswith("decode.") and name != "fallback.serial":
                             continue
-                        assert (
-                            choice.plan.middle.family is MiddleFamily.MATERIALIZED
-                        ), name
+                        assert choice.plan.act.family is ActFamily.MATERIALIZED, name
                         assert choice.plan.gate_up_b is not None, name
 
     def test_out_of_domain_prefill_twins_get_the_swap(self) -> None:
@@ -183,16 +181,16 @@ class TestBActMiddleConfig:
         # twin gets the swap only (its down-B is shared, never scattered);
         # rows are activation-agnostic, so the ReLU2 twin ships the same
         # fused middle with its own activation injected.
-        assert per_expert.plan.middle.family is MiddleFamily.B_ACTIVATION
+        assert per_expert.plan.act.family is ActFamily.B_ACTIVATION
         assert per_expert.plan.gate_up_b is None
         assert per_expert.plan.down_b_scatter is True
         assert per_expert.base_gemm_rows == "route_major"
-        assert shared.plan.middle.family is MiddleFamily.B_ACTIVATION
+        assert shared.plan.act.family is ActFamily.B_ACTIVATION
         assert shared.plan.gate_up_b is None
         assert shared.plan.down_b_scatter is False
         assert shared.base_gemm_rows == "expert_major"
-        assert relu2.plan.middle.family is MiddleFamily.B_ACTIVATION
-        assert relu2.plan.middle.activation is ActivationFn.RELU2
+        assert relu2.plan.act.family is ActFamily.B_ACTIVATION
+        assert relu2.plan.act.activation is ActivationFn.RELU2
         assert relu2.plan.down_b_scatter is True
 
 
@@ -292,7 +290,7 @@ def _reference_choice():
     config (one-launch B tilings, b_activation section, aligned-16 routes),
     so it doubles as the config donor for the swapped variants."""
     choice = _menu(_GB300, False)["fallback.serial"]
-    assert choice.plan.middle.family is MiddleFamily.MATERIALIZED
+    assert choice.plan.act.family is ActFamily.MATERIALIZED
     assert choice.plan.gate_up_b is not None
     assert choice.plan.down_b_scatter is False
     assert choice.plan == _build_plan()
@@ -371,9 +369,9 @@ def test_runner_b_act_matches_the_materialized_reference(
     )
     reference_choice = _reference_choice()
     swapped_plan = _build_plan(
-        middle_family=MiddleFamily.B_ACTIVATION, down_b_scatter=scatter
+        act_family=ActFamily.B_ACTIVATION, down_b_scatter=scatter
     )
-    assert swapped_plan.middle.family is MiddleFamily.B_ACTIVATION
+    assert swapped_plan.act.family is ActFamily.B_ACTIVATION
     assert swapped_plan.gate_up_b is None
     assert swapped_plan.down_b_scatter is scatter
     num_tokens, num_experts = 64, 4

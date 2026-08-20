@@ -44,18 +44,18 @@ import pytest
 import torch
 
 from sglang.srt.lora.moe.execution_plan import (
+    ActFamily,
     ActivationFn,
+    ActSpec,
     BridgeLayout,
     DeviceArchitecture,
+    DownOverlap,
     FinalizeFamily,
     FinalizeSpec,
-    LateOverlap,
     LoraAFamily,
     LoraASpec,
     LoraBFamily,
     LoraBSpec,
-    MiddleFamily,
-    MiddleSpec,
     MoeLoraExecutionPlan,
     SelectedPlan,
     Site,
@@ -108,7 +108,7 @@ def _build_plan(
     activation=_SWIGLU,
     is_shared_outer=False,
     finalize_family=FinalizeFamily.MATERIALIZED,
-    late_overlap=LateOverlap.NONE,
+    down_overlap=DownOverlap.NONE,
 ) -> MoeLoraExecutionPlan:
     """The serial one-launch plan shape, built the way
     ``execution_plan.build_plan`` materializes a table row (spec classes
@@ -129,7 +129,7 @@ def _build_plan(
             pe,
             BridgeLayout.PAIR_MAJOR,
         ),
-        middle=MiddleSpec(MiddleFamily.MATERIALIZED, activation),
+        act=ActSpec(ActFamily.MATERIALIZED, activation),
         down_a=LoraASpec(Site.DOWN, LoraAFamily.GROUPED, pe, BridgeLayout.PAIR_MAJOR),
         down_b=(
             None
@@ -144,7 +144,7 @@ def _build_plan(
         finalize=FinalizeSpec(
             finalize_family, down_b_contract if consumes_down_b else None
         ),
-        late_overlap=late_overlap,
+        down_overlap=down_overlap,
     )
 
 
@@ -202,8 +202,8 @@ class TestDownBScatterPlan:
         with pytest.raises(ValueError, match="down-B scatter"):
             replace(consumed, down_b_scatter=True)
 
-    def test_flag_rejects_late_overlap_windows(self) -> None:
-        overlapped = _build_plan(late_overlap=LateOverlap.DOWN_B)
+    def test_flag_rejects_down_overlap_windows(self) -> None:
+        overlapped = _build_plan(down_overlap=DownOverlap.DOWN_B)
         with pytest.raises(ValueError, match="down-B scatter"):
             replace(overlapped, down_b_scatter=True)
 
@@ -684,10 +684,10 @@ def _scatter_pair():
     flag flipped."""
     reference = _menu(_GB300, False)["fallback.serial"]
     assert reference.plan.down_b_scatter is False
-    assert reference.plan.middle.family is MiddleFamily.MATERIALIZED
+    assert reference.plan.act.family is ActFamily.MATERIALIZED
     assert reference.plan == _serial_plan()
     reordered_plan = replace(reference.plan, down_b_scatter=True)
-    assert reordered_plan.middle.family is MiddleFamily.MATERIALIZED
+    assert reordered_plan.act.family is ActFamily.MATERIALIZED
     return reference.plan, reordered_plan, _shipped_launch(_GB300, reference)
 
 

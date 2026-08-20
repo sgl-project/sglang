@@ -15,10 +15,10 @@
     "down_a_family": "indexed",
     "gate_up_b_family": "one_launch_sliced",
     "down_b_family": "one_launch_sliced",
-    "middle_family": "materialized",
+    "act_family": "materialized",
     "finalize_family": "materialized",
-    "early_overlap": "gate_up_a_b",
-    "late_overlap": "down_a_b"
+    "gate_up_overlap": "gate_up_a_b",
+    "down_overlap": "down_a_b"
    }
   },
   {
@@ -30,7 +30,7 @@
     "gate_up_a_family": "grouped",
     "down_a_family": "grouped",
     "down_b_family": "one_launch_sliced",
-    "middle_family": "b_activation",
+    "act_family": "b_activation",
     "finalize_family": "materialized",
     "down_b_scatter": true
    }
@@ -45,10 +45,10 @@
     "down_a_family": "grouped",
     "gate_up_b_family": "one_launch_sliced",
     "down_b_family": "one_launch_sliced",
-    "middle_family": "materialized",
+    "act_family": "materialized",
     "finalize_family": "materialized",
-    "early_overlap": "gate_up_a_b",
-    "late_overlap": "down_a_b",
+    "gate_up_overlap": "gate_up_a_b",
+    "down_overlap": "down_a_b",
     "route_builder": "joint_shared_outer"
    }
   },
@@ -62,7 +62,7 @@
     "gate_up_a_family": "token_dedup_grouped",
     "down_a_family": "grouped",
     "down_b_family": "one_launch_sliced",
-    "middle_family": "b_activation",
+    "act_family": "b_activation",
     "finalize_family": "materialized",
     "route_builder": "joint_shared_outer"
    }
@@ -76,7 +76,7 @@
    "plan": {
     "gate_up_a_family": "token_dedup_grouped",
     "down_a_family": "grouped",
-    "middle_family": "b_activation",
+    "act_family": "b_activation",
     "finalize_family": "shared_rank_reduce"
    }
   },
@@ -89,7 +89,7 @@
     "gate_up_a_family": "token_dedup_grouped",
     "down_a_family": "grouped",
     "down_b_family": "one_launch_sliced",
-    "middle_family": "b_activation",
+    "act_family": "b_activation",
     "finalize_family": "materialized",
     "route_builder": "joint_shared_outer"
    }
@@ -105,7 +105,7 @@
     "down_a_family": "grouped",
     "gate_up_b_family": "one_launch_sliced",
     "down_b_family": "one_launch_sliced",
-    "middle_family": "materialized",
+    "act_family": "materialized",
     "finalize_family": "materialized"
    }
   },
@@ -118,7 +118,7 @@
     "gate_up_a_family": "grouped",
     "down_a_family": "grouped",
     "down_b_family": "one_launch_sliced",
-    "middle_family": "b_activation",
+    "act_family": "b_activation",
     "finalize_family": "materialized",
     "down_b_scatter": true
    }
@@ -132,7 +132,7 @@
     "gate_up_a_family": "grouped",
     "down_a_family": "grouped",
     "down_b_family": "one_launch_sliced",
-    "middle_family": "b_activation",
+    "act_family": "b_activation",
     "finalize_family": "materialized"
    }
   }

@@ -88,7 +88,7 @@ class LoraBFamily(str, Enum):
     INDEXED_PAIRS = "indexed_pairs"
 
 
-class MiddleFamily(str, Enum):
+class ActFamily(str, Enum):
     MATERIALIZED = "materialized"
     B_ACTIVATION = "b_activation"
 
@@ -98,13 +98,13 @@ class FinalizeFamily(str, Enum):
     SHARED_RANK_REDUCE = "shared_rank_reduce"
 
 
-class EarlyOverlap(str, Enum):
+class GateUpOverlap(str, Enum):
     NONE = "none"
     GATE_UP_A = "gate_up_a"
     GATE_UP_A_B = "gate_up_a_b"
 
 
-class LateOverlap(str, Enum):
+class DownOverlap(str, Enum):
     NONE = "none"
     DOWN_A = "down_a"
     DOWN_B = "down_b"
@@ -220,7 +220,7 @@ class LoraBSpec:
 
 
 @pydantic_dataclass(frozen=True, slots=True, config=_STRICT)
-class MiddleSpec:
+class ActSpec:
     """Activation boundary and the gate/up B stage optionally fused into it.
 
     A consumed factor names its data contract, while ``family`` names the
@@ -228,22 +228,22 @@ class MiddleSpec:
     ``LoraBSpec`` because the standalone family does not run.
     """
 
-    family: MiddleFamily
+    family: ActFamily
     activation: ActivationFn
     consumed_gate_up_b: StageContract | None = None
 
     def __post_init__(self) -> None:
         self.validate()
 
-    def validate(self) -> MiddleSpec:
+    def validate(self) -> ActSpec:
         if self.consumed_gate_up_b is not None:
             if self.consumed_gate_up_b.site is not Site.GATE_UP:
                 raise ValueError("consumed_gate_up_b must describe the gate/up site")
 
-        expected_gate_up_b = self.family is MiddleFamily.B_ACTIVATION
+        expected_gate_up_b = self.family is ActFamily.B_ACTIVATION
         if (self.consumed_gate_up_b is not None) != expected_gate_up_b:
             raise ValueError(
-                f"middle family {self.family.value} "
+                f"act family {self.family.value} "
                 f"{'requires' if expected_gate_up_b else 'does not consume'} gate/up B"
             )
         return self
@@ -301,12 +301,12 @@ class MoeLoraExecutionPlan:
 
     gate_up_a: LoraASpec
     down_a: LoraASpec
-    middle: MiddleSpec
+    act: ActSpec
     finalize: FinalizeSpec
     gate_up_b: LoraBSpec | None = None
     down_b: LoraBSpec | None = None
-    early_overlap: EarlyOverlap = EarlyOverlap.NONE
-    late_overlap: LateOverlap = LateOverlap.NONE
+    gate_up_overlap: GateUpOverlap = GateUpOverlap.NONE
+    down_overlap: DownOverlap = DownOverlap.NONE
     route_builder: RouteBuilderFamily = RouteBuilderFamily.STANDARD
     # Down-tail reordering experiment: the standalone one-launch sliced
     # down-B runs AFTER the base down GEMM and read-modify-write adds its
@@ -324,8 +324,8 @@ class MoeLoraExecutionPlan:
         if self.gate_up_b is not None:
             return self.gate_up_b.contract
         # The exactly-one-owner parity check runs first, so falling past
-        # the branch above means the middle consumed it.
-        return self.middle.consumed_gate_up_b
+        # the branch above means the act stage consumed it.
+        return self.act.consumed_gate_up_b
 
     def _down_a_contract(self) -> StageContract:
         return self.down_a.contract
@@ -345,10 +345,10 @@ class MoeLoraExecutionPlan:
         if self.down_b is not None and self.down_b.site is not Site.DOWN:
             raise ValueError("down_b must describe the down site")
 
-        gate_up_b_consumed = self.middle.consumed_gate_up_b is not None
+        gate_up_b_consumed = self.act.consumed_gate_up_b is not None
         if gate_up_b_consumed == (self.gate_up_b is not None):
             raise ValueError(
-                "gate/up B must have exactly one owner: standalone gate_up_b or middle"
+                "gate/up B must have exactly one owner: standalone gate_up_b or the act stage"
             )
         down_b_consumed = self.finalize.consumed_down_b is not None
         if down_b_consumed == (self.down_b is not None):
@@ -366,20 +366,20 @@ class MoeLoraExecutionPlan:
         if down_a_contract.layout is not down_b_contract.layout:
             raise ValueError("down A output layout must match the down B input layout")
 
-        if self.early_overlap is EarlyOverlap.GATE_UP_A_B and self.gate_up_b is None:
+        if self.gate_up_overlap is GateUpOverlap.GATE_UP_A_B and self.gate_up_b is None:
             raise ValueError(
-                "gate/up-A+B overlap requires standalone gate/up B; the middle owns it"
+                "gate/up-A+B overlap requires standalone gate/up B; the act stage owns it"
             )
         if (
-            self.late_overlap
+            self.down_overlap
             in (
-                LateOverlap.DOWN_B,
-                LateOverlap.DOWN_A_B,
+                DownOverlap.DOWN_B,
+                DownOverlap.DOWN_A_B,
             )
             and self.down_b is None
         ):
             raise ValueError(
-                f"{self.late_overlap.value} overlap requires standalone down B"
+                f"{self.down_overlap.value} overlap requires standalone down B"
             )
 
         if self.down_b_scatter and not self.down_b_scatter_eligible():
@@ -397,14 +397,14 @@ class MoeLoraExecutionPlan:
         True iff the schedule has no early/late overlap windows and down-A
         is GROUPED over the pair activation.  Such a plan drives
         the provider seam
-        (prepare / gateup / middle / down / finalize) as ordered same-stream
+        (prepare / gateup / act / down / finalize) as ordered same-stream
         calls with no cross-stage coupling, which is the schedule shape
         row-domain conversions key on; the finalize family is judged
         separately (:meth:`is_fully_serial_materialized`).
         """
         return (
-            self.early_overlap is EarlyOverlap.NONE
-            and self.late_overlap is LateOverlap.NONE
+            self.gate_up_overlap is GateUpOverlap.NONE
+            and self.down_overlap is DownOverlap.NONE
             and self.down_a.family is LoraAFamily.GROUPED
             # The scatter reordering couples down-B to the base down output;
             # it is applied ON TOP of a fully serial materialized shape and
@@ -416,7 +416,7 @@ class MoeLoraExecutionPlan:
         """A fully serial schedule whose finalize is also MATERIALIZED.
 
         The MATERIALIZED finalize recombines base and LoRA delta in one
-        standalone launch, so this is the shape the middle-swap and
+        standalone launch, so this is the shape the act-swap and
         scatter config steps key on.
         """
         return (
@@ -430,7 +430,7 @@ class MoeLoraExecutionPlan:
         # A standalone down-B implies the materialized finalize (any other
         # finalize consumes it).  Which B kernel implements the epilogue is a
         # provider capability, checked in MoeLoraRunner.validate_plan.
-        return self.down_b is not None and self.late_overlap is LateOverlap.NONE
+        return self.down_b is not None and self.down_overlap is DownOverlap.NONE
 
     def route_requirements(self) -> frozenset[RouteRequirement]:
         """Return the exact union of route products consumed by this plan.
@@ -459,13 +459,13 @@ class MoeLoraExecutionPlan:
     def _requirements_of(
         self, *stages: LoraASpec | LoraBSpec | None
     ) -> frozenset[RouteRequirement]:
-        # The middle and finalize stages are never optional, so they join
+        # The act and finalize stages are never optional, so they join
         # every union; only the standalone A/B stages vary.
         requirements: set[RouteRequirement] = set()
         for stage in stages:
             if stage is not None:
                 requirements.update(stage.route_requirements())
-        requirements.update(self.middle.route_requirements())
+        requirements.update(self.act.route_requirements())
         requirements.update(self.finalize.route_requirements())
         return frozenset(requirements)
 
@@ -511,10 +511,10 @@ class _PlanSpecModel(pydantic.BaseModel):
     down_a_family: LoraAFamily = LoraAFamily.GROUPED
     gate_up_b_family: LoraBFamily = LoraBFamily.ONE_LAUNCH_SLICED
     down_b_family: LoraBFamily = LoraBFamily.ONE_LAUNCH_SLICED
-    middle_family: MiddleFamily = MiddleFamily.MATERIALIZED
+    act_family: ActFamily = ActFamily.MATERIALIZED
     finalize_family: FinalizeFamily = FinalizeFamily.MATERIALIZED
-    early_overlap: EarlyOverlap = EarlyOverlap.NONE
-    late_overlap: LateOverlap = LateOverlap.NONE
+    gate_up_overlap: GateUpOverlap = GateUpOverlap.NONE
+    down_overlap: DownOverlap = DownOverlap.NONE
     route_builder: RouteBuilderFamily = RouteBuilderFamily.STANDARD
     down_b_scatter: bool = False
 
@@ -639,11 +639,11 @@ def build_plan(
         if gate_up_a_family is LoraAFamily.TOKEN_DEDUP_GROUPED
         else BridgeLayout.PAIR_MAJOR
     )
-    middle_family = spec.middle_family
+    act_family = spec.act_family
     finalize_family = spec.finalize_family
     gate_up_b_contract = StageContract(Site.GATE_UP, False, gate_up_layout)
     down_b_contract = StageContract(Site.DOWN, is_shared_outer, BridgeLayout.PAIR_MAJOR)
-    consumes_gate_up_b = middle_family is MiddleFamily.B_ACTIVATION
+    consumes_gate_up_b = act_family is ActFamily.B_ACTIVATION
     consumes_down_b = finalize_family is not FinalizeFamily.MATERIALIZED
     plan = MoeLoraExecutionPlan(
         gate_up_a=LoraASpec(
@@ -654,8 +654,8 @@ def build_plan(
             if consumes_gate_up_b
             else LoraBSpec(Site.GATE_UP, spec.gate_up_b_family, False, gate_up_layout)
         ),
-        middle=MiddleSpec(
-            middle_family,
+        act=ActSpec(
+            act_family,
             activation,
             gate_up_b_contract if consumes_gate_up_b else None,
         ),
@@ -678,8 +678,8 @@ def build_plan(
         finalize=FinalizeSpec(
             finalize_family, down_b_contract if consumes_down_b else None
         ),
-        early_overlap=spec.early_overlap,
-        late_overlap=spec.late_overlap,
+        gate_up_overlap=spec.gate_up_overlap,
+        down_overlap=spec.down_overlap,
         route_builder=spec.route_builder,
         down_b_scatter=spec.down_b_scatter,
     )
