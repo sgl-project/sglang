@@ -7,7 +7,9 @@ from itertools import chain
 from typing import cast
 
 import torch
+import torch.distributed as dist
 from torch import nn
+from torch.distributed import init_device_mesh
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig
@@ -28,6 +30,10 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
     ComponentLoader,
+)
+from sglang.multimodal_gen.runtime.loader.fsdp_load import (
+    register_fsdp_entrypoints,
+    shard_model,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     set_default_torch_dtype,
@@ -589,6 +595,15 @@ class TextEncoderLoader(ComponentLoader):
         else:
             model_device = local_torch_device
 
+        fsdp_shard_conditions = model_config.arch_config._fsdp_shard_conditions
+        use_fsdp_cpu_offload = (
+            component_starts_on_cpu
+            and not current_platform.is_mps()
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+            and bool(fsdp_shard_conditions)
+        )
+
         encoder_tp_group = get_folding_tp_group(model_config)
         with use_tensor_parallel_group(encoder_tp_group), set_default_torch_dtype(
             PRECISION_TO_TYPE[dtype]
@@ -647,6 +662,23 @@ class TextEncoderLoader(ComponentLoader):
                         "Keeping %s on CPU for MPS layerwise offload",
                         model.__class__.__name__,
                     )
+                elif use_fsdp_cpu_offload:
+                    # FSDP CPU offload requires every parameter to start on CPU.
+                    model = model.to("cpu")
+                    mesh = init_device_mesh(
+                        current_platform.device_type,
+                        mesh_shape=(dist.get_world_size(),),
+                    )
+                    shard_model(
+                        model,
+                        cpu_offload=True,
+                        reshard_after_forward=True,
+                        mesh=mesh,
+                        fsdp_shard_conditions=fsdp_shard_conditions,
+                        pin_cpu_memory=server_args.pin_cpu_memory,
+                    )
+                    model._sglang_fsdp_cpu_offload = True
+                    register_fsdp_entrypoints(model)
                 else:
                     model = model.to("cpu")
             else:
