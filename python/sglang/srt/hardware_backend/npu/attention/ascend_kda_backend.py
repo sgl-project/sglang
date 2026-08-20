@@ -13,7 +13,6 @@ from sgl_kernel_npu.fla.kda_prefill import (
 from sgl_kernel_npu.fla.kda_ragged import (
     gather_kda_verify_output_norm_npu,
     gather_kda_verify_output_npu,
-    scatter_kda_verify_inputs_npu,
 )
 from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
 from sgl_kernel_npu.fla.solve_tril import solve_tril_npu
@@ -427,6 +426,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         batch_size = query_start_loc.shape[0] - 1
         num_dense_tokens = batch_size * draft_token_num
         ragged_layout = forward_batch.spec_info.ragged_verify_layout
+        direct_ragged_inputs = False
         if ragged_layout is None and seq_len == num_dense_tokens:
             dense_token_indices = None
             dense_qkv = mixed_qkv.view(batch_size, draft_token_num, -1)
@@ -453,14 +453,13 @@ class AscendKDAAttnBackend(KDAAttnBackend):
                     self._dense_token_indices = dense_token_indices
                     self._dense_token_indices_key = dense_indices_key
             if envs.SGLANG_NPU_FUSED_KDA_RAGGED_IO.get():
-                dense_qkv, dense_a, dense_b = scatter_kda_verify_inputs_npu(
-                    mixed_qkv,
-                    a,
-                    b,
-                    query_start_loc,
-                    draft_token_num=draft_token_num,
-                )
-                dense_qkv = dense_qkv.view(batch_size, draft_token_num, -1)
+                # Keep the accepted tokens packed through CANN convolution and
+                # the recurrent kernel. The recurrent kernel writes the fixed-
+                # width verify layout consumed by the existing fused gather.
+                direct_ragged_inputs = True
+                dense_qkv = mixed_qkv
+                dense_a = a
+                dense_b = b
             else:
                 dense_qkv = self._scatter_tokens_to_dense(
                     mixed_qkv, dense_token_indices, num_dense_tokens
@@ -494,12 +493,20 @@ class AscendKDAAttnBackend(KDAAttnBackend):
                 dtype=torch.int32,
                 device=mixed_qkv.device,
             )
+        conv_query_start_loc = (
+            query_start_loc if direct_ragged_inputs else dense_query_start_loc
+        )
+        conv_qkv = (
+            dense_qkv.contiguous()
+            if direct_ragged_inputs
+            else dense_qkv.reshape(num_dense_tokens, -1).contiguous()
+        )
         processed_qkv = torch.ops.npu.causal_conv1d(
-            dense_qkv.reshape(num_dense_tokens, -1).contiguous(),
+            conv_qkv,
             self._get_conv_weights_t(layer, mixed_qkv.dtype),
             conv_states=conv_states,
             bias=layer.bias,
-            query_start_loc=dense_query_start_loc,
+            query_start_loc=conv_query_start_loc,
             cache_indices=cache_indices[:batch_size],
             num_accepted_tokens=num_accepted_tokens,
             activation_mode=1,
@@ -541,6 +548,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             cache_steps=draft_token_num,
             gates_are_preactivated=not fuse_gate_activations,
             lower_bound=layer.lower_bound if fuse_gate_activations else None,
+            query_start_loc=query_start_loc if direct_ragged_inputs else None,
         )
         if dense_token_indices is None:
             return out
