@@ -55,8 +55,6 @@ class TestQwen3_5_9BXPUFusedGDN(Qwen3_5_9BXPUBase):
         "--linear-attn-backend",
         "intel_xpu",
     ]
-    # num_examples = 8
-    # accuracy = 0.0
 
 
 if __name__ == "__main__":
