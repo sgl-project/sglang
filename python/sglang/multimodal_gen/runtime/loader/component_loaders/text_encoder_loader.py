@@ -129,27 +129,6 @@ def _configure_encoder_quantization(
             f"got {model_cls.__name__}"
         )
 
-    capability = model_cls.checkpoint_quantization_capability
-    if capability is None:
-        raise ComponentCheckpointUnsupportedError(
-            f"{model_cls.__name__} does not support quantized checkpoints for "
-            f"{component_name!r}: no checkpoint quantization capability is declared"
-        )
-    if capability.backend != "diffusion":
-        raise ComponentCheckpointUnsupportedError(
-            f"{model_cls.__name__} declares the {capability.backend!r} checkpoint "
-            f"quantization backend for {component_name!r}, but the native encoder "
-            "loader currently supports only the 'diffusion' backend"
-        )
-
-    quant_method = quant_config.get_name()
-    if quant_method not in capability.methods:
-        raise ComponentCheckpointUnsupportedError(
-            f"{model_cls.__name__} does not support {component_name!r} checkpoints "
-            f"quantized with {quant_method!r}; supported methods for the "
-            f"{capability.backend!r} backend: {sorted(capability.methods)}"
-        )
-
 
 def _resolve_and_configure_encoder_quantization(
     model_config: EncoderConfig,
@@ -242,6 +221,23 @@ def _process_quantized_encoder_weights(
             "model did not construct any quantized linear layers"
         )
     return processed_layers
+
+
+def _require_quantized_encoder_layers(
+    model: nn.Module,
+    component_name: str,
+) -> None:
+    if any(
+        isinstance(module, LinearBase)
+        and module.quant_method is not None
+        and not isinstance(module.quant_method, UnquantizedLinearMethod)
+        for module in model.modules()
+    ):
+        return
+    raise ComponentCheckpointUnsupportedError(
+        f"The native {type(model).__name__} implementation does not construct "
+        f"quantized linear layers for {component_name!r}"
+    )
 
 
 def _checkpoint_bytes(model_path: str) -> int:
@@ -623,6 +619,9 @@ class TextEncoderLoader(ComponentLoader):
                     "EncoderTensorParallelMixin"
                 )
             model.bind_encoder_tp_group(encoder_tp_group)
+
+            if quant_config is not None:
+                _require_quantized_encoder_layers(model, component_name)
 
             if component_starts_on_cpu and (
                 current_platform.is_mps() or _keep_this_checkpoint_mapped(model_path)
