@@ -23,7 +23,7 @@ that choice:
 
 Install the pinned tree::
 
-    pip install --no-deps "b12x @ https://github.com/local-inference-lab/b12x/archive/5c8318009ea9833d4f50b5789fb291076c79baca.tar.gz"
+    pip install --no-deps "b12x @ https://github.com/local-inference-lab/b12x/archive/85d3681bb2c3749e4e94e121d5d829c7ec6f0b9f.tar.gz"
 
 (``--no-deps``: b12x's metadata pulls a newer torch and breaks the rest of the
 image.) Earlier generations -- 0.15.x and the PyPI 1.2.x wheels -- keep the old
@@ -63,7 +63,7 @@ if TYPE_CHECKING:
 
 _B12X_INSTALL_HINT = (
     "pip install --no-deps 'b12x @ https://github.com/local-inference-lab/"
-    "b12x/archive/5c8318009ea9833d4f50b5789fb291076c79baca.tar.gz'"
+    "b12x/archive/85d3681bb2c3749e4e94e121d5d829c7ec6f0b9f.tar.gz'"
 )
 
 
@@ -182,17 +182,32 @@ def _prepare_weights(
 
 
 def _plan_scratch(*, experts, top_k, device, swiglu_limit, counts):
-    """Frozen scratch plan + the process-wide shared arena. Returns (plan, scratch).
+    """One frozen scratch plan + arena shared by every expert layer.
 
-    Every expert layer presents identical caps, so one arena serves them all
-    (the same contract as vLLM's shared workspace manager -- per-layer copies
-    once wasted ~12 GB here); bind only requires ``numel >= nbytes``. All
-    layers are prepared at load time, before any CUDA graph capture, so the
-    grow-only allocation never moves an address a captured graph baked.
+    Every expert layer presents identical caps, so one plan and one arena
+    serve them all (per-layer arenas once wasted ~12 GB here; bind is a pure
+    view mapping over the arena, so sharing is allocation- and state-free).
+    The weight-plan identity check in bind passes across layers because
+    MoEWeightPreparationPlan is a tensor-free frozen dataclass with value
+    equality.
     """
     from b12x.moe import fused_moe
 
     from sglang.srt.runtime_context import get_resources
+
+    fingerprint = (
+        int(top_k),
+        tuple(counts),
+        None if swiglu_limit is None else float(swiglu_limit),
+        int(experts.num_experts),
+        int(experts.hidden_size),
+        int(experts.intermediate_size),
+    )
+    buffers = get_resources().buffers
+    key = f"b12x:moe_plan:{device}"
+    cached = buffers.get(key)
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1], cached[2]
 
     caps = fused_moe.Caps(
         max_tokens=max(counts),
@@ -211,13 +226,8 @@ def _plan_scratch(*, experts, top_k, device, swiglu_limit, counts):
     specs = plan.scratch_specs()
     if len(specs) != 1 or specs[0].dtype != torch.uint8:
         raise RuntimeError(f"unexpected b12x scratch specs: {specs}")
-    need = int(specs[0].shape[0])
-    buffers = get_resources().buffers
-    key = f"b12x:moe_scratch:{device}"
-    scratch = buffers.get(key)
-    if scratch is None or scratch.numel() < need:
-        scratch = torch.empty(need, dtype=torch.uint8, device=device)
-        buffers[key] = scratch
+    scratch = torch.empty(int(specs[0].shape[0]), dtype=torch.uint8, device=device)
+    buffers[key] = (fingerprint, plan, scratch)
     return plan, scratch
 
 
