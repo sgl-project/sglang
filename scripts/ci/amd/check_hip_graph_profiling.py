@@ -62,18 +62,22 @@ def loaded_tracing_libs() -> list[str]:
 
 
 def vendored_runtime_libs(libs: list[str]) -> list[str]:
-    """Mapped HIP/tracing libraries that did not come from the ROCm install.
+    """Mapped HIP/tracing libraries for which the ROCm install is not in play.
 
     `libtorch_hip.so` carries `RPATH $ORIGIN` and needs `libamdhip64.so` /
     `libroctracer64.so`, so the loader takes the wheel's copies and
     LD_LIBRARY_PATH does not override them. The image's ROCm version then says
     nothing about what torch.profiler is actually using.
+
+    A preload maps both copies at once and the preloaded one interposes, so a
+    library counts as vendored only when no ROCm copy of it is mapped at all.
     """
-    return [
-        lib
-        for lib in libs
-        if any(name in lib for name in RUNTIME_LIBS) and not lib.startswith("/opt/rocm")
-    ]
+    flagged = []
+    for name in RUNTIME_LIBS:
+        mapped = [lib for lib in libs if name in lib]
+        if mapped and not any(lib.startswith("/opt/rocm") for lib in mapped):
+            flagged.extend(mapped)
+    return flagged
 
 
 def rocm_runtime_preload(lib_dir: str = "/opt/rocm/lib") -> str | None:

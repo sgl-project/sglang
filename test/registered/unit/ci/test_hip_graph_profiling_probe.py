@@ -173,14 +173,25 @@ class TestVerdict(CustomTestCase):
 
 
 class TestVendoredRuntimeDetection(CustomTestCase):
-    def test_only_hip_and_roctracer_outside_opt_rocm_count(self):
+    def test_wheel_copies_are_flagged_when_no_rocm_copy_is_mapped(self):
         probe = _load_probe()
-        libs = VENDORED_LIBS + ROCM_LIBS + ["/opt/venv/.../torch/lib/libtorch_hip.so"]
+        libs = VENDORED_LIBS + ["/opt/venv/.../torch/lib/libtorch_hip.so"]
         self.assertEqual(probe.vendored_runtime_libs(libs), VENDORED_LIBS)
 
     def test_nothing_flagged_when_the_rocm_install_is_in_use(self):
         probe = _load_probe()
         self.assertEqual(probe.vendored_runtime_libs(ROCM_LIBS), [])
+
+    def test_a_preload_maps_both_copies_and_is_not_a_finding(self):
+        # LD_PRELOAD leaves the wheel's copies mapped too; the preloaded ones
+        # interpose, so reporting them would contradict the PASS they produced.
+        probe = _load_probe()
+        self.assertEqual(probe.vendored_runtime_libs(ROCM_LIBS + VENDORED_LIBS), [])
+
+    def test_a_partial_preload_still_flags_the_library_left_behind(self):
+        probe = _load_probe()
+        libs = [ROCM_LIBS[0]] + VENDORED_LIBS
+        self.assertEqual(probe.vendored_runtime_libs(libs), [VENDORED_LIBS[1]])
 
 
 class TestPreloadValue(CustomTestCase):
