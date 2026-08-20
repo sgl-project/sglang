@@ -88,12 +88,16 @@ class EnvField:
         backup_value = os.environ.get(self.name)
         backup_set_to_none = self._set_to_none
         self.set(value)
-        yield
-        if backup_present:
-            os.environ[self.name] = backup_value
-        else:
-            os.environ.pop(self.name, None)
-        self._set_to_none = backup_set_to_none
+        try:
+            yield
+        finally:
+            # Restore even when the `with` body raises, otherwise the env var
+            # leaks into os.environ for the rest of the process.
+            if backup_present:
+                os.environ[self.name] = backup_value
+            else:
+                os.environ.pop(self.name, None)
+            self._set_to_none = backup_set_to_none
 
     def clear(self):
         os.environ.pop(self.name, None)
