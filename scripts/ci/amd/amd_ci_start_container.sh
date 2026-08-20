@@ -28,7 +28,7 @@ LOCAL_DOCKER_REGISTRY="10.44.14.109:5000"
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
 MI35X_BASE_TAG="${DEFAULT_MI35X_BASE_TAG}"
-CUSTOM_IMAGE=""
+CUSTOM_IMAGE="${AMD_CI_IMAGE:-}"
 BUILD_FROM_DOCKERFILE=""
 GPU_ARCH_BUILD=""
 
@@ -50,7 +50,7 @@ while [[ $# -gt 0 ]]; do
       echo "Options:"
       echo "  --mi30x-base-tag TAG       Override MI30x base image tag"
       echo "  --mi35x-base-tag TAG       Override MI35x base image tag"
-      echo "  --custom-image IMAGE       Use a specific Docker image directly"
+      echo "  --custom-image IMAGE       Use a specific Docker image directly (or set AMD_CI_IMAGE)"
       echo "  --build-from-dockerfile    Build image from docker/rocm.Dockerfile"
       echo "  --gpu-arch ARCH            GPU architecture for Dockerfile build (e.g., gfx950-rocm720)"
       echo "  --rocm-version VERSION     Override ROCm version for image lookup (e.g., rocm720)"
