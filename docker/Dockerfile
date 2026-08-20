@@ -417,6 +417,7 @@ ARG USE_LATEST_SGLANG
 ARG GITHUB_ARTIFACTORY
 ARG MOONCAKE_VERSION
 ARG MSCCLPP_VERSION
+ARG SGL_NCCL_VERSION
 
 WORKDIR /sgl-workspace
 
@@ -517,8 +518,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && rm -rf /tmp/mscclpp
 
 # Install essential Python packages (use constraints to prevent conflicts)
+# runai-model-streamer depends on torch, and torch pins nvidia-nccl-cu13==2.29.7
+# exactly. constraints.txt carries the overridden ${SGL_NCCL_VERSION} (e.g. 2.30.7)
+# from the torch_deps stage, which makes pip's resolver hit ResolutionImpossible
+# (torch's ==2.29.7 vs constraint ==2.30.7). Drop the nccl pin from constraints for
+# this solve so pip can pick a consistent nccl, then force-reinstall the overridden
+# version back afterwards.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install -c /sgl-workspace/constraints.txt \
+    sed -i '/^nvidia-nccl-cu13==/d' /sgl-workspace/constraints.txt \
+    && python3 -m pip install -c /sgl-workspace/constraints.txt \
     datamodel_code_generator \
     pre-commit \
     pytest \
@@ -535,7 +543,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     matplotlib \
     tabulate \
     termplotlib \
-    "runai-model-streamer[s3,gcs,azure]>=0.15.7"
+    "runai-model-streamer[s3,gcs,azure]>=0.15.7" \
+    && python3 -m pip install --no-deps --force-reinstall "nvidia-nccl-cu13==${SGL_NCCL_VERSION}"
 
 # Per-CUDA-major package installs. The `nixl` stub package is needed (it owns
 # the `nixl` import path) but unconditionally requires nixl-cu12, so we install
