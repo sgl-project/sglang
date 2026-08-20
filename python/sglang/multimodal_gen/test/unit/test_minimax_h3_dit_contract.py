@@ -21,6 +21,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
     Fp8LinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.usp import _usp_input_all_to_all_packed_qkv
+from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+    _needs_device_weight_postprocess,
+)
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MINIMAX_H3_FP32_BUFFER_NAMES,
@@ -356,6 +359,99 @@ def test_online_fp8_keeps_fp32_boundaries_and_ignored_layers_unquantized():
         model.final_layer.audio_out,
     ):
         assert isinstance(layer.quant_method, UnquantizedLinearMethod)
+
+
+def test_offline_block_fp8_checkpoint_layout_and_cpu_load():
+    quant_config = Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        activation_scheme="dynamic",
+        weight_block_size=[128, 128],
+        ignored_layers=[
+            "video_patch_proj",
+            "audio_patch_proj",
+            "time_embedder.proj_in",
+            "time_embedder.proj_out",
+            "final_layer.video_out",
+            "final_layer.audio_out",
+        ],
+    )
+    _ensure_single_process_parallel_runtime()
+    with torch.device("meta"):
+        model = MiniMaxH3DiTModel(
+            config=MiniMaxH3DiTConfig(),
+            hf_config={},
+            quant_config=quant_config,
+        )
+
+    params = dict(model.named_parameters())
+    fp8_weights = {name for name, p in params.items() if p.dtype == torch.float8_e4m3fn}
+    scales = {name for name in params if name.endswith("weight_scale_inv")}
+    assert len(fp8_weights) == 260, len(fp8_weights)
+    assert {f"{n[: -len('weight')]}weight_scale_inv" for n in fp8_weights} == scales
+
+    for scale_name in scales:
+        weight = params[f"{scale_name[: -len('weight_scale_inv')]}weight"]
+        n, k = weight.shape
+        assert params[scale_name].dtype == torch.float32, scale_name
+        assert tuple(params[scale_name].shape) == (
+            -(-n // 128),
+            -(-k // 128),
+        ), scale_name
+
+    for layer in (
+        model.video_patch_proj,
+        model.audio_patch_proj,
+        model.time_embedder.proj_in,
+        model.time_embedder.proj_out,
+        model.final_layer.video_out,
+        model.final_layer.audio_out,
+    ):
+        assert isinstance(layer.quant_method, UnquantizedLinearMethod)
+        assert layer.weight.dtype != torch.float8_e4m3fn
+
+    # False keeps the DiT off the GPU during load, which is the point of
+    # loading a pre-quantized checkpoint.
+    assert _needs_device_weight_postprocess(quant_config) is False
+    assert _needs_device_weight_postprocess(Fp8Config()) is True
+
+
+def test_block_fp8_qkv_scale_follows_its_weight_through_the_grouped_reorder():
+    heads, head_dim, block = 8, 128, 128
+    rows = heads * 3 * head_dim
+    cols = 256
+    torch.manual_seed(0)
+    weight = torch.randn(rows, cols)
+
+    reordered = _reorder_grouped_qkv_to_qkv(
+        weight, num_query_groups=heads, heads_per_group=1, head_dim=head_dim
+    )
+    # A quantizer sees the grouped layout, so its scales are computed there.
+    tiles = weight.view(rows // block, block, cols // block, block)
+    scale = tiles.abs().amax(dim=(1, 3)) / 448.0
+    reordered_scale = _reorder_grouped_qkv_to_qkv(
+        scale, num_query_groups=heads, heads_per_group=1, head_dim=head_dim // block
+    )
+
+    def tile_max(w: torch.Tensor) -> torch.Tensor:
+        return w.view(rows // block, block, cols // block, block).abs().amax(dim=(1, 3))
+
+    assert torch.equal(tile_max(reordered) / 448.0, reordered_scale)
+    assert not torch.equal(tile_max(reordered) / 448.0, scale)
+
+    _ensure_single_process_parallel_runtime()
+    with torch.device("meta"):
+        model = MiniMaxH3DiTModel(
+            config=MiniMaxH3DiTConfig(),
+            hf_config={},
+            quant_config=Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                activation_scheme="dynamic",
+                weight_block_size=[block, block],
+            ),
+        )
+    qkv = model.blocks[0].attn.qkv_proj
+    assert qkv.weight_scale_inv.weight_loader is not qkv.weight.weight_loader
+    assert qkv.weight_scale_inv.weight_loader.__name__ == "_scale_loader"
 
 
 def test_sdpa_varlen_fallback_matches_naive_packed_reference():

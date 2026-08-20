@@ -661,6 +661,7 @@ class MiniMaxH3Attention(nn.Module):
             weight.weight_loader = _weight_loader
         # rank-local FSDP must reorder grouped QKV before selecting each shard
         weight.rank_local_weight_transform = _reorder_checkpoint_weight
+        self._install_qkv_block_scale_loader(arch)
 
     def _forward_mps_streamed_attention(
         self,
@@ -762,6 +763,43 @@ class MiniMaxH3Attention(nn.Module):
         del key, value
         torch.mps.empty_cache()
         return out
+
+    def _install_qkv_block_scale_loader(self, arch: MiniMaxH3DiTArchConfig) -> None:
+        """Reorder a block-quantized qkv scale the same way its weight is."""
+        scale = getattr(self.qkv_proj, "weight_scale_inv", None)
+        if scale is None:
+            return
+
+        quant_config = self.qkv_proj.quant_method.quant_config
+        block_size = getattr(quant_config, "weight_block_size", None)
+        if not block_size:
+            return
+        block_rows = block_size[0]
+        head_dim = arch.attention_head_dim
+        if head_dim % block_rows:
+            raise ValueError(
+                "block-quantized qkv needs a block size that divides the head dim: "
+                f"head_dim={head_dim}, weight_block_size={block_size}."
+            )
+        # The scale has one row per block of the weight, not per channel.
+        scale_head_dim = head_dim // block_rows
+        base_loader = scale.weight_loader
+
+        def _scale_loader(param: torch.Tensor, loaded_scale: torch.Tensor) -> None:
+            base_loader(
+                param,
+                _reorder_grouped_qkv_to_qkv(
+                    loaded_scale,
+                    num_query_groups=arch.num_attention_heads,
+                    heads_per_group=1,
+                    head_dim=scale_head_dim,
+                ),
+            )
+
+        if hasattr(scale, "_weight_loader"):
+            scale._weight_loader = _scale_loader
+        else:
+            scale.weight_loader = _scale_loader
 
     def forward(
         self,
