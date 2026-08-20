@@ -237,7 +237,7 @@ def filter_tests(
     hw: HWBackend,
     suites: List[str],
     nightly: bool = False,
-) -> List[CIRegistry]:
+) -> tuple[List[CIRegistry], List[CIRegistry]]:
     # `suites` may hold more than one suite (comma-separated --suite): the
     # matched tests are unioned so a single runner can partition several
     # suites as one balanced pool (e.g. base-b + base-c on a Xeon SPR box).
