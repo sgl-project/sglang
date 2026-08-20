@@ -63,6 +63,7 @@ from sglang.srt.utils import (
     round_up,
     set_weight_attrs,
     use_intel_amx_backend,
+    use_intel_xpu_backend,
 )
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
@@ -460,6 +461,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition_after_pad
                 - layer.intermediate_size_per_partition
             )
+        elif use_intel_xpu_backend():
+            # The XPU grouped GEMM recovers K/N from the packed weight shapes and
+            # the group size from the scale shape, so it takes the checkpoint
+            # dims unpadded. Keep this ahead of the triton_kernels branch so an
+            # installed triton_kernels does not pad the XPU layout.
+            pass
         elif has_triton_kernels:
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, triton_kernels_padding_alignment
@@ -989,6 +996,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         layer.w2_weight_bias.float(), requires_grad=False
                     )
             return
+        elif use_intel_xpu_backend():
+            # sgl-kernel-xpu's W4A16 grouped GEMM consumes the checkpoint MXFP4
+            # layout: packed e2m1 [E, N, K/2] plus N-outer ue8m0 scales
+            # [E, N, K/32] uint8, with GPT-OSS's interleaved
+            # [gate_0, up_0, gate_1, up_1, ...] w13 row order (which is exactly
+            # what the swiglu epilogue expects). Scales and biases are already in
+            # the expected dtypes (uint8 / bf16 -- the launcher promotes bias to
+            # fp32 since the kernel accumulates it in fp32), so the only step is
+            # reinterpreting the packed nibbles as int8, matching the dtype the
+            # kernel keys the 4-bit path on. That is a free view, and crucially
+            # there is no bf16 upcast -- the whole point of MXFP4 on XPU.
+            layer.w13_weight = Parameter(
+                layer.w13_weight.data.view(torch.int8), requires_grad=False
+            )
+            layer.w2_weight = Parameter(
+                layer.w2_weight.data.view(torch.int8), requires_grad=False
+            )
+            return
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
 
@@ -1428,6 +1453,35 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     topk_output,
                     self.moe_runner_config,
                 )
+            return StandardCombineInput(hidden_states=output)
+
+        if use_intel_xpu_backend():
+            # sgl-kernel-xpu path: moe_grouped_mm_nt_xe20_w4a16 consumes the
+            # packed MXFP4 weights directly, so no dequantization happens.
+            from sgl_kernel import fused_experts as sgl_fused_experts
+
+            assert TopKOutputChecker.format_is_standard(topk_output)
+            topk_weights, topk_ids, _ = topk_output
+            moe_runner_config = self.moe_runner_config
+            output = sgl_fused_experts(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                b1=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
+                use_mxfp4_w4a16=True,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                activation=moe_runner_config.activation,
+                routed_scaling_factor=moe_runner_config.routed_scaling_factor,
+                # GPT-OSS clamped swiglu: gate*sigmoid(gate*alpha)*(up+1). Passing
+                # gemm1_alpha selects it, and gemm1_limit is required with it.
+                gemm1_alpha=moe_runner_config.gemm1_alpha,
+                gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+                swiglu_limit=moe_runner_config.swiglu_limit,
+            )
             return StandardCombineInput(hidden_states=output)
 
         if self.use_marlin:
