@@ -2,6 +2,7 @@ from dataclasses import fields
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.multimodal_gen.configs.sample.ltx_2 import LTX23SamplingParams
 from sglang.multimodal_gen.configs.sample.ltx_2_5 import LTX25SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
@@ -11,6 +12,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _build_video_sampling_params,
     _video_request_model_kwargs,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
 
 def test_video_api_forwards_profiling_options():
@@ -77,3 +79,9 @@ def test_ltx25_video_extensions_remain_model_specific():
 
     assert _video_request_model_kwargs(request, LTX25SamplingParams) == field_values
     assert _video_request_model_kwargs(request, SamplingParams) == {}
+
+
+def test_ltx23_request_defaults_to_vae_decoder():
+    request = Req(sampling_params=LTX23SamplingParams())
+
+    assert request.use_diffusion_decoder is False
