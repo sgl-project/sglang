@@ -330,6 +330,24 @@ def fused_qkvzba_split_reshape_cat_contiguous(
     return mixed_qkv, z, b, a
 
 
+def qwen3_5_gdn_prefill_projection_views(
+    mixed_qkvz,
+    mixed_ba,
+    num_heads_qk,
+    num_heads_v,
+    head_qk,
+    head_v,
+):
+    """Return strided views accepted by the prefill GDN consumers."""
+    tokens = mixed_qkvz.shape[0]
+    qkv_dim = num_heads_qk * head_qk * 2 + num_heads_v * head_v
+    mixed_qkv = mixed_qkvz[:, :qkv_dim]
+    z = mixed_qkvz[:, qkv_dim:].view(tokens, num_heads_v, head_v)
+    b = mixed_ba[:, :num_heads_v]
+    a = mixed_ba[:, num_heads_v : 2 * num_heads_v]
+    return mixed_qkv, z, b, a
+
+
 @triton.jit
 def fused_qkv_split_gdn_prefill_kernel(
     q,
