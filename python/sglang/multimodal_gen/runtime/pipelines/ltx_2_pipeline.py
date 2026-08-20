@@ -982,9 +982,21 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
             if phase == "stage2":
                 # premerged modes keep official LTX-2.3 fused stage-2 LoRA; original
                 # avoids single-DiT request-time merge/unmerge with dynamic LoRA
-                set_lora_kwargs["merge_weights"] = self._should_merge_lora_for_phase(
-                    phase
-                )
+                merge_weights = self._should_merge_lora_for_phase(phase)
+                if (
+                    not merge_weights
+                    and self._stage1_lora_path is not None
+                    and distilled_lora_strength != 0.0
+                ):
+                    # Dynamic LoRA supports only one adapter per target, but
+                    # original stage2 may need both the user LoRA and the
+                    # distilled LoRA on the same transformer.
+                    merge_weights = True
+                    logger.info(
+                        "LTX2 original stage2 requires multiple adapters on "
+                        "transformer; forcing merge_weights=True."
+                    )
+                set_lora_kwargs["merge_weights"] = merge_weights
             elif phase == "stage1" and self.pipeline_name == "LTX2TwoStageHQPipeline":
                 # Official HQ also builds stage 1 with distilled LoRA fused.
                 set_lora_kwargs["merge_weights"] = self._should_merge_lora_for_phase(
