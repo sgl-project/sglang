@@ -18,6 +18,9 @@
 export const config = {
   modelName: "Qwen3.5",
 
+  // TTFT/TPOT are P50 (median_ttft_ms / median_tpot_ms from bench_serving).
+  latencyPercentile: "P50",
+
   supportedHardware: [
     "h100", "h200", "b200", "b300",
     "mi300x", "mi325x", "mi355x",
@@ -112,9 +115,9 @@ export const config = {
   --dataset-name {{DATASET}} \\
   --random-input-len {{ISL}} \\
   --random-output-len {{OSL}} \\
-  --num-prompts {{NUM_PROMPTS}} \\
-  --max-concurrency {{MAX_CONCURRENCY}} \\
-  --request-rate inf`,
+  --random-range-ratio 1.0 \\
+  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
+  --warmup-requests 64 --flush-cache`,
     accuracy: {
       gsm8k_pct:
 `# Run from the sglang repo root
@@ -123,7 +126,7 @@ python3 benchmark/gsm8k/bench_sglang.py --port {{CURL_PORT}}`,
 `# Run from the sglang repo root
 python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --max-new-tokens 512`,
     },
-    numPromptsByConc: { 1: 10, 100: 1000 },
+    numPromptsByConc: { 1: 8, 16: 64, 1024: 2048 },
   },
 
   // The page's measured evals are GSM8K + MMMU (vision) — not the engine's
@@ -603,21 +606,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       ],
     },
     {
-      match: { hw: "b300", variant: "397b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      verified: true,
-      env: [],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--tp 2",
-        "--enable-flashinfer-allreduce-fusion",
-        "--attention-backend trtllm_mha",
-        "--tokenizer-worker-num 6",
-        "--mem-fraction-static 0.8",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
       match: { hw: "b300", variant: "397b", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: [],
@@ -1080,21 +1068,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
       ],
     },
     {
-      match: { hw: "b200", variant: "122b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      verified: true,
-      env: [],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--tp 2",
-        "--enable-flashinfer-allreduce-fusion",
-        "--attention-backend trtllm_mha",
-        "--tokenizer-worker-num 6",
-        "--mem-fraction-static 0.8",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
       match: { hw: "b200", variant: "122b", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: [],
@@ -1107,20 +1080,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
         "--mamba-scheduler-strategy extra_buffer",
         "--enable-flashinfer-allreduce-fusion",
         "--attention-backend trtllm_mha",
-        "--mem-fraction-static 0.8",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "b200", variant: "122b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      verified: true,
-      env: [],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--enable-flashinfer-allreduce-fusion",
-        "--attention-backend trtllm_mha",
-        "--tokenizer-worker-num 6",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -1871,19 +1830,6 @@ python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --
         "--speculative-num-draft-tokens 4",
         "--mamba-scheduler-strategy extra_buffer",
         "--enable-flashinfer-allreduce-fusion",
-        "--mem-fraction-static 0.8",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "h200", variant: "27b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      verified: true,
-      env: [],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--enable-flashinfer-allreduce-fusion",
-        "--tokenizer-worker-num 6",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
