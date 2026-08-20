@@ -294,6 +294,7 @@ def resolve_hf_gguf_reference(
     """Download a .gguf named by Hub reference and return its local path.
 
     owner/repo/path/inside/repo.gguf   -> exactly that file
+    owner/repo:QUANT_TYPE              -> the only matching quantization
     owner/repo                         -> the only .gguf in the repo
     """
     from sglang.srt.utils import is_remote_url
@@ -301,11 +302,40 @@ def resolve_hf_gguf_reference(
     if not model or os.path.exists(model) or is_remote_url(model):
         return None
 
+    from huggingface_hub import hf_hub_download
+
+    if ":" in model:
+        repo_id, _, quant_type = model.rpartition(":")
+        if repo_id.count("/") != 1 or not quant_type:
+            return None
+
+        from huggingface_hub import HfApi
+
+        files = [
+            sibling.rfilename
+            for sibling in HfApi().repo_info(repo_id, revision=revision).siblings
+        ]
+        suffix = f"-{quant_type}.gguf"
+        candidates = [filename for filename in files if filename.endswith(suffix)]
+        if not candidates:
+            available = sorted(
+                filename for filename in files if filename.endswith(".gguf")
+            )
+            raise ValueError(
+                f"No file matching quant type {quant_type!r} in {repo_id}. "
+                f"Available GGUF files: {available}"
+            )
+        if len(candidates) > 1:
+            raise ValueError(
+                f"Quant type {quant_type!r} is ambiguous in {repo_id}: "
+                f"{sorted(candidates)}. Pass the full owner/repo/path/file.gguf "
+                "reference instead."
+            )
+        return hf_hub_download(repo_id, candidates[0], revision=revision)
+
     parts = model.strip("/").split("/")
     if len(parts) < 2:
         return None
-
-    from huggingface_hub import hf_hub_download
 
     if len(parts) > 2 and model.endswith(".gguf"):
         repo_id = "/".join(parts[:2])
