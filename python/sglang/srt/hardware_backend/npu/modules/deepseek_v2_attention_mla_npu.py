@@ -854,6 +854,13 @@ def npu_mla_preprocess(
                 hidden_states.device,
             ),
         )
+        from sglang.srt.server_args import get_global_server_args
+        if (
+            get_global_server_args().disaggregation_mode != "null"
+            and m.mla_preprocess.uses_mlaprolog()
+            and m.w_kc is not None
+        ):
+            m.w_kc.untyped_storage().resize_(0)
     else:
         m.mla_preprocess.runtime_refs["fak_descale_reciprocal"] = (
             _get_fp8_kv_runtime_scale(
