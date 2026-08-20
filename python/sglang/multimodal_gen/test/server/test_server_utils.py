@@ -462,9 +462,7 @@ class ServerManager:
             flush=True,
         )
 
-        self._wait_for_ready(process, stdout_path)
-
-        return ServerContext(
+        context = ServerContext(
             port=self.port,
             process=process,
             model=self.model,
@@ -474,6 +472,13 @@ class ServerManager:
             _stdout_fh=stdout_fh,
             _log_thread=log_thread,
         )
+        try:
+            self._wait_for_ready(process, stdout_path)
+        except BaseException:
+            context.cleanup()
+            raise
+
+        return context
 
     def _wait_for_ready(self, process: subprocess.Popen, stdout_path: Path) -> None:
         """Wait until model warmup finishes and inference traffic is accepted."""
