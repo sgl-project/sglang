@@ -94,10 +94,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || github.sha }}
-          # This checkout can hold a fork's code, and the steps below execute it.
-          # Without this, checkout leaves the job's token in .git/config, where
-          # that code could read it; nothing here runs git, and the steps that
-          # need the token take it from secrets explicitly.
+          # This checkout can hold a fork's code that the steps below execute;
+          # without this the job token stays in .git/config, readable by it.
           persist-credentials: false
 
       - name: Mark runner picked up
@@ -194,10 +192,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || github.sha }}
-          # This checkout can hold a fork's code, and the steps below execute it.
-          # Without this, checkout leaves the job's token in .git/config, where
-          # that code could read it; nothing here runs git, and the steps that
-          # need the token take it from secrets explicitly.
+          # This checkout can hold a fork's code that the steps below execute;
+          # without this the job token stays in .git/config, readable by it.
           persist-credentials: false
 
       - name: Mark runner picked up
@@ -273,10 +269,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || github.sha }}
-          # This checkout can hold a fork's code, and the steps below execute it.
-          # Without this, checkout leaves the job's token in .git/config, where
-          # that code could read it; nothing here runs git, and the steps that
-          # need the token take it from secrets explicitly.
+          # This checkout can hold a fork's code that the steps below execute;
+          # without this the job token stays in .git/config, readable by it.
           persist-credentials: false
 
       - name: Mark runner picked up

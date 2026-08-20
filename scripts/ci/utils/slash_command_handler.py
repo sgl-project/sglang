@@ -1032,13 +1032,9 @@ def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker
 def _check_rerun_test_permissions(gh_repo, pr, comment, user_perms, command_name):
     """
     Check permissions shared by /rerun-test and /rerun-group.
-
-    These commands check out the PR head, run it on the self-hosted GPU runners,
-    and never pass through pr-gate.yml, so they bypass its rate limit entirely.
-    They are therefore gated on the same two trust signals pr-gate itself uses: a
-    zero `cooldown_interval_minutes` in CI_PERMISSIONS.json, or write permission
-    on the repo.
     """
+    # A rerun dispatches rerun-test.yml, which never passes through pr-gate.yml,
+    # so it is unthrottled either way; gate on what pr-gate waives the limit for.
     if user_perms.get("cooldown_interval_minutes") == 0:
         return True
 
@@ -1321,8 +1317,7 @@ def main():
     # PR authors can always rerun failed CI on their own PRs, even if they are not
     # listed in CI_PERMISSIONS.json.
     # Note: /tag-run-ci-label still requires CI_PERMISSIONS.json.
-    # Note: authorship grants nothing for /rerun-test -- that is gated on the
-    # commenter's own trust level, see _check_rerun_test_permissions.
+    # Authorship grants nothing for /rerun-test; that gate reads the commenter.
     if pr.user.login == user_login:
         if user_perms is None:
             print(
@@ -1336,9 +1331,8 @@ def main():
             )
         user_perms["can_rerun_failed_ci"] = True
 
-    # No early exit on a missing entry: /rerun-test is gated on repo permission
-    # too, so a write-holder absent from the file must still reach its handler.
-    # The other commands re-check their own key and deny silently.
+    # No early exit on a missing entry: /rerun-test also gates on repo permission,
+    # so a write-holder absent from the file must still reach its handler.
     if user_perms is None:
         user_perms = {}
 
