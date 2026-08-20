@@ -1445,7 +1445,10 @@ class DeepseekV4AscendAttnBackend(
                 dim=0,
             )
             fm.actual_seq_lengths_q_pa_cpu = torch.cat(
-                [torch.zeros(1, dtype=torch.int32), torch.cumsum(seq_lens_cpu, dim=0).int()],
+                [
+                    torch.zeros(1, dtype=torch.int32),
+                    torch.cumsum(seq_lens_cpu, dim=0).int(),
+                ],
                 dim=0,
             )
         elif forward_batch.forward_mode.is_decode():
