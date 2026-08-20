@@ -2844,7 +2844,7 @@ class KimiK3LinearForCausalLM(nn.Module):
     def prepare_context_parallel_metadata_for_dcp(
         self,
         seq_lens: torch.Tensor,
-        extend_prefix_lens: Optional[torch.Tensor],
+        extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
         extend_seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
@@ -3451,7 +3451,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
     def prepare_context_parallel_metadata_for_dcp(
         self,
         seq_lens: torch.Tensor,
-        extend_prefix_lens: Optional[torch.Tensor],
+        extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
         extend_seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
