@@ -31,6 +31,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
@@ -49,7 +50,6 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
-from sglang.srt.sampling.sampling_params import TOP_K_ALL
 
 _is_npu = is_npu()
 
@@ -734,9 +734,7 @@ def _dspark_rs_dynamic_memory_enabled() -> bool:
 
 
 def _dspark_rs_memory_headroom_bytes() -> int:
-    value = os.environ.get(
-        "SGLANG_DSPARK_RS_MEMORY_HEADROOM_BYTES", str(512 * 1024**2)
-    )
+    value = os.environ.get("SGLANG_DSPARK_RS_MEMORY_HEADROOM_BYTES", str(512 * 1024**2))
     try:
         return max(int(value), 0)
     except ValueError:
@@ -966,9 +964,7 @@ def _accept_sampling_chunked(
     for start in range(0, bs, chunk_size):
         end = min(start + chunk_size, bs)
         chunk_bs = end - start
-        chunk_sampling_info = _dspark_slice_sampling_info(
-            sampling_info, start, end
-        )
+        chunk_sampling_info = _dspark_slice_sampling_info(sampling_info, start, end)
         chunk_draft_input = _dspark_slice_draft_input(
             draft_input, sampling_info, start, end
         )
@@ -986,9 +982,7 @@ def _accept_sampling_chunked(
             start * verify_num_draft_tokens : end * verify_num_draft_tokens
         ]
         chunk_cutoff = (
-            None
-            if cutoff_verify_lens is None
-            else cutoff_verify_lens[start:end]
+            None if cutoff_verify_lens is None else cutoff_verify_lens[start:end]
         )
         sampling_len, sampling_bonus, sampling_trim = AcceptSampling.execute(
             candidates=candidates[start:end],
@@ -1070,14 +1064,12 @@ def accept_draft_tokens(
             cutoff_verify_lens=cutoff_verify_lens,
         )
     bs, gamma_rows, vocab = draft_block.corrected_logits.shape
-    chunk_size, full_workspace_bytes, max_workspace_bytes = (
-        _dspark_rs_plan_chunk_size(
-            bs=bs,
-            gamma_rows=gamma_rows,
-            verify_num_draft_tokens=verify_num_draft_tokens,
-            vocab=vocab,
-            device=target_logits.device,
-        )
+    chunk_size, full_workspace_bytes, max_workspace_bytes = _dspark_rs_plan_chunk_size(
+        bs=bs,
+        gamma_rows=gamma_rows,
+        verify_num_draft_tokens=verify_num_draft_tokens,
+        vocab=vocab,
+        device=target_logits.device,
     )
     _dspark_rs_trace(
         bs=bs,

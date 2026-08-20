@@ -10,6 +10,9 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     _dspark_rs_plan_chunk_size,
     accept_draft_tokens,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
 
 
 def test_dspark_rs_planner_respects_workspace_budget(monkeypatch):
@@ -80,15 +83,11 @@ def test_dspark_rs_full_and_chunked_sampling_match(monkeypatch):
     candidates = torch.randint(
         0, vocab, (batch_size, verify_tokens), device=device, dtype=torch.int64
     )
-    temperatures = torch.full(
-        (batch_size, 1), 0.8, device=device, dtype=torch.float32
-    )
+    temperatures = torch.full((batch_size, 1), 0.8, device=device, dtype=torch.float32)
     sampling_info = SamplingBatchInfo(
         temperatures=temperatures,
         top_ps=torch.ones(batch_size, device=device),
-        top_ks=torch.full(
-            (batch_size,), TOP_K_ALL, device=device, dtype=torch.int32
-        ),
+        top_ks=torch.full((batch_size,), TOP_K_ALL, device=device, dtype=torch.int32),
         min_ps=torch.zeros(batch_size, device=device),
         is_all_greedy=False,
         is_any_greedy=False,
