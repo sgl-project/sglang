@@ -175,6 +175,37 @@ def test_peak_vram_validation_uses_independent_tolerances():
             validator.validate_peak_vram(runtime_regression, 10_000.0, 10_000.0)
 
 
+@pytest.mark.parametrize(
+    ("load_peak_vram_mb", "runtime_peak_vram_mb", "message"),
+    [
+        (0.0, 10_000.0, "Load peak VRAM metric missing"),
+        (10_000.0, 0.0, "Runtime peak VRAM metric missing"),
+    ],
+)
+def test_peak_vram_validation_rejects_missing_metrics(
+    load_peak_vram_mb, runtime_peak_vram_mb, message
+):
+    validator = PerformanceValidator(
+        scenario=ScenarioConfig({}, {}, 0.0, 0.0, 0.0),
+        tolerances=ToleranceConfig(0.0, 0.0, 0.0, 0.0, 0.0),
+        step_fractions=(),
+    )
+    summary = PerformanceSummary(
+        0.0,
+        0.0,
+        0.0,
+        {},
+        [],
+        {},
+        {},
+        load_peak_vram_mb=load_peak_vram_mb,
+        runtime_peak_vram_mb=runtime_peak_vram_mb,
+    )
+
+    with pytest.raises(AssertionError, match=message):
+        validator.validate_peak_vram(summary, 10_000.0, 10_000.0)
+
+
 def test_results_json_merges_retry_sessions(tmp_path):
     path = tmp_path / "diffusion-results.json"
     _write_results_json(
