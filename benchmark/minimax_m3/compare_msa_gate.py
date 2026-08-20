@@ -85,7 +85,9 @@ def main() -> None:
         if name.startswith("long_"):
             minimum_tokens = int(name.removeprefix("long_"))
             if int(baseline.get("prompt_tokens", 0)) < minimum_tokens:
-                failures.append(f"baseline probe {name} is shorter than {minimum_tokens}")
+                failures.append(
+                    f"baseline probe {name} is shorter than {minimum_tokens}"
+                )
             if (
                 candidate is not None
                 and int(candidate.get("prompt_tokens", 0)) < minimum_tokens
@@ -94,12 +96,8 @@ def main() -> None:
                     f"candidate probe {name} is shorter than {minimum_tokens}"
                 )
 
-    baseline_subset = load(
-        args.baseline_dir / "longbench_v2_subset_manifest.json"
-    )
-    candidate_subset = load(
-        args.candidate_dir / "longbench_v2_subset_manifest.json"
-    )
+    baseline_subset = load(args.baseline_dir / "longbench_v2_subset_manifest.json")
+    candidate_subset = load(args.candidate_dir / "longbench_v2_subset_manifest.json")
     if baseline_subset.get("subset_sha256") != candidate_subset.get("subset_sha256"):
         failures.append("LongBench-v2 subset hashes differ")
     for label, manifest in (
@@ -130,9 +128,7 @@ def main() -> None:
             )
 
     for concurrency in (1, 8, 32, 128):
-        baseline = load_last_jsonl(
-            args.baseline_dir / f"serving_c{concurrency}.jsonl"
-        )
+        baseline = load_last_jsonl(args.baseline_dir / f"serving_c{concurrency}.jsonl")
         candidate = load_last_jsonl(
             args.candidate_dir / f"serving_c{concurrency}.jsonl"
         )

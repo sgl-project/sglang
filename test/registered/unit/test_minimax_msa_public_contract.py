@@ -17,7 +17,6 @@ class _RecordingGraphState:
 
 
 def _production_inputs():
-    batch_size = 2
     total_q = 4
     num_q_heads = 16
     num_kv_heads = 1
@@ -25,9 +24,7 @@ def _production_inputs():
     page_size = 128
     num_pages = 2
     q = torch.zeros(total_q, num_q_heads, head_dim, dtype=torch.bfloat16)
-    k = torch.zeros(
-        num_pages * page_size, num_kv_heads, head_dim, dtype=torch.bfloat16
-    )
+    k = torch.zeros(num_pages * page_size, num_kv_heads, head_dim, dtype=torch.bfloat16)
     v = torch.zeros_like(k)
     q2k = torch.zeros(num_kv_heads, total_q, 16, dtype=torch.int32)
     page_table = torch.tensor([[0, 1], [0, 1]], dtype=torch.int32)
@@ -223,9 +220,9 @@ def test_graph_state_and_page_table_keep_stable_addresses(monkeypatch):
     assert second.data_ptr() == address
     assert torch.count_nonzero(second) == 0
 
-    req_to_token = torch.stack(
-        (torch.arange(128, 384), torch.arange(512, 768))
-    ).to(torch.int32)
+    req_to_token = torch.stack((torch.arange(128, 384), torch.arange(512, 768))).to(
+        torch.int32
+    )
     page_table = torch.full((2, 2), -1, dtype=torch.int32)
     result = msa.build_flashinfer_page_table(
         req_to_token,

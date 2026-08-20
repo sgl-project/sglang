@@ -46,7 +46,9 @@ def expected_order(repetition: int) -> list[str]:
 
 def build_summary(root: Path, repetitions: int = 3) -> dict:
     if repetitions != 3:
-        raise ValueError("the publishable MiniMax-M3 gate requires exactly 3 repetitions")
+        raise ValueError(
+            "the publishable MiniMax-M3 gate requires exactly 3 repetitions"
+        )
 
     comparisons = []
     orders = []

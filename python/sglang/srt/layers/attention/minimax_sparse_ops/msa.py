@@ -19,12 +19,12 @@ from __future__ import annotations
 
 import functools
 import inspect
+import os
 from typing import Optional
 
 import torch
 
 from sglang.kernels.ops.attention.minimax_sparse.common.utils import unit_scale
-from sglang.srt.environ import envs
 
 
 class MSAUnavailableError(RuntimeError):
@@ -143,15 +143,15 @@ def _check_msa_dtypes(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Ten
     # on q.dtype alone and casts the k/v pointers to the same element type, so
     # a mismatched cache would be silently reinterpreted.
     if q.dtype == torch.bfloat16:
-        assert (
-            k_cache.dtype == torch.bfloat16
-        ), f"MSA bf16 requires a bf16 K cache, got {k_cache.dtype}"
+        assert k_cache.dtype == torch.bfloat16, (
+            f"MSA bf16 requires a bf16 K cache, got {k_cache.dtype}"
+        )
     elif q.dtype == torch.float8_e4m3fn:
         # e5m2 is rejected here too: fmha_sm100's variant lookup falls back to
         # the e4m3 kernel for unknown dtype codes.
-        assert (
-            k_cache.dtype == torch.float8_e4m3fn
-        ), f"MSA fp8 requires an fp8_e4m3fn K cache, got {k_cache.dtype}"
+        assert k_cache.dtype == torch.float8_e4m3fn, (
+            f"MSA fp8 requires an fp8_e4m3fn K cache, got {k_cache.dtype}"
+        )
     else:
         raise AssertionError(f"MSA supports bf16 or fp8_e4m3fn Q, got {q.dtype}")
     assert v_cache.dtype == k_cache.dtype
@@ -233,15 +233,13 @@ def selected_msa_backend(
     and top-k values retain the existing standalone implementation.
     """
 
-    requested = envs.SGLANG_MINIMAX_MSA_BACKEND.get().lower()
+    requested = os.environ.get("SGLANG_MINIMAX_MSA_BACKEND", "auto").lower()
     if requested not in ("auto", "flashinfer", "fmha_sm100"):
         raise ValueError(
             "SGLANG_MINIMAX_MSA_BACKEND must be auto, flashinfer, or fmha_sm100"
         )
     flashinfer_compatible = (
-        kv_dtype in (torch.bfloat16, torch.float16)
-        and num_kv_heads == 1
-        and topk == 16
+        kv_dtype in (torch.bfloat16, torch.float16) and num_kv_heads == 1 and topk == 16
     )
     if requested == "flashinfer":
         if not flashinfer_compatible:
@@ -277,7 +275,7 @@ def msa_runtime_fallback_allowed() -> bool:
     evidence, so explicit selections fail closed.
     """
 
-    return envs.SGLANG_MINIMAX_MSA_BACKEND.get().lower() == "auto"
+    return os.environ.get("SGLANG_MINIMAX_MSA_BACKEND", "auto").lower() == "auto"
 
 
 @functools.lru_cache(maxsize=1)
