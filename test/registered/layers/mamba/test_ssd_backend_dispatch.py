@@ -6,6 +6,9 @@ import pytest
 import torch
 
 from sglang.kernels.ops.mamba.triton_ops import ssu_dispatch
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    MambaAttnBackendBase,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=1, stage="base-b", runner_config="1-gpu-small")
@@ -248,6 +251,55 @@ def test_cake_prefill_fuses_compact_checkpoint_into_main_run(monkeypatch):
     assert kwargs["checkpoint_states"] is intermediate.states
     assert kwargs["checkpoint_token_indices"] is checkpoint_tokens
     assert kwargs["checkpoint_state_slots"] is checkpoint_slots
+
+
+def test_cake_compact_checkpoint_tracks_radix_state_without_replay():
+    """The main SSD invocation supplies the exact state consumed by radix track."""
+    backend = object.__new__(MambaAttnBackendBase)
+    checkpoint_states = torch.arange(2 * 2 * 4 * 3, dtype=torch.float32).reshape(
+        2, 2, 4, 3
+    )
+    ssm_states = torch.zeros((5, 2, 4, 3), dtype=torch.bfloat16)
+    metadata = SimpleNamespace(
+        has_mamba_track_mask=True,
+        # A direct checkpoint must not index a replayed dense h tensor.
+        track_ssm_h_src=torch.tensor([999, 998], dtype=torch.int64),
+        track_ssm_h_dst=torch.tensor([3, 1], dtype=torch.int64),
+        track_ssm_final_src=torch.empty(0, dtype=torch.int64),
+        track_ssm_final_dst=torch.empty(0, dtype=torch.int64),
+    )
+
+    backend._track_mamba_state_extend(
+        SimpleNamespace(),
+        ssu_dispatch.CompactMambaPrefillCheckpoints(checkpoint_states),
+        ssm_states,
+        metadata,
+    )
+
+    torch.testing.assert_close(
+        ssm_states[metadata.track_ssm_h_dst], checkpoint_states.to(torch.bfloat16)
+    )
+
+
+def test_cake_compact_checkpoint_rejects_radix_destination_mismatch():
+    backend = object.__new__(MambaAttnBackendBase)
+    metadata = SimpleNamespace(
+        has_mamba_track_mask=True,
+        track_ssm_h_src=torch.tensor([0, 1], dtype=torch.int64),
+        track_ssm_h_dst=torch.tensor([3, 1], dtype=torch.int64),
+        track_ssm_final_src=torch.empty(0, dtype=torch.int64),
+        track_ssm_final_dst=torch.empty(0, dtype=torch.int64),
+    )
+
+    with pytest.raises(ValueError, match="checkpoint count does not match"):
+        backend._track_mamba_state_extend(
+            SimpleNamespace(),
+            ssu_dispatch.CompactMambaPrefillCheckpoints(
+                torch.zeros((1, 2, 4, 3), dtype=torch.bfloat16)
+            ),
+            torch.zeros((5, 2, 4, 3), dtype=torch.bfloat16),
+            metadata,
+        )
 
 
 def test_flashinfer_prefill_refuses_non_sglang_return_contract():
