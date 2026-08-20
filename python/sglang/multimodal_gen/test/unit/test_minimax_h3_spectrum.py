@@ -31,7 +31,9 @@ def test_target_span_drops_earlier_ref_audio_gap():
 
 def test_local_target_hidden_is_rank_local_view():
     hidden = torch.arange(20, dtype=torch.float32).unsqueeze(-1).expand(20, 3).clone()
-    sliced = local_target_hidden(hidden, audio_start=4, video_stop=10, row_start=0, row_stop=20)
+    sliced = local_target_hidden(
+        hidden, audio_start=4, video_stop=10, row_start=0, row_stop=20
+    )
     assert sliced is not None
     local, start, stop = sliced
     assert start == 4 and stop == 10

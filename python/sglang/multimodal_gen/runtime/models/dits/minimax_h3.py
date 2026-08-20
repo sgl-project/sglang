@@ -2364,9 +2364,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         hidden = decoder_input
         cu_seqlens = cu_seqlens.to(device)
         spectrum_on = self._h3_spectrum_requested(sp_ws=sp_ws)
-        run_transformer_blocks = (
-            self.begin_spectrum_step() if spectrum_on else True
-        )
+        run_transformer_blocks = self.begin_spectrum_step() if spectrum_on else True
         if spectrum_on:
             try:
                 timestep = get_forward_context().current_timestep
