@@ -202,7 +202,7 @@ def maybe_build_draft_sampler(
     )
     if tp_rank == 0:
         logger.info(
-            "DSpark draft proposal (%s) folded into the draft cuda graph.",
+            "DSpark draft proposal (%s) folded into the draft decode graph.",
             "greedy + sampling" if folded_sampling else "greedy only",
         )
     return DsparkDraftSampler(

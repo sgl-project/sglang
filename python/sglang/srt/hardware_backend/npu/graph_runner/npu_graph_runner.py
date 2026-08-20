@@ -233,7 +233,10 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     forward_batch.mrope_positions
                 )
 
-        graph_key = self._make_graph_key(self.bs)
+        # load_batch() selects by request batch size for ordinary decode and
+        # by packed-token tier for compact verify. Rebuilding the key from bs
+        # here aliases different compact tiers that use the same request slots.
+        graph_key = self._replay_graph_key
 
         if not (
             is_deepseek_dsa(self.model_runner.model_config.hf_config)

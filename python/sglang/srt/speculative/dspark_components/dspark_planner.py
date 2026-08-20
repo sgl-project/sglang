@@ -796,7 +796,11 @@ def verify_layout_graph_num_tokens_floor(
 
 def ragged_capture_num_tokens(*, model_runner) -> Optional[list[int]]:
     runner = model_runner.decode_cuda_graph_runner
-    if runner is None or not runner.ragged_verify_mode:
+    if (
+        runner is None
+        or not runner.ragged_verify_mode
+        or not runner.attn_backend.supports_ragged_verify_graph
+    ):
         return None
     return runner.capture_num_tokens
 
