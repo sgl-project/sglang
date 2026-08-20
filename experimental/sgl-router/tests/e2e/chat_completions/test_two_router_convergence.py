@@ -1,28 +1,44 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Content-based routing test for both cache-aware-zmq index backends.
+"""Content-based cross-router routing test for cache-aware-zmq.
 
-Two SGLang workers publish KV events to two routers at once: one runs the
-local ``KvEventIndex`` (SUB straight to the workers) and one runs against an
-external KV Indexer fed by a ``kv-indexer-bridge`` per worker. Every
-subscriber attaches before the single warmup, so one pair of disjoint
-prefixes exercises both index backends without a second model load.
+Two routers + two SGLang workers + one shared model. Each router runs an
+independent ``cache_aware_zmq`` policy whose ``KvEventIndex`` subscribes
+to **both** workers' KV publishers.
 
-Assert on content, not on convergence: a broken event path degrades
-``cache_aware_zmq`` to content-blind min-load, which routes both prefixes to
-one worker and so fails at least one assertion below.
+The test warms each worker with a DIFFERENT prefix DIRECTLY (bypassing
+both routers), then sends those prefixes through each router and
+asserts that routing follows the prefix CONTENT: ``PREFIX_X`` lands on
+the worker holding X, ``PREFIX_Y`` lands on the worker holding Y, on
+both routers.
+
+# Why content-based, not convergence
+
+An earlier version of this test asserted that both routers converged on
+the *same dominant worker* after a one-prefix warmup. That property
+sounds like it pins the ZMQ-fan-out contract, but it doesn't: when the
+KV-event path is broken (subscribers never opened, e.g. a worker's
+``/server_info`` lacks the ``kv_events`` block), ``cache_aware_zmq``
+silently degrades to **min-load** — which, with sequential requests
+holding ``active_load`` at zero, picks the same worker deterministically
+on every call within a router. Both routers' min-load picks happened to
+agree often enough (about half the time, modulo HashSet seed) to make
+the convergence assertion pass even when no event ever flowed.
+
+Content-based routing is uniquely sensitive to the KV-event path. Two
+disjoint prefixes warmed on two different workers can only be routed
+correctly if the router knows *which worker holds which content* — the
+only mechanism that supplies that information is the ``BlockStored``
+event stream. Under min-load fallback, both prefixes route to the same
+default worker on each router, so the ``PREFIX_Y → worker_y`` assertion
+fails regardless of which worker min-load defaults to.
 """
 
 from __future__ import annotations
 
-import os
 import re
-import socket
-import subprocess
 import time
-from contextlib import contextmanager
-from pathlib import Path
 
 import httpx
 import pytest
@@ -61,69 +77,6 @@ _REQ_TOTAL_RE = re.compile(
     r"^sgl_router_worker_requests_total\{([^}]*)\}\s+(\d+(?:\.\d+)?)\s*$"
 )
 _LABEL_RE = re.compile(r'(\w+)="([^"]*)"')
-
-
-def _open_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-@contextmanager
-def _run(binary: Path, env: dict[str, str], log_path: Path):
-    with log_path.open("w") as log:
-        process = subprocess.Popen(
-            [str(binary)],
-            env={**os.environ, **env},
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        try:
-            yield process
-        finally:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
-
-
-def _wait_for_indexer(process: subprocess.Popen, port: int, log_path: Path) -> None:
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        if process.poll() is not None:
-            raise RuntimeError(
-                f"KV Indexer exited during startup:\n{log_path.read_text()}"
-            )
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                return
-        except OSError:
-            time.sleep(0.1)
-    raise RuntimeError("timed out waiting for KV Indexer")
-
-
-def _wait_for_bridge(process: subprocess.Popen, log_path: Path) -> None:
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        output = log_path.read_text(errors="replace")
-        if "bridge session established" in output:
-            # ZMQ connect is asynchronous; let the subscription reach the PUB.
-            time.sleep(0.5)
-            return
-        if process.poll() is not None:
-            raise RuntimeError(f"KV Indexer Bridge exited during startup:\n{output}")
-        time.sleep(0.1)
-    raise RuntimeError(f"timed out waiting for KV Indexer Bridge:\n{output}")
-
-
-def _dump_logs(logs: dict[str, Path]) -> None:
-    """Print the tail of each Indexer/Bridge log so a routing failure is debuggable."""
-    for name, path in logs.items():
-        tail = path.read_text(errors="replace")[-4000:] if path.exists() else "<no log>"
-        print(f"\n----- {name} -----\n{tail}")
 
 
 def _success_counts_by_worker(router_url: str) -> dict[str, int]:
@@ -220,21 +173,26 @@ def _route_through(router_url: str, model_id: str, prompt: str) -> str:
 
 @pytest.mark.real_gpu
 @pytest.mark.slow
-def test_routers_route_by_prefix_content(
-    router_binary,
+def test_two_routers_route_by_prefix_content(
+    router_binary,  # noqa: ARG001 — fixture forces release-binary presence
     gpu_allocator,
-    tmp_path,
 ):
-    """Both the local ZMQ index and the external Indexer must route by content."""
+    """Each router must route by prefix CONTENT, agreeing across routers.
+
+    With each worker direct-warmed by a different disjoint prefix, the
+    only way a router can route ``PREFIX_X → worker_x`` AND
+    ``PREFIX_Y → worker_y`` is by consulting a HashTree populated from
+    the BlockStored events the workers emit. Min-load fallback (the
+    failure mode when no SUB socket opened) is content-blind and would
+    route both prefixes to whichever worker its tiebreaker prefers.
+    """
     spec = get_model_spec("qwen3-0.6b")
     gpus = gpu_allocator.acquire(2)
-    indexer_port = _open_port()
-    indexer_endpoint = f"http://127.0.0.1:{indexer_port}"
-    indexer_binary = router_binary.parent / "kv-indexer-server"
-    bridge_binary = router_binary.parent / "kv-indexer-bridge"
-    logs = {
-        name: tmp_path / f"{name}.log" for name in ("indexer", "bridge-x", "bridge-y")
-    }
+    # Workers run with the model's REAL chat template (no override): the engine
+    # caches chat-templated tokens, and the router renders the same template
+    # (loaded from the model's tokenizer_config.json) before hashing. This
+    # exercises the production chat-template tokenization path, which aligns
+    # router query hashes with the engine's templated blocks.
     try:
         with (
             spawn_worker(
@@ -247,79 +205,54 @@ def test_routers_route_by_prefix_content(
                 gpu_ids=[gpus[1]],
                 enable_kv_events=True,
             ) as worker_y,
-            _run(
-                indexer_binary,
-                {"KV_INDEXER_LISTEN_ADDR": f"127.0.0.1:{indexer_port}"},
-                logs["indexer"],
-            ) as indexer,
+            Gateway() as router_a,
+            Gateway() as router_b,
         ):
-            _wait_for_indexer(indexer, indexer_port, logs["indexer"])
             worker_urls = [worker_x.url, worker_y.url]
-
-            def bridge_env(worker, worker_id: str) -> dict[str, str]:
-                assert worker.kv_events_endpoint is not None
-                return {
-                    "KV_INDEXER_WORKER_ID": worker_id,
-                    "KV_INDEXER_WORKER_ADDRESS": worker.url,
-                    "KV_INDEXER_ENDPOINT": indexer_endpoint,
-                    "SGLANG_KV_EVENT_ENDPOINT": worker.kv_events_endpoint.replace(
-                        "*", "127.0.0.1"
-                    ),
-                    "SGLANG_KV_EVENT_TOPIC": "kv",
-                }
-
-            with (
-                _run(
-                    bridge_binary, bridge_env(worker_x, "worker-x"), logs["bridge-x"]
-                ) as bridge_x,
-                _run(
-                    bridge_binary, bridge_env(worker_y, "worker-y"), logs["bridge-y"]
-                ) as bridge_y,
-                Gateway() as local,
-                Gateway() as external,
-            ):
-                local.start_regular(
+            for gw in (router_a, router_b):
+                gw.start_regular(
                     model_id=spec["model"],
                     tokenizer_path=spec["model"],
                     worker_urls=worker_urls,
                     policy="cache_aware_zmq",
                     timeout=120.0,
                 )
-                external.start_regular(
-                    model_id=spec["model"],
-                    tokenizer_path=spec["model"],
-                    worker_urls=worker_urls,
-                    policy="cache_aware_zmq",
-                    kv_indexer_endpoint=indexer_endpoint,
-                    timeout=120.0,
+
+            # 1. Direct-warm each worker with its own prefix. Must happen
+            #    AFTER both routers have started — ZMQ PUB/SUB doesn't
+            #    replay messages emitted before SUB attaches, so any
+            #    BlockStored event predating subscription is lost and
+            #    the HashTree never sees it.
+            _direct_warm(worker_x.url, spec["model"], PREFIX_X)
+            _direct_warm(worker_y.url, spec["model"], PREFIX_Y)
+
+            # 2. Drain the SUB mpsc + pump-apply path. Sub-second under
+            #    loopback ZMQ; 2 s leaves comfortable headroom.
+            time.sleep(2.0)
+
+            # 3. Content-routing assertion (×4): each prefix must land
+            #    on the worker that holds it, on either router.
+            #
+            #    The four assertions below are independently strong:
+            #    min-load fallback routes both prefixes on a given
+            #    router to a single default worker, so for ANY broken-
+            #    fan-out scenario at least one of the four fails.
+            for router, label in ((router_a, "A"), (router_b, "B")):
+                landed = _route_through(router.base_url, spec["model"], PREFIX_X)
+                assert landed == worker_x.url, (
+                    f"router {label}: PREFIX_X must route to worker_x "
+                    f"({worker_x.url}); landed on {landed}. "
+                    f"Likely cause: HashTree is empty — KV-event "
+                    f"subscriber never opened, or BlockStored events "
+                    f"never reached the pump."
                 )
-
-                _wait_for_bridge(bridge_x, logs["bridge-x"])
-                _wait_for_bridge(bridge_y, logs["bridge-y"])
-
-                _direct_warm(worker_x.url, spec["model"], PREFIX_X)
-                _direct_warm(worker_y.url, spec["model"], PREFIX_Y)
-                time.sleep(2.0)
-
-                try:
-                    for router, label in (
-                        (local, "local-index"),
-                        (external, "external-indexer"),
-                    ):
-                        landed = _route_through(
-                            router.base_url, spec["model"], PREFIX_X
-                        )
-                        assert (
-                            landed == worker_x.url
-                        ), f"router {label}: PREFIX_X must route to {worker_x.url}; landed on {landed}"
-                        landed = _route_through(
-                            router.base_url, spec["model"], PREFIX_Y
-                        )
-                        assert (
-                            landed == worker_y.url
-                        ), f"router {label}: PREFIX_Y must route to {worker_y.url}; landed on {landed}"
-                except Exception:
-                    _dump_logs(logs)
-                    raise
+                landed = _route_through(router.base_url, spec["model"], PREFIX_Y)
+                assert landed == worker_y.url, (
+                    f"router {label}: PREFIX_Y must route to worker_y "
+                    f"({worker_y.url}); landed on {landed}. "
+                    f"Likely cause: HashTree is empty — KV-event "
+                    f"subscriber never opened, or BlockStored events "
+                    f"never reached the pump."
+                )
     finally:
         gpu_allocator.release(gpus)

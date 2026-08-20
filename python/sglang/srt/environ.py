@@ -997,8 +997,9 @@ class Envs:
     # Cache directories
     # ===================================================================
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
-    # JIT kernel build cache. None = unset, resolving to ~/.cache/sglang/jit;
-    # point it at a persistent mount to share builds across CI jobs.
+    # JIT kernel build cache. None = unset, resolving to $SGLANG_CACHE_DIR/jit
+    # (default ~/.cache/sglang/jit); point it or SGLANG_CACHE_DIR at a
+    # persistent mount to share builds across CI jobs.
     SGLANG_JIT_CACHE_DIR = EnvStr(None)
     # Log, at INFO, which dependency changed whenever a module is rebuilt.
     SGLANG_JIT_CACHE_DEBUG = EnvBool(False)
