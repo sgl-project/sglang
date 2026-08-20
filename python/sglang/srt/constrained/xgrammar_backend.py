@@ -140,7 +140,14 @@ class XGrammarGrammar(BaseGrammarObject):
 
             torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
         elif logits.device.type == "cpu":
-            apply_token_bitmask_inplace_cpu(logits, vocab_mask)
+            if _is_cpu and _is_cpu_amx_available:
+                apply_token_bitmask_inplace_cpu(logits, vocab_mask)
+            else:
+                # Used by the MLX backend, which builds its additive mask rows
+                # on the CPU before inserting them into the lazy graph.
+                from xgrammar import apply_token_bitmask_inplace
+
+                apply_token_bitmask_inplace(logits, vocab_mask, backend="cpu")
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 
