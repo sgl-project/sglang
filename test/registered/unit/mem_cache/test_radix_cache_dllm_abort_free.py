@@ -69,6 +69,7 @@ def _make_req(*, num_prompt: int, num_output: int):
         req_pool_idx=1,
         cache_protected_len=0,
         extra_key=None,
+        cache_salt=None,
         priority=0,
         last_node=None,
         session=None,
