@@ -1,5 +1,6 @@
 import json
 import logging
+import unittest
 
 import pytest
 
@@ -9,7 +10,6 @@ from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.internlm_detector import InternlmDetector
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(5, "base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
@@ -29,7 +29,7 @@ class DummyDetector(BaseFormatDetector):
         pass
 
 
-class TestInternlmUnknownToolForwarding(CustomTestCase):
+class TestInternlmUnknownToolForwarding(unittest.TestCase):
     def setUp(self):
         self.tools = [
             Tool(
