@@ -65,8 +65,8 @@ from sglang.srt.models.gemma4_causal import (
     pp_filter_load_weight,
 )
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
-from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu
 from sglang.srt.runtime_context import get_server_args
+from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
