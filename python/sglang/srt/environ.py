@@ -1548,6 +1548,10 @@ class Envs:
     # b12x compile-cache directory, forwarded to B12X_CUTE_COMPILE_CACHE_DIR.
     # Resolved lazily so it tracks SGLANG_CACHE_DIR, which is defined below.
     SGLANG_B12X_CACHE_DIR = EnvStr(lambda: _default_cache_subdir("b12x"))
+    # Test hook: assert the GPU memory capacity (MB) instead of probing
+    # nvidia-smi / torch. Benchmark clients on unified-memory boxes cannot
+    # probe while a server holds nearly all memory.
+    SGLANG_FAKE_GPU_MEM_MB = EnvInt(None)
 
 
 envs = Envs()

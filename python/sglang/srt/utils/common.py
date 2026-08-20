@@ -648,6 +648,14 @@ def _cuda_mem_fallback(reason: str) -> int:
 
 
 def get_nvgpu_memory_capacity():
+    # Benchmark clients on unified-memory boxes (DGX Spark) cannot probe or
+    # even init CUDA while a server holds ~all memory; let them assert the
+    # capacity instead of probing.
+    from sglang.srt.environ import envs
+
+    fake_mb = envs.SGLANG_FAKE_GPU_MEM_MB.get()
+    if fake_mb:
+        return float(fake_mb)
     try:
         # Run nvidia-smi and capture the output
         result = subprocess.run(
