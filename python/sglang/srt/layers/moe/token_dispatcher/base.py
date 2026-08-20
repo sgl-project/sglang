@@ -75,7 +75,8 @@ class _PreDispatchHooks(DispatcherBaseHooks):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ) -> Optional[Tuple[torch.Tensor, TopKOutput]]:
-        for hook_fun in self.hook_dict.values():
+        # Hooks are allowed to remove themselves after their one-shot work.
+        for hook_fun in tuple(self.hook_dict.values()):
             hook_output = hook_fun(dispatcher, hidden_states, topk_output)
             if hook_output is not None:
                 hidden_states, topk_output = hook_output
@@ -87,7 +88,7 @@ class _PostDispatchHooks(DispatcherBaseHooks):
     def __call__(
         self, dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
     ) -> Optional[DispatchOutput]:
-        for hook_fun in self.hook_dict.values():
+        for hook_fun in tuple(self.hook_dict.values()):
             hook_output = hook_fun(dispatcher, dispatch_output)
             if hook_output is not None:
                 dispatch_output = hook_output
@@ -99,7 +100,7 @@ class _PreCombineHooks(DispatcherBaseHooks):
     def __call__(
         self, dispatcher: BaseDispatcher, combine_input: CombineInput
     ) -> Optional[CombineInput]:
-        for hook_fun in self.hook_dict.values():
+        for hook_fun in tuple(self.hook_dict.values()):
             hook_output = hook_fun(dispatcher, combine_input)
             if hook_output is not None:
                 combine_input = hook_output
@@ -111,7 +112,7 @@ class _PostCombineHooks(DispatcherBaseHooks):
     def __call__(
         self, dispatcher: BaseDispatcher, hidden_states: torch.Tensor
     ) -> Optional[torch.Tensor]:
-        for hook_fun in self.hook_dict.values():
+        for hook_fun in tuple(self.hook_dict.values()):
             hook_output = hook_fun(dispatcher, hidden_states)
             if hook_output is not None:
                 hidden_states = hook_output

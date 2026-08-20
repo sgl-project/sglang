@@ -455,6 +455,19 @@ class DeepseekV2MLP(nn.Module):
         self._fused_clamp_fp8_checked = False
         self._fused_clamp_use_fp8 = False
 
+    def supports_split_forward(self) -> bool:
+        """Whether FC1+SwiGLU and FC2 can be invoked independently."""
+        if getattr(self, "_enable_nvfp4_gemm_swiglu_fusion", False):
+            return False
+        # This fast path fuses SwiGLU quantization and the down GEMM in one
+        # branch, so its output is already the final MLP output.
+        return not (
+            self.swiglu_limit is not None
+            and not self.down_proj.reduce_results
+            and self.down_proj.weight.dtype == torch.uint8
+            and hasattr(self.down_proj, "weight_scale_inv")
+        )
+
     def forward(
         self,
         x,
@@ -489,6 +502,27 @@ class DeepseekV2MLP(nn.Module):
             )
             out, _ = self.down_proj((out_fp4, out_scale))
             return out
+
+        x = self.forward_gate_up_act(
+            x,
+            gemm_output_zero_allocator=gemm_output_zero_allocator,
+            gateup_pre_quant=gateup_pre_quant,
+        )
+        return self.forward_down(x)
+
+    def forward_gate_up_act(
+        self,
+        x,
+        gemm_output_zero_allocator: BumpAllocator = None,
+        gateup_pre_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ):
+        """Run the first shared-expert GEMM and SwiGLU activation.
+
+        This split entry point is used by the fine-grained DeepEP overlap path.
+        The NVFP4 GEMM+SwiGLU+quant fusion is intentionally kept in ``forward``
+        because that kernel produces the down-projection input and cannot be
+        separated at its current API boundary.
+        """
 
         if gateup_pre_quant is not None:
             # SGLANG_OPT_MOE_QUANT_ONCE: reuse the caller's per-token-group-128
@@ -596,6 +630,10 @@ class DeepseekV2MLP(nn.Module):
                 silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
         else:
             x = self.act_fn(gate_up)
+        return x
+
+    def forward_down(self, x):
+        """Run only the shared-expert down projection."""
         x, _ = self.down_proj(x)
         return x
 
@@ -1390,6 +1428,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         shared_output = None
+        shared_event = None
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
         sbo_overlap_dispatch_flag = (
             sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
@@ -1397,11 +1436,26 @@ class DeepseekV2MoE(nn.Module):
         sbo_overlap_combine_flag = (
             sbo_enabled_flag and SboFlags.enable_combine_shared_two_stream_overlap()
         )
+        fine_grained_dual_stream = (
+            _is_npu
+            and envs.SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM.get()
+            and not sbo_enabled_flag
+            and self.num_fused_shared_experts == 0
+            and self.alt_stream is not None
+            and hidden_states.shape[0] > 0
+            and hasattr(self, "shared_experts")
+            and self.shared_experts.supports_split_forward()
+            and isinstance(self.experts.dispatcher, MaybeTboDeepEPDispatcher)
+        )
 
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
-            if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
+            if (
+                not sbo_enabled_flag
+                and self.num_fused_shared_experts == 0
+                and not fine_grained_dual_stream
+            ):
                 if self.alt_stream is not None:
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(self.alt_stream):
@@ -1440,7 +1494,65 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states.device, layer_id=self.layer_id
             )
 
-        if sbo_overlap_dispatch_flag:
+        if fine_grained_dual_stream:
+            shared_intermediate = None
+            shared_fc2_done = None
+
+            def _fine_grained_pre_dispatch_hook(
+                dispatcher: BaseDispatcher,
+                dispatch_hidden_states: torch.Tensor,
+                _dispatch_topk_output: TopKOutput,
+            ):
+                """Overlap shared FC1+SwiGLU with the full dispatch."""
+                nonlocal shared_intermediate
+                self.alt_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self.alt_stream):
+                    shared_intermediate = self.shared_experts.forward_gate_up_act(
+                        dispatch_hidden_states
+                    )
+                    shared_intermediate.record_stream(self.alt_stream)
+                fine_pre_dispatch_hook_handle.remove()
+
+            def _fine_grained_pre_combine_hook(
+                dispatcher: BaseDispatcher, combine_input: CombineInput
+            ):
+                """Launch shared FC2 after routed GEMMs and beside combine."""
+                nonlocal shared_output, shared_fc2_done
+                assert shared_intermediate is not None
+                self.alt_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self.alt_stream):
+                    shared_output = self.shared_experts.forward_down(
+                        shared_intermediate
+                    )
+                    shared_output.record_stream(self.alt_stream)
+                    shared_fc2_done = self.alt_stream.record_event()
+                fine_pre_combine_hook_handle.remove()
+
+            def _fine_grained_post_combine_hook(
+                dispatcher: BaseDispatcher, combined_output: torch.Tensor
+            ):
+                """Join shared FC2 before the two MoE branches are added."""
+                assert shared_fc2_done is not None
+                torch.cuda.current_stream().wait_event(shared_fc2_done)
+                fine_post_combine_hook_handle.remove()
+
+            fine_pre_dispatch_hook_handle = (
+                self.experts.dispatcher.register_pre_dispatch_hook(
+                    _fine_grained_pre_dispatch_hook
+                )
+            )
+            fine_pre_combine_hook_handle = (
+                self.experts.dispatcher.register_pre_combine_hook(
+                    _fine_grained_pre_combine_hook
+                )
+            )
+            fine_post_combine_hook_handle = (
+                self.experts.dispatcher.register_post_combine_hook(
+                    _fine_grained_post_combine_hook
+                )
+            )
+
+        elif sbo_overlap_dispatch_flag:
             shared_output = None
 
             def _deepep_dispatch_hook(dispatcher: BaseDispatcher):
@@ -1599,6 +1711,7 @@ class DeepseekV2MoE(nn.Module):
             and self.num_fused_shared_experts == 0
             and self.alt_stream is not None
             and not is_in_breakable_cuda_graph()
+            and shared_event is not None
         ):
             torch.cuda.current_stream().wait_event(shared_event)
 
@@ -2907,6 +3020,7 @@ class DeepseekV2Model(nn.Module):
                 _is_cuda
                 or _is_musa
                 or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+                or envs.SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM.get()
                 or envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
             )
             else None
