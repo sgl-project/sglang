@@ -796,6 +796,55 @@ class TestRegisterSession:
 
 
 class TestFireLoop:
+    def test_harmonic_periods_share_reporter_epoch_boundary(self):
+        from sglang.srt.load_reporter.runtime import _PeriodSchedule
+
+        epoch = 10.0
+        now = epoch + 0.75
+        period_500 = _PeriodSchedule(500, epoch, now)
+        period_1000 = _PeriodSchedule(1000, epoch, now)
+
+        assert period_500.next_deadline == pytest.approx(epoch + 1.0)
+        assert period_1000.next_deadline == pytest.approx(epoch + 1.0)
+
+    def test_missed_ticks_preserve_reporter_epoch_phase(self):
+        from sglang.srt.load_reporter.runtime import _PeriodSchedule
+
+        epoch = 10.0
+        now = epoch + 1.35
+        period = _PeriodSchedule(400, epoch, epoch)
+        period.advance(now)
+
+        assert period.next_deadline == pytest.approx(epoch + 1.6)
+
+    @pytest.mark.asyncio
+    async def test_equal_intervals_reuse_one_period_schedule(self):
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        rt = LoadReporterRuntime(RuntimeSnapshotSource(), make_runtime_server_args())
+        try:
+            _, first = rt.register_session("first", 5000, 30000)
+            schedule = rt._period_schedules[5000]
+            _, second = rt.register_session("second", 5000, 30000)
+
+            assert rt._period_schedules == {5000: schedule}
+            assert schedule.sessions == {first, second}
+        finally:
+            await rt.close()
+
+    @pytest.mark.asyncio
+    async def test_empty_period_schedule_is_removed(self):
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        rt = LoadReporterRuntime(RuntimeSnapshotSource(), make_runtime_server_args())
+        try:
+            _, session = rt.register_session("r1", 5000, 30000)
+            session.stop()
+
+            assert 5000 not in rt._period_schedules
+        finally:
+            await rt.close()
+
     @pytest.mark.asyncio
     async def test_coalesced_registration_shares_one_initial_pull(self):
         from sglang.srt.load_reporter.runtime import LoadReporterRuntime
@@ -828,6 +877,53 @@ class TestFireLoop:
             # The periodic broadcast shares one report across aligned sessions.
             assert r1.sequence_id == r2.sequence_id
             assert source.get_loads_calls == 2  # initial fire + one periodic fire
+        finally:
+            await rt.close()
+
+    @pytest.mark.asyncio
+    async def test_staggered_same_interval_sessions_share_periodic_pull(self):
+        """Equal intervals share one periodic phase despite staggered registration."""
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        source = RuntimeSnapshotSource()
+        rt = LoadReporterRuntime(source, make_runtime_server_args())
+        try:
+            _, first = rt.register_session("first", 400, 3000)
+            await asyncio.wait_for(first.queue.get(), timeout=0.3)
+
+            await asyncio.sleep(0.05)
+            _, second = rt.register_session("second", 400, 3000)
+            await asyncio.wait_for(second.queue.get(), timeout=0.3)
+            calls_after_initial = source.get_loads_calls
+
+            first_periodic = await asyncio.wait_for(first.queue.get(), timeout=0.6)
+            second_periodic = await asyncio.wait_for(second.queue.get(), timeout=0.6)
+
+            assert first_periodic.sequence_id == second_periodic.sequence_id
+            assert source.get_loads_calls == calls_after_initial + 1
+        finally:
+            await rt.close()
+
+    @pytest.mark.asyncio
+    async def test_harmonic_periods_share_one_pull_at_common_boundary(self):
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        source = RuntimeSnapshotSource()
+        rt = LoadReporterRuntime(source, make_runtime_server_args())
+        try:
+            _, fast = rt.register_session("fast", 100, 3000)
+            _, slow = rt.register_session("slow", 200, 3000)
+            await asyncio.wait_for(fast.queue.get(), timeout=0.3)
+            await asyncio.wait_for(slow.queue.get(), timeout=0.3)
+
+            # The 100 ms-only boundary sends only to fast.
+            await asyncio.wait_for(fast.queue.get(), timeout=0.3)
+            # At 200 ms both period buckets consume the same snapshot pull.
+            fast_common = await asyncio.wait_for(fast.queue.get(), timeout=0.3)
+            slow_common = await asyncio.wait_for(slow.queue.get(), timeout=0.3)
+
+            assert fast_common.sequence_id == slow_common.sequence_id
+            assert source.get_loads_calls == 3  # initial, 100 ms, shared 200 ms
         finally:
             await rt.close()
 
@@ -878,14 +974,14 @@ class TestFireLoop:
             await rt.close()
 
     @pytest.mark.asyncio
-    async def test_periodic_cadence_anchored_at_registration(self):
-        """R4: the cadence anchor is registration, not first-report completion (2nd fire at ~500ms, not ~700ms)."""
+    async def test_periodic_cadence_not_anchored_at_first_report_completion(self):
+        """A slow initial pull does not shift the reporter-epoch cadence."""
         from sglang.srt.load_reporter.runtime import LoadReporterRuntime
 
         source = ControlledSnapshotSource()
         rt = LoadReporterRuntime(source, make_runtime_server_args())
         try:
-            registered_at = time.monotonic()
+            reporter_started_at = time.monotonic()
             rt.register_session("r1", 500, 30000)
 
             # Hold the first pull for 200ms (< interval), then let it finish.
@@ -895,10 +991,10 @@ class TestFireLoop:
             source.release.set()
 
             await asyncio.wait_for(source.started.wait(), timeout=1.0)
-            elapsed = time.monotonic() - registered_at
+            elapsed = time.monotonic() - reporter_started_at
             assert (
                 0.42 <= elapsed < 0.62
-            ), f"fire 2 started {elapsed:.3f}s after registration"
+            ), f"fire 2 started {elapsed:.3f}s after reporter epoch"
         finally:
             source.release.set()
             await rt.close()
@@ -1019,7 +1115,27 @@ class TestFireLoop:
 
 class TestRuntimeUpdateConfig:
     @pytest.mark.asyncio
-    async def test_update_config_reanchors_report_deadline(self):
+    async def test_update_config_joins_existing_period_without_resetting_it(self):
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        rt = LoadReporterRuntime(RuntimeSnapshotSource(), make_runtime_server_args())
+        try:
+            _, moving = rt.register_session("moving", 5000, 30000)
+            _, existing = rt.register_session("existing", 3000, 30000)
+            schedule = rt._period_schedules[3000]
+            deadline = schedule.next_deadline
+
+            rt.update_session_config(moving, report_interval_ms=3000)
+
+            assert 5000 not in rt._period_schedules
+            assert rt._period_schedules[3000] is schedule
+            assert schedule.next_deadline == deadline
+            assert schedule.sessions == {moving, existing}
+        finally:
+            await rt.close()
+
+    @pytest.mark.asyncio
+    async def test_update_config_moves_session_to_aligned_period_schedule(self):
         from sglang.srt.load_reporter.runtime import LoadReporterRuntime
 
         rt = LoadReporterRuntime(RuntimeSnapshotSource(), make_runtime_server_args())
@@ -1028,7 +1144,13 @@ class TestRuntimeUpdateConfig:
             initial_report = await asyncio.wait_for(session.queue.get(), timeout=1.0)
             assert initial_report is not None
 
-            session.update_config(report_interval_ms=30)
+            rt.update_session_config(session, report_interval_ms=30)
+
+            assert 1000 not in rt._period_schedules
+            schedule = rt._period_schedules[30]
+            assert schedule.sessions == {session}
+            aligned_intervals = (schedule.next_deadline - rt._schedule_epoch) / 0.03
+            assert aligned_intervals == pytest.approx(round(aligned_intervals))
 
             report = await asyncio.wait_for(session.queue.get(), timeout=0.2)
             assert report is not None
@@ -1047,7 +1169,7 @@ class TestRuntimeUpdateConfig:
             initial_report = await asyncio.wait_for(session.queue.get(), timeout=1.0)
             assert initial_report is not None
 
-            session.update_config(lease_ttl_ms=30)
+            rt.update_session_config(session, lease_ttl_ms=30)
 
             sentinel = await asyncio.wait_for(session.queue.get(), timeout=0.2)
             assert sentinel is None
@@ -1065,9 +1187,10 @@ class TestRuntimeUpdateConfig:
             assert initial_report is not None
 
             with pytest.raises(ValueError, match="report_interval_ms"):
-                session.update_config(report_interval_ms=-1, lease_ttl_ms=1)
+                rt.update_session_config(session, report_interval_ms=-1, lease_ttl_ms=1)
 
             assert session.report_interval_ms == 500
+            assert rt._period_schedules[500].sessions == {session}
             with pytest.raises(asyncio.TimeoutError):
                 await asyncio.wait_for(session.queue.get(), timeout=0.05)
         finally:
@@ -1085,7 +1208,7 @@ class TestRuntimeUpdateConfig:
             _, session = rt.register_session("r1", 10, 50)
             # Extend the lease to 5000ms before the original 50ms expires.
             await asyncio.sleep(0.02)
-            session.update_config(lease_ttl_ms=5000)
+            rt.update_session_config(session, lease_ttl_ms=5000)
             # Wait well past the original 50ms window.
             await asyncio.sleep(0.1)
             # Session should still be emitting reports (queue not terminated).

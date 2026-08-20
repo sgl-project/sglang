@@ -160,7 +160,8 @@ class LoadMonitorService(pb_grpc.LoadMonitorServiceServicer):
                 validation_error = _validate_register(reg)
                 if validation_error is not None:
                     return validation_error
-                session.update_config(
+                self._runtime.update_session_config(
+                    session,
                     report_interval_ms=reg.report_interval_ms,
                     lease_ttl_ms=reg.lease_ttl_ms,
                 )
@@ -173,7 +174,11 @@ class LoadMonitorService(pb_grpc.LoadMonitorServiceServicer):
                 validation_error = _validate_timing(interval, lease)
                 if validation_error is not None:
                     return validation_error
-                session.update_config(report_interval_ms=interval, lease_ttl_ms=lease)
+                self._runtime.update_session_config(
+                    session,
+                    report_interval_ms=interval,
+                    lease_ttl_ms=lease,
+                )
             elif which == "stop":
                 session.stop()
                 return None

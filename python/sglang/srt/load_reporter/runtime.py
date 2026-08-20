@@ -36,7 +36,7 @@ def _validate_timing(
 
 
 class _RouterSession:
-    """One inbound Router stream: passive bookkeeping plus a response queue."""
+    """One inbound Router stream: passive lease state plus a response queue."""
 
     def __init__(
         self,
@@ -51,8 +51,6 @@ class _RouterSession:
         self._router_id = router_id
         self._report_interval_ms = report_interval_ms
         self._lease_ttl_ms = lease_ttl_ms
-        # Due immediately: the next fire delivers the initial report.
-        self._next_report_deadline = now
         self._lease_expires_at = now + lease_ttl_ms / 1000.0
         self._on_close = on_close
         self._state_changed = state_changed
@@ -74,24 +72,20 @@ class _RouterSession:
         """Reset lease timer to now + current lease_ttl_ms."""
         self._lease_expires_at = time.monotonic() + self._lease_ttl_ms / 1000.0
 
-    def update_config(
+    def _update_timing(
         self,
         report_interval_ms: Optional[int] = None,
         lease_ttl_ms: Optional[int] = None,
+        *,
+        now: float,
     ) -> None:
-        """Atomically update timing and re-anchor schedules from now."""
+        """Apply validated timing values; Runtime owns schedule membership."""
         _validate_timing(report_interval_ms, lease_ttl_ms)
-        now = time.monotonic()
-
         if report_interval_ms is not None:
             self._report_interval_ms = report_interval_ms
-            self._next_report_deadline = now + report_interval_ms / 1000.0
         if lease_ttl_ms is not None:
             self._lease_ttl_ms = lease_ttl_ms
         self._lease_expires_at = now + self._lease_ttl_ms / 1000.0
-
-        if report_interval_ms is not None or lease_ttl_ms is not None:
-            self._state_changed()
 
     def stop(self) -> None:
         """Idempotent stop: close the queue and deregister the session."""
@@ -119,16 +113,39 @@ class _RouterSession:
         except asyncio.QueueFull:
             pass  # consumed between check and put — skip
 
-    def _advance_deadline(self, now: float) -> None:
-        """Move the deadline forward one interval; re-anchor when behind."""
-        interval_sec = self._report_interval_ms / 1000.0
-        self._next_report_deadline += interval_sec
-        if self._next_report_deadline <= now:
-            self._next_report_deadline = now + interval_sec
+
+class _PeriodSchedule:
+    """One shared periodic deadline for all sessions using an interval."""
+
+    def __init__(self, interval_ms: int, schedule_epoch: float, now: float) -> None:
+        _validate_timing(report_interval_ms=interval_ms)
+        self.interval_ms = interval_ms
+        self._interval_seconds = interval_ms / 1000.0
+        self._schedule_epoch = schedule_epoch
+        self.next_deadline = self._next_aligned_deadline(now)
+        self.sessions: set[_RouterSession] = set()
+
+    def _next_aligned_deadline(self, now: float) -> float:
+        """Return the first reporter-epoch boundary strictly after ``now``."""
+        elapsed_seconds = max(0.0, now - self._schedule_epoch)
+        elapsed_periods = int(elapsed_seconds / self._interval_seconds)
+        deadline = self._schedule_epoch + (elapsed_periods + 1) * self._interval_seconds
+        if deadline <= now:
+            deadline += self._interval_seconds
+        return deadline
+
+    def advance(self, now: float) -> None:
+        """Advance one tick, skipping missed ticks without changing phase."""
+        self.next_deadline += self._interval_seconds
+        if self.next_deadline <= now:
+            missed_periods = (
+                int((now - self.next_deadline) / self._interval_seconds) + 1
+            )
+            self.next_deadline += missed_periods * self._interval_seconds
 
 
 class LoadReporterRuntime:
-    """Own reporter sessions and one shared pull timer (the fire loop)."""
+    """Own Router sessions, shared period schedules, and one pull timer."""
 
     def __init__(
         self,
@@ -141,6 +158,7 @@ class LoadReporterRuntime:
         self._config = LoadReporterConfig.from_server_args(server_args)
         self._worker_metadata = WorkerMetadata.from_server_args(server_args)
         self._snapshot_source = snapshot_source
+        self._schedule_epoch = time.monotonic()
 
         self._builder = ReportBuilder(
             str(uuid.uuid4()),
@@ -148,6 +166,8 @@ class LoadReporterRuntime:
             SequenceAllocator(),
         )
         self._sessions: Dict[str, _RouterSession] = {}
+        self._period_schedules: Dict[int, _PeriodSchedule] = {}
+        self._initial_due_sessions: set[_RouterSession] = set()
         self._state_changed: asyncio.Event = asyncio.Event()
         self._fire_task: asyncio.Task = asyncio.create_task(
             self._fire_loop(), name="load-reporter-fire-loop"
@@ -179,6 +199,10 @@ class LoadReporterRuntime:
             state_changed=self._state_changed.set,
         )
         self._sessions[router_id] = session
+        self._add_to_period_schedule(session, now=time.monotonic())
+        # Initial delivery is independent of the periodic schedule. Joining an
+        # existing period must not reset that period's shared deadline.
+        self._initial_due_sessions.add(session)
         self._state_changed.set()
 
         renew_after_ms = max(1, lease_ttl_ms // 3)
@@ -189,14 +213,82 @@ class LoadReporterRuntime:
         return ack, session
 
     def _on_session_closed(self, router_id: str, session: _RouterSession) -> None:
-        """Remove a session only when it still owns its Router ID."""
+        """Remove session-owned state without disturbing a replacement."""
+        self._initial_due_sessions.discard(session)
+        self._remove_from_period_schedule(session)
         if self._sessions.get(router_id) is session:
             del self._sessions[router_id]
+
+    def _add_to_period_schedule(
+        self, session: _RouterSession, *, now: float
+    ) -> _PeriodSchedule:
+        """Join the interval bucket, creating its aligned timer when needed."""
+        interval_ms = session.report_interval_ms
+        schedule = self._period_schedules.get(interval_ms)
+        if schedule is None:
+            schedule = _PeriodSchedule(interval_ms, self._schedule_epoch, now)
+            self._period_schedules[interval_ms] = schedule
+        schedule.sessions.add(session)
+        return schedule
+
+    def _remove_from_period_schedule(self, session: _RouterSession) -> None:
+        """Leave the current interval bucket and delete it when empty."""
+        interval_ms = session.report_interval_ms
+        schedule = self._period_schedules.get(interval_ms)
+        if schedule is None:
+            return
+        schedule.sessions.discard(session)
+        if not schedule.sessions:
+            del self._period_schedules[interval_ms]
+
+    def update_session_config(
+        self,
+        session: _RouterSession,
+        report_interval_ms: Optional[int] = None,
+        lease_ttl_ms: Optional[int] = None,
+    ) -> bool:
+        """Apply timing atomically and migrate interval-bucket membership."""
+        _validate_timing(report_interval_ms, lease_ttl_ms)
+        if self._sessions.get(session._router_id) is not session:
+            return False
+        if report_interval_ms is None and lease_ttl_ms is None:
+            return False
+
+        now = time.monotonic()
+        interval_changed = (
+            report_interval_ms is not None
+            and report_interval_ms != session.report_interval_ms
+        )
+        if interval_changed:
+            self._remove_from_period_schedule(session)
+        session._update_timing(
+            report_interval_ms=report_interval_ms,
+            lease_ttl_ms=lease_ttl_ms,
+            now=now,
+        )
+        if interval_changed:
+            self._add_to_period_schedule(session, now=now)
+        self._state_changed.set()
+        return True
 
     def update_expected_dp_ranks(self, expected_dp_ranks: Iterable[int]) -> bool:
         """Update a rank-aware snapshot source after elastic scaling."""
         update = getattr(self._snapshot_source, "update_expected_dp_ranks", None)
         return bool(update is not None and update(expected_dp_ranks))
+
+    def _collect_due(
+        self, now: float
+    ) -> Tuple[list[_PeriodSchedule], set[_RouterSession]]:
+        """Return current due periods and the union of their sessions."""
+        schedules = [
+            schedule
+            for schedule in self._period_schedules.values()
+            if schedule.next_deadline <= now
+        ]
+        sessions = set(self._initial_due_sessions)
+        for schedule in schedules:
+            sessions.update(schedule.sessions)
+        return schedules, sessions
 
     async def _pull_report(self, timeout_seconds: float) -> pb.LoadReport:
         """Pull once (retrying one rank-set change), build one report."""
@@ -243,7 +335,7 @@ class LoadReporterRuntime:
         )
 
     async def _fire_loop(self) -> None:
-        """The reporter's single timer: pull once per fire, broadcast to due sessions."""
+        """Pull once for all due periods, then broadcast to their sessions."""
         try:
             while not self._closing:
                 self._state_changed.clear()
@@ -255,27 +347,32 @@ class LoadReporterRuntime:
                     await self._state_changed.wait()
                     continue
 
-                next_fire = min(
-                    min(s._next_report_deadline, s._lease_expires_at)
-                    for s in self._sessions.values()
-                )
-                sleep_sec = max(0.0, next_fire - time.monotonic())
-                try:
-                    await asyncio.wait_for(
-                        self._state_changed.wait(), timeout=sleep_sec
+                if not self._initial_due_sessions:
+                    next_fire = min(
+                        min(
+                            schedule.next_deadline
+                            for schedule in self._period_schedules.values()
+                        ),
+                        min(s._lease_expires_at for s in self._sessions.values()),
                     )
-                except asyncio.TimeoutError:
-                    pass
-                if self._state_changed.is_set():
-                    continue  # membership or timing changed; recompute
+                    sleep_sec = max(0.0, next_fire - time.monotonic())
+                    try:
+                        await asyncio.wait_for(
+                            self._state_changed.wait(), timeout=sleep_sec
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                    if self._state_changed.is_set():
+                        continue  # membership or timing changed; recompute
 
                 now = time.monotonic()
-                due = [
-                    s
-                    for s in self._sessions.values()
-                    if s._next_report_deadline <= now and not s._done.is_set()
-                ]
-                if not due:
+                _, due_sessions = self._collect_due(now)
+                due_sessions = {
+                    session
+                    for session in due_sessions
+                    if not session._done.is_set() and now < session._lease_expires_at
+                }
+                if not due_sessions:
                     continue  # fired for lease expiry; the loop reaps them
 
                 # Pull with the source-level budget; leases only gate delivery.
@@ -283,17 +380,20 @@ class LoadReporterRuntime:
                 if self._closing:
                     break
 
-                # Broadcast to every session due at completion time (covers sessions registered during the pull).
+                # Recompute after the await so registration or interval changes
+                # during a pull use the current period membership.
                 now = time.monotonic()
-                for session in list(self._sessions.values()):
-                    if (
-                        session._done.is_set()
-                        or now >= session._lease_expires_at
-                        or session._next_report_deadline > now
-                    ):
+                due_schedules, due_sessions = self._collect_due(now)
+
+                delivered = set()
+                for session in due_sessions:
+                    if session._done.is_set() or now >= session._lease_expires_at:
                         continue
                     session._enqueue(report)
-                    session._advance_deadline(now)
+                    delivered.add(session)
+                self._initial_due_sessions.difference_update(delivered)
+                for schedule in due_schedules:
+                    schedule.advance(now)
         except asyncio.CancelledError:
             raise
 
@@ -320,3 +420,5 @@ class LoadReporterRuntime:
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 pass
         self._sessions.clear()
+        self._period_schedules.clear()
+        self._initial_due_sessions.clear()

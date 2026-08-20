@@ -15,8 +15,10 @@ Worker replies with an ack immediately, then the reporter's fire loop performs
 one bounded snapshot pull and sends the first `LoadReport`. A successful pull
 therefore makes the first report a completed current snapshot; a hung or
 invalid pull produces an explicit `UNREACHABLE` report after the bound.
-Periodic reports are then broadcast on the negotiated deadlines, anchored at
-each session's registration time (not at first-report completion).
+Periodic reports are then broadcast on each session's negotiated interval. All
+periodic deadlines are aligned to one reporter-owned monotonic epoch, so
+sessions with the same interval share periodic pulls even when they register at
+different times. Registration still requests an immediate initial report.
 
 The reporter is **opt-in and disabled by default**. When `--load-reporter-port`
 is unset there is zero overhead: no socket, no task, no binding, and the
@@ -37,38 +39,44 @@ Only the startup site and the snapshot source differ.
 
 | Serving mode | Reporter start site | Snapshot source | Snapshot fires |
 |---|---|---|---|
-| HTTP | FastAPI `lifespan` | `TokenizerManager` | registration + negotiated deadlines |
-| native gRPC (`--grpc-port`) | reuses the same FastAPI lifespan (no second listener) | `TokenizerManager` | registration + negotiated deadlines |
-| multi-tokenizer HTTP (`--tokenizer-worker-num > 1`) | sole `MultiTokenizerRouter` owns the port | Router shared-memory snapshot reader | registration + negotiated deadlines |
-| standalone SMG RPC (`--smg-grpc-mode`) | `grpc_server.py::_on_request_manager_ready` (`start_load_reporter`) | `GrpcRequestManager.get_loads(include=["core"])` | registration + negotiated deadlines |
+| HTTP | FastAPI `lifespan` | `TokenizerManager` | initial registration + shared period schedules |
+| native gRPC (`--grpc-port`) | reuses the same FastAPI lifespan (no second listener) | `TokenizerManager` | initial registration + shared period schedules |
+| multi-tokenizer HTTP (`--tokenizer-worker-num > 1`) | sole `MultiTokenizerRouter` owns the port | Router shared-memory snapshot reader | initial registration + shared period schedules |
+| standalone SMG RPC (`--smg-grpc-mode`) | `grpc_server.py::_on_request_manager_ready` (`start_load_reporter`) | `GrpcRequestManager.get_loads(include=["core"])` | initial registration + shared period schedules |
 
 > **Multi-tokenizer native gRPC is not supported.** `ServerArgs` rejects
 > `--grpc-port` together with `--tokenizer-worker-num > 1`, so the reporter does
 > not claim that combination. Multi-tokenizer applies to HTTP only.
 
 **All serving modes use request-independent snapshot fires.** The reporter owns
-exactly one timer: it wakes at the earliest report deadline (or lease expiry)
-across registered Router sessions, performs one bounded pull, and broadcasts
-the resulting report to every session whose deadline has fired. Request
-dispatch, completion, and abort events have no edge into this graph. Topology
-changes only update the expected DP-rank set; the next fire observes it.
+exactly one fire-loop task. It wakes at the earliest active period deadline (or
+session lease expiry), performs one bounded pull, and broadcasts the resulting
+report to every session in all period buckets due at that time. Request dispatch,
+completion, and abort events have no edge into this graph. Topology changes only
+update the expected DP-rank set; the next fire observes it.
 
 ## Push-channel semantics
 
-- **One timer.** `LoadReporterRuntime` owns a single fire-loop task. Sessions
-  are passive bookkeeping (deadline, lease, queue); they own no task and no
-  timer.
+- **One timer.** `LoadReporterRuntime` owns a single fire-loop task and a lazy
+  `report_interval_ms -> period schedule` index. A schedule owns one deadline
+  and all sessions using that interval. Sessions only retain lease, negotiated
+  interval, and queue state; neither sessions nor period schedules own tasks.
 - **One pull per fire.** Each fire reads the Scheduler snapshot exactly once
   (with one bounded retry when the expected DP-rank set changed mid-pull) and
   builds exactly one report.
-- **Broadcast to due sessions.** Every session whose deadline has fired at the
-  fire receives the same report simultaneously. When all Routers negotiate the
-  same interval, every fire broadcasts to every registered Router — a pure push
-  channel anchored by the first registration. When sessions differ, each still
-  receives only at its own negotiated deadline while the shared pull runs at
-  the union of deadlines.
-- **Coalesced registration.** Sessions registered before the next fire share
-  that fire's pull for their initial report.
+- **Broadcast to due periods.** Every session belonging to a period due at the
+  fire receives the same report simultaneously. Periodic deadlines share one
+  reporter-owned monotonic epoch. Routers with the same interval therefore
+  share every periodic pull regardless of registration time; harmonic intervals
+  (for example, 1 s and 2 s) also share their common boundaries. When intervals
+  differ, each session still receives only at its own negotiated deadline while
+  the shared pull runs at the union of the aligned deadline sets.
+- **Lazy period membership.** Registration joins the existing interval schedule
+  or creates one aligned schedule when the interval is first observed. Stop,
+  replacement, and lease expiry remove membership and delete an empty schedule.
+- **Coalesced registration.** Immediate initial delivery is tracked separately
+  from periodic schedules. Sessions registered before the next fire share that
+  fire's pull without resetting an existing period deadline.
 - **No persistent store.** There is no latest-snapshot store and no
   cross-report merge: a report contains only the ranks returned by its own
   pull attempt.
@@ -100,11 +108,12 @@ What the push stream provides over polling:
 ```text
 Scheduler
   -> existing SHM/ZMQ latest LoadSnapshot publication
-  -> reporter single fire timer (min next deadline across Router sessions)
+  -> reporter period index (report_interval_ms -> deadline + sessions)
+  -> single fire loop (min deadline across active periods and session leases)
   -> one bounded snapshot_source.get_loads() per fire
   -> validate this pull's complete DP-rank set (one retry on rank-set change)
   -> build one LoadReport per fire (no previous-report merge)
-  -> broadcast to every session due at this fire (capacity-one queues)
+  -> broadcast to every session in all due periods (capacity-one queues)
   -> bidirectional gRPC streams
 ```
 
@@ -180,9 +189,10 @@ service LoadMonitorService {
   `WorkerFrame(error=StreamError(code="INVALID_FIRST_FRAME"))`.
 - Registration timing must be positive and `router_id` must be non-empty.
   `update_config` distinguishes absent fields from explicit values; every
-  present timing field must be positive and starts a new deadline when the
-  Worker accepts the frame. Invalid input terminates the stream with
-  `StreamError(code="INVALID_ARGUMENT")`.
+  present timing field must be positive. An interval change moves the session
+  to an existing period schedule or creates an epoch-aligned one; it never
+  resets a schedule already used by other sessions. Invalid input terminates
+  the stream with `StreamError(code="INVALID_ARGUMENT")`.
 - `WorkerFrame` = `registered | report | error`. On valid register the Worker
   sends the ack immediately, then a bounded first-fire report, followed by
   periodic `LoadReport`s on the negotiated deadline.
@@ -251,8 +261,9 @@ only; its parameter name is chosen by the Router owner and is not defined here.
 ## Tests and validation
 
 - Unit / integration (CPU, real in-process `grpc.aio`): proto contract, runtime
-  fire loop (coalesced initial broadcast, shared periodic broadcast, per-session
-  deadline gating, pull retry on rank-set change, interval re-anchoring,
+  fire loop (coalesced initial broadcast, shared period buckets, staggered
+  same-period registration, harmonic-period overlap, interval migration and
+  cleanup, missed-tick phase preservation, pull retry on rank-set change,
   stale/error reports, in-flight pulls, re-registration, leases, shutdown),
   validation and report-builder contracts, service handshake/reporting,
   composition-root lifecycle (disabled, owner startup, cleanup, port conflicts,
