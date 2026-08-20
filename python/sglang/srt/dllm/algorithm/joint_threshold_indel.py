@@ -14,6 +14,9 @@ class JointThresholdInDel(DllmAlgorithm):
     Extends JointThreshold to handle edit tokens that modify block structure.
     DELETE removes a position and pads the shortened block with MASK. SPLIT
     inserts MASK before the previous token at that position.
+
+    The post-edit budget is cumulative and is not reset if an original mask
+    reappears. This intentionally differs from the released reference decoder.
     """
 
     def __init__(self, config: DllmConfig):
@@ -23,6 +26,11 @@ class JointThresholdInDel(DllmAlgorithm):
         self.max_post_edit_steps = config.algorithm_config.get(
             "max_post_edit_steps", 16
         )
+        if self.max_post_edit_steps < 0:
+            raise ValueError(
+                "max_post_edit_steps must be non-negative, "
+                f"got {self.max_post_edit_steps}"
+            )
         self.max_regular_update_steps = self.block_size + self.max_post_edit_steps
         self.delete_token_id = config.delete_token_id
         self.split_token_id = config.split_token_id

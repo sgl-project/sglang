@@ -3,13 +3,6 @@ from typing import Any
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.server_args import ServerArgs
 
-INDEL_CHECKPOINT_PARAMS = {
-    "inclusionAI/LLaDA2.2-flash": {
-        "delete_token_id": 156930,
-        "split_token_id": 156931,
-    },
-}
-
 
 class DllmConfig:
     def __init__(
@@ -69,12 +62,6 @@ class DllmConfig:
         if server_args.dllm_algorithm == "JointThresholdInDel":
             delete_token_id = getattr(model_config.hf_config, "delete_token_id", None)
             split_token_id = getattr(model_config.hf_config, "split_token_id", None)
-
-            if delete_token_id is None and split_token_id is None:
-                checkpoint_params = INDEL_CHECKPOINT_PARAMS.get(server_args.model_path)
-                if checkpoint_params is not None:
-                    delete_token_id = checkpoint_params["delete_token_id"]
-                    split_token_id = checkpoint_params["split_token_id"]
 
             if delete_token_id is None or split_token_id is None:
                 override_example = (
