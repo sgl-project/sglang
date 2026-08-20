@@ -72,6 +72,15 @@
     "change": "For greedy Qwen3.5 NEXTN under attention DP, all-gather draft hidden rows, project a rank-local target-head vocab view, gather one (token_id, max_logit) pair per row, and scatter selected ids back to the owning rank. Target sampling and the default-off path are unchanged.",
     "targeted_validation": "py_compile and diff-check pass; four-rank graph/eager identity and matched-B28 serving gates pending"
   },
+  "causal_conv_feature_tile_overlay": {
+    "parent_commit": "f2f98df6c4ee81b35e864f43817be955025b2b8f",
+    "source_commit": "e284e451ad93e511703432e848c5158ff98e4d51",
+    "file": "python/sglang/kernels/ops/mamba/causal_conv1d_triton.py",
+    "baseline_sha256": "8fa1fdc138374bf0685457a6f97e1ffea78f79d5e73cef07e0275c1639efac48",
+    "candidate_sha256": "3cacd28f09453edf18e27b8dcd916f031486f473abcbf0bc70b84a81a8e4e9ea",
+    "change": "Use a 128-wide feature tile only when speculative verification saves intermediate convolution windows; eager and non-speculative paths retain the 256-wide tile.",
+    "targeted_validation": "GB300 job 3159210: output bitwise at B24/B28/B30/B32; candidate saves 0.0919 ms per target step at B28 in the isolated micro. Layer-2 matched-state serving validation is pending."
+  },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
     "tree": "b0161fbca98775c0f79999f4970de1f14a4426fb"
