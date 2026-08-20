@@ -223,9 +223,17 @@ class TestDownBIntoBasePlan:
 
 
 def _into_base_expected(name: str, layout) -> bool:
-    """The into-base epilogue ships on per-expert prefill serial shapes only."""
+    """Which shipped rows run the into-base epilogue.
+
+    Per-expert: the serial prefill shapes. Shared-outer: the SM100
+    token-dedup prefill row, measured 1.8-6.8% of layer time on GB300 and
+    B200 across all three models (configs README). The shared fallback row
+    is expert-major and was not measured, so it stays off; H200's shared row
+    is prefill.shared_rank, whose finalize consumes down-B, so it has no
+    standalone down-B stage to reorder.
+    """
     if layout != False:
-        return False
+        return name == "prefill.token_dedup"
     return name in ("prefill.serial", "fallback.serial_prefill")
 
 
