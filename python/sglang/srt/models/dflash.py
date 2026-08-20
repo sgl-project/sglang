@@ -39,17 +39,19 @@ from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
+    dflash_head_logits,
     get_dflash_attention_sliding_window_size,
     get_dflash_layer_types,
     is_dense_head_weight,
     is_nemotron_35_draft_config,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils import is_npu, set_weight_attrs
+from sglang.srt.utils import is_cpu, is_npu, set_weight_attrs
 from sglang.srt.utils.common import get_compiler_backend
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
+_is_cpu = is_cpu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
@@ -90,8 +92,14 @@ def _project_candidate_logits(
 ) -> torch.Tensor:
     """Project draft hiddens through the target head, restricted to the org vocab."""
     if not use_quant_head:
-        weight = lm_head.weight
-        return torch.matmul(hidden.to(weight.dtype), weight[:num_org].T)
+        logits = dflash_head_logits(lm_head, hidden, 0, num_org)
+        if logits.shape[-1] <= num_org:
+            return logits
+        # An AMX-prepacked head can only produce the full local shard, so the
+        # padded tail is masked out of the top-k like the quantized path below.
+        logits = logits.contiguous()
+        logits[:, num_org:] = float("-inf")
+        return logits
     # A packed weight can't be row-sliced to the org vocab like the dense path,
     # and flashinfer's radix top-k rejects the crop view (non-contiguous), so
     # mask the padded tail out of the top-k instead.
@@ -219,6 +227,8 @@ class DFlashAttention(nn.Module):
         rotary = self.rotary_emb
         self.use_table_qk_norm_rope = (
             not _is_npu
+            # table_qk_norm_rope_ is a Triton kernel with no CPU equivalent.
+            and not _is_cpu
             and hasattr(rotary, "cos_sin_cache")
             and getattr(rotary, "rotary_dim", None) == head_dim
             and getattr(rotary, "is_neox_style", False)

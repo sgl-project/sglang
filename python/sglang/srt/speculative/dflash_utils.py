@@ -19,6 +19,7 @@ from sglang.srt.layers.sampler import (
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.utils.common import use_intel_amx_backend
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
@@ -34,6 +35,9 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
         "TritonAttnBackend",
         "TRTLLMHAAttnBackend",
         "TRTLLMMLABackend",
+        # The CPU kernel applies causal masking to the verify block on its own
+        # when the proposal is a linear chain (tree_topk == 1).
+        "IntelAMXAttnBackend",
     }
 )
 
@@ -735,7 +739,42 @@ def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
         )
     if not hasattr(qkv_proj, "weight"):
         return False, "qkv weight tensor is missing"
+    if use_intel_amx_backend(qkv_proj):
+        # The AMX path repacks the weight into a blocked VNNI layout, so its rows
+        # no longer map to q/k/v output ranges and a plain F.linear against it
+        # would read the packed bytes as if they were a dense matrix.
+        return False, "AMX-prepacked qkv_proj weight cannot be sliced"
     return True, ""
+
+
+def dflash_head_logits(
+    lm_head: Any,
+    hidden_states: torch.Tensor,
+    start: int = 0,
+    end: Optional[int] = None,
+) -> torch.Tensor:
+    """Logits for rows ``[start:end)`` of a dense target lm_head weight.
+
+    On CPU with AMX the head weight is prepacked, so the rows cannot be sliced
+    before the matmul; the packed kernel produces the full local shard and the
+    requested range is taken from the output instead.
+    """
+    weight = lm_head.weight
+    if hidden_states.dtype != weight.dtype:
+        hidden_states = hidden_states.to(weight.dtype)
+    if use_intel_amx_backend(lm_head):
+        logits = torch.ops.sgl_kernel.weight_packed_linear(
+            hidden_states.contiguous(),
+            weight,
+            None,  # bias
+            True,  # is_vnni
+        )
+        if start != 0 or end is not None:
+            logits = logits[:, start : logits.shape[-1] if end is None else end]
+        return logits
+    if start != 0 or end is not None:
+        weight = weight[start:end]
+    return torch.matmul(hidden_states, weight.T)
 
 
 def can_dflash_use_fused_qkv_proj(qkv_proj: Any) -> Tuple[bool, str]:

@@ -49,6 +49,7 @@ from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
+    dflash_head_logits,
     is_dense_head_weight,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
@@ -70,9 +71,10 @@ from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
 )
-from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
+from sglang.srt.utils import get_available_gpu_memory, is_cpu, is_cuda, is_hip, is_npu
 
 _is_npu = is_npu()
+_is_cpu = is_cpu()
 
 
 logger = logging.getLogger(__name__)
@@ -462,7 +464,8 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def init_cuda_graphs(self):
         capture_decode_cuda_graph = (
-            get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
+            not _is_cpu
+            and get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
         )
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -1109,7 +1112,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             for start in range(0, num_tokens, int(chunk_size)):
                 end = min(num_tokens, start + int(chunk_size))
                 hs = _cast_hs(hidden_states[start:end])
-                logits = torch.matmul(hs, weight.T)
+                logits = dflash_head_logits(lm_head, hs)
                 out_tokens[start:end] = torch.argmax(logits, dim=-1).to(torch.long)
             return out_tokens
 
@@ -1164,7 +1167,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 end = min(num_tokens, start + fast_chunk_size)
                 hs = _cast_hs(hidden_states[start:end])
                 if num_org > 0:
-                    base_logits = torch.matmul(hs, weight[:num_org].T)
+                    base_logits = dflash_head_logits(lm_head, hs, 0, num_org)
                     local_max, local_arg = _ensure_local_reduce_buffers(
                         end - start, base_logits.dtype, hs.device
                     )
@@ -1182,7 +1185,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             # Base vocab logits.
             if num_org > 0:
-                base_logits = torch.matmul(hs, weight[:num_org].T)
+                base_logits = dflash_head_logits(lm_head, hs, 0, num_org)
                 local_max, local_arg = _ensure_local_reduce_buffers(
                     chunk_len, base_logits.dtype, hs.device
                 )
@@ -1202,8 +1205,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             if num_added > 0:
                 added_slice_start = num_org_padded
                 added_slice_end = num_org_padded + num_added
-                added_logits = torch.matmul(
-                    hs, weight[added_slice_start:added_slice_end].T
+                added_logits = dflash_head_logits(
+                    lm_head, hs, added_slice_start, added_slice_end
                 )
                 added_max, added_arg = torch.max(added_logits, dim=-1)
                 use_added = added_max > local_max
@@ -1754,10 +1757,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         # `seq_lens` is carried over from the previous overlap iteration and may have been
-        # produced on another stream.
-        batch.seq_lens.record_stream(
-            torch.get_device_module(self.device).current_stream()
-        )
+        # produced on another stream. CPU tensors have no stream to record against.
+        if not _is_cpu:
+            batch.seq_lens.record_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
 
         bs = len(batch.seq_lens)
         device = self.device
