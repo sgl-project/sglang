@@ -324,7 +324,7 @@ jobs:
         run: |
           docker build -t sgl-router-fake-worker:e2e \
             -f experimental/sgl-router/tests/e2e/k8s_integration/Dockerfile.fake_worker \
-            experimental/sgl-router/tests/e2e/k8s_integration/
+            .
       - name: Bootstrap kind + deploy
         run: bash experimental/sgl-router/tests/e2e/k8s_integration/setup.sh
       - name: Set up Python

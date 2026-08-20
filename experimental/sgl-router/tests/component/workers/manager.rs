@@ -473,6 +473,7 @@ async fn manager_emits_single_server_info_fetch_per_worker() {
         None,
         Some(kv_index.clone()),
         None,
+        None,
     ));
 
     tx.send(DiscoveryEvent::Added(spec_for(

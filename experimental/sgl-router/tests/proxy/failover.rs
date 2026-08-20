@@ -47,6 +47,7 @@ async fn failover_when_one_worker_dies() {
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
+        load_monitor: Default::default(),
     };
 
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -58,6 +59,7 @@ async fn failover_when_one_worker_dies() {
         event_rx,
         registry.clone(),
         Some(Arc::new(cfg.clone())),
+        None,
         None,
         None,
     ));

@@ -92,6 +92,12 @@ async fn main() -> Result<()> {
         cfg.server.port
     );
 
+    // The Router owns one outbound monitor session per discovered Worker.
+    // No Router-side gRPC listener or HTTP registration callback is needed.
+    let load_monitor = Arc::new(sgl_router::load_monitor::LoadMonitor::new(
+        cfg.load_monitor.clone(),
+    ));
+
     let tokenizers = Arc::new(
         sgl_router::tokenizer::TokenizerRegistry::load_from_config(&cfg)
             .context("load tokenizers")?,
@@ -154,6 +160,7 @@ async fn main() -> Result<()> {
         Some(Arc::new(cfg.clone())),
         kv_index_opt,
         Some(Arc::clone(&active_load)),
+        Some(Arc::clone(&load_monitor)),
     ));
 
     let proxy = Arc::new(
@@ -194,6 +201,7 @@ async fn main() -> Result<()> {
     // exits — useful for tracing tail logs.
     discovery_handle.abort();
     manager_handle.abort();
+    load_monitor.shutdown().await;
     janitor_handle.shutdown().await;
     server_result
 }

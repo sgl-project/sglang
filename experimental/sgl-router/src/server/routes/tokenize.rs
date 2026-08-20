@@ -128,6 +128,7 @@ mod tests {
                 },
             ),
             proxy: crate::config::ProxyConfig::default(),
+            load_monitor: Default::default(),
             active_load: crate::config::ActiveLoadConfig::default(),
         };
         let registry = crate::tokenizer::TokenizerRegistry::load_from_config(&cfg).unwrap();

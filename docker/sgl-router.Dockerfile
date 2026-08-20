@@ -37,6 +37,8 @@ RUN cargo install cargo-chef --locked --version ^0.1
 WORKDIR /work
 COPY experimental/sgl-router/Cargo.toml ./
 COPY experimental/sgl-router/rust-toolchain.toml ./
+COPY experimental/sgl-router/build.rs ./
+COPY proto/sglang/router/loadmonitor/v1/load_monitor.proto /proto/sglang/router/loadmonitor/v1/load_monitor.proto
 # Stub a minimal src tree so cargo can resolve the workspace, generate
 # the lockfile (gitignored upstream), then prepare the chef recipe.
 RUN mkdir -p src && echo "fn main() {}" > src/main.rs \
@@ -61,6 +63,7 @@ ENV PCRE2_SYS_STATIC=1
 COPY --from=chef /work/recipe.json ./recipe.json
 COPY --from=chef /work/Cargo.lock ./Cargo.lock
 COPY experimental/sgl-router/rust-toolchain.toml ./
+COPY proto/sglang/router/loadmonitor/v1/load_monitor.proto /proto/sglang/router/loadmonitor/v1/load_monitor.proto
 
 # Cook (compile + cache) the dep graph from the recipe. This layer's
 # inputs are recipe.json + the toolchain — code changes in src/ do NOT
@@ -69,6 +72,7 @@ RUN cargo chef cook --release --recipe-path recipe.json
 
 # Now bring in the real sources and the manifest they need.
 COPY experimental/sgl-router/Cargo.toml ./
+COPY experimental/sgl-router/build.rs ./
 COPY experimental/sgl-router/src ./src
 
 # --locked is intentionally omitted: the lockfile is generated in-container
