@@ -392,9 +392,9 @@ def main() -> None:
         )
         for repetition in range(1, args.start_repetition):
             repetition_dir = output_root / f"rep{repetition:02d}"
-            recorded_order = json.loads(
-                (repetition_dir / "order.json").read_text()
-            )["order"]
+            recorded_order = json.loads((repetition_dir / "order.json").read_text())[
+                "order"
+            ]
             if recorded_order != expected_order(repetition):
                 raise ValueError(f"rep{repetition:02d} provider order drifted")
             resume_validation_name = (
