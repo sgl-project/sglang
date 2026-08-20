@@ -1559,19 +1559,25 @@ class DeepseekV4AscendAttnBackend(
         }
         # The host metadata op reads CPU int32 mirrors — never a D2H sync of the
         # device tensors (that would drain the stream and stall overlapped prep).
-        # cu_q mirror is sized for its graph bucket; slice down to this batch.
-        cu_q_cpu = fm.actual_seq_lengths_q_pa_cpu
-        if cu_q_cpu is not None and cu_q_cpu.numel() > bs + 1:
-            cu_q_cpu = cu_q_cpu[: bs + 1]
-        host_inputs = {"seqused_kv": fm.seq_lens_cpu_int[:bs].int()}
-        if cu_q_cpu is not None:
-            host_inputs["cu_seqlens_q"] = cu_q_cpu
-        c1a_kwargs = base_kwargs | common | host_inputs
-        kernel_metadata = {
-            "c1a_metadata": torch.ops.npu.sparse_attn_sharedkv_metadata_host(
-                **c1a_kwargs
-            )
-        }
+        c1a_kwargs = base_kwargs | common
+        if self._use_host_sparse_metadata:
+            cu_q_cpu = fm.actual_seq_lengths_q_pa_cpu
+            if cu_q_cpu is not None and cu_q_cpu.numel() > bs + 1:
+                cu_q_cpu = cu_q_cpu[: bs + 1]
+            host_inputs = {"seqused_kv": fm.seq_lens_cpu_int[:bs].int()}
+            if cu_q_cpu is not None:
+                host_inputs["cu_seqlens_q"] = cu_q_cpu
+            c1a_kwargs = c1a_kwargs | host_inputs
+            metadata_op = torch.ops.npu.sparse_attn_sharedkv_metadata_host
+        else:
+            # The device-side op requires tensor args for backend dispatch; pass
+            # the device mirrors just like the pre-refactor call did.
+            c1a_kwargs = c1a_kwargs | {
+                "cu_seqlens_q": actual_seq_lengths_q_pa,
+                "seqused_kv": actual_seq_lengths_kv,
+            }
+            metadata_op = torch.ops.custom.npu_sparse_attn_sharedkv_metadata
+        kernel_metadata = {"c1a_metadata": metadata_op(**c1a_kwargs)}
 
         if self._dsv4_has_c4:
             c4a_overrides = {
