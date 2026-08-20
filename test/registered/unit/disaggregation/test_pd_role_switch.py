@@ -400,7 +400,10 @@ class TestMooncakeTeardownNoThreadLeak(unittest.TestCase):
         m._monitor_cache = {}
         m.engine = MagicMock()
         m.kv_args = SimpleNamespace(
-            kv_data_ptrs=[], aux_data_ptrs=[], state_data_ptrs=[]
+            kv_data_ptrs=[],
+            kv_data_lens=[],
+            aux_data_ptrs=[],
+            state_data_ptrs=[],
         )
         for i, (q, ex) in enumerate(zip(m.transfer_queues, m.executors)):
             t = threading.Thread(
@@ -457,6 +460,8 @@ class TestMooncakeBootstrapThreadRobustness(unittest.TestCase):
         # The receive path is gated on this flag: role switch must be on for
         # the poll-with-timeout loop these tests exercise.
         m.server_args = SimpleNamespace(enable_pd_role_switch=True)
+        # Read by the receive loop; off keeps these tests on the plain ACK path.
+        m.enable_deferred_decode_kv_release = False
         # ABORT for an unknown room takes the "ignoring" branch and still
         # ACKs, giving a side-effect-free probe of the receive loop.
         m.request_status = {}
