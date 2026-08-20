@@ -11,7 +11,7 @@
 //! SSE streaming, and so on — is implemented purely in Rust and never touches
 //! a `PyObject`.
 
-mod http_server;
+mod api_server;
 mod message;
 mod multi_modality;
 mod tokenizer_manager;
