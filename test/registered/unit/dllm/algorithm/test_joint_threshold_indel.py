@@ -106,6 +106,12 @@ class TestJointThresholdInDelInitialization(CustomTestCase):
             state["prompt_index"].tolist(), [True, False, False, False, False]
         )
 
+    def test_negative_max_post_edit_steps_is_rejected(self):
+        with self.assertRaisesRegex(
+            ValueError, "max_post_edit_steps must be non-negative, got -34"
+        ):
+            JointThresholdInDel(make_config(block_size=32, max_post_edit_steps=-34))
+
     def test_missing_edit_token_ids_preserves_constructor_error(self):
         config = make_config(delete_token_id=None, split_token_id=None)
 
@@ -124,28 +130,7 @@ class TestJointThresholdInDelInitialization(CustomTestCase):
             get_algorithm(config)
 
     @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
-    def test_official_llada22_config_provides_edit_token_ids(self, mock_model_config):
-        mock_model_config.return_value.hf_config = SimpleNamespace(
-            architectures=["LLaDA2MoeModelLM"]
-        )
-        server_args = SimpleNamespace(
-            dllm_algorithm="JointThresholdInDel",
-            model_path="inclusionAI/LLaDA2.2-flash",
-            revision=None,
-            max_running_requests=None,
-            dllm_algorithm_config=None,
-            dllm_fdfo=True,
-        )
-
-        config = DllmConfig.from_server_args(server_args)
-
-        self.assertEqual(config.delete_token_id, 156930)
-        self.assertEqual(config.split_token_id, 156931)
-        self.assertEqual(config.max_running_requests, 1)
-        self.assertTrue(config.first_done_first_out_mode)
-
-    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
-    def test_explicit_checkpoint_edit_token_ids_enable_indel(self, mock_model_config):
+    def test_checkpoint_metadata_enables_indel(self, mock_model_config):
         mock_model_config.return_value.hf_config = SimpleNamespace(
             architectures=["LLaDA2MoeModelLM"],
             delete_token_id=9,
@@ -155,54 +140,55 @@ class TestJointThresholdInDelInitialization(CustomTestCase):
             dllm_algorithm="JointThresholdInDel",
             model_path="local/indel-checkpoint",
             revision=None,
-            max_running_requests=4,
+            max_running_requests=None,
             dllm_algorithm_config=None,
-            dllm_fdfo=False,
+            dllm_fdfo=True,
         )
 
         config = DllmConfig.from_server_args(server_args)
 
         self.assertEqual(config.delete_token_id, 9)
         self.assertEqual(config.split_token_id, 10)
+        self.assertEqual(config.max_running_requests, 1)
+        self.assertTrue(config.first_done_first_out_mode)
 
     @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
-    def test_unsupported_checkpoint_rejects_indel_at_startup(self, mock_model_config):
-        mock_model_config.return_value.hf_config = SimpleNamespace(
-            architectures=["LLaDA2MoeModelLM"]
-        )
-        server_args = SimpleNamespace(
-            dllm_algorithm="JointThresholdInDel",
-            model_path="inclusionAI/LLaDA2.0-mini",
-            revision=None,
-            max_running_requests=4,
-            dllm_algorithm_config=None,
-            dllm_fdfo=False,
-        )
+    def test_incomplete_checkpoint_edit_token_ids_are_rejected(self, mock_model_config):
+        test_cases = [
+            ("inclusionAI/LLaDA2.2-flash", None, None),
+            ("inclusionAI/LLaDA2.0-mini", None, None),
+            ("local/incomplete-indel-checkpoint", 9, None),
+            ("local/incomplete-indel-checkpoint", None, 10),
+        ]
 
-        with self.assertRaises(RuntimeError) as context:
-            DllmConfig.from_server_args(server_args)
+        for model_path, delete_token_id, split_token_id in test_cases:
+            with self.subTest(
+                model_path=model_path,
+                delete_token_id=delete_token_id,
+                split_token_id=split_token_id,
+            ):
+                hf_config = {"architectures": ["LLaDA2MoeModelLM"]}
+                if delete_token_id is not None:
+                    hf_config["delete_token_id"] = delete_token_id
+                if split_token_id is not None:
+                    hf_config["split_token_id"] = split_token_id
+                mock_model_config.return_value.hf_config = SimpleNamespace(**hf_config)
+                server_args = SimpleNamespace(
+                    dllm_algorithm="JointThresholdInDel",
+                    model_path=model_path,
+                    revision=None,
+                    max_running_requests=4,
+                    dllm_algorithm_config=None,
+                    dllm_fdfo=False,
+                )
 
-        message = str(context.exception)
-        self.assertIn("inclusionAI/LLaDA2.0-mini", message)
-        self.assertIn("delete_token_id and split_token_id", message)
-        self.assertIn("--json-model-override-args", message)
+                with self.assertRaises(RuntimeError) as context:
+                    DllmConfig.from_server_args(server_args)
 
-    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
-    def test_partial_checkpoint_edit_token_ids_are_rejected(self, mock_model_config):
-        mock_model_config.return_value.hf_config = SimpleNamespace(
-            architectures=["LLaDA2MoeModelLM"], delete_token_id=9
-        )
-        server_args = SimpleNamespace(
-            dllm_algorithm="JointThresholdInDel",
-            model_path="local/incomplete-indel-checkpoint",
-            revision=None,
-            max_running_requests=4,
-            dllm_algorithm_config=None,
-            dllm_fdfo=False,
-        )
-
-        with self.assertRaisesRegex(RuntimeError, "delete_token_id and split_token_id"):
-            DllmConfig.from_server_args(server_args)
+                message = str(context.exception)
+                self.assertIn(model_path, message)
+                self.assertIn("delete_token_id and split_token_id", message)
+                self.assertIn("--json-model-override-args", message)
 
     @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
     def test_non_indel_algorithm_does_not_require_edit_token_ids(
@@ -291,6 +277,28 @@ class TestJointThresholdInDelStructuralEdits(CustomTestCase):
         self.assertEqual(state["prompt_len"], 2)
         self.assertEqual(
             state["prompt_index"].tolist(), [True, True, False, False, False]
+        )
+
+    def test_split_and_delete_move_original_mask_flags_in_step(self):
+        algorithm = JointThresholdInDel(make_config(block_size=5))
+        batch = make_batch([[3, MASK, MASK, MASK, MASK]])
+        state = algorithm.init_step_state(batch)[0]
+        logits = make_logits(
+            [
+                [3],
+                [SPLIT, 5],
+                [DELETE, 6],
+                [7],
+                [8],
+            ]
+        )
+
+        algorithm.step(batch, logits, [state])
+
+        self.assertEqual(batch.input_ids.tolist(), [3, MASK, MASK, 7, 8])
+        self.assertEqual(
+            state["is_orig_mask"].tolist(),
+            [False, False, True, True, True],
         )
 
 
@@ -610,28 +618,6 @@ class TestJointThresholdInDelAntiLoop(CustomTestCase):
 
         self.assertEqual(batch.input_ids.tolist(), [3, 6, 4])
         self.assertEqual(state["sampled_history"][1], {5, 6})
-
-    def test_split_and_delete_move_original_mask_flags_in_step(self):
-        algorithm = JointThresholdInDel(make_config(block_size=5))
-        batch = make_batch([[3, MASK, MASK, MASK, MASK]])
-        state = algorithm.init_step_state(batch)[0]
-        logits = make_logits(
-            [
-                [3],
-                [SPLIT, 5],
-                [DELETE, 6],
-                [7],
-                [8],
-            ]
-        )
-
-        algorithm.step(batch, logits, [state])
-
-        self.assertEqual(batch.input_ids.tolist(), [3, MASK, MASK, 7, 8])
-        self.assertEqual(
-            state["is_orig_mask"].tolist(),
-            [False, False, True, True, True],
-        )
 
 
 if __name__ == "__main__":
