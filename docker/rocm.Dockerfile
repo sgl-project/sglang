@@ -853,11 +853,61 @@ RUN /bin/bash -lc 'set -euo pipefail; \
 
 # -----------------------
 # Hot patch: torch-ROCm
-# Torch wheels may hardcode a pinned triton version (e.g. triton==3.5.1).
-# Patch the installed METADATA in-place to relax "==" pins to ">=", so a
-# newer triton can satisfy the requirement without pip pulling CUDA torch.
-# Works regardless of how torch was installed (local .whl or remote index).
-RUN python3 - <<'PY'
+# rocm720:   torch wheel hardcodes triton==3.5.1; repack the .whl with the pin relaxed.
+# rocm7_15:  torch is pip-installed from an index; patch the installed METADATA in-place.
+# hack.py is written here (flavor-specific) then executed in the next RUN.
+ARG TORCH_ROCM_FILE="torch-2.9.1+rocm7.2.0.lw.git7e1940d4-cp310-cp310-linux_x86_64.whl"
+RUN mkdir /tmp/whl && cd /tmp/whl \
+     && export TORCH_ROCM_FILE="${TORCH_ROCM_FILE}" \
+     && cat > hack.py <<"PY"
+import zipfile, csv, os, re
+from pathlib import Path
+
+fname = os.environ["TORCH_ROCM_FILE"]
+in_whl  = Path("/")   / fname
+out_whl = Path("/tmp")/ fname
+work = Path("/tmp/whl")
+
+# 1) Extract
+with zipfile.ZipFile(in_whl, "r") as z:
+    z.extractall(work)
+
+# 2) Locate dist-info and patch METADATA (edit this logic to match your exact line)
+dist_info = next(work.glob("*.dist-info"))
+meta = dist_info / "METADATA"
+txt = meta.read_text(encoding="utf-8")
+
+# Example: replace one exact requirement form.
+# Adjust the string to match what you actually see.
+pat = r"^Requires-Dist:\s*triton==3.5.1[^\s]*;"
+txt2, n = re.subn(pat, r"triton>=3.5.1;", txt, flags=re.MULTILINE)
+if txt2 == txt:
+    raise SystemExit("Did not find expected Requires-Dist line to replace in METADATA")
+meta.write_text(txt2, encoding="utf-8")
+
+# 3) Hacky step: blank hash/size columns in RECORD
+record = dist_info / "RECORD"
+rows = []
+with record.open(newline="", encoding="utf-8") as f:
+    for r in csv.reader(f):
+        if not r:
+            continue
+        # keep filename, blank out hash and size
+        rows.append([r[0], "", ""])
+with record.open("w", newline="", encoding="utf-8") as f:
+    csv.writer(f).writerows(rows)
+
+# 4) Re-zip as a wheel
+with zipfile.ZipFile(out_whl, "w", compression=zipfile.ZIP_DEFLATED) as z:
+    for p in work.rglob("*"):
+        if p.is_file():
+            z.write(p, p.relative_to(work).as_posix())
+
+print("Wrote", out_whl)
+PY
+
+RUN case "${GPU_ARCH}" in \
+  *rocm7_15*) cat > /tmp/whl/hack.py <<'PY'
 import csv, re, sys
 from pathlib import Path
 from importlib.metadata import Distribution
@@ -886,6 +936,26 @@ with record_path.open(newline="", encoding="utf-8") as f:
 with record_path.open("w", newline="", encoding="utf-8") as f:
     csv.writer(f).writerows(rows)
 PY
+  ;; \
+esac
+
+RUN cd /tmp/whl \
+    && case "${GPU_ARCH}" in \
+      *rocm720*) \
+        echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
+        python hack.py \
+        && python3 -m pip install --force --no-deps /tmp/${TORCH_ROCM_FILE} \
+        && rm -fr /tmp/whl /tmp/${TORCH_ROCM_FILE} \
+        ;; \
+      *rocm7_15*) \
+        echo "ROCm 7.15 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
+        python hack.py \
+        && rm -fr /tmp/whl \
+        ;; \
+      *) \
+        echo "Not rocm720 or rocm7_15 (GPU_ARCH=${GPU_ARCH}), skip patch"; \
+        ;; \
+    esac
 
 
 # transformers 5.12.1: don't follow HF-cache symlinks when hashing custom modules
