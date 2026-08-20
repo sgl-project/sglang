@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import logging
 import threading
 import time
@@ -69,6 +70,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
 from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
     UnifiedSessionRefTracker,
 )
+from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
     NodeId,
@@ -77,10 +79,8 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
     UnifiedTreeNode,
 )
 from sglang.srt.observability.metrics_collector import (
-    STAT_LOGGER_ROLE_STORAGE,
     StorageMetrics,
     StorageMetricsCollector,
-    resolve_collector_class,
 )
 from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.utils.common import ceil_align
@@ -230,6 +230,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
         self.host_pool_group = None  # set by attach_hybrid_pool_to_unified_cache
+        # Owns the storage backend lifecycle; built by init_hicache.
+        self._storage_attachment: Optional[StorageAttachment] = None
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256
         self.prefetch_timeout_base = 1.0
@@ -457,8 +459,12 @@ class UnifiedRadixCache(BasePrefixCache):
         self.load_back_threshold = 10
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
+        # Runtime attach/detach of the L3 backend (startup, admin API, atexit).
+        self._storage_attachment = StorageAttachment(self)
+        atexit.register(self.shutdown)
+
         if storage_backend is not None:
-            self._apply_storage_runtime_config(
+            self._storage_attachment.apply_runtime_config(
                 storage_backend=storage_backend,
                 prefetch_threshold=storage_prefetch_threshold,
                 prefetch_timeout_base=prefetch_timeout_base,
@@ -1036,24 +1042,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 "an MHA or hybrid-SWA HiCache host stack."
             )
 
-        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        device_pools = {PoolName.KV: kv_cache}
-        if isinstance(kv_cache, SWAKVPool):
-            device_pools = {
-                PoolName.KV: kv_cache.full_kv_pool,
-                PoolName.SWA: kv_cache.swa_kv_pool,
-            }
-
-        for name, device_pool in device_pools.items():
-            host_pool = self.host_pool_group.entry_map[name].host_pool
-            if host_pool.logical_size < device_pool.size:
-                raise ValueError(
-                    "Retraction host pool is smaller than its device pool: "
-                    f"pool={name}, host_slots={host_pool.logical_size}, "
-                    f"device_slots={device_pool.size}. Increase --hicache-ratio "
-                    "or --hicache-size."
-                )
-
         for spec in self.sidecar_pool_specs:
             source_size = self.host_pool_group.entry_map[
                 spec.indices_from_pool
@@ -1132,7 +1120,8 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         return self.evict_host(num_tokens)
 
-    def retraction_backup(self, req: Req) -> RetractionBackup:
+    def retraction_backup(self, req: Req) -> Optional[RetractionBackup]:
+        """Back up device KV to the host pool; None when it cannot fit after reclaim."""
         assert req.seqlen > 1
 
         device_indices, extra_transfers = self._retraction_device_transfers(req)
@@ -1141,11 +1130,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self._reclaim_retraction_host(len(device_indices))
             host_indices = self.host_pool_group.alloc(len(device_indices))
         if host_indices is None:
-            raise RuntimeError(
-                "Retraction host KV pool exhausted after reclaim: "
-                f"request={req.rid}, required_slots={len(device_indices)}, "
-                f"available_slots={self.host_pool_group.available_size()}."
-            )
+            return None
 
         resolved = self.cache_controller._resolve_pool_transfers_allocation(
             extra_transfers or None,
@@ -1155,10 +1140,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         if resolved is None and extra_transfers:
             self.host_pool_group.free(host_indices)
-            raise RuntimeError(
-                "Retraction auxiliary host allocation failed after atomic rollback: "
-                f"request={req.rid}, pools={[x.name for x in extra_transfers]}."
-            )
+            return None
 
         backup = RetractionBackup(
             host_indices=host_indices,
@@ -1734,7 +1716,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return False
         if operation.host_indices is None:
             self.cache_controller.terminate_prefetch(operation)
-            self._revoke_pending_prefetch(req_id)
+            self.revoke_pending_prefetch(req_id)
             return True
 
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
@@ -1955,7 +1937,7 @@ class UnifiedRadixCache(BasePrefixCache):
         ) = self.ongoing_prefetch[rid]
         if operation.host_indices is None:
             self.cache_controller.terminate_prefetch(operation)
-            self._revoke_pending_prefetch(rid)
+            self.revoke_pending_prefetch(rid)
             return
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
@@ -2028,7 +2010,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return len(host_indices) if host_indices is not None else 0
         return len(prefetch_key)
 
-    def _revoke_pending_prefetch(self, req_id: str) -> None:
+    def revoke_pending_prefetch(self, req_id: str) -> None:
         info = self.ongoing_prefetch.pop(req_id, None)
         if info is None:
             return
@@ -2090,7 +2072,7 @@ class UnifiedRadixCache(BasePrefixCache):
             if info is None:
                 return True  # aborted/cleaned; nothing to retry
             if operation.is_terminated():
-                self._revoke_pending_prefetch(req_id)
+                self.revoke_pending_prefetch(req_id)
                 return True
 
             if buffer_mode and cc.prefetch_rate_limited():
@@ -2116,7 +2098,7 @@ class UnifiedRadixCache(BasePrefixCache):
             if host_indices is None:
                 if buffer_mode:
                     return False
-                self._revoke_pending_prefetch(req_id)
+                self.revoke_pending_prefetch(req_id)
                 return True
 
             operation.storage_hit_count = alloc_len
@@ -2146,13 +2128,13 @@ class UnifiedRadixCache(BasePrefixCache):
                     continue
                 if operation.is_terminated():
                     # Aborted while the storage query was in flight.
-                    self._revoke_pending_prefetch(req_id)
+                    self.revoke_pending_prefetch(req_id)
                     continue
                 if operation.storage_hit_count < self.prefetch_threshold:
                     # Below-threshold hit: classify + feed the L3 miss
                     # accounting, then revoke (not enough benefit).
                     self._account_prefetch_outcome(operation, revoked=True)
-                    self._revoke_pending_prefetch(req_id)
+                    self.revoke_pending_prefetch(req_id)
                     continue
                 self._invalidate_absent_from_hit_query(operation)
                 self._account_prefetch_outcome(operation, revoked=False)
@@ -2250,62 +2232,30 @@ class UnifiedRadixCache(BasePrefixCache):
             log_metrics=True,
         )
 
-    def _apply_storage_runtime_config(
-        self,
-        *,
-        storage_backend: Optional[str],
-        prefetch_threshold: int,
-        prefetch_timeout_base: float,
-        prefetch_timeout_per_ki_token: float,
-        hicache_storage_pass_prefix_keys: bool,
-        enable_storage: bool,
-        enable_storage_metrics: bool,
-        extra_metric_labels: Optional[dict[str, str]],
-    ) -> None:
-        self.enable_storage = enable_storage
-        self.prefetch_threshold = prefetch_threshold
-        self.prefetch_timeout_base = prefetch_timeout_base
-        self.prefetch_timeout_per_page = (
-            self.page_size / 1024 * prefetch_timeout_per_ki_token
+    def drain_storage_control_queues_local(self) -> None:
+        """Drain the storage control queues without cross-rank synchronization.
+
+        For the detach / shutdown path, where best-effort cleanup matters more than
+        keeping the drained counts identical across ranks. The prefetch-hit queue is
+        deliberately skipped: servicing it would allocate host pages for a prefetch
+        that can no longer complete.
+        """
+        cc = self.cache_controller
+        # The storage queues are created by the controller when the storage threads
+        # start, so they are still None when a backend was never attached.
+        if cc is None or cc.prefetch_hit_queue is None:
+            return
+        self._drain_storage_control_queues_impl(
+            n_storage_hit=0,
+            n_backup=None,
+            n_release=None,
+            extra_release_counts={
+                name: None for name in cc.extra_host_mem_release_queues
+            },
+            log_metrics=False,
         )
-        self.hicache_storage_pass_prefix_keys = hicache_storage_pass_prefix_keys
-        self.enable_storage_metrics = enable_storage_metrics
 
-        if self.enable_storage_metrics:
-            attn_cp_rank, attn_cp_size = (
-                self.cache_controller.get_attn_cp_rank_and_size()
-            )
-            labels = {
-                "storage_backend": storage_backend,
-                "tp_rank": self.cache_controller.tp_rank,
-                "dp_rank": self.cache_controller.dp_rank,
-                "pp_rank": self.cache_controller.pp_rank,
-                "pp_size": self.cache_controller.pp_size,
-                "attn_cp_rank": attn_cp_rank,
-                "attn_cp_size": attn_cp_size,
-            }
-            if extra_metric_labels:
-                labels.update(extra_metric_labels)
-            existing_collector = self.storage_metrics_collector
-            if existing_collector is None:
-                from sglang.srt.runtime_context import get_server_args
-
-                storage_cls = resolve_collector_class(
-                    get_server_args(),
-                    STAT_LOGGER_ROLE_STORAGE,
-                    StorageMetricsCollector,
-                )
-                self.storage_metrics_collector = storage_cls(labels=labels)
-            elif set(existing_collector.labels.keys()) == set(labels.keys()):
-                existing_collector.labels = labels
-            else:
-                logger.warning(
-                    "Storage metrics labels changed (%s -> %s). Keep existing labels to avoid duplicate metric registration.",
-                    sorted(existing_collector.labels.keys()),
-                    sorted(labels.keys()),
-                )
-        else:
-            self.storage_metrics_collector = None
+    # ---- HiCache: Storage backend lifecycle (delegated) ----
 
     def attach_storage_backend(
         self,
@@ -2315,30 +2265,40 @@ class UnifiedRadixCache(BasePrefixCache):
         hicache_storage_prefetch_policy: Optional[str] = None,
         hicache_write_policy: Optional[str] = None,
     ) -> tuple[bool, str]:
-        return (
-            False,
-            "UnifiedRadixCache does not support runtime HiCache storage attach yet. "
-            "Configure hicache_storage_backend at startup instead.",
+        """Attach (enable) the HiCache storage backend at runtime."""
+        if self._storage_attachment is None:
+            return (
+                False,
+                "HiCache is not initialized; launch with "
+                "--enable-hierarchical-cache to attach a storage backend.",
+            )
+        return self._storage_attachment.attach(
+            storage_backend=storage_backend,
+            storage_backend_extra_config_json=storage_backend_extra_config_json,
+            served_model_name=served_model_name,
+            hicache_storage_prefetch_policy=hicache_storage_prefetch_policy,
+            hicache_write_policy=hicache_write_policy,
         )
 
     def detach_storage_backend(self) -> tuple[bool, str]:
-        return (
-            False,
-            "UnifiedRadixCache does not support runtime HiCache storage detach yet. "
-            "Restart without hicache_storage_backend to disable it.",
-        )
+        """Detach (disable) the HiCache storage backend at runtime."""
+        if self._storage_attachment is None:
+            return False, "HiCache storage backend is not initialized."
+        return self._storage_attachment.detach()
+
+    def shutdown(self) -> None:
+        """Best-effort auto-detach of the storage backend on process shutdown."""
+        if self._storage_attachment is not None:
+            self._storage_attachment.shutdown()
 
     def clear_storage_backend(self) -> bool:
-        try:
-            ok = self.cache_controller.clear_storage_backend()
-        except Exception as e:
-            logger.error("Failed to clear hierarchical cache storage backend: %s", e)
+        if self._storage_attachment is None:
             return False
+        ok = self._storage_attachment.clear()
         if ok:
             # L3 is empty now: every storage-presence belief is stale, and a
             # retained positive would skip that page's backup forever.
             self.storage_existence_cache.clear()
-            logger.info("Hierarchical cache storage backend cleared successfully!")
         return ok
 
     # ---- HiCache: Async Event Management ----
