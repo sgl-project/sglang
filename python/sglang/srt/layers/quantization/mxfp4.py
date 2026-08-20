@@ -62,7 +62,6 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_triton_kernels_available,
-    is_xpu,
     next_power_of_2,
     round_up,
     set_weight_attrs,
@@ -599,21 +598,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         elif use_intel_xpu_backend():
             # The XPU grouped GEMM recovers K/N from the packed weight shapes and
             # the group size from the scale shape, so it takes the checkpoint
-            # dims unpadded. Keep this ahead of the triton_kernels branch so an
-            # installed triton_kernels does not pad the XPU layout.
-            pass
+            # dims. Keep this ahead of the triton_kernels branch so an installed
+            # triton_kernels does not pad the XPU layout.
+            #
+            # Align to mxfp4_block anyway: gpt_oss.py shards the intermediate by
+            # whole mxfp4 blocks (ceil(blocks / tp) * 32), so a rank's slice can
+            # exceed intermediate_size / tp -- 736 vs 720 for gpt-oss-20b at
+            # tp=4, which overflows an unaligned buffer during load. round_up to
+            # 32 reproduces the loader's shard exactly, so no rows are wasted and
+            # the kernel still sees the true dims.
+            intermediate_size_per_partition_after_pad = round_up(
+                intermediate_size_per_partition, mxfp4_block
+            )
         elif has_triton_kernels:
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, triton_kernels_padding_alignment
-            )
-        elif is_xpu():
-            # gpt_oss.py shards the MoE intermediate by whole mxfp4 blocks
-            # (ceil(blocks / tp) * 32), so a rank's slice can exceed
-            # intermediate_size / tp -- 736 vs 720 for gpt-oss-20b at tp=4. The
-            # branches above absorb that in their own alignment; this path has
-            # none, so pad to 2 * mxfp4_block as the comment above prescribes.
-            intermediate_size_per_partition_after_pad = round_up(
-                intermediate_size_per_partition, 2 * mxfp4_block
             )
 
         self.intermediate_size_per_partition = intermediate_size_per_partition_after_pad
