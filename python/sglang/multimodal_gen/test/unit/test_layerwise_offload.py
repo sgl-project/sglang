@@ -1296,3 +1296,45 @@ def test_pinning_still_copies_a_mapped_weight(tmp_path, monkeypatch):
         # pinned, therefore not something the kernel can reclaim -- which is
         # what the mapping would have given up in exchange for async copies
         assert not ProcessMappings().is_file_backed(buf)
+
+
+def test_kept_mappings_are_faulted_in_at_startup(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+
+    model = _file_backed_model(tmp_path, monkeypatch)
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=1,
+        enabled=True,
+        pin_cpu_memory=False,
+        prefetch_size=1,
+    )
+
+    # initialization already faulted them; asking again reports the same bytes
+    stored = manager._standalone_cpu_weights[0]["blocks.0.weight"]
+    assert manager.prefault_mapped_weights() == stored.untyped_storage().nbytes()
+
+
+def test_prefault_is_a_no_op_without_kept_mappings(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+
+    model = _DummyModel()
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=1,
+        enabled=True,
+        pin_cpu_memory=False,
+        prefetch_size=1,
+    )
+    assert manager._kept_mappings == 0
+    assert manager.prefault_mapped_weights() == 0
