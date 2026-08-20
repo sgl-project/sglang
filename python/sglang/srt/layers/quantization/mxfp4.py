@@ -22,7 +22,6 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
-from packaging.version import InvalidVersion, Version
 from torch.nn.parameter import Parameter
 
 # Silence the TRT-LLM cutlass autotune trace embedded inside FlashInfer's
@@ -65,7 +64,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
     use_intel_amx_backend,
 )
-from sglang.srt.utils.common import get_bool_env_var
+from sglang.srt.utils.common import check_pkg_version_at_least, get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
 
 has_triton_kernels = is_triton_kernels_available()
@@ -105,21 +104,14 @@ if is_flashinfer_available():
     # not duplicate FlashInfer's expert permutation on every forward. The old
     # implementation shipped briefly in 0.6.16 and was reverted from 0.6.17;
     # only enable the corrected ABI starting with the 0.6.18 release line.
-    try:
-        from flashinfer import __version__ as _flashinfer_version
-        from flashinfer import fused_moe as _flashinfer_fused_moe
-
-        # Compare full Versions, not .release[:3]: the release tuple drops
-        # prerelease markers, so 0.6.18rc*/0.6.18.dev* -- cut before the
-        # corrected API landed in the 0.6.18 release -- would slip through.
-        _FI_HAS_SM90_CUTLASS_MXFP4_FP8 = Version(_flashinfer_version) >= Version(
-            "0.6.18"
-        ) and hasattr(
-            _flashinfer_fused_moe,
-            "preprocess_moe_weights_for_sm90_mixed_gemm_humming",
-        )
-    except (ImportError, InvalidVersion):
-        _FI_HAS_SM90_CUTLASS_MXFP4_FP8 = False
+    # check_pkg_version_at_least does a full Version compare (prerelease-
+    # aware, so 0.6.18rc*/dev* stay excluded) and returns False when the
+    # package is absent. The weight processor imports the Humming API
+    # directly, so a build that misreports its version still fails loudly
+    # there.
+    _FI_HAS_SM90_CUTLASS_MXFP4_FP8 = check_pkg_version_at_least(
+        "flashinfer_python", "0.6.18"
+    )
 else:
     _FI_HAS_SM90_CUTLASS_MXFP4 = False
     _FI_HAS_SM90_CUTLASS_MXFP4_FP8 = False

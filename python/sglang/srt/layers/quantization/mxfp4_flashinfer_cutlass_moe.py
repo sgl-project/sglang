@@ -16,7 +16,7 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_flashinfer_available, log_info_on_rank0
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils.common import check_pkg_version_at_least, is_sm120_supported
 
 # Suppress TRT-LLM CUTLASS trace logs without overriding user configuration.
 os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
@@ -45,30 +45,17 @@ class Mxfp4FlashinferCutlassMoEMethod:
                 "path; use `default` for the SM120 MXFP8 path."
             )
         if self._use_sm90_humming:
-            try:
-                from flashinfer import __version__ as flashinfer_version
-                from flashinfer import fused_moe as flashinfer_fused_moe
-                from packaging.version import Version
-
-                # Full Version compare: .release[:3] drops prerelease
-                # markers and would accept 0.6.18rc*/dev* builds that predate
-                # the corrected API. InvalidVersion is a ValueError, so the
-                # except below still covers a malformed version string.
-                has_corrected_humming_api = Version(flashinfer_version) >= Version(
-                    "0.6.18"
-                ) and hasattr(
-                    flashinfer_fused_moe,
-                    "preprocess_moe_weights_for_sm90_mixed_gemm_humming",
-                )
-            except (ImportError, ValueError):
-                has_corrected_humming_api = False
-            if not has_corrected_humming_api:
+            # TODO: Remove this feature-specific check once the global
+            # FlashInfer dependency is upgraded to >= 0.6.18 (0.6.17
+            # intentionally reverted the per-expert Humming API of #3738; the
+            # corrected ABI of #4431 ships from 0.6.18). The weight processor
+            # imports the API directly, so a build that misreports its version
+            # still fails loudly there.
+            if not check_pkg_version_at_least("flashinfer_python", "0.6.18"):
                 raise RuntimeError(
-                    "flashinfer_mxfp4_moe_precision=fp8 on SM90 requires "
-                    "the corrected per-expert Humming API from FlashInfer "
-                    ">= 0.6.18. FlashInfer 0.6.17 intentionally reverted "
-                    "PR #3738; upgrade FlashInfer or use `default`/`bf16` "
-                    "for the existing W4A16 path."
+                    "`--flashinfer-mxfp4-moe-precision fp8` (SM90 Humming) "
+                    "requires FlashInfer >= 0.6.18; upgrade flashinfer-python "
+                    "or use `default`/`bf16` for the W4A16 path."
                 )
         self._fp8 = fp8_method
         self.prefix = prefix
