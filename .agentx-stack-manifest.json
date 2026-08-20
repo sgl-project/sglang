@@ -86,9 +86,9 @@
     "files": {
       "python/sglang/srt/disaggregation/decode.py": "03611b7f4a626de0afe2d5b724b157770862f208b3044eed3e3b225aca54c69b",
       "python/sglang/srt/managers/scheduler_components/request_receiver.py": "8afa6a5f6ce94604711fa07fa8cad4b96e59dbf524cab755b442b2ddfcc65142",
-      "python/sglang/srt/utils/nvtx_utils.py": "2677f54d48e40ffee01e2ee3320d1c608fb5ec924a515d1fa948ca671a51e062"
+      "python/sglang/srt/utils/nvtx_utils.py": "ab6d4d569d1c0b064eee90ca3ffe93d33177d058e817cea33d3041d8c951bbf4"
     },
-    "change": "Add profiler-gated NVTX ranges around Layer-2 receive, DP-rank query, admission, running-batch update, and DP-sync stages. Default execution remains a shared no-op when scheduler NVTX and torch profiling are disabled.",
+    "change": "Add profiler-gated NVTX ranges around Layer-2 receive, DP-rank query, admission, running-batch update, and DP-sync stages. Prefer the optional nvtx package and use torch.cuda.nvtx when it is absent. Default execution remains a shared no-op when scheduler NVTX and torch profiling are disabled.",
     "scope": "Diagnostic source only; no performance result or production optimization claim."
   },
   "srt_slurm": {
