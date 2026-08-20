@@ -1,5 +1,7 @@
 import bisect
+import ctypes
 import re
+import resource
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from typing import Any, Dict, List, Set, Tuple
@@ -92,6 +94,32 @@ def compute_streamed_layers(
 # Adapted from skywork AI Infra diffusion optimize
 # Below this a table is not worth a per-request round trip; above it the ratio
 # of table size to rows actually read makes residency clearly wasteful.
+# MADV_WILLNEED asks for asynchronous readahead of a mapping's pages. Only
+# meaningful where weights are left on a file mapping, so it is bound lazily and
+# stays None anywhere libc does not offer it.
+_MADV_WILLNEED = 3
+
+
+def _bind_madvise():
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    except OSError:
+        return None
+    fn = getattr(libc, "madvise", None)
+    if fn is None:
+        return None
+    fn.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+    fn.restype = ctypes.c_int
+
+    def advise(address: int, length: int) -> None:
+        fn(ctypes.c_void_p(address), ctypes.c_size_t(length), _MADV_WILLNEED)
+
+    return advise
+
+
+_madvise_willneed = _bind_madvise()
+
+
 HOST_RESIDENT_TABLE_MIN_BYTES = 256 * 1024**2
 
 
@@ -297,6 +325,9 @@ class LayerwiseOffloadManager:
         # A snapshot of this process's mappings, taken now because the weights
         # have just been loaded and their mappings exist.
         self._mapped_regions = MappedRegions()
+        self._readahead_page_size = (
+            resource.getpagesize() if _madvise_willneed is not None else None
+        )
         # Store forward hooks for removal
         self._forward_hooks: List[Any] = []
 
@@ -389,6 +420,40 @@ class LayerwiseOffloadManager:
         restore_host_resident_tables(host_resident, self.device)
 
         self._finalize_initialization()
+
+    def _advise_mapped_readahead(self, layer_idx: int) -> None:
+        """Ask the kernel to fault in a mapped layer before it is needed.
+
+        A mapped weight is copied to the device synchronously, so when the page
+        cache has dropped its pages the read happens on the critical path. This
+        is asynchronous readahead over one layer's range: free when the pages
+        are already resident, and overlapped with the current layer's compute
+        when they are not.
+
+        One call per layer rather than per weight -- a layer's mapped tensors are
+        slices of the same checkpoint shard, so advising min..max covers them
+        together and keeps this to one syscall per prefetch.
+        """
+        if self._readahead_page_size is None:
+            return
+        weights = self._mapped_cpu_weights.get(layer_idx)
+        if not weights:
+            return
+        low = None
+        high = None
+        for tensor in weights.values():
+            storage = tensor.untyped_storage()
+            start = storage.data_ptr()
+            if start == 0:
+                continue
+            end = start + storage.nbytes()
+            low = start if low is None else min(low, start)
+            high = end if high is None else max(high, end)
+        if low is None or high <= low:
+            return
+        page = self._readahead_page_size
+        aligned = low - (low % page)
+        _madvise_willneed(aligned, high - aligned)
 
     def _keep_weights_on_their_mapping(self, layer_groups: Dict) -> bool:
         """Whether to leave file-backed weights on their mapping.
@@ -733,6 +798,10 @@ class LayerwiseOffloadManager:
 
             # restore model's weights by their metadata using the same copy stream
             # so the recorded event covers both flat-buffer and stride-preserving copies.
+            # The layer after this one is the next to be read: advise it now so
+            # the kernel reads while this layer computes, not when it is wanted.
+            self._advise_mapped_readahead((layer_idx + 1) % max(1, self.num_layers))
+
             for name, meta in self._weight_metadata[layer_idx].items():
                 target = self.get_target_with_name(name)
                 if meta.get("mapped", False):
