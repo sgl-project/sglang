@@ -108,12 +108,14 @@ class KimiK3Detector(BaseFormatDetector):
         tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
         thinking_mode: bool = False,
         parallel_tool_calls: bool = True,
+        response_channel_open: bool = False,
     ) -> StructuralTag:
         return get_kimik3_structural_tag(
             tools=tools or [],
             tool_choice=tool_choice,
             thinking_mode=thinking_mode,
             parallel_tool_calls=parallel_tool_calls,
+            response_channel_open=response_channel_open,
         )
 
     def _decode_call(self, attrs: str, body: str) -> dict | None:
