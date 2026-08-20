@@ -245,6 +245,132 @@ class TestRadixKey(unittest.TestCase):
         # Full match of a long key: the gallop must reach the end.
         self._assert_match(base, base[:], 64, (2000 // 64) * 64)
 
+    def test_match_with_other_start(self):
+        """A logical offset matches a suffix without materializing that suffix."""
+        other = RadixKey(array("q", [90, 91, 1, 2, 3, 4, 99]), limit=6)
+        self.assertEqual(
+            RadixKey(array("q", [1, 2, 3, 4])).match(other, other_start=2), 4
+        )
+        self.assertEqual(
+            RadixKey(array("q", [1, 2, 8, 4])).match(other, other_start=2), 2
+        )
+        self.assertEqual(
+            RadixKey(array("q", [1, 2, 3, 8])).match(other, page_size=4, other_start=2),
+            0,
+        )
+        self.assertEqual(
+            RadixKey(array("q", [1, 2, 3, 4]), is_bigram=True).match(
+                RadixKey(
+                    array("q", [90, 91, 1, 2, 3, 4, 99]),
+                    is_bigram=True,
+                    limit=6,
+                ),
+                other_start=2,
+            ),
+            3,
+        )
+        with self.assertRaises(ValueError):
+            RadixKey(array("q", [1])).match(other, other_start=len(other) + 1)
+        with self.assertRaises(ValueError):
+            RadixKey(array("q", [1])).match(other, other_start=-1)
+
+    def test_match_with_other_start_matches_sliced_suffix(self):
+        """The cursor path is equivalent to the legacy suffix-copy path."""
+        raw_tokens = array("q", ((index * 17 + 3) % 251 for index in range(145)))
+
+        for is_bigram in (False, True):
+            for limit in (None, 0, 1, 2, 7, 64, 65, 144, 145):
+                other = RadixKey(
+                    raw_tokens,
+                    extra_key="class-a",
+                    is_bigram=is_bigram,
+                    limit=limit,
+                    cache_salt="tenant-a",
+                )
+                other_len = len(other)
+                other_starts = {
+                    0,
+                    1,
+                    2,
+                    other_len // 4,
+                    other_len // 2,
+                    (other_len * 3) // 4,
+                    other_len - 2,
+                    other_len - 1,
+                    other_len,
+                }
+                for other_start in sorted(
+                    start for start in other_starts if 0 <= start <= other_len
+                ):
+                    suffix = other[other_start:]
+                    candidate_tokens = [array("q", suffix.token_ids)]
+
+                    # Exercise divergences at the beginning, middle, and end of
+                    # the logical suffix in addition to the full-match case.
+                    raw_suffix_len = len(suffix.token_ids)
+                    for divergence in {
+                        0,
+                        raw_suffix_len // 2,
+                        raw_suffix_len - 1,
+                    }:
+                        if divergence < 0 or divergence >= raw_suffix_len:
+                            continue
+                        divergent = array("q", suffix.token_ids)
+                        divergent[divergence] += 10_000
+                        candidate_tokens.append(divergent)
+
+                    for tokens in candidate_tokens:
+                        candidate = RadixKey(
+                            tokens,
+                            extra_key="class-a",
+                            is_bigram=is_bigram,
+                            cache_salt="tenant-a",
+                        )
+                        for page_size in (1, 4, 64):
+                            context = (
+                                f"{is_bigram=}, {limit=}, {other_start=}, "
+                                f"candidate_len={len(candidate)}, {page_size=}"
+                            )
+                            self.assertEqual(
+                                candidate.match(
+                                    other,
+                                    page_size=page_size,
+                                    other_start=other_start,
+                                ),
+                                candidate.match(suffix, page_size=page_size),
+                                context,
+                            )
+
+    def test_child_key_with_start(self):
+        key = RadixKey(array("q", [90, 91, 1, 2, 3, 4]))
+        self.assertEqual(key.child_key(start=2), 1)
+        self.assertEqual(key.child_key(page_size=3, start=2), (1, 2, 3))
+
+        bigram_key = RadixKey(key.token_ids, is_bigram=True)
+        self.assertEqual(bigram_key.child_key(start=2), (1, 2))
+        self.assertEqual(bigram_key.child_key(page_size=2, start=2), ((1, 2), (2, 3)))
+
+    def test_child_key_with_start_matches_sliced_suffix(self):
+        """An in-place child-key offset preserves the old sliced-key result."""
+        raw_tokens = array("q", range(145))
+        for is_bigram in (False, True):
+            for limit in (None, 1, 4, 64, 65, 144, 145):
+                key = RadixKey(
+                    raw_tokens,
+                    extra_key="class-a",
+                    is_bigram=is_bigram,
+                    limit=limit,
+                    cache_salt="tenant-a",
+                )
+                for page_size in (1, 4, 64):
+                    for start in range(0, len(key) - page_size + 1):
+                        context = f"{is_bigram=}, {limit=}, {page_size=}, {start=}"
+                        self.assertEqual(
+                            key.child_key(page_size, start=start),
+                            key[start:].child_key(page_size),
+                            context,
+                        )
+
     def test_match_bigram(self):
         """is_bigram: L matching raw tokens imply L-1 matching bigrams."""
         self._assert_match([1, 2, 3, 4, 5], [1, 2, 3, 9, 5], 1, 2, is_bigram=True)
