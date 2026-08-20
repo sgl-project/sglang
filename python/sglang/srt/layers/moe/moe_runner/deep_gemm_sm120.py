@@ -71,7 +71,7 @@ def maybe_pre_permute(
     quant_info,
     runner_config: MoeRunnerConfig,
     running_state: dict,
-) -> Optional["DeepGemmRunnerInput"]:
+) -> Optional[DeepGemmRunnerInput]:
     """Contiguous scatter for SM120; ``None`` means use the shared masked path."""
     if not _eligible(hidden_states, quant_info, runner_config):
         return None
@@ -84,7 +84,7 @@ def maybe_post_permute(
     runner_output,
     runner_config: MoeRunnerConfig,
     running_state: dict,
-) -> Optional["StandardCombineInput"]:
+) -> Optional[StandardCombineInput]:
     """Gather matching ``maybe_pre_permute``; ``None`` means fall through."""
     if not running_state.get("contig_mode"):
         return None
@@ -116,7 +116,7 @@ def _pre_permute_standard_contig(
     topk_weights: torch.Tensor,
     runner_config: MoeRunnerConfig,
     running_state: dict,
-) -> "DeepGemmRunnerInput":
+) -> DeepGemmRunnerInput:
     from sglang.kernels.ops.moe.ep_moe_kernels import ep_scatter
     from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
