@@ -89,7 +89,7 @@ def test_worker_records_replica_load_and_runtime_peaks():
     assert metrics.memory_snapshots["runtime_peak"].peak_reserved_mb == 3584.0
 
 
-def test_baseline_config_loads_separate_peak_vram(tmp_path):
+def test_baseline_config_loads_per_scenario_peak_vram(tmp_path):
     path = tmp_path / "baseline.json"
     path.write_text(
         json.dumps(
@@ -106,9 +106,17 @@ def test_baseline_config_loads_separate_peak_vram(tmp_path):
                     }
                 },
                 "sampling": {"step_fractions": [0.0, 1.0]},
-                "scenarios": {},
-                "load_peak_vram_mb": {"case": 1234.5},
-                "runtime_peak_vram_mb": {"case": 2345.6},
+                "scenarios": {
+                    "case": {
+                        "stages_ms": {},
+                        "denoise_step_ms": {},
+                        "expected_e2e_ms": 1.0,
+                        "expected_avg_denoise_ms": 1.0,
+                        "expected_median_denoise_ms": 1.0,
+                        "load_peak_vram_mb": 1234.5,
+                        "runtime_peak_vram_mb": 2345.6,
+                    }
+                },
             }
         ),
         encoding="utf-8",
@@ -116,8 +124,9 @@ def test_baseline_config_loads_separate_peak_vram(tmp_path):
 
     config = BaselineConfig.load(path)
 
-    assert config.load_peak_vram_mb == {"case": 1234.5}
-    assert config.runtime_peak_vram_mb == {"case": 2345.6}
+    scenario = config.scenarios["case"]
+    assert scenario.load_peak_vram_mb == 1234.5
+    assert scenario.runtime_peak_vram_mb == 2345.6
     assert config.tolerances.load_peak_vram == 0.01
     assert config.tolerances.runtime_peak_vram == 0.02
 

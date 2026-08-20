@@ -103,7 +103,7 @@ def _torch_cleanup() -> None:
         pass
 
 
-def _run_case(case: DiffusionTestCase) -> tuple[dict, float, float]:
+def _run_case(case: DiffusionTestCase) -> dict:
     default_port = get_dynamic_server_port()
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
     mgr = ServerManager(
@@ -141,19 +141,23 @@ def _run_case(case: DiffusionTestCase) -> tuple[dict, float, float]:
             if "per_frame_generation" not in perf.stage_metrics:
                 perf.stage_metrics["per_frame_generation"] = perf.e2e_ms / sp.num_frames
 
-        return (
-            {
-                "stages_ms": {k: round(v, 2) for k, v in perf.stage_metrics.items()},
-                "denoise_step_ms": {
-                    str(k): round(v, 2) for k, v in perf.all_denoise_steps.items()
-                },
-                "expected_e2e_ms": round(perf.e2e_ms, 2),
-                "expected_avg_denoise_ms": round(perf.avg_denoise_ms, 2),
-                "expected_median_denoise_ms": round(perf.median_denoise_ms, 2),
+        baseline = {
+            "stages_ms": {k: round(v, 2) for k, v in perf.stage_metrics.items()},
+            "denoise_step_ms": {
+                str(k): round(v, 2) for k, v in perf.all_denoise_steps.items()
             },
-            round(perf.load_peak_vram_mb, 2),
-            round(perf.runtime_peak_vram_mb, 2),
-        )
+            "expected_e2e_ms": round(perf.e2e_ms, 2),
+            "expected_avg_denoise_ms": round(perf.avg_denoise_ms, 2),
+            "expected_median_denoise_ms": round(perf.median_denoise_ms, 2),
+        }
+        if current_platform.is_cuda():
+            baseline.update(
+                {
+                    "load_peak_vram_mb": round(perf.load_peak_vram_mb, 2),
+                    "runtime_peak_vram_mb": round(perf.runtime_peak_vram_mb, 2),
+                }
+            )
+        return baseline
     finally:
         ctx.cleanup()
 
@@ -175,8 +179,6 @@ def main() -> int:
     out_path = Path(args.out) if args.out else baseline_path
     data = json.loads(baseline_path.read_text(encoding="utf-8"))
     scenarios = data.setdefault("scenarios", {})
-    load_peak_vram_mb = data.setdefault("load_peak_vram_mb", {})
-    runtime_peak_vram_mb = data.setdefault("runtime_peak_vram_mb", {})
 
     ids = set(args.case) if args.case else None
     pat = re.compile(args.match) if args.match else None
@@ -205,12 +207,10 @@ def main() -> int:
     for c in cases:
         prev = scenarios.get(c.id, {})
         note = prev.get("notes")
-        baseline, load_peak_vram, runtime_peak_vram = _run_case(c)
+        baseline = _run_case(c)
         if note is not None:
             baseline["notes"] = note
         scenarios[c.id] = baseline
-        load_peak_vram_mb[c.id] = load_peak_vram
-        runtime_peak_vram_mb[c.id] = runtime_peak_vram
         sys.stdout.write(f"{c.id}\n")
         sys.stdout.flush()
         _torch_cleanup()

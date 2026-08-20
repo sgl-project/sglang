@@ -79,19 +79,5 @@
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 300.0
         }
-    },
-    "load_peak_vram_mb": {
-        "flux1_modelopt_nvfp4_t2i": 18116.0,
-        "flux2_modelopt_nvfp4_t2i": 26420.0,
-        "ideogram4_nvfp4_t2i": 14744.0,
-        "qwen_image_2512_modelopt_nvfp4_t2i": 17426.0,
-        "wan22_modelopt_nvfp4_t2v": 8852.0
-    },
-    "runtime_peak_vram_mb": {
-        "flux1_modelopt_nvfp4_t2i": 23104.0,
-        "flux2_modelopt_nvfp4_t2i": 32678.0,
-        "ideogram4_nvfp4_t2i": 34912.0,
-        "qwen_image_2512_modelopt_nvfp4_t2i": 20426.0,
-        "wan22_modelopt_nvfp4_t2v": 17412.0
     }
 }

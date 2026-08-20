@@ -412,18 +412,7 @@ class DiffusionServerBase:
         scenario = BASELINE_CONFIG.scenarios.get(case.id)
         missing_scenario = False
         if scenario is None:
-            # Create dummy scenario to allow metric collection
-            scenario = type(
-                "DummyScenario",
-                (),
-                {
-                    "expected_e2e_ms": 0,
-                    "expected_avg_denoise_ms": 0,
-                    "expected_median_denoise_ms": 0,
-                    "stages_ms": {},
-                    "denoise_step_ms": {},
-                },
-            )()
+            scenario = ScenarioConfig({}, {}, 0, 0, 0)
             if not is_baseline_generation_mode:
                 missing_scenario = True
 
@@ -460,12 +449,8 @@ class DiffusionServerBase:
                 return
 
             if current_platform.is_cuda():
-                expected_load_peak_vram_mb = BASELINE_CONFIG.load_peak_vram_mb.get(
-                    case.id
-                )
-                expected_runtime_peak_vram_mb = (
-                    BASELINE_CONFIG.runtime_peak_vram_mb.get(case.id)
-                )
+                expected_load_peak_vram_mb = scenario.load_peak_vram_mb
+                expected_runtime_peak_vram_mb = scenario.runtime_peak_vram_mb
                 if (
                     expected_load_peak_vram_mb is None
                     or expected_runtime_peak_vram_mb is None
@@ -545,18 +530,15 @@ class DiffusionServerBase:
                 f"avg_denoise={scenario.expected_avg_denoise_ms:.2f}ms, "
                 f"median_denoise={scenario.expected_median_denoise_ms:.2f}ms"
             )
-        expected_load_peak_vram_mb = BASELINE_CONFIG.load_peak_vram_mb.get(case.id)
-        expected_runtime_peak_vram_mb = BASELINE_CONFIG.runtime_peak_vram_mb.get(
-            case.id
-        )
         if (
-            expected_load_peak_vram_mb is not None
-            and expected_runtime_peak_vram_mb is not None
+            scenario is not None
+            and scenario.load_peak_vram_mb is not None
+            and scenario.runtime_peak_vram_mb is not None
         ):
             lines.append(
                 "  peak_vram_baseline: "
-                f"load={expected_load_peak_vram_mb:.0f}MiB, "
-                f"runtime={expected_runtime_peak_vram_mb:.0f}MiB"
+                f"load={scenario.load_peak_vram_mb:.0f}MiB, "
+                f"runtime={scenario.runtime_peak_vram_mb:.0f}MiB"
             )
         if summary.stage_metrics:
             stages = ", ".join(
@@ -597,6 +579,14 @@ class DiffusionServerBase:
             "expected_median_denoise_ms": round(summary.median_denoise_ms, 2),
         }
 
+        if current_platform.is_cuda():
+            baseline.update(
+                {
+                    "load_peak_vram_mb": round(summary.load_peak_vram_mb, 2),
+                    "runtime_peak_vram_mb": round(summary.runtime_peak_vram_mb, 2),
+                }
+            )
+
         if measured_full_time is not None:
             baseline["estimated_full_test_time_s"] = round(measured_full_time, 1)
 
@@ -613,14 +603,6 @@ class DiffusionServerBase:
 {action} this baseline in the "scenarios" section of {get_perf_baseline_path()}:
 
 "{case.id}": {json.dumps(baseline, indent=4)}
-
-and set this entry in the top-level "load_peak_vram_mb" object:
-
-"{case.id}": {round(summary.load_peak_vram_mb, 2)}
-
-and this entry in the top-level "runtime_peak_vram_mb" object:
-
-"{case.id}": {round(summary.runtime_peak_vram_mb, 2)}
 
 """
         logger.error(output)

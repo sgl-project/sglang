@@ -60,6 +60,8 @@
             "expected_e2e_ms": 18255.39,
             "expected_avg_denoise_ms": 338.78,
             "expected_median_denoise_ms": 345.95,
+            "load_peak_vram_mb": 1126.0,
+            "runtime_peak_vram_mb": 13180.0,
             "estimated_full_test_time_s": 94.0
         },
         "wan2_1_t2v_1.3b": {
@@ -82,6 +84,8 @@
             "expected_e2e_ms": 23418.73,
             "expected_avg_denoise_ms": 426.59,
             "expected_median_denoise_ms": 427.94,
+            "load_peak_vram_mb": 4934.0,
+            "runtime_peak_vram_mb": 18246.0,
             "estimated_full_test_time_s": 160.9
         },
         "zimage_image_t2i": {
@@ -104,6 +108,8 @@
             "expected_e2e_ms": 2492.09,
             "expected_avg_denoise_ms": 241.53,
             "expected_median_denoise_ms": 265.1,
+            "load_peak_vram_mb": 13120.0,
+            "runtime_peak_vram_mb": 17776.0,
             "estimated_full_test_time_s": 329.8
         },
         "lingbot_video_moe_t2v": {
@@ -128,19 +134,5 @@
             "expected_median_denoise_ms": 2200.8,
             "estimated_full_test_time_s": 90.0
         }
-    },
-    "load_peak_vram_mb": {
-        "flux_2_klein_base_image_t2i": 1126.0,
-        "flux_image_t2i_layerwise_cpu_offload_5090": 15178.0,
-        "turbo_wan2_1_t2v_1.3b": 4934.0,
-        "wan2_1_t2v_1.3b": 4934.0,
-        "zimage_image_t2i": 13120.0
-    },
-    "runtime_peak_vram_mb": {
-        "flux_2_klein_base_image_t2i": 13180.0,
-        "flux_image_t2i_layerwise_cpu_offload_5090": 25340.0,
-        "turbo_wan2_1_t2v_1.3b": 18222.0,
-        "wan2_1_t2v_1.3b": 18246.0,
-        "zimage_image_t2i": 17776.0
     }
 }

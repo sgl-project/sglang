@@ -113,6 +113,25 @@ class ScenarioConfig:
     expected_avg_denoise_ms: float
     expected_median_denoise_ms: float
     estimated_full_test_time_s: float | None = None
+    load_peak_vram_mb: float | None = None
+    runtime_peak_vram_mb: float | None = None
+
+    @classmethod
+    def from_dict(cls, cfg: dict[str, Any]) -> ScenarioConfig:
+        def optional_float(name: str) -> float | None:
+            value = cfg.get(name)
+            return float(value) if value is not None else None
+
+        return cls(
+            stages_ms=cfg["stages_ms"],
+            denoise_step_ms={int(k): v for k, v in cfg["denoise_step_ms"].items()},
+            expected_e2e_ms=float(cfg["expected_e2e_ms"]),
+            expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
+            expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
+            estimated_full_test_time_s=optional_float("estimated_full_test_time_s"),
+            load_peak_vram_mb=optional_float("load_peak_vram_mb"),
+            runtime_peak_vram_mb=optional_float("runtime_peak_vram_mb"),
+        )
 
 
 @dataclass
@@ -123,8 +142,6 @@ class BaselineConfig:
     step_fractions: Sequence[float]
     tolerances: ToleranceConfig
     improvement_threshold: float
-    load_peak_vram_mb: dict[str, float] = field(default_factory=dict)
-    runtime_peak_vram_mb: dict[str, float] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path) -> BaselineConfig:
@@ -138,16 +155,10 @@ class BaselineConfig:
             data.get("tolerances", {}), profile_name
         )
 
-        scenarios = {}
-        for name, cfg in data["scenarios"].items():
-            scenarios[name] = ScenarioConfig(
-                stages_ms=cfg["stages_ms"],
-                denoise_step_ms={int(k): v for k, v in cfg["denoise_step_ms"].items()},
-                expected_e2e_ms=float(cfg["expected_e2e_ms"]),
-                expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
-                expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
-                estimated_full_test_time_s=cfg.get("estimated_full_test_time_s"),
-            )
+        scenarios = {
+            name: ScenarioConfig.from_dict(cfg)
+            for name, cfg in data["scenarios"].items()
+        }
 
         return cls(
             scenarios=scenarios,
@@ -156,14 +167,6 @@ class BaselineConfig:
             improvement_threshold=data.get("improvement_reporting", {}).get(
                 "threshold", 0.2
             ),
-            load_peak_vram_mb={
-                name: float(value)
-                for name, value in data.get("load_peak_vram_mb", {}).items()
-            },
-            runtime_peak_vram_mb={
-                name: float(value)
-                for name, value in data.get("runtime_peak_vram_mb", {}).items()
-            },
         )
 
     def update(self, path: Path):
@@ -171,28 +174,10 @@ class BaselineConfig:
         with path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
 
-        scenarios_new = {}
-        for name, cfg in data["scenarios"].items():
-            scenarios_new[name] = ScenarioConfig(
-                stages_ms=cfg["stages_ms"],
-                denoise_step_ms={int(k): v for k, v in cfg["denoise_step_ms"].items()},
-                expected_e2e_ms=float(cfg["expected_e2e_ms"]),
-                expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
-                expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
-                estimated_full_test_time_s=cfg.get("estimated_full_test_time_s"),
-            )
-
-        self.scenarios.update(scenarios_new)
-        self.load_peak_vram_mb.update(
+        self.scenarios.update(
             {
-                name: float(value)
-                for name, value in data.get("load_peak_vram_mb", {}).items()
-            }
-        )
-        self.runtime_peak_vram_mb.update(
-            {
-                name: float(value)
-                for name, value in data.get("runtime_peak_vram_mb", {}).items()
+                name: ScenarioConfig.from_dict(cfg)
+                for name, cfg in data["scenarios"].items()
             }
         )
         return self
