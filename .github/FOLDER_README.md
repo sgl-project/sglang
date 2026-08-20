@@ -14,18 +14,21 @@ Recognized permission keys:
 | --- | --- |
 | `can_tag_run_ci_label` | `/tag-run-ci-label`, `/tag-and-rerun-ci` |
 | `can_rerun_failed_ci` | `/rerun-failed-ci`, `/tag-and-rerun-ci` |
-| `can_rerun_test` | `/rerun-test`, `/rerun-group` on same-repo PRs |
-| `can_rerun_test_on_fork` | additionally allows them on PRs from forks |
+| `cooldown_interval_minutes` | rate limit in `pr-gate.yml`; `0` also grants `/rerun-test`, `/rerun-group` |
 
-`can_rerun_test_on_fork` is the only key that clears a fork PR, and it is an
-add-on to `can_rerun_test` rather than a replacement. Grant it deliberately:
-these commands check out the PR head and execute it on the self-hosted GPU
-runners, so it lets the holder run fork code on CI hardware. Everyone else needs
-write permission on the repo to use these commands on a fork PR.
+`/rerun-test` and `/rerun-group` are gated on the commenter alone: either
+`cooldown_interval_minutes: 0`, or `write`/`admin` permission on the repo. Where
+the PR comes from makes no difference, and authoring it grants nothing.
 
-PR authors can always use `/rerun-failed-ci`, `/rerun-test`, and `/rerun-group`
-on their own same-repo PRs without an entry here, but authorship alone never
-clears a fork PR.
+Those are the same two signals `pr-gate.yml` already uses to waive its rate
+limit, and that is the point -- a selective rerun dispatches `rerun-test.yml`
+directly, which never passes through `pr-gate.yml`, so it bypasses the rate limit
+by construction. Anyone allowed to run one is therefore unthrottled in practice,
+which is exactly what a zero cooldown already declares.
+
+Set a cooldown deliberately: `0` lets the holder run PR-head code on the
+self-hosted GPU runners, and raising it above `0` takes that away again along
+with their rate-limit waiver.
 
 ## Others
 - `MAINTAINER.md` defines the code maintenance model.

@@ -1033,38 +1033,29 @@ def _check_rerun_test_permissions(gh_repo, pr, comment, user_perms, command_name
     """
     Check permissions shared by /rerun-test and /rerun-group.
 
-    `can_rerun_test_on_fork` is the only permission that clears a fork PR, and it
-    counts only when it comes from CI_PERMISSIONS.json -- main() marks PR authors
-    with `_is_pr_author` instead, so opening a fork PR never self-grants the fork
-    exemption.
+    These commands check out the PR head, run it on the self-hosted GPU runners,
+    and never pass through pr-gate.yml, so they bypass its rate limit entirely.
+    They are therefore gated on the same two trust signals pr-gate itself uses: a
+    zero `cooldown_interval_minutes` in CI_PERMISSIONS.json, or write permission
+    on the repo.
     """
-    if not (
-        user_perms.get("can_rerun_test", False)
-        or user_perms.get("_is_pr_author", False)
-    ):
-        print(f"Permission denied: /{command_name} requires can_rerun_test.")
-        return False
+    if user_perms.get("cooldown_interval_minutes") == 0:
+        return True
 
-    # SECURITY: These commands check out and execute code from the PR branch on
-    # self-hosted GPU runners, so a fork PR needs either an explicit
-    # `can_rerun_test_on_fork` grant or a trusted collaborator.
-    is_fork = pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
-    if is_fork and not user_perms.get("can_rerun_test_on_fork", False):
-        commenter = comment.user.login
-        perm = gh_repo.get_collaborator_permission(commenter)
-        if perm not in ("admin", "write"):
-            print(f"Permission denied: /{command_name} on fork PR by {commenter}.")
-            comment.create_reaction("confused")
-            pr.create_issue_comment(
-                f"⛔ `/{command_name}` is not available for fork PRs unless the commenter "
-                "has `can_rerun_test_on_fork` in `.github/CI_PERMISSIONS.json` or "
-                "write permission on the repo.\n\n"
-                "Please ask a maintainer to run this command, or use the normal CI flow."
-            )
-            return False
-        print(f"Fork PR, but commenter {commenter} has write+ permission. Proceeding.")
+    commenter = comment.user.login
+    perm = gh_repo.get_collaborator_permission(commenter)
+    if perm in ("admin", "write"):
+        print(f"Commenter {commenter} has write+ permission. Proceeding.")
+        return True
 
-    return True
+    print(f"Permission denied: /{command_name} by {commenter} (permission: {perm}).")
+    comment.create_reaction("confused")
+    pr.create_issue_comment(
+        f"⛔ `/{command_name}` requires `cooldown_interval_minutes: 0` in "
+        "`.github/CI_PERMISSIONS.json`, or write permission on the repo.\n\n"
+        "Please ask a maintainer to run this command, or use the normal CI flow."
+    )
+    return False
 
 
 def handle_rerun_test(
@@ -1327,11 +1318,11 @@ def main():
     pr = repo.get_pull(pr_number)
     comment = repo.get_issue(pr_number).get_comment(comment_id)
 
-    # PR authors can always rerun failed CI and rerun individual UTs on their own PRs,
-    # even if they are not listed in CI_PERMISSIONS.json.
+    # PR authors can always rerun failed CI on their own PRs, even if they are not
+    # listed in CI_PERMISSIONS.json.
     # Note: /tag-run-ci-label still requires CI_PERMISSIONS.json.
-    # Note: authorship is marked as `_is_pr_author`, never as a can_rerun_test* key
-    # -- clearing a fork PR requires `can_rerun_test_on_fork` from CI_PERMISSIONS.json.
+    # Note: authorship grants nothing for /rerun-test -- that is gated on the
+    # commenter's own trust level, see _check_rerun_test_permissions.
     if pr.user.login == user_login:
         if user_perms is None:
             print(
@@ -1344,11 +1335,12 @@ def main():
                 f"User {user_login} is the PR author and has existing CI permissions."
             )
         user_perms["can_rerun_failed_ci"] = True
-        user_perms["_is_pr_author"] = True
 
-    if not user_perms:
-        print(f"User {user_login} does not have any configured permissions. Exiting.")
-        return
+    # No early exit on a missing entry: /rerun-test is gated on repo permission
+    # too, so a write-holder absent from the file must still reach its handler.
+    # The other commands re-check their own key and deny silently.
+    if user_perms is None:
+        user_perms = {}
 
     # 4. Parse Command and Execute
     first_line = comment_body.split("\n")[0].strip()
