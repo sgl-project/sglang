@@ -56,7 +56,7 @@ def main() -> None:
     parser.add_argument("--split", default="train")
     parser.add_argument("--num-examples", type=int, default=100)
     parser.add_argument("--min-tokens", type=int, default=32768)
-    parser.add_argument("--max-tokens", type=int, default=131072)
+    parser.add_argument("--max-tokens", type=int, default=262144)
     args = parser.parse_args()
     if args.max_tokens < args.min_tokens:
         raise SystemExit("--max-tokens must be at least --min-tokens")
@@ -82,30 +82,18 @@ def main() -> None:
     categories = sorted(TASK_CATEGORIES)
     base, remainder = divmod(args.num_examples, len(categories))
     selected: list[dict] = []
-    selected_keys: set[str] = set()
     for index, category in enumerate(categories):
         quota = base + (index < remainder)
         ranked = sorted(eligible[category], key=stable_key)
+        if len(ranked) < quota:
+            raise RuntimeError(
+                f"category {category!r} has only {len(ranked)} eligible examples, "
+                f"but its balanced quota is {quota}"
+            )
         for row in ranked[:quota]:
             selected.append(row)
-            selected_keys.add(stable_key(row))
-
-    if len(selected) < args.num_examples:
-        remainder_rows = sorted(
-            (
-                row
-                for category in categories
-                for row in eligible[category]
-                if stable_key(row) not in selected_keys
-            ),
-            key=stable_key,
-        )
-        selected.extend(remainder_rows[: args.num_examples - len(selected)])
     if len(selected) != args.num_examples:
-        raise RuntimeError(
-            f"only {len(selected)} examples have {args.min_tokens} to "
-            f"{args.max_tokens} tokens"
-        )
+        raise RuntimeError("balanced category selection cardinality drifted")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(selected, ensure_ascii=False, indent=2) + "\n")
