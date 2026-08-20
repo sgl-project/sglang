@@ -383,8 +383,8 @@ class LMCRadixCache(RadixCache):
             self._update_leaf_status(last_node)
             self._update_leaf_status(new_node)
 
-            self._record_store_event(new_node.parent)
-            self._record_store_event(new_node)
+            self.kv_events.record_store(new_node.parent)
+            self.kv_events.record_store(new_node)
 
             return token_slots[:fetched], new_node
 

@@ -202,6 +202,14 @@ class LayerwiseOffloadStrategy(ComponentResidencyStrategy):
         state: ResidencyState,
     ) -> None:
         if isinstance(module, LayerwiseOffloadableModuleMixin):
+            # MPS layerwise components retain checkpoint-backed CPU weights and
+            # synchronously materialize one layer at a time. Moving the whole
+            # module here would defeat that bounded-residency contract.
+            if current_platform.is_mps():
+                if module.mps_stream_non_layer_weights:
+                    return
+                _module_to_local_device(module, dtype=use.target_dtype)
+                return
             module.prepare_for_next_req()
 
     def finish_use(
@@ -214,6 +222,10 @@ class LayerwiseOffloadStrategy(ComponentResidencyStrategy):
             return
         for manager in module.layerwise_offload_managers:
             manager.release_all()
+        if current_platform.is_mps():
+            torch.mps.synchronize()
+            module.restore_mps_cpu_non_layer_weights()
+            torch.mps.empty_cache()
 
     def finish_request(
         self,

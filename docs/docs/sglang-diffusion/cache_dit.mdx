@@ -15,12 +15,50 @@ SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching a
 
 ## Basic Usage
 
-Enable Cache-DiT by exporting the environment variable and using `sglang generate` or `sglang serve` :
+Cache-DiT is a **per-request** switch: each request decides whether to run
+cached or lossless, and requests with different Cache-DiT settings never share
+a batch. The `SGLANG_CACHE_DIT_*` environment variables remain available as
+server-wide defaults for requests that leave the switch unset.
+
+Enable it for a single generation:
+
+```bash
+sglang generate --model-path Qwen/Qwen-Image \
+    --prompt "A beautiful sunset over the mountains" \
+    --enable-cache-dit true
+```
+
+Or per request against a running server, via the OpenAI-compatible API:
+
+```python
+client.images.generate(
+    model="Qwen/Qwen-Image",
+    prompt="A beautiful sunset over the mountains",
+    extra_body={
+        "enable_cache_dit": True,
+        # optional knob overrides for this request only
+        "cache_dit_params": {"residual_diff_threshold": 0.12, "scm_preset": "fast"},
+    },
+)
+```
+
+`enable_cache_dit` accepts three states: `true` (on for this request), `false`
+(off for this request, overriding the server default), and unset (follow the
+`SGLANG_CACHE_DIT_ENABLED` server default). `cache_dit_params` accepts the
+DBCache knobs (`Fn_compute_blocks`, `Bn_compute_blocks`, `max_warmup_steps`,
+`residual_diff_threshold`, `max_continuous_cached_steps`, `enable_taylorseer`,
+`taylorseer_order`), the SCM knobs (`scm_preset`, `scm_compute_bins`,
+`scm_cache_bins`, `scm_policy`), and a nested `secondary` dict with the DBCache
+knobs for the second transformer of dual-DiT models (unset secondary keys
+inherit the request's primary values, then the
+`SGLANG_CACHE_DIT_SECONDARY_*` defaults).
+
+To make Cache-DiT the default for every request instead, export the
+environment variable when launching:
 
 ```bash
 SGLANG_CACHE_DIT_ENABLED=true \
-sglang generate --model-path Qwen/Qwen-Image \
-    --prompt "A beautiful sunset over the mountains"
+sglang serve --model-path Qwen/Qwen-Image
 ```
 
 ## Diffusers Backend
@@ -508,7 +546,9 @@ sglang generate --model-path Qwen/Qwen-Image \
 
 ## Environment Variables
 
-All Cache-DiT parameters can be configured via environment variables.
+All Cache-DiT parameters can also be configured via environment variables,
+which act as the server-wide defaults for requests that don't set
+`enable_cache_dit` / `cache_dit_params`.
 See [Environment Variables](./environment_variables) for the complete list.
 
 ## Supported Models

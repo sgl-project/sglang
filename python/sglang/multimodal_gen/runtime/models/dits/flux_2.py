@@ -21,15 +21,13 @@ from diffusers.models.attention import AttentionModuleMixin
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.normalization import AdaLayerNormContinuous
 
-from sglang.kernels.ops.diffusion.bitexact_gate import BitExactFusionGate
-from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
-from sglang.kernels.ops.diffusion.triton.layernorm_modulate import (
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
     can_use_fused_layernorm_modulate,
     fused_layernorm_modulate_raw,
-    is_plain_layer_norm,
-)
-from sglang.kernels.ops.diffusion.triton.silu_mul_bitexact import (
     fused_packed_silu_mul_bitexact,
+    is_plain_layer_norm,
+    residual_gate_add,
 )
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.distributed import (
