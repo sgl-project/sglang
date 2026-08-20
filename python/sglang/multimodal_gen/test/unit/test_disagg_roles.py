@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for disaggregation role-based module filtering."""
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -139,11 +142,15 @@ class TestGetModuleRole(unittest.TestCase):
         self.assertEqual(get_module_role("audio_vae"), RoleType.DECODER)
         self.assertEqual(get_module_role("video_vae"), RoleType.DECODER)
         self.assertEqual(get_module_role("vocoder"), RoleType.DECODER)
+        self.assertEqual(get_module_role("diffusion_decoder"), RoleType.DECODER)
         self.assertEqual(get_module_role("hy3dshape_vae"), RoleType.DECODER)
 
     def test_shared_modules(self):
         self.assertIsNone(get_module_role("scheduler"))
         self.assertIsNone(get_module_role("hy3dshape_scheduler"))
+
+    def test_ltx25_optional_modules(self):
+        self.assertEqual(get_module_role("duration_head"), RoleType.ENCODER)
 
 
 class TestFilterModulesForRole(unittest.TestCase):
@@ -240,6 +247,39 @@ class _FakeStage:
 
 
 class TestPipelineStageRoleFilter(unittest.TestCase):
+    def test_load_config_passes_server_revision_to_model_download(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            (tmp_path / "model_index.json").write_text(
+                json.dumps(
+                    {
+                        "_class_name": "FakePipeline",
+                        "_diffusers_version": "0.34.0",
+                        "transformer": ["diffusers", "FakeTransformer"],
+                    }
+                )
+            )
+            (tmp_path / "transformer").mkdir()
+
+            pipeline = object.__new__(_FakePipeline)
+            pipeline.model_path = "org/repo"
+            pipeline.server_args = SimpleNamespace(
+                model_subfolder=None,
+                revision="a" * 40,
+            )
+
+            with patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base.maybe_download_model",
+                return_value=str(tmp_path),
+            ) as download_model:
+                pipeline._load_config()
+
+        download_model.assert_called_once_with(
+            "org/repo",
+            force_diffusers_model=True,
+            revision="a" * 40,
+        )
+
     def test_stage_factory_skips_without_constructing_for_other_role(self):
         pipeline = _make_pipeline(RoleType.ENCODER)
 
@@ -341,9 +381,6 @@ class TestPipelineSpecificExtraModules(unittest.TestCase):
             extra_allowed_modules=extras,
         )
         self.assertEqual(extras, {"vae", "transformer"})
-        self.assertNotIn(
-            "text_encoder", QwenImageLayeredPipeline._required_config_modules
-        )
         self.assertEqual(
             set(filtered),
             {
@@ -352,6 +389,7 @@ class TestPipelineSpecificExtraModules(unittest.TestCase):
                 "processor",
                 "transformer",
                 "scheduler",
+                "text_encoder",
             },
         )
 
@@ -460,21 +498,16 @@ class TestQwenImageLayeredDtype(_GlobalStageArgsMixin, unittest.TestCase):
             def to(self, *args, **kwargs):
                 return self
 
-        with patch(
-            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image_layered.get_local_torch_device",
-            return_value=torch.device("cpu"),
-        ):
-            stage = QwenImageLayeredBeforeDenoisingStage(
-                vae=_DummyVAE(),
-                text_encoder=torch.nn.Linear(1, 1),
-                tokenizer=object(),
-                processor=object(),
-                transformer=object(),
-                scheduler=object(),
-                model_path="/unused",
-                vae_dtype=torch.float32,
-                text_encoder_dtype=torch.float16,
-            )
+        stage = QwenImageLayeredBeforeDenoisingStage(
+            vae=_DummyVAE(),
+            text_encoder=torch.nn.Linear(1, 1),
+            tokenizer=object(),
+            processor=object(),
+            transformer=object(),
+            scheduler=object(),
+            vae_dtype=torch.float32,
+            text_encoder_dtype=torch.float16,
+        )
 
         uses = stage.component_uses(SimpleNamespace(), "qwen_layered")
         self.assertEqual(

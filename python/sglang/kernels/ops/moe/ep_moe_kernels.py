@@ -1019,6 +1019,7 @@ def post_reorder_triton_kernel(
 @triton.jit
 def _fwd_kernel_ep_scatter_1(
     num_recv_tokens_per_expert,
+    num_valid_tokens_per_expert,
     expert_start_loc,
     m_indices,
     num_experts: tl.constexpr,
@@ -1037,15 +1038,17 @@ def _fwd_kernel_ep_scatter_1(
     tl.store(expert_start_loc + offset_cumsum, cumsum, mask=offset_cumsum < num_experts)
 
     cur_expert_start = tl.load(expert_start_loc + cur_expert)
-    cur_expert_token_num = tl.load(num_recv_tokens_per_expert + cur_expert)
+    cur_expert_padded_token_num = tl.load(num_recv_tokens_per_expert + cur_expert)
+    cur_expert_valid_token_num = tl.load(num_valid_tokens_per_expert + cur_expert)
 
     m_indices_start_ptr = m_indices + cur_expert_start
     off_expert = tl.arange(0, BLOCK_E)
 
-    for start_m in tl.range(0, cur_expert_token_num, BLOCK_E, num_stages=4):
+    for start_m in tl.range(0, cur_expert_padded_token_num, BLOCK_E, num_stages=4):
+        offsets = start_m + off_expert
         tl.store(
-            m_indices_start_ptr + start_m + off_expert,
-            cur_expert,
+            m_indices_start_ptr + offsets,
+            tl.where(offsets < cur_expert_valid_token_num, cur_expert, -1),
         )
 
 
@@ -1137,6 +1140,7 @@ def ep_scatter(
     recv_x_scale: torch.Tensor,
     recv_topk: torch.Tensor,
     num_recv_tokens_per_expert: torch.Tensor,
+    num_valid_tokens_per_expert: torch.Tensor,
     expert_start_loc: torch.Tensor,
     output_tensor: torch.Tensor,
     output_tensor_scale: torch.Tensor,
@@ -1172,6 +1176,7 @@ def ep_scatter(
 
     _fwd_kernel_ep_scatter_1[(grid,)](
         num_recv_tokens_per_expert,
+        num_valid_tokens_per_expert,
         expert_start_loc,
         m_indices,
         num_experts=num_experts,
@@ -1575,7 +1580,11 @@ def moe_ep_deepgemm_preprocess(
     assert len(block_shape) == 2
     block_n, block_k = block_shape[0], block_shape[1]
     is_fp8 = output_dtype == torch.float8_e4m3fn
-    if is_fp8 and use_mxfp8:
+    # Quantize FP8 values with the UE8M0 scale directly. Rounding only the
+    # scale afterward can change the represented activation by up to 2x.
+    from sglang.srt.layers import deep_gemm_wrapper
+
+    if is_fp8 and (use_mxfp8 or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0):
         from sglang.kernels.ops.quantization.minimax_quant_ue8m0 import (
             per_token_quant_fp8_ue8m0_scatter,
         )
@@ -1935,6 +1944,7 @@ def _fp8_per_token_quant_to_per_tensor_quant_kernel(
     k,
     K_SCALE_BLOCK_SIZE: tl.constexpr,
     K_BLOCK_SIZE: tl.constexpr,
+    HAS_K_TAIL: tl.constexpr,
 ):
     pid_k, pid_m, pid_e = (
         tl.program_id(axis=0),
@@ -1950,6 +1960,11 @@ def _fp8_per_token_quant_to_per_tensor_quant_kernel(
         return
     output_scale_val_inv = 1.0 / tl.load(output_scale_ptr).to(tl.float32)
     k_offsets = pid_k * K_BLOCK_SIZE + tl.arange(0, K_BLOCK_SIZE)
+    # k only has to be a multiple of the 128-wide scale group (e.g. 3584), so the
+    # last k block can be partial.  Specialize on it: hidden sizes that fill
+    # every block keep the unmasked loads, and their codegen is unchanged.
+    if HAS_K_TAIL:
+        k_mask = k_offsets < k
     scale_offsets = (k_offsets // K_SCALE_BLOCK_SIZE) * x_scale_stride2
 
     x_ptrs = x_ptr + pid_e * m * k + k_offsets
@@ -1957,10 +1972,22 @@ def _fp8_per_token_quant_to_per_tensor_quant_kernel(
     x_scale_ptrs = x_scale_ptr + pid_e * x_scale_stride0 + scale_offsets
 
     for tok_idx in tl.range(token_id, last_effective_id, pid_m_dim):
-        hidden = tl.load(x_ptrs + tok_idx * k).to(tl.float32)
-        scale_fp32 = tl.load(x_scale_ptrs + tok_idx * x_scale_stride1).to(tl.float32)
+        if HAS_K_TAIL:
+            hidden = tl.load(x_ptrs + tok_idx * k, mask=k_mask, other=0.0)
+            x_scale = tl.load(
+                x_scale_ptrs + tok_idx * x_scale_stride1, mask=k_mask, other=0.0
+            )
+        else:
+            hidden = tl.load(x_ptrs + tok_idx * k)
+            x_scale = tl.load(x_scale_ptrs + tok_idx * x_scale_stride1)
+        hidden = hidden.to(tl.float32)
+        scale_fp32 = x_scale.to(tl.float32)
         hidden = hidden * scale_fp32 * output_scale_val_inv
-        tl.store(output_ptrs + tok_idx * k, hidden.to(output_ptr.dtype.element_ty))
+        quantized = hidden.to(output_ptr.dtype.element_ty)
+        if HAS_K_TAIL:
+            tl.store(output_ptrs + tok_idx * k, quantized, mask=k_mask)
+        else:
+            tl.store(output_ptrs + tok_idx * k, quantized)
 
 
 def fp8_per_token_to_per_tensor_quant_triton(
@@ -1977,8 +2004,7 @@ def fp8_per_token_to_per_tensor_quant_triton(
     assert output_scale.numel() == 1
 
     K_BLOCK_SIZE = 1024
-    assert x.size(2) % K_BLOCK_SIZE == 0
-    grid = (x.size(2) // K_BLOCK_SIZE, 32, x.size(0))
+    grid = (triton.cdiv(x.size(2), K_BLOCK_SIZE), 32, x.size(0))
     _fp8_per_token_quant_to_per_tensor_quant_kernel[grid](
         x,
         x_scale,
@@ -1990,6 +2016,7 @@ def fp8_per_token_to_per_tensor_quant_triton(
         x.size(2),
         K_SCALE_BLOCK_SIZE=K_SCALE_BLOCK_SIZE,
         K_BLOCK_SIZE=K_BLOCK_SIZE,
+        HAS_K_TAIL=x.size(2) % K_BLOCK_SIZE != 0,
         num_warps=8,
     )
 

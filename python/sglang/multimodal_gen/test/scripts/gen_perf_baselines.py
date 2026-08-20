@@ -8,6 +8,7 @@ from pathlib import Path
 
 from openai import OpenAI
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.test.server.test_server_utils import (
     ServerManager,
     get_generate_fn,
@@ -23,7 +24,10 @@ from sglang.multimodal_gen.test.test_utils import (
 
 
 def _all_cases() -> list[DiffusionTestCase]:
-    import sglang.multimodal_gen.test.server.testcase_configs as cfg
+    if current_platform.is_npu():
+        import sglang.multimodal_gen.test.server.ascend.testcase_configs_npu as cfg
+    else:
+        import sglang.multimodal_gen.test.server.testcase_configs as cfg
 
     cases: list[DiffusionTestCase] = []
     for _, v in inspect.getmembers(cfg):
@@ -68,8 +72,8 @@ def _build_server_extra_args(case: DiffusionTestCase) -> str:
     if server_args.lora_path:
         a += f" --lora-path {server_args.lora_path}"
 
-    # default warmup
-    a += " --warmup"
+    # request-based warmup keeps the first measured generation out of the baseline
+    a += " --warmup-mode request"
 
     for extra_arg in server_args.extras:
         a += f" {extra_arg}"
@@ -137,7 +141,7 @@ def _run_case(case: DiffusionTestCase) -> dict:
             if "per_frame_generation" not in perf.stage_metrics:
                 perf.stage_metrics["per_frame_generation"] = perf.e2e_ms / sp.num_frames
 
-        return {
+        baseline = {
             "stages_ms": {k: round(v, 2) for k, v in perf.stage_metrics.items()},
             "denoise_step_ms": {
                 str(k): round(v, 2) for k, v in perf.all_denoise_steps.items()
@@ -146,6 +150,14 @@ def _run_case(case: DiffusionTestCase) -> dict:
             "expected_avg_denoise_ms": round(perf.avg_denoise_ms, 2),
             "expected_median_denoise_ms": round(perf.median_denoise_ms, 2),
         }
+        if current_platform.is_cuda():
+            baseline.update(
+                {
+                    "load_peak_vram_mb": round(perf.load_peak_vram_mb, 2),
+                    "runtime_peak_vram_mb": round(perf.runtime_peak_vram_mb, 2),
+                }
+            )
+        return baseline
     finally:
         ctx.cleanup()
 

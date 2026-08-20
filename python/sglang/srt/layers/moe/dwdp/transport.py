@@ -11,29 +11,22 @@ import torch
 import torch.distributed as dist
 from cuda.bindings import driver as cuda
 
-from sglang.srt.distributed.device_communicators.vmm_utils import (
+from sglang.srt.cuda_vmm_utils import (
+    VmmReservation,
+    align_down,
+    align_up,
     check_drv,
     exchange_posix_fds,
     export_shareable_handles,
+    get_device_granularity,
     import_peer_handle,
+    make_device_allocation_prop,
+    tensor_from_pointer,
 )
 from sglang.srt.layers.moe.dwdp.layout import (
     DwdpExpertLayout,
     LayerWeightSpecs,
     MnnvlHandleSet,
-)
-from sglang.srt.layers.moe.dwdp.vmm import (
-    align_down,
-    align_up,
-    create_fabric_handle,
-    free_va,
-    get_allocation_granularity,
-    map_handle,
-    release_handle,
-    reserve_va,
-    set_access,
-    tensor_from_ptr,
-    unmap_va,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,7 +47,8 @@ def _copy_local_weights_to_handles(
     layout: DwdpExpertLayout,
     device_id: int,
 ) -> Tuple[Dict[Tuple[int, str], int], Dict[Tuple[int, str], int]]:
-    granularity = get_allocation_granularity(device_id)
+    granularity = get_device_granularity(device_id)
+    prop = make_device_allocation_prop(device_id)
     handles: Dict[Tuple[int, str], int] = {}
     sizes: Dict[Tuple[int, str], int] = {}
 
@@ -69,21 +63,17 @@ def _copy_local_weights_to_handles(
         phys_size = page_end - page_start
         data_offset = local_start_bytes - page_start
 
-        handle = create_fabric_handle(phys_size, device_id)
-
-        temp_va = reserve_va(phys_size, granularity)
-        map_handle(temp_va, phys_size, handle)
-        set_access(temp_va, phys_size, device_id)
+        reservation = VmmReservation(phys_size, prop, device_id, alignment=granularity)
+        handle = int(reservation.map(0, phys_size, retain_handle=True))
 
         nbytes = param.numel() * param.element_size()
         check_drv(
-            cuda.cuMemcpyDtoD(temp_va + data_offset, param.data_ptr(), nbytes),
+            cuda.cuMemcpyDtoD(reservation.base + data_offset, param.data_ptr(), nbytes),
             "cuMemcpyDtoD",
         )
         torch.cuda.synchronize()
 
-        unmap_va(temp_va, phys_size)
-        free_va(temp_va, phys_size)
+        reservation.close(release_handles=False)
 
         param.untyped_storage().resize_(0)
 
@@ -105,7 +95,7 @@ class DWDPTransport:
         self._handle_set: Optional[MnnvlHandleSet] = None
         self._peer_views: Dict[Tuple[int, int, str], torch.Tensor] = {}
         self._imported_handles: List[int] = []
-        self._peer_va_regions: List[Tuple[int, int]] = []
+        self._peer_reservations: List[VmmReservation] = []
 
     @classmethod
     def create(
@@ -144,7 +134,8 @@ class DWDPTransport:
         device_id: int,
     ) -> None:
         cpu_group = group.cpu_group
-        granularity = get_allocation_granularity(device_id)
+        granularity = get_device_granularity(device_id)
+        prop = make_device_allocation_prop(device_id)
 
         handle_list = [self._handle_set.get_handle(li, n) for li, n in sorted_keys]
         fabric_handles, local_posix_fds, use_fabric = export_shareable_handles(
@@ -199,14 +190,19 @@ class DWDPTransport:
                 peer_phys_size = peer_page_end - peer_page_start
                 peer_data_offset = peer_start_bytes - peer_page_start
 
-                peer_va = reserve_va(peer_phys_size, granularity)
-                map_handle(peer_va, peer_phys_size, int(peer_handle))
-                set_access(peer_va, peer_phys_size, device_id)
-                self._peer_va_regions.append((peer_va, peer_phys_size))
+                peer_reservation = VmmReservation(
+                    peer_phys_size,
+                    prop,
+                    device_id,
+                    alignment=granularity,
+                )
+                peer_reservation.map_existing(0, peer_phys_size, int(peer_handle))
+                self._peer_reservations.append(peer_reservation)
 
                 num_peer_experts = peer_end - peer_start
-                peer_tensor = tensor_from_ptr(
-                    ptr=peer_va + peer_data_offset,
+                peer_tensor = tensor_from_pointer(
+                    peer_reservation.base + peer_data_offset,
+                    peer_end_bytes - peer_start_bytes,
                     shape=(num_peer_experts,) + spec.full_shape[1:],
                     dtype=spec.dtype,
                     device_id=device_id,
@@ -226,13 +222,12 @@ class DWDPTransport:
         return self._peer_views
 
     def release(self) -> None:
-        for va, size in self._peer_va_regions:
-            unmap_va(va, size)
-            free_va(va, size)
-        self._peer_va_regions.clear()
+        for reservation in self._peer_reservations:
+            reservation.close()
+        self._peer_reservations.clear()
 
         for h in self._imported_handles:
-            release_handle(h)
+            check_drv(cuda.cuMemRelease(h), "cuMemRelease")
         self._imported_handles.clear()
 
         self._peer_views.clear()

@@ -9,7 +9,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import pickle
 from collections import namedtuple
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -123,6 +123,18 @@ class GraphCaptureContext:
     stream: torch.cuda.Stream | None
 
 
+def new_device_group(ranks, backend=None):
+    """Create a process group for device collectives.
+
+    A single-rank group never runs one: every collective short-circuits on
+    world_size == 1. NCCL would still allocate its per-channel device buffers
+    for it, which costs ~390 MiB a group.
+    """
+    return torch.distributed.new_group(
+        ranks, backend="gloo" if len(ranks) == 1 else backend
+    )
+
+
 class GroupCoordinator:
     """
     PyTorch ProcessGroup wrapper for a group of processes.
@@ -169,9 +181,7 @@ class GroupCoordinator:
         self.cpu_group = None
 
         for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
+            device_group = new_device_group(ranks, torch_distributed_backend)
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
             with suppress_stdout():
@@ -314,7 +324,16 @@ class GroupCoordinator:
             if curr_stream != stream:
                 stream.wait_stream(curr_stream)
 
-            with torch.cuda.stream(stream):
+            # Custom all-reduce has an eager path and a graph path; only inside
+            # capture() does all_reduce pick the graph one, and only capture()
+            # exit registers the graph-pool buffers with the peers. Capturing the
+            # eager path instead faults on replay (unmapped peer IPC address).
+            custom_ar = self.srt_custom_allreduce
+            maybe_ca_context = (
+                nullcontext() if custom_ar is None else custom_ar.capture()
+            )
+
+            with torch.cuda.stream(stream), maybe_ca_context:
                 yield graph_capture_context
         else:
             # For non-CUDA platforms (MPS, CPU), just yield the context without stream management
@@ -854,9 +873,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.device_groups = []
         if len(group_ranks[0]) > 2 or len(group_ranks[0]) == 1:
             for ranks in group_ranks:
-                device_group = torch.distributed.new_group(
-                    ranks, backend=torch_distributed_backend
-                )
+                device_group = new_device_group(ranks, torch_distributed_backend)
                 # a group with `gloo` backend, to allow direct coordination between
                 # processes through the CPU.
                 with suppress_stdout():
@@ -918,9 +935,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         ] = None
         self.skip_device_group = None
         for ranks in group_ranks:
-            skip_device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
+            skip_device_group = new_device_group(ranks, torch_distributed_backend)
             if self.rank in ranks:
                 self.skip_device_group = skip_device_group
         assert self.skip_device_group is not None
