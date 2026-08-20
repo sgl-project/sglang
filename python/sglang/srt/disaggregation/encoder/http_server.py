@@ -488,11 +488,21 @@ async def handle_scheduler_receive_url_request(request: dict):
                 "req_id": request["req_id"],
             },
         )
-    await encoder.register_embedding_destinations(
-        request["req_id"],
-        request["receive_count"],
-        [request["receive_url"]],
-    )
+    try:
+        await encoder.register_embedding_destinations(
+            request["req_id"],
+            request["receive_count"],
+            [request["receive_url"]],
+        )
+    except MMError as e:
+        return ORJSONResponse(
+            status_code=int(e.code),
+            content={
+                "status": "error",
+                "message": str(e),
+                "req_id": request["req_id"],
+            },
+        )
     return ORJSONResponse(content=None)
 
 

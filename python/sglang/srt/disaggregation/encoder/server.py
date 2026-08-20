@@ -720,7 +720,12 @@ class MMEncoder:
             if req_id not in rid_to_receive_endpoint:
                 rid_to_receive_endpoint[req_id] = set()
                 rid_to_receive_count[req_id] = expected_destination_count
-            assert rid_to_receive_count[req_id] == expected_destination_count
+            registered_count = rid_to_receive_count[req_id]
+            if registered_count != expected_destination_count:
+                raise BadRequestError(
+                    f"Inconsistent receive_count for req_id={req_id}: "
+                    f"registered {registered_count}, got {expected_destination_count}"
+                )
             rid_to_receive_endpoint[req_id].update(destination_urls)
 
         cond = await _get_receive_condition(req_id)
