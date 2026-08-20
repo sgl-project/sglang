@@ -181,7 +181,9 @@ class ComposedPipelineBase(ABC):
 
         if model_subfolder is None:
             model_path = maybe_download_model(
-                self.model_path, force_diffusers_model=True
+                self.model_path,
+                force_diffusers_model=True,
+                revision=self.server_args.revision,
             )
         else:
             model_subfolder = os.path.normpath(model_subfolder)
@@ -196,6 +198,7 @@ class ComposedPipelineBase(ABC):
             model_root = maybe_download_model(
                 self.model_path,
                 allow_patterns=[f"{model_subfolder}/**"],
+                revision=self.server_args.revision,
             )
             model_path = os.path.join(model_root, model_subfolder)
 
