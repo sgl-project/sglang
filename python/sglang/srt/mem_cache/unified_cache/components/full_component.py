@@ -422,6 +422,8 @@ class FullComponent(TreeComponent):
                 self.tree_core.component_evictable_size_[ct] += n_len
                 self.tree_core._update_evictable_leaf_sets(n)
 
+            self.tree_core._record_device_values_ready()
+
             self.tree_core._update_evictable_leaf_sets(node)
 
     def free_host_values(self, host_values: list[torch.Tensor]) -> None:

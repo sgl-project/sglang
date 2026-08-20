@@ -122,12 +122,14 @@ class CacheOperation:
         node_id: int,
         priority: Optional[int] = None,
         pool_transfers: Optional[List[PoolTransfer]] = None,
+        device_values_ready_event=None,
     ):
         self.host_indices = host_indices
         self.device_indices = device_indices
         self.node_ids = [node_id]
         self.data = None
         self.pool_transfers = pool_transfers
+        self.device_values_ready_event = device_values_ready_event
 
         self.id = CacheOperation.counter
         CacheOperation.counter += 1
@@ -180,6 +182,14 @@ class CacheOperation:
             -1,
             priority,
             pool_transfers=CacheOperation._merge_pool_transfers(ops),
+            device_values_ready_event=next(
+                (
+                    op.device_values_ready_event
+                    for op in reversed(ops)
+                    if op.device_values_ready_event is not None
+                ),
+                None,
+            ),
         )
         merged_op.node_ids = node_ids
         return merged_op
@@ -424,10 +434,11 @@ class HiCacheController:
             finally:
                 self._direct_dispatch_queue.task_done()
 
-    def _enqueue_direct_dispatch(self, fn, *args) -> None:
+    def _enqueue_direct_dispatch(self, fn, *args, dependency=None) -> None:
         self.check_direct_dispatch_error()
-        dependency = device_module.Event()
-        dependency.record()
+        if dependency is None:
+            dependency = device_module.Event()
+            dependency.record()
         self._direct_dispatch_queue.put((dependency, fn, args))
 
     def check_direct_dispatch_error(self) -> None:

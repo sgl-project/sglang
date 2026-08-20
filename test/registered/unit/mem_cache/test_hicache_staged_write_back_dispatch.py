@@ -18,6 +18,8 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
+from sglang.srt.mem_cache.unified_cache import unified_tree_core
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
@@ -1102,6 +1104,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.move_indices.assert_not_called()
 
     def test_direct_hybrid_controller_defers_all_pool_index_copies(self):
+        ready_event = object()
         op = CacheOperation(
             host_indices=_indices(0, 4),
             device_indices=_indices(4, 8),
@@ -1113,6 +1116,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                     device_indices=_indices(4, 8),
                 )
             ],
+            device_values_ready_event=ready_event,
         )
         controller = HybridCacheController.__new__(HybridCacheController)
         controller.write_queue = [op]
@@ -1126,9 +1130,71 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
         self.assertEqual(controller.write_queue, [])
         controller._enqueue_direct_dispatch.assert_called_once_with(
-            controller._start_writing_op, op
+            controller._merge_and_start_writing_ops,
+            [op],
+            dependency=ready_event,
         )
         controller.move_hybrid_indices.assert_not_called()
+
+    def test_hybrid_merge_keeps_latest_device_value_dependency(self):
+        first_event = object()
+        latest_event = object()
+        ops = [
+            CacheOperation(
+                _indices(0, 2),
+                _indices(2, 4),
+                node_id=1,
+                device_values_ready_event=first_event,
+            ),
+            CacheOperation(
+                _indices(4, 6),
+                _indices(6, 8),
+                node_id=2,
+                device_values_ready_event=latest_event,
+            ),
+        ]
+
+        merged = CacheOperation.merge_ops(ops)
+
+        self.assertIs(merged.device_values_ready_event, latest_event)
+
+    def test_direct_hybrid_normalizes_aux_indices_on_helper_path(self):
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.io_backend = "direct"
+        operation = CacheOperation(
+            _indices(0, 2),
+            _indices(2, 4),
+            node_id=1,
+            pool_transfers=[
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    host_indices=_indices(0, 2),
+                    device_indices=torch.arange(2, dtype=torch.int32),
+                )
+            ],
+        )
+        controller.move_indices = mock.Mock(
+            side_effect=lambda host, device: (host, device)
+        )
+
+        _, _, transfers = controller.move_hybrid_indices(operation)
+
+        self.assertEqual(transfers[0].device_indices.dtype, torch.int64)
+
+    def test_tree_readiness_event_records_only_a_narrow_current_stream_point(self):
+        tree = UnifiedTreeCore.__new__(UnifiedTreeCore)
+        tree.device = torch.device("cuda")
+        event = mock.Mock()
+        fake_device_module = mock.Mock()
+        fake_device_module.Event.return_value = event
+
+        with mock.patch.object(
+            unified_tree_core, "device_module", fake_device_module
+        ):
+            tree._record_device_values_ready()
+
+        event.record.assert_called_once_with()
+        self.assertIs(tree.device_values_ready_event(), event)
 
     def test_cache_controller_can_defer_write_submission_for_batching(self):
         controller = HiCacheController.__new__(HiCacheController)

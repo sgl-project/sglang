@@ -317,6 +317,7 @@ class HybridCacheController(BaseHiCacheController):
         extra_pools: Optional[list[PoolTransfer]] = None,
         *,
         defer_start: bool = False,
+        device_values_ready_event=None,
     ) -> Optional[torch.Tensor]:
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
@@ -338,11 +339,38 @@ class HybridCacheController(BaseHiCacheController):
                 node_id,
                 priority,
                 pool_transfers=pool_transfers or None,
+                device_values_ready_event=device_values_ready_event,
             )
         )
         if not defer_start:
             self.start_writing()
         return host_indices
+
+    def start_writing(self) -> None:
+        if not self.write_queue:
+            return
+        ops = self.write_queue
+        self.write_queue = []
+        if self.io_backend == "direct":
+            dependency = next(
+                (
+                    op.device_values_ready_event
+                    for op in reversed(ops)
+                    if op.device_values_ready_event is not None
+                ),
+                None,
+            )
+            self._enqueue_direct_dispatch(
+                self._merge_and_start_writing_ops,
+                ops,
+                dependency=dependency,
+            )
+        else:
+            self._start_writing_op(CacheOperation.merge_ops(ops))
+
+    def _merge_and_start_writing_ops(self, ops: list[CacheOperation]) -> None:
+        """Merge direct-I/O indices on the helper's CUDA stream."""
+        self._start_writing_op(CacheOperation.merge_ops(ops))
 
     def _move_op_indices(
         self, op: CacheOperation
@@ -625,8 +653,15 @@ class HybridCacheController(BaseHiCacheController):
         if operation.pool_transfers:
             resolved_pool_transfers = []
             for transfer in operation.pool_transfers:
+                transfer_device_indices = transfer.device_indices
+                if (
+                    self.io_backend == "direct"
+                    and transfer_device_indices is not None
+                    and transfer_device_indices.dtype != torch.int64
+                ):
+                    transfer_device_indices = transfer_device_indices.to(torch.int64)
                 transfer_host_indices, transfer_device_indices = self.move_indices(
-                    transfer.host_indices, transfer.device_indices
+                    transfer.host_indices, transfer_device_indices
                 )
                 # Keep the original PoolTransfer unchanged because tree-owned
                 # transfers may still reference radix-tree host state. The
