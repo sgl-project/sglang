@@ -675,6 +675,19 @@ class TestWarmupModeNormalization(unittest.TestCase):
         sa.bcg_text_buckets = None
         sa._validate_breakable_cuda_graph()  # must not raise
 
+    def test_only_online_minimax_h3_adaln_disables_breakable_cuda_graph(self):
+        """BCG must fail closed for online AdaLN without affecting sidecars."""
+        for online, expected in ((True, False), (False, True)):
+            with self.subTest(online=online):
+                sa = ServerArgs.__new__(ServerArgs)
+                sa.enable_breakable_cuda_graph = True
+                sa.minimax_h3_adaln_online = online
+                sa.pipeline_config = MiniMaxH3PipelineConfig()
+
+                sa._adjust_minimax_h3_adaln_graph_compatibility()
+
+                self.assertEqual(sa.enable_breakable_cuda_graph, expected)
+
     def test_disagg_role_disables_server_warmup(self):
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 

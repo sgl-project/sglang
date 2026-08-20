@@ -10,8 +10,10 @@ from __future__ import annotations
 import math
 import os
 import struct
+from collections import OrderedDict
 from contextlib import ExitStack
-from typing import Any, Callable
+from dataclasses import dataclass
+from typing import Any, Callable, Literal
 
 import torch
 import torch.nn as nn
@@ -71,6 +73,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
 )
+from sglang.srt.utils.common import is_pin_memory_available
 
 logger = init_logger(__name__)
 
@@ -961,7 +964,7 @@ class MiniMaxH3AdalnProj(nn.Module):
 # A ref2va request carrying both a visual and an audio reference reaches four
 # distinct timesteps in one step: video, audio, the imgvid condition and the
 # audio reference. That is the widest case, so it is the default; a deployment
-# serving only narrower tasks (t2va reaches 2, fl2va 3) can shrink the slab
+# serving only narrower tasks (t2va reaches 2, fl2va 3) can shrink the workspace
 # proportionally via --minimax-h3-adaln-plan-width.
 MINIMAX_H3_ADALN_MAX_PLAN_WIDTH = 4
 
@@ -974,8 +977,95 @@ def _plan_key(timesteps: torch.Tensor) -> tuple[int, ...]:
     )
 
 
+MiniMaxH3AdalnScheduleKey = tuple[tuple[int, ...], ...]
+
+
+@dataclass(frozen=True)
+class MiniMaxH3AdalnAccess:
+    tier: Literal["gpu_hit", "host_hit", "rebuild"]
+    h2d_bytes: int = 0
+    d2h_bytes: int = 0
+    h2d_transfers: int = 0
+    d2h_transfers: int = 0
+    gpu_hits: int = 0
+    host_hits: int = 0
+    host_misses: int = 0
+    admissions: int = 0
+    evictions: int = 0
+    rebuilds: int = 0
+
+
+@dataclass(frozen=True)
+class _MiniMaxH3AdalnScheduleEntry:
+    plan_timesteps: torch.Tensor
+    block_params: torch.Tensor
+    final_params: torch.Tensor
+
+    @property
+    def nbytes(self) -> int:
+        return (
+            self.plan_timesteps.numel() * self.plan_timesteps.element_size()
+            + self.block_params.numel() * self.block_params.element_size()
+            + self.final_params.numel() * self.final_params.element_size()
+        )
+
+
+class MiniMaxH3AdalnHostCache:
+    """Byte-bounded LRU of complete AdaLN schedules in host memory."""
+
+    def __init__(self, max_bytes: int) -> None:
+        if max_bytes < 0:
+            raise ValueError("MiniMax H3 AdaLN host cache max_bytes cannot be negative")
+        self.max_bytes = max_bytes
+        self.current_bytes = 0
+        self.hits = 0
+        self.misses = 0
+        self.admissions = 0
+        self.evictions = 0
+        self._entries: OrderedDict[
+            MiniMaxH3AdalnScheduleKey, _MiniMaxH3AdalnScheduleEntry
+        ] = OrderedDict()
+
+    @property
+    def enabled(self) -> bool:
+        return self.max_bytes > 0
+
+    def get(
+        self, key: MiniMaxH3AdalnScheduleKey
+    ) -> _MiniMaxH3AdalnScheduleEntry | None:
+        entry = self._entries.get(key)
+        if entry is None:
+            self.misses += 1
+            return None
+        self._entries.move_to_end(key)
+        self.hits += 1
+        return entry
+
+    def put(
+        self,
+        key: MiniMaxH3AdalnScheduleKey,
+        entry: _MiniMaxH3AdalnScheduleEntry,
+    ) -> bool:
+        if not self.enabled or entry.nbytes > self.max_bytes:
+            return False
+        previous = self._entries.pop(key, None)
+        if previous is not None:
+            self.current_bytes -= previous.nbytes
+        while self.current_bytes + entry.nbytes > self.max_bytes:
+            _, evicted = self._entries.popitem(last=False)
+            self.current_bytes -= evicted.nbytes
+            self.evictions += 1
+        self._entries[key] = entry
+        self.current_bytes += entry.nbytes
+        self.admissions += 1
+        return True
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+
 class MiniMaxH3AdalnCache(nn.Module):
-    """Precomputed AdaLN outputs for fixed FP32 timestep plans."""
+    """AdaLN outputs backed by a sidecar or an online schedule cache."""
 
     _FORMAT_VERSION = "2"
     plan_timesteps: torch.Tensor
@@ -992,6 +1082,7 @@ class MiniMaxH3AdalnCache(nn.Module):
         weight_files: list[str] | None = None,
         max_plans: int = 64,
         max_plan_width: int = MINIMAX_H3_ADALN_MAX_PLAN_WIDTH,
+        host_cache_max_bytes: int = 0,
     ) -> None:
         super().__init__()
         if (path is None) == (weight_files is None):
@@ -1015,9 +1106,10 @@ class MiniMaxH3AdalnCache(nn.Module):
         self.hidden_size = arch.hidden_size
         self.block_width = 6 * MINIMAX_H3_ADALN_MODALITY_NUM * arch.hidden_size
         self.final_width = 2 * arch.hidden_size
-        # Rebuild path only: plan bit pattern -> slot, tracked on the host.
-        self._slots: dict[tuple[int, ...], int] = {}
+        self.host_cache = MiniMaxH3AdalnHostCache(host_cache_max_bytes)
+        self._active_schedule_key: MiniMaxH3AdalnScheduleKey | None = None
         self.rebuilds = 0
+        self.gpu_hits = 0
 
     def load(self, device: torch.device) -> None:
         if self.path is None:
@@ -1074,7 +1166,7 @@ class MiniMaxH3AdalnCache(nn.Module):
         self.register_buffer("final_params", final_params.to(device))
 
     def _allocate(self, device: torch.device) -> None:
-        """Empty slab for the rebuild path; its pointers must never move.
+        """Allocate the request workspace once so its pointers never move.
 
         ``plan_lengths`` starts at zero and that is what keeps unused slots out
         of ``lookup``: a real plan always has at least one timestep, so a zero
@@ -1107,18 +1199,28 @@ class MiniMaxH3AdalnCache(nn.Module):
             ),
         )
         logger.info(
-            "MiniMax H3 AdaLN rebuild slab: %d plans x %d timesteps = %.2f GiB",
+            "MiniMax H3 AdaLN workspace: %d plans x %d timesteps = %.2f GiB",
             self.max_plans,
             width,
-            self.block_params.numel() * 2 / 2**30,
+            sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in (
+                    self.plan_timesteps,
+                    self.plan_lengths,
+                    self.block_params,
+                    self.final_params,
+                )
+            )
+            / 2**30,
         )
 
+    @torch.inference_mode()
     def build(
         self,
         step_timesteps: list[torch.Tensor],
         *,
         embed: Callable[[torch.Tensor], torch.Tensor],
-    ) -> None:
+    ) -> MiniMaxH3AdalnAccess:
         """Fill every plan this request will look up, in one streaming pass.
 
         Each plan keeps its own timestep count as the GEMM batch size, because
@@ -1135,9 +1237,12 @@ class MiniMaxH3AdalnCache(nn.Module):
         wanted: dict[tuple[int, ...], torch.Tensor] = {}
         for timesteps in step_timesteps:
             wanted.setdefault(_plan_key(timesteps), timesteps)
-        missing = {k: v for k, v in wanted.items() if k not in self._slots}
-        if not missing:
-            return
+        if not wanted:
+            raise ValueError("MiniMax H3 AdaLN rebuild needs at least one plan")
+        schedule_key = tuple(wanted)
+        if schedule_key == self._active_schedule_key:
+            self.gpu_hits += 1
+            return self._access("gpu_hit")
         if len(wanted) > self.max_plans:
             raise ValueError(
                 f"MiniMax H3 AdaLN rebuild needs {len(wanted)} plans but "
@@ -1151,22 +1256,31 @@ class MiniMaxH3AdalnCache(nn.Module):
                 "--minimax-h3-adaln-plan-width (t2va needs 2, fl2va 3, ref2va 4)"
             )
 
-        reset = len(self._slots) + len(missing) > self.max_plans
-        # A reset also evicts this request's cache hits, so rebuild its complete
-        # plan set rather than only the plans that were initially missing.
-        plans_to_build = wanted if reset else missing
-        if reset:
-            self._slots.clear()
-            self.plan_lengths.zero_()
+        host_entry = (
+            self.host_cache.get(schedule_key) if self.host_cache.enabled else None
+        )
+        self._invalidate_workspace()
+        if host_entry is not None:
+            self._load_host_entry(wanted, schedule_key, host_entry)
+            logger.info(
+                "MiniMax H3 AdaLN: loaded %d-plan schedule from host cache "
+                "(%d entries, %.2f GiB)",
+                len(wanted),
+                len(self.host_cache),
+                self.host_cache.current_bytes / 2**30,
+            )
+            return self._access(
+                "host_hit",
+                h2d_bytes=host_entry.nbytes,
+                h2d_transfers=1,
+            )
 
         device = self.block_params.device
         slots = []
-        pending_slots: dict[tuple[int, ...], int] = {}
-        for offset, (key, timesteps) in enumerate(plans_to_build.items()):
-            slot = len(self._slots) + offset
-            pending_slots[key] = slot
-            slots.append((slot, timesteps.numel(), embed(timesteps.to(device))))
-            self.plan_timesteps[slot, : timesteps.numel()] = timesteps.to(device)
+        for slot, timesteps in enumerate(wanted.values()):
+            device_timesteps = timesteps.to(device)
+            slots.append((slot, timesteps.numel(), embed(device_timesteps)))
+            self.plan_timesteps[slot, : timesteps.numel()] = device_timesteps
 
         # adaln_proj is a ColumnParallelLinear: each rank owns a slice of the
         # output features and all-gathers afterwards. The rebuild has to do the
@@ -1212,18 +1326,141 @@ class MiniMaxH3AdalnCache(nn.Module):
 
         for slot, length, _ in slots:
             self.plan_lengths[slot] = length
-        # Commit host metadata only after every layer has been written. If a
-        # checkpoint read or projection raises, the zero-length slots remain
-        # invisible and a later request can retry the rebuild.
-        self._slots.update(pending_slots)
+        self._active_schedule_key = schedule_key
         self.rebuilds += 1
+        admitted_bytes = self._admit_active_schedule(
+            schedule_key, plan_count=len(wanted), width=widest
+        )
         logger.info(
-            "MiniMax H3 AdaLN: rebuilt %d plan(s), %d/%d resident, pass #%d",
-            len(plans_to_build),
-            len(self._slots),
+            "MiniMax H3 AdaLN: rebuilt %d-plan schedule, %d/%d workspace slots "
+            "active, pass #%d",
+            len(wanted),
+            len(wanted),
             self.max_plans,
             self.rebuilds,
         )
+        return self._access(
+            "rebuild",
+            d2h_bytes=admitted_bytes,
+            d2h_transfers=1 if admitted_bytes else 0,
+        )
+
+    def _access(
+        self,
+        tier: Literal["gpu_hit", "host_hit", "rebuild"],
+        **kwargs: int,
+    ) -> MiniMaxH3AdalnAccess:
+        return MiniMaxH3AdalnAccess(
+            tier=tier,
+            gpu_hits=self.gpu_hits,
+            host_hits=self.host_cache.hits,
+            host_misses=self.host_cache.misses,
+            admissions=self.host_cache.admissions,
+            evictions=self.host_cache.evictions,
+            rebuilds=self.rebuilds,
+            **kwargs,
+        )
+
+    def _invalidate_workspace(self) -> None:
+        self._active_schedule_key = None
+        self.plan_lengths.zero_()
+
+    def _load_host_entry(
+        self,
+        wanted: dict[tuple[int, ...], torch.Tensor],
+        schedule_key: MiniMaxH3AdalnScheduleKey,
+        entry: _MiniMaxH3AdalnScheduleEntry,
+    ) -> None:
+        device = self.block_params.device
+        plan_count, width = entry.block_params.shape[:2]
+        if (
+            plan_count != len(wanted)
+            or width > self.max_plan_width
+            or entry.plan_timesteps.shape != (plan_count, width)
+            or entry.block_params.shape[2:] != (self.num_layers, self.block_width)
+            or entry.final_params.shape != (plan_count, width, self.final_width)
+        ):
+            raise RuntimeError("MiniMax H3 AdaLN host cache entry has invalid shape")
+        non_blocking = entry.block_params.is_pinned() and device.type == "cuda"
+        self.plan_timesteps[:plan_count, :width].copy_(
+            entry.plan_timesteps, non_blocking=non_blocking
+        )
+        self.block_params[:plan_count, :width].copy_(
+            entry.block_params, non_blocking=non_blocking
+        )
+        self.final_params[:plan_count, :width].copy_(
+            entry.final_params, non_blocking=non_blocking
+        )
+        for slot, timesteps in enumerate(wanted.values()):
+            self.plan_lengths[slot] = timesteps.numel()
+        self._active_schedule_key = schedule_key
+
+    def _admit_active_schedule(
+        self,
+        schedule_key: MiniMaxH3AdalnScheduleKey,
+        plan_count: int,
+        width: int,
+    ) -> int:
+        if not self.host_cache.enabled:
+            return 0
+        entry_nbytes = (
+            plan_count * width * torch.empty((), dtype=_FP32_DTYPE).element_size()
+            + plan_count
+            * width
+            * (self.num_layers * self.block_width + self.final_width)
+            * torch.empty((), dtype=_BF16_DTYPE).element_size()
+        )
+        if entry_nbytes > self.host_cache.max_bytes:
+            return 0
+        pin_memory = is_pin_memory_available(self.block_params.device)
+        try:
+            plan_timesteps = torch.zeros(
+                (plan_count, width),
+                dtype=_FP32_DTYPE,
+                device="cpu",
+                pin_memory=pin_memory,
+            )
+            block_params = torch.empty(
+                (plan_count, width, self.num_layers, self.block_width),
+                dtype=_BF16_DTYPE,
+                device="cpu",
+                pin_memory=pin_memory,
+            )
+            final_params = torch.empty(
+                (plan_count, width, self.final_width),
+                dtype=_BF16_DTYPE,
+                device="cpu",
+                pin_memory=pin_memory,
+            )
+            plan_timesteps.copy_(
+                self.plan_timesteps[:plan_count, :width],
+                non_blocking=pin_memory,
+            )
+            block_params.copy_(
+                self.block_params[:plan_count, :width],
+                non_blocking=pin_memory,
+            )
+            final_params.copy_(
+                self.final_params[:plan_count, :width],
+                non_blocking=pin_memory,
+            )
+            if pin_memory:
+                torch.cuda.current_stream(self.block_params.device).synchronize()
+        except RuntimeError:
+            logger.warning(
+                "MiniMax H3 AdaLN: failed to allocate host schedule cache entry",
+                exc_info=True,
+            )
+            return 0
+        admitted = self.host_cache.put(
+            schedule_key,
+            _MiniMaxH3AdalnScheduleEntry(
+                plan_timesteps=plan_timesteps,
+                block_params=block_params,
+                final_params=final_params,
+            ),
+        )
+        return entry_nbytes if admitted else 0
 
     def lookup(self, unique_timesteps: torch.Tensor) -> torch.Tensor:
         num_timesteps = unique_timesteps.shape[0]
@@ -1559,7 +1796,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
     lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
 
-    def prepare_adaln_plans(self, step_timesteps: list[torch.Tensor]) -> None:
+    def prepare_adaln_plans(
+        self, step_timesteps: list[torch.Tensor]
+    ) -> MiniMaxH3AdalnAccess | None:
         """Fill the AdaLN cache for this request before denoising starts.
 
         No-op for a prebuilt sidecar; the rebuild path needs the model's own
@@ -1567,12 +1806,12 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         adaln_proj weights would have produced.
         """
         if self.adaln_cache is None or self.adaln_cache.weight_files is None:
-            return
+            return None
 
         def embed(timesteps: torch.Tensor) -> torch.Tensor:
             return nn.functional.silu(self.time_embedder(timesteps)).to(_BF16_DTYPE)
 
-        self.adaln_cache.build(step_timesteps, embed=embed)
+        return self.adaln_cache.build(step_timesteps, embed=embed)
 
     def _can_batch_block_adaln(self) -> bool:
         return (
@@ -1656,7 +1895,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         adaln_cache_path: str | None = None,
         adaln_cache_model_variant: str | None = None,
         adaln_weight_files: list[str] | None = None,
+        adaln_max_plans: int = 64,
         adaln_plan_width: int = MINIMAX_H3_ADALN_MAX_PLAN_WIDTH,
+        adaln_host_cache_max_bytes: int = 0,
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
         if (
@@ -1747,7 +1988,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 path=adaln_cache_path,
                 model_variant=adaln_cache_model_variant,
                 weight_files=adaln_weight_files,
+                max_plans=adaln_max_plans,
                 max_plan_width=adaln_plan_width,
+                host_cache_max_bytes=adaln_host_cache_max_bytes,
             )
             if self._adaln_precomputed
             else None

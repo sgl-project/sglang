@@ -260,8 +260,14 @@ class TransformerLoader(ComponentLoader):
             # Keep the weights off-device; the model rebuilds the AdaLN
             # outputs from the checkpoint for each request's timestep plan.
             init_params["adaln_weight_files"] = safetensors_list
+            init_params["adaln_max_plans"] = (
+                component_server_args.minimax_h3_adaln_max_plans
+            )
             init_params["adaln_plan_width"] = (
                 component_server_args.minimax_h3_adaln_plan_width
+            )
+            init_params["adaln_host_cache_max_bytes"] = int(
+                component_server_args.minimax_h3_adaln_host_cache_gb * 2**30
             )
             checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
 
