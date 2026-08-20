@@ -372,9 +372,6 @@ class MultimodalDataItem:
         return len([item for item in flatten_nested_list(l) if item is not None]) == 0
 
     def set_pad_value(self):
-        """
-        Set the pad value after first hashing the data
-        """
         if self.pad_value is not None:
             return
 
@@ -722,9 +719,6 @@ class MultimodalInputs:
         return image_tokens, audio_tokens, video_tokens
 
     def merge(self, other: MultimodalInputs):
-        """
-        merge image inputs when requests are being merged
-        """
 
         # args needed to be merged
         optional_args = [
@@ -1233,11 +1227,7 @@ class Req(ReqDllmMixin):
         return self.kv_committed_len
 
     def update_spec_correct_drafts_histogram(self, num_correct_drafts: int):
-        """Update the speculative decoding acceptance histogram.
-
-        Args:
-            num_correct_drafts: Number of correct draft tokens (no bonus) in this step.
-        """
+        """Record one step accepted draft count (excludes bonus token) into the histogram."""
         if len(self.spec_correct_drafts_histogram) <= num_correct_drafts:
             self.spec_correct_drafts_histogram.extend(
                 [0] * (num_correct_drafts - len(self.spec_correct_drafts_histogram) + 1)
@@ -1459,9 +1449,6 @@ class Req(ReqDllmMixin):
         return self.tokenizer.decode(self.output_ids[-tail_len:])
 
     def check_match_stop_str_prefix(self) -> bool:
-        """
-        Check if the suffix of tail_str overlaps with any stop_str prefix
-        """
         if not self.sampling_params.stop_strs:
             return False
 
