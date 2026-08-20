@@ -9,6 +9,7 @@ test into unit tests so that's easily reproducible in CI.
 
 import unittest
 
+from sglang.srt.utils import is_xpu
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cuda_ci,
@@ -22,13 +23,15 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     is_in_amd_ci,
 )
-from sglang.srt.utils import is_xpu
 
 register_cuda_ci(est_time=207, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=278, suite="stage-b-test-1-gpu-small-amd")
 register_xpu_ci(est_time=207, suite="stage-b-test-1-gpu-xpu")
 
+_is_xpu = is_xpu()
 
+
+@unittest.skipIf(_is_xpu, "CUDA runner only")
 @unittest.skipIf(is_in_amd_ci(), "Skip for AMD CI.")
 class TestFlashinferDeterministic(TestDeterministicBase):
     # Test with flashinfer attention backend
@@ -44,6 +47,7 @@ class TestFlashinferDeterministic(TestDeterministicBase):
         return args
 
 
+@unittest.skipIf(_is_xpu, "CUDA runner only")
 @unittest.skipIf(is_in_amd_ci(), "Skip for AMD CI.")
 class TestFa3Deterministic(TestDeterministicBase):
     # Test with fa3 attention backend
@@ -59,6 +63,7 @@ class TestFa3Deterministic(TestDeterministicBase):
         return args
 
 
+@unittest.skipIf(_is_xpu, "CUDA/AMD runner only")
 class TestTritonDeterministic(TestDeterministicBase):
     # Test with triton attention backend
     @classmethod
@@ -73,7 +78,7 @@ class TestTritonDeterministic(TestDeterministicBase):
         return args
 
 
-@unittest.skipUnless(is_xpu(), "Skip unless XPU is available.")
+@unittest.skipUnless(_is_xpu, "XPU runner only")
 class TestIntelXPUDeterministic(TestDeterministicBase):
     # Test with intel_xpu attention backend using smaller model to avoid OOM
     @classmethod
