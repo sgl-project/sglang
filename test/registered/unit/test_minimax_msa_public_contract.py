@@ -35,6 +35,13 @@ def _production_inputs():
     return q, k, v, q2k, page_table, seq_lens
 
 
+def _noncontiguous_q(total_q: int = 4) -> torch.Tensor:
+    q = torch.zeros(total_q, 128, 16, dtype=torch.bfloat16).transpose(1, 2)
+    assert q.shape == (total_q, 16, 128)
+    assert not q.is_contiguous()
+    return q
+
+
 def test_topk16_only_provider_selection(monkeypatch):
     monkeypatch.setenv("SGLANG_MINIMAX_MSA_BACKEND", "auto")
     monkeypatch.setattr(msa, "flashinfer_msa_available", lambda: True)
@@ -141,6 +148,63 @@ def test_decode_forwards_tp4_public_contract(monkeypatch):
     assert call["seqlen_q"] == 1
     assert call["workspace"] is graph_state.workspace
     assert set(graph_state.staged) == {"q", "q2k_indices", "seqused_k"}
+
+
+def test_prefill_makes_public_q_contiguous_without_graph_state(monkeypatch):
+    _, k, v, q2k, page_table, seq_lens = _production_inputs()
+    q = _noncontiguous_q()
+    public_prefill = Mock(return_value=q)
+    monkeypatch.setattr(
+        msa,
+        "_load_flashinfer_msa",
+        lambda: (public_prefill, Mock(), Mock(), Mock()),
+    )
+
+    msa._flashinfer_prefill(
+        q=q,
+        k_cache=k,
+        v_cache=v,
+        topk_idx=q2k,
+        req_to_token=torch.empty(2, 256, dtype=torch.int32),
+        slot_ids=torch.tensor([0, 1], dtype=torch.int32),
+        cu_seqlens=torch.tensor([0, 2, 4], dtype=torch.int32),
+        seq_lens=seq_lens,
+        prefix_lens=torch.tensor([126, 254], dtype=torch.int32),
+        block_size_k=128,
+        sm_scale=128**-0.5,
+        page_table=page_table,
+        graph_state=None,
+    )
+
+    assert public_prefill.call_args.kwargs["q"].is_contiguous()
+
+
+def test_decode_makes_public_q_contiguous_without_graph_state(monkeypatch):
+    _, k, v, q2k, page_table, seq_lens = _production_inputs()
+    q = _noncontiguous_q(total_q=2)
+    q2k = q2k[:, :2]
+    public_decode = Mock(return_value=q)
+    monkeypatch.setattr(
+        msa,
+        "_load_flashinfer_msa",
+        lambda: (Mock(), public_decode, Mock(), Mock()),
+    )
+
+    msa._flashinfer_decode(
+        q=q,
+        k_cache=k,
+        v_cache=v,
+        topk_idx=q2k,
+        req_to_token=torch.empty(2, 256, dtype=torch.int32),
+        slot_ids=torch.tensor([0, 1], dtype=torch.int32),
+        seq_lens=seq_lens,
+        block_size_k=128,
+        sm_scale=128**-0.5,
+        page_table=page_table,
+        graph_state=None,
+    )
+
+    assert public_decode.call_args.kwargs["q"].is_contiguous()
 
 
 def test_graph_state_and_page_table_keep_stable_addresses(monkeypatch):

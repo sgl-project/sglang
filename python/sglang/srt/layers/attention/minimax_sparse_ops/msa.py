@@ -424,13 +424,14 @@ def _flashinfer_prefill(
         page_table = build_flashinfer_page_table(
             req_to_token, slot_ids, seq_lens, block_size_k
         )
+    q = q.contiguous()
     q2k = topk_idx.contiguous().to(torch.int32)
     cu_q = cu_seqlens.to(torch.int32)
     kv_lens = seq_lens.to(torch.int32)
     q_offsets = prefix_lens.to(torch.int32)
     workspace = None
     if graph_state is not None:
-        q = graph_state.stage("q", q.contiguous())
+        q = graph_state.stage("q", q)
         q2k = graph_state.stage("q2k_indices", q2k)
         cu_q = graph_state.stage("cu_seqlens_q", cu_q)
         kv_lens = graph_state.stage("seqused_k", kv_lens)
@@ -775,11 +776,12 @@ def _flashinfer_decode(
         page_table = build_flashinfer_page_table(
             req_to_token, slot_ids, seq_lens, block_size_k
         )
+    q = q.contiguous()
     q2k = topk_idx.contiguous().to(torch.int32)
     kv_lens = seq_lens.to(torch.int32)
     workspace = None
     if graph_state is not None:
-        q = graph_state.stage("q", q.contiguous())
+        q = graph_state.stage("q", q)
         q2k = graph_state.stage("q2k_indices", q2k)
         kv_lens = graph_state.stage("seqused_k", kv_lens)
         workspace = graph_state.workspace
