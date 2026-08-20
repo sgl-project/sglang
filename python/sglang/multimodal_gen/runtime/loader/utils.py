@@ -333,5 +333,68 @@ def get_memory_usage_of_component(module) -> float | None:
     return round(usage, 2)
 
 
+def component_residency_bytes(module) -> Dict[str, int]:
+    """Where a component's weights actually sit, in bytes.
+
+    Layerwise-offloaded weights are absent from parameters()/buffers(): the
+    module keeps (1,) placeholders while its offload managers own the host
+    copy, so those managers are walked too. Sizes are taken from the storage
+    and deduped by it, because one flat host buffer backs many logical weights.
+    """
+    if not isinstance(module, nn.Module):
+        return {}
+
+    totals = {"vram": 0, "host_pinned": 0, "host": 0}
+    seen: set[int] = set()
+
+    def add(tensor: torch.Tensor) -> None:
+        try:
+            storage = tensor.untyped_storage()
+            pointer = storage.data_ptr()
+        except Exception:
+            return
+        # a zero pointer is an empty offload placeholder, not a weight
+        if pointer == 0 or pointer in seen:
+            return
+        seen.add(pointer)
+        if tensor.device.type != "cpu":
+            totals["vram"] += storage.nbytes()
+            return
+        try:
+            pinned = tensor.is_pinned()
+        except Exception:
+            pinned = False
+        totals["host_pinned" if pinned else "host"] += storage.nbytes()
+
+    for tensor in module.parameters():
+        add(tensor)
+    for tensor in module.buffers():
+        add(tensor)
+    for manager in getattr(module, "layerwise_offload_managers", None) or []:
+        iter_cpu_weights = getattr(manager, "iter_cpu_weights", None)
+        if iter_cpu_weights is None:
+            continue
+        for _, tensor in iter_cpu_weights():
+            add(tensor)
+
+    return totals
+
+
+def format_component_residency(module) -> str:
+    """Name the places a component's weights are, skipping the empty ones.
+
+    A component that streams from the host reports no VRAM at rest, which is
+    the point; saying so beats reporting a zero delta that reads as free.
+    """
+    totals = component_residency_bytes(module)
+    labels = (("vram", "vram"), ("host_pinned", "host pinned"), ("host", "host"))
+    parts = [
+        f"{label} {totals[key] / BYTES_PER_GB:.2f} GB"
+        for key, label in labels
+        if totals.get(key)
+    ]
+    return ", ".join(parts) if parts else "no weights of its own"
+
+
 # component name ->  ComponentLoader class
 component_name_to_loader_cls: Dict[str, Type[Any]] = {}

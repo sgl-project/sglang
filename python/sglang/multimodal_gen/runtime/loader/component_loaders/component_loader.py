@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
 from sglang.multimodal_gen.runtime.loader.utils import (
     _normalize_component_type,
     component_name_to_loader_cls,
+    format_component_residency,
     get_memory_usage_of_component,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
@@ -254,11 +255,11 @@ class ComponentLoader(ABC):
             model_size = get_memory_usage_of_component(component) or "NA"
             consumed = gpu_mem_before_loading - current_gpu_mem
             logger.info(
-                f"Loaded %s: %s ({source} version). model size: %s GB, consumed GPU mem: %.2f GB, avail GPU mem: %.2f GB",
+                f"Loaded %s: %s ({source} version). model size: %s GB, resident in %s. avail GPU mem: %.2f GB",
                 component_name,
                 component.__class__.__name__,
                 model_size,
-                consumed,
+                format_component_residency(component),
                 current_gpu_mem,
             )
         return component, consumed
