@@ -8,6 +8,12 @@ OUTPUT_DIR="${OUTPUT_DIR:?set OUTPUT_DIR to a unique result directory}"
 LONGBENCH_SUBSET="${LONGBENCH_SUBSET:?set LONGBENCH_SUBSET to the frozen JSON subset}"
 GPQA_DATASET="${GPQA_DATASET:?set GPQA_DATASET to the frozen GPQA-Diamond CSV}"
 NUM_THREADS="${NUM_THREADS:-32}"
+SERVING_DATASET_NAME="${SERVING_DATASET_NAME:-random-ids}"
+
+if [[ "${SERVING_DATASET_NAME}" != "random-ids" ]]; then
+  echo "SERVING_DATASET_NAME must be random-ids for the offline A/B gate" >&2
+  exit 2
+fi
 
 if [[ -e "${OUTPUT_DIR}" ]]; then
   echo "refusing to mix evidence in existing OUTPUT_DIR: ${OUTPUT_DIR}" >&2
@@ -66,7 +72,7 @@ for concurrency in 1 8 32 128; do
     --backend sglang \
     --base-url "${BASE_URL}" \
     --model "${MODEL}" \
-    --dataset-name random \
+    --dataset-name "${SERVING_DATASET_NAME}" \
     --num-prompts 256 \
     --random-input-len 8192 \
     --random-output-len 1024 \
