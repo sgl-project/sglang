@@ -27,7 +27,7 @@ REQUIRED_TORCH_VERSION = "2.13.0"
 REQUIRED_DEEP_GEMM_VERSION = "0.1.5.post3"
 REQUIRED_TVM_FFI_VERSION = "0.1.11"
 REQUIRED_LONGBENCH_MIN_TOKENS = 32768
-REQUIRED_LONGBENCH_MAX_TOKENS = 131072
+REQUIRED_LONGBENCH_MAX_TOKENS = 262144
 
 
 def sha256(path: Path) -> str:
@@ -116,7 +116,17 @@ def probe_datasets(longbench_subset: Path, gpqa_dataset: Path) -> dict:
     if int(manifest.get("minimum_observed_tokens", 0)) < REQUIRED_LONGBENCH_MIN_TOKENS:
         raise RuntimeError("LongBench-v2 subset contains a prompt shorter than 32K")
     if int(manifest.get("maximum_observed_tokens", 0)) > REQUIRED_LONGBENCH_MAX_TOKENS:
-        raise RuntimeError("LongBench-v2 subset contains a prompt longer than 128K")
+        raise RuntimeError("LongBench-v2 subset contains a prompt longer than 256K")
+    category_counts = manifest.get("category_counts", {})
+    if len(category_counts) != 6 or sorted(category_counts.values()) != [
+        16,
+        16,
+        17,
+        17,
+        17,
+        17,
+    ]:
+        raise RuntimeError("LongBench-v2 subset is not balanced across six categories")
 
     with gpqa_dataset.open(newline="") as source:
         reader = csv.DictReader(source)
