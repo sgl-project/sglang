@@ -96,6 +96,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
+    MoeRunnerBackend,
     get_moe_a2a_backend,
     get_moe_runner_backend,
     should_skip_post_experts_all_reduce,
@@ -254,6 +255,18 @@ _moe_quant_once_logged = False
 _enable_pcg_dsv2_dual_stream = (
     _is_cuda and envs.SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM.get()
 )
+
+# TODO(mattteochen) Cover more shapes
+_FLASHINFER_FUSED_SHARED_EXPERT_MAX_M = {4: 16, 8: 32}
+
+
+def _use_flashinfer_fused_shared_expert(
+    forward_batch: ForwardBatch, num_tokens: int, tp_size: int
+) -> bool:
+    return (
+        forward_batch.forward_mode.is_decode()
+        or forward_batch.forward_mode.is_target_verify()
+    ) and 0 < num_tokens <= _FLASHINFER_FUSED_SHARED_EXPERT_MAX_M.get(tp_size, 0)
 
 
 class DeepseekV2MLP(nn.Module):
@@ -564,8 +577,9 @@ class DeepseekV2MoE(nn.Module):
         mla_enable_prefill_cp: bool = False,
     ):
         super().__init__()
-        self.tp_size = get_parallel().tp_size
-        self.moe_ep_size = get_parallel().moe_ep_size
+        parallel = get_parallel()
+        self.tp_size = parallel.tp_size
+        self.moe_ep_size = parallel.moe_ep_size
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
 
@@ -711,6 +725,8 @@ class DeepseekV2MoE(nn.Module):
         self.shared_experts_is_fp8 = False
         self.shared_experts_weight_block_size = None
         self._shared_expert_tp1 = False
+        self._enable_flashinfer_fused_shared_expert = False
+        self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
         # Shared experts: skip when fused into MoE kernel
         # (self.num_fused_shared_experts > 0) or when DeepEP/MegaMOE fusion is enabled.
         if (
@@ -750,8 +766,36 @@ class DeepseekV2MoE(nn.Module):
             # [Up, Gate]-interleaved weight + scale.
             from sglang.srt.layers.quantization.modelopt_quant import (
                 ModelOptFp4LinearMethod,
+                ModelOptNvFp4FusedMoEMethod,
+            )
+            from sglang.srt.layers.quantization.unquant import (
+                UnquantizedLinearMethod,
             )
             from sglang.srt.utils.common import is_sm100_supported
+
+            gate_up_proj = self.shared_experts.gate_up_proj
+            tp_size = gate_up_proj.tp_size
+            local_n = gate_up_proj.output_size_per_partition // 2
+            k = gate_up_proj.weight.shape[1]
+            if (
+                envs.SGLANG_ENABLE_FLASHINFER_BF16_SWIGLU.get()
+                and get_moe_runner_backend() == MoeRunnerBackend.FLASHINFER_TRTLLM
+                and get_moe_a2a_backend().is_none()
+                and parallel.moe_tp_size == self.tp_size
+                and tp_size in _FLASHINFER_FUSED_SHARED_EXPERT_MAX_M
+                and (local_n, k) == (2048 // tp_size, 6144)
+                and not envs.FLASHINFER_NVFP4_4OVER6.get()
+                and _device_sm in (100, 103)
+                and self.shared_experts.swiglu_limit is None
+                and isinstance(gate_up_proj.quant_method, UnquantizedLinearMethod)
+                and gate_up_proj.weight.dtype == torch.bfloat16
+                and isinstance(self.experts.quant_method, ModelOptNvFp4FusedMoEMethod)
+                and not self.experts.quant_method.quant_config.use_per_token_activation
+                and not self._fuse_shared_experts_inside_sbo
+            ):
+                # Prepare the derived layout after canonical weights are loaded.
+                gate_up_proj.quant_method._prepare_flashinfer_bf16_swiglu_weight = True
+                self._enable_flashinfer_fused_shared_expert = True
 
             fc1_n = self.shared_experts.gate_up_proj.output_size_per_partition
             if (
@@ -834,7 +878,6 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
         )
-        self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
         # forward (weights and runner are final by then). None = undecided.
         self._moe_quant_once: Optional[bool] = None
@@ -871,6 +914,21 @@ class DeepseekV2MoE(nn.Module):
             and not get_exec().moe.enable_eplb
         )
 
+    def get_fused_ar_fp4_quant_scale(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Optional[torch.Tensor]:
+        if (
+            self._enable_flashinfer_fused_shared_expert
+            and _use_flashinfer_fused_shared_expert(
+                forward_batch, hidden_states.shape[0], self.tp_size
+            )
+            # (mattteochen): tc cuda graphs needs the fp4 fused AR+norm+quant custom op to be correctly registered
+            and not is_in_tc_piecewise_cuda_graph()
+        ):
+            return self.experts.w13_input_scale_quant
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -879,6 +937,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
@@ -891,7 +950,7 @@ class DeepseekV2MoE(nn.Module):
             )
 
         if not self._enable_a2a_moe:
-            if self._can_dual_stream_graph(hidden_states):
+            if pre_quant_input is None and self._can_dual_stream_graph(hidden_states):
                 fwd = get_forward()
                 return dsv2_flashinfer_moe_dual_stream_graph(
                     hidden_states,
@@ -910,6 +969,7 @@ class DeepseekV2MoE(nn.Module):
                     gemm_output_zero_allocator,
                     input_ids,
                     input_ids_global=input_ids_global,
+                    pre_quant_input=pre_quant_input,
                 )
             else:
                 return self.forward_normal(
@@ -918,6 +978,7 @@ class DeepseekV2MoE(nn.Module):
                     input_ids,
                     input_ids_global=input_ids_global,
                     skip_shared_experts=skip_shared_experts,
+                    pre_quant_input=pre_quant_input,
                 )
         else:
             return self.forward_deepep(
@@ -930,6 +991,7 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         # Note(kpham-sgl): issue order satisfies 3 constraints:
         # - no stream explosion: main (routed) issued before alt block -> capture reuses 1 alt stream;
@@ -940,11 +1002,8 @@ class DeepseekV2MoE(nn.Module):
         current_stream = torch.cuda.current_stream()
         # Quantize-once (SGLANG_OPT_MOE_QUANT_ONCE) must happen on the main
         # stream BEFORE the alt-stream fork so both consumers see it.
-        pre_quant_input = (
-            None
-            if use_flashinfer_trtllm_bypass
-            else self._maybe_quant_moe_input_once(hidden_states)
-        )
+        if pre_quant_input is None and not use_flashinfer_trtllm_bypass:
+            pre_quant_input = self._maybe_quant_moe_input_once(hidden_states)
         self.alt_stream.wait_stream(current_stream)
         has_shared_output = (
             hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0
@@ -980,18 +1039,13 @@ class DeepseekV2MoE(nn.Module):
             and topk_output.format == TopKOutputFormat.BYPASSED
             and self.experts.supports_deferred_finalize
         )
+        experts_forward = self.experts
         if deferred_finalize:
-            final_hidden_states = self.experts.forward_deferred_finalize(
-                hidden_states, topk_output
-            )
+            experts_forward = self.experts.forward_deferred_finalize
         elif use_flashinfer_trtllm_bypass:
-            final_hidden_states = self.experts.forward_impl(hidden_states, topk_output)
-        elif pre_quant_input is not None:
-            final_hidden_states = self.experts(
-                hidden_states, topk_output, pre_quant_input=pre_quant_input
-            )
-        else:
-            final_hidden_states = self.experts(hidden_states, topk_output)
+            experts_forward = self.experts.forward_impl
+        kwargs = {"pre_quant_input": pre_quant_input} if pre_quant_input else {}
+        final_hidden_states = experts_forward(hidden_states, topk_output, **kwargs)
         if (
             not _is_cuda
             and not _is_musa
@@ -1044,6 +1098,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -1062,11 +1117,8 @@ class DeepseekV2MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             # Quantize-once (SGLANG_OPT_MOE_QUANT_ONCE): only worthwhile when
             # the shared expert also runs here on the same tensor.
-            pre_quant_input = (
-                None
-                if skip_shared_experts
-                else self._maybe_quant_moe_input_once(hidden_states)
-            )
+            if pre_quant_input is None and not skip_shared_experts:
+                pre_quant_input = self._maybe_quant_moe_input_once(hidden_states)
             if (
                 not defer_shared
                 and not self._fuse_shared_experts_inside_sbo
@@ -1127,17 +1179,8 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
-        if pre_quant_input is not None:
-            final_hidden_states = self.experts(
-                hidden_states,
-                topk_output,
-                pre_quant_input=pre_quant_input,
-            )
-        else:
-            final_hidden_states = self.experts(
-                hidden_states,
-                topk_output,
-            )
+        kwargs = {"pre_quant_input": pre_quant_input} if pre_quant_input else {}
+        final_hidden_states = self.experts(hidden_states, topk_output, **kwargs)
         if (
             not _is_cuda
             and not _is_musa
@@ -1477,6 +1520,15 @@ class DeepseekV2MoE(nn.Module):
         pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
+            if pre_quant_input is not None and pre_quant_input[0].dtype == torch.uint8:
+                from flashinfer import mm_bf16_swiglu
+
+                out = mm_bf16_swiglu(
+                    hidden_states,
+                    self.shared_experts.gate_up_proj.flashinfer_bf16_swiglu_weight,
+                    pdl=True,
+                )
+                return self.shared_experts.down_proj(out)[0]
             if pre_quant_input is not None:
                 # SGLANG_OPT_MOE_QUANT_ONCE: (q, s) rows may be padded to a
                 # multiple of 4; the padded rows flow through the MLP (all ops
@@ -2479,9 +2531,20 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch, next_full_attention_layer_id
         )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
+        is_moe = isinstance(self.mlp, DeepseekV2MoE)
+        fp4_global_scale = (
+            self.mlp.get_fused_ar_fp4_quant_scale(hidden_states, forward_batch)
+            if is_moe
+            else None
         )
+        prepared = self.layer_communicator.prepare_mlp(
+            hidden_states,
+            residual,
+            forward_batch,
+            fp4_global_scale=fp4_global_scale,
+        )
+        hidden_states, residual = prepared[:2]
+        pre_quant_input = prepared[2] if fp4_global_scale is not None else None
 
         fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -2498,7 +2561,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             gemm_output_zero_allocator = None
 
         if (
-            isinstance(self.mlp, DeepseekV2MoE)
+            is_moe
             and not self.mlp.experts.moe_runner_config.inplace
             and not torch.compiler.is_compiling()
         ):
@@ -2513,10 +2576,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
             with _mlp_ctx:
+                kwargs = {"pre_quant_input": pre_quant_input} if pre_quant_input else {}
                 hidden_states = self.mlp(
                     hidden_states,
                     forward_batch,
                     gemm_output_zero_allocator,
+                    **kwargs,
                 )
 
         if (

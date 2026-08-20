@@ -762,17 +762,41 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         cache=None,
+        fp4_global_scale: Optional[torch.Tensor] = None,
     ):
         if cache is not None:
             self._context.cache = cache
 
-        return self._communicate_with_all_reduce_and_layer_norm_fn(
+        communicate_fn = self._communicate_with_all_reduce_and_layer_norm_fn
+        if (
+            fp4_global_scale is not None
+            and isinstance(communicate_fn, partial)
+            and communicate_fn.func
+            is CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual
+            and self.layer_scatter_modes.layer_input_mode == ScatterMode.TP_ATTN_FULL
+            and apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+        ):
+            from sglang.srt.layers.flashinfer_comm_fusion import (
+                flashinfer_allreduce_residual_rmsnorm_fp4_quant,
+            )
+
+            outputs = flashinfer_allreduce_residual_rmsnorm_fp4_quant(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm.weight,
+                fp4_global_scale,
+                self.post_attention_layernorm.variance_epsilon,
+            )
+            return outputs[0], outputs[1], outputs[2:]
+
+        outputs = communicate_fn(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
             layernorm=self.post_attention_layernorm,
             context=self._context,
         )
+        return outputs + (None,) if fp4_global_scale is not None else outputs
 
     def postprocess_layer(
         self,

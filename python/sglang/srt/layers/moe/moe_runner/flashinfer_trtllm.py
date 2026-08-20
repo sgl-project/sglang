@@ -937,7 +937,7 @@ def quantize_hidden_states_fp4(
 
 
 def fused_experts_none_to_flashinfer_trtllm_fp4(
-    dispatch_output: StandardDispatchOutput,
+    dispatch_output: StandardDispatchOutput | FlashinferDispatchOutput,
     quant_info: FlashInferTrtllmFp4MoeQuantInfo,
     runner_config: MoeRunnerConfig,
     use_routed_topk: bool = False,
@@ -952,7 +952,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         trtllm_fp4_block_scale_routed_moe,
     )
 
-    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+    from sglang.srt.layers.moe.token_dispatcher.standard import (
+        StandardCombineInput,
+        StandardDispatchOutput,
+    )
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
 
@@ -964,6 +967,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
+    pre_quant_input = (
+        dispatch_output.hidden_states_pre_quant
+        if isinstance(dispatch_output, StandardDispatchOutput)
+        else None
+    )
 
     # Quantize hidden states to FP4
     hidden_states_scale = dispatch_output.hidden_states_scale
@@ -1002,6 +1010,8 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         hs_scale_linear = hs_sf_bytes.view(torch.float8_e4m3fn).reshape(
             seq_len, hidden_size // 16
         )
+    elif pre_quant_input is not None:
+        hs_fp4, hs_scale_linear = pre_quant_input
     else:
         hs_fp4, hs_scale_linear = quantize_hidden_states_fp4(
             hidden_states, quant_info.w13_input_scale_quant
@@ -1026,9 +1036,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     symm_output = None
     if not defer_finalize:
         num_tokens = hs_fp4.shape[0]
-        hidden_size = (
-            hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
-        )
+        hidden_size = hs_fp4.shape[-1] * 2
         # When the dispatcher delivered pre-quantized FP4 (hidden_states is uint8),
         # the MoE output is bf16 rather than the input dtype.
         output_dtype = (

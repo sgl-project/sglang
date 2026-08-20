@@ -869,6 +869,59 @@ def flashinfer_allreduce_residual_rmsnorm(
     return norm_out, residual_out
 
 
+def fake_flashinfer_allreduce_residual_rmsnorm_fp4_quant(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    fp4_global_scale: torch.Tensor,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    token_num, hidden_dim = input_tensor.shape
+    return (
+        torch.empty_like(input_tensor),
+        torch.empty_like(residual),
+        input_tensor.new_empty((token_num, hidden_dim // 2), dtype=torch.uint8),
+        input_tensor.new_empty(
+            (token_num, hidden_dim // 16), dtype=torch.float8_e4m3fn
+        ),
+    )
+
+
+@register_custom_op(
+    mutates_args=["input_tensor", "residual", "weight"],
+    fake_impl=fake_flashinfer_allreduce_residual_rmsnorm_fp4_quant,
+)
+def flashinfer_allreduce_residual_rmsnorm_fp4_quant(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    fp4_global_scale: torch.Tensor,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    outputs = fake_flashinfer_allreduce_residual_rmsnorm_fp4_quant(
+        input_tensor, residual, weight, fp4_global_scale, eps
+    )
+    norm_out, residual_out, quant_out, scale_out = outputs
+
+    _flashinfer_comm.allreduce_fusion(
+        input=input_tensor,
+        workspace=_get_workspace_manager(True).workspace,
+        pattern=_flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNormOutFP4Quant,
+        launch_with_pdl=True,
+        residual_out=residual_out,
+        norm_out=norm_out,
+        quant_out=quant_out,
+        scale_out=scale_out,
+        residual_in=residual,
+        rms_gamma=weight,
+        rms_eps=eps,
+        scale_factor=fp4_global_scale,
+        layout_code=_flashinfer_comm.QuantizationSFLayout.LINEAR,
+    )
+
+    return outputs
+
+
 def can_use_flashinfer_allreduce(
     input_: torch.Tensor,
     *,
