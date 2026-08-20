@@ -853,61 +853,70 @@ RUN /bin/bash -lc 'set -euo pipefail; \
 
 # -----------------------
 # Hot patch: torch-ROCm
-# rocm720:   torch wheel hardcodes triton==3.5.1; repack the .whl with the pin relaxed.
-# rocm7_15:  torch is pip-installed from an index; patch the installed METADATA in-place.
-# hack.py is written here (flavor-specific) then executed in the next RUN.
+# Torch may hardcode triton== in Requires-Dist. Relax to >= so the pinned Triton
+# installed below satisfies the requirement without pip pulling CUDA torch.
+#   rocm720:   repack the base-image .whl (bundled at /) and reinstall torch.
+#   rocm7_15:  patch the pip-installed torch METADATA in site-packages.
+#   rocm724:   torch upgraded earlier; Requires-Dist fixed after the Triton swap.
+#   others:    skip (BUILD_TRITON=0 or no pin to relax).
 ARG TORCH_ROCM_FILE="torch-2.9.1+rocm7.2.0.lw.git7e1940d4-cp310-cp310-linux_x86_64.whl"
-RUN mkdir /tmp/whl && cd /tmp/whl \
-     && export TORCH_ROCM_FILE="${TORCH_ROCM_FILE}" \
-     && cat > hack.py <<"PY"
-import zipfile, csv, os, re
+RUN /bin/bash -lc 'set -euo pipefail; \
+  case "${GPU_ARCH}" in \
+    *rocm720*) \
+      echo "[torch patch] ROCm 7.2 (${GPU_ARCH}): repack and reinstall ${TORCH_ROCM_FILE}"; \
+      export TORCH_ROCM_FILE="${TORCH_ROCM_FILE}"; \
+      python3 - <<'"'"'PY'"'"'
+import csv, os, re, sys, zipfile
 from pathlib import Path
 
-fname = os.environ["TORCH_ROCM_FILE"]
-in_whl  = Path("/")   / fname
-out_whl = Path("/tmp")/ fname
-work = Path("/tmp/whl")
+TRITON_PIN = re.compile(
+    r"^((?:Requires-Dist:\s*)?triton)==([^;+\s]+)[^;\s]*", re.MULTILINE
+)
 
-# 1) Extract
+def relax_triton_metadata(meta_path: Path) -> int:
+    txt = meta_path.read_text(encoding="utf-8")
+    txt2, n = TRITON_PIN.subn(r"\1>=\2", txt)
+    if n == 0:
+        print(f"No triton== pin found in {meta_path}; nothing to patch")
+        sys.exit(0)
+    meta_path.write_text(txt2, encoding="utf-8")
+    return n
+
+def blank_record(record_path: Path) -> None:
+    rows = []
+    with record_path.open(newline="", encoding="utf-8") as f:
+        for r in csv.reader(f):
+            if r:
+                rows.append([r[0], "", ""])
+    with record_path.open("w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerows(rows)
+
+fname = os.environ["TORCH_ROCM_FILE"]
+in_whl = Path("/") / fname
+out_whl = Path("/tmp") / fname
+work = Path("/tmp/torch-whl")
+work.mkdir(parents=True, exist_ok=True)
+
 with zipfile.ZipFile(in_whl, "r") as z:
     z.extractall(work)
 
-# 2) Locate dist-info and patch METADATA (edit this logic to match your exact line)
 dist_info = next(work.glob("*.dist-info"))
-meta = dist_info / "METADATA"
-txt = meta.read_text(encoding="utf-8")
+n = relax_triton_metadata(dist_info / "METADATA")
+blank_record(dist_info / "RECORD")
 
-# Example: replace one exact requirement form.
-# Adjust the string to match what you actually see.
-pat = r"^Requires-Dist:\s*triton==3.5.1[^\s]*;"
-txt2, n = re.subn(pat, r"triton>=3.5.1;", txt, flags=re.MULTILINE)
-if txt2 == txt:
-    raise SystemExit("Did not find expected Requires-Dist line to replace in METADATA")
-meta.write_text(txt2, encoding="utf-8")
-
-# 3) Hacky step: blank hash/size columns in RECORD
-record = dist_info / "RECORD"
-rows = []
-with record.open(newline="", encoding="utf-8") as f:
-    for r in csv.reader(f):
-        if not r:
-            continue
-        # keep filename, blank out hash and size
-        rows.append([r[0], "", ""])
-with record.open("w", newline="", encoding="utf-8") as f:
-    csv.writer(f).writerows(rows)
-
-# 4) Re-zip as a wheel
 with zipfile.ZipFile(out_whl, "w", compression=zipfile.ZIP_DEFLATED) as z:
     for p in work.rglob("*"):
         if p.is_file():
             z.write(p, p.relative_to(work).as_posix())
 
-print("Wrote", out_whl)
+print(f"Relaxed {n} triton pin(s); wrote {out_whl}")
 PY
-
-RUN case "${GPU_ARCH}" in \
-  *rocm7_15*) cat > /tmp/whl/hack.py <<'PY'
+      python3 -m pip install --force-reinstall --no-deps "/tmp/${TORCH_ROCM_FILE}"; \
+      rm -rf /tmp/torch-whl "/tmp/${TORCH_ROCM_FILE}"; \
+      ;; \
+    *rocm7_15*) \
+      echo "[torch patch] ROCm 7.15 (${GPU_ARCH}): relax triton pin in installed torch"; \
+      python3 - <<'"'"'PY'"'"'
 import csv, re, sys
 from pathlib import Path
 from importlib.metadata import Distribution
@@ -917,17 +926,15 @@ meta_path = Path(dist._path) / "METADATA"
 record_path = Path(dist._path) / "RECORD"
 
 txt = meta_path.read_text(encoding="utf-8")
-# Match both "Requires-Dist: triton==..." and bare "triton==..." (continuation line)
 pat = r"^((?:Requires-Dist:\s*)?triton)==([^;+\s]+)[^;\s]*"
 txt2, n = re.subn(pat, r"\1>=\2", txt, flags=re.MULTILINE)
 if n == 0:
-    print("No triton==... pin found in torch METADATA; nothing to patch")
+    print("No triton== pin found in torch METADATA; nothing to patch")
     sys.exit(0)
 
 meta_path.write_text(txt2, encoding="utf-8")
 print(f"Relaxed {n} triton pin(s) from == to >= in {meta_path}")
 
-# Blank hash/size columns in RECORD so pip doesn't complain about mismatch
 rows = []
 with record_path.open(newline="", encoding="utf-8") as f:
     for r in csv.reader(f):
@@ -936,26 +943,11 @@ with record_path.open(newline="", encoding="utf-8") as f:
 with record_path.open("w", newline="", encoding="utf-8") as f:
     csv.writer(f).writerows(rows)
 PY
-  ;; \
-esac
-
-RUN cd /tmp/whl \
-    && case "${GPU_ARCH}" in \
-      *rocm720*) \
-        echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
-        python hack.py \
-        && python3 -m pip install --force --no-deps /tmp/${TORCH_ROCM_FILE} \
-        && rm -fr /tmp/whl /tmp/${TORCH_ROCM_FILE} \
-        ;; \
-      *rocm7_15*) \
-        echo "ROCm 7.15 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
-        python hack.py \
-        && rm -fr /tmp/whl \
-        ;; \
-      *) \
-        echo "Not rocm720 or rocm7_15 (GPU_ARCH=${GPU_ARCH}), skip patch"; \
-        ;; \
-    esac
+      ;; \
+    *) \
+      echo "[torch patch] skip (${GPU_ARCH})"; \
+      ;; \
+  esac'
 
 
 # transformers 5.12.1: don't follow HF-cache symlinks when hashing custom modules
