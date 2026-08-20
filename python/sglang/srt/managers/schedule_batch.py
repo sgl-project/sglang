@@ -503,14 +503,17 @@ class MultimodalProcessorOutput:
     input_ids: Optional[List[int]] = None
     padded_input_ids: Optional[List[int]] = None
 
+    # image
     im_token_id: Optional[int] = None
     im_start_id: Optional[int] = None
     im_end_id: Optional[int] = None
     slice_start_id: Optional[int] = None
     slice_end_id: Optional[int] = None
 
+    # video
     video_token_id: Optional[int] = None
 
+    # audio
     audio_token_id: Optional[int] = None
     audio_start_id: Optional[int] = None
     audio_end_id: Optional[int] = None
@@ -572,20 +575,25 @@ class MultimodalProcessorOutput:
 
 @dataclasses.dataclass
 class MultimodalInputs:
+    """The multimodal data related inputs."""
 
+    # items of data
     mm_items: List[MultimodalDataItem]
     padded_input_ids: Optional[List[int]] = None
     image_pad_len: Optional[list] = None
     num_image_tokens: Optional[int] = None
 
+    # image
     im_token_id: Optional[int] = None
     im_start_id: Optional[int] = None
     im_end_id: Optional[int] = None
     slice_start_id: Optional[int] = None
     slice_end_id: Optional[int] = None
 
+    # video
     video_token_id: Optional[int] = None
 
+    # audio
     audio_token_id: Optional[int] = None
     audio_start_id: Optional[int] = None
     audio_end_id: Optional[int] = None

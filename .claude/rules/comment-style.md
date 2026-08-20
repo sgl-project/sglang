@@ -16,7 +16,11 @@ like code, with the burden of proof reversed: the author justifies a comment's
 existence, not the reviewer its removal.
 
 **The test.** Delete the comment. If someone familiar with the repo can recover
-the fact from the surrounding code plus a grep, it stays deleted.
+what it said from the surrounding code plus a grep *at no real cost*, it stays
+deleted. The standard is the cost of recovery, not whether recovery is
+theoretically possible: a fact that lives in another file costs everything, a
+grouping the names only half-encode costs a tedious reconstruction, a restated
+line costs nothing.
 
 The next three sections are that test applied. A comment either carries a fact
 you cannot see from here (**keep**), carries nothing the code does not already
@@ -70,6 +74,13 @@ carry (**delete**), or carries a real fact whose home is somewhere else
   # None means the request is excluded from the radix cache, not that lookup failed.
   ```
 
+- **Structure the names only partly encode.** A marker whose deletion forces
+  the reader to re-derive organization the code does not state outright -- a
+  group boundary in a long flat block, a section split in a long body. If the
+  names alone leave the boundary ambiguous or tedious to reconstruct, the
+  marker earns its place. The same word above a single item that already says
+  it is still a restatement.
+
 ## Delete: nothing the code does not already carry
 
 - **Restating the code.** The function name, the next line, the branch
@@ -77,9 +88,10 @@ carry (**delete**), or carries a real fact whose home is somewhere else
 - **Step-by-step play-by-play.** `# Step 1: ...` / `# Step 2: ...` over
   straight-line code. If the flow needs numbering, extract named helpers.
 - **Naming the callers.** That is what grep is for.
-- **Section banners on short bodies.** `# ===== Helpers =====` above two
-  functions. Banners are for genuinely long modules only
-  (see `python/sglang/srt/environ.py`).
+- **Banners where the structure is already obvious.** `# ===== Helpers =====`
+  above two functions costs nothing to see past; the same banner splitting a
+  genuinely long flat module (see `python/sglang/srt/environ.py`) is a group
+  boundary and stays.
 - **Hedging.** "This should probably be revisited." Either establish the fact
   and state it, or file it as `TODO(<owner>)`.
 
