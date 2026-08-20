@@ -337,7 +337,26 @@ class KimiK3MLP(nn.Module):
             )
         else:
             raise ValueError(f"Unsupported activation: {hidden_act}")
+        self._npu_prequant_down = False
+        if _is_npu and isinstance(self.act_fn, SituAndMul):
+            from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                supports_npu_prequantized_input,
+            )
+
+            self._npu_prequant_down = supports_npu_prequantized_input(self.down_proj)
         self._dp_attention = is_dp_attention_enabled()
+
+    def _activate_for_down(self, gate_up: torch.Tensor):
+        if not self._npu_prequant_down:
+            return self.act_fn(gate_up)
+        from sgl_kernel_npu.activation.situ import situ_and_mul_quant
+
+        return situ_and_mul_quant(
+            gate_up,
+            beta=self.act_fn.beta,
+            linear_beta=self.act_fn.linear_beta,
+            need_quant=True,
+        )
 
     def forward(
         self,
@@ -357,7 +376,7 @@ class KimiK3MLP(nn.Module):
             hidden_states = get_global_dp_buffer(get_tp_group())
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
         gate_up, _ = self.gate_up_proj(hidden_states)
-        hidden_states = self.act_fn(gate_up)
+        hidden_states = self._activate_for_down(gate_up)
         hidden_states, _ = self.down_proj(hidden_states)
         if use_dp:
             global_out = hidden_states
@@ -389,17 +408,7 @@ class KimiK3MLP(nn.Module):
         gate_up = npu_fused_all_gather_linear(
             self.gate_up_proj, local_hidden_states, group
         )
-        if isinstance(self.act_fn, SituAndMul):
-            from sgl_kernel_npu.activation.situ import situ_and_mul_quant
-
-            hidden_states = situ_and_mul_quant(
-                gate_up,
-                beta=self.act_fn.beta,
-                linear_beta=self.act_fn.linear_beta,
-                need_quant=True,
-            )
-        else:
-            hidden_states = self.act_fn(gate_up)
+        hidden_states = self._activate_for_down(gate_up)
         return npu_fused_linear_reduce_scatter(
             self.down_proj, hidden_states, group
         )
