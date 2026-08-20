@@ -387,7 +387,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 # unused hook avoids paying for two proposal computations.
                 if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get():
                     self._draft_sampler = self._maybe_build_draft_sampler(
-                      available_memory_gb=available_mem
+                        available_memory_gb=available_mem
                     )
                     if self._draft_sampler is not None:
                         self.draft_model_runner.capture_tail_hooks.append(
