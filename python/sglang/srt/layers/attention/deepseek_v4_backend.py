@@ -1758,6 +1758,17 @@ class DeepseekV4AttnBackend(
                     flash_mla_with_kvcache_sm120,
                 )
 
+                # b12x kernel-family hint: verify rows follow the decode split
+                # contract (rows = bs * (1 + draft tokens)), everything
+                # extend-shaped runs the unified prefill kernel.
+                sm120_mode = (
+                    "decode"
+                    if (
+                        forward_batch.forward_mode.is_decode_or_idle()
+                        or forward_batch.forward_mode.is_target_verify()
+                    )
+                    else "extend"
+                )
                 o = flash_mla_with_kvcache_sm120(
                     q=q,
                     k_cache=swa_k_cache,
@@ -1769,6 +1780,7 @@ class DeepseekV4AttnBackend(
                     extra_k_cache=extra_k_cache,
                     extra_indices_in_kvcache=extra_indices,
                     extra_topk_length=extra_topk_lengths,
+                    mode=sm120_mode,
                 )[0]
             else:
                 if _is_xpu:

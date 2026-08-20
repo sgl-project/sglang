@@ -206,14 +206,15 @@ def _sm120_sparse_decode_fwd(
 
 
 # SM120 FlashMLA: default FlashInfer (CUTLASS SM120 sparse MLA decode).
-# Override with SGLANG_SM120_FLASHMLA_BACKEND=triton|torch to force fallback.
+# Override with SGLANG_SM120_FLASHMLA_BACKEND=b12x|triton|torch.
 _sm120_default_backend = envs.SGLANG_SM120_FLASHMLA_BACKEND.get()
 
 
 def flash_mla_with_kvcache_sm120(**kwargs):
     """SM120 FlashMLA sparse decode entry point.
 
-    Dispatches to FlashInfer (default if available), Triton, or PyTorch fallback.
+    Dispatches to FlashInfer (default if available), b12x compressed MLA,
+    Triton, or PyTorch fallback.
     """
     q = kwargs["q"]
     k_cache = kwargs["k_cache"]
@@ -227,6 +228,21 @@ def flash_mla_with_kvcache_sm120(**kwargs):
     extra_k_cache = kwargs.get("extra_k_cache")
     extra_indices = kwargs.get("extra_indices_in_kvcache")
     extra_topk_length = kwargs.get("extra_topk_length")
+
+    if _sm120_default_backend == "b12x":
+        return _flash_mla_b12x(
+            q,
+            k_cache,
+            indices,
+            topk_length,
+            attn_sink,
+            head_dim_v,
+            softmax_scale,
+            extra_k_cache,
+            extra_indices,
+            extra_topk_length,
+            kwargs.get("mode"),
+        )
 
     if _sm120_default_backend == "flashinfer":
         return _flash_mla_flashinfer(
@@ -560,6 +576,183 @@ def _flash_mla_flashinfer(
         extra_topk_length=extra_topk_length,
         mid_out=mid_out,
         mid_lse=mid_lse,
+    )
+
+    return (output.unsqueeze(1), None)
+
+
+# b12x compressed MLA state. The sink cache holds the fp32-contiguous copy of
+# each layer's attention sink (built once, outside capture, then stable). The
+# retired list keeps superseded scratch buffers alive: a captured CUDA graph
+# bakes the old buffer's address, so freeing it on growth would leave replays
+# reading reclaimed memory.
+_B12X_SINK_CACHE: dict = {}
+_B12X_RETIRED_SCRATCH: list = []
+
+
+def _b12x_page_bytes_view(cache: torch.Tensor) -> torch.Tensor:
+    """Rank-2 [pages, page_bytes] uint8 view b12x's cache validator expects."""
+    cache_u8 = cache.view(torch.uint8) if cache.dtype != torch.uint8 else cache
+    page_bytes = cache_u8.stride(0)
+    return torch.as_strided(cache_u8, (cache_u8.shape[0], page_bytes), (page_bytes, 1))
+
+
+def _b12x_scratch(plan, device: torch.device, mode: str) -> torch.Tensor:
+    """Persistent grow-only scratch, keyed per mode.
+
+    Decode scratch reaches its maximum during the (largest-bucket-first)
+    CUDA graph warmup and stays fixed; extend scratch only ever grows on the
+    eager prefill path. Splitting the keys keeps decode growth away from
+    capture, and the retired list covers the remaining realloc-after-capture
+    hazard.
+    """
+    from sglang.srt.runtime_context import get_resources
+
+    (shape, dtype) = plan.shapes_and_dtypes()[0]
+    need = int(shape[0])
+    buffers = get_resources().buffers
+    key = f"flash_mla_sm120_b12x_scratch:{mode}:{device}"
+    buf = buffers.get(key)
+    if buf is None or buf.numel() < need:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"b12x compressed MLA scratch needs {need} bytes during CUDA "
+                f"graph capture (have {0 if buf is None else buf.numel()}); "
+                "the eager pre-capture run must size it first."
+            )
+        if buf is not None:
+            _B12X_RETIRED_SCRATCH.append(buf)
+        with torch.inference_mode(False):
+            buf = torch.empty(need, dtype=dtype, device=device)
+        buffers[key] = buf
+    return buf
+
+
+def _b12x_sink_f32(attn_sink: torch.Tensor, heads: int) -> torch.Tensor:
+    """Per-layer fp32 contiguous sink of shape exactly (heads,)."""
+    key = (attn_sink.data_ptr(), heads)
+    sink = _B12X_SINK_CACHE.get(key)
+    if sink is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "b12x attention sink conversion requested during CUDA graph "
+                "capture; the eager pre-capture run must populate the cache."
+            )
+        sink = attn_sink.reshape(-1)[:heads].to(torch.float32).contiguous()
+        _B12X_SINK_CACHE[key] = sink
+    return sink
+
+
+def _b12x_i32(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if t is None:
+        return None
+    if t.dtype != torch.int32 or not t.is_contiguous():
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"b12x compressed MLA got a non-int32/non-contiguous index "
+                f"tensor (dtype={t.dtype}) during CUDA graph capture."
+            )
+        t = t.to(torch.int32).contiguous()
+    return t
+
+
+def _flash_mla_b12x(
+    q,
+    k_cache,
+    indices,
+    topk_length,
+    attn_sink,
+    head_dim_v,
+    softmax_scale,
+    extra_k_cache,
+    extra_indices,
+    extra_topk_length,
+    mode,
+):
+    """b12x compressed MLA: fused SWA + indexed sparse attention (SM12x).
+
+    Same kernel family as vLLM's DeepseekV4B12xMLAAttention. The SWA pool is
+    re-split to 64-token footer pages (reusing the FlashInfer path's split
+    buffer) because the SM121 single-pass decode requires page_size=64; the
+    c4 pool is 64-token pages natively. b12x accepts sglang's 576-padded page
+    byte width directly, and indexes both caches by raw token slot, so the
+    indices pass through unchanged.
+    """
+    import os
+
+    os.environ.setdefault("B12X_COMPILE_CACHE_DIR", envs.SGLANG_B12X_CACHE_DIR.get())
+    from b12x.attention import compressed_mla
+
+    B = q.shape[0]
+    heads = q.shape[-2]
+    dev = q.device
+
+    idx = _b12x_i32(indices.squeeze(1) if indices.dim() == 3 else indices)
+    extra_idx = _b12x_i32(
+        extra_indices.squeeze(1)
+        if extra_indices is not None and extra_indices.dim() == 3
+        else extra_indices
+    )
+    swa_lengths = _b12x_i32(topk_length)
+    extra_lengths = _b12x_i32(extra_topk_length)
+
+    kv_u8 = k_cache.view(torch.uint8) if k_cache.dtype != torch.uint8 else k_cache
+    src_pbs = k_cache.shape[1] if k_cache.ndim >= 3 else _PBS_SRC
+    kv_64 = (
+        _split_kv_pages_to_64(kv_u8, src_pbs, touched_indices=idx)
+        if src_pbs != _PBS_DST
+        else kv_u8
+    )
+    swa_pages = _b12x_page_bytes_view(kv_64)
+    extra_pages = (
+        _b12x_page_bytes_view(extra_k_cache) if extra_k_cache is not None else None
+    )
+
+    width = idx.shape[-1] + (extra_idx.shape[-1] if extra_idx is not None else 0)
+    num_splits_cap = compressed_mla.split_chunks_for_contract(
+        rows=max(1, B),
+        width=width,
+        max_chunks=max(1, (width + 63) // 64),
+        decode_row_capacity=None,
+    )
+    if mode is None:
+        mode = "decode" if B <= 256 else "extend"
+
+    caps = compressed_mla.Caps(
+        device=dev,
+        num_q_heads=heads,
+        max_q_rows=max(1, B),
+        max_width=width,
+        head_dim=q.shape[-1],
+        v_head_dim=head_dim_v,
+        page_size=_PBS_DST,
+        max_chunks_per_row=num_splits_cap,
+    )
+    plan = compressed_mla.plan(caps)
+    scratch = _b12x_scratch(plan, dev, mode)
+
+    q3 = q.squeeze(1) if q.ndim == 4 else q
+    binding = plan.bind(
+        scratch=scratch,
+        q=q3,
+        swa_indices=idx,
+        swa_lengths=swa_lengths,
+        indexed_indices=extra_idx,
+        indexed_lengths=extra_lengths,
+    )
+    binding.scratch.mode = mode
+
+    output = torch.empty(B, heads, head_dim_v, dtype=torch.bfloat16, device=dev)
+    compressed_mla.run(
+        binding=binding,
+        swa_k_cache=swa_pages,
+        swa_page_size=_PBS_DST,
+        indexed_k_cache=extra_pages,
+        indexed_page_size=_PBS_DST if extra_pages is not None else None,
+        attn_sink=_b12x_sink_f32(attn_sink, heads) if attn_sink is not None else None,
+        sm_scale=softmax_scale,
+        expected_num_q_heads=heads,
+        out=output,
     )
 
     return (output.unsqueeze(1), None)
