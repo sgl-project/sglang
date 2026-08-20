@@ -150,6 +150,8 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
+    ProfileReqOutput,
+    ProfileReqType,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -1592,7 +1594,7 @@ class Scheduler(
                 (SlowDownReqInput, self.slow_down),
                 (
                     ProfileReq,
-                    lambda req: self.profiler_manager._profile(req),
+                    self.handle_profile_request,
                 ),
                 (FreezeGCReq, self.handle_freeze_gc),
                 (ShutdownReq, self.handle_shutdown),
@@ -1759,42 +1761,9 @@ class Scheduler(
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
 
-        enable_profiling = os.getenv("SGLANG_NPU_PROFILING",
-                                     "0") == "1" and torch.distributed.get_rank() == 0  # envs.SGLANG_NPU_PROFILING.get()
-        prof_bs = int(os.getenv("SGLANG_NPU_PROFILING_BS", 1))  # envs.SGLANG_NPU_PROFILING_BS.get()
-        prof_step = int(os.getenv("SGLANG_NPU_PROFILING_STEP", 10))  # envs.SGLANG_NPU_PROFILING_STEP.get()
-        profiling_stage: str = os.getenv("SGLANG_NPU_PROFILING_STAGE",
-                                         "decode")  # envs.SGLANG_NPU_PROFILING_STAGE.get()
-        profiling_path: str = os.getenv("SGLANG_NPU_PROFILING_PATH", "profiling")  # envs.SGLANG_NPU_PROFILING_PATH.get()
-        
+        enable_profiling = self.custom_npu_profiling
         if enable_profiling:
-            prof_cnt = 0
             import torch_npu
-
-            experimental_config = torch_npu.profiler._ExperimentalConfig(
-                aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
-                profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
-                l2_cache=False,
-                data_simplification=False,
-            )
-            prof = torch_npu.profiler.profile(
-                activities=[
-                    torch_npu.profiler.ProfilerActivity.CPU,
-                    torch_npu.profiler.ProfilerActivity.NPU,
-                ],
-                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
-                    profiling_path
-                ),
-                schedule=torch_npu.profiler.schedule(
-                    wait=1, warmup=1, active=10, repeat=1, skip_first=1
-                ),
-                record_shapes=True,
-                profile_memory=True,
-                with_stack=False,
-                with_flops=False,
-                with_modules=False,
-                experimental_config=experimental_config,
-            )
 
         def pop_and_process():
             # Process the results of the last batch
@@ -1808,6 +1777,14 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            if enable_profiling and self.custom_npu_profile_stop_requested:
+                if self.custom_npu_profiler_active:
+                    torch.npu.synchronize()
+                    self.custom_npu_profiler.stop()
+                self.custom_npu_profiler = None
+                self.custom_npu_profiler_active = False
+                self.custom_npu_profiler_step = 0
+                self.custom_npu_profile_stop_requested = False
             if self._engine_paused:
                 continue
 
@@ -1837,34 +1814,42 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                if enable_profiling:
-                    is_prof_stage = False
-                    if (
-                            profiling_stage == "decode" and batch.forward_mode.is_decode()
+                profile_this_batch = False
+                if enable_profiling and self.custom_npu_profile_requested:
+                    is_prof_stage = (
+                        self.custom_npu_profiler_stage == "decode"
+                        and batch.forward_mode.is_decode()
                     ) or (
-                            profiling_stage == "prefill" and batch.forward_mode.is_extend()
+                        self.custom_npu_profiler_stage == "prefill"
+                        and batch.forward_mode.is_extend()
+                    )
+                    if (
+                        len(batch.reqs) >= self.custom_npu_profiler_bs
+                        and not self.custom_npu_profiler_active
+                        and is_prof_stage
                     ):
-                        is_prof_stage = True
-
-                    if len(batch.reqs) >= prof_bs and prof_cnt == 0 and is_prof_stage:
-                        prof.start()
-                        prof_cnt += 1
-                    if prof_cnt > 0 and is_prof_stage:
-                        prof_cnt += 1
-                    if prof_cnt == prof_step and is_prof_stage:
-                        torch.npu.synchronize()
-                        prof.stop()
+                        self.custom_npu_profiler.start()
+                        self.custom_npu_profiler_active = True
+                        self.custom_npu_profiler_step = 0
+                    profile_this_batch = (
+                        self.custom_npu_profiler_active and is_prof_stage
+                    )
                 batch_result = self.run_batch(batch)
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
-                if (
-                        enable_profiling
-                        and prof_cnt > 0
-                        and prof_cnt < prof_step
-                        and is_prof_stage
-                ):
-                    prof.step()
+                if profile_this_batch:
+                    self.custom_npu_profiler.step()
+                    self.custom_npu_profiler_step += 1
+                    if (
+                        self.custom_npu_profiler_step
+                        >= self.custom_npu_profiler_num_steps
+                    ):
+                        torch.npu.synchronize()
+                        self.custom_npu_profiler.stop()
+                        self.custom_npu_profiler = None
+                        self.custom_npu_profiler_active = False
+                        self.custom_npu_profile_requested = False
             else:
                 batch_result = None
                 self._sched_idled = True
@@ -1999,6 +1984,121 @@ class Scheduler(
             dp_tp_cpu_group=self.dp_tp_cpu_group,
             get_forward_ct=lambda: self.forward_ct,
         )
+
+        self.custom_npu_profiling = os.getenv("SGLANG_NPU_PROFILING", "0") == "1"
+        self.custom_npu_default_rank = int(
+            os.getenv("SGLANG_NPU_PROFILING_RANK", "0")
+        )
+        self.custom_npu_current_rank = self.custom_npu_default_rank
+        self.custom_npu_profiler = None
+        self.custom_npu_profiler_active = False
+        self.custom_npu_profiler_step = 0
+        self.custom_npu_profiler_num_steps = 0
+        self.custom_npu_profiler_bs = 1
+        self.custom_npu_profiler_stage = "decode"
+        self.custom_npu_profile_requested = False
+        self.custom_npu_profile_stop_requested = False
+
+    def handle_profile_request(self, req: ProfileReq) -> ProfileReqOutput:
+        if not self.custom_npu_profiling:
+            return self.profiler_manager._profile(req)
+
+        if req.req_type == ProfileReqType.START_PROFILE:
+            self.custom_npu_current_rank = (
+                req.profile_rank
+                if req.profile_rank is not None
+                else self.custom_npu_default_rank
+            )
+        global_rank = torch.distributed.get_rank()
+        if global_rank != self.custom_npu_current_rank:
+            return ProfileReqOutput(
+                success=True,
+                message=f"Custom NPU profiling skipped on global rank {global_rank}.",
+            )
+
+        if req.req_type == ProfileReqType.STOP_PROFILE:
+            self.custom_npu_profile_requested = False
+            self.custom_npu_profile_stop_requested = True
+            message = f"Custom NPU profiling stop requested on global rank {global_rank}."
+            logger.info(message)
+            return ProfileReqOutput(success=True, message=message)
+
+        if self.custom_npu_profile_requested or self.custom_npu_profiler_active:
+            return ProfileReqOutput(
+                success=False,
+                message="Custom NPU profiling is already armed or active.",
+            )
+
+        self.custom_npu_profiler_bs = (
+            req.profile_batch_size
+            if req.profile_batch_size is not None
+            else int(os.getenv("SGLANG_NPU_PROFILING_BS", "1"))
+        )
+        self.custom_npu_profiler_num_steps = (
+            req.num_steps
+            if req.num_steps is not None
+            else int(os.getenv("SGLANG_NPU_PROFILING_STEP", "10"))
+        )
+        self.custom_npu_profiler_stage = (
+            req.profile_stage
+            if req.profile_stage is not None
+            else os.getenv("SGLANG_NPU_PROFILING_STAGE", "decode")
+        )
+        output_dir = req.output_dir or os.getenv(
+            "SGLANG_NPU_PROFILING_PATH", "profiling"
+        )
+        if self.custom_npu_profiler_bs <= 0:
+            return ProfileReqOutput(
+                success=False, message="profile_batch_size must be greater than zero."
+            )
+        if self.custom_npu_profiler_num_steps <= 0:
+            return ProfileReqOutput(
+                success=False, message="num_steps must be greater than zero."
+            )
+        if self.custom_npu_profiler_stage not in ("prefill", "decode"):
+            return ProfileReqOutput(
+                success=False, message="profile_stage must be prefill or decode."
+            )
+
+        import torch_npu
+
+        experimental_config = torch_npu.profiler._ExperimentalConfig(
+            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
+            l2_cache=False,
+            data_simplification=False,
+        )
+        self.custom_npu_profiler = torch_npu.profiler.profile(
+            activities=[
+                torch_npu.profiler.ProfilerActivity.CPU,
+                torch_npu.profiler.ProfilerActivity.NPU,
+            ],
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(output_dir),
+            schedule=torch_npu.profiler.schedule(
+                wait=0,
+                warmup=0,
+                active=self.custom_npu_profiler_num_steps,
+                repeat=1,
+                skip_first=0,
+            ),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=False,
+            with_flops=False,
+            with_modules=False,
+            experimental_config=experimental_config,
+        )
+        self.custom_npu_profiler_step = 0
+        self.custom_npu_profile_requested = True
+        self.custom_npu_profile_stop_requested = False
+        message = (
+            f"Custom NPU profiling armed on global rank {global_rank}: "
+            f"batch_size={self.custom_npu_profiler_bs}, "
+            f"num_steps={self.custom_npu_profiler_num_steps}, "
+            f"stage={self.custom_npu_profiler_stage}, output_dir={output_dir}."
+        )
+        logger.info(message)
+        return ProfileReqOutput(success=True, message=message)
 
     def init_weight_updater(self) -> None:
         self.weight_updater = SchedulerWeightUpdaterManager(

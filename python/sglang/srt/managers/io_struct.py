@@ -2094,6 +2094,10 @@ class ProfileReq(BaseReq, kw_only=True):
     profile_prefix: Optional[str] = None
     # Only profile these stages and ignore others
     profile_stages: Optional[List[str]] = None
+    # Custom NPU profiler controls. These are ignored by the built-in profiler.
+    profile_rank: Optional[int] = None
+    profile_batch_size: Optional[int] = None
+    profile_stage: Optional[str] = None
 
 
 class ProfileReqOutput(BaseReq, kw_only=True):
