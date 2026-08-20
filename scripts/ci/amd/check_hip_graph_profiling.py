@@ -4,8 +4,8 @@
 ROCm 7.2.0 (roctracer 4.1.70200) loses kernel-dispatch events for work submitted
 through hipGraphLaunch: a trace captured while SGLang decodes -- which replays HIP
 graphs -- shows the host-side launch but no GPU kernels under it. ROCm resolved the
-roctracer reporting failure in 7.2.2 (https://github.com/ROCm/ROCm/issues/6102), so
-this probe is what qualifies a candidate ROCm image before it is published.
+roctracer reporting failure in 7.2.2 (https://github.com/ROCm/ROCm/issues/6102); the
+rocm724 flavors carry that fix, and this probe is what confirms an image has it.
 
 On 7.2.0 the same combination can also wedge the HIP runtime inside
 hipGraphLaunch instead of losing events, so each phase runs in a child process
