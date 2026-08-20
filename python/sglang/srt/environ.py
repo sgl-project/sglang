@@ -1533,6 +1533,12 @@ class Envs:
     # Upper bound on tokens in one b12x MoE call, used to size its scratch
     # workspace at load time. Track --chunked-prefill-size if that is raised.
     SGLANG_B12X_MAX_TOKENS = EnvInt(4096)
+    # Run the MoE as W4A8 (activations quantized to MXFP8-E4M3 in-kernel)
+    # instead of W4A16. This is the recipe the official vLLM DGX Spark image
+    # runs (its recipe sets B12X_MOE_FORCE_A8=1): all of b12x's GB10 MoE
+    # tuning lives on this path. Different numerics from W4A16 -- validate
+    # accuracy when flipping.
+    SGLANG_B12X_MOE_A8 = EnvBool(True)
     # Compile the b12x kernels for every planned token count at load time,
     # before any CUDA graph capture. Off only defers the cost: captured decode
     # shapes are still compiled by the graph runner's pre-capture warmup runs,
