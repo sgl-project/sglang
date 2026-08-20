@@ -50,9 +50,13 @@ class Mxfp4FlashinferCutlassMoEMethod:
                 from flashinfer import fused_moe as flashinfer_fused_moe
                 from packaging.version import Version
 
-                release = Version(flashinfer_version).release
-                release = release + (0,) * (3 - len(release))
-                has_corrected_humming_api = release[:3] >= (0, 6, 18) and hasattr(
+                # Full Version compare: .release[:3] drops prerelease
+                # markers and would accept 0.6.18rc*/dev* builds that predate
+                # the corrected API. InvalidVersion is a ValueError, so the
+                # except below still covers a malformed version string.
+                has_corrected_humming_api = Version(flashinfer_version) >= Version(
+                    "0.6.18"
+                ) and hasattr(
                     flashinfer_fused_moe,
                     "preprocess_moe_weights_for_sm90_mixed_gemm_humming",
                 )

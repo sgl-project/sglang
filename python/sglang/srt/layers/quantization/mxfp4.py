@@ -109,9 +109,12 @@ if is_flashinfer_available():
         from flashinfer import __version__ as _flashinfer_version
         from flashinfer import fused_moe as _flashinfer_fused_moe
 
-        _fi_release = Version(_flashinfer_version).release
-        _fi_release = _fi_release + (0,) * (3 - len(_fi_release))
-        _FI_HAS_SM90_CUTLASS_MXFP4_FP8 = _fi_release[:3] >= (0, 6, 18) and hasattr(
+        # Compare full Versions, not .release[:3]: the release tuple drops
+        # prerelease markers, so 0.6.18rc*/0.6.18.dev* -- cut before the
+        # corrected API landed in the 0.6.18 release -- would slip through.
+        _FI_HAS_SM90_CUTLASS_MXFP4_FP8 = Version(_flashinfer_version) >= Version(
+            "0.6.18"
+        ) and hasattr(
             _flashinfer_fused_moe,
             "preprocess_moe_weights_for_sm90_mixed_gemm_humming",
         )
