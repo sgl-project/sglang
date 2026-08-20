@@ -1885,6 +1885,12 @@ else:
     biased_grouped_topk = biased_grouped_topk_gpu
     grouped_topk = grouped_topk_xpu if _is_xpu else grouped_topk_gpu
     fused_topk_native = fused_topk_torch_native
+    if _is_cuda:
+        # topk_sigmoid/topk_softmax are imported only for GPU backends above.
+        # A CPU without AMX must stay on the torch-native fallback.
+        fused_topk = fused_topk_torch_native
+    else:
+        pass  # do nothing for other devices
 
 
 def remap_topk_for_per_rank_shared_slots(
@@ -2252,7 +2258,12 @@ def select_experts(
         if scoring_func not in ("sqrtsoftplus", "sigmoid"):
             assert not apply_routed_scaling_factor_on_output, "Not implemented"
 
-        if scoring_func == "sqrtsoftplus" or scoring_func == "sigmoid":
+        # The JIT route depends on GPU-only topk_sigmoid/topk_softmax imports
+        _can_use_jit_kernel = not _is_cpu
+
+        if _can_use_jit_kernel and (
+            scoring_func == "sqrtsoftplus" or scoring_func == "sigmoid"
+        ):
             _biased_topk = biased_topk_xpu if _is_xpu else biased_topk_jit_kernel_impl
             topk_weights, topk_ids = _biased_topk(
                 hidden_states=hidden_states,
