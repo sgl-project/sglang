@@ -23,6 +23,7 @@ REQUIRED_GPQA_COLUMNS = {
     "Incorrect Answer 3",
 }
 REQUIRED_SGLANG_KERNEL_VERSION = "0.4.6.post1"
+REQUIRED_TORCH_VERSION = "2.13.0"
 
 
 def sha256(path: Path) -> str:
@@ -195,11 +196,20 @@ def probe_sglang(repo: Path) -> dict:
             f"sglang-kernel is {kernel_version}, expected "
             f"{REQUIRED_SGLANG_KERNEL_VERSION}"
         )
+    torch = importlib.import_module("torch")
+    torch_version = torch.__version__.split("+", 1)[0]
+    if torch_version != REQUIRED_TORCH_VERSION:
+        raise RuntimeError(
+            f"torch is {torch.__version__}, expected {REQUIRED_TORCH_VERSION}"
+        )
+    sgl_kernel = importlib.import_module("sgl_kernel")
     return {
         "repo": str(repo.resolve()),
         "head": git(repo, "rev-parse", "HEAD"),
         "installed_path": str(installed_path),
         "sglang_kernel_version": kernel_version,
+        "sglang_kernel_path": str(Path(inspect.getfile(sgl_kernel)).resolve()),
+        "torch_version": torch.__version__,
     }
 
 
