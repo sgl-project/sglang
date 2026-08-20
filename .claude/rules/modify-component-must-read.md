@@ -7,3 +7,4 @@ Before modifying the following components, read the listed skill first.
 - **Any edit to a frozen core file** (currently `python/sglang/srt/model_executor/model_runner.py`) → [`large-class-style`](../skills/large-class-style/SKILL.md)
 - **Environment variables** (adding, renaming, or reviewing any `SGLANG_*` env var, migrating a legacy `SGL_*` alias, or touching `python/sglang/srt/environ.py`) → [`env-var-conventions`](../skills/env-var-conventions/SKILL.md)
 - **Scripted runtime** (anything related to the scripted runtime) → [`scripted-runtime-notes`](../skills/scripted-runtime-notes/SKILL.md)
+- **KV-cache allocators / device pools / host pools** (adding, moving, or renaming any `BaseTokenToKVPoolAllocator`, `KVCache`, or `HostKVCache` subclass, or adding a module under `python/sglang/srt/mem_cache/`) → [`mem-cache-layout`](../skills/mem-cache-layout/SKILL.md)
