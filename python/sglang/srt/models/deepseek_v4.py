@@ -138,9 +138,8 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
-    _is_fused_mhc_post_pre_enabled,
+    apply_mhc_post_pre_boundary,
     is_cross_layer_mhc_fusion_enabled,
-    try_mhc_fused_post_pre_boundary,
 )
 from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
@@ -1691,72 +1690,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.post_attention_layernorm.weight.data.bfloat16().contiguous()
         )
 
-    def _apply_mhc_post_pre_boundary(
-        self,
-        layer_input: torch.Tensor,
-        residual: torch.Tensor,
-        post: torch.Tensor,
-        comb: torch.Tensor,
-        hc_fn: torch.Tensor,
-        hc_scale: torch.Tensor,
-        hc_base: torch.Tensor,
-        norm_weight: Optional[torch.Tensor],
-        norm_eps: Optional[float],
-        *,
-        fn_transpose: bool,
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]]:
-        # Try the aiter/Triton fused post+pre kernels first; if neither fires,
-        # fall back to the TileLang fused kernel, else return None so the caller
-        # runs the unfused hc_post + hc_pre sequence.
-        fused = try_mhc_fused_post_pre_boundary(
-            layer_input,
-            residual,
-            post,
-            comb,
-            hc_fn,
-            hc_scale,
-            hc_base,
-            self.hc_mult,
-            self.rms_norm_eps,
-            self.hc_eps,
-            _MHC_POST_MULT_VALUE,
-            self.hc_sinkhorn_iters,
-            norm_weight,
-            norm_eps,
-            fn_transpose,
-            _is_gfx95_supported,
-        )
-        if fused is not None:
-            return fused
-
-        if not _is_fused_mhc_post_pre_enabled():
-            return None
-
-        post_in = post.unsqueeze(-1) if post.ndim == 2 else post
-        (
-            residual,
-            post_out,
-            comb_out,
-            layer_input_out,
-        ) = _get_mhc_ops().mhc_fused_post_pre(
-            layer_input,
-            residual,
-            post_in,
-            comb,
-            hc_fn,
-            hc_scale,
-            hc_base,
-            self.rms_norm_eps,
-            self.hc_eps,
-            self.hc_eps,
-            _MHC_POST_MULT_VALUE,
-            self.hc_sinkhorn_iters,
-            norm_weight=norm_weight,
-            norm_eps=norm_eps,
-        )
-        post_out = post_out.squeeze(-1) if post_out.ndim == 3 else post_out
-        return residual, layer_input_out, post_out, comb_out, True
-
     def hc_pre(
         self,
         x: torch.Tensor,
@@ -1960,7 +1893,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 if self._input_layernorm_weight_bf16 is not None
                 else self.input_layernorm.weight.data
             )
-            fused = self._apply_mhc_post_pre_boundary(
+            fused = apply_mhc_post_pre_boundary(
                 hidden_states,
                 prev_residual,
                 prev_post,
@@ -1968,6 +1901,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_attn_fn,
                 self.hc_attn_scale,
                 self.hc_attn_base,
+                self.hc_mult,
+                self.rms_norm_eps,
+                self.hc_eps,
+                _MHC_POST_MULT_VALUE,
+                self.hc_sinkhorn_iters,
                 input_norm_weight,
                 self.input_layernorm.variance_epsilon,
                 fn_transpose=False,
@@ -2057,7 +1995,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 if self._post_attention_layernorm_weight_bf16 is not None
                 else self.post_attention_layernorm.weight.data
             )
-            fused = self._apply_mhc_post_pre_boundary(
+            fused = apply_mhc_post_pre_boundary(
                 hidden_states,
                 residual,
                 post,
@@ -2065,6 +2003,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_ffn_fn,
                 self.hc_ffn_scale,
                 self.hc_ffn_base,
+                self.hc_mult,
+                self.rms_norm_eps,
+                self.hc_eps,
+                _MHC_POST_MULT_VALUE,
+                self.hc_sinkhorn_iters,
                 post_attn_norm_weight,
                 self.post_attention_layernorm.variance_epsilon,
                 fn_transpose=True,
@@ -2330,7 +2273,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         #
         # Pop each boundary tensor from the state EXACTLY ONCE, up front, and
         # reuse the locals for both the fused attempt and the non-fused
-        # fallback. _apply_mhc_post_pre_boundary() returns None when it declines
+        # fallback. apply_mhc_post_pre_boundary() returns None when it declines
         # to fuse -- most importantly for the 0-token DP two-batch-overlap idle
         # ubatch -- in which case control must fall through to the unfused
         # hc_post. Popping in the fused call's arguments and again in the
@@ -2349,7 +2292,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 if self._post_attention_layernorm_weight_bf16 is not None
                 else self.post_attention_layernorm.weight.data
             )
-            fused = self._apply_mhc_post_pre_boundary(
+            fused = apply_mhc_post_pre_boundary(
                 hidden_states_after_attn,
                 attn_residual,
                 attn_post,
@@ -2357,6 +2300,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_ffn_fn,
                 self.hc_ffn_scale,
                 self.hc_ffn_base,
+                self.hc_mult,
+                self.rms_norm_eps,
+                self.hc_eps,
+                _MHC_POST_MULT_VALUE,
+                self.hc_sinkhorn_iters,
                 post_attn_norm_weight,
                 self.post_attention_layernorm.variance_epsilon,
                 fn_transpose=True,

@@ -191,7 +191,7 @@ class TestAmdFusedMhcAttnBoundaryFallback(unittest.TestCase):
     """Regression: the attn-side boundary fallback must close the previous
     layer's deferred mHC post before opening the current layer's pre.
 
-    When ``_apply_mhc_post_pre_boundary`` declines to fuse (returns ``None``) --
+    When ``apply_mhc_post_pre_boundary`` declines to fuse (returns ``None``) --
     reachable after an aiter import/kernel failure permanently disables the fused
     path -- the fallback must call
     ``hc_post(hidden_states, prev_residual, prev_post, prev_comb)`` before
@@ -217,7 +217,6 @@ class TestAmdFusedMhcAttnBoundaryFallback(unittest.TestCase):
         layer = mock.Mock()
         layer.use_fused_mhc_post_pre = True
         layer._input_layernorm_weight_bf16 = None
-        layer._apply_mhc_post_pre_boundary.return_value = None
         closed_post = object()
         layer.hc_post.return_value = closed_post
         # norm_fused=True keeps the fallback off the fp8-quant / layernorm branch.
@@ -227,7 +226,13 @@ class TestAmdFusedMhcAttnBoundaryFallback(unittest.TestCase):
         hs_in = object()
         prev_residual, prev_post, prev_comb = object(), object(), object()
 
-        with self.assertRaises(_StopForward):
+        with (
+            mock.patch(
+                "sglang.srt.models.deepseek_v4.apply_mhc_post_pre_boundary",
+                return_value=None,
+            ),
+            self.assertRaises(_StopForward),
+        ):
             DeepseekV4DecoderLayer.forward(
                 layer,
                 positions=object(),
@@ -284,13 +289,6 @@ class TestAmdFusedMhcNormFusedHandling(unittest.TestCase):
         residual, post, comb = object(), object(), object()
         # Fused dispatch SUCCEEDS but reports the input layernorm was NOT applied
         # (norm_fused=False) -- the Triton fused post+pre contract.
-        layer._apply_mhc_post_pre_boundary.return_value = (
-            residual,
-            fused_hs,
-            post,
-            comb,
-            False,
-        )
         normed = object()
         layer.input_layernorm.return_value = normed
         layer.self_attn.maybe_use_decode_attn_tp.side_effect = _StopForward
@@ -300,6 +298,10 @@ class TestAmdFusedMhcNormFusedHandling(unittest.TestCase):
         with (
             mock.patch.object(deepseek_v4, "_use_aiter", False),
             mock.patch.object(deepseek_v4, "_is_gfx95_supported", False),
+            mock.patch(
+                "sglang.srt.models.deepseek_v4.apply_mhc_post_pre_boundary",
+                return_value=(residual, fused_hs, post, comb, False),
+            ),
             self.assertRaises(_StopForward),
         ):
             DeepseekV4DecoderLayer.forward(
