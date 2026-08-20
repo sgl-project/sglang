@@ -1973,7 +1973,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
+            # Only the CUDA prepare_for_verify pre-plans (load_batch /
+            # init_forward_metadata); the NPU branch leaves planning to the
+            # forward path, so it must not mark metadata ready here.
+            skip_attn_backend_init=None if _is_npu else True,
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
