@@ -22,6 +22,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     _compute_pad_value,
 )
+from sglang.srt.managers.tokenizer_manager import _apply_caller_mm_hashes
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -110,6 +111,35 @@ class TestMmHashesContract(CustomTestCase):
 
         self.assertEqual(item.hash, 0xBBBB)
         self.assertEqual(item.pad_value, _compute_pad_value(0xBBBB))
+
+    def test_incompatible_duplicate_hashes_fall_back_to_internal_identity(self):
+        items = [
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                offsets=[offset],
+            )
+            for offset in ((0, 0), (1, 2))
+        ]
+
+        with self.assertLogs(level="WARNING"):
+            _apply_caller_mm_hashes(items, ["deadbeef", "deadbeef"])
+
+        self.assertIsNone(items[0].hash)
+        self.assertIsNone(items[1].hash)
+
+    def test_compatible_duplicate_hashes_remain_shareable(self):
+        items = [
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                offsets=[offset],
+            )
+            for offset in ((0, 0), (1, 1))
+        ]
+
+        _apply_caller_mm_hashes(items, ["deadbeef", "deadbeef"])
+
+        self.assertEqual(items[0].hash, 0xDEADBEEF)
+        self.assertEqual(items[1].hash, 0xDEADBEEF)
 
 
 if __name__ == "__main__":

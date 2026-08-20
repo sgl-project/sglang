@@ -34,7 +34,17 @@ from datetime import datetime
 from enum import Enum
 from functools import lru_cache
 from http import HTTPStatus
-from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import fastapi
 import numpy as np
@@ -165,11 +175,62 @@ from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
+if TYPE_CHECKING:
+    from sglang.srt.multimodal.audio_encoder_windowing import (
+        AudioEncoderWindowConfig,
+    )
+
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+
+
+def _apply_caller_mm_hashes(
+    mm_items: List[MultimodalDataItem], caller_mm_hashes: List[str]
+) -> None:
+    """Apply valid caller hashes unless duplicates disagree on token geometry."""
+    if len(caller_mm_hashes) != len(mm_items):
+        logger.warning(
+            "mm_hashes length (%d) != mm_items length (%d); "
+            "ignoring caller hashes for this request.",
+            len(caller_mm_hashes),
+            len(mm_items),
+        )
+        return
+
+    parsed = []
+    geometry_by_hash = {}
+    for item, hex_hash in zip(mm_items, caller_mm_hashes):
+        if not isinstance(item, MultimodalDataItem):
+            continue
+        try:
+            item_hash = int(hex_hash, 16)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Ignoring malformed mm_hashes entry %r; "
+                "this item will fall back to hash_feature().",
+                hex_hash,
+            )
+            continue
+        geometry = (
+            item.modality,
+            tuple(end - start + 1 for start, end in item.offsets or ()),
+        )
+        previous_geometry = geometry_by_hash.get(item_hash)
+        if previous_geometry is not None and previous_geometry != geometry:
+            logger.warning(
+                "Duplicate mm_hashes value %r has incompatible token geometry; "
+                "ignoring caller hashes for this request.",
+                hex_hash,
+            )
+            return
+        geometry_by_hash[item_hash] = geometry
+        parsed.append((item, item_hash))
+
+    for item, item_hash in parsed:
+        item.set_hash(item_hash)
 
 
 def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
@@ -766,11 +827,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        *,
+        audio_encoder_window_config: Optional[AudioEncoderWindowConfig] = None,
     ):
         self.auto_create_handle_loop()
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
+        if audio_encoder_window_config is not None and not obj.is_single:
+            raise ValueError("audio encoder windowing requires a single request")
         self._set_default_priority(obj)
         if (
             isinstance(obj, GenerateReqInput)
@@ -809,7 +874,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 # Tokenize the request and send it to the scheduler
                 if obj.is_single:
-                    tokenized_obj = await self._tokenize_one_request(obj)
+                    tokenized_obj = await self._tokenize_one_request(
+                        obj,
+                        audio_encoder_window_config=audio_encoder_window_config,
+                    )
                     state = self.rid_to_state[obj.rid]
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
@@ -995,6 +1063,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def _tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
+        *,
+        audio_encoder_window_config: Optional[AudioEncoderWindowConfig] = None,
     ):
         """Tokenize one request."""
         # Tokenize
@@ -1091,6 +1161,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         audio_data=obj.audio_data,
                         input_text=mm_processor_input,
                         request_obj=obj,
+                        audio_encoder_window_config=audio_encoder_window_config,
                         max_req_input_len=self.max_req_input_len,
                     )
             elif (
@@ -1106,6 +1177,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     audio_data=obj.audio_data,
                     input_text=mm_processor_input,
                     request_obj=obj,
+                    audio_encoder_window_config=audio_encoder_window_config,
                     max_req_input_len=self.max_req_input_len,
                 )
 
@@ -1127,25 +1199,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # malformed mm_hashes never blocks a request.
             caller_mm_hashes = getattr(obj, "mm_hashes", None)
             if caller_mm_hashes and mm_inputs and mm_inputs.mm_items:
-                if len(caller_mm_hashes) != len(mm_inputs.mm_items):
-                    logger.warning(
-                        "mm_hashes length (%d) != mm_items length (%d); "
-                        "ignoring caller hashes for this request.",
-                        len(caller_mm_hashes),
-                        len(mm_inputs.mm_items),
-                    )
-                else:
-                    for item, hex_hash in zip(mm_inputs.mm_items, caller_mm_hashes):
-                        if not isinstance(item, MultimodalDataItem):
-                            continue
-                        try:
-                            item.set_hash(int(hex_hash, 16))
-                        except (TypeError, ValueError):
-                            logger.warning(
-                                "Ignoring malformed mm_hashes entry %r; "
-                                "this item will fall back to hash_feature().",
-                                hex_hash,
-                            )
+                _apply_caller_mm_hashes(mm_inputs.mm_items, caller_mm_hashes)
             if (
                 envs.SGLANG_MM_PRECOMPUTE_HASH.get()
                 and mm_inputs

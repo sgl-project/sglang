@@ -185,6 +185,137 @@ def test_tensor_cache_entries_share_storage():
         )
 
 
+def _encoder_window_item(item_hash, offset, *, cacheable=True, batch_key=("audio",)):
+    return MultimodalDataItem(
+        modality=Modality.AUDIO,
+        hash=item_hash,
+        feature=torch.zeros(1),
+        offsets=[offset],
+        use_embedding_cache=cacheable,
+        encoder_batch_key=batch_key,
+    )
+
+
+def _request(items, req_idx=0):
+    offsets = [item.offsets[0] for item in items]
+    return mm_schedule.PerImageRequestInfo(
+        req_idx=req_idx,
+        items=items,
+        items_offset=offsets,
+        extend_prefix_len=0,
+        extend_seq_len=max(end for _, end in offsets) + 1,
+    )
+
+
+def test_encoder_windows_cache_complete_items_but_reencode_tail():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    complete = _encoder_window_item(2000, (0, 1))
+    tail = _encoder_window_item(2001, (2, 2), cacheable=False)
+    request = _request([complete, tail])
+    encoded_item_counts = []
+
+    def encoder(items):
+        encoded_item_counts.append(len(items))
+        return _encoder_tensor(items)
+
+    for _ in range(2):
+        mm_schedule._encode_encoder_window_requests(encoder, [request], _CPU)
+
+    assert encoded_item_counts == [2, 1]
+    cached = mm_schedule.embedding_cache.get_single(complete.hash).embedding
+    assert cached.untyped_storage().nbytes() == cached.numel() * cached.element_size()
+    assert not mm_schedule.embedding_cache.has(tail.hash)
+
+
+def test_encoder_batch_key_separates_incompatible_items():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = [
+        _encoder_window_item(3000 + index, (index, index), batch_key=(width,))
+        for index, width in enumerate((3, 4))
+    ]
+    encoder_calls = []
+
+    def encoder(batch):
+        encoder_calls.append([item.encoder_batch_key for item in batch])
+        return _encoder_tensor(batch)
+
+    embeddings = mm_schedule._encode_encoder_window_requests(
+        encoder, [_request(items)], _CPU
+    )
+
+    assert encoder_calls == [[(3,)], [(4,)]]
+    assert set(embeddings) == {item.hash for item in items}
+
+
+def test_same_window_hash_requires_matching_token_counts():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = [_encoder_window_item(5001, offset) for offset in ((0, 0), (1, 2))]
+
+    with pytest.raises(RuntimeError, match="same hash"):
+        mm_schedule._encode_encoder_window_requests(
+            _encoder_tensor,
+            [_request(items)],
+            _CPU,
+        )
+
+
+@pytest.mark.parametrize("cacheable_first", [False, True])
+def test_same_hash_aggregates_cacheability(cacheable_first):
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = [
+        _encoder_window_item(
+            5500,
+            (0, 0),
+            cacheable=(index == 0) == cacheable_first,
+        )
+        for index in range(2)
+    ]
+    requests = [_request([item], index) for index, item in enumerate(items)]
+    encoder_calls = []
+
+    def encoder(batch):
+        encoder_calls.append(len(batch))
+        return _encoder_tensor(batch)
+
+    embeddings = mm_schedule._encode_encoder_window_requests(encoder, requests, _CPU)
+
+    assert encoder_calls == [1]
+    assert set(embeddings) == {5500}
+    assert mm_schedule.embedding_cache.has(5500)
+
+
+def test_window_item_reencodes_wrong_length_cache_hit():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    item = _encoder_window_item(6100, (0, 1))
+    mm_schedule.embedding_cache.set(
+        item.hash,
+        mm_schedule.EmbeddingResult(embedding=torch.zeros(1, HIDDEN)),
+    )
+
+    embeddings = mm_schedule._encode_encoder_window_requests(
+        _encoder_tensor, [_request([item])], _CPU
+    )
+
+    assert embeddings[item.hash].shape == (2, HIDDEN)
+    assert mm_schedule.embedding_cache.get_single(item.hash).embedding.shape == (
+        2,
+        HIDDEN,
+    )
+
+
+def test_wrong_length_encoder_output_is_rejected():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    item = _encoder_window_item(6200, (0, 1))
+
+    def bad_encoder(items):
+        return torch.zeros(1, HIDDEN)
+
+    with pytest.raises(RuntimeError, match="encoder returned"):
+        mm_schedule._encode_encoder_window_requests(
+            bad_encoder, [_request([item])], _CPU
+        )
+
+
 if __name__ == "__main__":
     import sys
 
