@@ -1,6 +1,7 @@
 # Adapted from https://github.com/thinking-machines-lab/batch_invariant_ops/blob/main/batch_invariant_ops/batch_invariant_ops.py
 
 import contextlib
+import logging
 from collections import namedtuple
 from collections.abc import Callable
 from typing import Any, Dict, Tuple
@@ -8,6 +9,7 @@ from typing import Any, Dict, Tuple
 import torch
 import triton
 import triton.language as tl
+from triton.runtime.errors import OutOfResources
 
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.utils import is_npu
@@ -17,6 +19,8 @@ from sglang.srt.utils.common import (
     get_device_core_count,
     get_dispatch_device_backend,
 )
+
+logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 if _is_npu:
@@ -45,6 +49,64 @@ __all__ = [
     "disable_batch_invariant_mode",
     "enable_batch_invariant_mode",
 ]
+
+
+_PERSISTENT_KERNEL_FALLBACK_CACHE: set[Tuple[Any, ...]] = set()
+_SHARED_MEMORY_FALLBACK_NUM_STAGES = 2
+
+
+def _persistent_kernel_fallback_key(
+    operator: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    config: Dict[str, Any],
+) -> Tuple[Any, ...]:
+    normalized_device = torch.device(device)
+    return (
+        operator,
+        normalized_device.type,
+        normalized_device.index,
+        dtype,
+        tuple(sorted(config.items())),
+    )
+
+
+def _launch_with_shared_memory_fallback(
+    launch: Callable[[Dict[str, Any]], None],
+    operator: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    config: Dict[str, Any],
+) -> None:
+    cache_key = _persistent_kernel_fallback_key(operator, device, dtype, config)
+    fallback_config = dict(config)
+    fallback_config["num_stages"] = _SHARED_MEMORY_FALLBACK_NUM_STAGES
+
+    if cache_key in _PERSISTENT_KERNEL_FALLBACK_CACHE:
+        launch(fallback_config)
+        return
+
+    try:
+        launch(dict(config))
+    except OutOfResources as error:
+        if (
+            error.name != "shared memory"
+            or config["num_stages"] <= _SHARED_MEMORY_FALLBACK_NUM_STAGES
+        ):
+            raise
+
+        launch(fallback_config)
+        _PERSISTENT_KERNEL_FALLBACK_CACHE.add(cache_key)
+        logger.warning(
+            "Triton %s kernel exceeded shared memory on %s for %s "
+            "(%s bytes required, %s bytes available); using num_stages=%s.",
+            operator,
+            device,
+            dtype,
+            error.required,
+            error.limit,
+            _SHARED_MEMORY_FALLBACK_NUM_STAGES,
+        )
 
 
 def _matmul_launch_metadata(
@@ -223,26 +285,36 @@ def _matmul_persistent_triton(
         },
     }
     # print(a.device, b.device, c.device)
-    matmul_kernel_persistent[grid](
-        a,
-        b,
-        c,  #
-        bias,
-        M,
-        N,
-        K,  #
-        a.stride(0),
-        a.stride(1),  #
-        b.stride(0),
-        b.stride(1),  #
-        c.stride(0),
-        c.stride(1),  #
-        NUM_SMS=NUM_SMS,  #
-        A_LARGE=a.numel() > 2**31,
-        B_LARGE=b.numel() > 2**31,
-        C_LARGE=c.numel() > 2**31,
-        HAS_BIAS=bias is not None,
-        **configs[dtype],
+
+    def launch(config: Dict[str, Any]) -> None:
+        matmul_kernel_persistent[grid](
+            a,
+            b,
+            c,  #
+            bias,
+            M,
+            N,
+            K,  #
+            a.stride(0),
+            a.stride(1),  #
+            b.stride(0),
+            b.stride(1),  #
+            c.stride(0),
+            c.stride(1),  #
+            NUM_SMS=NUM_SMS,  #
+            A_LARGE=a.numel() > 2**31,
+            B_LARGE=b.numel() > 2**31,
+            C_LARGE=c.numel() > 2**31,
+            HAS_BIAS=bias is not None,
+            **config,
+        )
+
+    _launch_with_shared_memory_fallback(
+        launch=launch,
+        operator="matmul_persistent",
+        device=a.device,
+        dtype=dtype,
+        config=configs[dtype],
     )
     return c
 
@@ -787,28 +859,37 @@ def bmm_batch_invariant(a, b, *, out=None):
         num_tiles_total = B * num_tiles_per_batch
         grid = (min(NUM_SMS, num_tiles_total),)
 
-        bmm_kernel_persistent[grid](
-            a,
-            b,
-            c,  #
-            B,
-            M,
-            N,
-            K,  #
-            a.stride(0),
-            a.stride(1),
-            a.stride(2),  #
-            b.stride(0),
-            b.stride(1),
-            b.stride(2),  #
-            c.stride(0),
-            c.stride(1),
-            c.stride(2),  #
-            NUM_SMS=NUM_SMS,  #
-            A_LARGE=a.numel() > 2**31,
-            B_LARGE=b.numel() > 2**31,
-            C_LARGE=c.numel() > 2**31,
-            **config,
+        def launch(config: Dict[str, Any]) -> None:
+            bmm_kernel_persistent[grid](
+                a,
+                b,
+                c,  #
+                B,
+                M,
+                N,
+                K,  #
+                a.stride(0),
+                a.stride(1),
+                a.stride(2),  #
+                b.stride(0),
+                b.stride(1),
+                b.stride(2),  #
+                c.stride(0),
+                c.stride(1),
+                c.stride(2),  #
+                NUM_SMS=NUM_SMS,  #
+                A_LARGE=a.numel() > 2**31,
+                B_LARGE=b.numel() > 2**31,
+                C_LARGE=c.numel() > 2**31,
+                **config,
+            )
+
+        _launch_with_shared_memory_fallback(
+            launch=launch,
+            operator="bmm_batch_invariant",
+            device=a.device,
+            dtype=dtype,
+            config=config,
         )
 
         return c
