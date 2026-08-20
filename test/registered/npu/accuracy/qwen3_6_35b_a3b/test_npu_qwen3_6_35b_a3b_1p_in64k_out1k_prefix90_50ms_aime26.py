@@ -13,6 +13,11 @@ register_npu_ci(
     suite="nightly-acc-2-npu-a3",
     nightly=True,
 )
+register_npu_ci(
+    est_time=2800,
+    suite="nightly-rerun-qwen3-6-35b-a3b-aime26",
+    nightly=True,
+)
 
 QWEN3_6_35B_A3B_64K_PREFIX_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",

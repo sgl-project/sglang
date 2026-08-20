@@ -15,6 +15,11 @@ register_npu_ci(
     suite="nightly-acc-16-npu-a3",
     nightly=True,
 )
+register_npu_ci(
+    est_time=4800,
+    suite="nightly-rerun-minimax-m2-5-gpqa",
+    nightly=True,
+)
 
 MINIMAX_M2_5_HIGH_THROUGHPUT_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
