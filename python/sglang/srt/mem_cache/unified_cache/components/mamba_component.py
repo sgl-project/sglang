@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
 from sglang.srt.runtime_context import (
     get_exec,
     mamba_cache_chunk_size,
+    mamba_checkpoint_grid,
 )
 
 if TYPE_CHECKING:
@@ -70,9 +71,16 @@ class MambaComponent(TreeComponent):
             ), f"MambaComponent requires page_size=1 when mamba_extra_buffer is disabled, got {params.page_size}"
         super().__init__(cache, params)
         self.mamba_cache_chunk_size = mamba_cache_chunk_size()
+        # params.page_size is the tree page the allocator actually uses, already
+        # widened by dcp_size, so it is the one grid a checkpoint depth can land on.
+        self.mamba_checkpoint_grid = mamba_checkpoint_grid(params.page_size)
         self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
+
+    def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
+        data = node.component_data[self.component_type]
+        return data.value is not None and data.host_value is None
 
     def _inc_session_coverage(self, session_id: str, leaf: UnifiedTreeNode) -> None:
         cd = leaf.component_data[self.component_type]
@@ -157,10 +165,12 @@ class MambaComponent(TreeComponent):
 
         # Full KV may extend beyond the latest reusable Mamba state. The branching
         # point is the last Mamba-cache-chunk-aligned position within the Full-KV hit
-        # that lies beyond the current Mamba boundary.
+        # that lies beyond the current Mamba boundary. With HiCache, incremental
+        # persistence of a new branching state is currently write-through only;
+        # write-back eviction may discard the device-only state.
         aligned_seqlen = (
-            result.full_kv_hit_length // self.mamba_cache_chunk_size
-        ) * self.mamba_cache_chunk_size
+            result.full_kv_hit_length // self.mamba_checkpoint_grid
+        ) * self.mamba_checkpoint_grid
         branching_seqlen = (
             aligned_seqlen if aligned_seqlen > mamba_boundary_len else None
         )

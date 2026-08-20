@@ -1,9 +1,10 @@
 """
-MLA split-KV attention for EAGLE/DSpark speculative *verify* (topk==1).
+Grouped-head split-KV attention for speculative *verify* (topk==1).
 Following the pattern of ``python/sglang/kernels/ops/attention/verify_splitkv.py``.
 
 Grid is ``(bs, n_head_blocks, split)``; each program handles ``BLOCK_H`` query
-heads x ALL ``L_EXT`` draft queries.
+heads x ALL ``L_EXT`` draft queries. It supports absorbed MLA and ordinary
+MHA/GQA when exactly one TP-local KV head is shared by all local query heads.
 
 Correctness matches ``extend_attention_fwd`` for the topk==1 causal verify case.
 
@@ -15,10 +16,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.verify_splitkv import (
-    _AMD_LAUNCH_KWARGS,
-    can_handle,
-)
+from sglang.kernels.ops.attention.verify_splitkv import _AMD_LAUNCH_KWARGS
 
 MAX_N_SPLITS = 32  # Grid split dim upper bound
 TARGET_PROGRAMS = 512  # Target total stage-1 programs
@@ -30,6 +28,7 @@ DEFAULT_BLOCK_N = 64
 DEFAULT_NUM_WARPS = 8
 _BLOCK_CONFIG = {
     # head_dim: (BLOCK_H, BLOCK_N, num_warps)
+    256: (4, 64, 8),  # Qwen3.5 TP2 / TP4 / TP8
     576: (4, 64, 8),  # K3 MLA (kv_lora_rank 512 + qk_rope 64)
 }
 
@@ -120,7 +119,9 @@ def _verify_mla_prefix_stage1(
             split_kv_id == active - 1, cur_batch_seq_len, split_start + kv_len_per_split
         )
 
-        # load q_nope and q_pe
+        # For absorbed MLA, NOPE_DIM is the latent width and PE_DIM is the
+        # appended RoPE width. For ordinary shared-KV attention (Qwen3.5),
+        # NOPE_DIM is the complete already-rotated Q/K head and PE_DIM is zero.
         q_row = tl.reshape(
             (cur_q_start + offs_l)[None, :] * stride_qbs + offs_h[:, None] * stride_qh,
             (R,),
@@ -130,11 +131,12 @@ def _verify_mla_prefix_stage1(
             mask=row_mask[:, None] & (offs_dn[None, :] < NOPE_DIM),
             other=0.0,
         ).to(K_Buffer.dtype.element_ty)
-        q_pe = tl.load(
-            Q + q_row[:, None] + (NOPE_DIM + offs_dp)[None, :],
-            mask=row_mask[:, None] & (offs_dp[None, :] < PE_DIM),
-            other=0.0,
-        ).to(K_Buffer.dtype.element_ty)
+        if PE_DIM > 0:
+            q_pe = tl.load(
+                Q + q_row[:, None] + (NOPE_DIM + offs_dp)[None, :],
+                mask=row_mask[:, None] & (offs_dp[None, :] < PE_DIM),
+                other=0.0,
+            ).to(K_Buffer.dtype.element_ty)
 
         e_max = tl.zeros([R], dtype=tl.float32) - float("inf")
         e_sum = tl.zeros([R], dtype=tl.float32)
@@ -153,17 +155,19 @@ def _verify_mla_prefix_stage1(
                 mask=(offs_dn[:, None] < NOPE_DIM) & n_mask[None, :],
                 other=0.0,
             )
-            k_pe = tl.load(
-                K_Buffer + base + (NOPE_DIM + offs_dp)[:, None],
-                mask=(offs_dp[:, None] < PE_DIM) & n_mask[None, :],
-                other=0.0,
-            )
-            qk = tl.dot(q_nope, k_nope) + tl.dot(q_pe, k_pe)
+            qk = tl.dot(q_nope, k_nope)
+            if PE_DIM > 0:
+                k_pe = tl.load(
+                    K_Buffer + base + (NOPE_DIM + offs_dp)[:, None],
+                    mask=(offs_dp[:, None] < PE_DIM) & n_mask[None, :],
+                    other=0.0,
+                )
+                qk += tl.dot(q_pe, k_pe)
             qk *= sm_scale * k_scale
             qk = tl.where(n_mask[None, :], qk, float("-inf"))
 
-            # V is the same as k_nope but transposed; tl.trans is slow, so re-load
-            # V instead of reusing k_nope.
+            # MLA exposes its latent V through V_Buffer; ordinary shared-KV
+            # attention has an independent V cache. Both use this same load.
             v = tl.load(
                 V_Buffer + kv_loc[:, None] * stride_buf_vbs + offs_dv[None, :],
                 mask=n_mask[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
@@ -351,7 +355,9 @@ class VerifyMLA:
         self.nope_dim = v_head_dim
         self.pe_dim = head_dim - v_head_dim
         self.l_ext = l_ext
-        self.l_pad = triton.next_power_of_2(l_ext)
+        # tl.dot requires BLOCK_H * L_EXT to cover at least 16 rows.
+        min_l_pad = triton.next_power_of_2(triton.cdiv(16, block_h))
+        self.l_pad = max(min_l_pad, triton.next_power_of_2(l_ext))
         self.device = device
         self.block_h = block_h
         self.block_n = block_n
@@ -427,7 +433,7 @@ class VerifyMLA:
             PE_DIM=self.pe_dim,
             V_HEAD_DIM=self.v_head_dim,
             BLOCK_DNOPE=triton.next_power_of_2(self.nope_dim),
-            BLOCK_DPE=triton.next_power_of_2(self.pe_dim),
+            BLOCK_DPE=max(1, triton.next_power_of_2(self.pe_dim)),
             BLOCK_DV=triton.next_power_of_2(self.v_head_dim),
             BLOCK_N=self.block_n,
             num_warps=self.num_warps,
@@ -558,7 +564,91 @@ def _get_vmla(max_bs, h_q, head_dim, v_head_dim, l_ext, device):
     return vk
 
 
-def verify_mla_fwd(
+def can_handle(
+    q_extend,
+    k_extend,
+    v_extend,
+    k_buffer,
+    v_buffer,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    custom_mask,
+    is_causal,
+    mask_indptr,
+    max_len_extend,
+    sliding_window_size=-1,
+    sinks=None,
+    logit_cap=0.0,
+    xai_temperature_len=-1,
+):
+    """Return True iff the grouped-head split-KV verify path can serve this
+    exact problem with the same result as extend_attention_fwd. Conservative:
+    anything not explicitly handled -> False -> caller falls back to the
+    baseline.
+
+    IMPORTANT: ``custom_mask`` is intentionally NOT inspected (its values can't
+    be read inside a captured HIP graph without a host sync). The kernel always
+    computes pure-causal attention, which equals the tree mask ONLY at
+    speculative topk == 1. The caller therefore MUST gate enablement on topk == 1
+    (TritonAttnBackend does: ``use_verify_shared_kv = ... and self.topk == 1``).
+    At topk > 1 the tree is not causal and this path must stay disabled."""
+    # No exotic features.
+    if sinks is not None:
+        return False
+    if sliding_window_size is not None and sliding_window_size > 0:
+        return False
+    if logit_cap and logit_cap > 0:
+        return False
+    if xai_temperature_len is not None and xai_temperature_len > 0:
+        return False
+    if not is_causal:
+        return False
+    # q layout must be [tokens, H_Q, D]; head dims handled by power-of-2 pad.
+    if q_extend.dim() != 3 or k_extend.dim() != 3 or v_extend.dim() != 3:
+        return False
+    # GQA group must divide evenly.
+    h_q = q_extend.shape[1]
+    h_kv = k_extend.shape[1]
+    if h_kv == 0 or h_q % h_kv != 0:
+        return False
+    # head dims must match buffers.
+    if k_buffer.shape[1] != h_kv or v_buffer.shape[1] != h_kv:
+        return False
+    if q_extend.shape[2] != k_extend.shape[2]:
+        return False
+    if q_extend.shape[2] != k_buffer.shape[2]:
+        return False
+    if v_extend.shape[2] != v_buffer.shape[2]:
+        return False
+    # NOTE: must NOT read any tensor *values* here (no .item()/.cpu()): the
+    # target-verify step runs inside a captured CUDA/HIP graph, where a
+    # device->host sync raises hipErrorStreamCaptureUnsupported. We therefore
+    # gate purely on static shapes/dtypes/python scalars.
+    bs = qo_indptr.shape[0] - 1
+    if bs < 1:
+        return False
+    # max_len_extend must be a known positive python int (it is the static
+    # server_args.speculative_num_draft_tokens for the verify path). For
+    # topk=1 the per-seq extend len is constant == num_draft_tokens ==
+    # max_len_extend by construction of qo_indptr (arange with that step), so
+    # the L_EXT row-tile mask is exactly right and the tree custom_mask equals
+    # causal -- no value inspection required.
+    try:
+        mle = int(max_len_extend)
+    except (TypeError, ValueError):
+        return False
+    if mle < 1:
+        return False
+    # The packed extend tensor must hold exactly bs * max_len_extend rows
+    # (constant extend len). This is a pure shape check (no sync) and rejects
+    # any ragged/variable-extend batch -> falls back to the baseline.
+    if q_extend.shape[0] != bs * mle:
+        return False
+    return True
+
+
+def verify_shared_kv_fwd(
     q_extend,
     k_extend,
     v_extend,
@@ -584,9 +674,9 @@ def verify_mla_fwd(
     max_bs=None,
 ):
     """
-    MLA-native drop-in for extend_attention_fwd on the EAGLE target-verify
-    (topk==1) shape. Returns True if it ran (o_extend written), False if unsupported
-    (caller falls back). Requires h_kv == 1 (MLA single latent).
+    Grouped-head drop-in for extend_attention_fwd on a topk==1 target-verify
+    shape. Returns True if it ran (o_extend written), False if unsupported
+    (caller falls back). Requires exactly one TP-local KV head.
     """
     if not can_handle(
         q_extend,
@@ -607,7 +697,11 @@ def verify_mla_fwd(
         xai_temperature_len=xai_temperature_len,
     ):
         return False
-    if k_extend.shape[1] != 1:  # MLA: single shared latent head
+    if k_extend.shape[1] != 1:
+        return False
+    if q_extend.shape[2] < v_extend.shape[2]:
+        return False
+    if kv_indices.numel() == 0:
         return False
 
     bs = qo_indptr.shape[0] - 1

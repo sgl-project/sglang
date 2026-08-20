@@ -18,6 +18,7 @@ Launch the server using the `sglang serve` command.
 ```bash
 SERVER_ARGS=(
   --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers
+  --served-model-name wan-t2v
   --text-encoder-cpu-offload
   --pin-cpu-memory
   --num-gpus 4
@@ -30,33 +31,66 @@ sglang serve "${SERVER_ARGS[@]}"
 ```
 
 - **--model-path**: Path to the model or model ID.
+- **--served-model-name**: Stable model name exposed by the serving APIs. It defaults to `--model-id` when set, otherwise `--model-path`.
 - **--port**: HTTP port to listen on (default: `30000`).
 
-**Get Model Information**
+### Served model name
 
-**Endpoint:** `GET /models`
+`--served-model-name` separates the public API identity from the checkpoint location. This is useful when replicas use different local mount paths or when a gateway needs one stable model name:
 
-Returns information about the model served by this server, including model path, task type, pipeline configuration, and precision settings.
+```bash
+sglang serve \
+  --model-path /models/Wan2.1-T2V-1.3B-Diffusers \
+  --served-model-name wan-t2v \
+  --port 30010
+```
+
+`--model-id` is not a free-form deployment alias: it selects the registered model configuration for checkpoints whose local path cannot be identified. `--served-model-name` only controls the name exposed by serving APIs. When both are set, the served name takes precedence for API responses.
+
+### Discover the served model
+
+**Endpoint:** `GET /v1/models`
+
+Returns the public model name together with diffusion-specific runtime information.
 
 **Curl Example:**
 
 ```bash curl
-curl -sS -X GET "http://localhost:30010/models"
+curl -sS "http://localhost:30010/v1/models"
 ```
 
 **Response Example:**
 
 ```json
 {
-  "model_path": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
-  "task_type": "T2V",
-  "pipeline_name": "wan_pipeline",
-  "pipeline_class": "WanPipeline",
-  "num_gpus": 4,
-  "dit_precision": "bf16",
-  "vae_precision": "fp16"
+  "object": "list",
+  "data": [
+    {
+      "id": "wan-t2v",
+      "object": "model",
+      "created": 1786348800,
+      "owned_by": "sglang",
+      "root": "wan-t2v",
+      "parent": null,
+      "max_model_len": null,
+      "num_gpus": 4,
+      "task_type": "T2V",
+      "dit_precision": "bf16",
+      "vae_precision": "fp16",
+      "pipeline_name": "WanPipeline",
+      "pipeline_class": "WanPipeline"
+    }
+  ]
 }
 ```
+
+Retrieve the same model by its served name:
+
+```bash curl
+curl -sS "http://localhost:30010/v1/models/wan-t2v"
+```
+
+`GET /server_info` also reports `served_model_name` for gateway discovery. Video and action responses use this name when the request does not provide a model explicitly.
 
 ---
 

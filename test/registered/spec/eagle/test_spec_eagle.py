@@ -33,7 +33,10 @@ _KITS = (
 
 
 class _Core(Eagle3Base):
-    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
+    env_overrides = (
+        (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),
+        (envs.SGLANG_ENABLE_GRAPH_POOL_BORROW, 1),
+    )
 
 
 class TestEagle3Overlap(_Core, *_KITS):

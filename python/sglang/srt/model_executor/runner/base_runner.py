@@ -100,7 +100,7 @@ def _allocate_decode_buffers(
             dtype=torch.bool,
         )
         # (max_num_token, vocab) fp32 is large (>10GB at 16k tokens); callers
-        # whose dummy runs never touch logits (skip_logits autotune) opt out.
+        # whose dummy runs never touch logits (run_lm_head=False autotune) opt out.
         next_token_logits_buffer = (
             torch.zeros(
                 (max_num_token, vocab_size),
@@ -219,7 +219,7 @@ class BaseRunner(ABC):
         self.return_hidden_states_mode = (
             CaptureHiddenMode.NULL
             if model_runner.is_draft_worker
-            else get_server_return_hidden_states_mode(model_runner.server_args)
+            else get_server_return_hidden_states_mode()
         )
         self.enable_return_hidden_states = self.return_hidden_states_mode.need_capture()
         self.attn_tp_size = get_parallel().attn_tp_size
@@ -314,7 +314,9 @@ class BaseRunner(ABC):
                 run_ctx=canary_run_ctx,
             )
 
-        run_flashinfer_autotune_forward(self.model_runner, forward_fn, skip_logits=True)
+        run_flashinfer_autotune_forward(
+            self.model_runner, forward_fn, run_lm_head=False
+        )
 
     def _alloc_dummy_decode_buffers(
         self,
@@ -401,7 +403,7 @@ class BaseRunner(ABC):
         capture_hidden_mode = (
             CaptureHiddenMode.NULL
             if mr.is_draft_worker
-            else get_server_return_hidden_states_mode(mr.server_args)
+            else get_server_return_hidden_states_mode()
         )
         num_tokens_per_req = 1
         # A PD prefill target worker's pool has no SpeculativeState, so a
@@ -552,7 +554,6 @@ class BaseRunner(ABC):
         # Speculative metadata and hidden-state capture mode.
         spec_info = create_dummy_verify_input(
             mr.spec_algorithm,
-            mr.server_args,
             buffers.custom_mask,
             num_tokens_per_req,
             mr.is_draft_worker,

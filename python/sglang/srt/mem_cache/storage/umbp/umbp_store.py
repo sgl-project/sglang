@@ -630,6 +630,15 @@ class UMBPStore(HiCacheStorage):
             #      .default_dram_page_size (2 MiB by default). The
             #      partial-tail safety net in PoolClient handles any
             #      size mismatch.
+            #
+            # Logical-anchor host pools (the DeepSeek-V4 HiCache HostPoolGroup
+            # whose KV anchor is a LogicalHostPool that owns only page indices
+            # and no physical KV tensor) return None from get_page_buffer_meta()
+            # by design — the real per-page byte sizes live in the v2 side pools
+            # (SWA / compressed KV / indexer / state), which each carry their own
+            # dimensions. There is no single page size that fits all of them, so
+            # we leave dram_page_size at 0 and let the mori master use its
+            # default with the PoolClient partial-tail safety net.
             page_byte_size = None
             if "dram_page_size" in extra:
                 page_byte_size = int(extra["dram_page_size"])
@@ -895,10 +904,9 @@ class UMBPStore(HiCacheStorage):
                 safe_cap = int(cfg.ssd.capacity_bytes * 0.95)
                 cfg.ssd.spdk_proxy_tenant_quota_bytes = max(1, safe_cap // dp_size_hint)
 
-        # Logical anchors have no tensor; their side pools register independently.
+        # Initialize before the optional constructor-time pool registration.
         self.registered_pools: dict = {}
         self._kv_anchor_is_logical = False
-        # Avoid registering shared storage more than once.
         self._registered_regions: set = set()
 
         self.client = UMBPClient(cfg)
@@ -1439,14 +1447,14 @@ class UMBPStore(HiCacheStorage):
             exists = list(self.client.batch_exists(component_keys))
             if len(exists) != len(component_keys):
                 logger.error(
-                    "UMBP v2 exists result-size mismatch for pool %s: expected=%d actual=%d",
+                    "UMBP v2 batch_exists result-size mismatch for pool %s: "
+                    "expected=%d actual=%d; treating the storage prefix as a miss",
                     transfer.name,
                     len(component_keys),
                     len(exists),
                 )
                 final_pages = 0
                 break
-
             page_exists = [
                 all(exists[i * multiplier : (i + 1) * multiplier])
                 for i in range(final_pages)
@@ -1465,7 +1473,6 @@ class UMBPStore(HiCacheStorage):
                     ):
                         boundary = prefix_len
                         break
-
             if boundary:
                 hit_count[transfer.name] = boundary
             final_pages = min(final_pages, boundary)
@@ -1473,12 +1480,12 @@ class UMBPStore(HiCacheStorage):
         return PoolTransferResult(final_pages, hit_count)
 
     def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool) -> dict:
+        """Unified per-pool zero-copy I/O. Returns {pool_name: per-page bools}."""
         results: dict = {}
         for transfer in transfers:
             host_pool = self.registered_pools.get(transfer.name)
             if host_pool is None:
                 raise ValueError(f"Unregistered UMBP hybrid pool: {transfer.name}")
-
             keys = transfer.keys or []
             host_indices = transfer.host_indices
             page_size = getattr(host_pool, "page_size", 1) or 1
@@ -1507,7 +1514,8 @@ class UMBPStore(HiCacheStorage):
             io_results = [bool(value) for value in operation(key_strs, ptrs, sizes)]
             if len(io_results) != len(key_strs):
                 logger.error(
-                    "UMBP v2 %s result-size mismatch for pool %s: expected=%d actual=%d",
+                    "UMBP v2 %s result-size mismatch for pool %s: "
+                    "expected=%d actual=%d; treating every page as failed",
                     "set" if is_set else "get",
                     transfer.name,
                     len(key_strs),
