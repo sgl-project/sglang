@@ -39,8 +39,8 @@ from sglang.srt.lora.moe.base_gemm_provider.masked_activation import (
 )
 from sglang.srt.lora.moe.route_view import RouteView
 
-MASKED_MIDDLE_FAMILIES = ("b_activation",)
-MASKED_MIDDLE_TRITON = "triton"
+MASKED_ACT_FAMILIES = ("b_activation",)
+MASKED_ACT_TRITON = "triton"
 
 FUSED_B_ACT_DEFAULT_CONFIG: dict[str, int] = {
     "BLOCK_SIZE_W": 64,
@@ -65,7 +65,7 @@ def _require_config(config: Mapping[str, int]) -> tuple[int, int, int, int, int]
     }
     missing = sorted(required - config.keys())
     if missing:
-        raise ValueError(f"fused-middle config is missing {missing}")
+        raise ValueError(f"fused-act config is missing {missing}")
     block_w = int(config["BLOCK_SIZE_W"])
     block_k = int(config["BLOCK_SIZE_K"])
     group_m = int(config["GROUP_SIZE_M"])
@@ -144,7 +144,7 @@ def _validate_common(
         tensors += (act_pairs,)
     devices = {item.device for item in tensors}
     if len(devices) != 1:
-        raise ValueError(f"masked-middle tensors span devices {devices}")
+        raise ValueError(f"masked-act tensors span devices {devices}")
     return slices, pairs, width
 
 
@@ -399,7 +399,7 @@ def _b_act_kernel(
         )
 
 
-def run_masked_fused_middle(
+def run_masked_fused_act(
     family: str,
     *,
     activation: str,
@@ -417,7 +417,7 @@ def run_masked_fused_middle(
     bridge_top_k: int = 1,
     consume_base_pdl: bool = False,
 ) -> None:
-    """Run the production masked-middle family with fail-closed arguments."""
+    """Run the production masked-act family with fail-closed arguments."""
     slices, pairs, width = _validate_common(
         activation=activation,
         base_gateup=base_gateup,
@@ -445,7 +445,7 @@ def run_masked_fused_middle(
     block_w, block_k, group_m, num_warps, num_stages = _require_config(config)
     if routing.block_size < 16 or not _is_power_of_two(routing.block_size):
         raise ValueError(
-            "aligned fused-middle route block size must be a power of two >= 16"
+            "aligned fused-act route block size must be a power of two >= 16"
         )
     num_m_blocks = triton.cdiv(routing.sorted_pair_ids.numel(), routing.block_size)
     pair_target = act_pairs if act_pairs is not None else act_masked

@@ -111,17 +111,17 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             invoke_shared_from_scratch_finalize,
             invoke_shared_rank_reduce,
         )
-        from sglang.srt.lora.moe.base_gemm_provider.masked_fused_middle import (
-            MASKED_MIDDLE_FAMILIES,
-            MASKED_MIDDLE_TRITON,
-            run_masked_fused_middle,
+        from sglang.srt.lora.moe.base_gemm_provider.masked_fused_act import (
+            MASKED_ACT_FAMILIES,
+            MASKED_ACT_TRITON,
+            run_masked_fused_act,
         )
 
         # Named, forceable implementations. A provider-specific CuTe port can
         # inject another callable without changing the semantic method ABI.
-        self._fused_middle_impls: dict[tuple[str, str, str], Callable] = {
-            (family, activation, MASKED_MIDDLE_TRITON): run_masked_fused_middle
-            for family in MASKED_MIDDLE_FAMILIES
+        self._fused_act_impls: dict[tuple[str, str, str], Callable] = {
+            (family, activation, MASKED_ACT_TRITON): run_masked_fused_act
+            for family in MASKED_ACT_FAMILIES
             for activation in ActivationFn
         }
         self._shared_reduce_impls: dict[str, Callable] = {
@@ -281,7 +281,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             pair_to_row=row_state.src2dst,
         )
 
-    def install_fused_middle_implementation(
+    def install_fused_act_implementation(
         self,
         family: str,
         activation: str,
@@ -290,10 +290,10 @@ class MaskedRowDomainProvider(MoeBaseProvider):
     ) -> None:
         """Inject an explicitly forceable provider-local implementation."""
         if family != "b_activation":
-            raise ValueError(f"unknown fused-middle family {family!r}")
+            raise ValueError(f"unknown fused-act family {family!r}")
         if not name or not callable(implementation):
-            raise ValueError("a fused-middle implementation needs a name and callable")
-        self._fused_middle_impls[(family, activation, name)] = implementation
+            raise ValueError("a fused-act implementation needs a name and callable")
+        self._fused_act_impls[(family, activation, name)] = implementation
 
     def install_fused_finalize_implementation(
         self,
@@ -324,41 +324,41 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         else:
             raise ValueError(f"unknown fused-finalize family {family!r}")
 
-    def fused_middle_implementations(self, family: str) -> tuple[str, ...]:
+    def fused_act_implementations(self, family: str) -> tuple[str, ...]:
         return tuple(
             sorted(
                 {
                     name
-                    for candidate_family, _activation, name in self._fused_middle_impls
+                    for candidate_family, _activation, name in self._fused_act_impls
                     if candidate_family == family
                 }
             )
         )
 
-    def supports_fused_middle(
+    def supports_fused_act(
         self,
         family: str,
         *,
         activation: str,
         implementation: str = "triton",
     ) -> bool:
-        return (family, activation, implementation) in self._fused_middle_impls
+        return (family, activation, implementation) in self._fused_act_impls
 
-    def _fused_middle_implementation(
+    def _fused_act_implementation(
         self,
         family: str,
         activation: str,
         implementation: str,
     ) -> Callable:
         try:
-            return self._fused_middle_impls[(family, activation, implementation)]
+            return self._fused_act_impls[(family, activation, implementation)]
         except KeyError as exc:
             raise NotImplementedError(
-                f"{self.contract.key} has no {implementation!r} masked-middle "
+                f"{self.contract.key} has no {implementation!r} masked-act "
                 f"implementation for {family!r}/{activation!r}"
             ) from exc
 
-    def run_fused_middle(
+    def run_fused_act(
         self,
         row_state: MaskedRowState,
         family: str,
@@ -375,7 +375,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         bridge_top_k: int = 1,
         consume_base_pdl: bool = False,
     ) -> None:
-        invoke = self._fused_middle_implementation(
+        invoke = self._fused_act_implementation(
             family,
             activation,
             implementation,

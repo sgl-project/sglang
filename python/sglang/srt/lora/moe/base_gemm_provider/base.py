@@ -160,19 +160,19 @@ class MoeBaseProvider:
     # Optional fused LoRA sites.  The implementation name is explicit so the
     # config/benchmark can force Triton versus an injected CuTe candidate;
     # unsupported providers fail before allocating or launching anything.
-    def fused_middle_implementations(self, family: str) -> tuple[str, ...]:
+    def fused_act_implementations(self, family: str) -> tuple[str, ...]:
         return ()
 
-    def supports_fused_middle(
+    def supports_fused_act(
         self,
         family: str,
         *,
         activation: str,
         implementation: str = "triton",
     ) -> bool:
-        return implementation in self.fused_middle_implementations(family)
+        return implementation in self.fused_act_implementations(family)
 
-    def run_fused_middle(
+    def run_fused_act(
         self,
         row_state,
         family: str,
@@ -190,7 +190,7 @@ class MoeBaseProvider:
         consume_base_pdl: bool = False,
     ) -> None:
         raise NotImplementedError(
-            f"{self.contract.key} has no {implementation!r} fused-middle "
+            f"{self.contract.key} has no {implementation!r} fused-act "
             f"implementation for {family!r}"
         )
 

@@ -20,7 +20,7 @@ from pydantic.dataclasses import dataclass as pydantic_dataclass
 from sglang.srt.lora.moe.base_gemm_provider.masked_finalize import (
     SHARED_RANK_DEFAULT_CONFIG,
 )
-from sglang.srt.lora.moe.base_gemm_provider.masked_fused_middle import (
+from sglang.srt.lora.moe.base_gemm_provider.masked_fused_act import (
     FUSED_B_ACT_DEFAULT_CONFIG,
 )
 from sglang.srt.lora.moe.execution_plan import (
@@ -116,11 +116,11 @@ class MoeLoraLaunchConfig:
     def for_b(self, site: Site) -> Mapping[str, int]:
         return self.gate_up_b if site is Site.GATE_UP else self.down_b
 
-    def for_middle(self, family: ActFamily) -> Mapping[str, int]:
-        """Return the explicit config for one fused-middle kernel family."""
+    def for_act(self, family: ActFamily) -> Mapping[str, int]:
+        """Return the explicit config for one fused-act kernel family."""
         if family is ActFamily.B_ACTIVATION:
             return self.b_activation
-        raise ValueError(f"{family.value} has no fused-middle launch config")
+        raise ValueError(f"{family.value} has no fused-act launch config")
 
     def validate_for_plan(self, plan: MoeLoraExecutionPlan) -> None:
         """Validate route tiles against the selected tensor-core consumers."""

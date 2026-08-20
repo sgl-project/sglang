@@ -98,9 +98,9 @@ from sglang.srt.lora.moe.base_gemm_provider.base import (
 from sglang.srt.lora.moe.base_gemm_provider.masked_activation import (
     _activation_delta_masked_kernel,
 )
-from sglang.srt.lora.moe.base_gemm_provider.masked_fused_middle import (
-    MASKED_MIDDLE_FAMILIES,
-    MASKED_MIDDLE_TRITON,
+from sglang.srt.lora.moe.base_gemm_provider.masked_fused_act import (
+    MASKED_ACT_FAMILIES,
+    MASKED_ACT_TRITON,
     _b_act_kernel,
     _is_power_of_two,
     _require_config,
@@ -725,7 +725,7 @@ def fused_b_act_contiguous(
 
     Same kernel (``_b_act_kernel``), same grid, same per-pair arithmetic, and
     the same exactly-once invalid-pair zero-write duty on ``act_pairs`` as
-    :func:`masked_fused_middle.run_masked_fused_middle`: the kernel addresses
+    :func:`masked_fused_act.run_masked_fused_act`: the kernel addresses
     base and activation rows exclusively through ``src2dst`` over flattened
     row views, so storing the compact row ``seg_offsets[e] + slot`` there
     re-targets it with zero kernel changes.  Only the wrapper-level shape
@@ -736,8 +736,8 @@ def fused_b_act_contiguous(
     content, exactly like the materialized contiguous S3: the down GEMM
     computes over them row-independently and no consumer reads their output.
     """
-    if family not in MASKED_MIDDLE_FAMILIES:
-        raise ValueError(f"family={family!r} is not one of {MASKED_MIDDLE_FAMILIES}")
+    if family not in MASKED_ACT_FAMILIES:
+        raise ValueError(f"family={family!r} is not one of {MASKED_ACT_FAMILIES}")
     ActivationFn.parse(activation)
     pairs = routing.topk_ids.numel()
     if src2dst.dtype != torch.int32 or src2dst.numel() != pairs:
@@ -801,7 +801,7 @@ def fused_b_act_contiguous(
     block_w, block_k, group_m, num_warps, num_stages = _require_config(config)
     if routing.block_size < 16 or not _is_power_of_two(routing.block_size):
         raise ValueError(
-            "aligned fused-middle route block size must be a power of two >= 16"
+            "aligned fused-act route block size must be a power of two >= 16"
         )
     num_m_blocks = triton.cdiv(routing.sorted_pair_ids.numel(), routing.block_size)
     pair_target = act_pairs.view(-1, width) if act_pairs is not None else act_compact
@@ -1136,12 +1136,12 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
             pair_to_row=row_state.src2dst,
         )
 
-    def fused_middle_implementations(self, family: str) -> tuple[str, ...]:
-        if family in MASKED_MIDDLE_FAMILIES:
-            return (MASKED_MIDDLE_TRITON,)
+    def fused_act_implementations(self, family: str) -> tuple[str, ...]:
+        if family in MASKED_ACT_FAMILIES:
+            return (MASKED_ACT_TRITON,)
         return ()
 
-    def supports_fused_middle(
+    def supports_fused_act(
         self,
         family: str,
         *,
@@ -1149,12 +1149,12 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         implementation: str = "triton",
     ) -> bool:
         return (
-            family in MASKED_MIDDLE_FAMILIES
+            family in MASKED_ACT_FAMILIES
             and activation in ActivationFn
-            and implementation == MASKED_MIDDLE_TRITON
+            and implementation == MASKED_ACT_TRITON
         )
 
-    def run_fused_middle(
+    def run_fused_act(
         self,
         row_state: ContiguousRowState,
         family: str,
@@ -1173,11 +1173,11 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
     ) -> None:
         # ``act_masked`` keeps the provider-ABI parameter name; on this
         # domain it is the compact 2-D activation buffer.
-        if not self.supports_fused_middle(
+        if not self.supports_fused_act(
             family, activation=activation, implementation=implementation
         ):
             raise NotImplementedError(
-                f"{self.contract.key} has no {implementation!r} fused-middle "
+                f"{self.contract.key} has no {implementation!r} fused-act "
                 f"implementation for {family!r}/{activation!r}"
             )
         fused_b_act_contiguous(

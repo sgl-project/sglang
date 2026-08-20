@@ -387,8 +387,8 @@ class MoeLoraRunner:
             )
 
         if plan.act.family is not ActFamily.MATERIALIZED:
-            family, implementation = self._middle_implementation(plan)
-            if not provider.supports_fused_middle(
+            family, implementation = self._act_implementation(plan)
+            if not provider.supports_fused_act(
                 family,
                 activation=self.activation.value,
                 implementation=implementation,
@@ -419,7 +419,7 @@ class MoeLoraRunner:
                 )
 
     @staticmethod
-    def _middle_implementation(
+    def _act_implementation(
         plan: MoeLoraExecutionPlan,
     ) -> tuple[str, str]:
         return plan.act.family.value, "triton"
@@ -777,8 +777,8 @@ class MoeLoraRunner:
 
         consumed_route = plan.act.consumed_gate_up_b
         route = routes.aligned(consumed_route.is_shared_outer)
-        family, implementation = self._middle_implementation(plan)
-        provider.run_fused_middle(
+        family, implementation = self._act_implementation(plan)
+        provider.run_fused_act(
             base_gemm_state,
             family,
             implementation=implementation,
@@ -787,7 +787,7 @@ class MoeLoraRunner:
             act_masked=act_out,
             act_pairs=act_pairs,
             routing=route,
-            config=launch_config.for_middle(plan.act.family),
+            config=launch_config.for_act(plan.act.family),
             bridge_gateup=gate_up.rank,
             b_gate_up=batch.gate_up_lora_b.flatten(0, 1),
             bridge_top_k=(

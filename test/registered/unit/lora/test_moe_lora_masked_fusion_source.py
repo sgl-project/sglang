@@ -80,7 +80,7 @@ class TestMaskedFusionSource(unittest.TestCase):
         sm100 = _source("cutedsl_masked/kernel.py")
         sm90 = _source("cutedsl_masked/kernel_sm90.py")
         activation = _source("masked_activation.py")
-        act = _source("masked_fused_middle.py")
+        act = _source("masked_fused_act.py")
         finalize = _source("masked_finalize.py")
         post_reorder = EP_MOE.read_text()
 
@@ -101,7 +101,7 @@ class TestMaskedFusionSource(unittest.TestCase):
                 "_activation_delta_masked_kernel",
                 "act_delta_masked",
             ),
-            (act, "_b_act_kernel", "run_masked_fused_middle"),
+            (act, "_b_act_kernel", "run_masked_fused_act"),
         ):
             self.assertIn("gdc_wait", _function(source, kernel_name))
             self.assertIn('"launch_pdl": True', _function(source, launcher_name))
@@ -218,9 +218,9 @@ class TestMaskedFusionSource(unittest.TestCase):
         row = _source("masked_row_domain.py")
         runner = (LORA_MOE / "moe_lora_runner.py").read_text()
         for method in (
-            "fused_middle_implementations",
-            "supports_fused_middle",
-            "run_fused_middle",
+            "fused_act_implementations",
+            "supports_fused_act",
+            "run_fused_act",
             "fused_finalize_implementations",
             "supports_fused_finalize",
             "run_shared_rank_finalize",
@@ -230,8 +230,8 @@ class TestMaskedFusionSource(unittest.TestCase):
         ):
             self.assertIn(f"def {method}(", base)
         for method in (
-            "fused_middle_implementations",
-            "run_fused_middle",
+            "fused_act_implementations",
+            "run_fused_act",
             "fused_finalize_implementations",
             "run_shared_rank_finalize",
             "run_shared_rank_reduce",
@@ -240,7 +240,7 @@ class TestMaskedFusionSource(unittest.TestCase):
         ):
             self.assertIn(f"def {method}(", row)
 
-        body = _function(row, "run_fused_middle")
+        body = _function(row, "run_fused_act")
         self.assertIn("row_state.src2dst", body)
         self.assertNotIn("row_state.hidden_permuted", body)
         self.assertNotIn("row_state.masked_m", body)
@@ -278,7 +278,7 @@ class TestMaskedFusionSource(unittest.TestCase):
         self.assertIn("del row_state", contiguous_reduce)
 
     def test_middle_pair_store_is_optional_and_masked_store_is_unconditional(self):
-        source = _source("masked_fused_middle.py")
+        source = _source("masked_fused_act.py")
         self.assertIn('("b_activation",)', source)
         # The activation set is single-sourced from moe.activation; restating
         # it here is the drift this assertion exists to prevent.
@@ -300,7 +300,7 @@ class TestMaskedFusionSource(unittest.TestCase):
             b_act.index("act_masked_ptr +"),
             b_act.index("if store_pair_act:"),
         )
-        launcher = _function(source, "run_masked_fused_middle")
+        launcher = _function(source, "run_masked_fused_act")
         self.assertIn("store_pair_act=act_pairs is not None", launcher)
 
     def test_materialized_activation_keeps_the_two_axes_independent(self):
@@ -372,7 +372,7 @@ class TestMaskedFusionSource(unittest.TestCase):
         )
 
     def test_config_names_match_the_execution_contract(self):
-        act = _source("masked_fused_middle.py")
+        act = _source("masked_fused_act.py")
         finalize = _source("masked_finalize.py")
         for key in (
             "BLOCK_SIZE_W",
@@ -389,10 +389,10 @@ class TestMaskedFusionSource(unittest.TestCase):
 
     def test_provider_can_force_injected_implementation(self):
         row = _source("masked_row_domain.py")
-        self.assertIn("def install_fused_middle_implementation(", row)
+        self.assertIn("def install_fused_act_implementation(", row)
         self.assertIn("def install_fused_finalize_implementation(", row)
         self.assertIn(
-            "self._fused_middle_impls[(family, activation, implementation)]",
+            "self._fused_act_impls[(family, activation, implementation)]",
             row,
         )
         self.assertIn("self._shared_reduce_impls[implementation]", row)
@@ -450,11 +450,11 @@ class TestMaskedFusionSource(unittest.TestCase):
         finalize.invoke_shared_from_scratch_finalize = lambda **_kwargs: None
         finalize.invoke_shared_rank_reduce = lambda **_kwargs: None
         act = types.ModuleType(
-            "sglang.srt.lora.moe.base_gemm_provider.masked_fused_middle"
+            "sglang.srt.lora.moe.base_gemm_provider.masked_fused_act"
         )
-        act.MASKED_MIDDLE_FAMILIES = ("b_activation",)
-        act.MASKED_MIDDLE_TRITON = "triton"
-        act.run_masked_fused_middle = lambda *_args, **_kwargs: None
+        act.MASKED_ACT_FAMILIES = ("b_activation",)
+        act.MASKED_ACT_TRITON = "triton"
+        act.run_masked_fused_act = lambda *_args, **_kwargs: None
 
         spec = importlib.util.spec_from_file_location(
             "_cpu_masked_row_domain", PROVIDER / "masked_row_domain.py"
@@ -484,10 +484,10 @@ class TestMaskedFusionSource(unittest.TestCase):
                 )
             )
 
-        for family in act.MASKED_MIDDLE_FAMILIES:
+        for family in act.MASKED_ACT_FAMILIES:
             for candidate_activation in ActivationFn:
                 self.assertTrue(
-                    provider.supports_fused_middle(
+                    provider.supports_fused_act(
                         family,
                         activation=candidate_activation,
                     )

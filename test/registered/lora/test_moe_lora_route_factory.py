@@ -101,7 +101,7 @@ def _load_launch_config():
         "reduce": {"BLOCK_SIZE_T": 16},
         "tail": {"BLOCK_SIZE_H": 16},
     }
-    act = types.ModuleType("sglang.srt.lora.moe.base_gemm_provider.masked_fused_middle")
+    act = types.ModuleType("sglang.srt.lora.moe.base_gemm_provider.masked_fused_act")
     act.FUSED_B_ACT_DEFAULT_CONFIG = {"BLOCK_SIZE_W": 16}
     module_name = "_host_launch_config"
     spec = importlib.util.spec_from_file_location(
