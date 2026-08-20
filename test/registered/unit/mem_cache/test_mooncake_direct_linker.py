@@ -555,9 +555,7 @@ def test_swa_linker_load_prepare_commit_and_abort():
     assert mapped_full.tolist() == [12, 13]
     assert mapped_swa.tolist() == [20, 21]
 
-    aborted = PoolTransfer(
-        name=PoolName.SWA, device_indices=torch.tensor([30, 31])
-    )
+    aborted = PoolTransfer(name=PoolName.SWA, device_indices=torch.tensor([30, 31]))
     component.update_external_linker_load(
         ExternalLinkerLoadPhase.ABORT, req, full, aborted, prefix_len=4
     )
