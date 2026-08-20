@@ -176,7 +176,8 @@ if _is_npu:
 class MhcOps(NamedTuple):
     hc_split_sinkhorn: Callable[..., Any]
     mhc_fused_post_pre: Optional[Callable[..., Any]]
-    npu_hc_pre: Optional[Callable[..., Any]]
+    mhc_pre: Optional[Callable[..., Any]]
+    mhc_post: Optional[Callable[..., Any]]
 
 
 @functools.cache
@@ -190,9 +191,9 @@ def _get_mhc_ops() -> MhcOps:
     their communication workspaces.  DeepSeek-V4 is the sole consumer here.
     """
     if _is_xpu:
-        from sgl_kernel import hc_split_sinkhorn, mhc_fused_post_pre
+        from sgl_kernel import hc_split_sinkhorn, mhc_fused_post_pre, mhc_pre, hc_post
 
-        return MhcOps(hc_split_sinkhorn, mhc_fused_post_pre, None)
+        return MhcOps(hc_split_sinkhorn, mhc_fused_post_pre, mhc_pre, hc_post)
 
     from sglang.kernels.ops.layernorm.mhc import (
         hc_split_sinkhorn,
@@ -200,7 +201,7 @@ def _get_mhc_ops() -> MhcOps:
         npu_hc_pre,
     )
 
-    return MhcOps(hc_split_sinkhorn, mhc_fused_post_pre, npu_hc_pre)
+    return MhcOps(hc_split_sinkhorn, mhc_fused_post_pre, npu_hc_pre, None)
 
 
 logger = logging.getLogger(__name__)
@@ -1569,7 +1570,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         shape, dtype = x.size(), x.dtype
 
         if _is_npu:
-            return _get_mhc_ops().npu_hc_pre(
+            return _get_mhc_ops().mhc_pre(
                 x,
                 hc_fn,
                 hc_scale,
@@ -1589,15 +1590,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post, comb, False
 
-        if _is_xpu or x.device.type == "xpu":
-            from sgl_kernel import mhc_pre
-
+        if _is_xpu:
             norm_kwargs = {}
             if norm is not None:
                 norm_kwargs["norm_weight"] = norm.weight.data
                 norm_kwargs["norm_eps"] = norm.variance_epsilon
 
-            post, comb, y = mhc_pre(
+            post, comb, y = _get_mhc_ops().mhc_pre(
                 residual=x,
                 fn=hc_fn,
                 hc_scale=hc_scale,
@@ -1716,15 +1715,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         if _is_npu:
             return torch.ops.custom.npu_hc_post(x, residual, post, comb)
 
-        if _is_xpu or x.device.type == "xpu":
-            from sgl_kernel import hc_post as mhc_post
-
-            return mhc_post(
-                x=x,
-                residual=residual,
-                post_layer_mix=post,
-                comb_res_mix=comb,
-            )
+        if _is_xpu:
+            return _get_mhc_ops().mhc_post(x, residual, post, comb)
 
         if envs.SGLANG_OPT_USE_FLASHINFER_MHC.get():
             from flashinfer.mhc import mhc_post
