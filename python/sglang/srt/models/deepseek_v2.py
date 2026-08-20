@@ -1921,7 +1921,9 @@ class DeepseekV2AttentionMLA(
         )
 
         self.alt_stream = alt_stream
-        self.attn_mha.kv_b_proj = None
+        # Alias for backends that only get the RadixAttention layer. Not registered
+        # as a submodule: a second state_dict name breaks sharded_state round-trips.
+        object.__setattr__(self.attn_mha, "kv_b_proj", self.kv_b_proj)
 
         self.w_kc = None
         self.w_vc = None
@@ -2068,9 +2070,6 @@ class DeepseekV2AttentionMLA(
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
-        if self.attn_mha.kv_b_proj is None:
-            self.attn_mha.kv_b_proj = self.kv_b_proj
-
         # when hidden_states is a tuple of tensors, the tuple will include quantized weight and scale tensor
         if isinstance(hidden_states, tuple):
             if (
