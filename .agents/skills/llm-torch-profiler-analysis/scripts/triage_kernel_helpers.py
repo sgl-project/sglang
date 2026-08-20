@@ -20,6 +20,7 @@ from profile_common import (
     is_complete_duration_event,
     is_non_kernel_trace_category,
     is_trace_metadata_name,
+    is_xpu_kernel_launch_event,
     looks_like_python_scope_name,
     normalize_repo_relative_path,
     normalize_text,
@@ -1605,6 +1606,10 @@ def is_gpu_kernel_event(event: dict) -> bool:
     if is_annotation_event(name, cat):
         return False
     if "kernel" in cat or cat.startswith("gpu_"):
+        return True
+    # Intel XPU traces carry no cat=="kernel" device events; the per-kernel
+    # device-proxy row is the runtime enqueue-launch (host launch-dispatch cost).
+    if is_xpu_kernel_launch_event(name, cat):
         return True
     if looks_like_python_scope_name(name):
         return False

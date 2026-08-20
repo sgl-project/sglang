@@ -45,6 +45,30 @@ TRACE_METADATA_NAMES = {
 }
 NON_KERNEL_TRACE_CATEGORIES = ("python_function", "cpu_op", "trace")
 PYTHON_SCOPE_NAME_PREFIXES = ("python/", "nn.module:")
+
+# Intel XPU (Level-Zero / SYCL) traces have no CUDA-style cat=="kernel" device
+# events. torch.profiler on XPU records host-side runtime calls under
+# cat=="xpu_runtime" (e.g. "urEnqueueKernelLaunch") and lower-level driver calls
+# under cat=="xpu_driver" (e.g. "zeCommandListAppendLaunchKernel",
+# "zeKernelSetArgumentValue"). The driver events are nested sub-spans of each
+# runtime launch, so counting them would multiply-count the same work. We treat
+# ONLY the runtime enqueue-launch event as the per-kernel device-proxy row: its
+# duration is the host launch-dispatch cost, which is the dominant signal on
+# XPU's eager path (no graph capture / torch.compile). It also carries
+# "correlation"/"External id" so the existing cpu_op + python-frame attribution
+# still works. NOTE: this is host launch time, not device-execution time --
+# callers should label it accordingly when no device timeline is present.
+XPU_RUNTIME_CATEGORY = "xpu_runtime"
+XPU_LAUNCH_NAME_HINT = "enqueuekernellaunch"  # matches urEnqueueKernelLaunch
+
+
+def is_xpu_kernel_launch_event(name: object, category: object) -> bool:
+    lowered_category = str(category or "").strip().lower()
+    if lowered_category != XPU_RUNTIME_CATEGORY:
+        return False
+    return XPU_LAUNCH_NAME_HINT in str(name or "").strip().lower()
+
+
 PROFILE_WORKLOAD_CHOICES = ("legacy", "prefill", "decode", "both")
 DEFAULT_PREFILL_INPUT_LEN = 4090
 DEFAULT_PREFILL_OUTPUT_LEN = 1

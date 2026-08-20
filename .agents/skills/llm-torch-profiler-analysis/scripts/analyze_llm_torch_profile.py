@@ -496,7 +496,10 @@ def render_kernel_table_for_stage(rows: Sequence[dict]) -> List[str]:
             "| No kernel rows at or above 1.0% share. | - | - | - | - | - | - |"
         )
         return lines
+    has_xpu_launch_rows = False
     for row in rows:
+        if "enqueuekernellaunch" in str(row.get("kernel", "")).lower():
+            has_xpu_launch_rows = True
         lines.append(
             "| {kernel} | {category} | {gpu_time} | {share:.1f}% | {launches} | {location} | {cpu_op} |".format(
                 kernel=kernel_helpers.escape_md_cell(row["kernel"]),
@@ -507,6 +510,14 @@ def render_kernel_table_for_stage(rows: Sequence[dict]) -> List[str]:
                 location=kernel_helpers.escape_md_cell(row["location"]),
                 cpu_op=kernel_helpers.escape_md_cell(row["cpu_op"]),
             )
+        )
+    if has_xpu_launch_rows:
+        lines.append("")
+        lines.append(
+            "> Note (Intel XPU): this trace has no device-execution timeline; rows are "
+            "`urEnqueueKernelLaunch` runtime events, so the **GPU time** column is host "
+            "launch-dispatch time, not device-execution time. High launch counts here "
+            "indicate eager-mode launch overhead (no graph capture / torch.compile)."
         )
     return lines
 
