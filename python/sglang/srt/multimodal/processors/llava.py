@@ -44,21 +44,21 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
     @staticmethod
-    def _process_single_image_task(
-        image_data: Union[str, bytes, ImageData],
+    def _preprocess_image_task(
+        image,
+        image_size,
+        image_hash,
         image_aspect_ratio: Optional[str] = None,
         image_grid_pinpoints: Optional[str] = None,
         processor=None,
     ):
-
+        # CPU-bound preprocessing of an already-loaded image. Loading is done
+        # separately so the wait_for budget in the caller covers CPU work only.
         image_processor = processor.image_processor
 
         try:
-            url = image_data.url if isinstance(image_data, ImageData) else image_data
-            image, image_size = load_image(url, False)
             if image_size is not None:
                 # It is a video with multiple images
-                image_hash = hash(url)
                 pixel_values = image_processor(image)["pixel_values"]
                 for i in range(len(pixel_values)):
                     pixel_values[i] = ensure_numpy(pixel_values[i]).astype(np.float16)
@@ -66,7 +66,6 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 return pixel_values, image_hash, image_size
             else:
                 # It is an image
-                image_hash = hash(url)
                 if image_aspect_ratio == "pad":
                     image = expand2square(
                         image,
@@ -93,18 +92,43 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         except Exception:
             logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())
 
+    async def _load_image_with_retry(self, url):
+        # Fetch + decode in the io thread pool, retrying transient failures.
+        loop = asyncio.get_running_loop()
+        max_retries = int(os.environ.get("SGLANG_MM_LOAD_MAX_RETRIES", "2"))
+        delay = 0.5
+        for attempt in range(max_retries + 1):
+            try:
+                return await loop.run_in_executor(
+                    self.io_executor, load_image, url, False
+                )
+            except Exception:
+                if attempt >= max_retries:
+                    raise
+                await asyncio.sleep(delay)
+                delay *= 2
+
     async def _process_single_image(
         self,
         image_data: Union[bytes, str, ImageData],
         aspect_ratio: str,
         grid_pinpoints: str,
     ):
+        url = image_data.url if isinstance(image_data, ImageData) else image_data
+        image_hash = hash(url)
+
+        # Load (network) outside the cpu pool and the wait_for budget below, so a
+        # slow fetch can't starve cpu workers or trip the CPU timeout.
+        image, image_size = await self._load_image_with_retry(url)
+
         if self.cpu_executor is not None:
             loop = asyncio.get_running_loop()
             fut = loop.run_in_executor(
                 self.cpu_executor,
-                LlavaImageProcessor._process_single_image_task,
-                image_data,
+                LlavaImageProcessor._preprocess_image_task,
+                image,
+                image_size,
+                image_hash,
                 aspect_ratio,
                 grid_pinpoints,
                 self._processor,
@@ -112,11 +136,13 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
             timeout = int(os.environ.get("REQUEST_TIMEOUT", "10"))
             return await asyncio.wait_for(fut, timeout=timeout)
         else:
-            return self._process_single_image_task(
-                image_data,
+            return LlavaImageProcessor._preprocess_image_task(
+                image,
+                image_size,
+                image_hash,
                 aspect_ratio,
                 grid_pinpoints,
-                self._processor.image_processor,
+                self._processor,
             )
 
     def _process_precomputed_image_data(self, image_data: List[Dict]) -> Dict:
