@@ -166,11 +166,7 @@ class DllmAlgorithm:
 
         inner_steps = self.fdfo_steps_per_round - 1
         if inner_steps and _is_npu:
-            # NPU: attention metadata is stable across a round's denoise steps
-            # (the forward above already planned it), so mark it ready once and
-            # let the inner forwards skip re-planning -- same as _run_sync.
-            # Other platforms just re-plan every step: correct, one
-            # optimization short.
+            # Metadata is stable across a round's denoise steps; see _run_sync.
             forward_batch.mark_forward_metadata_ready()
 
         if ctx is None:
@@ -181,15 +177,10 @@ class DllmAlgorithm:
                 out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
                 done = self.step(forward_batch, out.logits_output.full_logits, states)
         else:
-            # Batched-state inner loop: per-request states live in batched
-            # device tensors for the whole round, so an inner step costs no
-            # host gather/scatter and only a scalar all-finished sync.
             self.fdfo_batched_step(forward_batch, out.logits_output.full_logits, ctx)
             for _ in range(inner_steps):
-                # One scalar sync per inner step, and it is worth it at every
-                # batch size measured: skipping it (on the theory that a wide
-                # batch never resolves every row mid-round) issues no-op
-                # forwards during the tail of a run and measured slower.
+                # One scalar sync per inner step; cheaper than the no-op
+                # forwards it saves during a run's tail.
                 if self.fdfo_batched_all_finished(ctx):
                     break
                 out = model_runner.forward(forward_batch, pp_proxy_tensors=None)

@@ -141,9 +141,7 @@ def _drive(
 
 # The round loop is device-agnostic; pin the portable denoise math so the
 # result does not depend on whether the host happens to offer a fused kernel.
-# create=True because that hook is introduced by a sibling PR (#33161) and this
-# test must hold both before and after it lands; when absent there is no fused
-# path to pin and the patch is inert.
+# create=True: the fused hook is optional and may not exist on this build.
 @patch("sglang.srt.dllm.algorithm.base._argmax_softmax_prob_fused", None, create=True)
 class TestFdfoMultiStepRound(CustomTestCase):
     def test_batched_path_multi_step_round_matches_single_step_rounds(self):

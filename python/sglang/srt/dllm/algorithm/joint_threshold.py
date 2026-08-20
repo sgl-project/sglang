@@ -208,8 +208,7 @@ class JointThreshold(DllmAlgorithm):
         # FDFO carries per-request dict states across rounds (stashed on the
         # request, re-mixed with fresh rows each round), so gather them into
         # batched tensors for this round's single step, then scatter the results
-        # back onto the per-request dicts. Same three phases the multi-step
-        # round runs, collapsed to one step.
+        # back onto the per-request dicts.
         ctx = self.fdfo_batched_begin(forward_batch, states)
         self.fdfo_batched_step(forward_batch, full_logits, ctx)
         return self.fdfo_batched_end(ctx, states)
