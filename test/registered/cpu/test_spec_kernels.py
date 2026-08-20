@@ -4,6 +4,7 @@ import sgl_kernel  # noqa: F401
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, organize_draft_results
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cpu_test_utils import precision
@@ -1375,6 +1376,220 @@ class TestBuildDraftDecodeMetadata(CustomTestCase):
         for num_steps in [1, 2, 3]:
             with self.subTest(num_steps=num_steps):
                 self._run_and_check(seq_lens, 4, num_steps, pool_len=64, num_reqs=6)
+
+
+class TestFusedSigmoidGatingDeltaRuleVerify(CustomTestCase):
+    def setUp(self):
+        torch.manual_seed(1234)
+
+    def test_target_verify_multi_token(self):
+        # varlen multi-token verify: B=2 sequences of T=4 draft tokens each
+        B, T = 2, 4
+        HK, HV, K, V = 2, 4, 32, 32
+        total_tokens = B * T
+        num_slots, cache_size = 6, 4
+        dtype = torch.bfloat16
+
+        q = torch.rand(1, total_tokens, HK, K, dtype=dtype) * 0.1
+        k = torch.rand(1, total_tokens, HK, K, dtype=dtype) * 0.1
+        v = torch.rand(1, total_tokens, HV, V, dtype=dtype) * 0.1
+        # a/b are 2-D [tokens, HV] in verify mode (per-token gating)
+        a = torch.rand(total_tokens, HV, dtype=dtype) * 0.1
+        b = torch.rand(total_tokens, HV, dtype=dtype) * 0.1
+        dt_bias = torch.rand(HV, dtype=dtype) * 0.1
+        cu_seqlens = torch.tensor([0, T, 2 * T], dtype=torch.int32)
+        ssm_states_init = torch.rand(num_slots, HV, K, V, dtype=torch.float32) * 0.05
+        cache_indices = torch.tensor([5, 1], dtype=torch.int32)
+        # Index tensors may be longer than the sequence count (the GDN backend
+        # passes an arange over the whole state pool); only the first B entries
+        # are read -- the out-of-range tail values are canaries.
+        intermediate_state_indices = torch.tensor([2, 0, 7, 9], dtype=torch.int32)
+
+        for A_log_dtype in [torch.float32, torch.bfloat16]:
+            with self.subTest(A_log_dtype=A_log_dtype):
+                A_log = (torch.rand(HV, dtype=torch.float32) * 0.1).to(A_log_dtype)
+                ssm_states = ssm_states_init.clone()
+                intermediate_states_buffer = torch.zeros(
+                    cache_size, T, HV, K, V, dtype=torch.float32
+                )
+                core_attn_out = (
+                    torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu(
+                        A_log=A_log,
+                        dt_bias=dt_bias,
+                        q=q,
+                        k=k,
+                        v=v,
+                        a=a,
+                        b=b,
+                        initial_state_source=ssm_states,
+                        initial_state_indices=cache_indices,
+                        cu_seqlens=cu_seqlens,
+                        use_qk_l2norm_in_kernel=True,
+                        softplus_beta=1.0,
+                        softplus_threshold=20.0,
+                        is_kda=False,
+                        disable_state_update=True,
+                        intermediate_states_buffer=intermediate_states_buffer,
+                        intermediate_state_indices=intermediate_state_indices,
+                        cache_steps=T,
+                    )
+                )
+
+                # disable_state_update must leave the ssm state pool untouched
+                self.assertTrue(torch.equal(ssm_states, ssm_states_init))
+
+                out_ref, buffer_ref = self._ref_delta_rule_verify(
+                    q,
+                    k,
+                    v,
+                    a,
+                    b,
+                    A_log,
+                    dt_bias,
+                    ssm_states_init,
+                    cache_indices,
+                    cu_seqlens,
+                    intermediate_state_indices,
+                    cache_size,
+                )
+                atol = rtol = precision[torch.bfloat16]
+                torch.testing.assert_close(
+                    core_attn_out.float(), out_ref, atol=atol, rtol=rtol
+                )
+                torch.testing.assert_close(
+                    intermediate_states_buffer, buffer_ref, atol=1e-3, rtol=1e-3
+                )
+
+    def _ref_delta_rule_verify(
+        self,
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        ssm_states,
+        cache_indices,
+        cu_seqlens,
+        intermediate_state_indices,
+        cache_size,
+    ):
+        # Sequential pure-python delta rule with sigmoid gating, fp32 math.
+        _, total_tokens, HK, K = q.shape
+        HV, V = v.shape[2], v.shape[3]
+        T = int(cu_seqlens[1])
+        group_size = HV // HK
+        scale = 1.0 / (K**0.5)
+        eps = 1e-5  # kernel l2norm epsilon
+
+        qf = q[0].float()
+        kf = k[0].float()
+        qn = qf * (qf.pow(2).sum(-1, keepdim=True) + eps).rsqrt()
+        kn = kf * (kf.pow(2).sum(-1, keepdim=True) + eps).rsqrt()
+        g = -A_log.float().exp() * F.softplus(
+            a.float() + dt_bias.float()
+        )  # [tokens, HV]
+        beta = b.float().sigmoid()
+
+        out = torch.zeros(1, total_tokens, HV, V, dtype=torch.float32)
+        buffer_ref = torch.zeros(cache_size, T, HV, K, V, dtype=torch.float32)
+        num_sequences = cu_seqlens.numel() - 1
+        for n in range(num_sequences):
+            bos = int(cu_seqlens[n])
+            seq_len = int(cu_seqlens[n + 1]) - bos
+            for hv in range(HV):
+                h = ssm_states[int(cache_indices[n]), hv].clone()  # [K, V]
+                hk = hv // group_size
+                for t in range(seq_len):
+                    pos = bos + t
+                    h = h * g[pos, hv].exp()
+                    kv_mem = (h * kn[pos, hk].unsqueeze(-1)).sum(dim=0)  # [V]
+                    delta = (v[0, pos, hv].float() - kv_mem) * beta[pos, hv]
+                    h = h + kn[pos, hk].unsqueeze(-1) * delta.unsqueeze(0)
+                    out[0, pos, hv] = (h * qn[pos, hk].unsqueeze(-1)).sum(0) * scale
+                    buffer_ref[int(intermediate_state_indices[n]), t, hv] = h
+        return out, buffer_ref
+
+
+class TestCausalConv1dUpdateMultiToken(CustomTestCase):
+    def setUp(self):
+        torch.manual_seed(1234)
+
+    def test_multi_token_with_intermediate_conv_window(self):
+        batch, dim, width, seqlen = 3, 32, 4, 4
+        num_entries, cache_size = 6, 5
+        dtype = torch.bfloat16
+        state_len = width - 1
+
+        x = torch.randn(batch, dim, seqlen, dtype=dtype)
+        conv_states_init = torch.randn(num_entries, dim, state_len, dtype=dtype)
+        weight = torch.randn(dim, width, dtype=dtype)
+        bias = torch.randn(dim, dtype=dtype)
+        conv_state_indices = torch.tensor([4, 0, 2], dtype=torch.int32)
+        intermediate_state_indices = torch.tensor([1, 3, 0], dtype=torch.int32)
+        packed_weight = torch.ops.sgl_kernel.causal_conv1d_weight_pack(weight)
+
+        # reference: sequential single-token updates with state caching
+        conv_state_ref = conv_states_init[conv_state_indices.to(torch.int64)].clone()
+        window_ref = torch.zeros(cache_size, seqlen, dim, state_len, dtype=dtype)
+        out_ref = torch.empty_like(x)
+        for t in range(seqlen):
+            x_t = x[:, :, t]
+            x_cat = torch.cat([conv_state_ref, x_t.unsqueeze(-1)], dim=-1)
+            conv_state_ref = x_cat[:, :, -state_len:].clone()
+            out_t = F.conv1d(
+                x_cat.float(),
+                weight.float().unsqueeze(1),
+                bias.float(),
+                padding=0,
+                groups=dim,
+            )[:, :, -1]
+            out_ref[:, :, t] = F.silu(out_t).to(dtype)
+            for i in range(batch):
+                window_ref[int(intermediate_state_indices[i]), t] = conv_state_ref[i]
+
+        # The GDN verify call site passes a [batch, dim, seqlen] transpose view
+        # of a token-major buffer; a plain contiguous tensor must work too.
+        for layout in ["contiguous", "transpose_view"]:
+            with self.subTest(layout=layout):
+                if layout == "contiguous":
+                    x_in = x.clone()
+                else:
+                    x_in = x.transpose(1, 2).contiguous().transpose(1, 2)
+                conv_states = conv_states_init.clone()
+                intermediate_conv_window = torch.zeros(
+                    cache_size, seqlen, dim, state_len, dtype=dtype
+                )
+                out = torch.ops.sgl_kernel.causal_conv1d_update_cpu(
+                    x_in,
+                    conv_states,
+                    packed_weight,
+                    bias,
+                    True,  # silu_activation
+                    None,  # cache_seqlens
+                    conv_state_indices,
+                    PAD_SLOT_ID,
+                    True,  # is_vnni
+                    intermediate_conv_window,
+                    intermediate_state_indices,
+                )
+
+                # The output must stay a zero-copy transpose view of a
+                # token-major buffer: the caller reshapes it per token.
+                out.transpose(1, 2).view(batch * seqlen, dim)
+
+                atol = rtol = precision[dtype]
+                torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
+                torch.testing.assert_close(
+                    conv_states[conv_state_indices.to(torch.int64)],
+                    conv_state_ref,
+                    atol=atol,
+                    rtol=rtol,
+                )
+                torch.testing.assert_close(
+                    intermediate_conv_window, window_ref, atol=atol, rtol=rtol
+                )
 
 
 if __name__ == "__main__":

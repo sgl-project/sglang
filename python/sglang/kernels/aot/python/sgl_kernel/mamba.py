@@ -76,8 +76,27 @@ def causal_conv1d_fn_cpu(
 
 
 def causal_conv1d_update_cpu(
-    mixed_qkv, conv_states, conv_weights, bias, activation, conv_state_indices
+    mixed_qkv,
+    conv_states,
+    conv_weights,
+    bias,
+    activation,
+    conv_state_indices,
+    intermediate_conv_window=None,
+    intermediate_state_indices=None,
+    retrieve_next_token=None,
+    retrieve_next_sibling=None,
+    retrieve_parent_token=None,
 ):
+    # The tree-walk indices are accepted for call-site compatibility with the
+    # CUDA conv kernel but the CPU kernel is not tree-aware: tree verify
+    # (topk > 1) is rejected for hybrid GDN models on CPU in server_args, so
+    # they must always be None here.
+    assert (
+        retrieve_next_token is None
+        and retrieve_next_sibling is None
+        and retrieve_parent_token is None
+    ), "causal_conv1d_update_cpu: tree verify (topk > 1) is not supported on CPU"
     return torch.ops.sgl_kernel.causal_conv1d_update_cpu(
         mixed_qkv,
         conv_states,
@@ -88,6 +107,8 @@ def causal_conv1d_update_cpu(
         conv_state_indices,
         -1,
         True,
+        intermediate_conv_window,
+        intermediate_state_indices,
     )
 
 
