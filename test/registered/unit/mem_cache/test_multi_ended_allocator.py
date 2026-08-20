@@ -26,6 +26,7 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 import random
 import unittest
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -565,6 +566,25 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
     slot-conservation, the `schedulable_*` split, and watermark
     rollback."""
 
+    def test_segment_release_uses_shared_ids_and_cpu_frontier(self):
+        allocator = object.__new__(UnifiedSWATokenToKVPoolAllocator)
+        allocator.page_size = 4
+        allocator.is_not_in_free_group = True
+        allocator.full_attn_allocator = Mock()
+        allocator.swa_attn_allocator = Mock()
+        first = torch.arange(8, 16, dtype=torch.int64)
+        second = torch.arange(16, 24, dtype=torch.int64)
+        segments = [(first, 0), (second, 8)]
+
+        with patch("torch.unique", side_effect=AssertionError("unexpected unique")):
+            allocator.free_segments(segments, swa_evicted_seqlen=12)
+
+        allocator.full_attn_allocator.free_segments.assert_called_once_with(segments)
+        swa_segments = allocator.swa_attn_allocator.free_segments.call_args.args[0]
+        self.assertEqual(len(swa_segments), 1)
+        torch.testing.assert_close(swa_segments[0][0], second[4:])
+        self.assertEqual(swa_segments[0][1], 12)
+
     def _build(
         self,
         n_full_slots=32,
@@ -934,7 +954,14 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
 
     PAGE_SIZE = 8
 
-    def _build(self, n_full_pages=16, n_swa_pages=8, full_layer_num=2, swa_layer_num=2):
+    def _build(
+        self,
+        n_full_pages=16,
+        n_swa_pages=8,
+        full_layer_num=2,
+        swa_layer_num=2,
+        lazy_compaction=False,
+    ):
         full_spec = MHASubPoolSpec(
             name="full",
             layer_num=full_layer_num,
@@ -973,6 +1000,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             device=_DEV,
             is_id_owner=True,
             page_size=self.PAGE_SIZE,
+            lazy_compaction=lazy_compaction,
         )
         swa_alloc = MultiEndedAllocator(
             kvcache=swa_kv,
@@ -981,10 +1009,45 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             device=_DEV,
             is_id_owner=True,
             page_size=self.PAGE_SIZE,
+            lazy_compaction=lazy_compaction,
         )
         full_alloc.bind_peer(swa_alloc)
         swa_alloc.bind_peer(full_alloc)
         return pool, full_alloc, swa_alloc, full_kv, swa_kv
+
+    def test_free_segment_avoids_unique_in_lazy_path(self):
+        _, full_alloc, _, _, _ = self._build(lazy_compaction=True)
+        row = full_alloc.alloc(3 * self.PAGE_SIZE)
+        segment = row[1 : 2 * self.PAGE_SIZE + 2]
+        expected_pages = torch.unique(segment // self.PAGE_SIZE)
+
+        with patch("torch.unique", side_effect=AssertionError("unexpected unique")):
+            full_alloc.free_segment(segment, start_pos=1)
+
+        self.assertTrue(torch.all(full_alloc.virtual_to_physical[expected_pages] == -1))
+        self.assertEqual(full_alloc.live_page_count, 0)
+
+    def test_grouped_free_segment_owns_representatives_without_unique(self):
+        _, full_alloc, _, _, _ = self._build(lazy_compaction=True)
+        row = full_alloc.alloc(2 * self.PAGE_SIZE)
+        expected_pages = torch.unique(row // self.PAGE_SIZE)
+
+        full_alloc.free_group_begin()
+        full_alloc.free_segment(row, start_pos=0)
+        row.zero_()
+        with patch("torch.unique", side_effect=AssertionError("unexpected unique")):
+            full_alloc.free_group_end()
+
+        self.assertTrue(torch.all(full_alloc.virtual_to_physical[expected_pages] == -1))
+
+    def test_composite_swa_segment_uses_tombstone_aware_fallback(self):
+        composite = object.__new__(UnifiedSWATokenToKVPoolAllocator)
+        composite.free_swa = Mock()
+        indices = torch.arange(self.PAGE_SIZE, 2 * self.PAGE_SIZE)
+
+        composite.free_swa_segment(indices, start_pos=self.PAGE_SIZE)
+
+        composite.free_swa.assert_called_once_with(indices)
 
     def _stamp_tokens(
         self, alloc: MultiEndedAllocator, kv: _FakeKVCache, v_tokens: torch.Tensor
