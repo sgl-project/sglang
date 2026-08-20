@@ -198,6 +198,50 @@ baseline; everything else stays identical. GPU peak stays about 18 GB
 either way because streaming offload is set by the offload buffers and VAE
 decode, not the weight dtype.
 
+### Pre-quantized GGUF transformer
+
+Use `--transformer-weights-path` to replace only the DiT with a GGUF file; the
+base repository continues to provide the text encoder, VAEs, scheduler, and
+tokenizers. Do not also pass `--quantization gguf`.
+
+```bash 1×RTX 5090 Q4_K_M
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --transformer-weights-path \
+    leejet/MiniMax-H3-GGUF/minimax_h3_fl2va-Q4_K_M.gguf \
+  --attention-backend fa \
+  --performance-mode memory \
+  --layerwise-offload-components dit,text_encoder \
+  --dit-offload-prefetch-size 1 \
+  --dit-layerwise-resident-layers 0 \
+  --enable-torch-compile false \
+  --port 30010
+```
+
+The loader also recognizes pruned checkpoints that replace the timestep MLP
+with `adaln_t_table`. Repositories containing both FL2VA and Ref2VA variants
+need a full file reference:
+
+```bash Pruned FL2VA Q4_K
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --transformer-weights-path \
+    unsloth/MiniMax-H3-GGUF/minimax_h3_fl2va_pruned-Q4_K.gguf \
+  --performance-mode memory \
+  --layerwise-offload-components dit,text_encoder \
+  --enable-torch-compile false \
+  --port 30010
+```
+
+The linear adapter reuses SRT's GGUF type definitions and CUDA dequantization,
+then runs the native GEMM. SRT's fused MMVQ/MMQ kernels target the low-token LLM
+regime and are slower at diffusion sequence lengths. TP is supported when each
+row-parallel input shard remains GGML-block aligned; incompatible degrees fail
+during model construction. FSDP, LoRA merging, and the separate MiniMax-H3
+AdaLN cache flags are not compatible with packed GGUF weights.
+
 The first launch downloads the model through the selected Hub. If the Hugging
 Face repository requires authentication, export a Hugging Face token in the
 server environment.

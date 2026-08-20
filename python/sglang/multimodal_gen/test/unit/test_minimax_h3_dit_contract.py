@@ -129,6 +129,25 @@ def test_native_weight_names_and_grouped_qkv_reorder():
             )
 
 
+def test_pruned_adaln_curve_interpolates_without_timestep_mlp():
+    model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
+    torch.nn.Module.__init__(model)
+    model.time_embedder = None
+    model.adaln_t_table = torch.nn.Parameter(
+        torch.tensor([[0.0, 2.0], [2.0, 4.0], [4.0, 6.0]]),
+        requires_grad=False,
+    )
+
+    result = model._time_embedding(torch.tensor([0.0, 0.25, 1.0]))
+
+    torch.testing.assert_close(
+        result,
+        torch.tensor([[0.0, 2.0], [1.0, 3.0], [4.0, 6.0]]),
+        rtol=0,
+        atol=0,
+    )
+
+
 class _KwargIdentity(torch.nn.Module):
     def forward(self, x, **_kwargs):
         return x
@@ -292,6 +311,27 @@ def test_meta_model_enforces_mixed_precision_weight_contract():
             assert tensor.dtype == torch.float32, name
         elif tensor.is_floating_point():
             assert tensor.dtype == torch.bfloat16, name
+
+
+def test_pruned_meta_model_preserves_curve_adaln_fp32_island():
+    _ensure_single_process_parallel_runtime()
+    config = MiniMaxH3DiTConfig(
+        arch_config=MiniMaxH3DiTArchConfig(
+            adaln_curve_grid=1025,
+            time_embed_dim=8,
+        )
+    )
+    with torch.device("meta"):
+        model = MiniMaxH3DiTModel(
+            config=config,
+            hf_config={},
+            quant_config=None,
+        )
+
+    assert model.time_embedder is None
+    assert model.adaln_t_table.dtype == torch.float32
+    assert model.blocks[0].adaln_proj.linear.weight.dtype == torch.float32
+    assert model.final_layer.adaln_proj.linear.weight.dtype == torch.float32
 
 
 def test_online_fp8_keeps_fp32_boundaries_and_ignored_layers_unquantized():
