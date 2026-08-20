@@ -348,6 +348,22 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._segment_release_has_dense_swa_mapping = False
         self._set_full_to_swa_mapping(full_indices, swa_indices)
 
+    def rebuild_dense_full_to_swa_mapping(
+        self, full_indices: torch.Tensor, swa_indices: torch.Tensor
+    ) -> None:
+        """Rebuild a positionally dense mapping without disabling segment release.
+
+        HiCache load-back allocates both FULL and SWA slots as page-aligned runs,
+        then pairs them in token order.  Physical page ids may differ, but page
+        boundaries stay aligned, so one positional representative per page is
+        still sufficient when the segment is released.  Unlike the generic
+        mapping update above, this method must only be used for that contract.
+
+        Do not turn the fast path back on here: an earlier sparse/tombstone
+        update may already have invalidated another live mapping.
+        """
+        self._set_full_to_swa_mapping(full_indices, swa_indices)
+
     def _set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:
@@ -382,7 +398,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         full_indices = free_index.to(torch.int64)
-        swa_indices = self.full_to_swa_index_mapping[full_indices]
+        # Avoid CUDA advanced-index bounds checks on the scheduler thread.
+        swa_indices = torch.index_select(
+            self.full_to_swa_index_mapping, 0, full_indices
+        )
         if getattr(self.full_attn_allocator, "debug_mode", False):
             assert torch.all(
                 swa_indices > 0
@@ -430,7 +449,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._segment_release_has_dense_swa_mapping = False
 
         full_indices = free_index.to(torch.int64)
-        swa_indices = self.full_to_swa_index_mapping[full_indices]
+        # CUDA advanced indexing performs a host-blocking bounds check here,
+        # draining the in-flight prefill forward under overlap scheduling.
+        swa_indices = torch.index_select(
+            self.full_to_swa_index_mapping, 0, full_indices
+        )
         if getattr(self.swa_attn_allocator, "debug_mode", False):
             assert torch.all(
                 swa_indices > 0

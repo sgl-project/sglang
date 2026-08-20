@@ -435,9 +435,12 @@ class FullComponent(TreeComponent):
             alloc = self.cache.token_to_kv_pool_allocator
             for indices in action.indices:
                 if self.cache.is_swa_enabled:
-                    alloc.full_attn_allocator.free(indices)
+                    # Tree component values are page-aligned segments.  Avoid
+                    # PagedTokenToKVPoolAllocator.free(), whose torch.unique
+                    # result-size readback blocks the scheduler thread.
+                    alloc.full_attn_allocator.free_segment(indices, start_pos=0)
                 else:
-                    alloc.free(indices)
+                    alloc.free_segment(indices, start_pos=0)
             return
         raise AssertionError(
             f"FullComponent: unhandled ComponentAction {type(action).__name__}"

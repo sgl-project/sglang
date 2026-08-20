@@ -275,6 +275,29 @@ class TestSWADenseSegmentRelease(unittest.TestCase):
         alloc.set_full_to_swa_mapping(torch.tensor([4]), torch.tensor([8]))
         self.assertFalse(alloc._segment_release_has_dense_swa_mapping)
 
+    def test_hicache_dense_mapping_rebuild_keeps_segment_release(self):
+        alloc = self._make_swa_allocator()
+        full_row = alloc.full_attn_allocator.alloc(3 * PAGE_SIZE)
+        swa_row = alloc.swa_attn_allocator.alloc(3 * PAGE_SIZE)
+
+        alloc.rebuild_dense_full_to_swa_mapping(full_row, swa_row)
+
+        self.assertTrue(alloc._segment_release_has_dense_swa_mapping)
+        with patch("torch.unique", side_effect=AssertionError("unexpected unique")):
+            alloc.free_segment(full_row, start_pos=0)
+        self.assertEqual(len(alloc.full_attn_allocator.release_pages), 3)
+        self.assertEqual(len(alloc.swa_attn_allocator.release_pages), 3)
+
+    def test_hicache_dense_rebuild_does_not_reenable_invalidated_fast_path(self):
+        alloc = self._make_swa_allocator()
+        alloc._segment_release_has_dense_swa_mapping = False
+        full_row = alloc.full_attn_allocator.alloc(PAGE_SIZE)
+        swa_row = alloc.swa_attn_allocator.alloc(PAGE_SIZE)
+
+        alloc.rebuild_dense_full_to_swa_mapping(full_row, swa_row)
+
+        self.assertFalse(alloc._segment_release_has_dense_swa_mapping)
+
     def test_releases_swa_window_segment_without_unique(self):
         alloc = self._make_swa_allocator()
         full_row = alloc.full_attn_allocator.alloc(3 * PAGE_SIZE)

@@ -46,6 +46,7 @@ def _make_self(*, page_size: int, full_available: int, swa_available: int):
         ),
         translate_loc_from_full_to_swa=lambda last_loc: last_loc,
         new_pages_available=new_pages_available,
+        _set_full_to_swa_mapping=set_full_to_swa_mapping,
         set_full_to_swa_mapping=set_full_to_swa_mapping,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
     )
