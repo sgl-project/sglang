@@ -189,6 +189,43 @@ def test_load_and_offload_share_gc_freeze(monkeypatch):
     assert linker.stats["load"] == 2
 
 
+def test_load_waits_for_scheduler_stream(monkeypatch):
+    event_calls = []
+    loaded = threading.Event()
+
+    class _Event:
+        def record(self):
+            event_calls.append("record")
+
+        def synchronize(self):
+            event_calls.append("synchronize")
+
+    monkeypatch.setattr(mooncake_direct_linker.device_module, "Event", _Event)
+
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.gc_frozen = True
+    linker.pending_loads = {"rid": [object()]}
+    linker.layer_done_counter = SimpleNamespace(update_producer=lambda: 7)
+    linker.load_queue = Queue()
+    linker.stats = {"load": 0}
+
+    def load_layer_wise(counter_index, transfers):
+        assert event_calls == ["record", "synchronize"]
+        assert counter_index == 7
+        assert len(transfers) == 1
+        loaded.set()
+
+    linker.load_layer_wise = load_layer_wise
+    thread = threading.Thread(target=linker.load_thread_func, daemon=True)
+    thread.start()
+
+    assert linker.start_layer_wise_loading() == 7
+    assert loaded.wait(timeout=5)
+    linker.load_queue.join()
+    linker.load_queue.put(None)
+    thread.join(timeout=5)
+
+
 def test_offload_runs_on_background_thread(monkeypatch):
     started = threading.Event()
     release = threading.Event()

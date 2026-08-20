@@ -131,7 +131,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
         self.gc_frozen = False
-        self.load_queue: Queue[tuple[int, list[list[PoolTransfer]]] | None] = Queue()
+        self.load_queue: Queue[tuple[int, list[list[PoolTransfer]], object] | None] = (
+            Queue()
+        )
         self.offload_queue: Queue[tuple[list[PoolTransfer], int, object] | None] = (
             Queue()
         )
@@ -219,7 +221,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pending_loads = {}
 
         counter_index = self.layer_done_counter.update_producer()
-        self.load_queue.put((counter_index, list(pending.values())))
+        ready_event = device_module.Event()
+        ready_event.record()
+        self.load_queue.put((counter_index, list(pending.values()), ready_event))
         self.stats["load"] += len(pending)
         return counter_index
 
@@ -229,7 +233,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                counter_index, transfers = task
+                counter_index, transfers, ready_event = task
+                ready_event.synchronize()
                 self.load_layer_wise(counter_index, transfers)
             finally:
                 self.load_queue.task_done()
