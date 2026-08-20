@@ -130,17 +130,31 @@ jobs:
         id: parse
         run: |
           # Parse the default ROCm 7.2 PR gate (exclude utility jobs)
-          # Excluded: call-gate, check-changes, finish, cancel, check-all-jobs
+          # Excluded: call-gate, check-changes, finish, cancel, check-all-jobs,
+          # plus the extra call and the stage waits -- they run on ubuntu-latest
+          # (or delegate to another workflow), so the self-hosted-only snapshot
+          # has nothing for them and the sed below would not apply to them either.
+          # Job ids keep the -rocm720 lane suffix but display names no longer do
+          # (the flavor moved into the paren coordinates), so strip it to get the
+          # prefix query_job_status.py matches against.
           pr_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/pr-test-amd-rocm720.yml | \
-            grep -v -E '^(call-gate|check-changes|pr-test-amd-rocm720-finish|cancel|check-all-jobs)$' | \
+            grep -v -E '^(call-gate|check-changes|pr-test-amd-rocm720-finish|cancel|check-all-jobs|call-pr-test-amd-extra-rocm720|wait-for-stage-[ab]-amd-rocm720)$' | \
+            sed 's/-rocm720$//' | \
             jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "pr_jobs=$pr_jobs" >> $GITHUB_OUTPUT
           echo "PR jobs: $pr_jobs"
 
           # Parse the default ROCm 7.2 nightly (exclude utility jobs)
           # Excluded: check-all-jobs
+          # One nightly run covers every flavor, so ask for each by its full name.
+          # A stem-only prefix matches both and merges them into a single row,
+          # which hides a regression that only reproduces on one image.
+          # Keep in sync with the rocm_version matrix in the nightly workflow.
+          rocm_flavors="rocm724 rocm720"
           nightly_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/nightly-test-amd-rocm720.yml | \
             grep -v -E '^(check-all-jobs)$' | \
+            sed 's/-rocm720$//' | \
+            while read -r stem; do for f in $rocm_flavors; do echo "$stem ($f)"; done; done | \
             jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "nightly_jobs=$nightly_jobs" >> $GITHUB_OUTPUT
           echo "Nightly jobs: $nightly_jobs"
