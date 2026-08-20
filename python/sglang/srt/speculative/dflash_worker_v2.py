@@ -20,6 +20,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -482,14 +483,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         lm_head = getattr(target_model, "lm_head", None)
         if lm_head is None:
             return _eager("no target lm_head")
-        if not hasattr(lm_head, "weight"):
-            return _eager("quantized lm_head has no dense weight")
-        if not is_dense_head_weight(lm_head.weight):
-            # Quantized lm_head (FP8/INT) would break the static matmul.
-            return _eager("quantized lm_head")
 
         if self.selector is not None:
             # compute_candidates needs the target lm_head attached before capture.
+            # A gate-admitted quantized head is capture-safe: the target's own
+            # logits path already runs the same kernel under CUDA graphs.
+            if not is_dense_head_weight(
+                getattr(lm_head, "weight", None)
+            ) and not should_apply_lm_head_quant_method(
+                lm_head, getattr(lm_head, "quant_method", None)
+            ):
+                return _eager("unsupported quantized lm_head")
             self.draft_model.lm_head = lm_head
             if self.ps.tp_rank == 0:
                 logger.info(
@@ -502,6 +506,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
                 device=self.device,
             )
+        if not hasattr(lm_head, "weight"):
+            return _eager("quantized lm_head has no dense weight")
+        if not is_dense_head_weight(lm_head.weight):
+            # Quantized lm_head (FP8/INT) would break the static matmul.
+            return _eager("quantized lm_head")
         tp_group = get_tp_group()
         if not hasattr(lm_head, "shard_indices"):
             if tp_group.world_size != 1:
