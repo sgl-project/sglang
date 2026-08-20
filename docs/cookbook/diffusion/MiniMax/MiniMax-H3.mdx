@@ -198,11 +198,108 @@ baseline; everything else stays identical. GPU peak stays about 18 GB
 either way because streaming offload is set by the offload buffers and VAE
 decode, not the weight dtype.
 
+### Pre-quantized GGUF transformer
+
+Use `--transformer-weights-path` to replace only the DiT with a GGUF file; the
+base repository continues to provide the text encoder, VAEs, scheduler, and
+tokenizers. Do not also pass `--quantization gguf`.
+
+```bash 1×RTX 5090 Q4_K_M
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --transformer-weights-path \
+    leejet/MiniMax-H3-GGUF/minimax_h3_fl2va-Q4_K_M.gguf \
+  --attention-backend fa \
+  --performance-mode memory \
+  --layerwise-offload-components dit,text_encoder \
+  --dit-offload-prefetch-size 1 \
+  --dit-layerwise-resident-layers 0 \
+  --enable-torch-compile false \
+  --port 30010
+```
+
+The loader also recognizes pruned checkpoints that replace the timestep MLP
+with `adaln_t_table`. Repositories containing both FL2VA and Ref2VA variants
+need a full file reference:
+
+```bash Pruned FL2VA Q4_K
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --transformer-weights-path \
+    unsloth/MiniMax-H3-GGUF/minimax_h3_fl2va_pruned-Q4_K.gguf \
+  --performance-mode memory \
+  --layerwise-offload-components dit,text_encoder \
+  --enable-torch-compile false \
+  --port 30010
+```
+
+The linear adapter reuses SRT's GGUF type definitions and CUDA dequantization,
+then runs the native GEMM. SRT's fused MMVQ/MMQ kernels target the low-token LLM
+regime and are slower at diffusion sequence lengths. TP is supported when each
+row-parallel input shard remains GGML-block aligned; incompatible degrees fail
+during model construction. FSDP, LoRA merging, and the separate MiniMax-H3
+AdaLN cache flags are not compatible with packed GGUF weights.
+
 The first launch downloads the model through the selected Hub. If the Hugging
 Face repository requires authentication, export a Hugging Face token in the
 server environment.
 
 For MiniMax-H3, `--performance-mode speed` deliberately keeps the DiT eager. The current `torch.compile` path changes the model's numerical output, so it is not enabled implicitly by any recommended lossless preset. An explicit `--enable-torch-compile true` remains available for controlled experiments, but it should not be used to generate consistency ground truth.
+
+### AdaLN-pruned safetensors transformers
+
+[Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/diffusion_models)
+publishes smaller DiT-only checkpoints that replace the original AdaLN branches
+with an interpolated curve table. Select one file explicitly; the base model
+still supplies the text encoder and VAEs.
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --transformer-weights-path \
+    Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors \
+  --num-gpus 4 \
+  --tp-size 2 \
+  --ulysses-degree 2 \
+  --performance-mode speed \
+  --port 30010
+```
+
+The pruned checkpoint is approximate and is therefore rejected by
+`quality="high"`, which remains limited to the audited official BF16 DiT.
+
+The Comfy `pruned_fp8_scaled` FL2VA and Ref2VA files are also supported. Their
+per-layer markers are detected automatically; do not add `--quantization`:
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --transformer-weights-path \
+    Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_fl2va_pruned_fp8_scaled.safetensors \
+  --num-gpus 4 \
+  --tp-size 2 \
+  --ulysses-degree 2 \
+  --performance-mode speed \
+  --port 30010
+```
+
+SGLang uses its native static-activation FP8 linear path for attention and
+`fc1`. The checkpoint marks `fc2` for full-precision matrix multiplication, so
+SGLang retains its FP8 storage but materializes and scales one compute-dtype
+`fc2` matrix for each call. This preserves the checkpoint's mixed execution
+contract and low resident weight memory, but that part is slower than a fully
+quantized FP8 GEMM. TP, Ulysses/Ring sequence parallelism, and
+component/layerwise offload are supported; FSDP inference is rejected.
+
+The `pruned_int8_convrot` files are detected but remain unsupported. They
+require online regular-Hadamard ConvRot, dynamic INT8 activation quantization,
+and a matching W8A8 GEMM. SGLang fails before loading them instead of silently
+treating their stored INT8 values as ordinary weights. A native ConvRot kernel
+path should be added and benchmarked separately before these files are accepted.
 
 ### Advanced: precomputed AdaLN cache
 
