@@ -301,12 +301,6 @@ class MoeLoraRunner:
                 f"but is_gated={self.is_gated} needs {expected_slices}"
             )
 
-        if plan.down_b_into_base and not provider.supports_down_b_into_base():
-            raise NotImplementedError(
-                f"{provider.contract.key} does not implement the down-B "
-                "into-base epilogue"
-            )
-
     def run_plan(
         self,
         dispatch_output: StandardDispatchOutput,

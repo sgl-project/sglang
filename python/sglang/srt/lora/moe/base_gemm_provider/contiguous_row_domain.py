@@ -796,12 +796,8 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
             invoke_shared_from_scratch_finalize,
             invoke_shared_rank_reduce,
         )
-        from sglang.srt.lora.moe.lora_b import (
-            invoke_down_b_into_base,
-        )
 
         self._post_reorder = post_reorder_deepgemm
-        self._down_b_into_base = invoke_down_b_into_base
         self._shared_reduce = invoke_shared_rank_reduce
         self._shared_tail = invoke_shared_from_scratch_finalize
 
@@ -984,28 +980,6 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
             b_gate_up=b_gate_up,
             bridge_top_k=bridge_top_k,
             consume_base_pdl=consume_base_pdl,
-        )
-
-    def supports_down_b_into_base(self) -> bool:
-        return True
-
-    def run_down_b_into_base(
-        self,
-        row_state: ContiguousRowState,
-        *,
-        down_out: torch.Tensor,
-        bridge: torch.Tensor,
-        b_down: torch.Tensor,
-        routing: RouteView,
-        config: Mapping[str, int],
-    ) -> None:
-        self._down_b_into_base(
-            down_rows=down_out.view(-1, self.hidden_size),
-            src2dst=row_state.src2dst,
-            bridge=bridge,
-            b_down=b_down,
-            routing=routing,
-            config=config,
         )
 
     def run_shared_rank_finalize(

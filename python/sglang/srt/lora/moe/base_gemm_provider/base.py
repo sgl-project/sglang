@@ -196,14 +196,6 @@ class MoeBaseProvider:
             pair_to_row=row_state.src2dst,
         )
 
-    def supports_down_b_into_base(self) -> bool:
-        """Report whether the down rows accept the down-B into-base add.
-
-        Return ``True`` only with a stable pair-to-row map, as for
-        ``mapped_down_lora_a_input``.
-        """
-        return False
-
     def run_down_b_into_base(
         self,
         row_state,
@@ -216,13 +208,21 @@ class MoeBaseProvider:
     ) -> None:
         """Add each pair's unweighted down-B result into ``down_out``.
 
-        Call this after the base down GEMM. It uses the provider's pair-to-row
-        map. The later finalize must then run with no pair delta. ``bridge`` is
-        the pair-major down-A output. ``b_down`` holds the down-B weights of
-        every virtual expert.
+        Call this after the base down GEMM. It reaches a row only through
+        ``src2dst``, so both row domains work. The later finalize must then
+        run with no pair delta. ``bridge`` is the pair-major down-A output.
+        ``b_down`` holds the down-B weights of every virtual expert.
         """
-        raise NotImplementedError(
-            f"{self.contract.key} has no down-B into-base epilogue"
+        # Imported here so this module keeps to msgspec and torch.
+        from sglang.srt.lora.moe.lora_b import invoke_down_b_into_base
+
+        invoke_down_b_into_base(
+            down_rows=down_out.view(-1, self.hidden_size),
+            src2dst=row_state.src2dst,
+            bridge=bridge,
+            b_down=b_down,
+            routing=routing,
+            config=config,
         )
 
     def run_shared_rank_finalize(

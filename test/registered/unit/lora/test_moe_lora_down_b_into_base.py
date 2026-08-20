@@ -246,36 +246,17 @@ class TestProviderIntoBaseSurface:
             intermediate_size=8,
             hidden_size=16,
         )
-        assert MaskedRowDomainProvider(quant_info).supports_down_b_into_base()
+        # One implementation on the base. Both row domains reach a row only
+        # through src2dst, so neither needs its own copy.
+        from sglang.srt.lora.moe.base_gemm_provider.base import MoeBaseProvider
+
+        for cls in (MaskedRowDomainProvider, ContiguousRowDomainProvider):
+            assert "run_down_b_into_base" not in vars(cls)
+        assert "run_down_b_into_base" in vars(MoeBaseProvider)
+        assert MaskedRowDomainProvider(quant_info).run_down_b_into_base
         assert ContiguousRowDomainProvider(
             quant_info, m_alignment=128
-        ).supports_down_b_into_base()
-
-    def test_the_base_seam_fails_closed(self) -> None:
-        from sglang.srt.lora.moe.base_gemm_provider.base import (
-            MoeBaseProvider,
-            MoeBaseProviderContract,
-        )
-
-        provider = MoeBaseProvider()
-        provider.contract = MoeBaseProviderContract(
-            key="stub",
-            gate_first=True,
-            interleaved=False,
-            gate_up_output_dtype=torch.bfloat16,
-            lora_delta_dtype=torch.bfloat16,
-            lora_activation_dtype=torch.bfloat16,
-        )
-        assert provider.supports_down_b_into_base() is False
-        with pytest.raises(NotImplementedError, match="into-base"):
-            provider.run_down_b_into_base(
-                None,
-                down_out=torch.zeros(1),
-                bridge=torch.zeros(1),
-                b_down=torch.zeros(1),
-                routing=None,
-                config={},
-            )
+        ).run_down_b_into_base
 
 
 cuda_only = pytest.mark.skipif(
