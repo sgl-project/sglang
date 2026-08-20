@@ -14,13 +14,14 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
-from sglang.kernels.ops.diffusion.fused_linear_gelu import (
-    can_fuse_linear_gelu,
+from sglang.kernels.ops.diffusion import (
+    can_use_linear_gelu,
     fused_gelu_active,
     fused_linear_gelu_tanh,
     mark_fused_gelu_site,
 )
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_transformer_block
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_tp_world_size,
@@ -841,7 +842,7 @@ class QwenImageGELU(nn.Module):
         mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_fuse_linear_gelu(self.proj, hidden_states):
+        if fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
@@ -1315,7 +1316,7 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _repeated_blocks = ["QwenImageTransformerBlock"]
 
     param_names_mapping = QwenImageDitConfig().arch_config.param_names_mapping
-    _fsdp_shard_conditions = QwenImageDitConfig().arch_config._fsdp_shard_conditions
+    _fsdp_shard_conditions = [is_transformer_block]
 
     @classmethod
     def get_nunchaku_quant_rules(cls) -> dict[str, list[str]]:
