@@ -1741,7 +1741,8 @@ def biased_grouped_topk_gpu(
                 topk_indices,
                 gating_output,
                 renormalize,
-                correction_bias,
+                # The XPU topk_sigmoid AOT kernel requires an fp32 correction bias.
+                correction_bias.to(torch.float32),
                 scale,
             )
 
