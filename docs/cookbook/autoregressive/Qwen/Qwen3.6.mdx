@@ -84,6 +84,14 @@ import { benchmarks } from "/src/snippets/configs/Qwen/qwen3.6-benchmarks.jsx";
 
 <Deployment config={config} benchmarks={benchmarks} />
 
+<Note>
+  The **low-latency** speed numbers are **provisional**. Those cells run MTP (EAGLE speculative
+  decoding) and were measured with real acceptance on the `random` dataset (no
+  `SGLANG_SIMULATE_ACC_LEN`); random-dataset acceptance is unrealistic, so the low-latency
+  figures understate realistic speculative speedups and will be re-measured with a pinned
+  acceptance length. High-throughput (MTP off) and Xeon (balanced) numbers are unaffected.
+</Note>
+
 <div style={{fontSize: "0.85em", lineHeight: "1.55", color: "#6b7280", margin: "0.5rem 0 1rem 0"}}>
   <p style={{margin: "0 0 0.3rem 0"}}><strong>Panel controls</strong> (top of the command box):</p>
   <ul style={{margin: 0, paddingLeft: "1.25rem"}}>
