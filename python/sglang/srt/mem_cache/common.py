@@ -119,6 +119,9 @@ def free_kv_row_range(
     ``swa_evicted_seqlen``, which released their peers already -- by window
     eviction, or as the deliberately unmapped prefix of a PD decode SWA-tail
     prealloc. The boundary is page-aligned because ``swa_evicted_seqlen`` is.
+
+    Callers already on ``free_segment`` want ``free_kv_row_segment`` instead, so
+    they keep its fixed-shape page-representative path.
     """
     num_indices = kv_indices.numel()
     if num_indices == 0:
@@ -127,6 +130,53 @@ def free_kv_row_range(
     allocator.free_full(kv_indices)
     if swa_already_freed < num_indices:
         allocator.free_swa(kv_indices[swa_already_freed:])
+
+
+def free_kv_row_segments(
+    allocator: BaseTokenToKVPoolAllocator,
+    segments,
+    *,
+    swa_evicted_seqlen: int,
+) -> None:
+    """``free_segments()`` for one request's row, skipping the SWA side below
+    ``swa_evicted_seqlen``.
+
+    Segments are ``(kv_indices, start_pos)`` in ascending row order. The leading
+    part of each that sits below the eviction floor gives back only its
+    full-attention slots; the rest keeps the fixed-shape page-representative path
+    of ``free_segment``. The floor is page-aligned, so both halves stay on page
+    boundaries.
+    """
+    alive = []
+    for kv_indices, start_pos in segments:
+        num_indices = kv_indices.numel()
+        if num_indices == 0:
+            continue
+        swa_already_freed = min(max(swa_evicted_seqlen - start_pos, 0), num_indices)
+        if swa_already_freed > 0:
+            allocator.free_full(kv_indices[:swa_already_freed])
+        if swa_already_freed < num_indices:
+            alive.append(
+                (kv_indices[swa_already_freed:], start_pos + swa_already_freed)
+            )
+    if alive:
+        allocator.free_segments(alive)
+
+
+def free_kv_row_segment(
+    allocator: BaseTokenToKVPoolAllocator,
+    kv_indices: torch.Tensor,
+    *,
+    start_pos: int,
+    swa_evicted_seqlen: int,
+) -> None:
+    """Single-segment ``free_kv_row_segments``. With nothing below the floor this
+    is exactly ``allocator.free_segment(kv_indices, start_pos=start_pos)``."""
+    free_kv_row_segments(
+        allocator,
+        [(kv_indices, start_pos)],
+        swa_evicted_seqlen=swa_evicted_seqlen,
+    )
 
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
@@ -284,17 +334,16 @@ def _release_overallocated_kv_indices(
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
             start_p:end_p
         ]
+        # start_p is aligned to the allocator's physical page size above, so it
+        # never shares a page with cache_finished_req's tail free in this group.
         # strip_thinking_cache can pull the committed length below the eviction
         # floor, so the head of this range may already have lost its SWA peers.
-        swa_dead = min(max(req.kv.swa_evicted_seqlen - start_p, 0), end_p - start_p)
-        if swa_dead > 0:
-            allocator.free_full(indices_to_free[:swa_dead])
-        if swa_dead < end_p - start_p:
-            # start_p is aligned to the allocator's physical page size above, so it
-            # never shares a page with cache_finished_req's tail free in this group.
-            allocator.free_segment(
-                indices_to_free[swa_dead:], start_pos=start_p + swa_dead
-            )
+        free_kv_row_segment(
+            allocator,
+            indices_to_free,
+            start_pos=start_p,
+            swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
+        )
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:

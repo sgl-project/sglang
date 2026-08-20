@@ -435,7 +435,9 @@ class FullComponent(TreeComponent):
             alloc = self.cache.token_to_kv_pool_allocator
             for indices in action.indices:
                 if self.cache.is_swa_enabled:
-                    alloc.full_attn_allocator.free(indices)
+                    # The SWA component frees its own side from these same
+                    # full indices, so this must not touch the SWA pool.
+                    alloc.free_full(indices)
                 else:
                     alloc.free(indices)
             return
