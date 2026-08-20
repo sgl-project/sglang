@@ -81,6 +81,82 @@ def compute_streamed_layers(
 
 
 # Adapted from skywork AI Infra diffusion optimize
+# Below this a table is not worth a per-request round trip; above it the ratio
+# of table size to rows actually read makes residency clearly wasteful.
+HOST_RESIDENT_TABLE_MIN_BYTES = 256 * 1024**2
+
+
+def _host_resident_tables(model: torch.nn.Module) -> List[torch.nn.Module]:
+    """Vocab tables large enough that holding them on the device is waste.
+
+    A table is read by gather, not by GEMM: one row per token, so a 512-token
+    prompt touches 8 MiB of umT5-XXL's 3.91 GiB table. Streaming it layer by
+    layer would be worse than resident -- 3.91 GiB moved to read 8 MiB -- so it
+    belongs in host memory with the lookup running there.
+    """
+    tables = []
+    for module in model.modules():
+        weight = getattr(module, "weight", None)
+        if weight is None or not hasattr(weight, "dim") or weight.dim() != 2:
+            continue
+        if getattr(module, "num_embeddings", None) is None:
+            continue
+        # A sharded table is already divided by the world size, and its output
+        # feeds an all-reduce that expects a device tensor.
+        if getattr(module, "tp_size", 1) != 1:
+            continue
+        if weight.numel() * weight.element_size() < HOST_RESIDENT_TABLE_MIN_BYTES:
+            continue
+        tables.append(module)
+    return tables
+
+
+def detach_host_resident_tables(
+    model: torch.nn.Module,
+) -> List[Tuple[torch.nn.Module, torch.Tensor]]:
+    """Swap large vocab tables for placeholders so a `.to(device)` skips them."""
+    detached = []
+    for module in _host_resident_tables(model):
+        weight = module.weight
+        detached.append((module, weight.data))
+        weight.data = torch.empty(0, dtype=weight.dtype, device=weight.device)
+    return detached
+
+
+def restore_host_resident_tables(
+    detached: List[Tuple[torch.nn.Module, torch.Tensor]],
+    device: torch.device | str,
+) -> None:
+    for module, data in detached:
+        module.weight.data = data
+        _install_host_gather_hooks(module, device)
+        logger.info(
+            "Keeping %s (%.2f GiB) in host memory: a gather reads one row per "
+            "token, so residency buys almost nothing.",
+            type(module).__name__,
+            data.numel() * data.element_size() / (1024**3),
+        )
+
+
+def _install_host_gather_hooks(
+    module: torch.nn.Module, device: torch.device | str
+) -> None:
+    """Run this module's gather on the host, move only the result."""
+
+    def _inputs_to_host(_module, args, kwargs):
+        if not args or not torch.is_tensor(args[0]):
+            return None
+        return (args[0].to("cpu"),) + args[1:], kwargs
+
+    def _output_to_device(_module, _args, output):
+        if not torch.is_tensor(output):
+            return output
+        return output.to(device, non_blocking=True)
+
+    module.register_forward_pre_hook(_inputs_to_host, with_kwargs=True)
+    module.register_forward_hook(_output_to_device)
+
+
 class LayerwiseOffloadManager:
     """A lightweight layerwise CPU offload manager.
 
@@ -273,8 +349,10 @@ class LayerwiseOffloadManager:
         # Keep non-layer parameters resident on GPU. Layer tensors have already
         # been replaced by tiny device placeholders, so this does not reload the
         # offloaded layer weights.
+        host_resident = detach_host_resident_tables(self.model)
         if not self._has_dtensor_weights:
             self.model.to(self.device)
+        restore_host_resident_tables(host_resident, self.device)
 
         self._finalize_initialization()
 
@@ -1067,7 +1145,10 @@ class LayerwiseOffloadableModuleMixin:
             if enabled_managers and not any(
                 manager._has_dtensor_weights for manager in enabled_managers
             ):
-                self.to(enabled_managers[0].device)
+                device = enabled_managers[0].device
+                host_resident = detach_host_resident_tables(self)
+                self.to(device)
+                restore_host_resident_tables(host_resident, device)
 
             for manager in enabled_managers:
                 manager._finalize_initialization()
