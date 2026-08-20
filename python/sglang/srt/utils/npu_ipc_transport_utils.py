@@ -61,6 +61,7 @@ class MmItemMemoryChunk:
 class MmItemMemoryPool:
     def __init__(self, memory_size, recycle_interval, base_npu_id, tp_size):
         self.tp_size = tp_size
+        memory_size_mb = memory_size / (1024 * 1024)
         self.memory_pool = torch.empty(
             memory_size, dtype=torch.int8, device=f"npu:{base_npu_id}"
         ).contiguous()
@@ -86,8 +87,8 @@ class MmItemMemoryPool:
         self._recycle_thread.start()
 
         logger.info(
-            f"[NPU IPC Pool] Initialized: size={memory_size / (1024*1024):.1f} MB, "
-            f"device=npu:{base_npu_id}"
+            f"[NPU IPC Pool] Initialized: size={memory_size_mb:.1f} MB, "
+            f"device=npu:{base_npu_id}, tp_size={tp_size}"
         )
 
     def shutdown(self):
@@ -120,7 +121,8 @@ class MmItemMemoryPool:
                 logger.warning("allocate shm buffer failed")
                 raise RuntimeError
         else:
-            return self.sync_flag_list.pop()
+            shm_buffer = self.sync_flag_list.pop()
+            return shm_buffer
 
     def push_sync_buffer(self, sync_buffer):
         self.sync_flag_list.append(sync_buffer)
@@ -136,15 +138,22 @@ class MmItemMemoryPool:
                     selected_chunk = chunk
 
         if not selected_chunk:
+            logger.warning(
+                f"[NPU IPC Pool] No available chunk for tensor size={src_tensor_size / (1024*1024):.2f} MB, "
+                f"pool is FULL. available_chunks={len(self.available_chunks)}, "
+                f"occupied_chunks={len(self.occupied_chunks)}"
+            )
             return None
 
         occupied_chunk_area = (
             selected_chunk.start,
             selected_chunk.start + src_tensor_size,
         )
-        occupied_chunk_sync_flag = selected_chunk.sync_flag
+        old_sync_name = selected_chunk.sync_flag.buffer.name
+        new_sync_buffer = self.pop_sync_buffer()
+        new_sync_name = new_sync_buffer.buffer.name
         new_occupied_chunk = MmItemMemoryChunk(
-            occupied_chunk_area, occupied_chunk_sync_flag, self.tp_size
+            occupied_chunk_area, new_sync_buffer, self.tp_size
         )
 
         self.available_chunks.remove(selected_chunk)
@@ -157,6 +166,12 @@ class MmItemMemoryPool:
             self.available_chunks.append(split_available_chunk)
         self.occupied_chunks.append(new_occupied_chunk)
 
+        logger.debug(
+            f"[NPU IPC Pool] Chunk allocated: size={src_tensor_size / (1024*1024):.2f} MB, "
+            f"offset={new_occupied_chunk.start}, "
+            f"old_sync={old_sync_name}, new_sync={new_sync_name}, "
+            f"available={len(self.available_chunks)}, occupied={len(self.occupied_chunks)}"
+        )
         return new_occupied_chunk
 
     def return_a_slice_tensor_with_flag(self, tensor: torch.Tensor):
@@ -194,6 +209,7 @@ class MmItemMemoryPool:
                 ),
                 pool_byte_offset=byte_offset,
                 pool_device_index=self._pool_device_index,
+                tp_size=self.tp_size,
             )
         return None
 
@@ -209,6 +225,9 @@ class MmItemMemoryPool:
 
         for chunk in to_recycle_chunks:
             self.reclaim_chunk(chunk)
+
+        if to_recycle_chunks:
+            total_recycled = sum(c.mem_size for c in to_recycle_chunks)
 
     def merge_chunks(self):
         if len(self.available_chunks) <= 1:
@@ -253,6 +272,7 @@ class NpuIpcTensorTransportProxy:
         pool_ipc_handle=None,
         pool_byte_offset: int = 0,
         pool_device_index: int = 0,
+        tp_size: int = 1,
     ):
         if (not isinstance(data, torch.Tensor)) or (
             not isinstance(info_data, torch.Tensor)
@@ -263,6 +283,8 @@ class NpuIpcTensorTransportProxy:
 
         if pool_ipc_handle is not None:
             sync_flag_meta = sync_buffer_meta.meta_data if sync_buffer_meta else None
+            if sync_flag_meta:
+                sync_flag_meta["tp_size"] = tp_size
             self.proxy_state = {
                 "ipc_extra": {
                     "pool_handle": pool_ipc_handle,
@@ -277,6 +299,7 @@ class NpuIpcTensorTransportProxy:
                     "recons_dtype": info_data.dtype,
                     "device_type": "npu",
                     "sync_flag_meta": sync_flag_meta,
+                    "tp_size": tp_size,
                 },
                 "tensor_data": None,
             }
@@ -310,7 +333,17 @@ class NpuIpcTensorTransportProxy:
 
     @property
     def sync_data_meta(self):
-        return self.proxy_state.get("tensor_data", {}).get("sync_buffer_meta", {})
+        tensor_data = self.proxy_state.get("tensor_data")
+        if tensor_data:
+            tensor_data_sync = tensor_data.get("sync_buffer_meta", {})
+            if tensor_data_sync:
+                return tensor_data_sync
+        ipc_extra = self.proxy_state.get("ipc_extra")
+        if ipc_extra:
+            ipc_extra_sync = ipc_extra.get("sync_flag_meta", {})
+            if ipc_extra_sync:
+                return ipc_extra_sync
+        return {}
 
     @property
     def sync_buffer(self):
@@ -373,7 +406,6 @@ class NpuIpcTensorTransportProxy:
         self, ipc_extra, *, use_cache: bool, rebuild_device_idx: int
     ):
         shape = ipc_extra["shape"]
-        dtype = ipc_extra["dtype"]
         stride = ipc_extra["stride"]
         pool_handle = ipc_extra["pool_handle"]
 
@@ -402,19 +434,16 @@ class NpuIpcTensorTransportProxy:
             return
         try:
             ipc_extra = self.proxy_state.get("ipc_extra")
-            sync_flag_meta = ipc_extra.get("sync_flag_meta") if ipc_extra else None
-            if sync_flag_meta is None:
-                sync_data = self.sync_buffer_data
-                if sync_data is not None:
-                    sync_data += consumer_count
+            if ipc_extra is None:
+                return
+            tp_size = ipc_extra.get("tp_size", 1)
+            sync_data = self.sync_buffer_data
+            if sync_data is not None:
+                sync_data += consumer_count
+                if float(sync_data) >= float(tp_size):
                     self._consumer_acknowledged = True
-            else:
-                sync_data = self.sync_buffer_data
-                if sync_data is not None:
-                    sync_data += consumer_count
-                    self._consumer_acknowledged = True
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[NPU IPC] acknowledge_consumption error: {e}")
 
     def _copy_slice_tensor_to_target(
         self, slice_tensor, target_device, recons_shape, recons_dtype, consumer_count
