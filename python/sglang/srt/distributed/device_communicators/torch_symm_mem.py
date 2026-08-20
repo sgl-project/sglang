@@ -12,7 +12,7 @@ from sglang.srt.distributed.device_communicators.all_reduce_utils import (
     TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_exec, get_server_args
+from sglang.srt.runtime_context import get_exec, get_schedule
 from sglang.srt.utils import is_cuda, is_hip
 
 try:
@@ -214,11 +214,11 @@ class TorchSymmMemCommunicator:
 
     def _get_max_forward_tokens(self) -> int:
         """Return max tokens per forward (chunked_prefill_size or max_prefill_tokens)."""
-        server_args = get_server_args()
-        cps = server_args.chunked_prefill_size
+        schedule = get_schedule()
+        cps = schedule.chunked_prefill_size
         if cps is not None and cps > 0:
             return cps
-        return server_args.max_prefill_tokens
+        return schedule.max_prefill_tokens
 
     def get_or_create_moe_rs_ctx(
         self,
