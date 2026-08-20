@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 import torch
 
-from sglang.kernel_api_logging import wrap_method_with_debug_kernel_once
+from sglang.kernels.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 

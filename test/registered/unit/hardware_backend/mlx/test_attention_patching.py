@@ -909,7 +909,10 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         auxiliary_state_idx = pool.get_auxiliary_state_indices(req.req_pool_idx)
         pool.free(req)
 
-        self.assertEqual(req_indices, [1])
+        # Which free slot a fresh alloc gets is not semantically meaningful
+        # (see ReqToTokenPool.alloc); only pin that it's a real, valid slot.
+        self.assertEqual(len(req_indices), 1)
+        self.assertIn(req_indices[0], range(1, pool.size + 1))
         self.assertIsNotNone(auxiliary_state_idx)
         self.assertIsNone(req.req_pool_idx)
         self.assertIsNotNone(req.mamba_pool_idx)
