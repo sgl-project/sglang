@@ -48,6 +48,10 @@ def _function(source: str, name: str) -> str:
     raise AssertionError(f"function {name!r} not found")
 
 
+class _ContiguousRowStateStub(msgspec.Struct, kw_only=True):
+    """Subclassable stand-in: the real state is a Struct, and providers extend it."""
+
+
 class TestMaskedFusionSource(unittest.TestCase):
     def test_lora_a_to_b_pdl_has_a_complete_signal_wait_launch_chain(self):
         # The kernel-level A->B PDL ABI stays complete (benchmarks drive it);
@@ -155,6 +159,11 @@ class TestMaskedFusionSource(unittest.TestCase):
         row_module.MaskedRowState = object
         quant_module = types.ModuleType("sglang.srt.lora.moe.quant_info")
         quant_module.MoeLoraBf16QuantInfo = object
+        contiguous_module = types.ModuleType(
+            "sglang.srt.lora.moe.base_gemm_provider.contiguous_row_domain"
+        )
+        contiguous_module.ContiguousRowDomainProvider = object
+        contiguous_module.ContiguousRowState = object
         packages = {}
         for name in (
             "sglang",
@@ -179,6 +188,7 @@ class TestMaskedFusionSource(unittest.TestCase):
                 base_module.__name__: base_module,
                 row_module.__name__: row_module,
                 quant_module.__name__: quant_module,
+                contiguous_module.__name__: contiguous_module,
             },
         ):
             spec.loader.exec_module(module)
@@ -455,6 +465,10 @@ class TestMaskedFusionSource(unittest.TestCase):
         act.MASKED_ACT_FAMILIES = ("b_activation",)
         act.MASKED_ACT_TRITON = "triton"
         act.run_masked_fused_act = lambda *_args, **_kwargs: None
+        scatter = types.ModuleType(
+            "sglang.srt.lora.moe.base_gemm_provider.down_b_scatter"
+        )
+        scatter.invoke_down_b_scatter = lambda *_args, **_kwargs: None
 
         spec = importlib.util.spec_from_file_location(
             "_cpu_masked_row_domain", PROVIDER / "masked_row_domain.py"
@@ -471,6 +485,7 @@ class TestMaskedFusionSource(unittest.TestCase):
             dispatch.__name__: dispatch,
             finalize.__name__: finalize,
             act.__name__: act,
+            scatter.__name__: scatter,
         }
         with mock.patch.dict(sys.modules, injected):
             spec.loader.exec_module(module)
@@ -550,6 +565,16 @@ class TestMaskedFusionSource(unittest.TestCase):
         row_module.MaskedRowState = StubWorkspace
         quant_module = types.ModuleType("sglang.srt.lora.moe.quant_info")
         quant_module.MoeLoraBf16QuantInfo = object
+        contiguous_module = types.ModuleType(
+            "sglang.srt.lora.moe.base_gemm_provider.contiguous_row_domain"
+        )
+        contiguous_module.ContiguousRowDomainProvider = object
+        contiguous_module.ContiguousRowState = _ContiguousRowStateStub
+
+        def _ceiling_not_exercised(*_args, **_kwargs):
+            raise AssertionError("contiguous_m_pad_ceiling is not exercised here")
+
+        contiguous_module.contiguous_m_pad_ceiling = _ceiling_not_exercised
         packages = {}
         for name in (
             "sglang",
@@ -574,6 +599,7 @@ class TestMaskedFusionSource(unittest.TestCase):
                 base_module.__name__: base_module,
                 row_module.__name__: row_module,
                 quant_module.__name__: quant_module,
+                contiguous_module.__name__: contiguous_module,
             },
         ):
             spec.loader.exec_module(module)
