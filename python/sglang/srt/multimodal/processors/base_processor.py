@@ -676,6 +676,7 @@ class BaseMultimodalProcessor(ABC):
                 "Gemma4Processor",
                 "Gemma4UnifiedProcessor",
                 "GlmAsrProcessor",
+                "GraniteSpeechProcessor",
                 "Qwen2AudioProcessor",
                 "Qwen3ASRProcessor",
                 "Qwen3OmniMoeProcessor",
