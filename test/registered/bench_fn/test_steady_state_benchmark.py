@@ -32,6 +32,11 @@ class _RequestOutput:
     output_len: int = 0
 
 
+@dataclass
+class _InputRequest:
+    prompt_len: int
+
+
 def _request(start_time, latency, ttft, itl, output_len):
     return _RequestOutput(
         generated_text=" ".join(["token"] * output_len),
@@ -56,6 +61,11 @@ class TestSteadyStateMetrics(unittest.TestCase):
             outputs=outputs,
             tokenizer=_StringTokenizer(),
             concurrency_ratio=0.8,
+            input_requests=[
+                _InputRequest(prompt_len=100),
+                _InputRequest(prompt_len=200),
+                _InputRequest(prompt_len=300),
+            ],
         )
 
         self.assertEqual(metrics.window_start, 2.0)
@@ -63,6 +73,8 @@ class TestSteadyStateMetrics(unittest.TestCase):
         self.assertEqual(metrics.duration, 6.0)
         self.assertEqual(metrics.concurrency_threshold, 3)
         self.assertEqual(metrics.completed, 2)
+        self.assertEqual(metrics.total_input, 500)
+        self.assertEqual(metrics.input_throughput, 500 / 6)
         self.assertEqual(metrics.total_output, 9.0)
         self.assertEqual(metrics.output_throughput, 1.5)
         self.assertEqual(metrics.output_throughput_retokenized, 1.5)
@@ -105,6 +117,7 @@ class TestSteadyStateMetrics(unittest.TestCase):
             _request(0.0, 4.0, 1.0, [1.0, 1.0, 1.0], 4),
         ]
         tokenizer = _StringTokenizer()
+        input_requests = [_InputRequest(prompt_len=4), _InputRequest(prompt_len=4)]
 
         def regular_calculate_metrics(
             input_requests, outputs, dur_s, tokenizer, backend
@@ -113,7 +126,7 @@ class TestSteadyStateMetrics(unittest.TestCase):
 
         def regular_run_benchmark(args):
             steady_state_serving.serving.calculate_metrics(
-                input_requests=None,
+                input_requests=input_requests,
                 outputs=outputs,
                 dur_s=4.0,
                 tokenizer=tokenizer,
@@ -143,6 +156,7 @@ class TestSteadyStateMetrics(unittest.TestCase):
             )
 
         self.assertEqual(result, {"normal_result": True})
+        self.assertEqual(metrics.input_throughput, 2.0)
         self.assertEqual(metrics.output_throughput, 2.0)
 
 

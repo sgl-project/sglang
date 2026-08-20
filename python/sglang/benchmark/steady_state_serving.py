@@ -34,6 +34,15 @@ def _print_metrics(metrics: SteadyStateMetrics) -> None:
     print("{:<40} {:<10.2f}".format("Measurement duration (s):", metrics.duration))
     print("{:<40} {:<10}".format("Minimum concurrency:", metrics.concurrency_threshold))
     print("{:<40} {:<10}".format("Completed requests:", metrics.completed))
+    if metrics.input_throughput is None:
+        print("{:<40} {:<10}".format("Input token throughput (tok/s):", "N/A"))
+    else:
+        print("{:<40} {:<10}".format("Input tokens:", metrics.total_input))
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Input token throughput (tok/s):", metrics.input_throughput
+            )
+        )
     print("{:<40} {:<10.2f}".format("Generated tokens:", metrics.total_output))
     print(
         "{:<40} {:<10.2f}".format(
@@ -75,6 +84,10 @@ def _run_with_capture(
 
     def capture_calculate_metrics(*call_args, **call_kwargs):
         bound = calculate_signature.bind(*call_args, **call_kwargs)
+        input_requests = bound.arguments["input_requests"]
+        captured["input_requests"] = (
+            None if input_requests is None else list(input_requests)
+        )
         captured["outputs"] = list(bound.arguments["outputs"])
         captured["tokenizer"] = bound.arguments["tokenizer"]
         return original_calculate_metrics(*call_args, **call_kwargs)
@@ -94,6 +107,7 @@ def _run_with_capture(
         outputs=captured["outputs"],
         tokenizer=captured["tokenizer"],
         concurrency_ratio=concurrency_ratio,
+        input_requests=captured["input_requests"],
     )
     _print_metrics(steady_state_metrics)
     if output_file:

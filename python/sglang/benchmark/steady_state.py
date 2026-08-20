@@ -25,6 +25,10 @@ class RequestOutput(Protocol):
     generated_text: str
 
 
+class InputRequest(Protocol):
+    prompt_len: int
+
+
 class Tokenizer(Protocol):
     def encode(self, text: str, add_special_tokens: bool = False) -> List[Any]: ...
 
@@ -46,6 +50,8 @@ class SteadyStateMetrics:
     duration: float
     concurrency_threshold: int
     completed: int
+    total_input: Optional[int]
+    input_throughput: Optional[float]
     total_output: float
     total_output_retokenized: float
     output_throughput: float
@@ -157,9 +163,31 @@ def calculate_steady_state_metrics(
     outputs: Sequence[RequestOutput],
     tokenizer: Tokenizer,
     concurrency_ratio: float,
+    input_requests: Optional[Sequence[InputRequest]] = None,
 ) -> SteadyStateMetrics:
-    """Calculate output-throughput metrics for the selected steady-state window."""
+    """Calculate token throughput metrics for the steady-state window.
+
+    Input tokens do not have per-token timestamps. Their throughput therefore uses
+    an arrival-based definition: prompt tokens from successful requests that start
+    inside the half-open measurement window ``[start, end)`` divided by its duration.
+    ``None`` is reported when aligned input requests are unavailable, as in the
+    current multi-turn serving benchmark.
+    """
     window = find_steady_state_window(outputs, concurrency_ratio)
+
+    if input_requests is not None and len(input_requests) != len(outputs):
+        raise ValueError("input requests and outputs must have the same length")
+
+    if input_requests is None:
+        total_input = None
+        input_throughput = None
+    else:
+        total_input = sum(
+            request.prompt_len
+            for request, output in zip(input_requests, outputs)
+            if output.success and window.start <= output.start_time < window.end
+        )
+        input_throughput = total_input / window.duration
 
     output_lens = [output.output_len if output.success else 0 for output in outputs]
     retokenized_output_lens = [
@@ -209,6 +237,8 @@ def calculate_steady_state_metrics(
         duration=window.duration,
         concurrency_threshold=window.concurrency_threshold,
         completed=completed,
+        total_input=total_input,
+        input_throughput=input_throughput,
         total_output=total_output,
         total_output_retokenized=total_output_retokenized,
         output_throughput=total_output / window.duration,
