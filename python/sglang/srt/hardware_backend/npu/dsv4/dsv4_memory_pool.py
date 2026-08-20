@@ -7,9 +7,10 @@ rules as the GPU implementation:
 * C4A/C4Li state follows SWA physical pages.
 * C128A state follows ``req_pool_idx`` and absolute position.
 
-``NPUCompressStatePool`` only adds the contiguous 3-D view and positive dummy
-location required by the Atlas A3 ``cache_mode=2`` operator. There is no paged
-state allocator or ``cache_mode=1`` compatibility storage.
+``NPUCompressStatePool`` adds the contiguous 3-D view and positive dummy
+location required by the Atlas fused compressor operators. A3 uses explicit
+locations; A5 uses the same ring storage through its request-bank (cycle) ABI.
+There is no paged state allocator or ``cache_mode=1`` compatibility storage.
 """
 
 from __future__ import annotations
@@ -96,12 +97,12 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
 
 
 class NPUCompressStatePool(CompressStatePool):
-    """Thin A3 adapter over the shared GPU-style ring state pool.
+    """Thin Atlas adapter over the shared GPU-style ring state pool.
 
     Allocation, sizing, ring ownership and address translation are inherited
     from :class:`CompressStatePool`. NPU only requests a contiguous 3-D view,
-    enforces the A3 FP32 contract and replaces invalid locations with a cleared
-    positive dummy row.
+    enforces the FP32 state-cache contract and replaces invalid locations with
+    a cleared positive dummy row for explicit-location callers.
 
     Location 0 is valid in explicit mode. Invalid/history-padding locations map
     to the final cleared row instead of ``-1`` because the A3 kernel consumes
@@ -344,9 +345,16 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             "SGLANG_OPT_USE_ONLINE_COMPRESS is incompatible with the "
             "NPU fused compressor (no online mode in the kernel)."
         )
+        ring_size = self.get_ring_size(ratio)
+        # A5 cache_mode=2 addresses one ring bank per request.  The A3
+        # explicit-location path can share the smaller flat pool, but the A5
+        # cycle ABI needs enough physical banks for every req_pool_idx.
+        size = self._state_pool_size(ratio)
+        if _is_atlas_a5():
+            size = max(size, self.num_req_slots * ring_size)
         return NPUCompressStatePool(
-            size=self._state_pool_size(ratio),
-            ring_size=self.get_ring_size(ratio),
+            size=size,
+            ring_size=ring_size,
             overlap=ratio == 4,
             head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
             dtype=self.c4_state_dtype if ratio == 4 else self.c128_state_dtype,
@@ -361,9 +369,13 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     ) -> NPUCompressStatePool:
         # c4 indexer shares the c4 state pool size budget but has its own
         # slot_dim (indexer_head_dim vs attention head_dim).
+        ring_size = self.get_ring_size(ratio)
+        size = self.c4_state_pool_size
+        if _is_atlas_a5():
+            size = max(size, self.num_req_slots * ring_size)
         return NPUCompressStatePool(
-            size=self.c4_state_pool_size,
-            ring_size=self.get_ring_size(ratio),
+            size=size,
+            ring_size=ring_size,
             overlap=ratio == 4,
             head_dim=self.indexer_head_dim,
             device=self.device,
