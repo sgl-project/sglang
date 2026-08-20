@@ -142,6 +142,7 @@ def match_prefix_for_req(
     *,
     cow_mamba: bool = False,
     include_req: bool = False,
+    skip_mamba_match: bool = False,
 ):
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
@@ -163,6 +164,7 @@ def match_prefix_for_req(
             ),
             cow_mamba=cow_mamba,
             req=req if include_req else None,
+            skip_mamba_match=skip_mamba_match,
         )
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():

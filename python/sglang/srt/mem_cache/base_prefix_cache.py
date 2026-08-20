@@ -56,6 +56,9 @@ class MatchPrefixParams:
     # Mamba specific
     cow_mamba: bool = False
     req: Optional[Req] = None
+    # When True, match prefix without requiring mamba_value on each node.
+    # Used by PD decode where the mamba state is always transferred from prefill.
+    skip_mamba_match: bool = False
 
 
 @dataclasses.dataclass
