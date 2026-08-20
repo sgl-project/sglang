@@ -136,6 +136,24 @@ never silently changes prompt embeddings. For a native text encoder:
 - `--component-paths.text_encoder {MODEL}` replaces the text-encoder checkpoint; `--text-encoder-path {MODEL}` is its shorter alias
 - Quantization metadata is auto-detected from that checkpoint. Each native encoder must explicitly support the serialized format; this is not blanket quantization support for every component, and unsupported combinations fail before weight loading.
 
+### Artifact preflight
+
+Use the normal `generate` or `serve` command to inspect the configured model,
+component overrides, transformer weights override, and startup LoRA before
+allocating a GPU:
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --lora-path owner/adapter \
+  --artifact-preflight metadata
+```
+
+`metadata` reads Hub inventory, configs, and safetensors headers without
+downloading tensor payloads. `full` additionally downloads exactly the selected
+artifacts but still exits before model construction. Add
+`--artifact-report-format json` for a machine-readable CI or support report.
+
 For supported realtime causal video models, `--kv-cache-quant {off|int4|int2}`
 compresses completed KV-cache chunks independently of transformer weight
 quantization. It is lossy and disabled by default.

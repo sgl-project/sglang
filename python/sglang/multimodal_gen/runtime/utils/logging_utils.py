@@ -528,12 +528,12 @@ class _PytreeEnumRegistrationFilter(logging.Filter):
         )
 
 
-def configure_logger(server_args, prefix: str = ""):
+def configure_logger(server_args, prefix: str = "", stream=None):
     log_format = f"[%(asctime)s{prefix}] %(message)s"
     datefmt = "%m-%d %H:%M:%S"
 
     formatter = ColoredFormatter(log_format, datefmt=datefmt)
-    handler = logging.StreamHandler(sys.stdout)
+    handler = logging.StreamHandler(sys.stdout if stream is None else stream)
     handler.setFormatter(formatter)
 
     root = logging.getLogger()

@@ -11,6 +11,9 @@ from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcomman
 from sglang.multimodal_gen.runtime.launch_server import (
     dispatch_launch,
 )
+from sglang.multimodal_gen.runtime.loader.artifact_preflight import (
+    run_artifact_preflight,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
@@ -35,6 +38,9 @@ def execute_serve_cmd(args: argparse.Namespace, unknown_args: list[str] | None =
         unknown_args,
         default_args={"warmup_mode": "server"},
     )
+
+    if run_artifact_preflight(server_args):
+        return
 
     dispatch_launch(server_args)
 
