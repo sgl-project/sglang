@@ -2,13 +2,10 @@ name: Nightly Test (AMD ROCm 7.2)
 
 on:
   schedule:
-    # Two flavors share this workflow. The release nightly publishes both
-    # images at 12:00 UTC and takes ~2.5h, so 17:30 picks up the same day's
-    # rocm724 build; the 05:30 rocm720 run uses the previous day's. Running
-    # them 12h apart keeps rocm720 covered without doubling the concurrent
-    # GPU load, which matrixing all ~47 jobs would have done.
-    - cron: '30 17 * * *'   # rocm724
-    - cron: '30 5 * * *'    # rocm720
+    # One run covers every published ROCm 7.2 flavor: each GPU job is
+    # matrixed over rocm724 and rocm720. The release nightly publishes both
+    # images at 12:00 UTC and takes ~2.5h, so 17:30 picks up the same day's.
+    - cron: '30 17 * * *'
   push:
     branches:
       - main
@@ -17,11 +14,12 @@ on:
   workflow_dispatch:
     inputs:
       rocm_version:
-        description: 'ROCm image version'
+        description: 'ROCm image version ("all" runs every flavor, as the nightly schedule does)'
         required: false
         type: choice
-        default: rocm724
+        default: 'all'
         options:
+          - 'all'
           - rocm724
           - rocm720
       aiter_ref:
@@ -117,9 +115,14 @@ on:
   workflow_call:
     inputs:
       rocm_version:
-        description: 'ROCm image version'
+        description: 'ROCm image version ("all" runs every flavor)'
         required: false
         type: string
+        # Deliberately a single flavor rather than 'all', unlike the schedule
+        # and the dispatch form. amd-aiter-scout, bot-bump-sglang-version and
+        # release-branch-cut all call this workflow without passing
+        # rocm_version, and defaulting them to 'all' would silently double
+        # their GPU cost. They can opt in explicitly.
         default: rocm724
       ref:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
@@ -144,9 +147,6 @@ on:
 
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
-  # `inputs` is empty on schedule and push, so the default has to live here
-  # rather than only on the inputs above. The 05:30 cron is the rocm720 leg.
-  ROCM_VERSION: ${{ inputs.rocm_version || (github.event.schedule == '30 5 * * *' && 'rocm720' || 'rocm724') }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
@@ -155,9 +155,7 @@ concurrency:
   # collisions with direct schedule/push triggers. We use inputs.ref (not github.event_name)
   # to detect this, because github.event_name inherits from the caller in workflow_call.
   # Manual dispatch runs also get unique groups so they never cancel each other.
-  # The scheduled legs also carry the flavor, so a rocm720 run and a rocm724
-  # run can never cancel each other if one overruns into the other's slot.
-  group: nightly-test-amd-rocm720-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || inputs.ref && format('caller-{0}', github.run_id) || format('{0}-{1}', github.ref, github.event.schedule == '30 5 * * *' && 'rocm720' || 'rocm724') }}
+  group: nightly-test-amd-rocm720-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || inputs.ref && format('caller-{0}', github.run_id) || github.ref }}
   cancel-in-progress: ${{ !inputs.ref && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
@@ -169,6 +167,10 @@ jobs:
   # ==============================================================================
 
   nightly-test-1-gpu-unit-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-test-1-gpu-unit-rocm720,'))
     runs-on: linux-mi300-1gpu-sglang
     steps:
@@ -183,7 +185,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -199,6 +201,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-test-1-gpu-kernel-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-test-1-gpu-kernel-rocm720,'))
     runs-on: linux-mi300-1gpu-sglang
     steps:
@@ -213,7 +219,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -229,6 +235,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-test-1-gpu-mi35x-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-test-1-gpu-mi35x-rocm720,'))
     runs-on: linux-mi35x-gpu-1
     steps:
@@ -243,7 +253,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -264,6 +274,10 @@ jobs:
   # ==============================================================================
 
   nightly-accuracy-2-gpu-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-2-gpu-rocm720,'))
     runs-on: linux-mi300-2gpu-sglang
     steps:
@@ -278,7 +292,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -294,6 +308,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-2-gpu-mi35x-glm51-mxfp4-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-2-gpu-mi35x-glm51-mxfp4-rocm720,'))
     runs-on: linux-mi35x-gpu-2
     steps:
@@ -308,7 +326,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -328,6 +346,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2-rocm720,'))
     runs-on: linux-mi35x-gpu-2
     steps:
@@ -342,7 +364,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -363,6 +385,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-accuracy-2-gpu-vlm-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-2-gpu-vlm-rocm720,'))
     runs-on: linux-mi300-2gpu-sglang
     steps:
@@ -377,7 +403,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -394,6 +420,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-perf-2-gpu-text-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-perf-2-gpu-text-rocm720,'))
     runs-on: linux-mi300-2gpu-sglang
     steps:
@@ -408,7 +438,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -426,6 +456,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-perf-2-gpu-vlm-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-perf-2-gpu-vlm-rocm720,'))
     runs-on: linux-mi300-2gpu-sglang
     steps:
@@ -440,7 +474,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -458,6 +492,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-4-gpu-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu-rocm720,'))
     runs-on: linux-mi300-4gpu-sglang
     steps:
@@ -472,7 +510,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -494,6 +532,10 @@ jobs:
   # ==============================================================================
 
   nightly-accuracy-8-gpu-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-8-gpu-rocm720,'))
     runs-on: linux-mi300-8gpu-sglang
     steps:
@@ -508,7 +550,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -542,6 +584,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-accuracy-8-gpu-mi35x-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-8-gpu-mi35x-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
@@ -556,7 +602,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -594,6 +640,10 @@ jobs:
   # ==============================================================================
 
   nightly-8-gpu-grok1-int4-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-grok1-int4-rocm720,'))
     runs-on: linux-mi300-8gpu-sglang
     steps:
@@ -608,7 +658,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -639,6 +689,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-grok1-int4-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-grok1-int4-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
@@ -653,7 +707,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -691,6 +745,10 @@ jobs:
   # ==============================================================================
 
   nightly-8-gpu-grok2-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-grok2-rocm720,'))
     runs-on: linux-mi300-8gpu-sglang
     steps:
@@ -705,7 +763,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -736,6 +794,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-grok2-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-grok2-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
@@ -750,7 +812,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -788,6 +850,10 @@ jobs:
   # ==============================================================================
 
   nightly-8-gpu-deepseek-v31-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-deepseek-v31-rocm720,'))
     runs-on: linux-mi300-8gpu-sglang
     steps:
@@ -802,7 +868,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -834,6 +900,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-deepseek-v32-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-deepseek-v32-rocm720,'))
     runs-on: linux-mi300-8gpu-sglang
     steps:
@@ -848,7 +918,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -878,6 +948,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-deepseek-v32-mtp-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-deepseek-v32-mtp-rocm720,'))
     runs-on: linux-mi300-8gpu-sglang
     steps:
@@ -892,7 +966,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -922,6 +996,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-deepseek-v3-kv-fp8-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-deepseek-v3-kv-fp8-rocm720,'))
     runs-on: linux-mi300-8gpu-sglang
     steps:
@@ -936,7 +1014,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -959,6 +1037,10 @@ jobs:
   # ==============================================================================
 
   nightly-accuracy-8-gpu-mi35x-deepseek-v32-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-8-gpu-mi35x-deepseek-v32-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
@@ -973,7 +1055,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -995,6 +1077,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
@@ -1009,7 +1095,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1031,6 +1117,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-perf-8-gpu-mi35x-deepseek-v32-basic-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-perf-8-gpu-mi35x-deepseek-v32-basic-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
@@ -1045,7 +1135,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1067,6 +1157,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-perf-8-gpu-mi35x-deepseek-v32-mtp-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-perf-8-gpu-mi35x-deepseek-v32-mtp-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
@@ -1081,7 +1175,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1107,6 +1201,10 @@ jobs:
   # ==============================================================================
 
   nightly-8-gpu-mi35x-deepseek-r1-mxfp4-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-mxfp4-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
@@ -1121,7 +1219,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1154,6 +1252,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
@@ -1168,7 +1270,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1200,6 +1302,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
@@ -1214,7 +1320,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1247,6 +1353,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
@@ -1261,7 +1371,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1294,6 +1404,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-deepseek-r1-hicache-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-r1-hicache-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
@@ -1308,7 +1422,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1332,6 +1446,10 @@ jobs:
   # ==============================================================================
 
   nightly-8-gpu-mi35x-deepseek-v4-flash-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-flash-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
@@ -1346,7 +1464,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1383,6 +1501,10 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
   nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
@@ -1397,7 +1519,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1434,6 +1556,10 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
   nightly-8-gpu-mi35x-deepseek-v4-pro-mtp-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-pro-mtp-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
@@ -1448,7 +1574,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1485,6 +1611,10 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
   nightly-8-gpu-mi35x-deepseek-v4-pro-dspark-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-pro-dspark-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
@@ -1499,7 +1629,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1530,6 +1660,10 @@ jobs:
   # ==============================================================================
 
   nightly-8-gpu-kimi-k26-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-kimi-k26-rocm720,'))
     runs-on: linux-mi300-8gpu-sglang
     steps:
@@ -1544,7 +1678,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1567,6 +1701,10 @@ jobs:
   # ==============================================================================
 
   nightly-8-gpu-mi35x-kimi-k3-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-kimi-k3-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
@@ -1581,7 +1719,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1626,6 +1764,10 @@ jobs:
   # ==============================================================================
 
   nightly-8-gpu-qwen3-235b-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-qwen3-235b-rocm720,'))
     runs-on: linux-mi300-8gpu-sglang
     steps:
@@ -1640,7 +1782,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1660,6 +1802,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-qwen3-235b-mxfp4-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-qwen3-235b-mxfp4-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
@@ -1674,7 +1820,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1699,6 +1845,10 @@ jobs:
   # ==============================================================================
 
   nightly-8-gpu-qwen35-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-qwen35-rocm720,'))
     runs-on: linux-mi300-8gpu-sglang
     steps:
@@ -1713,7 +1863,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1747,6 +1897,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-qwen35-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-qwen35-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
@@ -1761,7 +1915,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1794,6 +1948,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-qwen35-triton-dcp-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-qwen35-triton-dcp-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
@@ -1808,7 +1966,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1832,6 +1990,10 @@ jobs:
   # ==============================================================================
 
   nightly-8-gpu-glm51-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-glm51-rocm720,'))
     runs-on: linux-mi300-8gpu-sglang
     steps:
@@ -1846,7 +2008,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1877,6 +2039,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-glm51-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-glm51-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
@@ -1891,7 +2057,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1926,6 +2092,10 @@ jobs:
   # ==============================================================================
 
   nightly-8-gpu-mi35x-glm5-mxfp4-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-glm5-mxfp4-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
@@ -1940,7 +2110,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1977,6 +2147,10 @@ jobs:
   # ==============================================================================
 
   nightly-4-gpu-mi35x-minimax-m25-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu-mi35x-minimax-m25-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
@@ -1991,7 +2165,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -2016,6 +2190,10 @@ jobs:
   # ==============================================================================
 
   nightly-4-gpu-mi35x-minimax-m3-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu-mi35x-minimax-m3-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
@@ -2030,7 +2208,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -2054,6 +2232,10 @@ jobs:
   # ==============================================================================
 
   nightly-8-gpu-minimax-m27-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-minimax-m27-rocm720,'))
     runs-on: linux-mi300-8gpu-sglang
     steps:
@@ -2068,7 +2250,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -2104,6 +2286,10 @@ jobs:
   # ==============================================================================
 
   nightly-1-gpu-zimage-turbo-rocm720:
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-1-gpu-zimage-turbo-rocm720,'))
     runs-on: linux-mi300-1gpu-sglang
     steps:
@@ -2118,7 +2304,7 @@ jobs:
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
