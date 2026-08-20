@@ -358,33 +358,34 @@ def run_lora_b(
     intermediate_top_k: int = 1,
     consume_pdl: bool = False,
 ) -> None:
-    """Execute exactly the B family named by an execution-plan spec."""
+    """Run exactly the family the spec names; no fallback, no selector."""
     family = spec.family.value
-    if consume_pdl and family != "one_launch_sliced":
-        raise ValueError(
-            f"{family} B has no qualified programmatic-dependent-launch consumer"
-        )
-    if family == "one_launch_sliced":
-        one_launch_sliced_lora_b(
-            bridge,
-            weight,
-            destination,
-            routing,
-            destination_offsets=destination_offsets,
-            config=config,
-            intermediate_top_k=intermediate_top_k,
-            consume_pdl=consume_pdl,
-        )
-        return
-    if family == "indexed_pairs":
-        indexed_pairs_lora_b(
-            bridge,
-            weight,
-            destination,
-            routing,
-            destination_offsets=destination_offsets,
-            config=config,
-            intermediate_top_k=intermediate_top_k,
-        )
-        return
-    raise NotImplementedError(f"no production LoRA-B executor for {family!r}")
+    match family:
+        case "one_launch_sliced":
+            one_launch_sliced_lora_b(
+                bridge,
+                weight,
+                destination,
+                routing,
+                destination_offsets=destination_offsets,
+                config=config,
+                intermediate_top_k=intermediate_top_k,
+                consume_pdl=consume_pdl,
+            )
+        case "indexed_pairs":
+            if consume_pdl:
+                raise ValueError(
+                    f"{family} B has no qualified programmatic-dependent-launch "
+                    "consumer"
+                )
+            indexed_pairs_lora_b(
+                bridge,
+                weight,
+                destination,
+                routing,
+                destination_offsets=destination_offsets,
+                config=config,
+                intermediate_top_k=intermediate_top_k,
+            )
+        case _:
+            raise NotImplementedError(f"no production LoRA-B executor for {family!r}")

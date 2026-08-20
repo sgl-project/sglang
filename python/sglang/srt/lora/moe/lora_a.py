@@ -338,15 +338,9 @@ def run_lora_a(
 ) -> torch.Tensor:
     """Run exactly the family the spec names; no fallback, no selector."""
     family = spec.family.value
-    site = spec.site.value
-    pair_input = site == "down"
-    if pair_to_row is not None and not (family == "grouped" and site == "down"):
-        raise ValueError(
-            "a provider pair_to_row is supported only by standalone grouped down-A"
-        )
-
-    if family in ("grouped", "token_dedup_grouped"):
-        if family == "token_dedup_grouped":
+    pair_input = spec.site.value == "down"
+    match family:
+        case "token_dedup_grouped":
             token_dedup_grouped_lora_a(
                 input,
                 weight,
@@ -355,7 +349,7 @@ def run_lora_a(
                 config=config,
                 produce_pdl=produce_pdl,
             )
-        else:
+        case "grouped":
             grouped_lora_a(
                 input,
                 weight,
@@ -366,22 +360,20 @@ def run_lora_a(
                 pair_to_row=pair_to_row,
                 produce_pdl=produce_pdl,
             )
-        return output
-
-    if produce_pdl:
-        raise ValueError(
-            f"{family} A has no qualified programmatic-dependent-launch producer"
-        )
-
-    if family == "indexed":
-        indexed_lora_a(
-            input,
-            weight,
-            output,
-            routing,
-            config=config,
-            pair_input=pair_input,
-        )
-        return output
-
-    raise NotImplementedError(f"no production LoRA-A executor for {family!r}")
+        case "indexed":
+            if produce_pdl:
+                raise ValueError(
+                    f"{family} A has no qualified programmatic-dependent-launch "
+                    "producer"
+                )
+            indexed_lora_a(
+                input,
+                weight,
+                output,
+                routing,
+                config=config,
+                pair_input=pair_input,
+            )
+        case _:
+            raise NotImplementedError(f"no production LoRA-A executor for {family!r}")
+    return output
