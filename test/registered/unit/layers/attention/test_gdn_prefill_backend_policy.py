@@ -177,6 +177,10 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
 
         torch.testing.assert_close(
             metadata.state_checkpoint_cu_starts,
+            torch.tensor([0, 0, 1, 2, 3, 5, 7], dtype=torch.int64),
+        )
+        torch.testing.assert_close(
+            metadata.cake_state_checkpoint_cu_starts,
             torch.tensor([0, 0, 1, 2, 3, 5, 7], dtype=torch.int32),
         )
         torch.testing.assert_close(metadata.track_ssm_h_src, torch.tensor([1, 2, 3, 6]))

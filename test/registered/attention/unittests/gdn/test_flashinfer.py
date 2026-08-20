@@ -481,9 +481,7 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
             fixture.forward_batch.extend_seq_lens_cpu,
         )
         self.assertEqual(extend.call_args.kwargs["layer_id"], 0)
-        torch.testing.assert_close(
-            actual, expected.output, atol=1e-2, rtol=1e-2
-        )
+        torch.testing.assert_close(actual, expected.output, atol=1e-2, rtol=1e-2)
         torch.testing.assert_close(
             _ssm_states(fixture)[cache_indices],
             expected.final_states[cache_indices],
@@ -531,9 +529,7 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         torch.cuda.current_stream().synchronize()
         graph.replay()
         torch.cuda.synchronize()
-        torch.testing.assert_close(
-            graph_output, expected.output, atol=1e-2, rtol=1e-2
-        )
+        torch.testing.assert_close(graph_output, expected.output, atol=1e-2, rtol=1e-2)
         torch.testing.assert_close(
             _ssm_states(fixture)[cache_indices],
             expected.final_states[cache_indices],
@@ -578,9 +574,7 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         noncp_selector.assert_not_called()
         noncp_loader.assert_not_called()
         self.assertGreater(cp_loader.call_count, 0)
-        torch.testing.assert_close(
-            actual, expected.output, atol=1e-2, rtol=1e-2
-        )
+        torch.testing.assert_close(actual, expected.output, atol=1e-2, rtol=1e-2)
         torch.testing.assert_close(
             _ssm_states(fixture)[cache_indices],
             expected.final_states[cache_indices],
@@ -670,9 +664,7 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         torch.cuda.current_stream().synchronize()
         graph.replay()
         torch.cuda.synchronize()
-        torch.testing.assert_close(
-            graph_output, cake_output, atol=1e-2, rtol=1e-2
-        )
+        torch.testing.assert_close(graph_output, cake_output, atol=1e-2, rtol=1e-2)
         torch.testing.assert_close(
             cache.temporal[batch.mamba_track_indices],
             cake_tracked,
@@ -695,15 +687,9 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         triton_tracked = cache.temporal[batch.mamba_track_indices]
         triton_final = cache.temporal[_cache_indices(fixture)]
 
-        torch.testing.assert_close(
-            cake_output, triton_output, atol=3e-2, rtol=3e-2
-        )
-        torch.testing.assert_close(
-            cake_tracked, triton_tracked, atol=3e-2, rtol=3e-2
-        )
-        torch.testing.assert_close(
-            cake_final, triton_final, atol=3e-2, rtol=3e-2
-        )
+        torch.testing.assert_close(cake_output, triton_output, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(cake_tracked, triton_tracked, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(cake_final, triton_final, atol=1e-2, rtol=1e-2)
 
     def test_cake_exact_verify_eager_and_cuda_graph(self):
         cake_api = self._cake_api_or_skip()
@@ -771,10 +757,10 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         triton_tracked = cache.temporal[batch.mamba_track_indices]
 
         torch.testing.assert_close(
-            flashinfer_output, triton_output, atol=3e-2, rtol=3e-2
+            flashinfer_output, triton_output, atol=1e-2, rtol=1e-2
         )
         torch.testing.assert_close(
-            flashinfer_tracked, triton_tracked, atol=3e-2, rtol=3e-2
+            flashinfer_tracked, triton_tracked, atol=1e-2, rtol=1e-2
         )
 
 

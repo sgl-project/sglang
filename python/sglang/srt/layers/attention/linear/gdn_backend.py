@@ -700,6 +700,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 state_checkpoint_cu_starts=(
                     forward_metadata.state_checkpoint_cu_starts
                 ),
+                cake_state_checkpoint_cu_starts=(
+                    forward_metadata.cake_state_checkpoint_cu_starts
+                ),
                 num_state_checkpoints=forward_metadata.num_state_checkpoints,
                 state_checkpoint_every_n_tokens=(
                     forward_metadata.state_checkpoint_every_n_tokens
