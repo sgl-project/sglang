@@ -88,7 +88,19 @@ impl TokenizerRegistry {
     pub fn load_from_config(cfg: &crate::config::Config) -> Result<Self> {
         let me = TokenizerRegistry::default();
         let m = &cfg.model;
-        let t = adapter::load(&m.tokenizer_path)?;
+        // `--no-tokenizer`: leave the registry empty. Every consumer already
+        // handles a missing entry — `has_chat_encoder` is false, so the chat
+        // handler's `want_tokens` gate turns off tokenization and the
+        // `input_ids` offload with it, and `/v1/tokenize` returns
+        // ModelNotFound. Load-only policies (round_robin / random /
+        // power_of_two / load_based) route identically either way.
+        let Some(tokenizer_path) = m.tokenizer_path.as_deref() else {
+            tracing::info!(model = %m.id,
+                "--no-tokenizer: routing without tokenization; /v1/tokenize and \
+                 /v1/detokenize are unavailable and prompts are tokenized by the engine");
+            return Ok(me);
+        };
+        let t = adapter::load(tokenizer_path)?;
         me.inner.insert(m.id.clone(), t);
         // Resolve the chat encoder, best-effort: a Jinja template from
         // tokenizer_config.json, else a built-in encoder for a recognized model
@@ -97,7 +109,7 @@ impl TokenizerRegistry {
         // model is the single most useful signal for diagnosing "cache-aware
         // routing degraded to overlap=0 on chat traffic", so it must never be
         // silent.
-        if let Some(encoder) = me.resolve_chat_encoder(&m.id, &m.tokenizer_path) {
+        if let Some(encoder) = me.resolve_chat_encoder(&m.id, tokenizer_path) {
             me.encoders
                 .insert(m.id.clone(), Arc::new(ChatEncoderEntry::new(encoder)));
         }
@@ -230,7 +242,7 @@ mod tests {
             observability: Default::default(),
             model: crate::config::ModelConfig {
                 id: "tiny".into(),
-                tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+                tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
                 policy: PolicyKind::RoundRobin,
                 circuit_breaker: None,
                 cache_aware: None,
@@ -367,7 +379,7 @@ mod tests {
     #[test]
     fn missing_file_errors() {
         let mut c = cfg();
-        c.model.tokenizer_path = "/nonexistent.json".into();
+        c.model.tokenizer_path = Some("/nonexistent.json".into());
         let err = TokenizerRegistry::load_from_config(&c).unwrap_err();
         assert!(err.to_string().to_lowercase().contains("tokenizer"));
     }

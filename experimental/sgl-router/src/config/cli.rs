@@ -49,6 +49,15 @@ pub struct Cli {
     /// as the repo id (download honors `HF_TOKEN` / `HF_HOME`).
     #[arg(long)]
     pub tokenizer_path: Option<String>,
+    /// Route without a tokenizer. Use for models whose tokenizer is not a
+    /// HuggingFace `tokenizer.json` (e.g. tiktoken-based ones): the router
+    /// then never tokenizes, so `/v1/tokenize` and `/v1/detokenize` are
+    /// unavailable and prompts are tokenized by the engine instead of being
+    /// offloaded as `input_ids`. Rejected with `--policy cache_aware_zmq`
+    /// (which routes on token hashes) and mutually exclusive with
+    /// `--tokenizer-path`.
+    #[arg(long)]
+    pub no_tokenizer: bool,
     /// Routing policy.
     #[arg(long, value_enum, default_value = "round_robin")]
     pub policy: PolicyKind,
@@ -160,6 +169,24 @@ impl Cli {
     /// (model id, static worker URLs).
     pub fn into_config(self) -> Result<Config> {
         let discovery = self.build_discovery()?;
+
+        // `--no-tokenizer` turns off ingress tokenization entirely. Reject the
+        // two combinations that would silently mean something other than what
+        // the operator wrote, rather than letting one flag win.
+        if self.no_tokenizer {
+            if self.tokenizer_path.is_some() {
+                return Err(anyhow!(
+                    "--no-tokenizer and --tokenizer-path are mutually exclusive"
+                ));
+            }
+            if self.policy == PolicyKind::CacheAwareZmq {
+                return Err(anyhow!(
+                    "--policy cache_aware_zmq requires a tokenizer (it routes on prompt \
+                     token hashes); drop --no-tokenizer, or pick a load-based policy \
+                     (round_robin / random / power_of_two / load_based)"
+                ));
+            }
+        }
 
         // Reject knobs that only take effect alongside another flag, rather
         // than silently dropping them — mirrors the discovery mutual-exclusion
@@ -308,8 +335,13 @@ impl Cli {
             },
             model: ModelConfig {
                 // Default the tokenizer source to the model id (treated as a
-                // HuggingFace repo id) when --tokenizer-path is omitted.
-                tokenizer_path: self.tokenizer_path.unwrap_or_else(|| self.model_id.clone()),
+                // HuggingFace repo id) when --tokenizer-path is omitted;
+                // `None` under --no-tokenizer (validated above).
+                tokenizer_path: if self.no_tokenizer {
+                    None
+                } else {
+                    Some(self.tokenizer_path.unwrap_or_else(|| self.model_id.clone()))
+                },
                 id: self.model_id,
                 policy: self.policy,
                 circuit_breaker,
@@ -453,7 +485,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(c.model.id, "Qwen/Qwen3-0.6B");
-        assert_eq!(c.model.tokenizer_path, "Qwen/Qwen3-0.6B");
+        assert_eq!(c.model.tokenizer_path.as_deref(), Some("Qwen/Qwen3-0.6B"));
     }
 
     #[test]
@@ -467,7 +499,7 @@ mod tests {
             "http://x:30000",
         ])
         .unwrap();
-        assert_eq!(c.model.tokenizer_path, "/models/qwen3/tokenizer.json");
+        assert_eq!(c.model.tokenizer_path.as_deref(), Some("/models/qwen3/tokenizer.json"));
     }
 
     #[test]
@@ -714,6 +746,62 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(c.model.policy, PolicyKind::LoadBased);
+    }
+
+    /// `--no-tokenizer` clears `tokenizer_path`, so `TokenizerRegistry` skips
+    /// the load and the chat handler's `want_tokens` gate stays closed. Without
+    /// it the field defaults to the model id and the router tries to download
+    /// a `tokenizer.json` that a tiktoken-based model does not publish.
+    /// Bypasses `with_model`, which supplies its own `--tokenizer-path`.
+    #[test]
+    fn no_tokenizer_clears_tokenizer_path() {
+        let c = into_config(&[
+            "--model-id",
+            "qwen3-0.6b",
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--policy",
+            "load_based",
+            "--no-tokenizer",
+        ])
+        .unwrap();
+        assert!(c.model.tokenizer_path.is_none());
+    }
+
+    /// `--no-tokenizer` with an explicit `--tokenizer-path` is contradictory;
+    /// rejecting it beats silently letting one of the two win.
+    #[test]
+    fn no_tokenizer_rejects_explicit_tokenizer_path() {
+        let err = into_config(&[
+            "--model-id",
+            "qwen3-0.6b",
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--no-tokenizer",
+            "--tokenizer-path",
+            "/model/tokenizer.json",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    /// cache_aware_zmq routes on prompt token hashes, so it cannot run without
+    /// a tokenizer — fail at startup rather than degrade to overlap=0 silently.
+    #[test]
+    fn no_tokenizer_rejects_cache_aware_policy() {
+        let err = into_config(&[
+            "--model-id",
+            "qwen3-0.6b",
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--no-tokenizer",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("requires a tokenizer"), "got: {err}");
     }
 
     /// clap rejects `--cb-threshold 0` because the field is `NonZeroU32`.

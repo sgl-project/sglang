@@ -143,7 +143,13 @@ pub struct ModelConfig {
     /// Tokenizer source: a local `tokenizer.json` path or a HuggingFace repo
     /// id (downloaded on demand). Defaults to `id` when `--tokenizer-path`
     /// is omitted. Resolved by [`crate::tokenizer::adapter::load`].
-    pub tokenizer_path: String,
+    ///
+    /// `None` only under `--no-tokenizer`: the router then never tokenizes,
+    /// so it cannot serve `/v1/tokenize` / `/v1/detokenize` and cannot
+    /// offload tokenization to the engine via `input_ids`. Required by
+    /// `cache_aware_zmq` (which routes on token hashes), rejected at
+    /// config-build time for that policy.
+    pub tokenizer_path: Option<String>,
     pub policy: PolicyKind,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     /// Tuning for cache-aware routing. Ignored unless
