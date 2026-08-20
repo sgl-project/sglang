@@ -182,8 +182,17 @@ def _prepare_weights(
 
 
 def _plan_scratch(*, experts, top_k, device, swiglu_limit, counts):
-    """Frozen scratch plan. Returns (plan, scratch)."""
+    """Frozen scratch plan + the process-wide shared arena. Returns (plan, scratch).
+
+    Every expert layer presents identical caps, so one arena serves them all
+    (the same contract as vLLM's shared workspace manager -- per-layer copies
+    once wasted ~12 GB here); bind only requires ``numel >= nbytes``. All
+    layers are prepared at load time, before any CUDA graph capture, so the
+    grow-only allocation never moves an address a captured graph baked.
+    """
     from b12x.moe import fused_moe
+
+    from sglang.srt.runtime_context import get_resources
 
     caps = fused_moe.Caps(
         max_tokens=max(counts),
@@ -202,7 +211,13 @@ def _plan_scratch(*, experts, top_k, device, swiglu_limit, counts):
     specs = plan.scratch_specs()
     if len(specs) != 1 or specs[0].dtype != torch.uint8:
         raise RuntimeError(f"unexpected b12x scratch specs: {specs}")
-    scratch = torch.empty(int(specs[0].shape[0]), dtype=torch.uint8, device=device)
+    need = int(specs[0].shape[0])
+    buffers = get_resources().buffers
+    key = f"b12x:moe_scratch:{device}"
+    scratch = buffers.get(key)
+    if scratch is None or scratch.numel() < need:
+        scratch = torch.empty(need, dtype=torch.uint8, device=device)
+        buffers[key] = scratch
     return plan, scratch
 
 
