@@ -194,6 +194,8 @@ class _TestServerArgs(SimpleNamespace):
     record_component_layerwise_capability = (
         ServerArgs.record_component_layerwise_capability
     )
+    _parse_component_value_map = staticmethod(ServerArgs._parse_component_value_map)
+    layerwise_tuning_for = ServerArgs.layerwise_tuning_for
 
 
 def _server_args(**kwargs):
@@ -214,6 +216,9 @@ def _server_args(**kwargs):
         dit_offload_prefetch_size=1,
         dit_layerwise_resident_layers=0.0,
         dit_layerwise_residency_policy=RESIDENCY_POLICY_LEADING,
+        layerwise_prefetch_size={},
+        layerwise_resident_layers={},
+        layerwise_residency_policy={},
         pin_cpu_memory=False,
         # the pin budget ranks candidates by bytes x steps, and reads the step
         # count off the pipeline's sampling defaults
@@ -1301,3 +1306,59 @@ def test_mapped_weights_are_visible_to_checksums(tmp_path, monkeypatch):
     manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
     names = {name for name, _ in manager.iter_cpu_weights()}
     assert "blocks.0.weight" in names
+
+
+def test_layerwise_tuning_defaults_match_the_group():
+    """No per-component entry: the DiT group keeps its knobs, auxiliaries do not."""
+    args = _server_args(
+        dit_offload_prefetch_size=3,
+        dit_layerwise_resident_layers=20,
+        dit_layerwise_residency_policy=RESIDENCY_POLICY_STRIDED,
+    )
+    assert args.layerwise_tuning_for("transformer", dit_group=True) == (
+        3.0,
+        20.0,
+        RESIDENCY_POLICY_STRIDED,
+    )
+    assert args.layerwise_tuning_for("text_encoder", dit_group=False) == (
+        0.0,
+        0.0,
+        RESIDENCY_POLICY_LEADING,
+    )
+
+
+def test_layerwise_tuning_per_component_entry_wins():
+    """An auxiliary component can be tuned; its layers cost the same per pass."""
+    args = _server_args(
+        dit_offload_prefetch_size=3,
+        dit_layerwise_resident_layers=20,
+        layerwise_prefetch_size="text_encoder=2",
+        layerwise_resident_layers="text_encoder=4",
+        layerwise_residency_policy={"text_encoder": RESIDENCY_POLICY_STRIDED},
+    )
+    assert args.layerwise_tuning_for("text_encoder", dit_group=False) == (
+        2.0,
+        4.0,
+        RESIDENCY_POLICY_STRIDED,
+    )
+    # an entry for one component leaves every other component alone
+    assert args.layerwise_tuning_for("vae", dit_group=False) == (
+        0.0,
+        0.0,
+        RESIDENCY_POLICY_LEADING,
+    )
+    assert args.layerwise_tuning_for("transformer", dit_group=True)[:2] == (3.0, 20.0)
+
+
+def test_layerwise_tuning_rejects_unknown_policy():
+    args = _server_args(layerwise_residency_policy="vae=sideways")
+    with pytest.raises(ValueError, match="unknown residency policy"):
+        args.layerwise_tuning_for("vae", dit_group=False)
+
+
+def test_layerwise_tuning_accepts_json_and_pair_forms():
+    pair = _server_args(layerwise_resident_layers="vae=6,text_encoder=2")
+    assert pair.layerwise_tuning_for("vae", dit_group=False)[1] == 6.0
+    assert pair.layerwise_tuning_for("text_encoder", dit_group=False)[1] == 2.0
+    as_json = _server_args(layerwise_resident_layers='{"vae": 6}')
+    assert as_json.layerwise_tuning_for("vae", dit_group=False)[1] == 6.0
