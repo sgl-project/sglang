@@ -1766,11 +1766,29 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             {"moe_runner_backend": "flashinfer_trtllm"},
         )
         with patch.object(overrides_module, "is_sm120_supported", return_value=True):
+            for quantization in ("modelopt_fp4", "modelopt_mixed"):
+                with self.subTest(quantization=quantization):
+                    self.assertEqual(
+                        _moe_runner_backend_quant_constraints(
+                            _view(quantization=quantization)
+                        ),
+                        {"moe_runner_backend": "flashinfer_cutlass"},
+                    )
             self.assertEqual(
                 _moe_runner_backend_quant_constraints(
-                    _view(quantization="modelopt_fp4")
+                    _view(
+                        quantization="modelopt_mixed",
+                        moe_runner_backend="flashinfer_trtllm",
+                    )
                 ),
-                {"moe_runner_backend": "flashinfer_cutlass"},
+                {},
+            )
+        with patch.object(overrides_module, "is_sm120_supported", return_value=False):
+            self.assertEqual(
+                _moe_runner_backend_quant_constraints(
+                    _view(quantization="modelopt_mixed")
+                ),
+                {},
             )
         self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
 

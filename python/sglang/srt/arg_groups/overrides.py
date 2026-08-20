@@ -2505,13 +2505,13 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
             moe_runner_backend = mxfp8_default
     if (
         moe_runner_backend == "auto"
-        and view.quantization == "modelopt_fp4"
+        and view.quantization in ("modelopt_fp4", "modelopt_mixed")
         and is_sm120_supported()
     ):
         moe_runner_backend = "flashinfer_cutlass"
         logger.info(
             "Use flashinfer_cutlass as MoE runner backend on SM120 for "
-            "modelopt_fp4 (trtllm-gen MoE kernels are SM100-only)"
+            f"{view.quantization} (trtllm-gen MoE kernels are SM100-only)"
         )
     if moe_runner_backend != view.moe_runner_backend:
         return {"moe_runner_backend": moe_runner_backend}
