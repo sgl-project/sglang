@@ -39,6 +39,7 @@ class TokenizerManagerScoreMixin:
         This is a thin wrapper over `score_request` that treats `prompts` as
         already-composed inputs (i.e., no query/item concatenation needed).
         """
+        # Text prompts
         if isinstance(prompts, str) or (
             isinstance(prompts, list) and (not prompts or isinstance(prompts[0], str))
         ):
@@ -51,6 +52,7 @@ class TokenizerManagerScoreMixin:
                 request=request,
             )
 
+        # Tokenized prompts
         if isinstance(prompts, list) and (not prompts or isinstance(prompts[0], list)):
             return await self.score_request(
                 query=[],
@@ -205,6 +207,7 @@ class TokenizerManagerScoreMixin:
         is_generation = self.is_generation
         if is_generation:
             for result in results:
+                # For single-item scoring, logprobs are in output_token_ids_logprobs
                 output_logprobs = result["meta_info"].get(
                     "output_token_ids_logprobs", []
                 )
@@ -254,6 +257,10 @@ class TokenizerManagerScoreMixin:
             prompt_tokens=prompt_tokens,
             pooled_hidden_states=phs_list if has_phs else None,
         )
+
+    # ------------------------------------------------------------------
+    # Embed override position resolution
+    # ------------------------------------------------------------------
 
     def _resolve_overrides_for_sequence(
         self,
@@ -311,6 +318,10 @@ class TokenizerManagerScoreMixin:
             return None
         return PositionalEmbeds(embeds=all_embeds, positions=all_positions)
 
+    # ------------------------------------------------------------------
+    # Input preparation (tokenization + input_ids construction)
+    # ------------------------------------------------------------------
+
     def _build_token_id_inputs(
         self,
         query: List[int],
@@ -326,6 +337,7 @@ class TokenizerManagerScoreMixin:
         Multi-item-scoring and single-item modes differ only in how input_ids
         are assembled and what position offset each item gets.
         """
+        # Both query and items are token IDs
         has_embeds = (
             query_embed_overrides is not None or item_embed_overrides is not None
         )
@@ -379,6 +391,7 @@ class TokenizerManagerScoreMixin:
             return None, input_ids, positional_embed_overrides, delimiter_indices
 
         else:
+            # Single-item scoring: process each item separately
             if item_first:
                 input_ids = [item + query for item in items]
             else:
@@ -416,6 +429,10 @@ class TokenizerManagerScoreMixin:
                 positional_embed_overrides if any_overrides else None,
                 None,
             )
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
 
     async def score_request(
         self,
@@ -496,6 +513,7 @@ class TokenizerManagerScoreMixin:
         use_text_prompts = isinstance(query, str) and not has_embeds
 
         if use_text_prompts:
+            # Both query and items are text
             items_list = [items] if isinstance(items, str) else items
             if use_multi_item_scoring:
                 # Tokenize separately, then combine at token level with placeholder
@@ -512,6 +530,7 @@ class TokenizerManagerScoreMixin:
                 )
                 input_ids = [combined_input_ids]
             else:
+                # Single-item scoring: create separate prompts for each item
                 if item_first:
                     text_prompts = [f"{item}{query}" for item in items_list]
                 else:
@@ -523,6 +542,7 @@ class TokenizerManagerScoreMixin:
             and items
             and isinstance(items[0], list)
         ):
+            # Both query and items are token IDs — tokenize text inputs if needed for embed overrides
             query_ids, items_ids = query, items
             _, input_ids, positional_embed_overrides, delimiter_indices = (
                 self._build_token_id_inputs(
@@ -536,6 +556,7 @@ class TokenizerManagerScoreMixin:
                 )
             )
         elif has_embeds:
+            # Text inputs with embed overrides — need to tokenize first to resolve positions
             query_ids, items_ids = self._batch_tokenize_query_and_items(query, items)
             _, input_ids, positional_embed_overrides, delimiter_indices = (
                 self._build_token_id_inputs(
@@ -596,6 +617,7 @@ class TokenizerManagerScoreMixin:
         results = await self.generate_request(batch_request, request).__anext__()
 
         if use_multi_item_scoring:
+            # Multi-item scoring: extract scores from input_token_ids_logprobs or embedding
             return self._process_multi_item_scoring_results(
                 results,
                 items,
@@ -605,6 +627,7 @@ class TokenizerManagerScoreMixin:
                 return_pooled_hidden_states,
             )
         else:
+            # Single-item scoring: process each result separately
             return self._process_single_item_scoring_results(
                 results, label_token_ids, apply_softmax, return_pooled_hidden_states
             )
