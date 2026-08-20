@@ -169,11 +169,7 @@ def _resize_center_crop_uint8_cthw(
     left = (resize_w - width) // 2
     cropped = resized[:, :, top : top + height, left : left + width]
     return (
-        cropped.round()
-        .clamp(0, 255)
-        .to(torch.uint8)
-        .permute(1, 0, 2, 3)
-        .contiguous()
+        cropped.round().clamp(0, 255).to(torch.uint8).permute(1, 0, 2, 3).contiguous()
     )
 
 
@@ -229,9 +225,7 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
             dim=1,
         )
         return (
-            _resize_center_crop_uint8_cthw(
-                frames_cthw, height=target_h, width=target_w
-            )
+            _resize_center_crop_uint8_cthw(frames_cthw, height=target_h, width=target_w)
             .unsqueeze(0)
             .contiguous()
         )

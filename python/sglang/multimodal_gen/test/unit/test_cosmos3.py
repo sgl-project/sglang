@@ -1031,9 +1031,7 @@ class TestCosmos3Transfer(unittest.TestCase):
         self.assertEqual(padded[0, 0, :, 0, 0].tolist(), [0, 1, 2, 2, 1])
 
     def test_transfer_resize_matches_vllm_omni(self):
-        frames = torch.arange(3 * 2 * 2 * 3, dtype=torch.uint8).reshape(
-            3, 2, 2, 3
-        )
+        frames = torch.arange(3 * 2 * 2 * 3, dtype=torch.uint8).reshape(3, 2, 2, 3)
 
         actual = _resize_center_crop_uint8_cthw(frames, height=3, width=3)
 
