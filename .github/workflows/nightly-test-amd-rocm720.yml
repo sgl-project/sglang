@@ -2,9 +2,6 @@ name: Nightly Test (AMD ROCm 7.2)
 
 on:
   schedule:
-    # One run covers every published ROCm 7.2 flavor: each GPU job is
-    # matrixed over rocm724 and rocm720. The release nightly publishes both
-    # images at 12:00 UTC and takes ~2.5h, so 17:30 picks up the same day's.
     - cron: '30 17 * * *'
   push:
     branches:
