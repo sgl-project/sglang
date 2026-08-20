@@ -19,6 +19,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    LAYERWISE_OFFLOAD,
+    RESIDENT,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
     MiniMaxH3PartitionAdmissionStage,
     MiniMaxH3ReleaseMetadata,
@@ -368,4 +372,31 @@ def test_validate_server_args_requires_packed_varlen_backend():
         side_effect=ValueError("does not implement packed varlen attention"),
     ):
         with pytest.raises(ValueError, match="does not implement packed varlen"):
+            MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+
+
+def test_mps_admission_requires_layerwise_residency_for_every_h3_component():
+    config = SimpleNamespace(
+        vae_config=SimpleNamespace(resolved_parallel_decode_mode=lambda: None),
+        dit_config=SimpleNamespace(arch_config=SimpleNamespace(attention_head_dim=128)),
+        _server_arg_value=MiniMaxH3PipelineConfig._server_arg_value,
+    )
+    modes = {
+        "transformer": LAYERWISE_OFFLOAD,
+        "text_encoder": LAYERWISE_OFFLOAD,
+        "video_vae": LAYERWISE_OFFLOAD,
+        "audio_vae": LAYERWISE_OFFLOAD,
+    }
+    server_args = SimpleNamespace(
+        component_attention_backends={},
+        attention_backend=None,
+        enable_torch_compile=False,
+        residency_mode=modes.get,
+    )
+
+    with patch.object(current_platform, "is_mps", return_value=True):
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+
+        modes["audio_vae"] = RESIDENT
+        with pytest.raises(ValueError, match="audio_vae"):
             MiniMaxH3PipelineConfig.validate_server_args(config, server_args)

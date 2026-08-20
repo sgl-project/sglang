@@ -1013,9 +1013,11 @@ def build_full_draft_pools(
     controller = tree_cache.cache_controller
     host_pool_group = controller.mem_pool_host
 
+    # Note(kpham-sgl): DCP x DSpark draft KV is replicated and spans the virtual
+    # loc space, so match the target host's logical_size instead of physical size.
     draft_host_pool = _build_mha_mla_host_pool(
         pool=pool,
-        host_to_device_ratio=host_pool_group.size / pool.size,
+        host_to_device_ratio=host_pool_group.logical_size / pool.size,
         page_size=controller.page_size,
         layout=server_args.hicache_mem_layout,
         allocator_type=_get_allocator_type(server_args),
