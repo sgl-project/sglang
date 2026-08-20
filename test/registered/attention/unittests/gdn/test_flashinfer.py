@@ -625,6 +625,66 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         cake_final = cache.temporal[_cache_indices(fixture)].clone()
 
         self.assertGreater(load_kernel.call_count, 0)
+
+        # Prepare every stream-local output/workspace/checkpoint buffer, then
+        # capture the same checkpoint route without a capture-time allocation.
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        cache.conv[0].copy_(initial_conv)
+        cache.temporal.copy_(initial_ssm)
+        with (
+            torch.no_grad(),
+            torch.cuda.stream(capture_stream),
+            forward_context(ForwardContext(attn_backend=fixture.backend)),
+        ):
+            fixture.backend.init_forward_metadata(fixture.forward_batch)
+            fixture.actual_module(
+                fixture.forward_batch,
+                fixture.mixed_qkv,
+                fixture.a,
+                fixture.b,
+            )
+        capture_stream.synchronize()
+
+        cache.conv[0].copy_(initial_conv)
+        cache.temporal.copy_(initial_ssm)
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with (
+            torch.no_grad(),
+            torch.cuda.stream(capture_stream),
+            forward_context(ForwardContext(attn_backend=fixture.backend)),
+        ):
+            with torch.cuda.graph(graph, stream=capture_stream):
+                graph_output = fixture.actual_module(
+                    fixture.forward_batch,
+                    fixture.mixed_qkv,
+                    fixture.a,
+                    fixture.b,
+                )
+        capture_stream.synchronize()
+
+        cache.conv[0].copy_(initial_conv)
+        cache.temporal.copy_(initial_ssm)
+        torch.cuda.current_stream().synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            graph_output, cake_output, atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            cache.temporal[batch.mamba_track_indices],
+            cake_tracked,
+            atol=1e-2,
+            rtol=1e-2,
+        )
+        torch.testing.assert_close(
+            cache.temporal[_cache_indices(fixture)],
+            cake_final,
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
         cache.conv[0].copy_(initial_conv)
         cache.temporal.copy_(initial_ssm)
         fixture.backend.linear_attn_backend.kernel_dispatcher.extend_kernel = (
