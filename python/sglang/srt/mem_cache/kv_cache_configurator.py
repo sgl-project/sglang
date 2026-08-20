@@ -273,8 +273,50 @@ class KVCacheConfigurator:
         quant_method.load_scales_from_model(self.model)
         return quant_method
 
+    def _validate_direct_replayssm_spec(self) -> None:
+        if (
+            self.is_draft_worker
+            or not get_exec().mamba.enable_linear_replayssm_spec
+            or not self.spec_algorithm.is_dflash_family()
+        ):
+            return
+
+        is_gdn = self.hybrid_gdn_config is not None
+        is_kda = kimi_linear_config(self.model_config) is not None
+        if not (is_gdn or is_kda):
+            raise ValueError(
+                "--enable-linear-replayssm-spec with direct target verification "
+                "requires a GDN or KDA model."
+            )
+        if not self.device.startswith("cuda"):
+            raise ValueError(
+                "ReplaySSM with direct target verification is only supported on "
+                "CUDA and ROCm GPUs."
+            )
+        if get_memory().enable_unified_memory:
+            raise ValueError(
+                "ReplaySSM with direct target verification is not supported with "
+                "--enable-unified-memory yet."
+            )
+        if not is_gdn:
+            return
+
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        ragged_mode = read_ragged_verify_mode()
+        if ragged_mode is not RaggedVerifyMode.STATIC:
+            raise ValueError(
+                "GDN ReplaySSM requires SGLANG_RAGGED_VERIFY_MODE=static; "
+                f"got {ragged_mode.value!r}."
+            )
+
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
+        self._validate_direct_replayssm_spec()
+
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
             assert (
                 self.memory_pool_config is not None
@@ -864,18 +906,6 @@ class KVCacheConfigurator:
         max_num_reqs: int,
         extra_max_context_len: int,
     ) -> ReqToTokenPool:
-        # DSPARK/DFLASH commit routes through the backend fold (KDA-only); a
-        # non-KDA model there would scatter a None intermediate_ssm and crash.
-        _algo = (get_spec().speculative_algorithm or "").upper()
-        if (
-            get_exec().mamba.enable_linear_replayssm_spec
-            and _algo in ("DSPARK", "DFLASH")
-            and kimi_linear_config(self.model_config) is None
-        ):
-            raise ValueError(
-                "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
-                "(kimi_linear) model; got a non-KDA model."
-            )
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,

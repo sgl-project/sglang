@@ -961,6 +961,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_layers = full_attn_layers
         self.full_attn_backend = full_attn_backend
         self.linear_attn_backend = linear_attn_backend
+        self._replayssm_verify_commit = self._resolve_replayssm_verify_commit(
+            linear_attn_backend
+        )
         self.attn_backend_list = [full_attn_backend, linear_attn_backend]
         self.token_to_kv_pool = full_attn_backend.token_to_kv_pool
         self.req_to_token_pool = full_attn_backend.req_to_token_pool
@@ -972,6 +975,29 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             full_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False
         ) or getattr(linear_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False)
+
+    @staticmethod
+    def _resolve_replayssm_verify_commit(linear_attn_backend):
+        req_pool = getattr(linear_attn_backend, "req_to_token_pool", None)
+        mamba_pool = getattr(req_pool, "mamba_pool", None)
+        if mamba_pool is None or not getattr(mamba_pool, "replayssm_spec_fold", False):
+            return None
+
+        if getattr(mamba_pool, "replayssm_is_kda", False):
+            from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
+                commit_kda_replayssm_after_verify,
+            )
+
+            return commit_kda_replayssm_after_verify
+        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+
+        if isinstance(linear_attn_backend, GDNAttnBackend):
+            from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
+                commit_gdn_replayssm_fold_after_verify,
+            )
+
+            return commit_gdn_replayssm_fold_after_verify
+        return None
 
     @property
     def data_type(self):
@@ -1227,20 +1253,15 @@ class HybridLinearAttnBackend(AttentionBackend):
         req_pool = self.linear_attn_backend.req_to_token_pool
         mamba_caches = req_pool.get_speculative_mamba2_params_all_layers()
 
-        # ReplaySSM-KDA: the accepted drafts live in the per-slot ring (written
+        # ReplaySSM: the accepted drafts live in the per-slot ring (written
         # during verify); no intermediate_ssm is allocated. Replay the accepted
         # prefix into `temporal` instead of scattering an intermediate state.
         # dspark/dflash call this method directly; the generic spec_utils commit
         # handles replayssm before reaching here (returns early), so this branch is
         # only hit by the direct callers. Chain layout only (topk <= 1), so
         # accept_lens == last_correct_step_indices + 1.
-        mamba_pool = req_pool.mamba_pool
-        if getattr(mamba_pool, "replayssm_is_kda", False):
-            from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
-                commit_kda_replayssm_after_verify,
-            )
-
-            commit_kda_replayssm_after_verify(
+        if self._replayssm_verify_commit is not None:
+            self._replayssm_verify_commit(
                 spec_state=mamba_caches,
                 state_batch_indices=state_indices_tensor,
                 accept_lens=last_correct_step_indices + 1,
