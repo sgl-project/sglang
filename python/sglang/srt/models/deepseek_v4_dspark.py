@@ -207,11 +207,14 @@ class DSparkAttention(MqaAttentionBase):
             and hidden_states.shape[0] <= self._multi_stream_bs_limit
         )
 
+        from sglang.srt.models.deepseek_v4 import _dsv4_mqa_padded_num_heads
+
+        pad_num_heads = _dsv4_mqa_padded_num_heads(self.n_local_heads, _PAD_NUM_HEADS)
         q_padded: Optional[torch.Tensor] = None
         q_out: Optional[torch.Tensor] = None
-        if self.n_local_heads < _PAD_NUM_HEADS:
+        if self.n_local_heads < pad_num_heads:
             q_padded = hidden_states.new_empty(
-                hidden_states.shape[0], _PAD_NUM_HEADS, self.head_dim
+                hidden_states.shape[0], pad_num_heads, self.head_dim
             )
             q_out = q_padded[:, : self.n_local_heads, :]
 
