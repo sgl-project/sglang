@@ -285,6 +285,23 @@ def resolve_draft_attention_backend(
 class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
+    @property
+    def sampling_observer(self) -> Optional[SamplingObserver]:
+        return self._sampling_observer
+
+    @sampling_observer.setter
+    def sampling_observer(self, observer: Optional[SamplingObserver]) -> None:
+        if observer is not None and not self.supports_sampling_observer():
+            raise ValueError(
+                "sampling observers are not supported by the configured "
+                "sampling path"
+            )
+        self._sampling_observer = observer
+
+    def supports_sampling_observer(self) -> bool:
+        """Whether this runner's sampling path publishes observer output."""
+        return self.server_args.dllm_algorithm is None and self.spec_algorithm.is_none()
+
     def __init__(
         self,
         model_config: ModelConfig,
@@ -353,7 +370,7 @@ class ModelRunner:
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
-        self.sampling_observer: Optional[SamplingObserver] = None
+        self._sampling_observer: Optional[SamplingObserver] = None
 
         self.init_startup_observability()
 
@@ -1814,7 +1831,7 @@ class ModelRunner:
             ),
         )
         if observer_state is not None:
-            logits_output.auxiliary_device_output = self.sampling_observer.after_sample(
+            logits_output.auxiliary_device_output = observer.after_sample(
                 observer_state,
                 next_token_ids,
             )

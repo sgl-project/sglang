@@ -183,6 +183,7 @@ class GenerationBatchResult:
         device_output = self.logits_output.auxiliary_device_output
         if device_output is not None:
             self.auxiliary_host_output = device_output.copy_to_host(_async_d2h)
+            self.logits_output.auxiliary_device_output = None
 
     @classmethod
     def from_pp_proxy(

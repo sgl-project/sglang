@@ -197,6 +197,16 @@ class SchedulerBatchResultProcessor:
         return req.finished_len if req.finished_len is not None else len(req.output_ids)
 
     @classmethod
+    def snapshot_auxiliary_output_starts(
+        cls,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> Optional[List[int]]:
+        if result.auxiliary_host_output is None:
+            return None
+        return [cls._visible_output_len(req) for req in batch.reqs]
+
+    @classmethod
     def _build_auxiliary_commits(
         cls,
         batch: ScheduleBatch,
@@ -238,12 +248,10 @@ class SchedulerBatchResultProcessor:
         if self.is_generation:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
-            auxiliary_output = result.auxiliary_host_output
-            auxiliary_output_starts = (
-                [self._visible_output_len(req) for req in batch.reqs]
-                if auxiliary_output is not None
-                else None
+            auxiliary_output_starts = self.snapshot_auxiliary_output_starts(
+                batch, result
             )
+            auxiliary_output = result.auxiliary_host_output
             if result.routed_experts_output is not None:
                 result.routed_experts_output.finalize()
                 result.routed_experts_output = None
@@ -859,12 +867,8 @@ class SchedulerBatchResultProcessor:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
+        auxiliary_output_starts = self.snapshot_auxiliary_output_starts(batch, result)
         auxiliary_output = result.auxiliary_host_output
-        auxiliary_output_starts = (
-            [self._visible_output_len(req) for req in batch.reqs]
-            if auxiliary_output is not None
-            else None
-        )
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None

@@ -15,6 +15,7 @@ from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -63,7 +64,19 @@ class CopyDone:
         self.record_count += 1
 
 
-def test_auxiliary_output_uses_result_copy_path_without_mutating_device_holder():
+def _model_runner_for_sampling_path(
+    *,
+    spec_algorithm=SpeculativeAlgorithm.NONE,
+    dllm_algorithm=None,
+):
+    runner = object.__new__(ModelRunner)
+    runner.server_args = SimpleNamespace(dllm_algorithm=dllm_algorithm)
+    runner.spec_algorithm = spec_algorithm
+    runner._sampling_observer = None
+    return runner
+
+
+def test_auxiliary_output_releases_device_holder_after_copy():
     device_output = DeviceOutput(torch.tensor([1.0, 2.0]))
     logits_output = LogitsProcessorOutput(
         next_token_logits=None,
@@ -77,7 +90,7 @@ def test_auxiliary_output_uses_result_copy_path_without_mutating_device_holder()
 
     result.copy_to_cpu(return_logprob=False)
 
-    assert logits_output.auxiliary_device_output is device_output
+    assert logits_output.auxiliary_device_output is None
     assert result.auxiliary_host_output is not device_output
     assert torch.equal(result.auxiliary_host_output.values, device_output.values)
     assert device_output.copy_count == 1
@@ -126,7 +139,7 @@ def test_auxiliary_host_outputs_are_owned_by_each_generation_result():
 
 
 def test_sampling_clears_stale_device_output_when_observer_produces_no_state():
-    runner = object.__new__(ModelRunner)
+    runner = _model_runner_for_sampling_path()
     runner.sampling_observer = SimpleNamespace(
         is_active=lambda sampling_info: True,
         after_sample=lambda state, token_ids: None,
@@ -167,7 +180,7 @@ def test_sampling_publishes_observer_output_for_the_sampled_tokens():
         is_active=Mock(return_value=True),
         after_sample=Mock(return_value=device_output),
     )
-    runner = object.__new__(ModelRunner)
+    runner = _model_runner_for_sampling_path()
     runner.sampling_observer = observer
     runner._preprocess_logits = Mock(return_value=state)
     sampled_tokens = torch.tensor([3])
@@ -198,6 +211,39 @@ def test_sampling_publishes_observer_output_for_the_sampled_tokens():
     observer.after_sample.assert_called_once_with(state, sampled_tokens)
 
 
+@pytest.mark.parametrize(
+    ("spec_algorithm", "dllm_algorithm"),
+    [
+        (SpeculativeAlgorithm.EAGLE, None),
+        (SpeculativeAlgorithm.NONE, "dream"),
+    ],
+)
+def test_sampling_observer_rejects_sampling_paths_that_bypass_hooks(
+    spec_algorithm,
+    dllm_algorithm,
+):
+    runner = _model_runner_for_sampling_path(
+        spec_algorithm=spec_algorithm,
+        dllm_algorithm=dllm_algorithm,
+    )
+
+    with pytest.raises(ValueError, match="configured sampling path"):
+        runner.sampling_observer = Observer()
+
+
+def test_custom_sampling_path_can_enable_sampling_observer():
+    class SupportedModelRunner(ModelRunner):
+        def supports_sampling_observer(self):
+            return True
+
+    runner = object.__new__(SupportedModelRunner)
+    observer = Observer()
+
+    runner.sampling_observer = observer
+
+    assert runner.sampling_observer is observer
+
+
 @pytest.mark.parametrize("has_inactive_observer", [False, True])
 def test_sampling_without_active_observer_preserves_preprocess_override(
     has_inactive_observer,
@@ -207,7 +253,7 @@ def test_sampling_without_active_observer_preserves_preprocess_override(
         if has_inactive_observer
         else None
     )
-    runner = object.__new__(ModelRunner)
+    runner = _model_runner_for_sampling_path()
     runner.sampling_observer = observer
     runner._preprocess_logits = Mock(
         side_effect=lambda logits_output, sampling_info: None
@@ -412,13 +458,13 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         prefill_stats=None,
         dp_cooperation_info=None,
     )
-    visible_output_len = Mock(
-        side_effect=SchedulerBatchResultProcessor._visible_output_len
+    snapshot_auxiliary_output_starts = Mock(
+        side_effect=SchedulerBatchResultProcessor.snapshot_auxiliary_output_starts
     )
     processor = SimpleNamespace(
         move_logprobs_to_cpu=Mock(),
         consume_auxiliary_output=Mock(),
-        _visible_output_len=visible_output_len,
+        snapshot_auxiliary_output_starts=snapshot_auxiliary_output_starts,
     )
     scheduler = SimpleNamespace(
         batch_result_processor=processor,
@@ -437,7 +483,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         )
 
     assert req.output_ids == [7]
-    visible_output_len.assert_called_once_with(req)
+    snapshot_auxiliary_output_starts.assert_called_once_with(batch, result)
     processor.consume_auxiliary_output.assert_called_once_with(
         batch,
         host_output,
@@ -618,6 +664,27 @@ def test_pipeline_parallel_auxiliary_output_requires_transport_observer():
             PPBatchMetadata(can_run_cuda_graph=False),
             PPProxyTensors(tensors),
         )
+
+
+def test_auxiliary_output_snapshot_uses_visible_request_lengths():
+    batch = SimpleNamespace(
+        reqs=[
+            SimpleNamespace(output_ids=[10, 11, 12], finished_len=2),
+            SimpleNamespace(output_ids=[20], finished_len=None),
+        ]
+    )
+    result = SimpleNamespace(auxiliary_host_output=None)
+
+    assert (
+        SchedulerBatchResultProcessor.snapshot_auxiliary_output_starts(batch, result)
+        is None
+    )
+
+    result.auxiliary_host_output = object()
+
+    assert SchedulerBatchResultProcessor.snapshot_auxiliary_output_starts(
+        batch, result
+    ) == [2, 1]
 
 
 def test_auxiliary_commit_uses_the_scheduler_visible_prefix():

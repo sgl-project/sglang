@@ -184,18 +184,16 @@ class SchedulerOutputStreamer:
             self.has_additional_customized_info
             and self.should_build_additional_customized_info()
         ):
-            req_by_rid = {req.rid: req for req in reqs}
-            output_reqs = [req_by_rid[rid] for rid in acc.rids]
             additional_customized_info = self.build_additional_customized_info(
-                output_reqs
+                acc.output_reqs
             )
             for key, values in additional_customized_info.items():
                 if key in acc.customized_info:
                     raise ValueError(f"duplicate customized_info key: {key}")
-                if len(values) != len(output_reqs):
+                if len(values) != len(acc.output_reqs):
                     raise ValueError(
                         f"customized_info key {key!r} returned {len(values)} values "
-                        f"for {len(output_reqs)} requests"
+                        f"for {len(acc.output_reqs)} requests"
                     )
                 acc.customized_info[key] = values
 
@@ -214,7 +212,10 @@ class SchedulerOutputStreamer:
         """Return fields aligned with the emitted requests in ``reqs``.
 
         Subclasses must set ``has_additional_customized_info`` to opt in. Each
-        returned value must have one entry per request.
+        returned value must have one entry per request. A matching
+        ``HostAuxiliaryOutput.consume`` call has already observed the tokens
+        committed in this scheduler step, so implementations can read buffered
+        per-request state here.
         """
         return {}
 
@@ -316,6 +317,7 @@ class _GenerationStreamAccumulator:
     default_force_stream_interval: int
     get_cached_tokens_details: Callable[[Req], Optional[CachedTokensDetails]]
     rids: list = field(default_factory=list)
+    output_reqs: list[Req] = field(default_factory=list)
     http_worker_ipcs: list = field(default_factory=list)
     finished_reasons: list = field(default_factory=list)
     decoded_texts: list = field(default_factory=list)
@@ -434,6 +436,7 @@ class _GenerationStreamAccumulator:
         send_token_offset = req.send_token_offset
         send_output_token_logprobs_offset = req.send_output_token_logprobs_offset
         self.rids.append(req.rid)
+        self.output_reqs.append(req)
         self.finished_reasons.append(
             req.finished_reason.to_json() if req.finished_reason else None
         )

@@ -680,12 +680,10 @@ class SchedulerDisaggregationPrefillMixin:
 
         if copy_done is not None:
             copy_done.synchronize()
-        auxiliary_output = result.auxiliary_host_output
         auxiliary_output_starts = (
-            [self.batch_result_processor._visible_output_len(req) for req in batch.reqs]
-            if auxiliary_output is not None
-            else None
+            self.batch_result_processor.snapshot_auxiliary_output_starts(batch, result)
         )
+        auxiliary_output = result.auxiliary_host_output
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None

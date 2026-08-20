@@ -231,6 +231,40 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             {"request_info": [["terminal"]]},
         )
 
+    def test_additional_customized_info_preserves_duplicate_rid_requests(self):
+        accepted_reqs = []
+
+        class Streamer(SchedulerOutputStreamer):
+            has_additional_customized_info = True
+
+            def get_cached_tokens_details(self, req):
+                return None
+
+            def build_additional_customized_info(self, reqs):
+                accepted_reqs.extend(reqs)
+                return {"request_info": [[req.rid] for req in reqs]}
+
+        outputs = []
+        streamer = Streamer(
+            send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+            tree_cache=None,
+            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
+            server_args=SimpleNamespace(
+                stream_interval=1,
+                enable_request_time_stats_logging=False,
+            ),
+            is_generation=True,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            disaggregation_mode=DisaggregationMode.NULL,
+            enable_hicache_storage=lambda: False,
+        )
+        first = _FakeReq("duplicate", [10], finished=True)
+        second = _FakeReq("duplicate", [20], finished=True)
+
+        streamer._stream_output_generation([first, second], False)
+
+        self.assertEqual(accepted_reqs, [first, second])
+
     def test_additional_customized_info_hook_is_opt_in(self):
         class Streamer(SchedulerOutputStreamer):
             build_additional_customized_info = Mock()
