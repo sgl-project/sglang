@@ -1327,13 +1327,17 @@ class MQALayer(MqaAttentionBase):
 
             token_to_kv_pool = get_token_to_kv_pool()
             if unified and fuse_verify:
-                # Target-verify is a 2-source consumer: attention reads history
-                # from the ring and takes the current chunk as k/v so the draft
-                # tokens stay causally masked against each other. Writing the
-                # ring here would make them look like history to every draft
-                # position, so fuse only the norm+RoPE and let the backend store
-                # after attention. swa_loc is not computed -- it exists solely to
-                # address a store this path no longer performs.
+                # Target-verify runs through the unified_kv decode path. The
+                # backend writes the current chunk's KV into the ring *before*
+                # attention (save_kv_cache=True -> store_swa_into_unified ahead
+                # of runtime.decode), and per-token causal index streams -- built
+                # once per step in the backend metadata -- keep each draft query
+                # attending only to positions up to itself. Causal masking among
+                # the draft tokens comes from those index streams, not from store
+                # timing. So this path skips only the fused kernel's *own* store
+                # and returns kv, letting that existing causally-indexed backend
+                # store run unchanged; we fuse just the norm+RoPE. swa_loc is not
+                # computed -- it only addresses the kernel store this path drops.
                 #
                 # kv is a strided slice of qkv_a and the ring store requires a
                 # contiguous buffer, so materialise it before the kernel norms
@@ -1379,8 +1383,10 @@ class MQALayer(MqaAttentionBase):
                 bf16_store=bf16_store,
             )
             # On the verify path the kernel normed + RoPE'd kv in place and wrote
-            # nothing, so hand it back: the caller feeds it to attention and
-            # stores it afterwards (save_kv_cache = kv is not None).
+            # nothing, so hand it back: the caller feeds it to attention as the
+            # current chunk (attn_k = kv) and save_kv_cache = kv is not None lets
+            # the backend do its normal causally-indexed store into the ring
+            # before the decode kernel runs -- exactly as the unfused path did.
             if not (unified and fuse_verify):
                 kv = None
 
@@ -1591,10 +1597,13 @@ class MQALayer(MqaAttentionBase):
                 x_quant=x_quant,
             )
 
-        # The cache write is always fused / already done by _forward_prepare* --
-        # tell the backend to skip its own store_cache. When `kv is None`
-        # (no DSA-CP), pass `q` as a sentinel for the `k is v` assert; the
-        # attention path doesn't read it once `save_kv_cache=False`.
+        # save_kv_cache = kv is not None selects who writes the ring. When kv is
+        # None the store was already fused into _forward_prepare* (decode) or
+        # done inline, so the backend skips its own store_cache; pass `q` as a
+        # sentinel for the `k is v` assert (attention won't read it once
+        # save_kv_cache=False). When kv is not None (target-verify, or DSA-CP),
+        # _forward_prepare* deliberately left the store off and the backend does
+        # its normal causally-indexed store from attn_k = kv.
         attn_k = kv if kv is not None else q
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
