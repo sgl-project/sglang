@@ -19,7 +19,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.attention.backends import (
     flash_attn as _fa_backend,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.utils.common import torch_release
 
 _cp_options.enable_load_balance = False
@@ -341,8 +340,7 @@ def _usp_input_all_to_all_packed_qkv(
     h_local = h_global // world_size
 
     if (
-        (current_platform.is_cuda() or current_platform.is_rocm())
-        and q.is_cuda
+        q.is_cuda
         and q.dtype in (torch.float16, torch.bfloat16)
         and q.dtype == k.dtype == v.dtype
         and q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
@@ -382,8 +380,7 @@ def _can_use_packed_qkv_a2a_4d(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, world_size: int
 ) -> bool:
     return (
-        (current_platform.is_cuda() or current_platform.is_rocm())
-        and q.is_cuda
+        q.is_cuda
         and q.ndim == 4
         and q.shape == k.shape == v.shape
         and q.dtype == k.dtype == v.dtype
