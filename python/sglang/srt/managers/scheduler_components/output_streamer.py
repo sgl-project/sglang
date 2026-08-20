@@ -6,6 +6,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    ClassVar,
     List,
     Optional,
 )
@@ -43,6 +44,8 @@ DEFAULT_FORCE_STREAM_INTERVAL = envs.SGLANG_FORCE_STREAM_INTERVAL.get()
 
 @dataclass(kw_only=True, slots=True)
 class SchedulerOutputStreamer:
+    has_additional_customized_info: ClassVar[bool] = False
+
     send_to_detokenizer: zmq.Socket
     tree_cache: BasePrefixCache
     ps: ParallelState
@@ -56,6 +59,13 @@ class SchedulerOutputStreamer:
     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
     rust_server: Optional[RustServer] = None
     _test_stream_output_count: int = 0
+
+    def __post_init__(self) -> None:
+        if self.has_additional_customized_info and self.rust_server is not None:
+            raise ValueError(
+                "additional customized generation output is not supported by "
+                "Rust egress"
+            )
 
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
@@ -170,6 +180,25 @@ class SchedulerOutputStreamer:
             acc.accept(req=req)
             self._maybe_log_time_stats(req=req)
 
+        if (
+            self.has_additional_customized_info
+            and self.should_build_additional_customized_info()
+        ):
+            req_by_rid = {req.rid: req for req in reqs}
+            output_reqs = [req_by_rid[rid] for rid in acc.rids]
+            additional_customized_info = self.build_additional_customized_info(
+                output_reqs
+            )
+            for key, values in additional_customized_info.items():
+                if key in acc.customized_info:
+                    raise ValueError(f"duplicate customized_info key: {key}")
+                if len(values) != len(output_reqs):
+                    raise ValueError(
+                        f"customized_info key {key!r} returned {len(values)} values "
+                        f"for {len(output_reqs)} requests"
+                    )
+                acc.customized_info[key] = values
+
         # Send to detokenizer
         payload = acc.to_payload(
             dp_rank=self.ps.dp_rank,
@@ -180,6 +209,18 @@ class SchedulerOutputStreamer:
                 self.rust_server.push_generation(payload)
             else:
                 self.send_to_detokenizer.send_output(payload)
+
+    def build_additional_customized_info(self, reqs: List[Req]) -> dict[str, list]:
+        """Return fields aligned with the emitted requests in ``reqs``.
+
+        Subclasses must set ``has_additional_customized_info`` to opt in. Each
+        returned value must have one entry per request.
+        """
+        return {}
+
+    def should_build_additional_customized_info(self) -> bool:
+        """Return whether this invocation needs subclass-provided output fields."""
+        return True
 
     def _maybe_log_time_stats(self, *, req: Req) -> None:
         if (

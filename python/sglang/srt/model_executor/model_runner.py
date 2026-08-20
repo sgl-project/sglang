@@ -182,6 +182,7 @@ from sglang.srt.runtime_context import (
     set_global_dwdp_manager,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_observer import SamplingObserver
 from sglang.srt.server_args import (  # noqa: F401  (re-export)
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
     ServerArgs,
@@ -352,6 +353,7 @@ class ModelRunner:
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
+        self.sampling_observer: Optional[SamplingObserver] = None
 
         self.init_startup_observability()
 
@@ -1739,14 +1741,24 @@ class ModelRunner:
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
     def _preprocess_logits(
-        self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+        observer: Optional[SamplingObserver] = None,
     ):
         # NOTE: In overlap mode, the function update_regex_vocab_mask (in sample)
         #       was executed after we processed last batch's results.
 
         # Calculate logits bias and apply it to next_token_logits.
         sampling_info.update_regex_vocab_mask()
-        sampling_info.apply_logits_bias(logits_output.next_token_logits)
+        observer_state = None
+        if observer is not None:
+            observer_state = sampling_info.apply_logits_bias_with_observer(
+                logits_output.next_token_logits,
+                observer=observer,
+            )
+        else:
+            sampling_info.apply_logits_bias(logits_output.next_token_logits)
 
         # Release the vocab_mask GPU tensor immediately after it has been applied
         # to the logits. In overlap scheduling, the sampling_info (and its
@@ -1754,6 +1766,7 @@ class ModelRunner:
         # batch_record_buf until the next iteration, causing a steady VRAM leak
         # when structured output (grammar) is used.
         sampling_info.grammar_mask = None
+        return observer_state
 
     def sample(
         self,
@@ -1769,7 +1782,22 @@ class ModelRunner:
         Returns:
             A list of next_token_ids
         """
-        self._preprocess_logits(logits_output, forward_batch.sampling_info)
+        # LogitsProcessorOutput is normally invocation-scoped, but CUDA graph
+        # runners may reuse backing objects. Never leak an auxiliary result from
+        # a previous replay into a request with no observer state.
+        logits_output.auxiliary_device_output = None
+        observer = self.sampling_observer
+        # Preserve two-argument overrides when observation is inactive.
+        if observer is not None and observer.is_active(forward_batch.sampling_info):
+            observer_state = self._preprocess_logits(
+                logits_output,
+                forward_batch.sampling_info,
+                observer=observer,
+            )
+        else:
+            observer_state = self._preprocess_logits(
+                logits_output, forward_batch.sampling_info
+            )
 
         # Sample the next tokens
         next_token_ids = self.sampler(
@@ -1785,6 +1813,11 @@ class ModelRunner:
                 else forward_batch.seq_lens - 1
             ),
         )
+        if observer_state is not None:
+            logits_output.auxiliary_device_output = self.sampling_observer.after_sample(
+                observer_state,
+                next_token_ids,
+            )
         self.ngram_embedding_manager.update_after_decode(
             next_token_ids=next_token_ids,
             forward_batch=forward_batch,
@@ -1807,10 +1840,10 @@ class ModelRunner:
             logits_output: The logits output from the model forward
             forward_batch: The forward batch that generates logits_output
         """
+        logits_output.auxiliary_device_output = None
         if not forward_batch.token_ids_logprobs:
             return
 
-        # Preprocess logits (same as in sample method)
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
 
         # Delegate to sampler for logprob-only computation
