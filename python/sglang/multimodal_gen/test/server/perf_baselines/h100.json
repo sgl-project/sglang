@@ -2578,7 +2578,7 @@
             "expected_avg_denoise_ms": 520.0,
             "expected_median_denoise_ms": 494.9,
             "load_peak_vram_mb": 46278.0,
-            "runtime_peak_vram_mb": 49390.0,
+            "runtime_peak_vram_mb": 60330.0,
             "estimated_full_test_time_s": 144.2
         },
         "ltx_2.3_two_stage_t2v_2gpus": {
