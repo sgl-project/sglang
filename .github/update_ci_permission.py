@@ -203,7 +203,7 @@ def main():
         new_permissions[user] = {
             "can_tag_run_ci_label": True,
             "can_rerun_failed_ci": True,
-            "can_rerun_stage": True,
+            "can_rerun_test": True,
             "cooldown_interval_minutes": 0,
             "reason": "top contributor",
         }
@@ -221,7 +221,7 @@ def main():
             new_permissions[user] = {
                 "can_tag_run_ci_label": True,
                 "can_rerun_failed_ci": True,
-                "can_rerun_stage": True,
+                "can_rerun_test": True,
                 "cooldown_interval_minutes": 60,
                 "reason": "custom override",
             }

@@ -14,10 +14,11 @@ Recognized permission keys:
 | --- | --- |
 | `can_tag_run_ci_label` | `/tag-run-ci-label`, `/tag-and-rerun-ci` |
 | `can_rerun_failed_ci` | `/rerun-failed-ci`, `/tag-and-rerun-ci` |
-| `can_rerun_stage` | `/rerun-test`, `/rerun-group` -- on same-repo PRs only |
-| `can_rerun_test` | `/rerun-test`, `/rerun-group` -- including PRs from forks |
+| `can_rerun_test` | `/rerun-test`, `/rerun-group` on same-repo PRs |
+| `can_rerun_test_on_fork` | additionally allows them on PRs from forks |
 
-`can_rerun_test` is the only key that clears a fork PR. Grant it deliberately:
+`can_rerun_test_on_fork` is the only key that clears a fork PR, and it is an
+add-on to `can_rerun_test` rather than a replacement. Grant it deliberately:
 these commands check out the PR head and execute it on the self-hosted GPU
 runners, so it lets the holder run fork code on CI hardware. Everyone else needs
 write permission on the repo to use these commands on a fork PR.
