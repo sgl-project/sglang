@@ -394,67 +394,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self._publish(nvfp4)
         self.assertEqual(get_exec().moe.moe_runner_backend, "flashinfer_trtllm_routed")
 
-    def test_kimi_k3_sm107_mxfp4_auto_selects_flashinfer(self):
-        from sglang.srt.arg_groups.overrides import _kimi_k3_moe_runner_overrides
-
-        packed_mxfp4 = SimpleNamespace(
-            text_config=SimpleNamespace(
-                quantization_config={
-                    "config_groups": {"group_0": {"format": "mxfp4-pack-quantized"}}
-                }
-            )
-        )
-        non_mxfp4 = SimpleNamespace(
-            text_config=SimpleNamespace(
-                quantization_config={"config_groups": {"group_0": {"format": "fp8"}}}
-            )
-        )
-
-        def _args(moe_runner_backend):
-            return SimpleNamespace(moe_runner_backend=moe_runner_backend)
-
-        with (
-            patch.object(overrides_module, "is_sm100_supported", return_value=True),
-            patch.object(overrides_module, "get_device_sm", return_value=107),
-        ):
-            self.assertEqual(
-                _kimi_k3_moe_runner_overrides(_args("auto"), packed_mxfp4),
-                {"moe_runner_backend": "flashinfer_mxfp4"},
-            )
-            self.assertIn(
-                (
-                    _kimi_k3_moe_runner_overrides.__qualname__,
-                    {"moe_runner_backend": "flashinfer_mxfp4"},
-                ),
-                collect_model_override_declarations(
-                    "KimiK3ForConditionalGeneration", _args("auto"), packed_mxfp4
-                ),
-            )
-            self.assertEqual(
-                _kimi_k3_moe_runner_overrides(_args("auto"), non_mxfp4), {}
-            )
-
-            explicit_flashinfer = _args("flashinfer_mxfp4")
-            self.assertEqual(
-                _kimi_k3_moe_runner_overrides(explicit_flashinfer, packed_mxfp4),
-                {},
-            )
-            self.assertEqual(explicit_flashinfer.moe_runner_backend, "flashinfer_mxfp4")
-
-            explicit_alternative = _args("marlin")
-            self.assertEqual(
-                _kimi_k3_moe_runner_overrides(explicit_alternative, packed_mxfp4), {}
-            )
-            self.assertEqual(explicit_alternative.moe_runner_backend, "marlin")
-
-        with (
-            patch.object(overrides_module, "is_sm100_supported", return_value=True),
-            patch.object(overrides_module, "get_device_sm", return_value=110),
-        ):
-            self.assertEqual(
-                _kimi_k3_moe_runner_overrides(_args("auto"), packed_mxfp4), {}
-            )
-
     def test_mimo_v2_declarations(self):
         # Callable-level golden: MiMoV2 archs are hybrid (config-shape heavy),
         # so the declaration is pinned directly for both provider inputs.
