@@ -7,15 +7,28 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_xpu
+
+_is_xpu = is_xpu()
+
 
 def _inputs_on_cuda(*args, **kwargs) -> bool:
     """Route kernel dispatch by input placement: the first tensor argument
-    decides. CUDA inputs take the fused triton kernel; CPU inputs take the
-    torch reference implementation (triton is CUDA-only, and CPU-side callers
-    such as unit tests exercise the reference path)."""
+    decides. Accelerator inputs take the fused triton kernel; CPU inputs take
+    the torch reference implementation (CPU-side callers such as unit tests
+    exercise the reference path).
+
+    XPU must take the triton arm: the two are not numerically equivalent in
+    build_causal_swa_page_indices, where the reference indexes
+    full_to_swa_mapping with -1 and torch wraps that to the last table entry,
+    while the kernel stores the -1 sentinel.
+
+    ExpandPrefillCausally is the exception and does not consult this at all on
+    XPU: its triton kernel does not compile under triton-xpu 3.7.2, so it takes
+    the native sgl_kernel op instead of the eager torch reference."""
     for value in (*args, *kwargs.values()):
         if isinstance(value, torch.Tensor):
-            return value.is_cuda
+            return value.is_cuda or (_is_xpu and value.device.type == "xpu")
     raise AssertionError("kernel dispatch requires at least one tensor argument")
 
 
@@ -27,9 +40,52 @@ class ExpandPrefillCausallyResult(msgspec.Struct):
 class ExpandPrefillCausally:
     @classmethod
     def execute(cls, *args, **kwargs) -> ExpandPrefillCausallyResult:
+        if _is_xpu:
+            return cls.xpu(*args, **kwargs)
         if _inputs_on_cuda(*args, **kwargs):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
+
+    @classmethod
+    def xpu(
+        cls,
+        *,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        extend_start_loc: Optional[torch.Tensor],
+        seq_lens_cpu: Optional[list[int]],
+        extend_seq_lens_cpu: Optional[list[int]],
+        num_tokens: int,
+        padded_num_tokens: Optional[int],
+    ) -> ExpandPrefillCausallyResult:
+        del seq_lens_cpu, extend_seq_lens_cpu
+        from sgl_kernel import dsv4_expand_prefill_causally_out
+
+        total_tokens = (
+            padded_num_tokens if padded_num_tokens is not None else num_tokens
+        )
+        if total_tokens < num_tokens:
+            raise ValueError("padded_num_tokens must be at least num_tokens")
+        device = req_pool_indices.device
+        seq_lens_casual = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        req_pool_indices_repeated = torch.empty(
+            total_tokens, dtype=req_pool_indices.dtype, device=device
+        )
+        dsv4_expand_prefill_causally_out(
+            req_pool_indices,
+            seq_lens,
+            extend_seq_lens,
+            extend_start_loc,
+            seq_lens_casual,
+            req_pool_indices_repeated,
+            num_tokens,
+            total_tokens,
+        )
+        return ExpandPrefillCausallyResult(
+            seq_lens_casual=seq_lens_casual,
+            req_pool_indices_repeated=req_pool_indices_repeated,
+        )
 
     @classmethod
     def torch(
@@ -240,7 +296,8 @@ class PageTablePositionsResult(msgspec.Struct):
 class BuildPageTablePositions:
     @classmethod
     def execute(cls, *args, **kwargs) -> PageTablePositionsResult:
-        if _inputs_on_cuda(*args, **kwargs):
+        to_triton = _inputs_on_cuda(*args, **kwargs)
+        if to_triton:
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
 
@@ -385,7 +442,8 @@ def build_page_table_positions_triton(
 class BuildCausalSwaPageIndices:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
-        if _inputs_on_cuda(*args, **kwargs):
+        to_triton = _inputs_on_cuda(*args, **kwargs)
+        if to_triton:
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
 
