@@ -59,7 +59,12 @@ from sglang.srt.observability.trace import (
     TraceReqContext,
     trace_set_thread_info,
 )
-from sglang.srt.runtime_context import get_memory, get_parallel, get_schedule
+from sglang.srt.runtime_context import (
+    get_device,
+    get_memory,
+    get_parallel,
+    get_schedule,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
 
@@ -347,6 +352,7 @@ class MooncakeKVManager(CommonKVManager):
             self.kv_args,
             count,
             get_schedule().chunked_prefill_size,
+            get_device().device,
         )
         self.kv_buffer_tensors = None
 
@@ -358,6 +364,7 @@ class MooncakeKVManager(CommonKVManager):
         self._staging_ctx.allocator = init_staging_allocator(
             lambda ptr, size: self.engine.batch_register([ptr], [size]),
             self.kv_args,
+            get_device().device,
         )
         self.kv_buffer_tensors = None
 
