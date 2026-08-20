@@ -46,6 +46,12 @@ def test_consistency_gt_urls_are_pinned_to_ci_data_revision():
     assert pinned_revision_path in test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE
 
 
+def test_minimax_h3_t2va_uses_its_pinned_reference_gt():
+    assert test_utils._remote_consistency_gt_base_urls("minimax_h3_t2va_2gpu_h100") == (
+        test_utils.SGL_TEST_FILES_MINIMAX_H3_CONSISTENCY_GT_BASE,
+    )
+
+
 def test_remote_file_exists_returns_false_for_definitive_404(monkeypatch):
     class Response:
         status_code = 404

@@ -39,7 +39,8 @@ logger = init_logger(__name__)
 # NPU/ascend) is read from sgl-project/ci-data-diffusion, where the GT-gen workflows
 # publish.
 SGL_TEST_FILES_CI_DATA_REPO = "sgl-project/ci-data-diffusion"
-SGL_TEST_FILES_CI_DATA_REVISION = "81ca8f18d485df4e4bac9a5a40c5b4666f0fa57f"
+SGL_TEST_FILES_CI_DATA_REVISION = "8c3896984319c8d5628bf08df4b596baf2368ec7"
+SGL_TEST_FILES_MINIMAX_H3_CI_DATA_REVISION = "81ca8f18d485df4e4bac9a5a40c5b4666f0fa57f"
 
 # The NPU pin is kept as a separate branch so ascend GT can be bumped independently
 # when it's regenerated on its own cadence.
@@ -56,6 +57,11 @@ SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE = (
 )
 SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE = (
     f"{SGL_TEST_FILES_CONSISTENCY_GT_ROOT}/sglang_generated"
+)
+SGL_TEST_FILES_MINIMAX_H3_CONSISTENCY_GT_BASE = (
+    "https://raw.githubusercontent.com/"
+    f"{SGL_TEST_FILES_CI_DATA_REPO}/{SGL_TEST_FILES_MINIMAX_H3_CI_DATA_REVISION}/"
+    "diffusion-ci/consistency_gt/sglang_generated"
 )
 SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE_ASCEND = (
     f"{SGL_TEST_FILES_CONSISTENCY_GT_ROOT}/official_generated/ascend"
@@ -1218,6 +1224,8 @@ def _official_consistency_gt_candidate_is_declared(case_id: str, filename: str) 
 
 
 def _remote_consistency_gt_base_urls(case_id: str) -> tuple[str, ...]:
+    if case_id == "minimax_h3_t2va_2gpu_h100":
+        return (SGL_TEST_FILES_MINIMAX_H3_CONSISTENCY_GT_BASE,)
     if case_id in OFFICIAL_CONSISTENCY_GT_SKIP_CASES:
         if _is_ascend_consistency_case(case_id) or current_platform.is_npu():
             return (
