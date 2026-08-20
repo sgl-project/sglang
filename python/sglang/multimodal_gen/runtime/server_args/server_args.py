@@ -146,7 +146,9 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
     {
         "comfy-org/ideogram-4",
         "efficient-large-model/sana1.5_1.6b_1024px_diffusers",
+        "efficient-large-model/sana-video_2b_480p_diffusers",
         "sana1.5_1.6b_1024px_diffusers",
+        "sana-video_2b_480p_diffusers",
         "fal/ideogram-v4-fast",
         "fal/ideogram-v4-instant",
         "glm-image",
@@ -184,6 +186,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "MiniMaxH3PipelineConfig",
         "QwenImagePipelineConfig",
         "SanaPipelineConfig",
+        "SanaVideoPipelineConfig",
         "ZImagePipelineConfig",
     }
 )
@@ -643,7 +646,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
         logger.warning(
             "[Diffusion BCG] disabled for %s: only Ideogram-4, Lightricks/LTX-2, MiniMax-H3, "
-            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, "
+            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, SANA-Video, "
             "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image are "
             "currently supported.",
             pipeline_config_name,

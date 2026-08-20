@@ -301,10 +301,15 @@ framework-specific optimization workflow.
   joint-stream `cat`/split inside each single block. Do not misclassify those
   as a missed existing packed path; they are model-local structural
   opportunities that need their own weight-loader and parity coverage.
-- SANA-Video already packs self QKV and cross KV. Its conv/modulation formulas
-  mirror SANA, but it does not yet call SANA's bit-exact bias-SiLU, bias-GLU,
-  residual-gate, LayerNorm-modulation, or one-time contiguous-layout helpers.
-  Reuse or extract those helpers before authoring a video-only kernel.
+- SANA-Video already packs self QKV and cross KV. For fixed 832x480 serving,
+  its default 300-token prompt shape can reuse one breakable CUDA graph without
+  generic text-bucket padding. An H200 81-frame, 8-step run measured
+  920.6--925.3 ms/step eager versus 797.8--798.9 ms/step with BCG, with
+  bit-exact final videos; reserved peak memory increased by about 3.4 GB.
+  Its conv/modulation formulas mirror SANA, but it does not yet call SANA's
+  bit-exact bias-SiLU, bias-GLU, residual-gate, LayerNorm-modulation, or
+  one-time contiguous-layout helpers. Reuse or extract those helpers before
+  authoring a video-only kernel.
 - LingBot Video MoE's router implements sigmoid+bias grouped top-k in
   `multimodal_gen/runtime/layers/moe.py`. Check parameter and output-order
   compatibility with `srt/layers/moe/topk.py::biased_grouped_topk` before
@@ -371,6 +376,9 @@ framework-specific optimization workflow.
   every additional served resolution in `--warmup-resolutions`, and use
   `--bcg-text-buckets` for prompt signatures. Check this path before proposing
   a second graph-capture mechanism for launch-bound traces.
+- SANA-Video uses this runner directly at declared 832x480 resolutions. Its
+  default text pipeline always emits 300 prompt slots, so one graph covers
+  different raw prompt lengths without padding cross-attention to 512 slots.
 - Dual-stream diffusion models: `use_dual_stream = True` in models such as `hunyuan3d.py` is an existing overlap family.
 - Workflow rule: if a hotspot is communication-heavy, rule out these in-repo overlap families before proposing a brand new overlap design.
 
