@@ -192,6 +192,12 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 for field_name in (
                     "short_edge",
                     "aspect_ratio",
+                    # The exact-canvas alternative to short_edge+aspect_ratio.
+                    # Without them in the projection the offline path drops both
+                    # before validation sees them, so the request is refused for
+                    # a missing short_edge instead of honouring the canvas.
+                    "width",
+                    "height",
                     "duration_seconds",
                 )
                 if field_name in self.target

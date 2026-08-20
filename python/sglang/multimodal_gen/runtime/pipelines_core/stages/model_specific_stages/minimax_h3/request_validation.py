@@ -19,6 +19,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MINIMAX_H3_SUPPORTED_FPS,
     warn_unverified_short_edge,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
+    MINIMAX_H3_CANVAS_MULTIPLE,
+    MINIMAX_H3_MAX_PIXELS,
+    MINIMAX_H3_SHAPE_POLICY_VERSION,
+    minimax_h3_resolve_spatial_shape,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     MINIMAX_H3_CONDITION_ROLE_KEYFRAME,
     MINIMAX_H3_CONDITION_ROLE_REFERENCE,
@@ -76,13 +82,85 @@ def _optional_nonnegative_finite_float(value: Any, path: str) -> float | None:
     return normalized
 
 
+def _normalize_exact_canvas(
+    target: Mapping[str, Any], *, path: str, profile: MiniMaxH3TaskProfile
+) -> tuple[Mapping[str, Any], bool]:
+    """Rewrite a ``width``+``height`` target as the short_edge+ratio it means.
+
+    ``short_edge`` names a policy size and lets adapt_shape_v1 choose the canvas.
+    A caller that already knows the canvas it wants -- a fixed delivery geometry,
+    a UI preset -- has to work backwards to a nominal short edge and a ratio
+    string that round to it, and gets no error when the guess is wrong: unknown
+    target keys are ignored, so a request carrying width/height is admitted and
+    rendered at whatever the ratio resolved to instead.
+
+    Naming both axes is exact, because the ratio *is* the canvas: the resolver's
+    nominal-times-ratio step reproduces it and the nearest-32 rounding is a
+    no-op. That only holds on the 32px grid and inside the pixel budget, so a
+    canvas off the grid or over the budget is refused instead of being rounded or
+    scaled -- silently changing the requested geometry is worse than refusing it.
+
+    Returns the target to validate and whether it named an exact canvas.
+    """
+    if target.get("width") is None and target.get("height") is None:
+        return target, False
+    if target.get("short_edge") is not None or target.get("aspect_ratio") is not None:
+        raise ValueError(
+            f"{path} takes either width+height or short_edge+aspect_ratio, not both"
+        )
+    if profile.aspect_ratio_forced_auto:
+        # This rewrite ends in a concrete aspect_ratio, so without this guard it
+        # would be a way around the forced-"auto" check below rather than an
+        # alternative spelling of a ratio the task accepts.
+        raise ValueError(
+            f"{path}.width/height are not allowed for task {profile.task!r}: its "
+            'canvas is not caller-chosen (aspect_ratio is forced to "auto")'
+        )
+    width = _require_int(target.get("width"), f"{path}.width")
+    height = _require_int(target.get("height"), f"{path}.height")
+    for name, value in (("width", width), ("height", height)):
+        if value <= 0 or value % MINIMAX_H3_CANVAS_MULTIPLE:
+            raise ValueError(
+                f"{path}.{name} must be a positive multiple of "
+                f"{MINIMAX_H3_CANVAS_MULTIPLE}, got {value}"
+            )
+    if width * height > MINIMAX_H3_MAX_PIXELS:
+        raise ValueError(
+            f"{path}.width*height must be at most {MINIMAX_H3_MAX_PIXELS} px, "
+            f"got {width * height} for {width}x{height}"
+        )
+    # The resolver owns the inclusive 1:4..4:1 range and the grid, so ask it
+    # whether it reproduces this canvas rather than restating either rule here.
+    try:
+        resolved = minimax_h3_resolve_spatial_shape(
+            width=width, height=height, base_short_edge=min(width, height)
+        )
+    except ValueError as exc:
+        # Keep the offending field path on the message this boundary contracts.
+        raise ValueError(f"{path}.width/height: {exc}") from exc
+    if (resolved["width"], resolved["height"]) != (width, height):
+        raise ValueError(
+            f"{path}.width/height must name a canvas {MINIMAX_H3_SHAPE_POLICY_VERSION} "
+            f"reproduces: {width}x{height} resolves to "
+            f"{resolved['width']}x{resolved['height']}"
+        )
+    normalized = {
+        key: value for key, value in target.items() if key not in ("width", "height")
+    }
+    normalized["short_edge"] = min(width, height)
+    normalized["aspect_ratio"] = f"{width}:{height}"
+    return normalized, True
+
+
 def _validate_target(target: Any, *, profile: MiniMaxH3TaskProfile) -> dict[str, Any]:
     path = "target"
     if not isinstance(target, Mapping):
         raise ValueError(f"{path} is required and must be an object")
+    target, exact_canvas = _normalize_exact_canvas(target, path=path, profile=profile)
     # The canonical target has a deliberately small projection.  Transport
     # compatibility keys are ignored; only these three declared values are
-    # validated and emitted below.
+    # validated and emitted below -- an exact canvas has already been rewritten
+    # into the short edge and ratio it denotes.
     short_edge = _require_int(target.get("short_edge"), f"{path}.short_edge")
     if short_edge <= 0:
         raise ValueError(f"{path}.short_edge must be positive, got {short_edge}")
@@ -95,7 +173,11 @@ def _validate_target(target: Any, *, profile: MiniMaxH3TaskProfile) -> dict[str,
         )
     has_duration = target.get("duration_seconds") is not None
     if (
-        profile.task in {MINIMAX_H3_TASK_T2VA, MINIMAX_H3_TASK_REF2VA}
+        # The allowlist constrains *ratio* requests to the tested shapes. An
+        # exact canvas is deliberately exempt: a caller naming both axes has
+        # already chosen, and the resolver still enforces 1:4..4:1 on the ratio.
+        not exact_canvas
+        and profile.task in {MINIMAX_H3_TASK_T2VA, MINIMAX_H3_TASK_REF2VA}
         and aspect_ratio != "auto"
         and aspect_ratio not in MINIMAX_H3_FINITE_ASPECT_RATIOS
     ):
