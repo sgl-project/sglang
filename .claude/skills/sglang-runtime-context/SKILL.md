@@ -10,8 +10,8 @@ One container owns process-static runtime state: `sglang.srt.runtime_context.Run
 
 | Tier | Accessor | Holds | Lifecycle |
 |------|----------|-------|-----------|
-| raw config seed | `get_server_args()` | the published `ServerArgs` — the startup record, for debugging, dumps and provenance. **Business code does not read fields off it**: the read ratchet pins that at zero, and "Reading config: the seed is off limits" below says what to read instead, which forms the ratchet sees, and what is outside it by construction (a runtime-computed name; a whole-object hand-off) | published at process entry; re-publish is **last-publish-wins** (in-process tokenizer build, multi-Engine) and re-projects the bags; read-only |
-| resolved config | `get_exec()` `get_memory()` `get_schedule()` `get_model()` `get_spec()` `get_serving()` `get_observability()` `get_disagg()` `get_lora()` `get_mm()` `get_device()` | namespace **config bags** — the single source of truth for resolved config; leaves are real attributes (dynamo-traceable) | projected from `server_args` at `publish`; mutated only via `get_context().override` |
+| raw config seed | `get_server_args()` | the published `ServerArgs` — the startup record, for debugging, dumps and provenance. **Business code does not read fields off it**: the read ratchet pins that at zero, and "Reading config: the seed is off limits" below says what to read instead, which forms the ratchet sees, and what is outside it by construction (a runtime-computed name; a whole-object hand-off) | published at process entry; re-publish is **last-publish-wins** (the tokenizer publish in the launcher process; sequential engine rebuild in one process, e.g. unit tests) and re-projects the bags; read-only |
+| resolved config | `get_exec()` `get_memory()` `get_schedule()` `get_model()` `get_spec()` `get_serving()` `get_observability()` `get_disagg()` `get_lora()` `get_mm()` `get_device()` | namespace **config bags** — the single source of truth for resolved config; leaves are real attributes (dynamo-traceable). Each is a **module function of no arguments**, and a module binds the name once: `manager.get_disagg()`, `self.get_disagg = get_disagg`, or a same-named import next to the bag one (`from model_loader import get_model`) all import fine and fail only when that path runs. `ruff --select F811` catches the import collision; `RuntimeContext` has no bag-named member and no `__getattr__`, so the member-call shapes are an `AttributeError` at call time — give it a delegating `__getattr__` and they go silent instead | projected from `server_args` at `publish`; mutated only via `get_context().override` |
 | runtime flags | `get_flags()` | state that is *not* a pure function of config: `capture` (cuda-graph lifecycle), `moe` (ACTIVE backends, swappable), `dp` (DP-attention runtime flags) | materialized at subsystem init; groups offer `override()` for tests |
 | resources | `get_resources()`, `get_stream(name)`, `get_buffer(name, factory)` | process-level handles: graph pools, EPLB state, EP dispatcher state, named side streams, workspace buffers | lazy; cleared by `reset_context()` |
 | per-forward | `get_forward()` | forward-scoped flags (multi-stream switch, MoE output buffer, attn-TP inputs, extend-in-batch) | contextvar-backed; `scoped(**kw)` restores on exit; new threads see defaults |
@@ -27,10 +27,13 @@ resolved configuration lives in the namespace bags.**
 
 - Every publishing process entry calls `publish(server_args, role=...)`
   (`run_scheduler_process`, the Ray `SchedulerActor`, the DP controller, tokenizer,
-  encoder, weight-cache daemon, launcher, ...). The one deliberate exception is the
-  detokenizer: its processes never publish and read only the raw config handed to
-  their constructors — code that can run detokenizer-side must not use the
-  namespace accessors. `publish` snapshots the resolved field
+  detokenizer, encoder, weight-cache daemon, ...); the roles are enumerated once,
+  as the keys of `ROLE_NAMESPACE_SETS` — there is no `launcher` role, the launch
+  path publishes as `tokenizer`. The remaining non-publisher is
+  `run_multi_detokenizer_router_process`: it *is* handed a `ServerArgs`, and uses
+  it only for `configure_logger(server_args)` today, so it has nothing to publish
+  for — a bag read added under that entry needs a `publish` at the entry first.
+  `publish` snapshots the resolved field
   values into the config bags; the accessors (`get_exec()` etc.) fail closed before it
   runs. `role` records which process type published, and keys per-role namespace
   enforcement: `SGLANG_ROLE_NAMESPACES=record` audits which namespaces each role's
@@ -51,6 +54,32 @@ resolved configuration lives in the namespace bags.**
   There is **no write-through** to the `ServerArgs` instance — it stays pristine.
   There is no in-place mutation entry on the instance at all: it is read-only after
   resolution.
+- **Reading a leaf when the caller holds the field *name*** (a readback endpoint,
+  a control-plane handler): `get_context().config_leaf(name)` — the read side of
+  `override`. It resolves the flat name through the same `NS` map the write side
+  uses and raises on a name that is not a config leaf. Code that knows its field
+  when it is written reads the bag leaf directly; `config_leaf` is for
+  name-driven code, not a way around the seed ratchet.
+- **Post-startup control-plane changes** — a weight update, a HiCache mirror
+  attach, a parser resolved from the chat template — go through
+  `TokenizerManager.record_config_updates(source, **fields)`, a named wrapper
+  over `get_context().override`. One process keeps one log: the request dumps
+  ship `get_context().overrides_log()`, and `config_value(name)` /
+  `resolved_config_dict(base)` answer from the bags. The exposure ratchet
+  resolves the wrapper, so a field recorded through it joins the post-publish
+  override surface exactly like a direct `override` and needs the same ordering
+  judgment against any supplied-instance read of it
+  (`test_supplied_instance_exposure_ratchet.py`).
+- **`model_path` and `served_model_name` are answered off the manager.** Both are
+  `NS` leaves and `override` accepts them, but the tokenizer-side weight reload
+  records only `load_format` and writes the two path fields as `TokenizerManager`
+  attributes (`_MANAGER_OWNED_FIELDS`); `config_value` and `resolved_config_dict`
+  overlay them on top of the bags. Bags do not cross a process boundary (above),
+  so recording those two in the tokenizer process would leave every other
+  process's bag on the old path while the log claimed a process-wide change. The
+  scheduler rewrites its own copy where the reload happens —
+  `ModelRunner.update_model_fields` overrides `model_path` / `load_format` for
+  the target runner.
 - **Late launcher-stage resolution (pre-publish)**: a few rules cannot run inside
   `__post_init__` — LoRA normalization, and the auto-parser detection that needs a
   tokenizer/chat-template load. They are resolution, not mutation, and they write
@@ -79,11 +108,6 @@ re-projects its own bags, so a parent-side override is lost. Values that feed
 construction before any bag exists (group init reads `server_args.tp_size`) have no
 bag to override at all.
 
-- **Nested publishes**: `get_context().preserve_config()` snapshots the enclosing
-  lifecycle (including its post-publish overrides) and reinstates it on exit. No
-  production caller is left — the draft build was the last one, and per-runner
-  values are constructor arguments now — so it survives for tests and for a future
-  construction step that genuinely has to publish a private copy.
 
 ### Reads that legitimately stay on a `ServerArgs` instance
 
@@ -110,28 +134,32 @@ bag to override at all.
   the scope. When there is a runner in hand, read its
   stamp; that is a different rule from "read the instance".
 - **Per-instance boundaries** — the tokenizer-manager family, everything under
-  `entrypoints/`, and the tokenizer-process multimodal processors read
-  `self.server_args`: several `Engine`s can share one process, and the process-global
-  bags are last-publish-wins across engines. `base_gpu_id` also differs per engine,
-  so no process-global value can stand in for it —
-  `BaseMultimodalProcessor._fast_image_processor_device` is the shape to copy. (The
-  encode-server DP workers used to specialize a config copy for the same reason;
-  their device now travels as `MMEncoder(gpu_id=...)`.)
+  `entrypoints/`, and the tokenizer-process multimodal processors read the bags.
+  The old justification for keeping them on `self.server_args` ("several
+  `Engine`s can share one process, bags are last-publish-wins across them") is
+  **retracted** — owner ruling (2026-08-15): a process holds at most one live
+  config at a time (concurrent multi-Engine is unsupported; sequential rebuild
+  stays legal, unit tests rely on it). What still reads the instance in those
+  files is pinned pair by pair in the exposure ratchet, each with its own
+  disposition; none of it is a boundary to imitate. What
+  genuinely stays per-instance is what differs per *worker* within one engine:
+  `base_gpu_id` travels as a constructor argument (`MMEncoder(gpu_id=...)`;
+  `BaseMultimodalProcessor._fast_image_processor_device` is the shape to copy).
 - **Whole-object passes** (`f(server_args)` handing the instance along) keep the
   supplied-instance contract; don't rewrite the parameter reads unless the
   field is runtime-mutated (see the elastic-EP `ep_size` case in
   `eplb/expert_location.py`) — **or the field is one that resolution fills in
   and the callee runs in a process that has published.** That second case is
-  step-12 debt, not a style question: the record is destined to carry the
+  pinned debt, not a style question: the record is destined to carry the
   user's raw input, so `server_args.page_size` inside a runner-owned
   constructor will read the raw pre-resolution value instead of the effective
   one. Debt means a decision, not automatically a bag read: pick where the
   value should come from — usually the `get_*()` bag, sometimes a runner stamp
   or a constructor argument (the per-mode attention pair and the encode-server
-  `gpu_id` above are dispositions of exactly this debt). And the per-instance
-  boundaries above stay exempt from this unless-clause: a multi-Engine site
-  must not become a process-global bag read even for a resolution-filled
-  field. `test_supplied_instance_exposure_ratchet.py`
+  `gpu_id` above are dispositions of exactly this debt). The per-instance
+  boundaries above are **not** exempt from this unless-clause (the multi-Engine
+  exemption is retracted); each one gets its own disposition.
+  `test_supplied_instance_exposure_ratchet.py`
   pins the remaining set — three spellings of the read: `server_args.field`,
   literal-name `getattr(server_args, "field", default)`, and the parked form
   (`self.x = server_args` in a method that takes the parameter, read as
@@ -140,6 +168,51 @@ bag to override at all.
   *resolution pipeline* calls with a `resolved_view` (its parameter happens to be
   named `server_args`), and a factory whose contract is "build X from the record
   you are handed" (`create_kt_config_from_server_args`, `DllmConfig.from_server_args`).
+
+### Four ways a config sweep breaks something no test runs
+
+Each of these shipped in a review round and cost a real defect; each now has a
+guard, named here so the next sweep checks the same four things by hand first.
+
+1. **The other implementations of an interface.** Dropping a parameter means
+   auditing implementers, not just callers: `CustomSpecAlgo` is the plugin
+   base for speculative algorithms, and the dispatch calls it with the
+   built-in's argument list. Nothing in the tree implements it, so only a
+   plugin user hits the `TypeError`.
+   Guard: `test_plugin_hook_signatures.py`.
+2. **Publish order inside a process entry, not per file.** A file containing a
+   `publish` says nothing about whether a given read runs before it. Spawned
+   workers (`MMEncoder` for encoder DP/TP, the Ray scheduler actor) start with
+   an empty context, so a bag read above the publish raises only there.
+   Guard: `test_publish_precedes_bag_reads.py`.
+3. **The role namespace a process publishes under.** `ROLE_NAMESPACE_SETS`
+   narrows what each role may read; the DP controller is audited for `exec`
+   alone. A helper that reaches for another namespace passes every default-mode
+   test and aborts startup under `SGLANG_ROLE_NAMESPACES=enforce`. Prefer
+   answering from the caller's own namespaces over widening the set.
+4. **Sibling surfaces of a readback.** Changing what one entry point reports
+   means enumerating the others: HTTP, gRPC and in-process `Engine` each have
+   their own server-info and model-info, and each passes its own tests while
+   its users lose the field.
+   Guard: `test_effective_state_surfaces.py`.
+
+A fifth, from the same rounds: the accessor **name itself**. Called as an
+object member (`manager.get_disagg()`), or shadowed by a same-named import
+(`from model_loader import get_model` next to the model bag, where the later
+import silently wins and the loader call gets a zero-argument bag), it imports
+fine and fails only when that path runs. The invariant is one line: the name
+means the process-wide bag, takes no arguments, and is bound once per module.
+`ruff --select F811` catches the import collision; the member-call shapes are an
+`AttributeError` at call time only because `RuntimeContext` has no bag-named
+member and no `__getattr__` -- a delegating `__getattr__` would make them
+silent, and that is when this needs a guard again rather than a rule.
+
+Write these guards over a **derived** set, never a hand-kept list: an entry
+naming a function that no longer exists, or a field list missing the one field
+nobody migrated, passes green forever. Both happened here -- a `_ENTRY_POINTS`
+row for a method the Ray actor does not have, and an effective-field set
+without `load_format` -- and both were invisible because the assertion had
+slack (`>= len(...) - 1`) or compared key names instead of value sources.
 
 ### `get_parallel()`: config leaves vs live topology
 
@@ -180,6 +253,9 @@ this).
   parallel bag's own leaf — are what see post-publish overrides. Only the
   instance-derived accessors (the ones with no leaf to read) answer from the
   startup record and therefore do not.
+- **a leaf the caller names at runtime** (a readback reporting a list of fields)
+  → `get_context().config_leaf(name)`; it resolves the name through `NS` and
+  raises on a non-leaf. A call site that knows its field reads the bag leaf.
 - **the live topology** → `get_parallel()`.
 - **a value derived from published leaves** → an accessor in `runtime_context` that
   derives it *from the bags*: `mamba_extra_buffer_enabled()` /
@@ -224,23 +300,29 @@ this).
 `self.server_args.field` is still right for handed per-instance config (see
 "Reads that legitimately stay on a ServerArgs instance" above for the full set —
 per-instance boundaries and whole-object passes; there are no per-runner config
-copies to read any more). The allow-list is the
-tokenizer-manager family, `entrypoints/`, the tokenizer-process multimodal
-processors, `GrammarManager`, `MMEncoder` — but not for one single reason:
+copies to read any more). The allow-list is `GrammarManager` and `MMEncoder`;
+what sits beside it is residue, not a family — and not for one single reason:
 
-- the tokenizer-manager family and `entrypoints/` are the multi-Engine case
-  proper: several of them can live in one process, so a bag read would answer
-  from whichever Engine published last;
-- `GrammarManager` is a handed instance — it is constructed with the config its
-  owner hands it and never assumes a published namespace;
+- the tokenizer-manager family and `entrypoints/` **read the bags**; what is
+  left of them in the exposure ratchet is a handful of individually-dispositioned
+  pairs, not a family awaiting conversion. Read the ratchet for the current set
+  rather than assuming a directory is off-limits;
+- `GrammarManager` is a handed instance for its residual `self.server_args`
+  reads, but backend selection is **not** on the instance any more:
+  `create_grammar_backend` reads `get_exec().kernel.grammar_backend`, and
+  `__init__` calls that factory whenever `skip_tokenizer_init` is false. In
+  production the scheduler process has published; a test that constructs one
+  without publishing has to keep patching the factory (or publish itself);
 - `MMEncoder` publishes the very instance it is handed (`publish(server_args,
   role="encoder")`) and takes its per-worker device as a separate `gpu_id`
   argument, so its `self.server_args` reads and the bag agree today. They are on
   this list as a construction-path convention rather than a semantic exception —
   and the residual is real: a post-publish `override` would not reach them.
 
-Their tests tell you the same thing: they construct the object standalone, so a
-bag read turns into "config namespace not published".
+Their tests are not one story: a `GrammarManager` built standalone turns the
+factory's bag read into "config namespace not published" unless the test patches
+it or publishes, while `MMEncoder` publishes in its own `__init__` and so needs
+no such arrangement.
 
 **Test doubles publish, they do not inject.** A stand-in that carries
 `server_args=SimpleNamespace(field=...)` stops working the moment production reads
@@ -474,7 +556,7 @@ Never module-skip a test "until the migration settles" — seed the context inst
 ## Where to read the code
 
 Key source files: `python/sglang/srt/runtime_context.py` (the container, every tier,
-`publish`, `_ConfigBag`, `preserve_config`, `override_server_args`),
+`publish`, `_ConfigBag`, `override_server_args`),
 `python/sglang/srt/arg_groups/overrides.py` (override registry, passes,
 `declare_late_resolution`), `python/sglang/srt/server_args.py` (`NS` metadata,
 `Arg(..., resolvable=True)`, `__setattr__` strict guard), and the guardrail tests under
