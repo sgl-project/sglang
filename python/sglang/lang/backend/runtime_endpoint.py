@@ -509,7 +509,7 @@ class Runtime:
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
-        lora_path: Optional[List[Optional[str]]] = None,
+        lora_path: Optional[Union[str, List[Optional[str]]]] = None,
         session_id: Optional[str] = None,
     ):
         json_data = {
@@ -521,7 +521,6 @@ class Runtime:
             "lora_path": lora_path,
             "session_id": session_id,
         }
-        assert not isinstance(lora_path, list) or len(lora_path) == len(prompt)
         response = requests.post(
             self.url + "/generate",
             json=json_data,

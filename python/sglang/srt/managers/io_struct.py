@@ -61,7 +61,10 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
-from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
+from sglang.srt.utils.field_validators import (
+    normalize_lora_paths,
+    validate_optional_list_i64_1d_2d,
+)
 from sglang.srt.utils.msgspec_utils import (
     Base64Bytes,
     msgspec_struct_pydantic_core_schema,
@@ -390,6 +393,12 @@ class GenerateReqInput:
         if self.session_id is not None and self.session_params is not None:
             raise ValueError("session_id and session_params cannot both be set.")
         self._handle_parallel_sampling()
+        self.lora_path = normalize_lora_paths(
+            self.lora_path,
+            self.batch_size,
+            is_single=self.is_single,
+            expansion_factor=self.parallel_sample_num,
+        )
 
         if self.is_single:
             self._normalize_single_inputs()
@@ -518,7 +527,6 @@ class GenerateReqInput:
         # Expand input based on type
         self._expand_inputs(num)
         self._normalize_rid(num)
-        self._normalize_lora_paths(num)
         self._normalize_image_data(num)
         self._normalize_mm_hashes(num)
         self._normalize_video_data(num)
@@ -549,16 +557,6 @@ class GenerateReqInput:
             if not isinstance(self.input_embeds, list):
                 raise ValueError("input_embeds should be a list for batch processing.")
             self.input_embeds = self.input_embeds * self.parallel_sample_num
-
-    def _normalize_lora_paths(self, num):
-        """Normalize LoRA paths for batch processing."""
-        if self.lora_path is not None:
-            if isinstance(self.lora_path, str):
-                self.lora_path = [self.lora_path] * num
-            elif isinstance(self.lora_path, list):
-                self.lora_path = self.lora_path * self.parallel_sample_num
-            else:
-                raise ValueError("lora_path should be a list or a string.")
 
     def _normalize_image_data(self, num):
         """Normalize image data for batch processing."""
@@ -1188,6 +1186,10 @@ class EmbeddingReqInput:
             else:
                 self.batch_size += 1
 
+        self.lora_path = normalize_lora_paths(
+            self.lora_path, self.batch_size, is_single=self.is_single
+        )
+
         # Fill in default arguments
         if self.is_single:
             if self.rid is None:
@@ -1208,22 +1210,7 @@ class EmbeddingReqInput:
             for i in range(self.batch_size):
                 self.sampling_params[i]["max_new_tokens"] = 0
 
-            self._normalize_lora_paths(self.batch_size)
-
         self._validate_rid_uniqueness()
-
-    def _normalize_lora_paths(self, num):
-        """Normalize LoRA paths for batch processing."""
-        if self.lora_path is not None:
-            if isinstance(self.lora_path, str):
-                self.lora_path = [self.lora_path] * num
-            elif isinstance(self.lora_path, list):
-                if len(self.lora_path) != num:
-                    raise ValueError(
-                        f"lora_path list length ({len(self.lora_path)}) must match batch size ({num})"
-                    )
-            else:
-                raise ValueError("lora_path should be a list or a string.")
 
     def contains_mm_input(self) -> bool:
         return (
