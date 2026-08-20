@@ -1255,8 +1255,8 @@ class MooncakeKVManager(CommonKVManager):
             StateType.DSA,
             StateType.SWA_RING,
             StateType.C128_STATE,
-            StateType.MXFP8_SCALE,
-            StateType.MXFP8_SCALE_SWA,
+            StateType.BLOCK_SCALE,
+            StateType.BLOCK_SCALE_SWA,
         )
 
     def _requires_exact_state_index_match(self, st: StateType) -> bool:

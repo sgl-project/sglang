@@ -1069,7 +1069,7 @@ def setup_state_kv_args(
     ):
         append_state_component(
             kv_args,
-            StateType.MXFP8_SCALE,
+            StateType.BLOCK_SCALE,
             *token_to_kv_pool.get_kv_scale_buf_infos(),
         )
 
@@ -1098,12 +1098,12 @@ def setup_state_kv_args(
             ):
                 append_state_component(
                     kv_args,
-                    StateType.MXFP8_SCALE,
+                    StateType.BLOCK_SCALE,
                     *token_to_kv_pool.get_kv_scale_buf_infos(),
                 )
                 append_state_component(
                     kv_args,
-                    StateType.MXFP8_SCALE_SWA,
+                    StateType.BLOCK_SCALE_SWA,
                     *token_to_kv_pool.get_swa_kv_scale_buf_infos(),
                 )
             # unified_kv: the SWA ring lives in the unified buffers (no separate
