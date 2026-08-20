@@ -83,6 +83,7 @@ from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
+    without_schema_identifiers,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
@@ -909,7 +910,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 # guards against hand-crafted cyclic schemas so the request gets
                 # a 400 instead of crashing into a 500.
                 normalize_json_schema_types(tool.function.parameters)
-                Draft202012Validator.check_schema(tool.function.parameters)
+                # Identifier keywords are checked for URI form by the 2020-12
+                # metaschema but constrain no instance, so a draft-07-style
+                # `$id: "#name"` would 400 a schema this stack renders and
+                # constrains correctly. Validate without them.
+                Draft202012Validator.check_schema(
+                    without_schema_identifiers(tool.function.parameters)
+                )
             except SchemaError as e:
                 return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
             except RecursionError:

@@ -110,6 +110,29 @@ def _normalize_type_list(raw_items: List[Any]) -> List[Any]:
     return normalized_items
 
 
+# Identifier keywords carry no constraint: they name a schema, they never
+# restrict an instance. Draft 2020-12's metaschema does constrain their FORM
+# (``$id`` may not carry a non-empty fragment, which draft-07's plain-name
+# ``#anchor`` style did), so a draft-07-era schema fails ``check_schema`` while
+# validating instances identically. Reference resolution here follows only
+# in-document ``#/...`` pointers, so dropping these for the metaschema check
+# cannot change which instances a schema accepts.
+_SCHEMA_IDENTIFIER_KEYWORDS = ("$id", "$anchor", "$dynamicAnchor", "$dynamicRef")
+
+
+def without_schema_identifiers(schema: Any) -> Any:
+    """Copy a JSON Schema with identifier keywords removed, for validation only."""
+    if isinstance(schema, dict):
+        return {
+            key: without_schema_identifiers(value)
+            for key, value in schema.items()
+            if key not in _SCHEMA_IDENTIFIER_KEYWORDS
+        }
+    if isinstance(schema, list):
+        return [without_schema_identifiers(item) for item in schema]
+    return schema
+
+
 def normalize_json_schema_types(schema: Any) -> None:
     """
     Walk a JSON Schema in place and rewrite non-standard ``"type"`` values
