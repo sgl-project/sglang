@@ -16,12 +16,7 @@ def warn_if_adapter_targets_embeddings(
     embedding_layer_names: Iterable[str],
     speculative_algorithm: Optional[str],
 ) -> None:
-    """Warn once when an adapter carries embedding weights under EAGLE spec.
-
-    The draft consumes base lm_head/embed_tokens weights, so those deltas do
-    not influence drafting; verification runs the adapted target, so outputs
-    stay lossless and only the accept rate moves.
-    """
+    """Warn once when an adapter carries embedding weights under EAGLE spec."""
     if speculative_algorithm not in ("EAGLE", "EAGLE3"):
         return
     modules = sorted(embedding_layer_names)
