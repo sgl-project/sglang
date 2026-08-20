@@ -33,25 +33,11 @@ utilities, and common action-policy helpers. Model packages may call these
 helpers. Keep ownership in shared runtime folders unless the code is truly
 architecture-specific.
 
-## Develop Outside the SGLang Source Tree
+## Out-of-Tree Models and Pipelines
 
-An installed Python package can register a native pipeline and its component
-models without changing SGLang-Diffusion. This is useful for private models and
-for developing support before upstreaming it.
-
-Use this package layout:
-
-```text
-custom_diffusion/
-├── pyproject.toml
-└── custom_diffusion/
-    ├── __init__.py
-    ├── configs.py
-    ├── models.py
-    └── pipeline.py
-```
-
-Register everything from the package's `__init__.py`:
+An installed package can register native component models and a pipeline
+without modifying SGLang-Diffusion. Register them in the package's
+`__init__.py`:
 
 ```python
 from sglang.multimodal_gen.registry import register_pipeline
@@ -74,16 +60,8 @@ register_pipeline(
 )
 ```
 
-The string form passed to `register_model` keeps the component model import
-lazy. `hf_model_paths` maps known checkpoint paths to this pipeline and its
-config classes, including checkpoints without `model_index.json`.
-`model_detectors` adds aliases for config detection. For other Diffusers-format
-checkpoints, `model_index.json` `_class_name` can select a registered
-`pipeline_name`. For a standalone safetensors file, also pass
-`--pipeline CustomPipeline`.
-
-Install the package in the same environment as every server worker, then set
-the same environment variable used by SRT out-of-tree models:
+Install the package in the server environment and set the same environment
+variable used by SRT plugins:
 
 ```bash
 pip install -e /path/to/custom-diffusion
@@ -91,14 +69,14 @@ SGLANG_EXTERNAL_MODEL_PACKAGE=custom_diffusion \
   sglang serve --model-path my-org/custom-diffusion-model
 ```
 
-Set `SGLANG_EXTERNAL_MODEL_PACKAGE` before the process starts. Each server
-process imports the package once, so the registration is available with both
-`fork` and `spawn` workers. External diffusion packages should use the APIs
-above instead of declaring SRT's module-level `EntryClass`.
+Notes:
 
-Registration rejects an existing `pipeline_name` by default. Pass
-`overwrite=True` only when the external package intentionally replaces a
-built-in pipeline.
+- The string form of `register_model` keeps component imports lazy.
+- `hf_model_paths` also supports checkpoints without `model_index.json`. Other
+  Diffusers checkpoints can select the pipeline through `_class_name`.
+- For a standalone safetensors file, pass `--pipeline CustomPipeline`.
+- Set the environment variable before startup. Each process imports the package
+  once. Use `overwrite=True` only to intentionally replace a built-in pipeline.
 
 ## Start With the Smallest Change
 
