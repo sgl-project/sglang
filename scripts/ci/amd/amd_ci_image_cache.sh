@@ -78,14 +78,18 @@ image_cache_load() {
     *)    docker load -i "${path}" >/dev/null 2>&1 || true ;;
   esac
   if [[ -n "$(docker images -q "${image}" 2>/dev/null)" ]]; then
+    # Retention is by mtime, so refresh it on use: find_latest_image walks back
+    # up to a week when a nightly is missing, and a tarball that is still the
+    # tag being asked for must not age out from under the jobs using it.
+    touch "${path}" 2>/dev/null || true
     return 0
   fi
   echo "Warning: tarball cache did not yield ${image}; falling back to a pull" >&2
   return 1
 }
 
-# image_cache_prune -- bound the footprint; tags are date-stamped so anything
-# older than the lookback window is dead weight.
+# image_cache_prune -- bound the footprint. Ages out by last use, not by when
+# the tarball was written, because image_cache_load refreshes mtime on a hit.
 image_cache_prune() {
   [[ -n "${IMAGE_CACHE_DIR}" ]] || return 0
   find "${IMAGE_CACHE_DIR}" -maxdepth 1 -name '*.tar*' \
