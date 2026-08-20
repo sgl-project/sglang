@@ -4,7 +4,6 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_disagg,
-    get_exec,
     get_schedule,
     get_serving,
     get_spec,
@@ -12,6 +11,7 @@ from sglang.srt.runtime_context import (
     mamba_checkpoint_grid,
     mamba_extra_buffer_enabled,
     mamba_extra_buffer_lazy_enabled,
+    mamba_track_grid,
 )
 from sglang.srt.utils.common import (
     Range,
@@ -3107,7 +3107,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         if mamba_extra_buffer_enabled():
-            mamba_track_interval = get_exec().mamba.mamba_track_interval
+            mamba_track_interval = mamba_track_grid(self.tree_cache.page_size)
 
             if len(self.reqs) == 0:
                 self.mamba_track_indices = torch.empty(
