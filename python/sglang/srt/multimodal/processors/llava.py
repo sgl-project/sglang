@@ -1,10 +1,9 @@
 import asyncio
 import os
-
-import requests
 from typing import Dict, List, Optional, Union
 
 import numpy as np
+import requests
 from transformers.models.auto.processing_auto import (
     PROCESSOR_MAPPING_NAMES as HF_MAPPING_NAMES,
 )
@@ -106,7 +105,9 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         delay = 0.5
         for attempt in range(max_retries + 1):
             try:
-                return await loop.run_in_executor(self.io_executor, get_image_bytes, url)
+                return await loop.run_in_executor(
+                    self.io_executor, get_image_bytes, url
+                )
             except (
                 requests.exceptions.Timeout,
                 requests.exceptions.ConnectionError,
