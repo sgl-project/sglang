@@ -315,7 +315,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
 BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "gemv", "torch"]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
-RETRACTION_POLICY_CHOICES = ["length", "priority"]
+RETRACTION_POLICY_CHOICES = ["length", "priority", "backup-cost"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -888,7 +888,8 @@ class ServerArgs:
                 "'length' preserves the existing behavior and retracts short-output, "
                 "long-input requests first. 'priority' retracts lower-priority "
                 "requests first, using the same priority direction as priority "
-                "scheduling."
+                "scheduling. 'backup-cost' uses the current memory shortfall to "
+                "prefer victims with a smaller page-aligned KV backup footprint."
             ),
             choices=RETRACTION_POLICY_CHOICES,
         ),

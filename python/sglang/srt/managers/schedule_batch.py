@@ -83,6 +83,11 @@ from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationM
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.retraction_policy import (
+    build_backup_cost_retraction_order,
+    compute_decode_shortfall,
+    make_backup_cost_candidate,
+)
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
@@ -2820,7 +2825,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
-        sorted_indices = self._get_decode_retraction_order(self.reqs, server_args)
+        available_tokens = self.token_to_kv_pool_allocator.available_size()
+        required_tokens = self.new_tokens_required_next_decode()
+        shortfall = compute_decode_shortfall(required_tokens, available_tokens)
+        sorted_indices = self._get_decode_retraction_order_for_shortfall(
+            server_args, shortfall
+        )
 
         retracted_reqs = []
         reqs_to_abort: List[Req] = []
@@ -2919,6 +2929,40 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             reverse=True,
         )
         return sorted_indices
+
+    def _get_decode_retraction_order_for_shortfall(
+        self, server_args: ServerArgs, shortfall: int
+    ) -> List[int]:
+        # TEST_RETRACT enters here without a real shortfall. Preserve its legacy
+        # length ordering so the test injection does not change semantics.
+        if server_args.retraction_policy != "backup-cost" or shortfall <= 0:
+            return self._get_decode_retraction_order(self.reqs, server_args)
+
+        page_size = self.token_to_kv_pool_allocator.page_size
+        candidates = [
+            make_backup_cost_candidate(
+                index=i,
+                sequence_length=req.seqlen,
+                kv_allocated_len=req.kv.kv_allocated_len,
+                next_decode_tokens=self.new_tokens_required_next_decode([i]),
+                page_size=page_size,
+                priority=req.priority,
+            )
+            for i, req in enumerate(self.reqs)
+        ]
+        # kv_allocated_len can overestimate releasable memory for shared radix
+        # prefixes and specialized pools. The order is only a cost heuristic;
+        # retract_decode still calls check_decode_mem after every actual release.
+        victim_first = build_backup_cost_retraction_order(
+            candidates,
+            shortfall,
+            respect_priority=server_args.enable_priority_scheduling,
+            schedule_low_priority_values_first=(
+                server_args.schedule_low_priority_values_first
+            ),
+        )
+        # The retraction loop pops from the end.
+        return list(reversed(victim_first))
 
     def release_req(
         self,
