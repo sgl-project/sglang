@@ -240,12 +240,14 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     if (
         ctx.server_args.enable_hierarchical_cache
         and ctx.server_args.hicache_host_memory_mode == "buffer_only"
-        and type(cache).__name__ != "UnifiedRadixCache"
     ):
-        raise ValueError(
-            "--hicache-host-memory-mode buffer_only is only implemented for "
-            f"the unified radix tree; this model selected {type(cache).__name__}."
-        )
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        if not isinstance(cache, UnifiedRadixCache):
+            raise ValueError(
+                "--hicache-host-memory-mode buffer_only is only implemented for "
+                f"the unified radix tree; this model selected {type(cache).__name__}."
+            )
 
     if ctx.server_args.enable_session_radix_cache and not getattr(
         cache, "enable_session_radix_cache", False
