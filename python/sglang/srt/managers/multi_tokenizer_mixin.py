@@ -468,10 +468,14 @@ class MultiTokenizerRouter:
         # MultiTokenizerRouter process owns it (zmq -> SHM) and the workers
         # read SHM only. Drain it event-driven via the socket's fd instead of
         # polling on a timer.
-        self.load_snapshot_reader = create_load_snapshot_reader(
-            server_args, port_args, caller="MultiTokenizerRouter"
-        )
-        if zmq_reader_owner(server_args, "MultiTokenizerRouter"):
+        owns_zmq_reader = zmq_reader_owner("MultiTokenizerRouter")
+        self.load_snapshot_reader = None
+        if owns_zmq_reader or server_args.load_reporter_port is not None:
+            self.load_snapshot_reader = create_load_snapshot_reader(
+                port_args, caller="MultiTokenizerRouter"
+            )
+
+        if owns_zmq_reader:
             self._loop.call_soon_threadsafe(self._register_load_snapshot_reader)
 
         self.disaggregation_bootstrap_server = start_disagg_service(self.server_args)
@@ -507,6 +511,8 @@ class MultiTokenizerRouter:
         """Start the router-owned reporter; block until the listener binds so an occupied port fails construction."""
         if self.server_args.load_reporter_port is None:
             return None
+
+        assert self.load_snapshot_reader is not None
 
         from sglang.srt.load_reporter import start_load_reporter
         from sglang.srt.load_reporter.snapshot_source import RouterLoadSnapshotSource

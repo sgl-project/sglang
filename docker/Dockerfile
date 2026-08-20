@@ -9,24 +9,19 @@ ARG SGL_VERSION
 ARG SGL_DEEP_GEMM_VERSION=0.1.5.post2
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
+ARG SGL_NCCL_VERSION=2.30.7
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.15.post1
-ARG TRTLLM_GEN_MOE_CUBIN_URL="https://github.com/sgl-project/whl/releases/download/trtllm_gen_moe_cubin_20260617/trtllm_gen_moe_cubin_pool_20260617_v0613rc1.zip"
-ARG TRTLLM_GEN_MOE_CUBIN_SHA256="4900501cbe782a76b08a5858f9f07152287b97cb68114466dac286366b66c192"
-ARG TRTLLM_GEN_MOE_CUBIN_ARCHIVE_ROOT="trtllm_gen_moe_cubin_pool_20260617_v0613rc1"
+ARG FLASHINFER_VERSION=0.6.17
 ARG MOONCAKE_VERSION=0.3.12.post1
 ARG MSCCLPP_VERSION=sglang-v0.9.1
-#if need other arg please add in MOONCAKE_COMPILE_ARG
-ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/ \
-    FLASHINFER_VERSION=${FLASHINFER_VERSION} \
-    SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL=/opt/trtllm_gen_moe_cubin_pool
+    FLASHINFER_VERSION=${FLASHINFER_VERSION}
 
 # Add GKE default lib and bin locations
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
@@ -46,14 +41,13 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     && apt install -y --no-install-recommends python3.12-full python3.12-dev \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
-    && wget -q https://bootstrap.pypa.io/get-pip.py \
-    && python3 get-pip.py --break-system-packages \
-    && rm get-pip.py \
-    # Allow pip to install packages globally (PEP 668 workaround for Ubuntu 24.04)
-    && python3 -m pip config set global.break-system-packages true \
     # Fix for apt-add-repository
     && cd /usr/lib/python3/dist-packages/ \
     && ln -s apt_pkg.cpython-312-*-linux-gnu.so apt_pkg.so
+
+# create virtual env for sglang to avoid conflict with system python packages
+RUN python3 -m venv /opt/sglang
+ENV PATH="/opt/sglang/bin:${PATH}"
 
 # Install system dependencies (organized by category for better caching)
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
@@ -73,7 +67,6 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     build-essential \
     cmake \
     perl \
-    patch \
     patchelf \
     ccache \
     git-lfs \
@@ -164,7 +157,6 @@ ENV LANG=en_US.UTF-8 \
 #     |
 #     +-- devtools_builder (independent)
 #     +-- gateway_builder  (independent, only needs gateway source)
-#     +-- trtllm_cubin_builder (independent)
 #     |
 #     v
 #   framework (combines all artifacts)
@@ -179,6 +171,11 @@ ARG CUDA_VERSION
 ARG BUILD_TYPE
 ARG SGL_KERNEL_VERSION
 ARG GITHUB_ARTIFACTORY
+# Renamed from NCCL_VERSION: the nvidia/cuda base image sets ENV NCCL_VERSION
+# (Debian apt format, e.g. 2.28.3-1), which shadows a same-named ARG inside RUN,
+# so the CUDA-13 nvidia-nccl-cu13 pip install below resolved an invalid PyPI
+# version. A distinct ARG name avoids the collision.
+ARG SGL_NCCL_VERSION
 
 WORKDIR /sgl-workspace
 
@@ -254,6 +251,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' pyproject.toml; \
        fi \
     && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
+    && if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+           python3 -m pip install --force-reinstall --no-deps \
+               "nvidia-nccl-cu13==${SGL_NCCL_VERSION}"; \
+       fi \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
                | xargs -r python3 -m pip uninstall -y && \
@@ -313,12 +314,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && mkdir -p /flashinfer_jit_output \
     # flashinfer-cubin is CUDA-version-agnostic, unlike jit-cache, so its index-url has no cu${CUINDEX} suffix
     && python3 -m pip install flashinfer-cubin==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl \
-    && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_cubin /flashinfer_jit_output/ \
-    && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_cubin-*.dist-info /flashinfer_jit_output/ \
+    && cp -r /opt/sglang/lib/python3.12/site-packages/flashinfer_cubin /flashinfer_jit_output/ \
+    && cp -r /opt/sglang/lib/python3.12/site-packages/flashinfer_cubin-*.dist-info /flashinfer_jit_output/ \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} \
-        && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache /flashinfer_jit_output/ \
-        && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache-*.dist-info /flashinfer_jit_output/ ; \
+        && cp -r /opt/sglang/lib/python3.12/site-packages/flashinfer_jit_cache /flashinfer_jit_output/ \
+        && cp -r /opt/sglang/lib/python3.12/site-packages/flashinfer_jit_cache-*.dist-info /flashinfer_jit_output/ ; \
     fi
 
 ########################################################
@@ -401,27 +402,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && rm -rf /root/.cargo /root/.rustup /build/sgl-model-gateway/target /build/sgl-model-gateway/bindings/python/target
 
 ########################################################
-# PARALLEL STAGE 6: TRT-LLM Generated-MoE Cubin Pool
-########################################################
-FROM base AS trtllm_cubin_builder
-
-RUN cubin_archive="/tmp/trtllm_gen_moe_cubin_pool.zip" && \
-    cubin_extract_dir="/tmp/trtllm_gen_moe_cubin_extract" && \
-    wget --no-verbose --output-document="${cubin_archive}" \
-      "${TRTLLM_GEN_MOE_CUBIN_URL}" && \
-    echo "${TRTLLM_GEN_MOE_CUBIN_SHA256}  ${cubin_archive}" | \
-      sha256sum --check --strict - && \
-    mkdir -p "${cubin_extract_dir}" && \
-    unzip -q "${cubin_archive}" -d "${cubin_extract_dir}" && \
-    test ! -e "${SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL}" && \
-    mv "${cubin_extract_dir}/${TRTLLM_GEN_MOE_CUBIN_ARCHIVE_ROOT}" \
-      "${SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL}" && \
-    test "$(find "${SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL}" \
-      -type f -name '*.cubin' | wc -l)" -eq 1696 && \
-    rm -f "${cubin_archive}" && \
-    rm -rf "${cubin_extract_dir}"
-
-########################################################
 ########## Final Framework Image ######################
 ########################################################
 #
@@ -436,7 +416,6 @@ ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
 ARG GITHUB_ARTIFACTORY
 ARG MOONCAKE_VERSION
-ARG MOONCAKE_COMPILE_ARG
 ARG MSCCLPP_VERSION
 
 WORKDIR /sgl-workspace
@@ -453,22 +432,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     fi && rm -rf /tmp/wheels/hpc-ops
 
 # Copy flashinfer cubin (always) and jit-cache (if installed) packages
-COPY --from=flashinfer_cache /flashinfer_jit_output/ /usr/local/lib/python3.12/dist-packages/
-
-# Apply the FlashInfer CuTeDSL MLA decode-context-parallel runtime patch.
-# Exclude tests because they are not included in the installed wheel.
-COPY docker/kimi_k3/flashinfer-perkz-dcp-0.6.15.txt /tmp/flashinfer-perkz-dcp-0.6.15.txt
-RUN FLASHINFER_DCP_PATCH=/tmp/flashinfer-perkz-dcp-0.6.15.txt && \
-    FLASHINFER_SITE_PACKAGES="$(python3 -c 'from pathlib import Path; import flashinfer; print(Path(flashinfer.__file__).resolve().parent.parent)')" && \
-    sed '/^diff --git a\/tests\//,$d' "${FLASHINFER_DCP_PATCH}" | \
-      patch --dry-run --batch --forward --strip=1 --directory="${FLASHINFER_SITE_PACKAGES}" && \
-    sed '/^diff --git a\/tests\//,$d' "${FLASHINFER_DCP_PATCH}" | \
-      patch --batch --forward --strip=1 --directory="${FLASHINFER_SITE_PACKAGES}" && \
-    rm -f "${FLASHINFER_DCP_PATCH}" && \
-    rm -rf /root/.cache/flashinfer /root/.cache/pip
-
-# Copy the pinned FlashInfer MXFP4 MoE runner cubin pool
-COPY --from=trtllm_cubin_builder /opt/trtllm_gen_moe_cubin_pool /opt/trtllm_gen_moe_cubin_pool
+COPY --from=flashinfer_cache /flashinfer_jit_output/ /opt/sglang/lib/python3.12/site-packages/
 
 # Copy dev tools
 COPY --from=devtools_builder /tools/diff-so-fancy /usr/local/bin/
@@ -680,11 +644,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
          [ "$success" = "1" ] ) \
     && mkdir -p /root/.cache/huggingface /root/.cache/sglang \
     && ( if [ -f python/kernels.lock ]; then mv python/kernels.lock /root/.cache/sglang/; fi ) \
-    && ( find /usr/local/lib/python3.12/dist-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true )
+    && ( find /opt/sglang/lib/python3.12/site-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true )
 
 
 # Install pre-built gateway artifacts from parallel builder
-COPY --from=gateway_builder /build/sgl-model-gateway-bin /usr/local/bin/sgl-model-gateway
+COPY --from=gateway_builder /build/sgl-model-gateway-bin /opt/sglang/bin/sgl-model-gateway
 COPY --from=gateway_builder /build/gateway_wheels /tmp/gateway_wheels
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --force-reinstall /tmp/gateway_wheels/*.whl \
@@ -734,8 +698,7 @@ ARG GDRCOPY_VERSION=2.5.1
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
-    GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/ \
-    SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL=/opt/trtllm_gen_moe_cubin_pool
+    GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/
 
 # Add GKE default lib and bin locations + CUDA compiler paths for FlashInfer JIT
 ENV PATH="${PATH}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm/bin" \
@@ -790,13 +753,12 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
-    && wget -q https://bootstrap.pypa.io/get-pip.py \
-    && python3 get-pip.py --break-system-packages \
-    && rm get-pip.py \
-    # Allow pip to install packages globally (PEP 668 workaround for Ubuntu 24.04)
-    && python3 -m pip config set global.break-system-packages true \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
+
+# create virtual env for sglang to avoid conflict with system python packages
+RUN python3 -m venv /opt/sglang
+ENV PATH="/opt/sglang/bin:${PATH}"
 
 # Set up locale
 RUN apt-get update && apt-get install -y --no-install-recommends locales \
@@ -819,22 +781,19 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy Python site-packages from framework (already cleaned of __pycache__/tests/pyc files)
-COPY --from=framework_final /usr/local/lib/python3.12/dist-packages /usr/local/lib/python3.12/dist-packages
-
-# Copy the pinned FlashInfer MXFP4 MoE runner cubin pool
-COPY --from=framework_final /opt/trtllm_gen_moe_cubin_pool /opt/trtllm_gen_moe_cubin_pool
+COPY --from=framework_final /opt/sglang/lib/python3.12/site-packages /opt/sglang/lib/python3.12/site-packages
 
 # Copy SGLang workspace
 COPY --from=framework_final /sgl-workspace /sgl-workspace
 
 # Copy sgl-model-gateway binary
-COPY --from=framework_final /usr/local/bin/sgl-model-gateway /usr/local/bin/sgl-model-gateway
+COPY --from=framework_final /opt/sglang/bin/sgl-model-gateway /opt/sglang/bin/sgl-model-gateway
 
 # Copy sglang binary
-COPY --from=framework_final /usr/local/bin/sglang /usr/local/bin/sglang
+COPY --from=framework_final /opt/sglang/bin/sglang /opt/sglang/bin/sglang
 
 # Copy py-spy binary
-COPY --from=framework_final /usr/local/bin/py-spy /usr/local/bin/py-spy
+COPY --from=framework_final /opt/sglang/bin/py-spy /opt/sglang/bin/py-spy
 
 # Copy cache for kernels from kernels community
 COPY --from=framework_final /root/.cache/huggingface /root/.cache/huggingface
