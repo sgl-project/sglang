@@ -151,6 +151,26 @@ _SHAPES = (
 if torch.cuda.is_available():
     _SHAPES = _SHAPES + (("deepseek_dsa", _DEEPSEEK_MINI_CONFIG, {}),)
 
+# Since #34662 made cuda_ipc opt-in, no auto-resolution reaches the handler's
+# cuda_ipc arm any more -- an explicit request is the only way in, so without
+# this shape that arm (two raises and the pool-budget logging) is resolved by
+# nothing in this file. It is also the only shape whose env write differs from
+# what the *next* resolution would pick on its own, which is what keeps the
+# sticky-carry assertion in `test_a_resolution_does_not_leak_into_the_next`
+# from being vacuous. Gated on `is_cuda()` rather than
+# `torch.cuda.is_available()`: the handler raises for cuda_ipc off NVIDIA CUDA,
+# ROCm included.
+_CUDA_IPC_SHAPES = ()
+if is_cuda():
+    _CUDA_IPC_SHAPES = (
+        (
+            "multimodal_cuda_ipc",
+            _MULTIMODAL_MINI_CONFIG,
+            dict(mm_feature_transport="cuda_ipc"),
+        ),
+    )
+    _SHAPES = _SHAPES + _CUDA_IPC_SHAPES
+
 # The one field a previous resolution genuinely dictates for the next one in
 # this process: `_handle_multimodal_feature_transport` writes
 # SGLANG_USE_CUDA_IPC_TRANSPORT so tokenizer workers inherit the decision, and
@@ -298,6 +318,11 @@ class TestResolutionIsReproducible(CustomTestCase):
             ("multimodal", _MULTIMODAL_MINI_CONFIG, {}),
             ("torch_compile", _MINI_CONFIG, dict(enable_torch_compile=True)),
         )
+        # Auto-resolution picks cpu on every runner this case runs on now that
+        # cuda_ipc is opt-in, so the auto shape above writes what the next
+        # resolution would have picked anyway; the explicit shape is what makes
+        # the carry observable at all.
+        intermediates += _CUDA_IPC_SHAPES
         if torch.cuda.is_available():
             # Same device gate as _SHAPES: the DSA arm probes the device
             # capability during resolution.
@@ -321,7 +346,7 @@ class TestResolutionIsReproducible(CustomTestCase):
                 # against `default_before`, so clearing it here does not skew
                 # that comparison.
                 envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
-                self._resolved(self._config_dir(config), **kwargs)
+                intermediate = self._resolved(self._config_dir(config), **kwargs)
                 after = self._resolved(model_path)
                 without_sticky = lambda snapshot: {
                     k: v
@@ -332,15 +357,21 @@ class TestResolutionIsReproducible(CustomTestCase):
                     without_sticky(self._comparable(after)),
                     without_sticky(self._comparable(default_before)),
                 )
-                if label == "multimodal":
-                    # And the documented exception, asserted rather than
-                    # assumed: the multimodal handler's env write does reach
-                    # the next resolution. What it carries is the
-                    # intermediate's own device-dependent selection — cuda_ipc
-                    # on single-node CUDA, cpu on the CPU/ROCm runners (the
-                    # same `is_cuda()` gate the handler branches on).
-                    expected = "cuda_ipc" if is_cuda() else "cpu"
-                    self.assertEqual(after.mm_feature_transport, expected)
+                # And the documented exception, asserted rather than assumed,
+                # for every intermediate: each one runs the transport handler,
+                # so each one writes the variable the next resolution reads.
+                # What carries is the legacy *boolean*, not the tri-state field
+                # -- the handler writes 1 only for cuda_ipc -- so every other
+                # selection comes back as cpu, which is what keeps this honest
+                # if a cuda_vmm shape is ever added (its carry is cpu, not
+                # cuda_vmm). The `cuda_ipc` shape is the one whose carry
+                # differs from the cpu that `default_before` resolved to.
+                expected = (
+                    "cuda_ipc"
+                    if intermediate.mm_feature_transport == "cuda_ipc"
+                    else "cpu"
+                )
+                self.assertEqual(after.mm_feature_transport, expected)
 
     def test_resolving_a_sibling_leaves_the_first_alone(self):
         for label, config, kwargs in _SHAPES:
@@ -369,6 +400,60 @@ class TestResolutionIsReproducible(CustomTestCase):
         # And the first record's own list is untouched by the second
         # resolution -- a shared mutable would show up here.
         self.assertEqual(getattr(first, "_resolved_overrides", None), first_provenance)
+
+
+class TestTheResolutionSeamHasOneCaller(CustomTestCase):
+    """The pipeline is entered from exactly one place.
+
+    Step 12 moves the call from ``__post_init__`` to ``publish`` so the record
+    stays raw; that is a one-line move only while the seam has a single caller.
+    A second entry point would also mean resolution could run twice on one
+    instance, which the strict ``__setattr__`` guard turns into an
+    ``AttributeError`` rather than a silent re-resolve.
+    """
+
+    def test_only_post_init_runs_the_pipeline(self):
+        import ast
+        from pathlib import Path
+
+        import sglang
+
+        package_root = Path(next(iter(sglang.__path__)))
+        callers = []
+        for path in sorted(package_root.rglob("*.py")):
+            try:
+                tree = ast.parse(path.read_text())
+            except SyntaxError:
+                continue
+            # The full (class, function, ...) scope chain, so the assertion can
+            # say "the one caller is ServerArgs.__post_init__" -- not merely
+            # that nothing outside a function named __post_init__ calls it.
+            scopes = {}
+            for node in ast.walk(tree):
+                own = scopes.get(id(node), ())
+                if isinstance(
+                    node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+                ):
+                    own = own + (node.name,)
+                for child in ast.iter_child_nodes(node):
+                    scopes[id(child)] = own
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "_run_resolution_pipeline"
+                ):
+                    rel = path.relative_to(package_root).as_posix()
+                    callers.append((rel, ".".join(scopes.get(id(node), ()))))
+        # Every call, compared whole: a removed call, a duplicate inside
+        # __post_init__, or another class growing a same-named __post_init__
+        # all show up here.
+        self.assertEqual(
+            [("srt/server_args.py", "ServerArgs.__post_init__")],
+            callers,
+            "the resolution pipeline must be entered exactly once, from "
+            f"ServerArgs.__post_init__; found: {callers}",
+        )
 
 
 if __name__ == "__main__":

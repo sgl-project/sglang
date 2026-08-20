@@ -1401,7 +1401,7 @@ def main():
             "- **Full CI rerun** (with extra coverage): add the `run-ci` or "
             "`run-ci-extra` label and push a new commit (or use `/tag-and-rerun-ci`).\n\n"
             "**AMD CI**: stage-level dispatch is still available via "
-            "Actions UI → *PR Test (AMD)* / *PR Test ROCm 7.2 (AMD)* → "
+            "Actions UI → *PR Test ROCm 7.2 (AMD)* (default) / *PR Test ROCm 7.0 (AMD)* → "
             "*Run workflow* → pick a stage from the dropdown."
         )
 

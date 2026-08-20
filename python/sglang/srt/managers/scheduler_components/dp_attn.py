@@ -137,10 +137,14 @@ class MLPSyncBatchInfo:
         local_info_tensor = self._get_local_tensor(device=device)
         fallback_tensor = self._get_fallback_tensor(device=device)
         info_width = local_info_tensor.numel()
-        # Inactive max_world_size slots must decode as IDLE.
-        global_info_tensor = fallback_tensor.expand(
-            self.dp_size, self.tp_size * self.cp_size, info_width
-        ).contiguous()
+        # Inactive max_world_size slots must decode as IDLE. repeat() (not
+        # expand().contiguous()) so the buffer never aliases fallback_tensor:
+        # at world size 1 the expanded view is already contiguous, contiguous()
+        # is a no-op, and the masked fallback writes below would then read and
+        # write the same storage.
+        global_info_tensor = fallback_tensor.repeat(
+            self.dp_size, self.tp_size * self.cp_size, 1
+        )
 
         if use_all_reduce:
             # Admission can expose different WORLD sizes; use fixed global slots.

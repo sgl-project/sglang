@@ -7,7 +7,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import GLM_4_6V_FLASH_MOD
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
-    est_time=3600,
+    est_time=4800,
     suite="",
     nightly=True,
     disabled="performance testcase",

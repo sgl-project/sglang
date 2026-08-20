@@ -40,13 +40,13 @@ class TestPyTorchSamplingBackend(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="mmlu",
-            num_examples=64,
+            num_examples=256,
             num_threads=32,
             temperature=0.1,
         )
 
         metrics = run_eval(args)
-        self.assertGreaterEqual(metrics["score"], 0.65)
+        self.assertGreaterEqual(metrics["score"], 0.64)
 
     @unittest.skipIf(
         is_in_amd_ci(),

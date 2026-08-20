@@ -5,6 +5,7 @@ import os
 import sys
 import warnings
 
+from sglang.srt.plugins import load_plugins
 from sglang.srt.server_args import prepare_server_args
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.common import suppress_noisy_warnings
@@ -60,8 +61,6 @@ if __name__ == "__main__":
         UserWarning,
         stacklevel=1,
     )
-
-    from sglang.srt.plugins import load_plugins
 
     load_plugins()
 

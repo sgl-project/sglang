@@ -13,7 +13,7 @@ import multiprocessing as mp
 import os
 import time
 from contextlib import ExitStack
-from typing import Any, List, Union
+from typing import Any, List, Optional, Union
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
@@ -547,6 +547,7 @@ class DiffGenerator:
         target: Union[str, List[str]] = "all",
         strength: Union[float, List[float]] = 1.0,
         merge_mode: str | None = None,
+        lora_alpha: Optional[Union[int, List[Optional[int]]]] = None,
     ) -> None:
         """
         Set LoRA adapter(s) for the specified transformer(s).
@@ -563,6 +564,7 @@ class DiffGenerator:
                 - "critic": Apply only to the critic model
             strength: LoRA strength(s) for merge, default 1.0. Can be a float or a list of floats.
             merge_mode: Optional LoRA merge mode: "auto", "merge", or "dynamic".
+            lora_alpha: Training alpha override for adapters that omit it from metadata.
         """
         req = SetLoraReq(
             lora_nickname=lora_nickname,
@@ -570,6 +572,7 @@ class DiffGenerator:
             target=target,
             strength=strength,
             merge_mode=merge_mode,
+            lora_alpha=lora_alpha,
         )
         nickname_str, target_str, strength_str = format_lora_message(
             lora_nickname, target, strength

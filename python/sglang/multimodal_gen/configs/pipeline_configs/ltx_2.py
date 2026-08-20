@@ -178,6 +178,10 @@ class LTX2PipelineConfig(PipelineConfig):
     generator_device: str = "cpu"
     dit_config: LTX2Config = field(default_factory=LTX2Config)
 
+    # Distilled checkpoints are trained against one fixed sigma schedule rather
+    # than a step count. When set, it replaces the derived schedule.
+    default_sigmas: tuple[float, ...] | None = None
+
     # Model architecture
     in_channels: int = 128
     out_channels: int = 128
@@ -309,6 +313,9 @@ class LTX2PipelineConfig(PipelineConfig):
             self.patch_size,
         )
         latents = latents.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(4, 7).flatten(1, 3)
+        # Deliberately left non-contiguous: both flattens are views, so this
+        # keeps the permuted strides. Normalising here would change which GEMM
+        # kernel runs and move bf16 output. The fp8 path makes its own copy.
         return latents
 
     def _infer_video_latent_frames_and_tokens_per_frame(

@@ -19,15 +19,16 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+    cast_q_fp8_for_q8kv8_prefill,
     dequantize_k_cache_paged,
+    fp8_dtype,
+    gather_dequant_requant_fp8_paged,
+    q8kv8_padded_num_heads,
 )
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
 from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPController
-from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
-    quant_to_nope_fp8_rope_bf16_pack_triton,
-)
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
@@ -41,7 +42,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
-    SharedReadBoundary,
+    SharedReadEnds,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
@@ -59,8 +60,12 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillWorkspace,
+    use_dsv4_q8kv8_sparse_prefill,
 )
-from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
+from sglang.srt.layers.attention.verify_mask import (
+    VerifyMask,
+    maybe_create_verify_mask,
+)
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -68,13 +73,12 @@ from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
-    compute_ragged_extend_lengths,
     compute_target_verify_graph_key,
     compute_uniform_extend_lengths,
     read_ragged_verify_mode,
     resolve_ragged_verify_layout,
 )
-from sglang.srt.utils import ceil_align, is_cuda, is_xpu
+from sglang.srt.utils import ceil_align, is_cuda, is_sm90_supported, is_xpu
 from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
@@ -504,11 +508,15 @@ class DeepseekV4AttnBackend(
     supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False
 
-    def shared_read_boundary(self, forward_mode: ForwardMode) -> SharedReadBoundary:
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Breakable-graph verify rereads shared state across segments.
-        if forward_mode.is_target_verify():
-            return SharedReadBoundary.POST_REPLAY
-        return super().shared_read_boundary(forward_mode)
+        # DSPARK verify replays one full (non-breakable) graph that honors the
+        # out-graph/in-graph init contract, so the base IN_REPLAY bound holds.
+        if fm.is_target_verify():
+            if self.model_runner.spec_algorithm.is_dspark():
+                return SharedReadEnds.IN_REPLAY
+            return SharedReadEnds.POST_REPLAY
+        return super().shared_read_ends(fm)
 
     def __init__(
         self,
@@ -552,6 +560,22 @@ class DeepseekV4AttnBackend(
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
+        self.dsv4_prefill_backend: str = getattr(
+            model_runner.server_args, "dsv4_prefill_backend", "auto"
+        )
+        if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
+            if not is_sm90_supported():
+                raise ValueError(
+                    "DeepSeek-V4 flashmla_sparse_q8 prefill requires SM90 CUDA GPUs."
+                )
+            if self.head_dim_v != 512:
+                raise ValueError(
+                    "DeepSeek-V4 flashmla_sparse_q8 prefill requires d_v=512, "
+                    f"got {self.head_dim_v}."
+                )
+        self._q8kv8_qpad_buf = None
+        self._q8kv8_attn_sink_pad = None
+        self._q8kv8_identity_scale = None
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0
@@ -582,14 +606,13 @@ class DeepseekV4AttnBackend(
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
         spec_alg = model_runner.spec_algorithm
         self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
-            not _is_cuda
-            or not envs.SGLANG_PREP_IN_CUDA_GRAPH.get()
-            or self.online_c128_mtp.enabled()
+            not _is_cuda or self.online_c128_mtp.enabled()
         )
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
+        self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -691,38 +714,10 @@ class DeepseekV4AttnBackend(
             req_pool_indices.shape[0] == seq_lens.shape[0] == out_cache_loc.shape[0]
         ), f"{req_pool_indices.shape=} {seq_lens.shape=} {out_cache_loc.shape=}"
 
-        if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
-            return DSV4RawDecodeMetadata(
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out_cache_loc=out_cache_loc,
-            )
-
-        core_attn_metadata = self.make_core_attn_metadata(
-            req_to_token=self.req_to_token,
-            req_pool_indices_repeated=req_pool_indices,
-            seq_lens_casual=seq_lens,
-            max_seq_len=max_seq_len,
-            out_loc=out_cache_loc,
-            need_compress=True,
-        )
-
-        indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
-
-        create = functools.partial(
-            create_paged_compressor_data,
-            is_prefill=False,
-            token_to_kv_pool=self.token_to_kv_pool,
-            req_to_token=self.req_to_token,
+        return DSV4RawDecodeMetadata(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-        )
-
-        return DSV4Metadata(
-            core_attn_metadata,
-            indexer_metadata,
-            c4_compress_metadata=create(compress_ratio=4),
-            c128_compress_metadata=create(compress_ratio=128),
+            out_cache_loc=out_cache_loc,
         )
 
     def init_forward_metadata_prefill(
@@ -841,108 +836,44 @@ class DeepseekV4AttnBackend(
         online_c128_state_slot_offset: int = 0,
         ragged_layout: Optional[RaggedVerifyLayout] = None,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
-        if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
-            assert out_cache_loc is not None
-            bs = len(seq_lens)
-            if self.needs_cpu_seq_lens:
-                assert seq_lens_cpu is not None
-                seq_lens_cpu_list = seq_lens_cpu.tolist()
-            else:
-                seq_lens_cpu_list = None
-            if ragged_layout is None:
-                self.extend_seq_lens_buffer[:bs].fill_(
-                    self.speculative_num_draft_tokens
-                )
-                extend_seq_lens = self.extend_seq_lens_buffer[:bs]
-                extend_start_loc = None
-                verify_lens = None
-                total_verify_tokens = self.speculative_num_draft_tokens * bs
-            else:
-                self.extend_seq_lens_buffer[:bs].copy_(ragged_layout.verify_lens)
-                self.extend_start_loc_buffer[:bs].copy_(ragged_layout.extend_start_loc)
-                extend_seq_lens = self.extend_seq_lens_buffer[:bs]
-                extend_start_loc = self.extend_start_loc_buffer[:bs]
-                verify_lens = self.extend_seq_lens_buffer[:bs]
-                total_verify_tokens = ragged_layout.graph_num_tokens
-
-            return DSV4RawVerifyMetadata(
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out_cache_loc=out_cache_loc,
-                extend_seq_lens=extend_seq_lens,
-                seq_lens_cpu=seq_lens_cpu_list,
-                c128_compress_metadata=self._make_target_verify_c128_metadata(
-                    req_pool_indices,
-                    seq_lens,
-                    seq_lens_cpu_list,
-                    extend_seq_lens,
-                    use_prefill_cuda_graph,
-                    online_c128_state_slot_offset,
-                ),
-                extend_start_loc=extend_start_loc,
-                verify_lens=verify_lens,
-                total_verify_tokens=total_verify_tokens,
-            )
+        assert out_cache_loc is not None
+        bs = len(seq_lens)
+        if self.needs_cpu_seq_lens:
+            assert seq_lens_cpu is not None
+            seq_lens_cpu_list = seq_lens_cpu.tolist()
         else:
-            seq_lens_cpu_list = (
-                seq_lens_cpu.tolist() if seq_lens_cpu is not None else seq_lens.tolist()
-            )
-            return self.init_forward_metadata_target_verify_old(
-                max_seq_len=max_seq_len,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu_list,
-                out_cache_loc=out_cache_loc,
-                use_prefill_cuda_graph=use_prefill_cuda_graph,
-                online_c128_state_slot_offset=online_c128_state_slot_offset,
-                ragged_layout=ragged_layout,
-            )
-
-    def init_forward_metadata_target_verify_old(
-        self,
-        max_seq_len: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: Optional[List[int]] = None,
-        out_cache_loc: Optional[torch.Tensor] = None,
-        use_prefill_cuda_graph: bool = False,
-        online_c128_state_slot_offset: int = 0,
-        ragged_layout: Optional[RaggedVerifyLayout] = None,
-    ) -> DSV4Metadata:
+            seq_lens_cpu_list = None
         if ragged_layout is None:
-            lengths = compute_uniform_extend_lengths(
-                seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu,
-                extend_len=self.speculative_num_draft_tokens,
-            )
-            extend_seq_lens = self._move_to_device(lengths.extend_seq_lens_cpu)
+            self.extend_seq_lens_buffer[:bs].fill_(self.speculative_num_draft_tokens)
+            extend_seq_lens = self.extend_seq_lens_buffer[:bs]
+            extend_start_loc = None
+            verify_lens = None
+            total_verify_tokens = self.speculative_num_draft_tokens * bs
         else:
-            lengths = compute_ragged_extend_lengths(
-                seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu,
-                ragged_layout=ragged_layout,
-            )
-            extend_seq_lens = ragged_layout.verify_lens
-        seq_lens = lengths.seq_lens_extended
-        seq_lens_cpu = lengths.seq_lens_cpu_extended
-        extend_seq_lens_cpu = lengths.extend_seq_lens_cpu
-        num_tokens = lengths.num_tokens
-        extend_start_loc = lengths.extend_start_loc
-        if out_cache_loc is None:
-            out_cache_loc = seq_lens.new_zeros(num_tokens)
-        return self.init_forward_metadata_prefill(
-            max_seq_len=max_seq_len,
+            self.extend_seq_lens_buffer[:bs].copy_(ragged_layout.verify_lens)
+            self.extend_start_loc_buffer[:bs].copy_(ragged_layout.extend_start_loc)
+            extend_seq_lens = self.extend_seq_lens_buffer[:bs]
+            extend_start_loc = self.extend_start_loc_buffer[:bs]
+            verify_lens = self.extend_seq_lens_buffer[:bs]
+            total_verify_tokens = ragged_layout.graph_num_tokens
+
+        return DSV4RawVerifyMetadata(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
             out_cache_loc=out_cache_loc,
-            num_tokens=num_tokens,
             extend_seq_lens=extend_seq_lens,
-            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            seq_lens_cpu=seq_lens_cpu_list,
+            c128_compress_metadata=self._make_target_verify_c128_metadata(
+                req_pool_indices,
+                seq_lens,
+                seq_lens_cpu_list,
+                extend_seq_lens,
+                use_prefill_cuda_graph,
+                online_c128_state_slot_offset,
+            ),
             extend_start_loc=extend_start_loc,
-            need_compress=True,
-            use_prefill_cuda_graph=use_prefill_cuda_graph,
-            online_c128_state_slot_offset=online_c128_state_slot_offset,
+            verify_lens=verify_lens,
+            total_verify_tokens=total_verify_tokens,
         )
 
     def init_forward_metadata_dspark_draft_block(
@@ -1094,6 +1025,13 @@ class DeepseekV4AttnBackend(
     ) -> DSV4Metadata:
         batch_size = len(seq_lens)
         num_tokens = num_tokens_per_req * batch_size
+        swa_out_cache_loc = self._fill_cuda_graph_swa_out_cache_loc(out_cache_loc)
+        if swa_out_cache_loc is None and out_cache_loc is not None:
+            # Eager-only miss (no graph state / oversized batch): translate once
+            # per step instead of per layer at store time.
+            swa_out_cache_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                out_cache_loc
+            ).to(torch.int32)
         if out_cache_loc is None:
             out_cache_loc = seq_lens.new_zeros(num_tokens)
 
@@ -1116,10 +1054,35 @@ class DeepseekV4AttnBackend(
             need_compress=False,
             is_prefill=True,
         )
+        if swa_out_cache_loc is not None:
+            # Captures store_cache's cached path instead of a per-layer
+            # in-graph mapping translate.
+            core_attn_metadata.swa_out_cache_loc = swa_out_cache_loc
         return DSV4Metadata(
             core_attn_metadata=core_attn_metadata,
             indexer_metadata=None,
         )
+
+    def _fill_cuda_graph_swa_out_cache_loc(
+        self, out_cache_loc: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        # None (buffer absent / too small) is an eager-only miss: capture and
+        # replay always fit the pre-sized buffer.
+        buf = self.cuda_graph_swa_out_cache_loc
+        if (
+            buf is None
+            or out_cache_loc is None
+            or out_cache_loc.shape[0] > buf.shape[0]
+        ):
+            return None
+        n = out_cache_loc.shape[0]
+        buf[n:].zero_()
+        buf[:n].copy_(
+            self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
+                torch.int32
+            )
+        )
+        return buf[:n]
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         # Upgrade Raw->Full so the c4/c128 compress + core_attn + indexer
@@ -1540,6 +1503,12 @@ class DeepseekV4AttnBackend(
         self.draft_extend_num_tokens_per_req = (
             max_num_tokens // max_bs if max_bs > 0 else 1
         )
+        if self.is_draft_runner:
+            # Draft-extend SWA write-target buffer; bound as a [:num_tokens]
+            # view and refilled outside the graph each step.
+            self.cuda_graph_swa_out_cache_loc = torch.zeros(
+                max_num_tokens, dtype=torch.int32, device=self.device
+            )
         # Verify metadata never extracts the mask. No skip_prefill notion here.
         self._verify_mask = maybe_create_verify_mask(
             is_draft_runner=self.is_draft_runner,
@@ -1596,15 +1565,12 @@ class DeepseekV4AttnBackend(
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Resolve the SWA KV-store write target for the current forward.
 
-        Fast path: the per-forward value cached by init_forward_metadata_in_graph
-        (recorded inside cuda graphs, so replay re-reads live buffers). Fallback:
-        translate at store time, matching the pre-cache behavior, for paths that
-        never run the in-graph init — eager idle (forward_idle skips attn init),
-        runners that only run the out-graph prep (e.g.
-        EAGLEDraftExtendCudaGraphRunner) — or whose batch was re-padded after
-        init (shape mismatch). Idle always falls back: its metadata is absent or
-        left over from a previous forward, and translating the zero-padded
-        out_cache_loc writes to the dummy slot.
+        Prefer the value cached by the metadata init: in-graph for
+        decode/verify, the hoisted cuda_graph_swa_out_cache_loc buffer for
+        draft-extend. Translate at store time when nothing matching is cached
+        (paths that skip the init, or a batch re-padded after init). Idle
+        always falls back: its metadata may be stale, and
+        translating the zero-padded out_cache_loc writes to the dummy slot.
         """
         out_cache_loc = forward_batch.out_cache_loc
         core = getattr(self.forward_metadata, "core_attn_metadata", None)
@@ -1623,19 +1589,11 @@ class DeepseekV4AttnBackend(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
         swa_loc = self.get_swa_out_cache_loc(forward_batch)
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
-            self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
-                layer_id=layer_id,
-                swa_loc=swa_loc,
-                cache_k=swa_k,
-            )
-        else:
-            swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
-            self.token_to_kv_pool.set_swa_key_buffer_radix(
-                layer_id=layer_id,
-                swa_loc=swa_loc,
-                cache_nope_fp8_rope_bf16_pack=swa_k_pack,
-            )
+        self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
+            layer_id=layer_id,
+            swa_loc=swa_loc,
+            cache_k=swa_k,
+        )
 
     def forward(
         self,
@@ -1739,6 +1697,16 @@ class DeepseekV4AttnBackend(
                     or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
                 )
             ):
+                if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
+                    return self._forward_prefill_sparse_q8kv8(
+                        q=q,
+                        layer_id=layer_id,
+                        compress_ratio=compress_ratio,
+                        forward_batch=forward_batch,
+                        token_to_kv_pool=token_to_kv_pool,
+                        core_attn_metadata=core_attn_metadata,
+                        attn_sink=attn_sink,
+                    )
                 return self._forward_prefill_sparse(
                     q=q,
                     layer_id=layer_id,
@@ -1912,6 +1880,216 @@ class DeepseekV4AttnBackend(
             topk_length=combined_lens,
         )
         return o
+
+    def _prepare_q8kv8_q_and_sink(
+        self,
+        q: torch.Tensor,
+        attn_sink: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """Pad TP-local heads to the SM90 kernel's 64-head CTA granularity."""
+        num_tokens, num_heads, head_dim = q.shape
+        padded_heads = q8kv8_padded_num_heads(num_heads)
+
+        qpad = getattr(self, "_q8kv8_qpad_buf", None)
+        if (
+            qpad is None
+            or qpad.shape[0] < num_tokens
+            or qpad.shape[1] != padded_heads
+            or qpad.shape[2] != head_dim
+            or qpad.device != q.device
+        ):
+            qpad = torch.empty(
+                (num_tokens, padded_heads, head_dim),
+                dtype=fp8_dtype,
+                device=q.device,
+            )
+            self._q8kv8_qpad_buf = qpad
+
+        qpad = qpad[:num_tokens]
+
+        q_fp8, _ = cast_q_fp8_for_q8kv8_prefill(
+            q,
+            padded_num_heads=padded_heads,
+            out=qpad,
+        )
+
+        sink_pad = getattr(self, "_q8kv8_attn_sink_pad", None)
+        if (
+            sink_pad is None
+            or sink_pad.shape != (padded_heads,)
+            or sink_pad.device != q.device
+        ):
+            sink_pad = torch.zeros(padded_heads, dtype=torch.float32, device=q.device)
+            self._q8kv8_attn_sink_pad = sink_pad
+
+        sink_pad[:num_heads].copy_(attn_sink.reshape(-1)[:num_heads])
+        if padded_heads > num_heads:
+            sink_pad[num_heads:].zero_()
+
+        scale = getattr(self, "_q8kv8_identity_scale", None)
+        if scale is None or scale.device != q.device:
+            scale = torch.ones((), dtype=torch.float32, device=q.device)
+            self._q8kv8_identity_scale = scale
+
+        return q_fp8, sink_pad, scale, num_heads
+
+    def _forward_prefill_sparse_q8kv8(
+        self,
+        q: torch.Tensor,
+        layer_id: int,
+        compress_ratio: Literal[0, 4, 128],
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        core_attn_metadata: DSV4AttnMetadata,
+        attn_sink: torch.Tensor,
+    ) -> torch.Tensor:
+        """Experimental DeepSeek-V4 sparse prefill path using Q8KV8 kernels.
+
+        This mirrors ``_forward_prefill_sparse``'s cache/index construction, but
+        writes the gathered KV workspace as FP8 and calls the SM90 Q8KV8 sparse
+        prefill kernel. The path is selected by ``--dsv4-prefill-backend
+        flashmla_sparse_q8``; ``SGLANG_DSV4_Q8KV8_PREFILL`` remains as a debug
+        override for focused runtime validation.
+        """
+
+        from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
+            sparse_mla_q8kv8_prefill_fwd,
+        )
+
+        q_flat = q.squeeze(1)
+        if q_flat.ndim != 3:
+            raise ValueError(
+                f"Q8KV8 sparse prefill expects 3D Q after squeeze, got {q_flat.shape}"
+            )
+
+        if attn_sink.numel() != q_flat.shape[1]:
+            raise ValueError(
+                f"attn_sink has {attn_sink.numel()} heads but Q has "
+                f"{q_flat.shape[1]} local heads"
+            )
+
+        q_fp8, attn_sink_pad, identity_scale, active_heads = (
+            self._prepare_q8kv8_q_and_sink(q_flat, attn_sink)
+        )
+
+        if not getattr(self, "_q8kv8_sparse_prefill_log_emitted", False):
+            logger.info(
+                "DSV4_Q8KV8_SPARSE_PREFILL_HIT layer_id=%s "
+                "compress_ratio=%s q_shape=%s padded_heads=%s d_v=%s",
+                layer_id,
+                compress_ratio,
+                tuple(q_flat.shape),
+                q_fp8.shape[1],
+                self.head_dim_v,
+            )
+            self._q8kv8_sparse_prefill_log_emitted = True
+
+        cache = self.forward_metadata.sparse_prefill_cache
+        if cache is None:
+            seq_lens_cpu = forward_batch.seq_lens_cpu
+            assert seq_lens_cpu is not None
+            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+            assert extend_seq_lens_cpu is not None
+            total_swa = sum(
+                min(int(seq_len), int(extend_len) + SWA_WINDOW - 1)
+                for seq_len, extend_len in zip(
+                    seq_lens_cpu.tolist(), extend_seq_lens_cpu, strict=True
+                )
+            )
+            cache = SparsePrefillChunkCache.build(
+                seq_lens=forward_batch.seq_lens.to(torch.int32),
+                extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
+                req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
+                req_to_token=self.req_to_token,
+                full_to_swa=token_to_kv_pool.full_to_swa_index_mapping,
+                swa_window_size=SWA_WINDOW,
+                swa_page_size=token_to_kv_pool.swa_window_size,
+                num_qo_tokens=q_flat.shape[0],
+                max_seq_len=int(seq_lens_cpu.max().item()),
+                total_swa=total_swa,
+            )
+            self.forward_metadata.sparse_prefill_cache = cache
+
+        compressed_slice = None
+        extra_k_cache = None
+        extra_page_size = None
+        flat_token_ids = None
+
+        if compress_ratio == 0:
+            workspace = self.sparse_prefill_workspace.get(
+                cache.swa_token_ids.shape[0] + 1,
+                dtype=fp8_dtype,
+            )
+            combined_indices = cache.c0_combined_indices
+            combined_lens = cache.c0_combined_lens
+            swa_slice = workspace
+        else:
+            extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
+            extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
+
+            if compress_ratio == 128:
+                assert core_attn_metadata.c128_page_indices is not None
+                cache.ensure_c128(core_attn_metadata.c128_page_indices)
+                flat_token_ids = cache.c128_flat_token_ids
+                combined_indices = cache.c128_combined_indices
+                combined_lens = cache.c128_combined_lens
+            else:
+                assert core_attn_metadata.c4_sparse_raw_indices is not None, (
+                    "Q8KV8 sparse-prefill c4 path requires c4_sparse_raw_indices "
+                    "(allocated in init_flashmla_related when is_prefill=True)"
+                )
+                cache.ensure_c4(core_attn_metadata.page_table, extra_page_size)
+                flat_token_ids = cache.c4_flat_token_ids
+                combined_indices, combined_lens = cache.combine_c4_layer(
+                    c4_sparse_raw_indices=core_attn_metadata.c4_sparse_raw_indices[
+                        : cache.num_qo_tokens
+                    ],
+                )
+
+            n_compressed = flat_token_ids.shape[0]
+            workspace = self.sparse_prefill_workspace.get(
+                n_compressed + cache.swa_token_ids.shape[0] + 1,
+                dtype=fp8_dtype,
+            )
+            compressed_slice = workspace[:n_compressed]
+            swa_slice = workspace[n_compressed:]
+
+        if compressed_slice is not None:
+            gather_dequant_requant_fp8_paged(
+                extra_k_cache,
+                flat_token_ids,
+                page_size=extra_page_size,
+                out=compressed_slice,
+            )
+
+        gather_dequant_requant_fp8_paged(
+            token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+            cache.swa_token_ids,
+            page_size=cache.swa_page_size,
+            extra_rows=1,
+            out=swa_slice,
+        )
+
+        sentinel_row = workspace.shape[0] - 1
+        q8_indices = torch.where(
+            combined_indices < 0,
+            torch.full_like(combined_indices, sentinel_row),
+            combined_indices,
+        )
+
+        o, _, _ = sparse_mla_q8kv8_prefill_fwd(
+            q=q_fp8,
+            kv=workspace,
+            indices=q8_indices.unsqueeze(1),
+            sm_scale=self.softmax_scale,
+            q_scale=identity_scale,
+            kv_scale=identity_scale,
+            d_v=self.head_dim_v,
+            attn_sink=attn_sink_pad,
+            topk_length=combined_lens,
+        )
+
+        return o[:, :active_heads]
 
     def expand_prefill_casually(
         self,

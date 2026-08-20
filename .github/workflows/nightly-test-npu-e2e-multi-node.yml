@@ -59,6 +59,11 @@ on:
         type: string
         default: ""
         description: "The transformers version number for running sglang. Use default version in image if keep empty."
+      run_start_metadata:
+        required: false
+        type: string
+        default: '{}'
+        description: 'JSON run metadata {branch_label, workflow_name, create_time}, recorded once at workflow start'
 
 concurrency:
   group: ascend-nightly-multi-node-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_config_name }}
@@ -135,14 +140,28 @@ jobs:
           fi
 
           # prepare for output data
-          current_date=$(date +%Y%m%d)
-          test_data_output_path=/root/.cache/tests/output/${{ inputs.test_type }}/${current_date}
-          mkdir -p ${test_data_output_path}
           tc_name=${test_case##*/}
           tc_name=${tc_name%.*}
-          metrics_data_path=${test_data_output_path}/${tc_name}
-          mkdir -p ${metrics_data_path}
-          echo "Metrics file path: ${metrics_data_path}"
+
+          # Provided automatically by the GitHub server.
+          # run_id is the unique identifier for the workflow run,
+          # attempt represents the re‑run attempt count of the job.
+          run_id=${{ github.run_id }}
+          run_attempt=${{ github.run_attempt }}
+
+          # Parse run metadata (branch_label / workflow_name / create_time)
+          # from run_start_metadata JSON input using GitHub fromJson expression, same as partitions input.
+          branch_label=$(echo "${{ fromJson(inputs.run_start_metadata).branch_label }}" | tr '/:' '--')
+          workflow_name=$(echo "${{ fromJson(inputs.run_start_metadata).workflow_name }}" | tr ' ' '_' | tr -d '()')
+          create_time="${{ fromJson(inputs.run_start_metadata).create_time }}"
+          if [ -z "${create_time}" ]; then create_time=$(date -u -d '+8 hours' +%Y%m%d-%H%M); fi
+
+          # Print persistence‑directory‑prefix variables
+          echo "Persistence prefix: run_id=${run_id} run_attempt=${run_attempt} branch_label=${branch_label} workflow_name=${workflow_name} create_time=${create_time}"
+
+          sglang_test_results_output_path=/root/.cache/tests/output/${branch_label}-${create_time}-${run_id}-${run_attempt}/${workflow_name}/${{ inputs.test_type }}/${tc_name}
+          mkdir -p ${sglang_test_results_output_path}
+          echo "Metrics file path: ${sglang_test_results_output_path}"
 
           prefill_decode_deployment="${{ inputs.prefill_decode_deployment }}"
           kube_job_type=""
@@ -161,7 +180,7 @@ jobs:
             --env ci \
             --image ${{ inputs.image }} \
             --sglang-source-relative-path ${sglang_source_relative_path} \
-            --metrics-data-file ${metrics_data_path} \
+            --metrics-data-file ${sglang_test_results_output_path} \
             --test-case ${test_case} \
             --kube-name-space ${NAMESPACE} \
             --kube-job-type ${kube_job_type} \
@@ -189,7 +208,7 @@ jobs:
             echo "Install sglang from source."
             CMD="${CMD} --install-sglang-from-source"
             commit_id=${{ github.sha }}
-            echo "commit id: ${commit_id}" > ${test_data_output_path}/commit_id
+            echo "commit id: ${commit_id}" > "$(dirname "${sglang_test_results_output_path}")/commit_id"
           else
             echo "Use sglang from image: ${{ inputs.image }}"
           fi

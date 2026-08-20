@@ -8,13 +8,21 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def _make_processor(server_mode: str = "full") -> SchedulerBatchResultProcessor:
+def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProcessor:
+    # The server-side hidden-state ceiling is a bag leaf.
+    override = get_context().override_server_args(
+        enable_return_hidden_states=True,
+        return_hidden_states_mode=server_mode,
+    )
+    override.install()
+    case.addCleanup(override.restore)
     metrics_reporter = Mock()
     metrics_reporter.num_generated_tokens = 0
     metrics_reporter.forward_ct_decode = 0
@@ -26,8 +34,6 @@ def _make_processor(server_mode: str = "full") -> SchedulerBatchResultProcessor:
         server_args=SimpleNamespace(
             enable_metrics=False,
             enable_hisparse=False,
-            enable_return_hidden_states=True,
-            return_hidden_states_mode=server_mode,
         ),
         model_config=SimpleNamespace(think_end_ids=None),
         token_to_kv_pool_allocator=Mock(),
@@ -139,7 +145,7 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                     can_run_cuda_graph=False,
                     skipped_output_comm=False,
                 )
-                processor = _make_processor(server_mode)
+                processor = _make_processor(self, server_mode)
 
                 with (
                     patch(
@@ -160,7 +166,7 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
 
 class TestDecodeHiddenStateRetention(CustomTestCase):
     def test_last_mode_multi_step_storage_stays_bounded(self):
-        processor = _make_processor()
+        processor = _make_processor(self)
         req = _DecodeReq()
         batch = SimpleNamespace(
             reqs=[req],

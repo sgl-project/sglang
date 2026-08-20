@@ -62,6 +62,11 @@ These settings should preserve model behavior while changing residency, parallel
       <td style={{padding: "9px 12px"}}><a href="./attention_backends">Attention Backends</a></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500}}>Fused kernels</td>
+      <td style={{padding: "9px 12px"}}>You want to know which elementwise chains are already fused, or to opt into the request-gated set.</td>
+      <td style={{padding: "9px 12px"}}><a href="./fused_kernels">Fused Kernels</a></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500}}>Dynamic batching</td>
       <td style={{padding: "9px 12px"}}>Serving many compatible requests concurrently.</td>
       <td style={{padding: "9px 12px"}}><a href="./dynamic_batching">Inference Batching</a></td>
@@ -126,6 +131,7 @@ These techniques can change the denoising path, numerical representation, or gen
 
 - [Deployment and Performance Modes](./deployment_cookbook)
 - [Attention Backends](./attention_backends)
+- [Fused Kernels](./fused_kernels)
 - [Sequence Parallelism](./ring_sp_performance)
 - [Caching Strategies](./caching-acceleration)
 - [Profiling](./profiling)

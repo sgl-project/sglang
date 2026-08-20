@@ -5,6 +5,7 @@ import threading
 import time
 import unittest
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Any
 
@@ -13,6 +14,7 @@ import openai
 import requests
 from transformers import AutoTokenizer
 
+from sglang.srt.mem_cache.kv_cache_builder import BACKUP_ONLY_HICACHE_RATIO
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
 from sglang.test.kits.pause_generation_kit import PauseResumeInPlaceMixin
@@ -20,6 +22,7 @@ from sglang.test.kits.spec_server_kits import SpecGrammarKit
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
+    assert_process_healthy,
 )
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
@@ -225,13 +228,15 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
 class TestDisaggregationMooncakeSpec(
     JSONConstrainedMixin, SpecGrammarKit, PDDisaggregationServerBase
 ):
+    min_retraction_accept_length = 1.3
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls.model = DEFAULT_TARGET_MODEL_EAGLE3
         spec_args = [
             "--speculative-algorithm",
-            "EAGLE",
+            "EAGLE3",
             "--speculative-draft-model-path",
             DEFAULT_DRAFT_MODEL_EAGLE3,
             "--speculative-num-steps",
@@ -245,8 +250,146 @@ class TestDisaggregationMooncakeSpec(
             "--dtype=float16",
         ]
         cls.extra_prefill_args = spec_args
-        cls.extra_decode_args = spec_args
+        cls.extra_decode_args = [
+            *spec_args,
+            "--disaggregation-decode-retraction-backup",
+            "host_pool",
+        ]
+        cls.extra_decode_env = {"SGLANG_TEST_RETRACT": "true"}
         cls.launch_all()
+
+    def test_host_pool_retraction_preserves_spec_acceptance(self):
+        prompts = [
+            f"Request {i}: explain how speculative decoding works. " * 4
+            for i in range(4)
+        ]
+        response = requests.post(
+            self.lb_url + "/generate",
+            json={
+                "text": prompts,
+                "sampling_params": {
+                    "temperature": 0,
+                    "ignore_eos": True,
+                    "max_new_tokens": 64,
+                },
+            },
+        )
+        response.raise_for_status()
+        results = response.json()
+        retracted_results = [
+            result for result in results if result["meta_info"]["num_retractions"] > 0
+        ]
+        retraction_count = sum(
+            result["meta_info"]["num_retractions"] for result in retracted_results
+        )
+        self.assertGreater(retraction_count, 0)
+
+        completion_tokens = sum(
+            result["meta_info"]["completion_tokens"] for result in retracted_results
+        )
+        verify_count = sum(
+            result["meta_info"]["spec_verify_ct"] for result in retracted_results
+        )
+        self.assertGreater(verify_count, 0)
+        accept_length = completion_tokens / verify_count
+        print(f"Retraction speculative {accept_length=:.4f}")
+        self.assertGreater(accept_length, self.min_retraction_accept_length)
+
+    def test_oversized_backup_aborts_only_its_own_request(self):
+        # Backup-only host_pool retraction sizes the host pool at a fraction of the
+        # device pool, so a long enough request cannot be backed up. Derive the
+        # length from the running server rather than pinning pool sizes, which
+        # would change what the other cases in this class exercise.
+        info = requests.get(self.decode_url + "/get_server_info", timeout=30).json()
+        device_tokens = info["max_total_num_tokens"]
+        host_slots = int(device_tokens * BACKUP_ONLY_HICACHE_RATIO)
+        # Over the host pool, but still inside both the device pool and the model
+        # context — a pool far larger than the context would reject the request
+        # before it ever reaches retraction.
+        oversized_len = min(int(device_tokens * 0.4), info["max_req_input_len"] - 1024)
+        self.assertGreater(
+            oversized_len,
+            host_slots,
+            f"no prompt length both overflows the {host_slots}-slot host pool and "
+            f"fits the {info['max_req_input_len']}-token context",
+        )
+
+        def oversized_request(seed):
+            # Sent on its own: a batched /generate fails as a whole once any member
+            # aborts, which would hide the concurrent traffic's own outcome.
+            # Generate long enough to still be decoding when a forced retraction
+            # lands — a short request finishes first and is never retracted.
+            return requests.post(
+                self.lb_url + "/generate",
+                json={
+                    "input_ids": [seed] * oversized_len,
+                    "sampling_params": {"max_new_tokens": 512, "ignore_eos": True},
+                },
+                timeout=900,
+            )
+
+        def ordinary_request(seed):
+            # Must still be decoding when the oversized prefill lands: retraction
+            # keeps one request, so a batch that has drained to a single entry is
+            # skipped entirely and nothing is ever picked.
+            return requests.post(
+                self.lb_url + "/generate",
+                json={
+                    "input_ids": [seed] * 512,
+                    "sampling_params": {"max_new_tokens": 4096, "ignore_eos": True},
+                },
+                timeout=900,
+            )
+
+        # Retraction picks the request with the fewest generated tokens; the prompt
+        # length only breaks ties. The oversized request has by far the longest
+        # prefill, so in a fixed batch it enters decode last, holds the fewest
+        # tokens, and is picked first — but only while nothing newer arrives, which
+        # is why the eval below runs after these rather than alongside them.
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            oversized = pool.submit(oversized_request, 233)
+            ordinary = [pool.submit(ordinary_request, 300 + i) for i in range(3)]
+            response = oversized.result()
+            neighbours = [f.result() for f in ordinary]
+
+        # A 200 here means the request was never retracted, not that the abort path
+        # is broken, so surface the retraction count to tell the two apart.
+        meta = (
+            response.json().get("meta_info", {}) if response.status_code == 200 else {}
+        )
+        self.assertEqual(
+            response.status_code,
+            500,
+            (
+                f"expected an aborted backup; got num_retractions="
+                f"{meta.get('num_retractions')} completion_tokens="
+                f"{meta.get('completion_tokens')}"
+                if meta
+                else response.text
+            ),
+        )
+        self.assertIn("Retraction host KV pool exhausted", response.text)
+        for neighbour in neighbours:
+            self.assertEqual(neighbour.status_code, 200, neighbour.text)
+
+        # The abort must leave the scheduler serving, and ordinary traffic must stay
+        # correct afterwards — a leaked host slot or a damaged neighbour shows up as
+        # a wrong answer rather than merely a 200.
+        assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
+        metrics = run_eval(
+            SimpleNamespace(
+                base_url=f"http://{self.base_host}:{self.lb_port}",
+                eval_name="gsm8k",
+                api="completion",
+                max_tokens=512,
+                num_examples=64,
+                num_threads=32,
+            )
+        )
+        print(f"Post-abort gsm8k metrics: {metrics}")
+        # Looser than the 200-example test_gsm8k bar above: 64 examples is a
+        # health check on the post-abort server, not an accuracy measurement.
+        self.assertGreater(metrics["score"], 0.62)
 
     def test_gsm8k(self):
         args = SimpleNamespace(

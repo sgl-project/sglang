@@ -199,3 +199,47 @@ def test_video_direct_save_short_circuits_materialization(tmp_path, monkeypatch)
 
     assert paths == [str(output_path)]
     assert len(direct_calls) == 1
+
+
+def test_multiple_videos_use_parallel_direct_save_with_serial_fallback(
+    tmp_path, monkeypatch
+):
+    outputs = [torch.zeros((3, 1, 2, 3)), torch.ones((3, 1, 2, 3))]
+    direct_calls = []
+
+    def parallel_save(samples, paths, **kwargs):
+        direct_calls.append((samples, paths, kwargs))
+        return [True, False]
+
+    serial_calls = []
+
+    monkeypatch.setattr(output_utils, "_try_save_cuda_videos_direct", parallel_save)
+    monkeypatch.setattr(
+        output_utils,
+        "_try_save_cuda_video_direct",
+        lambda **kwargs: serial_calls.append(kwargs) or True,
+    )
+    monkeypatch.setattr(
+        output_utils,
+        "post_process_sample",
+        lambda *_args, **_kwargs: pytest.fail(
+            "successful parallel direct saves should skip frame materialization"
+        ),
+    )
+
+    paths = output_utils.save_outputs(
+        outputs,
+        DataType.VIDEO,
+        fps=24,
+        save_output=True,
+        build_output_path=lambda idx: str(tmp_path / f"sample_{idx}.mp4"),
+    )
+
+    assert paths == [str(tmp_path / "sample_0.mp4"), str(tmp_path / "sample_1.mp4")]
+    assert len(direct_calls) == 1
+    samples, save_paths, kwargs = direct_calls[0]
+    assert all(actual is expected for actual, expected in zip(samples, outputs))
+    assert save_paths == paths
+    assert kwargs["fps"] == 24
+    assert len(serial_calls) == 1
+    assert serial_calls[0]["save_file_path"] == paths[1]

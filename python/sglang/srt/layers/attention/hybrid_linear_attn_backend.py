@@ -15,7 +15,10 @@ from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     track_mamba_states_if_needed,
 )
 from sglang.srt.configs.hybrid_arch import mamba2_config
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    SharedReadEnds,
+)
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
@@ -1001,6 +1004,11 @@ class HybridLinearAttnBackend(AttentionBackend):
             attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
             )
+
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        return SharedReadEnds.max_of(
+            b.shared_read_ends(fm) for b in self.attn_backend_list
+        )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         for attn_backend in self.attn_backend_list:

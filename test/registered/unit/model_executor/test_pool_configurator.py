@@ -11,8 +11,9 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel, get_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -35,7 +36,21 @@ def mock_cpu_env(kv_size=2, tp_size=1, swa_eviction_interval=4):
         yield
 
 
+def _publish_config(testcase, **fields):
+    """Publish the configuration a runner double describes.
+
+    Installed per call and restored on the calling case's cleanup, so a failed
+    case cannot leave a partial publish for a later file in a monolithic run.
+    """
+    from sglang.srt.runtime_context import get_context
+
+    override = get_context().override_server_args(**fields)
+    override.install()
+    testcase.addCleanup(override.restore)
+
+
 def _make_model_runner(
+    testcase,
     *,
     num_kv_heads=4,
     head_dim=64,
@@ -56,7 +71,6 @@ def _make_model_runner(
     disable_overlap_schedule=False,
     sliding_window_size=None,
     speculative_num_draft_tokens=None,
-    max_speculative_num_draft_tokens=None,
     speculative_algorithm=None,
     speculative_num_steps=None,
     speculative_eagle_topk=None,
@@ -105,27 +119,30 @@ def _make_model_runner(
     mr.model_config = mc
     mr.kv_cache_dtype = "fake_bf16"
 
-    sa = SimpleNamespace()
-    sa.max_total_tokens = None
-    sa.swa_full_tokens_ratio = swa_full_tokens_ratio
-    sa.page_size = page_size
-    sa.disable_radix_cache = disable_radix_cache
-    sa.chunked_prefill_size = chunked_prefill_size
-    sa.disable_overlap_schedule = disable_overlap_schedule
-    sa.speculative_num_draft_tokens = speculative_num_draft_tokens
-    sa.max_speculative_num_draft_tokens = (
-        max_speculative_num_draft_tokens or speculative_num_draft_tokens
+    # The configurator reads the published bags, so the fixture publishes the
+    # configuration it describes. The instance stays for the whole-object
+    # hand-offs the configurator still does.
+    _publish_config(
+        testcase,
+        max_total_tokens=None,
+        swa_full_tokens_ratio=swa_full_tokens_ratio,
+        page_size=page_size,
+        disable_radix_cache=disable_radix_cache,
+        chunked_prefill_size=chunked_prefill_size,
+        disable_overlap_schedule=disable_overlap_schedule,
+        speculative_num_draft_tokens=speculative_num_draft_tokens,
+        speculative_algorithm=speculative_algorithm,
+        speculative_num_steps=speculative_num_steps,
+        speculative_eagle_topk=speculative_eagle_topk,
+        disaggregation_mode=disaggregation_mode,
+        max_running_requests=max_running_requests,
+        disaggregation_decode_extra_slots=disaggregation_decode_extra_slots,
+        enable_hisparse=False,
+        enable_hierarchical_cache=False,
+        enable_dsa_cache_layer_split=False,
+        kv_cache_dtype="auto",
     )
-    sa.speculative_algorithm = speculative_algorithm
-    sa.speculative_num_steps = speculative_num_steps
-    sa.speculative_eagle_topk = speculative_eagle_topk
-    sa.disaggregation_mode = disaggregation_mode
-    sa.max_running_requests = max_running_requests
-    sa.disaggregation_decode_extra_slots = disaggregation_decode_extra_slots
-    sa.enable_hisparse = False
-    sa.enable_dsa_cache_layer_split = False
-    sa.kv_cache_dtype = "auto"
-    mr.server_args = sa
+    mr.server_args = get_server_args()
 
     spec = MagicMock()
     spec.is_eagle.return_value = False
@@ -145,6 +162,13 @@ def _make_model_runner(
     )
 
     return mr
+
+
+def _configure_dsa_model(model_runner):
+    hf_config = model_runner.model_config.hf_config
+    hf_config.architectures = ["GlmMoeDsaForCausalLM"]
+    hf_config.index_topk = 2048
+    hf_config.index_head_dim = 128
 
 
 KV_SIZE = 2  # bf16
@@ -176,11 +200,11 @@ def _actual_memory_used(mr, config):
         return config.max_total_num_tokens * full_pt * (nf + ns)
 
 
-class TestDefaultConfigurator(unittest.TestCase):
+class TestDefaultConfigurator(CustomTestCase):
     """Default (MHA): available_bytes -> tokens, memory invariant holds."""
 
     def _run(self, available_bytes, page_size=1, **kwargs):
-        mr = _make_model_runner(page_size=page_size, **kwargs)
+        mr = _make_model_runner(self, page_size=page_size, **kwargs)
         with mock_cpu_env():
             from sglang.srt.model_executor.pool_configurator import (
                 create_memory_pool_configurator,
@@ -222,29 +246,26 @@ class TestDefaultConfigurator(unittest.TestCase):
         self.assertIsNone(config.swa_max_total_num_tokens)
 
     @patch(
-        "sglang.srt.model_executor.pool_configurator.get_dsa_index_head_dim",
-        return_value=128,
-    )
-    @patch(
-        "sglang.srt.model_executor.pool_configurator.is_deepseek_dsa",
-        return_value=True,
-    )
-    @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         side_effect=(576, 656),
     )
     def test_dsa_mla_cell_size_uses_backend_kv_layout(
-        self, mock_calculate_mla_kv_cache_dim, _mock_is_dsa, _mock_index_head_dim
+        self,
+        mock_calculate_mla_kv_cache_dim,
     ):
         num_layers = 2
         raw = _make_model_runner(
+            self,
             num_layers=num_layers,
             use_mla_backend=True,
         )
         packed = _make_model_runner(
+            self,
             num_layers=num_layers,
             use_mla_backend=True,
         )
+        _configure_dsa_model(raw)
+        _configure_dsa_model(packed)
 
         with mock_cpu_env(kv_size=1):
             from sglang.srt.model_executor.pool_configurator import (
@@ -260,11 +281,12 @@ class TestDefaultConfigurator(unittest.TestCase):
         self.assertEqual(mock_calculate_mla_kv_cache_dim.call_count, 2)
 
 
-class TestHybridSWAConfigurator(unittest.TestCase):
+class TestHybridSWAConfigurator(CustomTestCase):
     """Hybrid SWA: full/swa split, ratio, memory invariant."""
 
     def _make_swa_runner(self, full_layers=16, swa_layers=16, ratio=0.5, page_size=1):
         return _make_model_runner(
+            self,
             is_hybrid_swa=True,
             full_attention_layer_ids=list(range(full_layers)),
             swa_attention_layer_ids=list(range(full_layers, full_layers + swa_layers)),
@@ -353,6 +375,7 @@ class TestHybridSWAConfigurator(unittest.TestCase):
     def test_chunk_cache_cap_accounts_for_spec_topk_page_rounding(self):
         available = 1_000_000
         mr = _make_model_runner(
+            self,
             is_hybrid_swa=True,
             full_attention_layer_ids=[0],
             swa_attention_layer_ids=[1],
@@ -392,6 +415,7 @@ class TestHybridSWAConfigurator(unittest.TestCase):
         # 2*chunk(4) + page(1) = 9; cap = 41 * 2 + 9 = 91.
         available = 1_000_000
         mr = _make_model_runner(
+            self,
             is_hybrid_swa=True,
             full_attention_layer_ids=[0],
             swa_attention_layer_ids=[1],
@@ -422,6 +446,7 @@ class TestHybridSWAConfigurator(unittest.TestCase):
     def test_chunk_cache_cap_drops_prefill_for_disagg_decode(self):
         available = 1_000_000
         mr = _make_model_runner(
+            self,
             is_hybrid_swa=True,
             full_attention_layer_ids=[0],
             swa_attention_layer_ids=[1],
@@ -452,6 +477,7 @@ class TestHybridSWAConfigurator(unittest.TestCase):
         # under overlap.
         available = 1_000_000
         mr = _make_model_runner(
+            self,
             is_hybrid_swa=True,
             full_attention_layer_ids=[0],
             swa_attention_layer_ids=[1],
@@ -484,6 +510,7 @@ class TestHybridSWAConfigurator(unittest.TestCase):
         # request count (num_reserved_decode_tokens is a full-pool concern, not SWA).
         available = 2_000_000
         mr = _make_model_runner(
+            self,
             is_hybrid_swa=True,
             full_attention_layer_ids=[0],
             swa_attention_layer_ids=[1],
@@ -512,11 +539,12 @@ class TestHybridSWAConfigurator(unittest.TestCase):
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
 
-class TestAllSWAConfigurator(unittest.TestCase):
+class TestAllSWAConfigurator(CustomTestCase):
     """All-SWA (full_layers=0): special case."""
 
     def _run(self, available_bytes, ratio=0.5, page_size=1, **kwargs):
         mr = _make_model_runner(
+            self,
             is_hybrid_swa=True,
             full_attention_layer_ids=[],
             swa_attention_layer_ids=list(range(32)),
@@ -560,7 +588,7 @@ class TestAllSWAConfigurator(unittest.TestCase):
         self.assertEqual(config.swa_max_total_num_tokens, 500)
 
 
-class TestEagleConfigurator(unittest.TestCase):
+class TestEagleConfigurator(CustomTestCase):
     """EAGLE: draft KV cache must be accounted for so total allocation fits in budget."""
 
     def test_eagle_does_not_exceed_budget(self):
@@ -569,7 +597,7 @@ class TestEagleConfigurator(unittest.TestCase):
         num_layers = 32
         eagle_draft_num_layers = 4
 
-        mr = _make_model_runner(num_layers=num_layers)
+        mr = _make_model_runner(self, num_layers=num_layers)
         mr.spec_algorithm.is_eagle.return_value = True
         mr.spec_algorithm.is_standalone.return_value = False
         mr.spec_algorithm.is_none.return_value = False
@@ -588,10 +616,109 @@ class TestEagleConfigurator(unittest.TestCase):
         used = config.max_total_num_tokens * full_pt * total_layers
         self.assertLessEqual(used, available)
 
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_dsa_draft_full_indexer_cost_does_not_exceed_budget(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+    ):
+        """A sharing-enabled target must not discount the draft's full index-K."""
+        available = 10_000_000
+        num_layers = 78
+        draft_num_layers = 1
+        active_indexer_layers = 21
+        indexer_bytes_per_token = 132
 
-class TestFactory(unittest.TestCase):
+        mr = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
+        _configure_dsa_model(mr)
+        mr.model_config.hf_config.index_topk_freq = 4
+        mr.model_config.hf_config.index_skip_topk_offset = 3
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = draft_num_layers
+
+        with mock_cpu_env(kv_size=1):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size=1)
+
+        actual_bytes_per_token = (
+            576 * num_layers
+            + indexer_bytes_per_token * active_indexer_layers
+            + (576 + indexer_bytes_per_token) * draft_num_layers
+        )
+        self.assertEqual(cfg._cell_size, actual_bytes_per_token)
+        self.assertLessEqual(
+            config.max_total_num_tokens * actual_bytes_per_token,
+            available,
+        )
+
+
+class TestDSAIndexerAllocationPolicy(CustomTestCase):
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_resolved_hicache_override_prices_every_indexer_layer(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+    ):
+        """Post-publish HiCache overrides must keep sizing and allocation aligned."""
+        num_layers = 6
+        mr = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
+        _configure_dsa_model(mr)
+        mr.model_config.hf_config.index_topk_freq = 4
+        mr.model_config.hf_config.index_skip_topk_offset = 3
+
+        with get_memory().override(enable_hierarchical_cache=True), mock_cpu_env(
+            kv_size=1
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            cfg = DefaultPoolConfigurator(mr)
+
+        self.assertEqual(cfg._cell_size, (576 + 132) * num_layers)
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_pd_prices_every_indexer_layer(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+    ):
+        """PD must retain dense index-K metadata until transports support sparsity."""
+        num_layers = 6
+        mr = _make_model_runner(
+            self,
+            num_layers=num_layers,
+            use_mla_backend=True,
+            disaggregation_mode="prefill",
+        )
+        _configure_dsa_model(mr)
+        mr.model_config.hf_config.index_topk_freq = 4
+        mr.model_config.hf_config.index_skip_topk_offset = 3
+
+        with mock_cpu_env(kv_size=1):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            cfg = DefaultPoolConfigurator(mr)
+
+        self.assertEqual(cfg._cell_size, (576 + 132) * num_layers)
+
+
+class TestFactory(CustomTestCase):
     def test_default_for_non_swa(self):
-        mr = _make_model_runner(is_hybrid_swa=False)
+        mr = _make_model_runner(self, is_hybrid_swa=False)
         with mock_cpu_env():
             from sglang.srt.model_executor.pool_configurator import (
                 DefaultPoolConfigurator,
@@ -603,6 +730,7 @@ class TestFactory(unittest.TestCase):
 
     def test_swa_for_hybrid(self):
         mr = _make_model_runner(
+            self,
             is_hybrid_swa=True,
             full_attention_layer_ids=list(range(16)),
             swa_attention_layer_ids=list(range(16, 32)),
@@ -621,6 +749,7 @@ class TestFactory(unittest.TestCase):
         # SWAChunkCapPoolConfigurator is selected only when max_running_requests is set.
         def _cfg(max_running_requests):
             mr = _make_model_runner(
+                self,
                 is_hybrid_swa=True,
                 full_attention_layer_ids=[0],
                 swa_attention_layer_ids=[1],
@@ -645,7 +774,7 @@ class TestFactory(unittest.TestCase):
         self.assertNotIsInstance(_cfg(None), SWAChunkCapPoolConfigurator)
 
 
-class TestDflashDraftKvBudget(unittest.TestCase):
+class TestDflashDraftKvBudget(CustomTestCase):
     """DFLASH draft KV pool as a flat bytes/token term on the target's budget."""
 
     def test_bytes_per_token_from_draft_geometry(self):
@@ -681,7 +810,7 @@ class TestDflashDraftKvBudget(unittest.TestCase):
     def test_dcp_replication_scales_draft_budget(self):
         """The replicated draft pool spans every DCP virtual location."""
         draft_kv_per_token = 10_240
-        mr = _make_model_runner()
+        mr = _make_model_runner(self)
         mr.spec_algorithm.is_dflash_family.return_value = True
         mr.spec_aux_config = SimpleNamespace(
             eagle_draft_num_layers=None,
@@ -715,6 +844,7 @@ class TestDflashDraftKvBudget(unittest.TestCase):
 
         def _tokens(draft_kv_per_token):
             mr = _make_model_runner(
+                self,
                 is_hybrid_swa=True,
                 full_attention_layer_ids=list(range(16)),
                 swa_attention_layer_ids=list(range(16, 32)),

@@ -219,7 +219,7 @@ class BaseRunner(ABC):
         self.return_hidden_states_mode = (
             CaptureHiddenMode.NULL
             if model_runner.is_draft_worker
-            else get_server_return_hidden_states_mode(model_runner.server_args)
+            else get_server_return_hidden_states_mode()
         )
         self.enable_return_hidden_states = self.return_hidden_states_mode.need_capture()
         self.attn_tp_size = get_parallel().attn_tp_size
@@ -403,7 +403,7 @@ class BaseRunner(ABC):
         capture_hidden_mode = (
             CaptureHiddenMode.NULL
             if mr.is_draft_worker
-            else get_server_return_hidden_states_mode(mr.server_args)
+            else get_server_return_hidden_states_mode()
         )
         num_tokens_per_req = 1
         # A PD prefill target worker's pool has no SpeculativeState, so a
@@ -554,7 +554,6 @@ class BaseRunner(ABC):
         # Speculative metadata and hidden-state capture mode.
         spec_info = create_dummy_verify_input(
             mr.spec_algorithm,
-            mr.server_args,
             buffers.custom_mask,
             num_tokens_per_req,
             mr.is_draft_worker,

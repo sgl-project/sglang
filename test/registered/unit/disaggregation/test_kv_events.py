@@ -9,7 +9,14 @@ the router can subscribe per replica (the `dp_size` it reads from
 
 import unittest
 
+import msgspec
+
 from sglang.srt.disaggregation.kv_events import (
+    BlockStored,
+    BlockStoredMetadata,
+    BlockStoredWithMetadata,
+    KVEventBatch,
+    StorageMedium,
     ZmqEventPublisher,
     select_kv_publisher_dp_rank,
 )
@@ -92,6 +99,45 @@ class TestSelectKvPublisherDpRank(CustomTestCase):
                     for a in range(dp_size)
                 }
                 self.assertEqual(len(ranks), dp_size)
+
+
+class TestBlockStoredWireFormat(CustomTestCase):
+    def _event(self, metadata=None):
+        event_type = BlockStored if metadata is None else BlockStoredWithMetadata
+        kwargs = dict(
+            block_hashes=[123],
+            parent_block_hash=None,
+            token_ids=[1, 2],
+            block_size=2,
+            lora_id=None,
+            medium=StorageMedium.GPU,
+        )
+        if metadata is not None:
+            kwargs["metadata"] = metadata
+        return event_type(**kwargs)
+
+    def test_unsalted_event_keeps_legacy_array_shape(self):
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(self._event()))
+        self.assertEqual(len(decoded), 7)
+
+    def test_salted_event_appends_typed_metadata(self):
+        event = self._event(BlockStoredMetadata(cache_salt="tenant-a"))
+        encoded = msgspec.msgpack.encode(event)
+        decoded = msgspec.msgpack.decode(encoded)
+        round_tripped = msgspec.msgpack.decode(encoded, type=BlockStoredWithMetadata)
+        self.assertEqual(len(decoded), 8)
+        self.assertEqual(decoded[7], {"cache_salt": "tenant-a"})
+        self.assertEqual(round_tripped.metadata.cache_salt, "tenant-a")
+
+    def test_salted_event_remains_compatible_with_typed_batch_consumers(self):
+        batch = KVEventBatch(
+            ts=1.0,
+            events=[self._event(BlockStoredMetadata(cache_salt="tenant-a"))],
+        )
+        round_tripped = msgspec.msgpack.decode(
+            msgspec.msgpack.encode(batch), type=KVEventBatch
+        )
+        self.assertEqual(round_tripped.events[0].block_hashes, [123])
 
 
 if __name__ == "__main__":

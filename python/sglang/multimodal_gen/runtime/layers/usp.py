@@ -9,10 +9,7 @@ import torch.distributed._functional_collectives as ft_c
 from torch.distributed.tensor.experimental._attention import _cp_options
 
 from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
-from sglang.kernels.ops.diffusion.triton.ulysses_qkv import (
-    pack_qkv_destination_major,
-)
-from sglang.kernels.ops.diffusion.usp_relayout import usp_merge_heads
+from sglang.kernels.ops.diffusion import pack_qkv_destination_major, usp_merge_heads
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_sp_group,
@@ -172,6 +169,11 @@ def _ipc_input_a2a_qkv(q, k, v):
     """The three input A2As of one attention as a single IPC exchange;
     None when unavailable."""
     if get_ulysses_parallel_world_size() != 2:
+        return None
+    # One staging slot is sized from `q` and reused for all three, so unequal
+    # k/v lengths would copy mismatched extents into it. The general exchange
+    # guards the same way and handles them.
+    if q.shape != k.shape or q.shape != v.shape:
         return None
     group = _ipc_ready_group()
     if group is None:

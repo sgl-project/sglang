@@ -98,19 +98,43 @@ async fn main() -> Result<()> {
     );
 
     let registry = Arc::new(sgl_router::workers::WorkerRegistry::default());
+    let prefix_index = cfg
+        .model
+        .cache_aware
+        .as_ref()
+        .and_then(|cache| cache.kv_indexer_endpoint.as_ref())
+        .map(|indexer| {
+            let config = sgl_kv_indexer::PrefixIndexConfig {
+                endpoint: indexer.url.clone(),
+                query_deadline: std::time::Duration::from_millis(indexer.query_timeout_ms),
+                max_inflight: indexer.query_max_inflight,
+            };
+            sgl_kv_indexer::GrpcPrefixIndex::new(config)
+                .map(Arc::new)
+                .context("configure KV Indexer client")
+        })
+        .transpose()?;
 
     // Build the KV-event index up front so the cache-aware-zmq policy can
-    // share its `HashTree` handle + `BlockSizeOracle`. When no model uses
-    // `cache_aware_zmq`, the index is still constructed (cheap) but no
-    // subscribers are ever added.
+    // share its `HashTree` handle + `BlockSizeOracle`. An external Indexer makes
+    // the local tree irrelevant to routing, so only discover hash metadata rather
+    // than duplicating every KV event.
     let block_size_oracle = sgl_router::policies::kv_events::BlockSizeOracle::new();
-    let kv_index = sgl_router::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build()
-            .expect("default http client builds"),
-        Arc::clone(&block_size_oracle),
-    );
+    let kv_event_http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .expect("default http client builds");
+    let kv_index = if prefix_index.is_some() {
+        sgl_router::policies::kv_events::KvEventIndex::new_metadata_only_with_http_and_oracle(
+            kv_event_http,
+            Arc::clone(&block_size_oracle),
+        )
+    } else {
+        sgl_router::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
+            kv_event_http,
+            Arc::clone(&block_size_oracle),
+        )
+    };
     let policies = Arc::new(
         sgl_router::policies::factory::build_registry(
             &cfg,
@@ -163,16 +187,17 @@ async fn main() -> Result<()> {
         .context("build proxy client")?,
     );
 
-    let ctx = Arc::new(
-        sgl_router::server::app_context::AppContext::with_active_load(
-            cfg.clone(),
-            tokenizers,
-            proxy,
-            registry,
-            policies,
-            active_load,
-        ),
+    let mut app_ctx = sgl_router::server::app_context::AppContext::with_active_load(
+        cfg.clone(),
+        tokenizers,
+        proxy,
+        registry,
+        policies,
+        active_load,
     );
+    app_ctx.prefix_index = prefix_index;
+    app_ctx.block_size_oracle = block_size_oracle;
+    let ctx = Arc::new(app_ctx);
     ctx.mark_ready();
 
     let app = sgl_router::server::app::build_router(ctx.clone());

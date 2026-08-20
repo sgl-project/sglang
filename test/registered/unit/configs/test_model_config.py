@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.configs.model_config import (
+    ModelConfig,
     get_hybrid_layer_ids,
     is_embedding_gemma,
 )
@@ -50,6 +51,23 @@ class TestEmbeddingGemmaConfig(CustomTestCase):
             model_type="gemma3_text", use_bidirectional_attention=False
         )
         self.assertFalse(is_embedding_gemma(config))
+
+
+class TestDraftModelConfig(CustomTestCase):
+    def test_qwen35_mtp_depth_is_synced_to_text_config(self):
+        config = object.__new__(ModelConfig)
+        config.is_draft_model = True
+        config.speculative_algorithm = "EAGLE"
+        config.hf_config = SimpleNamespace(
+            architectures=["Qwen3_5MoeForConditionalGeneration"]
+        )
+        config.hf_text_config = SimpleNamespace()
+
+        config._config_draft_model()
+
+        self.assertEqual(config.hf_config.architectures, ["Qwen3_5ForCausalLMMTP"])
+        self.assertEqual(config.hf_config.num_nextn_predict_layers, 1)
+        self.assertEqual(config.hf_text_config.num_nextn_predict_layers, 1)
 
 
 if __name__ == "__main__":

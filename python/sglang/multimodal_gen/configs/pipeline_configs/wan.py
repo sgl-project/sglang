@@ -99,6 +99,8 @@ class WanT2V480PConfig(PipelineConfig):
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
             dit_layerwise_offload_modes=("memory",),
+            keep_resident_min_available_gb=60,
+            keep_resident_components=("dit",),
         )
 
     def expand_conditioning_to_sample_batch(self, batch):
@@ -141,6 +143,7 @@ class TurboWanT2V1_3B480PConfig(TurboWanT2V480PConfig):
             dit_layerwise_offload_modes=("memory",),
             keep_resident_min_available_gb=60,
             keep_resident_components=(
+                "dit",
                 "text_encoder",
                 "image_encoder",
                 "vae",
@@ -181,11 +184,6 @@ class WanI2V480PConfig(WanT2V480PConfig, WanI2VCommonConfig):
     def __post_init__(self) -> None:
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
-
-    def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        return ModelDeploymentConfig(
-            dit_layerwise_offload_modes=("memory",),
-        )
 
 
 @dataclass
@@ -228,6 +226,7 @@ class FastWan2_1_T2V_480P_Config(WanT2V480PConfig):
             dit_layerwise_offload_modes=("memory",),
             keep_resident_min_available_gb=60,
             keep_resident_components=(
+                "dit",
                 "text_encoder",
                 "image_encoder",
                 "vae",

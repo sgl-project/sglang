@@ -36,7 +36,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 try:
-    from sglang.kernels.ops.diffusion.triton.group_norm_silu_twopass import (
+    from sglang.kernels.ops.diffusion import (
+        can_use_group_norm_silu_4d,
+        can_use_group_norm_silu_rows,
         group_norm_silu_4d,
         group_norm_silu_rows,
     )
@@ -70,8 +72,12 @@ class FusedGroupNormSiLU(nn.Module):
         self._sgl_gate = gate
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self._sgl_gate.enabled and x.dim() == 4:
-            y = group_norm_silu_4d(
+        if (
+            self._sgl_gate.enabled
+            and x.dim() == 4
+            and can_use_group_norm_silu_4d(x, self.weight, self.bias, self.num_groups)
+        ):
+            return group_norm_silu_4d(
                 x,
                 self.weight,
                 self.bias,
@@ -79,8 +85,6 @@ class FusedGroupNormSiLU(nn.Module):
                 self.eps,
                 apply_silu=True,
             )
-            if y is not None:
-                return y
         return F.silu(
             F.group_norm(x, self.num_groups, self.weight, self.bias, self.eps)
         )
@@ -257,10 +261,12 @@ def _attn_fast_forward(
 
     if self.group_norm is not None:
         gn = self.group_norm
-        y = group_norm_silu_rows(
-            hs, gn.weight, gn.bias, gn.num_groups, gn.eps, apply_silu=False
-        )
-        hs = y if y is not None else gn(hs.transpose(1, 2)).transpose(1, 2)
+        if can_use_group_norm_silu_rows(hs, gn.weight, gn.bias, gn.num_groups):
+            hs = group_norm_silu_rows(
+                hs, gn.weight, gn.bias, gn.num_groups, gn.eps, apply_silu=False
+            )
+        else:
+            hs = gn(hs.transpose(1, 2)).transpose(1, 2)
 
     query = self.to_q(hs)
     key = self.to_k(hs)

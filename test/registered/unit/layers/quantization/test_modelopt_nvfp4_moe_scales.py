@@ -291,6 +291,26 @@ class TestG1ScaleC(CustomTestCase):
         self.assertTrue(g1_scale_c.is_contiguous())
         torch.testing.assert_close(g1_scale_c, torch.full((num_experts,), 20.0))
 
+    def test_situ_keeps_both_dequant_scales_inside_activation(self):
+        # SiTU keeps both GEMM1 scales before tanh; scale_c contains only the
+        # GEMM2 input requantization.
+        num_experts = GATED_CONFIGS[0][1]
+        w2_input_scale_quant = torch.tensor(20.0)
+        gate = _global_scales(num_experts, 1, seed=8)
+        up = _global_scales(num_experts, 1, seed=9)
+
+        g1_scale_c = _compute_g1_scale_c(
+            w2_input_scale_quant,
+            gate,
+            up,
+            is_gated=True,
+            activation="situ",
+        )
+
+        self.assertEqual(g1_scale_c.shape, (num_experts,))
+        self.assertTrue(g1_scale_c.is_contiguous())
+        torch.testing.assert_close(g1_scale_c, torch.full((num_experts,), 20.0))
+
     def test_scale_c_is_float32(self):
         # Lower-precision inputs are upcast to fp32 for the kernel.
         num_experts = GATED_CONFIGS[0][1]

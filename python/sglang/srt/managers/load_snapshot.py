@@ -52,6 +52,7 @@ import msgspec.msgpack
 import msgspec.structs
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_parallel, get_serving
 from sglang.srt.utils.network import is_zmq_endpoint_ipv6
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def should_use_zmq(server_args) -> bool:
+def should_use_zmq() -> bool:
     """Whether to use zmq PUSH/PULL instead of shared memory for load snapshots.
 
     Shared memory (mmap) only works within a single node.  When schedulers
@@ -70,14 +71,14 @@ def should_use_zmq(server_args) -> bool:
     ``SGLANG_LOAD_SNAPSHOT_USE_ZMQ`` forces zmq mode for testing.
     """
     return (
-        server_args.enable_dp_attention and server_args.nnodes > 1
+        get_parallel().enable_dp_attention and get_parallel().nnodes > 1
     ) or envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.get()
 
 
 _LOAD_AWARE_METHODS = frozenset({"total_requests", "total_tokens"})
 
 
-def _tokenizer_load_snapshot_owner_caller(server_args) -> str:
+def _tokenizer_load_snapshot_owner_caller() -> str:
     """The caller that plays the tokenizer-side zmq owner role.
 
     In multi-tokenizer mode (``tokenizer_worker_num > 1``) there are N
@@ -85,12 +86,12 @@ def _tokenizer_load_snapshot_owner_caller(server_args) -> str:
     same zmq PULL endpoint.  Instead, the single ``MultiTokenizerRouter``
     process owns the socket (polls zmq -> SHM) and every worker reads SHM.
     """
-    if server_args.tokenizer_worker_num > 1:
+    if get_serving().tokenizer_worker_num > 1:
         return "MultiTokenizerRouter"
     return "TokenizerManager"
 
 
-def zmq_reader_owner(server_args, caller: str) -> bool:
+def zmq_reader_owner(caller: str) -> bool:
     """Decide which process owns the zmq PULL socket.
 
     Exactly one of ``"DataParallelController"``, ``"TokenizerManager"``, or
@@ -108,18 +109,25 @@ def zmq_reader_owner(server_args, caller: str) -> bool:
         load data -> tokenizer-side owner owns it (polls on /v1/loads calls).
 
     The tokenizer-side owner is the ``"MultiTokenizerRouter"`` caller in
-    multi-tokenizer mode, otherwise the ``"TokenizerManager"`` caller.
+    multi-tokenizer mode, otherwise the ``"TokenizerManager"`` caller. Which of
+    the two it is only matters to a tokenizer-side caller, and asking costs the
+    DP controller a `serving` read its role is not audited for -- so the
+    controller answers from the parallel leaves alone.
     """
-    if not should_use_zmq(server_args):
+    if not should_use_zmq():
         return False
-    if server_args.node_rank != 0:
+    if get_parallel().node_rank != 0:
         return False
-    tokenizer_owner = _tokenizer_load_snapshot_owner_caller(server_args)
-    if server_args.dp_size == 1:
-        return caller == tokenizer_owner
-    if server_args.load_balance_method.lower() in _LOAD_AWARE_METHODS:
-        return caller == "DataParallelController"
-    return caller == tokenizer_owner
+    if caller == "DataParallelController":
+        return (
+            get_parallel().dp_size > 1
+            and get_parallel().load_balance_method.lower() in _LOAD_AWARE_METHODS
+        )
+    if get_parallel().dp_size > 1 and (
+        get_parallel().load_balance_method.lower() in _LOAD_AWARE_METHODS
+    ):
+        return False
+    return caller == _tokenizer_load_snapshot_owner_caller()
 
 
 # ---------------------------------------------------------------------------
@@ -627,14 +635,13 @@ def _zmq_addr_for(port_args) -> str:
 
 
 def create_load_snapshot_writer(
-    server_args,
     port_args,
     dp_size: int,
     dp_rank: int,
     publish_interval: int = 1,
 ):
     """Return a SHM or ZMQ writer based on server configuration."""
-    if should_use_zmq(server_args):
+    if should_use_zmq():
         return ZmqLoadSnapshotWriter(
             _zmq_addr_for(port_args), dp_size, dp_rank, publish_interval
         )
@@ -643,7 +650,7 @@ def create_load_snapshot_writer(
     )
 
 
-def create_load_snapshot_reader(server_args, port_args, caller: str):
+def create_load_snapshot_reader(port_args, caller: str):
     """Create a load snapshot reader.
 
     Args:
@@ -651,8 +658,8 @@ def create_load_snapshot_reader(server_args, port_args, caller: str):
             ``"MultiTokenizerRouter"`` -- determines who binds the zmq PULL
             socket when zmq mode is active.
     """
-    dp_size = server_args.dp_size
-    if zmq_reader_owner(server_args, caller):
+    dp_size = get_parallel().dp_size
+    if zmq_reader_owner(caller):
         return ZmqShmLoadSnapshotReader(
             _zmq_addr_for(port_args), shm_path_for(port_args.instance_id), dp_size
         )

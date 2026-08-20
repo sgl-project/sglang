@@ -32,6 +32,14 @@ Each recipe provides step-by-step instructions to help you quickly implement SGL
 3. Adapt configurations to your specific hardware and requirements
 4. Join our community to share feedback and improvements
 
+For memory placement, prefer the unified
+[`--component-residency`](/docs/sglang-diffusion/api/cli#component-residency)
+selector. Each component resolves to exactly one of `resident`,
+`component-offload`, or `layerwise-offload`. Existing options such as
+`--dit-cpu-offload`, `--text-encoder-cpu-offload`,
+`--image-encoder-cpu-offload`, and `--vae-cpu-offload` remain supported by all
+recipes that already use them.
+
 The sglang diffusion cookbook directory structure are shown below:
 
 ```text Example

@@ -1,19 +1,14 @@
 import importlib.util
-import sys
 import unittest
-from pathlib import Path
 
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
     MLAAttentionCase,
     run_mla_attention_case,
 )
+from sglang.test.test_utils import CustomTestCase
 
 # tokenspeed_mla is a CuTe DSL backend for Blackwell (SM100). It additionally
 # enforces:

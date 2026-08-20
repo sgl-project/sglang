@@ -15,6 +15,7 @@ from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -23,31 +24,29 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 class TestHiddenStateGraphRecapture(CustomTestCase):
     def test_server_mode_sets_graph_capture_ceiling(self):
-        disabled = SimpleNamespace(
-            enable_return_hidden_states=False,
-            return_hidden_states_mode=None,
+        cases = (
+            (dict(enable_return_hidden_states=False), CaptureHiddenMode.NULL),
+            (
+                dict(
+                    enable_return_hidden_states=True, return_hidden_states_mode="last"
+                ),
+                CaptureHiddenMode.LAST,
+            ),
+            (
+                dict(
+                    enable_return_hidden_states=True, return_hidden_states_mode="full"
+                ),
+                CaptureHiddenMode.FULL,
+            ),
         )
-        last = SimpleNamespace(
-            enable_return_hidden_states=True,
-            return_hidden_states_mode="last",
-        )
-        full = SimpleNamespace(
-            enable_return_hidden_states=True,
-            return_hidden_states_mode="full",
-        )
-
-        self.assertEqual(
-            get_server_return_hidden_states_mode(disabled),
-            CaptureHiddenMode.NULL,
-        )
-        self.assertEqual(
-            get_server_return_hidden_states_mode(last),
-            CaptureHiddenMode.LAST,
-        )
-        self.assertEqual(
-            get_server_return_hidden_states_mode(full),
-            CaptureHiddenMode.FULL,
-        )
+        for fields, expected in cases:
+            with self.subTest(**fields):
+                override = get_context().override_server_args(**fields)
+                override.install()
+                try:
+                    self.assertEqual(get_server_return_hidden_states_mode(), expected)
+                finally:
+                    override.restore()
 
     @staticmethod
     def _make_runner(runner_cls, capture_hidden_mode):

@@ -18,6 +18,8 @@ Pi0.5 is an OpenPI / LeRobot diffusion Vision-Language-Action (dVLA) policy. It 
 
 SGLang serves Pi0.5 through the native `multimodal_gen` runtime. The implementation uses a SigLIP/PaliGemma prefix encoder and a Gemma action expert: the prefix is encoded once, then the action expert runs the flow-matching denoising loop. This is not a token decode workload, so the Pi0.5 path does not use the LLM sampler, logits processor, token streaming, paged decode KV cache, or a separate SRT serving engine.
 
+The SigLIP vision tower, PaliGemma language stack, and action expert are all SGLang-native modules. Transformers is used for checkpoint configuration and tokenization, not for the runtime neural network.
+
 The prefix encoder covers both stages of observation encoding: SigLIP turns resized camera pixels into continuous patch embeddings, then the PaliGemma transformer jointly encodes those patches with tokenized task/state inputs and produces per-layer prefix K/V. At flow timestep `t`, the action expert projects the noisy continuous action chunk `x_t` into action embeddings. Its queries attend to both the fixed prefix K/V and the current action K/V, while the timestep follows a separate sinusoidal-MLP path and conditions every action-expert layer through AdaRMSNorm gates.
 
 Supported public checkpoints:

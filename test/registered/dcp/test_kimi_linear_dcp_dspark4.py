@@ -168,7 +168,6 @@ class TestKimiLinearDCPDSpark4(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 8,
             other_args=other_args,
             env={
-                "SGLANG_PREP_IN_CUDA_GRAPH": "1",
                 "SGLANG_RAGGED_VERIFY_MODE": "static",
             },
         )

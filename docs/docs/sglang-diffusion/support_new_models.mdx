@@ -356,17 +356,29 @@ Required fields for `DenoisingStage`:
 | `batch.num_inference_steps` | Number of denoising iterations. |
 | `batch.raw_latent_shape` | Original latent shape before packing, if decode needs it. |
 
-### 5. Denoising Module
+### 5. Distributed and memory integration
 
-Add a file under `runtime/models/dits/` only when the architecture is new. Reuse
-existing encoders, VAEs, schedulers, normalization layers, and fused kernels
-whenever possible.
+Single-GPU parity is only the first milestone. Complete native support also
+requires:
 
-For multi-GPU serving, add TP/SP support after the single-GPU path is correct.
-Useful references:
+- **Encoder and DiT TP/SP:** use native parallel projections and sharded weight
+  loading for TP, and `USPAttention` for SP. Handle masks, RoPE, padding, and
+  output gathering without falling back to a replicated full model. TP and SP
+  must work together.
+- **VAE parallel decode:** subclass `ParallelTiledVAE`, or reuse an existing
+  native base with the same contract. Support tiled and `spatial_shard` decode
+  through `DecodingStage` and the shared decode group. Reuse
+  `runtime/layers/parallel_conv.py` and
+  `runtime/models/vaes/parallel/diffusers_spatial.py` where applicable.
+- **Layerwise offload:** every loaded neural module must inherit
+  `LayerwiseOffloadableModuleMixin` and list all repeated block paths in
+  `layer_names`. Set `layerwise_offload_dit_group_enabled = False` for non-DiT
+  modules. Component CPU offload is not a substitute.
 
-- `runtime/models/dits/wanvideo.py` for TP plus SP.
-- `runtime/models/dits/qwen_image.py` for USP attention.
+See `wanvideo.py` and `qwen_image.py` for DiT TP/SP, `gemma_3.py` for encoder TP
+and offload, and `autoencoder_kl_qwenimage.py` or `ltx_2_vae.py` for VAE decode.
+The Diffusers backend is compatibility-first and does not need to meet this
+native integration contract.
 
 ### 6. Registry
 
@@ -393,10 +405,13 @@ implementation.
    content.
 2. Compare latent scale and shift, timestep order, sigma values, and conditioning
    kwargs against Diffusers or the official implementation.
-3. Verify VAE decode and post-processing separately from denoising.
-4. If the model supports LoRA, CFG parallelism, TP, SP, or disaggregation, test
-   each feature explicitly.
-5. Add or update docs, examples, or the compatibility matrix when users need a
+3. Compare VAE decode separately, including tiled and multi-GPU `spatial_shard`.
+4. Run encoder and DiT TP, SP, combined TP x SP, and
+   `--layerwise-offload-components all`; compare with the single-GPU resident
+   baseline.
+5. If the model supports LoRA, CFG parallelism, or disaggregation, test each
+   feature explicitly.
+6. Add or update docs, examples, or the compatibility matrix when users need a
    new launch command.
 
 Common failure points:
@@ -419,5 +434,5 @@ Common failure points:
       `_class_name` when applicable.
 - [ ] Confirmed `_required_config_modules` matches the model repo.
 - [ ] Verified image or video quality against a reference output.
-- [ ] Tested multi-GPU paths if the PR claims TP, SP, CFG parallelism, or
-      distributed serving support.
+- [ ] Completed the distributed and memory integration checks above.
+- [ ] Tested CFG parallelism and distributed serving paths when they apply.

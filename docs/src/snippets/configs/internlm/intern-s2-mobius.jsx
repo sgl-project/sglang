@@ -6,12 +6,12 @@ export const config = {
 
   supportedHardware: ["h200", "b200"],
 
-  // Single released checkpoint — no variant axis.
   variants: [
-    { id: "default", label: "Intern-S2-Mobius", subtitle: "Mobius-v0 · BF16" },
+    { id: "default", label: "Intern-S2-Mobius", subtitle: "Mobius-v0" },
   ],
   quantizations: [
     { id: "bf16", label: "BF16" },
+    { id: "fp8", label: "FP8" },
   ],
   strategies: [
     { id: "low-latency",     label: "Low-Latency"     },
@@ -23,6 +23,7 @@ export const config = {
 
   modelNames: {
     "default|bf16": "internlm/Intern-S2-Mobius",
+    "default|fp8": "internlm/Intern-S2-Mobius-FP8",
   },
 
   placeholders: {
@@ -105,9 +106,7 @@ sgl-eval run gpqa \\
     // — models/interns2_mobius.py), so EP has nothing to shard. The runtime enforces
     // that: server_args._handle_model_specific_adjustments raises for this arch on
     // `--ep-size != 1` (and `--pp-size != 1`), so an EP chip would emit a command
-    // that cannot start. `--moe-a2a-backend deepep` is out for the same reason, and
-    // arg_groups/overrides.py pins moe_runner_backend to triton_kernel as the only
-    // runner validated for the 2,560-expert bank.
+    // that cannot start. `--moe-a2a-backend deepep` is out for the same reason.
 
     // ----- Card: "Parsers" -----
     parsers: {
@@ -175,6 +174,46 @@ sgl-eval run gpqa \\
         "--port {{PORT}}",
       ],
     },
+    {
+      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--mem-fraction-static 0.6",
+        "--context-length 262144",
+        "--reasoning-parser qwen3",
+        "--moe-runner-backend deep_gemm",
+        "--disable-prefill-cuda-graph",
+        "--cuda-graph-max-bs-decode 16",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--mem-fraction-static 0.6",
+        "--context-length 262144",
+        "--reasoning-parser qwen3",
+        "--moe-runner-backend deep_gemm",
+        "--disable-prefill-cuda-graph",
+        "--cuda-graph-max-bs-decode 16",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
     // ==== B200, 2 GPUs, BF16, low-latency (MTP NEXTN on) — INFERRED from H200 ====
     {
       match: { hw: "b200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
@@ -207,6 +246,46 @@ sgl-eval run gpqa \\
         "--mem-fraction-static 0.8",
         "--context-length 262144",
         "--reasoning-parser qwen3",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--mem-fraction-static 0.6",
+        "--context-length 262144",
+        "--reasoning-parser qwen3",
+        "--moe-runner-backend deep_gemm",
+        "--disable-prefill-cuda-graph",
+        "--cuda-graph-max-bs-decode 16",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--mem-fraction-static 0.6",
+        "--context-length 262144",
+        "--reasoning-parser qwen3",
+        "--moe-runner-backend deep_gemm",
+        "--disable-prefill-cuda-graph",
+        "--cuda-graph-max-bs-decode 16",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

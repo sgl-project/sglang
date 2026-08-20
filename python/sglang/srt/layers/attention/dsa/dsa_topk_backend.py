@@ -158,27 +158,7 @@ class DSATopKBackend(Enum):
             import flashinfer
 
             if topk_transform_method == TopkTransformMethod.PAGED:
-                if row_starts is not None:
-                    # Packed PAGED extend uses batch-global score offsets with
-                    # request-local page tables. FlashInfer applies row_starts
-                    # to both, so reuse the SGL transform.
-                    from sgl_kernel import fast_topk_transform_fused
-
-                    page_table_size_1 = (
-                        attn_metadata.page_table_1[batch_idx_list]
-                        if batch_idx_list is not None
-                        else attn_metadata.page_table_1
-                    )
-                    return fast_topk_transform_fused(
-                        score=logits,
-                        lengths=lengths,
-                        page_table_size_1=page_table_size_1,
-                        cu_seqlens_q=cu_seqlens_q_topk,
-                        topk=topk,
-                        row_starts=row_starts,
-                    )
-
-                row_to_batch, local_row_starts = _build_flashinfer_paged_args(
+                row_to_batch, page_table_row_starts = _build_flashinfer_paged_args(
                     attn_metadata=attn_metadata,
                     row_starts=row_starts,
                     cu_seqlens_q_topk=cu_seqlens_q_topk,
@@ -195,7 +175,8 @@ class DSATopKBackend(Enum):
                     deterministic=envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
                     tie_break=_flashinfer_tie_break_value(),
                     dsa_graph_safe=True,
-                    row_starts=local_row_starts,
+                    row_starts=row_starts,
+                    page_table_row_starts=page_table_row_starts,
                 )
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 if topk_indices_offset is None:
@@ -308,8 +289,6 @@ def _topk_transform_v2_paged(
     assert 0 < topk <= 2048, f"v2 top-k supports 0 < topk <= 2048, got {topk=}"
 
     page_table = attn_metadata.real_page_table
-    assert page_table.dtype == torch.int32
-    lengths_i32 = lengths.to(torch.int32)
 
     # The plan is preprocessed once per forward (DSAMetadata.topk_v2_plan,
     # refreshed in-place under CUDA graph) and reused across layers. A missing or
@@ -321,8 +300,8 @@ def _topk_transform_v2_paged(
     ), "topk_v2_plan must be preprocessed per forward (see DSAMetadata.topk_v2_plan)"
 
     page_size = attn_metadata.page_size
-    out = logits.new_full((num_rows, topk), -1, dtype=torch.int32)
-    topk_transform_512_v2(logits, lengths_i32, page_table, out, page_size, plan)
+    out = logits.new_empty((num_rows, topk), dtype=torch.int32)
+    topk_transform_512_v2(logits, lengths, page_table, out, page_size, plan)
     return out
 
 
@@ -373,13 +352,13 @@ def _build_flashinfer_paged_args(
             "PAGED topk_transform with row_starts requires cu_seqlens_q metadata."
         )
 
-    local_row_starts = row_starts
-    if local_row_starts is not None and row_to_batch is not None:
-        local_row_starts = (
-            local_row_starts - attn_metadata.cu_seqlens_k[:-1][row_to_batch]
+    page_table_row_starts = row_starts
+    if page_table_row_starts is not None and row_to_batch is not None:
+        page_table_row_starts = (
+            page_table_row_starts - attn_metadata.cu_seqlens_k[:-1][row_to_batch]
         )
 
-    return row_to_batch, local_row_starts
+    return row_to_batch, page_table_row_starts
 
 
 def _flashinfer_tie_break_value() -> int:

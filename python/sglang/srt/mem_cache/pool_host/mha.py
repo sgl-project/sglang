@@ -4,7 +4,6 @@ import logging
 import threading
 from typing import Sequence
 
-import psutil
 import torch
 
 from sglang.kernels.ops.kvcache.hicache import (
@@ -32,8 +31,8 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.srt.mem_cache.memory_pool import MHATokenToKOnlyPool, MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
-    HICACHE_HOST_MEMORY_RESERVE_BYTES,
     HostKVCache,
+    host_memory_budget_bytes,
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
@@ -724,9 +723,8 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self.page_num = anchor_host.page_num
         self.size_per_token = self.get_size_per_token()
 
-        host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        available_bytes = host_memory_budget_bytes()
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for MiniMax index-K hierarchical cache. "

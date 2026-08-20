@@ -337,6 +337,166 @@ def align_down(value: int, alignment: int) -> int:
     return int(value) // alignment * alignment
 
 
+# Bump allocator over caller-provided extents: malloc first-fits an extent and
+# hands back base+cursor, bounded by each extent's RESERVED size (not any
+# committed watermark) so upper-bound tensors can be allocated before physical
+# commit. Allocations are aligned so VMM users can commit each pointer at its
+# own VA range (cuMemMap requires it; GB300 rejects partial-handle maps).
+# Symbols are SUFFIXED per (process, arena instance) and each instance loads its
+# own .so, so neither multiple arenas per process nor co-located engine
+# processes sharing the tempdir clobber each other.
+def _bump_arena_stub_source(sfx: str) -> str:
+    return f"""
+#include <cstddef>
+#include <cstdint>
+#include <mutex>
+extern "C" {{
+enum {{ BUMPARENA_MAX_EXTENTS = 64 }};
+static uintptr_t g_bases[BUMPARENA_MAX_EXTENTS];
+static size_t g_reserved[BUMPARENA_MAX_EXTENTS];
+static size_t g_cursors[BUMPARENA_MAX_EXTENTS];
+static size_t g_num_extents = 0;
+static size_t g_freed_bytes = 0;
+static size_t g_align = 512;
+static std::mutex g_mu;
+static size_t align_up(size_t v, size_t a){{ return (v + a - 1) / a * a; }}
+void bumparena_set_extents_{sfx}(const uintptr_t* bases, const size_t* sizes, size_t n){{
+  std::lock_guard<std::mutex> lk(g_mu);
+  if (n > BUMPARENA_MAX_EXTENTS) n = BUMPARENA_MAX_EXTENTS;
+  g_num_extents = n;
+  g_freed_bytes = 0;
+  for (size_t i = 0; i < n; ++i) {{
+    g_bases[i] = bases[i];
+    g_reserved[i] = sizes[i];
+    g_cursors[i] = 0;
+  }}
+}}
+void bumparena_set_align_{sfx}(size_t a){{ std::lock_guard<std::mutex> lk(g_mu); if (a) g_align=a; }}
+size_t bumparena_cursor_{sfx}(void){{
+  std::lock_guard<std::mutex> lk(g_mu);
+  size_t total = 0;
+  for (size_t i = 0; i < g_num_extents; ++i) total += g_cursors[i];
+  return total;
+}}
+void* bumparena_malloc_{sfx}(size_t size, int device, void* stream){{
+  std::lock_guard<std::mutex> lk(g_mu);
+  for (size_t i = 0; i < g_num_extents; ++i) {{
+    size_t need = g_cursors[i] + align_up(size, g_align);
+    if (need > g_reserved[i]) continue;
+    void* p = reinterpret_cast<void*>(g_bases[i] + g_cursors[i]);
+    g_cursors[i] = need;
+    return p;
+  }}
+  return 0;   // no extent fits -- surfaces as an allocator OOM
+}}
+size_t bumparena_freed_{sfx}(void){{ std::lock_guard<std::mutex> lk(g_mu); return g_freed_bytes; }}
+void bumparena_free_{sfx}(void* ptr, size_t size, int device, void* stream){{
+  std::lock_guard<std::mutex> lk(g_mu);
+  g_freed_bytes += size;
+}}
+}}
+"""
+
+
+class BumpArenaStub:
+    """JIT-built pluggable bump allocator over caller-provided device VA extents.
+
+    ``malloc`` first-fits an extent and hands out ``base + cursor``; ``free``
+    is a no-op. Plain ``torch.empty`` can thus be placed on externally managed
+    storage by wrapping ``allocator`` in a ``torch.cuda.MemPool``.
+    ``set_extents`` re-points the arena and resets every cursor, letting one
+    stub serve successive region sets.
+    """
+
+    MAX_EXTENTS = 64  # mirrors BUMPARENA_MAX_EXTENTS in the stub source
+
+    # Per-instance suffix -> isolated allocator symbols/state (see _bump_arena_stub_source).
+    _instance_count = 0
+
+    def __init__(self):
+        # Unique per (process, instance): the stub .so lives in a host-shared
+        # tempdir, so co-located engine processes must not build the same-named
+        # .so (they race and one loads a half-relinked copy -> undefined symbol
+        # crash).
+        self.sfx = f"{os.getpid()}_{BumpArenaStub._instance_count}"
+        BumpArenaStub._instance_count += 1
+        self._lib = self._build()
+        from torch.cuda.memory import CUDAPluggableAllocator
+
+        self.allocator = CUDAPluggableAllocator(
+            self._so_path,
+            f"bumparena_malloc_{self.sfx}",
+            f"bumparena_free_{self.sfx}",
+        ).allocator()
+
+    def _build(self) -> ctypes.CDLL:
+        import torch.utils.cpp_extension
+
+        # Per-stub build dir: load_inline writes every caller's source to the
+        # same main.cpp inside build_directory, so any sharing (across
+        # co-located engine processes under the host tempdir, or across arenas
+        # within one process) can compile another stub's source and link a .so
+        # missing this stub's symbols. One dir per stub means no shared ninja
+        # scratch or .so, ever.
+        out_dir = os.path.join(tempfile.gettempdir(), "sgl_bump_arena", self.sfx)
+        os.makedirs(out_dir, exist_ok=True)
+        libname = f"sgl_bump_arena_stub_{self.sfx}"
+        torch.utils.cpp_extension.load_inline(
+            name=libname,
+            cpp_sources=_bump_arena_stub_source(self.sfx),
+            with_cuda=False,  # pure arithmetic -- no nvcc, no CUDA headers
+            is_python_module=False,
+            verbose=False,
+            build_directory=out_dir,
+            no_implicit_headers=True,
+        )
+        self._so_path = f"{out_dir}/{libname}.so"
+        lib = ctypes.CDLL(self._so_path)
+        self._fn_set_extents = lib[f"bumparena_set_extents_{self.sfx}"]
+        self._fn_set_extents.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_size_t,
+        ]
+        self._fn_set_extents.restype = None
+        self._fn_set_align = lib[f"bumparena_set_align_{self.sfx}"]
+        self._fn_set_align.argtypes = [ctypes.c_size_t]
+        self._fn_set_align.restype = None
+        self._fn_cursor = lib[f"bumparena_cursor_{self.sfx}"]
+        self._fn_cursor.argtypes = []
+        self._fn_cursor.restype = ctypes.c_size_t
+        self._fn_freed = lib[f"bumparena_freed_{self.sfx}"]
+        self._fn_freed.argtypes = []
+        self._fn_freed.restype = ctypes.c_size_t
+        return lib
+
+    def set_extents(self, extents: List[tuple]) -> None:
+        """Register ``(base, nbytes)`` extents (first-fit order) and reset
+        every bump cursor."""
+        if len(extents) > BumpArenaStub.MAX_EXTENTS:
+            raise ValueError(
+                f"{len(extents)} extents exceed BUMPARENA_MAX_EXTENTS "
+                f"({BumpArenaStub.MAX_EXTENTS})"
+            )
+        n = len(extents)
+        bases = (ctypes.c_void_p * n)(*(base for base, _ in extents))
+        sizes = (ctypes.c_size_t * n)(*(nbytes for _, nbytes in extents))
+        self._fn_set_extents(bases, sizes, ctypes.c_size_t(n))
+
+    def set_align(self, nbytes: int) -> None:
+        self._fn_set_align(ctypes.c_size_t(nbytes))
+
+    @property
+    def cursor_bytes(self) -> int:
+        return int(self._fn_cursor())
+
+    @property
+    def freed_bytes(self) -> int:
+        """Bytes handed back through ``free`` since the last ``set_extents``
+        -- nonzero means someone (empty_cache) released this arena's segments."""
+        return int(self._fn_freed())
+
+
 class VmmReservation:
     """Own a VA reservation, its mappings, and their teardown order."""
 

@@ -1,7 +1,6 @@
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 
 from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
@@ -143,22 +142,30 @@ class TestProfileSpsTable(CustomTestCase):
         self.assertEqual(table.max_batch_tokens, 256)
 
 
-def _build_sps_cost_table_for(*, sps_table_path):
+def _build_sps_cost_table_for(testcase, *, sps_table_path):
+    from sglang.srt.runtime_context import get_context, get_server_args
     from sglang.srt.speculative.dspark_components.dspark_planner import (
         build_sps_cost_table,
     )
 
-    server_args = SimpleNamespace(
+    # The table bound reads `max_running_requests` from the published bags, so
+    # the case publishes it; the table path stays on the handed record, which is
+    # what `build_sps_cost_table` takes.
+    override = get_context().override_server_args(
         speculative_dspark_sps_table_path=sps_table_path,
         max_running_requests=4,
     )
-    return build_sps_cost_table(server_args=server_args, verify_num_draft_tokens=5)
+    override.install()
+    testcase.addCleanup(override.restore)
+    return build_sps_cost_table(
+        server_args=get_server_args(), verify_num_draft_tokens=5
+    )
 
 
 class TestBuildSpsCostTableContract(CustomTestCase):
     def test_unset_table_path_returns_flat_table(self):
         for sps_table_path in (None, ""):
-            table = _build_sps_cost_table_for(sps_table_path=sps_table_path)
+            table = _build_sps_cost_table_for(self, sps_table_path=sps_table_path)
             self.assertEqual(table.sample_batch_tokens, [1])
             self.assertEqual(table.sample_steps_per_sec, [1.0])
             self.assertEqual(table.max_batch_tokens, 20)
@@ -168,7 +175,7 @@ class TestBuildSpsCostTableContract(CustomTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "sps.json"
             path.write_text(table.to_json(), encoding="utf-8")
-            loaded = _build_sps_cost_table_for(sps_table_path=str(path))
+            loaded = _build_sps_cost_table_for(self, sps_table_path=str(path))
         self.assertEqual(loaded.sample_batch_tokens, table.sample_batch_tokens)
         self.assertEqual(loaded.sample_steps_per_sec, table.sample_steps_per_sec)
         self.assertEqual(loaded.max_batch_tokens, table.max_batch_tokens)

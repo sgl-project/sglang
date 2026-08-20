@@ -7,8 +7,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernel_api_logging import debug_kernel_api
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.moe import moe_route_radix
 
 if TYPE_CHECKING:
@@ -89,7 +89,7 @@ def moe_fused_gate_jit(
 @triton.jit
 def _router_triton_kernel(
     scores_ptr,  # [M, N] fp32, GEMM output (raw logits)
-    bias_ptr,  # [N]    fp32
+    bias_ptr,  # [N]    fp32/fp16/bf16 (upcast to fp32 on load)
     out_weights_ptr,  # [M, K] fp32
     out_indices_ptr,  # [M, K] int32
     M,
@@ -282,7 +282,14 @@ def moe_fused_gate(
         torch.float16,
         torch.bfloat16,
     ), "scores must be float32/float16/bfloat16"
-    assert bias.dtype == torch.float32, "bias must be float32"
+    # The kernel loads the bias and upcasts it to fp32 in-register (see
+    # _router_triton_kernel), so a non-fp32 bias (DeepSeek-V4 stores the
+    # correction bias in bf16) needs no host-side cast/copy.
+    assert bias.dtype in (
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+    ), "bias must be float32/float16/bfloat16"
     assert scores.ndim == 2, "scores must be 2D"
     assert bias.ndim == 1, "bias must be 1D"
     assert scores.size(1) == bias.size(0), "scores and bias must have same num_experts"

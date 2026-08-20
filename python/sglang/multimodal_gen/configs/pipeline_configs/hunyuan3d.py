@@ -4,6 +4,7 @@ from typing import Optional
 
 from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.hunyuan3d import Hunyuan3DDiTConfig
+from sglang.multimodal_gen.configs.models.encoders.clip import CLIPTextConfig
 from sglang.multimodal_gen.configs.models.vaes.hunyuan3d import Hunyuan3DVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
@@ -29,6 +30,12 @@ class Hunyuan3D2PipelineConfig(PipelineConfig):
     # VAE configuration
     vae_config: VAEConfig = field(default_factory=Hunyuan3DVAEConfig)
     vae_precision: str = "fp32"
+
+    text_encoder_configs: tuple[CLIPTextConfig, ...] = field(
+        default_factory=lambda: (CLIPTextConfig(),)
+    )
+    text_encoder_precisions: tuple[str, ...] = ("fp16",)
+    native_only_components = ("delight_text_encoder",)
 
     # Shape model configuration
     shape_model_path: Optional[str] = None

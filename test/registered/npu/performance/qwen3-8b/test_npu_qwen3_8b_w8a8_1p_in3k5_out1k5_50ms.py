@@ -10,6 +10,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=3600, suite="base-c-test-perf-2-npu-a3")
+register_npu_ci(est_time=3600, suite="nightly-perf-2-npu-a3", nightly=True)
 
 QWEN3_8B_ENVS = {
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
@@ -20,6 +21,7 @@ QWEN3_8B_ENVS = {
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
     "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "50",
+    "SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE": "128",
 }
 
 QWEN3_8B_OTHER_ARGS = [

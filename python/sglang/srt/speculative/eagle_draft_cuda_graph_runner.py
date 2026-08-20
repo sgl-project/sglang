@@ -147,9 +147,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # Bucket sizes
         self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
         # Static capture width.
-        self.captured_req_width = resolve_num_tokens_per_req(
-            phase="draft_decode", server_args=model_runner.server_args
-        )
+        self.captured_req_width = resolve_num_tokens_per_req(phase="draft_decode")
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width
 

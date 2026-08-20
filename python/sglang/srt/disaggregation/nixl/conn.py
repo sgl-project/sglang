@@ -512,7 +512,8 @@ class NixlKVManager(CommonKVManager):
             if self.enable_staging:
                 self._init_staging_decode_ctx()
                 self._staging_handler = None
-                self._start_decode_staging_thread()
+            if self.enable_staging or self.enable_deferred_decode_kv_release:
+                self._start_decode_listener_thread()
             self._start_heartbeat_checker_thread()
         else:
             raise ValueError(
@@ -592,21 +593,30 @@ class NixlKVManager(CommonKVManager):
 
         return is_watermark_ready(self._staging_ctx, agent_name, alloc_round, alloc_end)
 
-    def _start_decode_staging_thread(self):
-        """Start a thread on the decode side to recv STAGING_REQ from prefill via ZMQ."""
+    def _start_decode_listener_thread(self):
+        """Decode-side ZMQ listener for STAGING_REQ and ABORT_ACK. A thread, not
+        NIXL notifs: the decode agent has no progress thread, so notifs only drain
+        inside a live receiver's poll() and would be missed while idle."""
 
-        def decode_staging_thread():
+        def decode_listener_thread():
             while True:
                 msg = self.server_socket.recv_multipart()
                 if msg[0] == b"STAGING_REQ":
                     self._handle_staging_req(msg)
                     continue
+                if msg[0] == b"ABORT_ACK":
+                    # Drain ack for an aborted room; aggregate per prefill rank.
+                    if len(msg) >= 3:
+                        self.note_abort_ack(
+                            int(msg[1].decode("ascii")), int(msg[2].decode("ascii"))
+                        )
+                    continue
                 logger.warning(
-                    "decode_staging_thread: unexpected message tag %s",
+                    "decode_listener_thread: unexpected message tag %s",
                     msg[0][:20],
                 )
 
-        threading.Thread(target=decode_staging_thread, daemon=True).start()
+        threading.Thread(target=decode_listener_thread, daemon=True).start()
 
     def _handle_staging_req(self, msg):
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -1119,16 +1129,22 @@ class NixlKVManager(CommonKVManager):
             room = kv_chunk.room
             handles: List[Any] = []
             try:
-                if self.check_status(room) == KVPoll.Failed:
-                    self._staging_outstanding.pop(room, None)
-                    continue
-
-                assert room in self.transfer_infos
-
-                # Count each chunk once; the flag survives re-enqueue on defer.
+                # Counted at dequeue, before the status check, so
+                # `outstanding == 0` means nothing is dequeued or in flight --
+                # the predicate the abort ack relies on. The flag survives
+                # re-enqueue on defer.
                 if not kv_chunk.staging_counted:
                     self._staging_outstanding[room] += 1
                     kv_chunk.staging_counted = True
+
+                if self.check_status(room) == KVPoll.Failed:
+                    self._staging_outstanding.pop(room, None)
+                    if self.enable_deferred_decode_kv_release:
+                        # Skipped => nothing written for this aborted room; ack.
+                        self._maybe_ack_drained_abort(room)
+                    continue
+
+                assert room in self.transfer_infos
 
                 # Lazily build a per-worker staging strategy bound to this
                 # worker's private staging buffer (matches mooncake).
@@ -1344,6 +1360,10 @@ class NixlKVManager(CommonKVManager):
                     time.sleep(0)
 
                 self._staging_outstanding[room] -= 1
+                if self.enable_deferred_decode_kv_release:
+                    # Handles all DONE => this room's writes landed; ack if it
+                    # was aborted and nothing else is outstanding.
+                    self._maybe_ack_drained_abort(room)
                 if kv_chunk.is_last_chunk:
                     self.update_status(room, KVPoll.Success)
                 elif self.check_status(room) != KVPoll.Success:
@@ -1383,6 +1403,8 @@ class NixlKVManager(CommonKVManager):
                 self.exceptions[room] = e
                 self.record_failure(room, str(e))
                 self.update_status(room, KVPoll.Failed)
+                # No ack here on purpose: the DONE barrier bails on the first
+                # ERR, so siblings may still be writing; fall back to the timeout.
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -2628,14 +2650,17 @@ class NixlKVManager(CommonKVManager):
 
         try:
             room_to_be_aborted = int(msg[1].decode("ascii"))
+            decode_ip = msg[2].decode("ascii") if len(msg) > 2 else None
+            decode_port = int(msg[3].decode("ascii")) if len(msg) > 3 else None
         except Exception as e:
             logger.debug(f"Ignoring malformed abort notification: {e}")
             return True
 
-        if (
+        room_active = (
             room_to_be_aborted in self.request_status
             and self.check_status(room_to_be_aborted) != KVPoll.Success
-        ):
+        )
+        if room_active:
             self.record_failure(
                 room_to_be_aborted,
                 "Aborted by decode-side abort notification.",
@@ -2651,8 +2676,20 @@ class NixlKVManager(CommonKVManager):
                 f"ignoring (already completed or unknown)"
             )
 
-        # TODO: Define real ACK/deferred-release semantics if decode-side buffer
-        # release needs to wait for prefill-side NIXL transfer quiescence.
+        # Deferred KV release: register only after the status flip above (see
+        # register_deferred_ack_target), then try once -- the room may already be
+        # quiescent and never revisited by the worker. A concluded/unknown room is
+        # acked only when nothing is still counted for it: the ERR path abandons
+        # sibling handles that may still be writing and clear() then drops the
+        # room, so "unknown" alone does not imply quiescent.
+        if self.enable_deferred_decode_kv_release and decode_port is not None:
+            if room_active:
+                self.register_deferred_ack_target(
+                    room_to_be_aborted, decode_ip, decode_port
+                )
+                self._maybe_ack_drained_abort(room_to_be_aborted)
+            elif self._staging_outstanding.get(room_to_be_aborted, 0) == 0:
+                self._send_abort_ack(decode_ip, decode_port, room_to_be_aborted)
 
         return True
 
@@ -2745,6 +2782,7 @@ class NixlKVSender(CommonKVSender):
             pp_rank,
             req_has_disagg_prefill_dp_rank,
         )
+        self.init_time = time.time()
         self.has_sent = False
         self.chunk_id = 0
         self._send_failed = False
@@ -2790,6 +2828,10 @@ class NixlKVSender(CommonKVSender):
         if self._send_failed:
             return KVPoll.Failed  # type: ignore
         status = self.kv_mgr.check_status(self.bootstrap_room)
+        if status == KVPoll.Bootstrapping:
+            timeout_result = self._check_bootstrap_timeout()
+            if timeout_result is not None:
+                return timeout_result
         # Hold Success until all staging chunks transferred: a deferred chunk
         # can still be pending, and concluding now would drop it.
         if (

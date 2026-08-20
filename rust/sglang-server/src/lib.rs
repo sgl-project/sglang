@@ -292,7 +292,7 @@ static LOG_GUARD: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuar
     std::sync::OnceLock::new();
 
 #[pymodule]
-fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _server(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Initialize tracing once; ignore if already set by the host process.
     // Non-blocking writer: emitting threads (axum workers, egress, detok) only
     // enqueue; a dedicated thread does the stdout formatting-flush + syscall.

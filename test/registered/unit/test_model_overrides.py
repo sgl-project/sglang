@@ -69,6 +69,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "quantization",
                     "enable_dp_attention",
                     "enable_dp_lm_head",
+                    "enable_tp_lm_head_all_to_all",
                     "moe_a2a_backend",
                     "ep_size",
                     "moe_dense_tp_size",
@@ -1773,29 +1774,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
 
-    def test_cutlass_moe_env_override_pass(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _cutlass_moe_env_override,
-        )
-
-        with patch("sglang.srt.environ.envs.SGLANG_CUTLASS_MOE") as e:
-            e.get.return_value = True
-            self.assertEqual(
-                _cutlass_moe_env_override(
-                    ResolvedView(SimpleNamespace(quantization="fp8"))
-                ),
-                {"moe_runner_backend": "cutlass"},
-            )
-            with self.assertRaises(AssertionError):
-                _cutlass_moe_env_override(
-                    ResolvedView(SimpleNamespace(quantization=None))
-                )
-            e.get.return_value = False
-            self.assertEqual(
-                _cutlass_moe_env_override(ResolvedView(SimpleNamespace())), {}
-            )
-
     def test_gguf_quantization_pass(self):
         from sglang.srt.arg_groups.overrides import ResolvedView, _gguf_quantization
 
@@ -2146,7 +2124,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_data_parallelism_and_a2a_passes(self):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
-            _a2a_backend_overrides,
             _a2a_ep_size,
             _data_parallelism_defaults,
         )
@@ -2163,27 +2140,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ),
             {},
         )
-
-        with patch("sglang.srt.environ.envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE") as e:
-            e.get.return_value = False
-            self.assertEqual(
-                _a2a_backend_overrides(
-                    ResolvedView(
-                        SimpleNamespace(enable_waterfill=True, moe_a2a_backend="none")
-                    )
-                ),
-                {"moe_a2a_backend": "deepep"},
-            )
-            e.get.return_value = True
-            # megamoe env wins over the waterfill override (chained, last write)
-            self.assertEqual(
-                _a2a_backend_overrides(
-                    ResolvedView(
-                        SimpleNamespace(enable_waterfill=True, moe_a2a_backend="none")
-                    )
-                ),
-                {"moe_a2a_backend": "megamoe"},
-            )
 
         self.assertEqual(
             _a2a_ep_size(

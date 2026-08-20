@@ -32,6 +32,7 @@ For SWA-only layers callers pass ``topk=0``, ``compressed_base = 0`` (the
 compressed branch becomes a no-op) and any ``compress_ratio >= 1``.
 """
 
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -47,12 +48,31 @@ SPARSE_PREFILL_TOPK_ALIGNMENT = 128
 # Bf16 workspace per-token width, matching ``dequantize_k_cache_paged``'s
 # output: 448 fp8 nope (dequanted) + 64 bf16 rope = 512.
 WORKSPACE_DIM = DIM_NOPE + DIM_ROPE
-
+DSV4_Q8KV8_PREFILL_ENV = "SGLANG_DSV4_Q8KV8_PREFILL"
+DSV4_Q8KV8_PREFILL_LOG_ENV = "SGLANG_DSV4_Q8KV8_PREFILL_LOG"
 
 from sglang.kernels.ops.attention.dsv4.sparse_prefill_kernels import (
     _build_swa_token_ids_kernel,
     _combine_topk_swa_indices_kernel,
 )
+
+
+def use_dsv4_q8kv8_sparse_prefill(dsv4_prefill_backend: str = "auto") -> bool:
+    """Return whether DeepSeek-V4 sparse prefill should use Q8KV8.
+
+    ``dsv4_prefill_backend`` is the production configuration. The environment
+    variable remains as a debug override while the runtime path is being
+    hardened: truthy values force Q8 on, falsy values force it off.
+    """
+    env_value = os.getenv(DSV4_Q8KV8_PREFILL_ENV)
+    if env_value is not None:
+        return env_value.lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    return dsv4_prefill_backend == "flashmla_sparse_q8"
 
 
 class SparsePrefillWorkspace:
@@ -68,13 +88,18 @@ class SparsePrefillWorkspace:
         self.device = device
         self._buffer: Optional[torch.Tensor] = None
 
-    def get(self, num_tokens: int) -> torch.Tensor:
+    def get(
+        self,
+        num_tokens: int,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> torch.Tensor:
         assert num_tokens > 0
         current_capacity = self._buffer.shape[0] if self._buffer is not None else 0
-        if num_tokens > current_capacity:
+        current_dtype = self._buffer.dtype if self._buffer is not None else None
+        if num_tokens > current_capacity or dtype != current_dtype:
             self._buffer = torch.empty(
                 (num_tokens, 1, WORKSPACE_DIM),
-                dtype=torch.bfloat16,
+                dtype=dtype,
                 device=self.device,
             )
         return self._buffer[:num_tokens]

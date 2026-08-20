@@ -569,6 +569,7 @@ class Pi05PolicyModel(nn.Module):
         candidates = [key]
         replacements = {
             ".vision_tower.vision_model.": ".vision_tower.",
+            ".self_attn.out_proj.": ".self_attn.proj.",
             ".paligemma.language_model.": ".paligemma.model.language_model.",
             ".paligemma.vision_tower.": ".paligemma.model.vision_tower.",
             ".paligemma.multi_modal_projector.": (
@@ -576,8 +577,9 @@ class Pi05PolicyModel(nn.Module):
             ),
         }
         for old, new in replacements.items():
-            if old in key:
-                candidates.append(key.replace(old, new))
+            for candidate in list(candidates):
+                if old in candidate:
+                    candidates.append(candidate.replace(old, new))
 
         if key in {
             "paligemma_with_expert.paligemma.lm_head.weight",

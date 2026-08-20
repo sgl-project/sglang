@@ -21,13 +21,13 @@ register_cpu_ci(
 
 
 def load_core():
-    """The Rust ``_core`` extension, or ``None`` (→ skip) when not built
+    """The Rust ``_multimodal`` extension, or ``None`` (→ skip) when not built
     locally. In CI a missing extension is a hard failure, never a silent
     skip — the CPU suite builds it from source."""
     try:
-        from sglang.srt.multimodal import _core
+        from sglang.srt.rust_extensions import _multimodal
 
-        return _core
+        return _multimodal
     except ImportError:
         if is_in_ci():
             raise

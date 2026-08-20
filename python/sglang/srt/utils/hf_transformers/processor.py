@@ -48,6 +48,7 @@ from .tokenizer import (
     _TOKENIZERS_BACKEND,
     _fix_added_tokens_encoding,
     _fix_special_tokens_pattern,
+    _install_tokenizer_warnings_filter,
 )
 
 _IMAGE_PROCESSOR_BACKENDS = {"auto", "torchvision", "pil"}
@@ -367,6 +368,8 @@ def get_processor(
             processor = tokenizer
         else:
             processor.tokenizer = tokenizer
+
+    _install_tokenizer_warnings_filter(tokenizer)
 
     if tokenizer.chat_template is None:
         local_path = download_from_hf(

@@ -1,11 +1,12 @@
 import sys
 
 import pytest
+import sgl_kernel  # noqa: F401
 import torch
-from utils import GeluAndMul, SiluAndMul, precision
 
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.cpu_test_utils import GeluAndMul, SiluAndMul, precision
 
 register_cpu_ci(est_time=10, suite="base-b-test-cpu")
 register_cpu_ci(est_time=10, suite="base-b-test-cpu-arm64")

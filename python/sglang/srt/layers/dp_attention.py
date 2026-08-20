@@ -13,6 +13,7 @@ import triton.language as tl
 from sglang.srt.distributed import (
     GroupCoordinator,
     get_attn_cp_group,
+    get_attn_cp_overlap_group,
     get_attn_tensor_model_parallel_rank,
     get_attn_tensor_model_parallel_world_size,
     get_attn_tp_group,
@@ -30,9 +31,12 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.runtime_context import (
     configured_attn_cp_size,
     configured_moe_dp_size,
+    get_device,
+    get_exec,
     get_flags,
+    get_parallel,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -71,6 +75,7 @@ def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
 
 _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
+_is_cpu = is_cpu()
 
 
 class DpPaddingMode(IntEnum):
@@ -344,9 +349,9 @@ def initialize_dp_attention(
     dp.max_len_with_idle = (
         getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
     )
-    enable_dp_attention = server_args.enable_dp_attention
-    dp_size = server_args.dp_size
-    attn_cp_size = server_args.attn_cp_size
+    enable_dp_attention = get_parallel().enable_dp_attention
+    dp_size = get_parallel().dp_size
+    attn_cp_size = configured_attn_cp_size()
 
     dp.enabled = enable_dp_attention
 
@@ -358,15 +363,15 @@ def initialize_dp_attention(
     )
     _ATTN_DP_SIZE = dp_size if enable_dp_attention else 1
 
-    if server_args.elastic_ep_backend is not None and server_args.max_ep_size:
-        _ATTN_DP_RANK = tp_rank + server_args.ep_join_rank_offset
+    if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
+        _ATTN_DP_RANK = tp_rank + get_parallel().ep_join_rank_offset
         if server_args.is_ep_scale_joiner:
             dp.joiner_skip_all_gather = True
 
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,
         dtype=model_config.dtype,
-        device=torch.device(server_args.device),
+        device=torch.device(get_device().device),
     )
 
 
@@ -447,6 +452,40 @@ def get_dp_local_slice_cpu(
 from sglang.kernels.ops.memory.memcpy_triton import memcpy_triton
 
 
+# TODO: write c++ kernel for cpu
+def memcpy_cpu(dst, src, dim, offset, sz, offset_src):
+    assert dim == 0, "Only dim=0 supported"
+    assert src.shape[1:] == dst.shape[1:], "src and dst must have same trailing shape"
+
+    total_rows_dst, total_rows_src = dst.shape[0], src.shape[0]
+    dst_start, src_start = 0, 0
+
+    if offset_src:
+        # src[offset:] → dst[0:]
+        src_start = offset
+        dst_start = 0
+    else:
+        # src[0:] → dst[offset:]
+        src_start = 0
+        dst_start = offset
+
+    dst_end = min(dst_start + sz, total_rows_dst)
+    src_end = min(src_start + sz, total_rows_src)
+    actual_sz = min(dst_end - dst_start, src_end - src_start)
+
+    if actual_sz <= 0:
+        return
+
+    dst[dst_start : dst_start + actual_sz].copy_(src[src_start : src_start + actual_sz])
+
+
+memcpy_func = memcpy_cpu if _is_cpu else memcpy_triton
+
+
+def memcpy(dst, src, dim, offset, sz, offset_src):
+    memcpy_func(dst, src, dim, offset, sz, offset_src)
+
+
 def _dp_gather_via_all_reduce(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
@@ -466,9 +505,7 @@ def _dp_gather_via_all_reduce(
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
 
-        memcpy_triton(
-            global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
-        )
+        memcpy(global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False)
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
     if world_dp_gather_enabled():
@@ -823,9 +860,7 @@ def dp_scatter(
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between local_tokens and global_tokens not allowed"
 
-        memcpy_triton(
-            local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
-        )
+        memcpy(local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True)
 
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
@@ -967,6 +1002,14 @@ def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_attn_cp_group().all_gather_into_tensor(output, input)
+
+
+def attn_cp_overlap_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
+    return get_attn_cp_overlap_group().all_gather_into_tensor(output, input)
+
+
+def attn_cp_overlap_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
+    return get_attn_cp_overlap_group().reduce_scatter_tensor(output, input)
 
 
 def get_moe_cp_group() -> GroupCoordinator:

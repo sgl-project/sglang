@@ -99,26 +99,36 @@ repos:
         pass_filenames: false
       - id: check-workflow-job-names
         name: check for duplicate workflow job names
-        entry: python3 scripts/ci/check_workflow_job_names.py
+        entry: python3 scripts/lint/check_workflow_job_names.py
         language: system
         files: ^\.github/workflows/.*\.yml$
         pass_filenames: false
       - id: check-rust-ext-cache-prefix
         name: check rust-ext cache key prefix defaults match
-        entry: python3 scripts/ci/check_rust_ext_cache_prefix.py
+        entry: python3 scripts/lint/check_rust_ext_cache_prefix.py
         language: system
         files: ^(\.github/actions/download-rust-ext/action\.yml|\.github/workflows/_pr-test-rust-ext-build\.yml)$
         pass_filenames: false
+      - id: check-no-bare-pytest-main
+        name: reject bare pytest.main calls in __main__ blocks
+        entry: python3 scripts/lint/check_no_bare_pytest_main.py
+        language: system
+        files: ^(python|test)/.*\.py$
+      - id: check-lint-script-tests
+        name: unit tests for lint checkers
+        entry: python3 -m unittest discover -s scripts/lint -p 'test_check_*.py'
+        language: system
+        files: ^scripts/lint/(check_|test_check_).*\.py$
+        pass_filenames: false
       - id: check-registered-tests
         name: validate registered test CI registries
-        entry: python3 scripts/ci/check_registered_tests.py
+        entry: python3 scripts/lint/check_registered_tests.py
         language: system
         files: ^test/registered/.*\.py$
-        exclude: ^test/registered/.*/utils\.py$
         pass_filenames: false
       - id: check-no-registered-tests-in-package
         name: reject CI-registered tests inside the sglang package
-        entry: python3 scripts/ci/check_no_registered_tests_in_package.py
+        entry: python3 scripts/lint/check_no_registered_tests_in_package.py
         language: system
         files: ^python/sglang/.*\.py$
         pass_filenames: false
@@ -130,7 +140,7 @@ repos:
         pass_filenames: false
       - id: rustfmt-sgl-router
         name: rustfmt experimental/sgl-router
-        entry: bash -c 'cd experimental/sgl-router && cargo fmt -- --check'
+        entry: bash -c 'cd experimental/sgl-router && cargo fmt --all -- --check'
         language: system
         files: ^experimental/sgl-router/.*\.rs$
         pass_filenames: false

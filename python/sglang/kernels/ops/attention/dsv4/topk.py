@@ -89,13 +89,21 @@ def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Ten
 def topk_transform_512_v2(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
-    page_tables: torch.Tensor,
+    page_tables: Optional[torch.Tensor],
     out_page_indices: torch.Tensor,
     page_size: int,
     metadata: torch.Tensor,
-    out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
-    """Fused top-k + page-table transform (DeepSeek-V4 top-k v2 kernel).
+    """Fused top-k + optional page-table transform (DeepSeek-V4 top-k v2 kernel).
+
+    Two output modes, chosen by whether ``page_tables`` is given and resolved to
+    a device-side template parameter, so an unused page-table gather is compiled
+    out rather than skipped at runtime:
+
+    * ``page_tables=None`` -- ``out_page_indices`` receives the raw selected
+      indices and no page table is read.
+    * ``page_tables`` given -- ``out_page_indices`` receives the page-table
+      transform of them.
 
     IMPORTANT: every entry of ``seq_lens`` must be NON-NEGATIVE, and
     ``metadata`` must come from :func:`plan_topk_v2` over the same ``seq_lens``
@@ -114,5 +122,4 @@ def topk_transform_512_v2(
         out_page_indices,
         page_size,
         metadata,
-        out_raw_indices,
     )

@@ -7,22 +7,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.kernels.ops.diffusion.bitexact_gate import (
+from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    tensors_equal,
-)
-from sglang.kernels.ops.diffusion.fused_gate_rmsnorm import (
+    can_use_fused_silu_mul,
     fused_gate_rmsnorm_active,
     fused_rmsnorm_scale,
     fused_rmsnorm_tanh_residual,
-    mark_fused_gate_rmsnorm_site,
-)
-from sglang.kernels.ops.diffusion.triton.rope_rotate_half_bitexact import (
     fused_rope_rotate_half_bitexact,
-)
-from sglang.kernels.ops.diffusion.triton.silu_mul_bitexact import (
-    can_use_fused_silu_mul,
     fused_silu_mul_bitexact,
+    mark_fused_gate_rmsnorm_site,
+    modulate_scale_shift,
+    residual_gate_add,
+    tensors_equal,
 )
 from sglang.multimodal_gen.configs.models.dits.ideogram import Ideogram4DiTConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_layer
@@ -68,6 +64,7 @@ LLM_TOKEN_INDICATOR = 3
 
 _IDEOGRAM_ROPE = BitExactFusionGate("Ideogram fused RoPE")
 _IDEOGRAM_SWIGLU = BitExactFusionGate("Ideogram fused SiLU-mul")
+_IDEOGRAM_ZERO_SHIFTS: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {}
 
 
 def _can_use_fused_rope(
@@ -434,6 +431,20 @@ def _norm_scale(
         )
         if y is not None:
             return y
+    if (
+        not torch.compiler.is_compiling()
+        and x.is_cuda
+        and not torch.cuda.is_current_stream_capturing()
+        and x.dim() == 3
+        and scale.shape == (x.shape[0], 1, x.shape[-1])
+        and x.shape[0] == 1
+    ):
+        key = (x.device, x.dtype, x.shape[-1])
+        zero_shift = _IDEOGRAM_ZERO_SHIFTS.get(key)
+        if zero_shift is None:
+            zero_shift = torch.zeros(1, x.shape[-1], device=x.device, dtype=x.dtype)
+            _IDEOGRAM_ZERO_SHIFTS[key] = zero_shift
+        return modulate_scale_shift(norm(x), scale.squeeze(1), zero_shift)
     return norm(x) * (1.0 + scale)
 
 
@@ -455,7 +466,15 @@ def _gate_residual(
         )
         if y is not None:
             return y
-    return residual + torch.tanh(gate) * norm(x)
+    normed = norm(x)
+    tanh_gate = torch.tanh(gate)
+    if (
+        not torch.compiler.is_compiling()
+        and x.is_cuda
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        return residual_gate_add(residual, normed, tanh_gate)
+    return residual + tanh_gate * normed
 
 
 class Ideogram4TransformerBlock(nn.Module):

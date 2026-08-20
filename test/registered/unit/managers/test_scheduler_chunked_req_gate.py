@@ -47,6 +47,7 @@ def _make_req(
     req.logprob_start_len = -1
     req.positional_embed_overrides = None
     req.extra_key = None
+    req.cache_salt = None
     req.mamba_pool_idx = None
     req.sampling_params = SimpleNamespace(max_new_tokens=128, ignore_eos=False)
     return req
@@ -90,6 +91,8 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.running_batch.is_prefill_only = False
     s.running_batch.batch_is_full = False
     s.running_batch.reqs = []
+    s.prefill_decode_interval = 0
+    s._prefill_decode_interval_remaining = 0
     s.get_new_batch_prefill = MagicMock(
         return_value=NextBatchPlan(batch_to_run=None, running_batch=s.running_batch)
     )

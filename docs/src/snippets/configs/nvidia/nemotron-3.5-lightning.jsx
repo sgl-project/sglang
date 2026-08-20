@@ -10,7 +10,7 @@ export const config = {
 
   variants: [{ id: "default", label: "Default" }],
 
-  quantizations: [{ id: "nvfp4", label: "NVFP4" }],
+  quantizations: [{ id: "nvfp4", label: "NVFP4" }, { id: "bf16", label: "BF16" }],
 
   // The base serving recipe plus the three validated speculative decoders.
   strategies: [
@@ -24,6 +24,7 @@ export const config = {
 
   modelNames: {
     "default|nvfp4": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
+    "default|bf16": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
   },
 
   placeholders: {
@@ -336,6 +337,237 @@ sgl-eval run gsm8k \\
     // DSpark: separate draft model; gamma three.
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "dspark", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--mamba-ssm-dtype float16",
+        "--mem-fraction-static 0.78",
+        "--cuda-graph-max-bs-decode 4",
+        "--speculative-algorithm DSPARK",
+        "--speculative-draft-model-path nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark",
+        "--speculative-dspark-block-size 3",
+        "--reasoning-parser nemotron_3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ==== NVIDIA B200 (SM100) + BF16, single GPU ====
+    // The Nemotron-H resolver selects FlashInfer target attention without
+    // speculation and TRT-LLM MHA target/eligible-draft attention with it.
+    {
+      match: { hw: "b200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--mamba-backend flashinfer",
+        "--mamba-ssm-dtype float16",
+        "--enable-mamba-cache-stochastic-rounding",
+        "--mamba-cache-philox-rounds 5",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs-decode 16",
+        "--reasoning-parser nemotron_3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "default", quant: "bf16", strategy: "mtp", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--mamba-backend flashinfer",
+        "--mamba-ssm-dtype float16",
+        "--enable-mamba-cache-stochastic-rounding",
+        "--mamba-cache-philox-rounds 5",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs-decode 16",
+        "--speculative-algorithm EAGLE",
+        "--speculative-draft-model-path {{MODEL_NAME}}",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--reasoning-parser nemotron_3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // DFlash uses depth five on B200; its full-attention draft resolves to
+    // FlashInfer while target verification remains TRT-LLM MHA.
+    {
+      match: { hw: "b200", variant: "default", quant: "bf16", strategy: "dflash", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--mamba-backend flashinfer",
+        "--mamba-ssm-dtype float16",
+        "--enable-mamba-cache-stochastic-rounding",
+        "--mamba-cache-philox-rounds 5",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs-decode 16",
+        "--speculative-algorithm DFLASH",
+        "--speculative-draft-model-path nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash",
+        "--speculative-dflash-block-size 6",
+        "--reasoning-parser nemotron_3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "default", quant: "bf16", strategy: "dspark", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--mamba-backend flashinfer",
+        "--mamba-ssm-dtype float16",
+        "--enable-mamba-cache-stochastic-rounding",
+        "--mamba-cache-philox-rounds 5",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs-decode 16",
+        "--speculative-algorithm DSPARK",
+        "--speculative-draft-model-path nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark",
+        "--speculative-dspark-block-size 3",
+        "--reasoning-parser nemotron_3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ==== NVIDIA Hopper (SM90) + BF16, single GPU ====
+    // FA3 target attention is selected by default and inherited by the draft.
+    {
+      match: { hw: "h100", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--mamba-ssm-dtype float16",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs-decode 16",
+        "--reasoning-parser nemotron_3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // MTP: the draft head is embedded in the target checkpoint, so SGLang's
+    // EAGLE path points --speculative-draft-model-path back at the target.
+    {
+      match: { hw: "h100", variant: "default", quant: "bf16", strategy: "mtp", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--mamba-ssm-dtype float16",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs-decode 16",
+        "--speculative-algorithm EAGLE",
+        "--speculative-draft-model-path {{MODEL_NAME}}",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--reasoning-parser nemotron_3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // DFlash: separate draft model; depth three -> block/verify width four.
+    {
+      match: { hw: "h100", variant: "default", quant: "bf16", strategy: "dflash", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--mamba-ssm-dtype float16",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs-decode 16",
+        "--speculative-algorithm DFLASH",
+        "--speculative-draft-model-path nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash",
+        "--speculative-dflash-block-size 4",
+        "--reasoning-parser nemotron_3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // DSpark: separate draft model; gamma three.
+    {
+      match: { hw: "h100", variant: "default", quant: "bf16", strategy: "dspark", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--mamba-ssm-dtype float16",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs-decode 16",
+        "--speculative-algorithm DSPARK",
+        "--speculative-draft-model-path nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark",
+        "--speculative-dspark-block-size 3",
+        "--reasoning-parser nemotron_3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ==== NVIDIA DGX Spark (GB10 / SM121) + BF16, single GPU ====
+    // The Nemotron-H resolver selects Triton target attention plus FlashInfer
+    // draft attention for speculative decoding on SM121.
+    {
+      match: { hw: "dgx-spark", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--mamba-ssm-dtype float16",
+        "--mem-fraction-static 0.78",
+        "--cuda-graph-max-bs-decode 4",
+        "--reasoning-parser nemotron_3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // MTP: the draft head is embedded in the target checkpoint, so SGLang's
+    // EAGLE path points --speculative-draft-model-path back at the target.
+    {
+      match: { hw: "dgx-spark", variant: "default", quant: "bf16", strategy: "mtp", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--mamba-ssm-dtype float16",
+        "--mem-fraction-static 0.78",
+        "--cuda-graph-max-bs-decode 4",
+        "--speculative-algorithm EAGLE",
+        "--speculative-draft-model-path {{MODEL_NAME}}",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--reasoning-parser nemotron_3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // DFlash: separate draft model; depth three -> block/verify width four.
+    {
+      match: { hw: "dgx-spark", variant: "default", quant: "bf16", strategy: "dflash", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--mamba-ssm-dtype float16",
+        "--mem-fraction-static 0.78",
+        "--cuda-graph-max-bs-decode 4",
+        "--speculative-algorithm DFLASH",
+        "--speculative-draft-model-path nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash",
+        "--speculative-dflash-block-size 4",
+        "--reasoning-parser nemotron_3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // DSpark: separate draft model; gamma three.
+    {
+      match: { hw: "dgx-spark", variant: "default", quant: "bf16", strategy: "dspark", nodes: "single" },
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",

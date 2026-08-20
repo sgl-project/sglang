@@ -75,13 +75,7 @@ class LTX2UpsampleStage(PipelineStage):
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
         stage_name = self._component_stage_name(stage_name)
-        uses = [
-            ComponentUse(stage_name, "spatial_upsampler"),
-            ComponentUse(stage_name, "vae"),
-        ]
-        if self.audio_vae is not None:
-            uses.append(ComponentUse(stage_name, "audio_vae"))
-        return uses
+        return [ComponentUse(stage_name, "spatial_upsampler")]
 
     def _upsample_video_latents(
         self, latents: torch.Tensor, server_args: ServerArgs, device: torch.device
@@ -93,12 +87,12 @@ class LTX2UpsampleStage(PipelineStage):
             device=device, dtype=latents.dtype
         )
         latents = latents * vae_std + vae_mean
-        self.spatial_upsampler = self.spatial_upsampler.to(
-            device=device, dtype=latents.dtype
-        )
-        latents = self.spatial_upsampler(latents)
-        # Keep the small spatial upsampler resident after warmup; moving it
-        # every request dominates the measured two-stage upsample latency.
+        with self.use_declared_component(
+            component_name="spatial_upsampler",
+            module=self.spatial_upsampler,
+            target_dtype=latents.dtype,
+        ) as spatial_upsampler:
+            latents = spatial_upsampler(latents)
         latents = (latents - vae_mean) / vae_std
         return latents
 

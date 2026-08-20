@@ -10,9 +10,8 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=3600,
-    suite="",
+    suite="nightly-perf-4-npu-a3",
     nightly=True,
-    disabled="performance testcase",
 )
 
 QWEN3_6_27B_128K_ENVS = {

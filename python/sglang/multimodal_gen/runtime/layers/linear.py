@@ -10,7 +10,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
-from sglang.kernel_api_logging import wrap_method_with_debug_kernel_once
+from sglang.kernels.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_tp_group,
@@ -154,11 +154,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
-        if x.device.type == "mps" and (
-            x.dtype != torch.float32
-            or layer.weight.dtype != torch.float32
-            or (bias is not None and bias.dtype != torch.float32)
-        ):
+        if x.device.type == "mps":
+            if x.dtype == layer.weight.dtype and (
+                bias is None or bias.dtype == x.dtype
+            ):
+                return F.linear(x, layer.weight, bias)
             return F.linear(
                 x.to(torch.float32),
                 layer.weight.to(torch.float32),

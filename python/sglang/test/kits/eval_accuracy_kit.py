@@ -231,9 +231,9 @@ class GSM8KMixin:
 class MMLUMixin:
     """Mixin for MMLU evaluation.
 
-    Backend is selectable via ``mmlu_backend`` (default ``"run_eval"``; or
-    ``"sgl_eval"``: sgl-eval multichoice grader, skipped if sgl-eval is not
-    installed).
+    Both ``mmlu_backend`` values score through sgl-eval -- ``"sgl_eval"`` calls it
+    in-process, ``"run_eval"`` reaches the same CLI via ``run_eval``. The switch
+    picks the call mechanism, not the grader.
 
     Required attributes on the test class:
         base_url: str

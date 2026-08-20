@@ -14,12 +14,20 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
+import asyncio
+import io
 import json
 import unittest
 from typing import List
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock, patch
 
-from sglang.srt.entrypoints.openai.protocol import TranscriptionRequest
+import numpy as np
+import soundfile as sf
+
+from sglang.srt.entrypoints.openai.protocol import (
+    TranscriptionRequest,
+    TranscriptionResponse,
+)
 from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
@@ -239,6 +247,426 @@ class TestStreamingFusedAutodetect(CustomTestCase):
         deltas = _deltas_from_sse(frames)
         self.assertEqual(deltas, ["Hello", " world"])
         self.assertFalse(any("<|" in d for d in deltas))
+
+
+class _MockChunkTokenizerManager:
+    """Mock TM scripting one result list per dispatched request, in order."""
+
+    def __init__(self, results_per_request: List):
+        self.model_config = Mock()
+        self.model_config.hf_config = Mock()
+        self.model_config.hf_config.architectures = ["WhisperForConditionalGeneration"]
+        self.server_args = Mock(
+            incremental_streaming_output=False,
+            asr_max_concurrent_sessions=32,
+        )
+        self.request_logger = Mock(log_requests=False)
+        self.tokenizer = Mock()
+        self.requests: List[GenerateReqInput] = []
+        self.aborted: List[str] = []
+        self._results = results_per_request
+        self.active_dispatches = 0
+        self.max_active_dispatches = 0
+
+    def generate_request(self, adapted_request, raw_request):
+        idx = len(self.requests)
+        # Mimic the real generate_request assigning a rid (via
+        # normalize_batch_and_arguments) so abort-by-rid is exercisable.
+        adapted_request.rid = f"rid{idx}"
+        self.requests.append(adapted_request)
+        results = self._results[idx]
+
+        async def gen():
+            self.active_dispatches += 1
+            self.max_active_dispatches = max(
+                self.max_active_dispatches, self.active_dispatches
+            )
+            # Give concurrently scheduled generators a chance to overlap at
+            # dispatch, then record that this request reached the engine.
+            await asyncio.sleep(0)
+            self.active_dispatches -= 1
+            for r in results:
+                # A bare exception entry simulates a chunk request failing.
+                if isinstance(r, BaseException):
+                    raise r
+                yield r
+
+        return gen()
+
+    def abort_request(self, rid: str = "", abort_all: bool = False):
+        self.aborted.append(rid)
+
+    def create_abort_task(self, adapted_request):
+        return None
+
+
+def _long_wav_bytes(duration_s: float = 65.0) -> bytes:
+    """A 16 kHz tone with silence gaps inside each 30 s stride's split-search
+    window, so the energy-aware splitter cuts at ~29.2 s and ~58.5 s."""
+    sr = 16000
+    t = np.arange(int(duration_s * sr)) / sr
+    wav = (0.5 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+    for gap_start, gap_end in ((29.2, 29.5), (58.5, 58.8)):
+        wav[int(gap_start * sr) : int(gap_end * sr)] = 0.0
+    buf = io.BytesIO()
+    sf.write(buf, wav, sr, format="WAV")
+    return buf.getvalue()
+
+
+class TestLongAudioChunkedNonStreaming(CustomTestCase):
+    """Audio longer than Whisper's 30 s window must be split into chunk
+    requests and the transcripts stitched in order — without chunking the
+    feature extractor silently truncates everything past 30 s."""
+
+    def _create_transcription(self, tm, audio_bytes, language="en", **kwargs):
+        serving = OpenAIServingTranscription(tm)
+        loop = get_or_create_event_loop()
+        return loop.run_until_complete(
+            serving.create_transcription(
+                audio_data=audio_bytes,
+                model="whisper",
+                language=language,
+                response_format=kwargs.pop("response_format", "json"),
+                temperature=0.0,
+                stream=False,
+                raw_request=Mock(),
+                **kwargs,
+            )
+        )
+
+    def test_long_audio_is_chunked_and_stitched(self):
+        texts = [" part one.", " part two.", " part three."]
+        tm = _MockChunkTokenizerManager(
+            [
+                [{"text": t, "meta_info": {"finish_reason": {"type": "stop"}}}]
+                for t in texts
+            ]
+        )
+        result = self._create_transcription(tm, _long_wav_bytes(65.0))
+
+        self.assertIsInstance(result, TranscriptionResponse, result)
+        # In-order plain concatenation (vLLM-parity stitching).
+        self.assertEqual(result.text, " part one. part two. part three.")
+        self.assertEqual(result.usage.seconds, 65)
+        self.assertEqual(len(tm.requests), 3)
+        self.assertEqual(tm.max_active_dispatches, 1)
+
+        # Each chunk request is independent: own audio payload, own
+        # sampling_params dict (the multimodal processor pops keys out of
+        # it per request), stream=False, audio modality.
+        params_ids = {id(req.sampling_params) for req in tm.requests}
+        self.assertEqual(len(params_ids), len(tm.requests))
+        total_samples = 0
+        for req in tm.requests:
+            self.assertFalse(req.stream)
+            self.assertEqual(req.modalities, ["audio"])
+            data, sr = sf.read(io.BytesIO(req.audio_data), dtype="float32")
+            self.assertEqual(sr, 16000)
+            self.assertLessEqual(len(data), 30 * 16000)
+            total_samples += len(data)
+        self.assertEqual(total_samples, 65 * 16000)
+
+    def test_chunk_failure_returns_error_and_stops_dispatch(self):
+        # When one chunk request fails, create_transcription must return an
+        # error response (not a partial transcript), abort the in-flight
+        # request, and leave later chunks undispatched.
+        tm = _MockChunkTokenizerManager(
+            [
+                [
+                    {
+                        "text": " part one.",
+                        "meta_info": {"finish_reason": {"type": "stop"}},
+                    }
+                ],
+                [ValueError("chunk boom")],
+                [
+                    {
+                        "text": " part three.",
+                        "meta_info": {"finish_reason": {"type": "stop"}},
+                    }
+                ],
+            ]
+        )
+        result = self._create_transcription(tm, _long_wav_bytes(65.0))
+        # Error response, not a TranscriptionResponse.
+        self.assertNotIsInstance(result, TranscriptionResponse)
+        # Sequential dispatch means the third chunk never reaches the engine.
+        self.assertEqual(len(tm.requests), 2)
+        self.assertIn(tm.requests[-1].rid, tm.aborted)
+        self.assertEqual(tm.max_active_dispatches, 1)
+
+    def test_split_failure_returns_error_without_dispatch(self):
+        tm = _MockChunkTokenizerManager([])
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_transcription."
+            "split_audio_energy_aware",
+            side_effect=RuntimeError("decode failed"),
+        ):
+            result = self._create_transcription(tm, _long_wav_bytes(65.0))
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Failed to split audio", json.loads(result.body)["message"])
+        self.assertEqual(tm.requests, [])
+
+    def test_short_audio_stays_unchunked(self):
+        tm = _MockChunkTokenizerManager(
+            [[{"text": " short.", "meta_info": {"finish_reason": {"type": "stop"}}}]]
+        )
+        result = self._create_transcription(tm, _long_wav_bytes(10.0))
+        self.assertIsInstance(result, TranscriptionResponse, result)
+        self.assertEqual(result.text, " short.")
+        self.assertEqual(len(tm.requests), 1)
+
+    def test_chunked_fused_autodetect_first_chunk_language_wins(self):
+        # language=None → fused auto-detect per chunk. Each chunk carries
+        # its own forced prefix; the stitched text must strip all of them,
+        # and the reported language comes from the first chunk.
+        tm = _MockChunkTokenizerManager(
+            [
+                [
+                    {
+                        "text": "<|en|><|transcribe|><|notimestamps|> part one.",
+                        "meta_info": {"finish_reason": {"type": "stop"}},
+                    }
+                ],
+                [
+                    {
+                        "text": "<|fr|><|transcribe|><|notimestamps|> part two.",
+                        "meta_info": {"finish_reason": {"type": "stop"}},
+                    }
+                ],
+                [
+                    {
+                        "text": "<|en|><|transcribe|><|notimestamps|> part three.",
+                        "meta_info": {"finish_reason": {"type": "stop"}},
+                    }
+                ],
+            ]
+        )
+        result = self._create_transcription(tm, _long_wav_bytes(65.0), language=None)
+        self.assertIsInstance(result, TranscriptionResponse, result)
+        self.assertEqual(result.text, "part one. part two. part three.")
+        self.assertNotIn("<|", result.text)
+        self.assertEqual(len(tm.requests), 3)
+        # Every chunk request kept the fused regex constraint.
+        for req in tm.requests:
+            self.assertIn("regex", req.sampling_params)
+
+    def test_chunked_fused_spaceless_script_not_space_joined(self):
+        # zh/ja/th chunk texts carry no boundary whitespace; stitching must
+        # not inject an ASCII space the model never emitted.
+        tm = _MockChunkTokenizerManager(
+            [
+                [
+                    {
+                        "text": "<|zh|><|transcribe|><|notimestamps|>你好",
+                        "meta_info": {"finish_reason": {"type": "stop"}},
+                    }
+                ],
+                [
+                    {
+                        "text": "<|zh|><|transcribe|><|notimestamps|>世界",
+                        "meta_info": {"finish_reason": {"type": "stop"}},
+                    }
+                ],
+            ]
+        )
+        result = self._create_transcription(tm, _long_wav_bytes(40.0), language=None)
+        self.assertIsInstance(result, TranscriptionResponse, result)
+        self.assertEqual(result.text, "你好世界")
+        self.assertEqual(len(tm.requests), 2)
+
+    def test_chunked_fused_language_uses_first_nonempty_chunk(self):
+        tm = _MockChunkTokenizerManager(
+            [
+                [
+                    {
+                        "text": "<|fr|><|transcribe|><|notimestamps|>",
+                        "output_ids": [],
+                        "meta_info": {"finish_reason": {"type": "stop"}},
+                    }
+                ],
+                [
+                    {
+                        "text": "<|en|><|transcribe|><|notimestamps|> Hello",
+                        "output_ids": [],
+                        "meta_info": {"finish_reason": {"type": "stop"}},
+                    }
+                ],
+            ]
+        )
+        result = self._create_transcription(
+            tm,
+            _long_wav_bytes(40.0),
+            language=None,
+            response_format="verbose_json",
+        )
+
+        self.assertEqual(result.text, "Hello")
+        self.assertEqual(result.language, "en")
+
+
+class TestLongAudioChunkedStreaming(CustomTestCase):
+    """_generate_long_audio_stream: chunks transcribed sequentially, deltas
+    emitted in audio order, exactly one finish frame."""
+
+    def _run_stream(self, results_per_request, fused=False, n_chunks=2):
+        tm = _MockChunkTokenizerManager(results_per_request)
+        serving = OpenAIServingTranscription(tm)
+        request = TranscriptionRequest(model="whisper", stream=True)
+        if fused:
+            request._fused_autodetect = True
+            request._fused_ts_variant = False
+        request._audio_chunks = [b"chunk%d" % i for i in range(n_chunks)]
+        # Streaming has no segment timing, so the offsets are intentionally
+        # not set here — only the non-streaming verbose_json path reads them.
+        adapted = GenerateReqInput(
+            text="", modalities=["audio"], sampling_params={"temperature": 0.0}
+        )
+        raw_request = Mock()
+        raw_request.is_disconnected = AsyncMock(return_value=False)
+
+        async def drive():
+            frames = []
+            async for frame in serving._generate_long_audio_stream(
+                adapted, request, raw_request
+            ):
+                frames.append(frame)
+            return frames
+
+        loop = get_or_create_event_loop()
+        return tm, request, loop.run_until_complete(drive())
+
+    @staticmethod
+    def _finish_reasons(frames: List[str]) -> List[str]:
+        out = []
+        for line in frames:
+            if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+                continue
+            obj = json.loads(line[len("data: ") :])
+            for choice in obj.get("choices", []):
+                if choice.get("finish_reason"):
+                    out.append(choice["finish_reason"])
+        return out
+
+    def test_chunks_streamed_in_order_with_single_finish(self):
+        tm, _, frames = self._run_stream(
+            [
+                [_chunk(" Hello"), _chunk(" Hello world", finish="stop")],
+                [_chunk(" Again"), _chunk(" Again done", finish="stop")],
+            ]
+        )
+        self.assertEqual(
+            _deltas_from_sse(frames), [" Hello", " world", " Again", " done"]
+        )
+        self.assertEqual(self._finish_reasons(frames), ["stop"])
+        self.assertEqual(frames[-1], "data: [DONE]\n\n")
+        # Both chunk requests were dispatched and streamed.
+        self.assertEqual(len(tm.requests), 2)
+        self.assertTrue(all(req.stream for req in tm.requests))
+
+    def test_disconnect_between_chunks_stops_and_aborts(self):
+        # Client disconnects after the first chunk: the second chunk is
+        # never dispatched, and the in-flight request from chunk 0 is
+        # already done so nothing is left decoding.
+        tm = _MockChunkTokenizerManager(
+            [
+                [_chunk(" Hello", finish="stop")],
+                [_chunk(" world", finish="stop")],
+            ]
+        )
+        serving = OpenAIServingTranscription(tm)
+        request = TranscriptionRequest(model="whisper", stream=True)
+        request._audio_chunks = [b"chunk0", b"chunk1"]
+        adapted = GenerateReqInput(
+            text="", modalities=["audio"], sampling_params={"temperature": 0.0}
+        )
+        raw_request = Mock()
+        # Connected for the first chunk, disconnected before the second.
+        raw_request.is_disconnected = AsyncMock(side_effect=[False, True])
+
+        async def drive():
+            return [
+                f
+                async for f in serving._generate_long_audio_stream(
+                    adapted, request, raw_request
+                )
+            ]
+
+        frames = get_or_create_event_loop().run_until_complete(drive())
+        self.assertEqual(_deltas_from_sse(frames), [" Hello"])
+        # Only the first chunk was dispatched.
+        self.assertEqual(len(tm.requests), 1)
+
+    def test_abnormal_chunk_finish_reason_not_masked(self):
+        # A non-final chunk truncated at the token cap (finish="length")
+        # must surface in the single final frame even though later chunks
+        # stop cleanly — otherwise silently missing transcript content
+        # reads as success.
+        _, _, frames = self._run_stream(
+            [
+                [_chunk(" Hello", finish="length")],
+                [_chunk(" world", finish="stop")],
+            ]
+        )
+        self.assertEqual(_deltas_from_sse(frames), [" Hello", " world"])
+        self.assertEqual(self._finish_reasons(frames), ["length"])
+
+    def test_fused_chunks_strip_prefixes_and_preserve_boundary_space(self):
+        tm, request, frames = self._run_stream(
+            [
+                [
+                    _chunk("<|fr|><|transcribe|>"),
+                    _chunk(
+                        "<|fr|><|transcribe|><|notimestamps|> Bonjour", finish="stop"
+                    ),
+                ],
+                [
+                    _chunk(
+                        "<|fr|><|transcribe|><|notimestamps|> le monde",
+                        finish="stop",
+                    )
+                ],
+            ],
+            fused=True,
+        )
+        deltas = _deltas_from_sse(frames)
+        self.assertFalse(any("<|" in d for d in deltas))
+        # No leading space at stream start; the later chunk's own leading
+        # space is the seam separator.
+        self.assertFalse(deltas[0].startswith(" "))
+        self.assertEqual("".join(deltas), "Bonjour le monde")
+        self.assertEqual(request.language, "fr")
+        self.assertEqual(self._finish_reasons(frames), ["stop"])
+
+    def test_fused_spaceless_script_chunks_not_space_joined(self):
+        # zh/ja/th transcripts carry no boundary whitespace; the seam must
+        # not inject an ASCII space the model never emitted.
+        _, request, frames = self._run_stream(
+            [
+                [_chunk("<|zh|><|transcribe|><|notimestamps|>你好", finish="stop")],
+                [_chunk("<|zh|><|transcribe|><|notimestamps|>世界", finish="stop")],
+            ],
+            fused=True,
+        )
+        self.assertEqual("".join(_deltas_from_sse(frames)), "你好世界")
+        self.assertEqual(request.language, "zh")
+
+    def test_fused_leading_silence_uses_first_nonempty_chunk_language(self):
+        _, request, frames = self._run_stream(
+            [
+                [_chunk("<|fr|><|transcribe|><|notimestamps|>", finish="stop")],
+                [
+                    _chunk(
+                        "<|en|><|transcribe|><|notimestamps|> Hello",
+                        finish="stop",
+                    )
+                ],
+            ],
+            fused=True,
+        )
+        self.assertEqual("".join(_deltas_from_sse(frames)), "Hello")
+        self.assertEqual(request.language, "en")
 
 
 class TestStreamingIncrementalOutputMode(CustomTestCase):

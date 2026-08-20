@@ -56,10 +56,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 
 if current_platform.is_cuda():
     try:
-        from sglang.kernels.ops.diffusion.triton.wan_causal_cache import (
-            cat_pad_channels_last_3d,
-            dup_up3d_add,
-        )
+        from sglang.kernels.ops.diffusion import cat_pad_channels_last_3d, dup_up3d_add
     except ImportError:  # pragma: no cover
         cat_pad_channels_last_3d = None
         dup_up3d_add = None

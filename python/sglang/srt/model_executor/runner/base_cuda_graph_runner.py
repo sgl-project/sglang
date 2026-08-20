@@ -23,7 +23,10 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
 
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
-from sglang.srt.runtime_context import get_flags
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_flags,
+)
 from sglang.srt.utils import (
     get_cuda_graph_batch_size_alignment,
     get_cuda_graph_max_batch_size,
@@ -68,14 +71,14 @@ def get_batch_sizes_to_capture(
     """
 
     server_args = model_runner.server_args
-    capture_bs = list(server_args.cuda_graph_config.decode.bs)
+    capture_bs = list(get_exec().graph.cuda_graph_config.decode.bs)
     num_max_requests = model_runner.req_to_token_pool.size
 
     mul_base = get_cuda_graph_batch_size_alignment(server_args)
     # TBO splits each request's rows across two micro-batches, so the
     # alignment constraint applies per request rather than per token row.
     alignment_width = captured_req_width
-    if server_args.enable_two_batch_overlap:
+    if get_exec().overlap.enable_two_batch_overlap:
         alignment_width = 1
 
     # pad `num_max_requests` to avoid being filtered out
@@ -92,7 +95,7 @@ def get_batch_sizes_to_capture(
 
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
     compile_bs = (
-        [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
+        [bs for bs in capture_bs if bs <= get_exec().graph.torch_compile_max_bs]
         if get_flags().capture.enable_torch_compile
         else []
     )

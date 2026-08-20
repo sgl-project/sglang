@@ -1,6 +1,4 @@
-import sys
 import unittest
-from pathlib import Path
 
 import torch
 
@@ -11,10 +9,6 @@ from sglang.srt.utils.common import (
     is_sm100_supported,
     is_sm120_supported,
 )
-from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
     DenseAttentionCase,
@@ -31,6 +25,7 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner i
 from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
     run_dense_split_op_extend_case,
 )
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")

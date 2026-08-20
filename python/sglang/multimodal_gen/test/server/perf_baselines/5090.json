@@ -2,8 +2,8 @@
     "metadata": {
         "model": "Diffusion Server",
         "hardware": "CI RTX 5090 pool",
-        "description": "Reference numbers captured from real 5090 CI runner history (PR 29791 run 28492141274, job 84450974283).",
-        "last_updated": "2026-07-01"
+        "description": "Reference numbers tightened from RTX 5090 multimodal_gen CI run 31935214180 at source revision 2ee0d38a8553d186faad9c50893480e3c1d79270.",
+        "last_updated": "2026-08-16"
     },
     "tolerances": {
         "long_term": {
@@ -38,68 +38,68 @@
         "flux_2_klein_base_image_t2i": {
             "stages_ms": {
                 "DecodingStage": 18.19,
-                "DenoisingStage": 18213.48,
+                "DenoisingStage": 17612.9,
                 "ImageVAEEncodingStage": 0.01,
                 "InputValidationStage": 0.08,
-                "LatentPreparationStage": 4.87,
+                "LatentPreparationStage": 1.67,
                 "TextEncodingStage": 104.46,
                 "TimestepPreparationStage": 142.18
             },
             "denoise_step_ms": {
-                "0": 219.58,
-                "10": 359.79,
-                "20": 361.55,
-                "29": 361.99,
-                "39": 362.57,
-                "49": 362.89
+                "0": 95.07,
+                "10": 344.0,
+                "20": 345.85,
+                "29": 346.2,
+                "39": 346.9,
+                "49": 347.31
             },
-            "expected_e2e_ms": 18641.09,
-            "expected_avg_denoise_ms": 357.93,
-            "expected_median_denoise_ms": 361.8,
+            "expected_e2e_ms": 18255.39,
+            "expected_avg_denoise_ms": 338.78,
+            "expected_median_denoise_ms": 345.95,
             "estimated_full_test_time_s": 94.0
         },
         "wan2_1_t2v_1.3b": {
             "stages_ms": {
-                "DecodingStage": 1202.43,
+                "DecodingStage": 495.01,
                 "DenoisingStage": 21452.59,
                 "InputValidationStage": 0.09,
                 "LatentPreparationStage": 0.23,
-                "TextEncodingStage": 1210.22,
+                "TextEncodingStage": 1025.11,
                 "TimestepPreparationStage": 3.91
             },
             "denoise_step_ms": {
-                "0": 480.39,
+                "0": 169.02,
                 "10": 426.11,
                 "20": 427.32,
                 "29": 428.09,
                 "39": 428.04,
                 "49": 422.31
             },
-            "expected_e2e_ms": 23877.73,
-            "expected_avg_denoise_ms": 428.74,
+            "expected_e2e_ms": 23418.73,
+            "expected_avg_denoise_ms": 426.59,
             "expected_median_denoise_ms": 427.94,
             "estimated_full_test_time_s": 160.9
         },
         "zimage_image_t2i": {
             "stages_ms": {
                 "DecodingStage": 7.11,
-                "DenoisingStage": 2229.48,
+                "DenoisingStage": 2178.8,
                 "InputValidationStage": 0.04,
                 "LatentPreparationStage": 0.17,
-                "TextEncodingStage": 252.73,
-                "TimestepPreparationStage": 38.57
+                "TextEncodingStage": 252.2,
+                "TimestepPreparationStage": 36.04
             },
             "denoise_step_ms": {
                 "0": 39.34,
-                "2": 277.35,
-                "3": 267.94,
-                "5": 279.01,
-                "6": 273.01,
-                "8": 275.12
+                "2": 270.3,
+                "3": 263.6,
+                "5": 264.28,
+                "6": 265.1,
+                "8": 265.56
             },
-            "expected_e2e_ms": 2533.95,
-            "expected_avg_denoise_ms": 246.97,
-            "expected_median_denoise_ms": 273.01,
+            "expected_e2e_ms": 2492.09,
+            "expected_avg_denoise_ms": 241.53,
+            "expected_median_denoise_ms": 265.1,
             "estimated_full_test_time_s": 329.8
         },
         "lingbot_video_moe_t2v": {

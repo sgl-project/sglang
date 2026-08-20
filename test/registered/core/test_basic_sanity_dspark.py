@@ -8,7 +8,7 @@ from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixi
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.fwd_occupancy_kit import FwdOccupancyMixin
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
-from sglang.test.kits.spec_server_kits import SpecGrammarKit
+from sglang.test.kits.spec_server_kits import SpecGrammarKit, SpecLogprobKit
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -38,6 +38,7 @@ class TestBasicSanityDSpark(
     GSM8KMixin,
     JSONConstrainedMixin,
     SpecGrammarKit,
+    SpecLogprobKit,
     CustomTestCase,
 ):
     served_model_name = TARGET_MODEL
@@ -87,10 +88,6 @@ class TestBasicSanityDSpark(
                 "SGLANG_RAGGED_VERIFY_MODE": "compact",
             },
         )
-
-    @unittest.skip("DSPARK rejects return_logprob at admission")
-    def test_grammar_logprob_count_matches_completion_tokens(self):
-        pass
 
     @classmethod
     def tearDownClass(cls):

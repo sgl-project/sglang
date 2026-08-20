@@ -21,6 +21,7 @@ import torch
 
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
+    dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
@@ -36,7 +37,13 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_write_pad,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
 from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
@@ -177,10 +184,33 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(eagle_draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
-                self._cell_size = int(
-                    self._cell_size
-                    * (1 + int(eagle_draft_num_layers) / int(num_layers))
-                )
+                draft_num_layers = int(eagle_draft_num_layers)
+                if is_deepseek_dsa(kvc.model_config.hf_config):
+                    target_indexer_size = self._compute_dsa_indexer_cell_size(
+                        kvc=kvc,
+                        num_layers=num_layers,
+                    )
+                    target_kv_size = self._cell_size - target_indexer_size
+                    from sglang.srt.layers.cp.utils import (
+                        get_glm_dsa_layer_split_effective_num_layers,
+                    )
+
+                    target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
+                        kvc, num_layers
+                    )
+                    draft_kv_size = int(
+                        target_kv_size * draft_num_layers / target_kv_num_layers
+                    )
+                    draft_indexer_size = self._compute_dsa_indexer_cell_size(
+                        kvc=kvc,
+                        num_layers=draft_num_layers,
+                        allocate_all_layers=True,
+                    )
+                    self._cell_size += draft_kv_size + draft_indexer_size
+                else:
+                    self._cell_size = int(
+                        self._cell_size * (1 + draft_num_layers / int(num_layers))
+                    )
 
         # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
         if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
@@ -247,26 +277,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
-                index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
-                indexer_size_per_token = (
-                    index_head_dim
-                    + index_head_dim // DSATokenToKVPool.quant_block_size * 4
-                )
-                element_size = torch._utils._element_size(
-                    DSATokenToKVPool.index_k_with_scale_buffer_dtype
-                )
-                indexer_ratio = 1
-                if kvc.server_args.enable_hisparse:
-                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
-
-                    indexer_ratio = parse_hisparse_config(
-                        kvc.server_args
-                    ).host_to_device_ratio
-                cell_size += int(
-                    indexer_size_per_token
-                    * effective_num_layers
-                    * element_size
-                    * indexer_ratio
+                cell_size += self._compute_dsa_indexer_cell_size(
+                    kvc=kvc,
+                    num_layers=num_layers,
                 )
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
@@ -335,6 +348,69 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 ) // scale_block_size
 
         return cell_size
+
+    def _compute_dsa_indexer_cell_size(
+        self,
+        *,
+        kvc: KVCacheConfigurator,
+        num_layers: int,
+        allocate_all_layers: bool = False,
+    ) -> int:
+        index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
+        indexer_size_per_token = (
+            index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+        )
+        element_size = torch._utils._element_size(
+            DSATokenToKVPool.index_k_with_scale_buffer_dtype
+        )
+        memory_config = get_memory()
+        indexer_ratio = 1
+        if memory_config.enable_hisparse:
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            indexer_ratio = parse_hisparse_config(kvc.server_args).host_to_device_ratio
+
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            _should_elide_dsa_index_k,
+        )
+
+        if allocate_all_layers or not _should_elide_dsa_index_k(
+            is_draft_worker=kvc.is_draft_worker
+        ):
+            num_indexer_layers = num_layers
+        else:
+            active_indexer_layers = [
+                layer_id
+                for layer_id in range(
+                    kvc.layer_info.start_layer, kvc.layer_info.end_layer
+                )
+                if not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
+            ]
+            from sglang.srt.layers.cp.utils import (
+                get_glm_dsa_cp_layer_shard_info,
+                get_layer_shard_range,
+            )
+
+            _, shard_size = get_glm_dsa_cp_layer_shard_info(kvc)
+            if shard_size > 1:
+                active_set = set(active_indexer_layers)
+                max_owned = 0
+                for rank in range(shard_size):
+                    start, end = get_layer_shard_range(rank, shard_size, num_layers)
+                    max_owned = max(
+                        max_owned,
+                        sum(
+                            kvc.layer_info.start_layer + i in active_set
+                            for i in range(start, end)
+                        ),
+                    )
+                num_indexer_layers = max_owned + 1
+            else:
+                num_indexer_layers = len(active_indexer_layers)
+
+        return int(
+            indexer_size_per_token * num_indexer_layers * element_size * indexer_ratio
+        )
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
@@ -533,10 +609,9 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         super().__init__(kvc)
         assert self._full_layers_num > 0
 
-        sa = kvc.server_args
         page_size = kvc.page_size
         window = kvc.sliding_window_size
-        draft_tokens = sa.speculative_num_draft_tokens or 1
+        draft_tokens = get_spec().speculative_num_draft_tokens or 1
         eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
 
         """
@@ -544,40 +619,44 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         Padding to make sure eviction point is page-aligned.
         """
         trailing_tokens = window + eviction_interval * draft_tokens + page_size
-        if sa.speculative_algorithm is None:
+        if get_spec().speculative_algorithm is None:
             decode_alloc = page_size
-        elif sa.disable_overlap_schedule:
+        elif get_schedule().disable_overlap_schedule:
             # spec-v1: new_tokens_required_next_decode per request.
-            decode_alloc = spec_decode_alloc_len_per_request(sa)
+            decode_alloc = spec_decode_alloc_len_per_request(
+                page_size=page_size,
+                speculative_num_steps=get_spec().speculative_num_steps,
+                speculative_eagle_topk=get_spec().speculative_eagle_topk,
+                speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
+            )
         else:
             # spec-v2: the overlap allocator keeps 2 * alloc_len outstanding
             # (eagle_utils.eagle_prepare_for_decode: kv_committed_len + 2 * alloc_len).
-            decode_alloc = 2 * get_alloc_len_per_decode(sa)
+            decode_alloc = 2 * get_alloc_len_per_decode()
         per_request = trailing_tokens + decode_alloc
 
-        num_reqs = sa.max_running_requests // kvc.ps.attn_dp_size
-        if sa.disaggregation_mode == "decode":
+        num_reqs = get_schedule().max_running_requests // kvc.ps.attn_dp_size
+        if get_disagg().disaggregation_mode == "decode":
             self._swa_cap = (
                 per_request * num_reqs
-                + (window + page_size) * sa.disaggregation_decode_extra_slots
+                + (window + page_size) * get_disagg().disaggregation_decode_extra_slots
             )
         else:
-            chunks_in_flight = 1 if sa.disable_overlap_schedule else 2
+            chunks_in_flight = 1 if get_schedule().disable_overlap_schedule else 2
             self._swa_cap = (
                 per_request * num_reqs
-                + chunks_in_flight * sa.chunked_prefill_size
+                + chunks_in_flight * get_schedule().chunked_prefill_size
                 + page_size
             )
 
     @staticmethod
     def is_applicable(kvc: KVCacheConfigurator) -> bool:
         """True when SWAChunkCache can be sized from explicit max requests."""
-        sa = kvc.server_args
-        if sa.max_running_requests is None:
+        if get_schedule().max_running_requests is None:
             return False
-        if not sa.disable_radix_cache:
+        if not get_memory().disable_radix_cache:
             return False
-        if sa.chunked_prefill_size is None:
+        if get_schedule().chunked_prefill_size is None:
             return False
         if kvc.sliding_window_size is None:
             return False

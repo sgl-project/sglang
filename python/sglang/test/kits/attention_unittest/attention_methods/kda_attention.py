@@ -16,7 +16,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
 from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
-from sglang.srt.layers.attention.linear.utils import initialize_linear_attn_config
+from sglang.srt.layers.attention.linear.utils import resolve_linear_attn_backends
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
@@ -609,7 +609,9 @@ def build_kda_attention_fixture(
     except (AssertionError, ImportError, ModuleNotFoundError) as exc:
         testcase.skipTest(f"{case.backend} backend is not available: {exc}")
 
-    initialize_linear_attn_config(runner.server_args)
+    # Standing in for `attn_backend_wrapper`, which is what stamps this on a
+    # runner before building the backend that reads it.
+    runner.linear_attn_backends = resolve_linear_attn_backends()
     linear_backend = KDAAttnBackend(runner)
     backend = HybridLinearAttnBackend(full_backend, linear_backend, full_attn_layers=[])
     actual_module = ProjectedKDAAttention(

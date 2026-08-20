@@ -1,16 +1,17 @@
 import unittest
 
+import sgl_kernel  # noqa: F401
 import torch
-from utils import (
+
+from sglang.srt.layers.quantization.fp8_utils import input_to_float8
+from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.cpu_test_utils import (
     convert_weight,
     native_w8a8_per_token_matmul,
     per_token_quant_int8,
     precision,
 )
-
-from sglang.srt.layers.quantization.fp8_utils import input_to_float8
-from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
-from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-b-test-cpu")

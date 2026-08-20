@@ -63,7 +63,7 @@ export const config = {
 
   modelNames: {
     "default|bf16": "meta-models/Muse-Glimmer-30B",
-    "default|gguf": "meta-models/Muse-Glimmer-30B-GGUF/muse-glimmer-30B-kquant-17gb.gguf",
+    "default|gguf": "meta-models/Muse-Glimmer-30B-GGUF/Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf",
     "default|nvfp4": "RadixArk/Muse-Glimmer-NVFP4",
     "default|mlx-q4": "RadixArk/Muse-Glimmer-q4-MLX",
     "default|mlx-q4km": "RadixArk/Muse-Glimmer-q4km-gs128-MLX",

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Transformer building blocks for the MiniMax H3 visual VAE ViT decoder.
 import math
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
@@ -11,9 +12,7 @@ from diffusers.utils.torch_utils import maybe_allow_in_graph
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding,
 )
-from sglang.kernels.ops.diffusion.triton.scale_shift import (
-    try_fused_scaled_residual_add_exact,
-)
+from sglang.kernels.ops.diffusion import try_fused_scaled_residual_add_exact
 
 from .attention import Attention
 from .vit_utils import _env_flag, _vit_torch_compile_kwargs
@@ -173,7 +172,10 @@ class RotaryEmbeddingND(nn.Module):
         if D != self.n_dim:
             raise ValueError(f"Expected {self.n_dim} dimensions, got {D}")
 
-        with torch.autocast("cuda", enabled=False):
+        autocast_context = (
+            torch.autocast("cuda", enabled=False) if img_ids.is_cuda else nullcontext()
+        )
+        with autocast_context:
             angles = (
                 self.angle_scale
                 * img_ids[:, :, :, None]
@@ -256,12 +258,11 @@ class TransformerBlock(nn.Module):
         self,
         hidden_states: torch.FloatTensor,
         rotary_pos_emb: Optional[torch.FloatTensor] = None,
-        pack_info: dict = {},
     ):
         norm_hidden_states = self.norm1(_vit_norm_input(self.norm1, hidden_states)).to(
             hidden_states.dtype
         )
-        attn_output = self.attn(norm_hidden_states, rotary_pos_emb, pack_info)
+        attn_output = self.attn(norm_hidden_states, rotary_pos_emb)
         if self.use_scale:
             hidden_states = _scaled_residual_add(
                 hidden_states, attn_output, self.scale1

@@ -6,7 +6,6 @@ were skipped or double-emitted, drifting the per-request entry counts that
 the scheduler asserts on.
 """
 
-import itertools
 import unittest
 from types import SimpleNamespace
 
@@ -14,6 +13,7 @@ import torch
 
 from sglang.srt.layers.logprob_processor import InputLogprobProcessor
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.logprob_test_utils import coverage_cases
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
@@ -23,6 +23,11 @@ VOCAB = 11
 TOPK_CYCLE = [2, 0, 3]
 # [] is a valid probe set distinct from None (opt-out).
 TOKEN_IDS_CYCLE = [[0, 3], None, [1], []]
+# start == extend_len is the zero-logprob-row shape. Order determines the cyclic
+# width-3/4 heterogeneous coverage cases.
+SEQ_SPEC_MENU = ((1, 1), (2, 2), (3, 0), (4, 1), (5, 5), (2, 0), (6, 2))
+# 7 singletons + 7*7 ordered pairs + 4*7 wide cases each at width 3 and 4.
+EXPECTED_CASES = 112
 
 
 def _build_batch(seq_specs, with_token_ids):
@@ -92,40 +97,38 @@ class TestLogprobChunkStitching(CustomTestCase):
     def _sweep(self, with_token_ids):
         torch.manual_seed(0)
         proc = InputLogprobProcessor()
-        # (extend_len, start); start == extend_len is the degenerate
-        # zero-logprob-row shape.
-        menu = [(1, 1), (2, 2), (3, 0), (4, 1), (5, 5), (2, 0), (6, 2)]
+        combos = list(coverage_cases(SEQ_SPEC_MENU, max_seqs=4))
+        self.assertEqual(len(combos), EXPECTED_CASES)
         tried = 0
-        for n_seqs in (1, 2, 3, 4):
-            for combo in itertools.product(menu, repeat=n_seqs):
-                batch = _build_batch(list(combo), with_token_ids)
-                # Same unit as the production gate: grid rows, not logprob rows.
-                total_rows = batch[0].shape[0]
-                for chunk_size in (1, 2, 3, 5):
-                    if total_rows <= chunk_size:
-                        continue
-                    tried += 1
-                    ref, ref_sampled = _run(proc, batch, False, 10**9)
-                    got, got_sampled = _run(proc, batch, True, chunk_size)
-                    label = f"specs={list(combo)} chunk={chunk_size}"
-                    self.assertEqual(ref.top_logprobs_val, got.top_logprobs_val, label)
-                    self.assertEqual(ref.top_logprobs_idx, got.top_logprobs_idx, label)
-                    if with_token_ids:
-                        self.assertEqual(
-                            ref.token_ids_logprobs_val,
-                            got.token_ids_logprobs_val,
-                            label,
-                        )
-                        self.assertEqual(
-                            ref.token_ids_logprobs_idx,
-                            got.token_ids_logprobs_idx,
-                            label,
-                        )
-                    torch.testing.assert_close(
-                        ref.token_logprobs, got.token_logprobs, msg=label
+        for combo in combos:
+            batch = _build_batch(list(combo), with_token_ids)
+            # Same unit as the production gate: grid rows, not logprob rows.
+            total_rows = batch[0].shape[0]
+            for chunk_size in (1, 2, 3, 5):
+                if total_rows <= chunk_size:
+                    continue
+                tried += 1
+                ref, ref_sampled = _run(proc, batch, False, 10**9)
+                got, got_sampled = _run(proc, batch, True, chunk_size)
+                label = f"specs={list(combo)} chunk={chunk_size}"
+                self.assertEqual(ref.top_logprobs_val, got.top_logprobs_val, label)
+                self.assertEqual(ref.top_logprobs_idx, got.top_logprobs_idx, label)
+                if with_token_ids:
+                    self.assertEqual(
+                        ref.token_ids_logprobs_val,
+                        got.token_ids_logprobs_val,
+                        label,
                     )
-                    torch.testing.assert_close(ref_sampled, got_sampled, msg=label)
-        self.assertGreater(tried, 1000)
+                    self.assertEqual(
+                        ref.token_ids_logprobs_idx,
+                        got.token_ids_logprobs_idx,
+                        label,
+                    )
+                torch.testing.assert_close(
+                    ref.token_logprobs, got.token_logprobs, msg=label
+                )
+                torch.testing.assert_close(ref_sampled, got_sampled, msg=label)
+        self.assertGreater(tried, 100)
 
     def test_top_logprobs_stitching(self):
         self._sweep(with_token_ids=False)

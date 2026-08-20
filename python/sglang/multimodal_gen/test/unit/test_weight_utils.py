@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The patched find_local_ranks() must never touch torch.distributed."""
+"""Unit tests for multimodal weight-loading utilities."""
 
+import os
+import tempfile
 import unittest
 from unittest.mock import patch
 
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     _disable_runai_streamer_rank_discovery_collective,
+    get_lock,
 )
 
 _DIST_STREAMER_MOD = "runai_model_streamer.distributed_streamer.distributed_streamer"
@@ -81,6 +84,26 @@ class TestDisableRunaiStreamerRankDiscoveryCollective(unittest.TestCase):
             wu._disable_runai_streamer_rank_discovery_collective()  # must not raise
 
         self.assertFalse(hasattr(_StubParams, "find_local_ranks"))
+
+
+class TestDiffusionWeightLock(unittest.TestCase):
+    def test_long_snapshot_path_uses_bounded_lock_filename(self):
+        component_path = os.path.join(
+            "/scratch",
+            "models--" + "very-long-repository-name-" * 8,
+            "snapshots",
+            "a" * 64,
+            "transformer",
+            "config.json",
+        )
+
+        with tempfile.TemporaryDirectory() as lock_dir:
+            lock = get_lock(component_path, lock_dir)
+            lock_filename = os.path.basename(lock.lock_file)
+
+            self.assertLessEqual(len(os.fsencode(lock_filename)), 255)
+            with lock:
+                self.assertTrue(os.path.exists(lock.lock_file))
 
 
 if __name__ == "__main__":

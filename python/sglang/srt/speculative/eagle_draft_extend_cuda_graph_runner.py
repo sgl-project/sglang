@@ -130,9 +130,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Static capture width: full tree width (num_draft_tokens), not
         # num_steps + 1 -- topk > 1 draft-extend overflows the buffers.
-        self.captured_req_width = resolve_num_tokens_per_req(
-            phase="draft_extend", server_args=model_runner.server_args
-        )
+        self.captured_req_width = resolve_num_tokens_per_req(phase="draft_extend")
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width
 
@@ -591,10 +589,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Snapshot built -- the forward is done reading the shared pool. Publish
         # a read-done event the scheduler's WAR barrier waits on (draft extend
-        # is the EAGLE-family war-publish phase; last write wins the mailbox).
+        # is the EAGLE-family last shared-read phase; last write wins the mailbox).
         read_done = self.device_module.Event()
         read_done.record()
-        self.model_runner.war_fastpath_read_done_event = read_done
+        self.model_runner.shared_read_done_event = read_done
 
         self.raw_bs = raw_bs
         self.bs = bs
