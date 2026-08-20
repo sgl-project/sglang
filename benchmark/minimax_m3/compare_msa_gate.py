@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 
@@ -27,12 +28,24 @@ def latency_gain(baseline: float, candidate: float) -> float:
     return baseline / candidate - 1.0
 
 
+def load_sha256(path: Path) -> str:
+    value = path.read_text().strip()
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError(f"invalid SHA-256 artifact: {path}")
+    return value
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline-dir", type=Path, required=True)
     parser.add_argument("--candidate-dir", type=Path, required=True)
     parser.add_argument("--score-tolerance", type=float, default=0.0)
     parser.add_argument("--num-prompts", type=int, default=256)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Also write the machine-readable comparison JSON to this path",
+    )
     parser.add_argument(
         "--min-output-throughput-gain",
         type=float,
@@ -41,6 +54,10 @@ def main() -> None:
     args = parser.parse_args()
 
     failures = []
+    baseline_gpqa_sha = load_sha256(args.baseline_dir / "gpqa_dataset.sha256")
+    candidate_gpqa_sha = load_sha256(args.candidate_dir / "gpqa_dataset.sha256")
+    if baseline_gpqa_sha != candidate_gpqa_sha:
+        failures.append("GPQA-Diamond dataset hashes differ")
     baseline_parity = load(args.baseline_dir / "fixed_parity.json")
     candidate_parity = load(args.candidate_dir / "fixed_parity.json")
     baseline_records = {row["name"]: row for row in baseline_parity["records"]}
@@ -185,7 +202,11 @@ def main() -> None:
                 f"{args.min_output_throughput_gain:.2%}"
             )
 
-    print(json.dumps(comparisons, indent=2, sort_keys=True))
+    rendered = json.dumps(comparisons, indent=2, sort_keys=True)
+    print(rendered)
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(rendered + "\n")
     if failures:
         raise SystemExit("\n".join(failures))
 
