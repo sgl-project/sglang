@@ -86,10 +86,6 @@ def _grouped_lora_a_kernel(
     n_offsets = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
     n_mask = n_offsets < N
     if PRODUCE_PDL:
-        # Everything above is independent route/pointer setup. Release the
-        # consecutive B launch now so it can execute its own independent
-        # prologue while this CTA computes A. B's gdc_wait still protects its
-        # first bridge load until every producer CTA has completed.
         tl.extra.cuda.gdc_launch_dependents()
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -139,14 +135,13 @@ def grouped_lora_a(
     block_size_n = int(config["BLOCK_SIZE_N"])
     block_size_k = int(config["BLOCK_SIZE_K"])
     group_size_m = int(config["GROUP_SIZE_M"])
-    pair_to_row_ptr = output if pair_to_row is None else pair_to_row
     num_m_blocks = triton.cdiv(routing.sorted_pair_ids.numel(), routing.block_size)
     num_n_blocks = triton.cdiv(weight.shape[1], block_size_n)
     _grouped_lora_a_kernel[(num_m_blocks * num_n_blocks,)](
         input,
         weight,
         output,
-        pair_to_row_ptr,
+        output if pair_to_row is None else pair_to_row,
         routing.sorted_pair_ids,
         routing.block_virtual_expert_ids,
         routing.num_pairs_post_padded,
@@ -265,8 +260,7 @@ def indexed_lora_a(
     num_pairs = routing.topk_ids.numel()
     if num_pairs == 0:
         return
-    shared_outer = routing.is_shared_outer
-    routed_bound = routing.num_local_experts
+
     block_size_n = int(config["BLOCK_SIZE_N"])
     _indexed_lora_a_kernel[(num_pairs, triton.cdiv(weight.shape[1], block_size_n))](
         input,
@@ -275,7 +269,7 @@ def indexed_lora_a(
         routing.token_lora_mapping,
         output,
         num_pairs,
-        routed_bound,
+        routing.num_local_experts,
         input.stride(0),
         input.stride(1),
         weight.stride(0),
@@ -288,7 +282,7 @@ def indexed_lora_a(
         LORA_EXPERTS_PER_ADAPTER=routing.lora_experts_per_adapter,
         MAX_LORAS=routing.max_loras,
         TOP_K=routing.topk_ids.shape[1],
-        SHARED_OUTER=shared_outer,
+        SHARED_OUTER=routing.is_shared_outer,
         PAIR_INPUT=pair_input,
         BLOCK_SIZE_N=block_size_n,
         BLOCK_SIZE_K=int(config["BLOCK_SIZE_K"]),

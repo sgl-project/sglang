@@ -96,9 +96,6 @@ def _one_launch_sliced_lora_b_kernel(
         return
 
     if CONSUME_PDL:
-        # Route decoding, destination-address calculation, and sentinel stores
-        # are independent of A. Wait only immediately before the first bridge
-        # load in a CTA that actually consumes A's stores.
         tl.extra.cuda.gdc_wait()
 
     bridge_rows = pair_ids // INTERMEDIATE_TOP_K
