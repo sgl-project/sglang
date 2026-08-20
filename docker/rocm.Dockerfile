@@ -859,13 +859,9 @@ RUN /bin/bash -lc 'set -euo pipefail; \
 #   rocm7_15:  patch the pip-installed torch METADATA in site-packages.
 #   rocm724:   torch upgraded earlier; Requires-Dist fixed after the Triton swap.
 #   others:    skip (BUILD_TRITON=0 or no pin to relax).
+# --- rocm720: repack the base-image torch .whl with the triton pin relaxed ---
 ARG TORCH_ROCM_FILE="torch-2.9.1+rocm7.2.0.lw.git7e1940d4-cp310-cp310-linux_x86_64.whl"
-RUN /bin/bash -lc 'set -euo pipefail; \
-  case "${GPU_ARCH}" in \
-    *rocm720*) \
-      echo "[torch patch] ROCm 7.2 (${GPU_ARCH}): repack and reinstall ${TORCH_ROCM_FILE}"; \
-      export TORCH_ROCM_FILE="${TORCH_ROCM_FILE}"; \
-      python3 - <<'"'"'PY'"'"'
+RUN cat > /tmp/relax_triton_whl.py <<'PY'
 import csv, os, re, sys, zipfile
 from pathlib import Path
 
@@ -873,7 +869,7 @@ TRITON_PIN = re.compile(
     r"^((?:Requires-Dist:\s*)?triton)==([^;+\s]+)[^;\s]*", re.MULTILINE
 )
 
-def relax_triton_metadata(meta_path: Path) -> int:
+def relax_triton_metadata(meta_path):
     txt = meta_path.read_text(encoding="utf-8")
     txt2, n = TRITON_PIN.subn(r"\1>=\2", txt)
     if n == 0:
@@ -882,7 +878,7 @@ def relax_triton_metadata(meta_path: Path) -> int:
     meta_path.write_text(txt2, encoding="utf-8")
     return n
 
-def blank_record(record_path: Path) -> None:
+def blank_record(record_path):
     rows = []
     with record_path.open(newline="", encoding="utf-8") as f:
         for r in csv.reader(f):
@@ -911,12 +907,19 @@ with zipfile.ZipFile(out_whl, "w", compression=zipfile.ZIP_DEFLATED) as z:
 
 print(f"Relaxed {n} triton pin(s); wrote {out_whl}")
 PY
-      python3 -m pip install --force-reinstall --no-deps "/tmp/${TORCH_ROCM_FILE}"; \
-      rm -rf /tmp/torch-whl "/tmp/${TORCH_ROCM_FILE}"; \
-      ;; \
-    *rocm7_15*) \
-      echo "[torch patch] ROCm 7.15 (${GPU_ARCH}): relax triton pin in installed torch"; \
-      python3 - <<'"'"'PY'"'"'
+
+RUN case "${GPU_ARCH}" in \
+      *rocm720*) \
+        echo "[torch patch] ROCm 7.2 (${GPU_ARCH}): repack and reinstall ${TORCH_ROCM_FILE}"; \
+        TORCH_ROCM_FILE="${TORCH_ROCM_FILE}" python3 /tmp/relax_triton_whl.py \
+        && python3 -m pip install --force-reinstall --no-deps "/tmp/${TORCH_ROCM_FILE}" \
+        && rm -rf /tmp/torch-whl "/tmp/${TORCH_ROCM_FILE}" ;; \
+      *) echo "[torch patch] rocm720: skip (${GPU_ARCH})" ;; \
+    esac \
+    && rm -f /tmp/relax_triton_whl.py
+
+# --- rocm7_15: patch the pip-installed torch METADATA in-place ---
+RUN cat > /tmp/relax_triton_meta.py <<'PY'
 import csv, re, sys
 from pathlib import Path
 from importlib.metadata import Distribution
@@ -943,11 +946,14 @@ with record_path.open(newline="", encoding="utf-8") as f:
 with record_path.open("w", newline="", encoding="utf-8") as f:
     csv.writer(f).writerows(rows)
 PY
-      ;; \
-    *) \
-      echo "[torch patch] skip (${GPU_ARCH})"; \
-      ;; \
-  esac'
+
+RUN case "${GPU_ARCH}" in \
+      *rocm7_15*) \
+        echo "[torch patch] ROCm 7.15 (${GPU_ARCH}): relax triton pin in installed torch"; \
+        python3 /tmp/relax_triton_meta.py ;; \
+      *) echo "[torch patch] rocm7_15: skip (${GPU_ARCH})" ;; \
+    esac \
+    && rm -f /tmp/relax_triton_meta.py
 
 
 # transformers 5.12.1: don't follow HF-cache symlinks when hashing custom modules
