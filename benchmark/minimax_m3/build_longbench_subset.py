@@ -56,7 +56,7 @@ def main() -> None:
     parser.add_argument("--split", default="train")
     parser.add_argument("--num-examples", type=int, default=100)
     parser.add_argument("--min-tokens", type=int, default=32768)
-    parser.add_argument("--max-tokens", type=int, default=262144)
+    parser.add_argument("--max-tokens", type=int, default=524288)
     args = parser.parse_args()
     if args.max_tokens < args.min_tokens:
         raise SystemExit("--max-tokens must be at least --min-tokens")

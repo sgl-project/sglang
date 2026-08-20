@@ -74,7 +74,7 @@ curl -fL \
 
 python benchmark/minimax_m3/build_longbench_subset.py \
   --model MiniMaxAI/MiniMax-M3-MXFP8 \
-  --num-examples 100 --min-tokens 32768 --max-tokens 262144 \
+  --num-examples 100 --min-tokens 32768 --max-tokens 524288 \
   --output /shared/eval/longbench_v2_m3_100_min32k.json
 ```
 
@@ -173,7 +173,7 @@ The mandatory accuracy gates are exact temperature-zero output parity for the
 fixed probes (with tokenizer-measured 32K and 64K prompt lengths), no regression
 on all 198 GPQA-Diamond questions, and no regression
 on the deterministic 100-example category-balanced LongBench-v2 subset whose
-prompts are 32K--256K tokens. GPQA is materially harder than saturated GSM8K;
+prompts are 32K--512K tokens. GPQA is materially harder than saturated GSM8K;
 LongBench directly exercises MSA's long-context page selection and decode replay
 without admitting prompts beyond the model's serving envelope.
 
