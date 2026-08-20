@@ -1,5 +1,6 @@
 import functools
 import logging
+import sys
 from enum import IntEnum
 from typing import TYPE_CHECKING, Callable
 
