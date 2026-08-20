@@ -1054,6 +1054,7 @@ def setup_state_kv_args(
         MHATokenToKVPoolMXFP8,
         MiniMaxSparseKVPool,
     )
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
     kv_args.state_types = []
     kv_args.state_data_ptrs = []
@@ -1092,7 +1093,11 @@ def setup_state_kv_args(
             )
             # MXFP8 KV: each sub-pool's block scales ride as their own component
             # so they inherit the index payload of the KV they describe.
-            if isinstance(token_to_kv_pool.full_kv_pool, MHATokenToKVPoolMXFP8):
+            # Only the concrete SWAKVPool owns a full sub-pool; other
+            # BaseSWAKVPool implementations describe their state per entry.
+            if isinstance(token_to_kv_pool, SWAKVPool) and isinstance(
+                token_to_kv_pool.full_kv_pool, MHATokenToKVPoolMXFP8
+            ):
                 append_state_component(
                     kv_args,
                     StateType.BLOCK_SCALE,
