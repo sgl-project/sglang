@@ -1,85 +1,77 @@
 import unittest
-from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
+from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
-)
+from sglang.test.performance_test_runner import PerformanceTestParams
+from sglang.test.run_combined_tests import run_combined_tests
+from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
 
-register_cuda_ci(est_time=1800, stage="nightly", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=3000, stage="nightly", runner_config="4-gpu-b200")
 
 LAGUNA_XS_NVFP4_MODEL = "poolside/Laguna-XS-2.1-NVFP4"
 LAGUNA_S_NVFP4_MODEL = "poolside/Laguna-S-2.1-NVFP4"
 
-LAGUNA_NVFP4_ARGS = ["--tp-size", "1"]
+# Measured 0.935 (temp=1.0, 200 examples); floored with margin for
+# FP4-kernel variance across Blackwell parts.
+LAGUNA_XS_GSM8K_BASELINE = 0.87
+# Measured 0.95 (temp=1.0, 200 examples); floored with margin.
+LAGUNA_S_GSM8K_BASELINE = 0.89
 
 
-def _run_gsm8k(test_case, baseline):
-    args = SimpleNamespace(
-        model=test_case.model,
-        eval_name="gsm8k",
-        num_shots=5,
-        num_examples=200,
-        max_tokens=4096,
-        num_threads=128,
-        repeat=1,
-        temperature=1.0,
-        top_p=0.95,
-        base_url=test_case.base_url,
-        host="http://127.0.0.1",
-        port=int(test_case.base_url.split(":")[-1]),
-    )
-    metrics = run_eval(args)
-    print(f"{metrics=}")
-    test_case.assertGreaterEqual(metrics["score"], baseline)
+class TestLagunaNVFP4Nightly(unittest.TestCase):
+    """Nightly test for Laguna-XS-2.1 / S-2.1 NVFP4, TP=1, Blackwell only.
 
+    Each model runs BOTH:
+    - Performance test (using NightlyBenchmarkRunner)
+    - Accuracy test (using run_eval with gsm8k)
 
-class TestLagunaXS21NVFP4(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = LAGUNA_XS_NVFP4_MODEL
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=LAGUNA_NVFP4_ARGS,
+    The models carry different gsm8k baselines, so each gets its own
+    run_combined_tests call (the runner takes one baseline per call).
+    """
+
+    def _run_model(self, model_path: str, test_name: str, baseline: float) -> None:
+        run_combined_tests(
+            models=[
+                ModelLaunchSettings(
+                    model_path,
+                    tp_size=1,
+                    variant="TP1",
+                )
+            ],
+            test_name=test_name,
+            accuracy_params=AccuracyTestParams(
+                dataset="gsm8k",
+                baseline_accuracy=baseline,
+                num_examples=200,
+                num_shots=5,
+                num_threads=128,
+                max_tokens=4096,
+                temperature=1.0,
+                top_p=0.95,
+                repeat=1,
+            ),
+            performance_params=PerformanceTestParams(
+                result_dir="performance_results_laguna_nvfp4",
+            ),
         )
 
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
-        # Measured 0.935 (temp=1.0, 200 examples); floored with margin for
-        # FP4-kernel variance across Blackwell parts.
-        _run_gsm8k(self, 0.87)
-
-
-class TestLagunaS21NVFP4(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = LAGUNA_S_NVFP4_MODEL
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=LAGUNA_NVFP4_ARGS,
+    @unittest.skipIf(not is_blackwell_system(), "NVFP4 requires Blackwell")
+    def test_laguna_xs_nvfp4(self):
+        """Run performance and accuracy for Laguna-XS-2.1-NVFP4 (TP1)."""
+        self._run_model(
+            model_path=LAGUNA_XS_NVFP4_MODEL,
+            test_name="Laguna-XS-2.1-NVFP4",
+            baseline=LAGUNA_XS_GSM8K_BASELINE,
         )
 
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
-        # Measured 0.95 (temp=1.0, 200 examples); floored with margin.
-        _run_gsm8k(self, 0.89)
+    @unittest.skipIf(not is_blackwell_system(), "NVFP4 requires Blackwell")
+    def test_laguna_s_nvfp4(self):
+        """Run performance and accuracy for Laguna-S-2.1-NVFP4 (TP1)."""
+        self._run_model(
+            model_path=LAGUNA_S_NVFP4_MODEL,
+            test_name="Laguna-S-2.1-NVFP4",
+            baseline=LAGUNA_S_GSM8K_BASELINE,
+        )
 
 
 if __name__ == "__main__":
