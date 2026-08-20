@@ -27,6 +27,7 @@ import random
 import unittest
 import unittest.mock
 from array import array
+from types import SimpleNamespace
 
 import torch
 
@@ -38,6 +39,11 @@ from sglang.srt.disaggregation.kv_events import (
     BlockStoredWithMetadata,
     StorageMedium,
 )
+from sglang.srt.mem_cache import kv_cache_configurator
+from sglang.srt.mem_cache.allocator.paged import (
+    PagedTokenToKVPoolAllocator,
+    alloc_extend_naive,
+)
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -45,13 +51,41 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
+from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.mamba_radix_cache import TreeNode as MambaTreeNode
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.utils import get_device
 
 # Test constants
 DEFAULT_PAGE_SIZE = 4
+
+
+class _FakeKVCache:
+    def __init__(self, size: int, page_size: int):
+        self.k = torch.full((size + page_size, 2), -1, dtype=torch.int64)
+        self.v = torch.full((size + page_size, 2), -1, dtype=torch.int64)
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        self.k[tgt_loc] = self.k[src_loc].clone()
+        self.v[tgt_loc] = self.v[src_loc].clone()
+
+
+class _ReqToTokenPool:
+    def __init__(self, width: int):
+        self.req_to_token = torch.full((1, width), -1, dtype=torch.int64)
+
+    def write(self, indices, values):
+        self.req_to_token[indices] = values
+
+
+def _make_partial_prefix_req(prefix_indices: torch.Tensor):
+    return SimpleNamespace(
+        prefix_indices=prefix_indices,
+        cache_protected_len=len(prefix_indices),
+    )
 
 
 class TestKVCacheEventQueue(unittest.TestCase):
@@ -202,10 +236,19 @@ class TestRadixKey(unittest.TestCase):
         with self.assertRaises(IndexError):
             _ = key[10]  # Out of bounds
 
-    def _assert_match(self, a, b, page_size, expected, is_bigram=False):
+    def _assert_match(
+        self, a, b, page_size, expected, is_bigram=False, return_exact=False
+    ):
         key_a = RadixKey(array("q", a), is_bigram=is_bigram)
         key_b = RadixKey(array("q", b), is_bigram=is_bigram)
-        self.assertEqual(key_a.match(key_b, page_size=page_size), expected)
+        self.assertEqual(
+            key_a.match(
+                key_b,
+                page_size=page_size,
+                return_exact=return_exact,
+            ),
+            expected,
+        )
 
     def test_match_page_size_1(self):
         """match() with page_size=1: full, partial, none, prefix, and empty keys."""
@@ -217,21 +260,35 @@ class TestRadixKey(unittest.TestCase):
         self._assert_match([1, 2], [], 1, 0)  # empty other
         self._assert_match([], [], 1, 0)  # both empty
 
-    def test_match_page_size_gt_1_rounds_down(self):
-        """match() with page_size>1 rounds the shared length down to a page."""
+    def test_match_page_size_gt_1_is_aligned_by_default(self):
         self._assert_match([1, 2, 3, 4, 5, 6, 7, 8], [1, 2, 3, 4, 5, 6, 9, 8], 4, 4)
-        self._assert_match(
-            [1, 2, 3, 4], [1, 9, 3, 4], 4, 0
-        )  # diverge inside first page
+        self._assert_match([1, 2, 3, 4], [1, 9, 3, 4], 4, 0)
         self._assert_match([1, 2, 3, 4, 5, 6, 7, 8], [1, 2, 3, 4, 9, 6, 7, 8], 4, 4)
         self._assert_match([1, 2, 3, 4, 5, 6, 7, 8], [1, 2, 3, 4, 5, 6, 7, 8], 4, 8)
-        self._assert_match([1, 2, 3], [1, 2, 3], 4, 0)  # shorter than one page
+        self._assert_match([1, 2, 3], [1, 2, 3], 4, 0)
+
+    def test_match_can_return_exact_lcp(self):
+        self._assert_match(
+            [1, 2, 3, 4, 5, 6, 7, 8],
+            [1, 2, 3, 4, 5, 6, 9, 8],
+            4,
+            6,
+            return_exact=True,
+        )
+        self._assert_match(
+            [1, 2, 3, 4],
+            [1, 9, 3, 4],
+            4,
+            1,
+            return_exact=True,
+        )
+        self._assert_match([1, 2, 3], [1, 2, 3], 4, 3, return_exact=True)
 
     def test_match_long_keys_exponential_search(self):
         """Deep divergences exercise the doubling gallop windows + binary search.
 
         ``base`` has distinct values, so flipping one position diverges the prefix
-        exactly there; the shared length is that index rounded down to the page.
+        exactly there; the shared length is that exact index.
         """
         base = list(range(2000))
         for div in (1, 2, 63, 64, 65, 127, 128, 511, 512, 513, 1234, 1999):
@@ -239,22 +296,46 @@ class TestRadixKey(unittest.TestCase):
             b[div] = -1
             for page_size in (1, 4, 64):
                 with self.subTest(div=div, page_size=page_size):
-                    self._assert_match(
-                        base, b, page_size, (div // page_size) * page_size
-                    )
+                    self._assert_match(base, b, page_size, div, return_exact=True)
         # Full match of a long key: the gallop must reach the end.
-        self._assert_match(base, base[:], 64, (2000 // 64) * 64)
+        self._assert_match(base, base[:], 64, 2000, return_exact=True)
 
     def test_match_bigram(self):
         """is_bigram: L matching raw tokens imply L-1 matching bigrams."""
         self._assert_match([1, 2, 3, 4, 5], [1, 2, 3, 9, 5], 1, 2, is_bigram=True)
         self._assert_match([1, 2, 3, 4, 5], [1, 2, 3, 4, 5], 1, 4, is_bigram=True)
         self._assert_match([1, 2], [1, 2], 1, 1, is_bigram=True)
-        # Raw diverge at token 70 -> 69 matching bigrams -> rounded down to 64.
+        # Raw diverge at token 70 -> 69 matching bigrams.
         long_a = list(range(130))
         long_b = list(range(130))
         long_b[70] = -1
-        self._assert_match(long_a, long_b, 64, 64, is_bigram=True)
+        self._assert_match(
+            long_a,
+            long_b,
+            64,
+            69,
+            is_bigram=True,
+            return_exact=True,
+        )
+
+    def test_first_page_matched_hint_preserves_lcp(self):
+        base = list(range(257))
+        for div in (4, 5, 7, 8, 31, 32, 127, 256, len(base)):
+            other = base[:]
+            if div < len(other):
+                other[div] = -1
+            expected = div
+            generic = RadixKey(array("q", base)).match(
+                RadixKey(array("q", other)), page_size=4, return_exact=True
+            )
+            hinted = RadixKey(array("q", base)).match(
+                RadixKey(array("q", other)),
+                page_size=4,
+                first_page_matched=True,
+                return_exact=True,
+            )
+            self.assertEqual(generic, expected)
+            self.assertEqual(hinted, expected)
 
 
 class TestTreeNode(unittest.TestCase):
@@ -374,6 +455,85 @@ class TestRadixCache(unittest.TestCase):
         """Set up test fixtures."""
         TreeNode.counter = 0
 
+    def _build_partial_prefix_cache(self, *, enabled: bool = True):
+        page_size = 4
+        pool_size = 64
+        kv_cache = _FakeKVCache(pool_size, page_size)
+        allocator = PagedTokenToKVPoolAllocator(
+            size=pool_size,
+            page_size=page_size,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=kv_cache,
+            need_sort=False,
+        )
+        cache = RadixCache.create_simulated(
+            mock_allocator=allocator,
+            page_size=page_size,
+            enable_partial_prefix_reuse=enabled,
+        )
+        cached_tokens = array("q", range(1, 13))
+        cached_indices = allocator.alloc(len(cached_tokens))
+        assert cached_indices is not None
+        kv_cache.k[cached_indices] = torch.arange(24, dtype=torch.int64).view(12, 2)
+        kv_cache.v[cached_indices] = torch.arange(100, 124, dtype=torch.int64).view(
+            12, 2
+        )
+        cache.insert(
+            InsertParams(
+                key=RadixKey(cached_tokens),
+                value=cached_indices,
+            )
+        )
+        query_tokens = array("q", [*range(1, 11), 101, 102, 103])
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(query_tokens)))
+        return cache, allocator, kv_cache, cached_indices, query_tokens, result
+
+    def _build_split_child_partial_cache(
+        self,
+        *,
+        workload: str,
+        partial_reuse: bool,
+    ):
+        page_size = 4
+        pool_size = 128
+        kv_cache = _FakeKVCache(pool_size, page_size)
+        allocator = PagedTokenToKVPoolAllocator(
+            size=pool_size,
+            page_size=page_size,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=kv_cache,
+            need_sort=False,
+        )
+        cache = RadixCache.create_simulated(
+            mock_allocator=allocator,
+            page_size=page_size,
+            enable_partial_prefix_reuse=partial_reuse,
+        )
+        common = [1, 2, 3, 4]
+        if workload == "lookup_limited":
+            target_tail = [5, 6, 7, 8]
+            sibling_tail = [105, 106, 107, 108]
+            query_tokens = array("q", common + target_tail[:2] + [999, 1000, 1001])
+        elif workload == "legacy_reachable":
+            target_tail = [5, 6, 7, 8, 9, 10, 11, 12]
+            sibling_tail = [105, 106, 107, 108, 109, 110, 111, 112]
+            query_tokens = array("q", common + target_tail[:6] + [999, 1000, 1001])
+        else:
+            raise AssertionError(f"unknown workload {workload!r}")
+
+        target_tokens = array("q", common + target_tail)
+        sibling_tokens = array("q", common + sibling_tail)
+        target_indices = allocator.alloc(len(target_tokens))
+        sibling_indices = allocator.alloc(len(sibling_tokens))
+        self.assertIsNotNone(target_indices)
+        self.assertIsNotNone(sibling_indices)
+        cache.insert(InsertParams(key=RadixKey(target_tokens), value=target_indices))
+        cache.insert(InsertParams(key=RadixKey(sibling_tokens), value=sibling_indices))
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(query_tokens)))
+        return cache, target_indices, query_tokens, result
+
     def test_init_variations(self):
         """Test cache initialization with different parameters."""
         test_cases = [
@@ -398,6 +558,104 @@ class TestRadixCache(unittest.TestCase):
                 self.assertEqual(cache.device, torch.device("cpu"))
                 self.assertIsNotNone(cache.root_node)
                 self.assertEqual(len(cache.root_node.key), 0)
+
+    def test_partial_prefix_rejects_unsupported_production_pool(self):
+        allocator = PagedTokenToKVPoolAllocator(
+            size=16,
+            page_size=4,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=_FakeKVCache(size=16, page_size=4),
+            need_sort=False,
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "enable_partial_prefix_reuse is unsupported.*device cpu.*_FakeKVCache",
+        ):
+            RadixCache(
+                CacheInitParams(
+                    disable=False,
+                    req_to_token_pool=object(),
+                    token_to_kv_pool_allocator=allocator,
+                    page_size=4,
+                    enable_partial_prefix_reuse=True,
+                )
+            )
+
+    def test_partial_prefix_enables_copy_primitive_for_ordinary_mha_pool(self):
+        for partial_reuse, speculative, expected in (
+            (False, None, False),
+            (True, None, True),
+            (False, object(), True),
+        ):
+            with self.subTest(
+                partial_reuse=partial_reuse,
+                speculative=speculative is not None,
+            ):
+                captured = {}
+
+                def pool_cls(*args, **kwargs):
+                    captured.update(kwargs)
+                    return object()
+
+                configurator = SimpleNamespace(
+                    kv_cache_dtype_str="bfloat16",
+                    pool_page_size=4,
+                    kv_cache_dtype=torch.bfloat16,
+                    model_config=SimpleNamespace(
+                        get_num_kv_heads=lambda *_: 8,
+                        head_dim=128,
+                        v_head_dim=128,
+                    ),
+                    layer_info=SimpleNamespace(
+                        num_effective_layers=32,
+                        start_layer=0,
+                        end_layer=32,
+                    ),
+                    device="cuda",
+                    post_capture_kv_active=False,
+                    server_args=SimpleNamespace(
+                        enable_partial_prefix_reuse=partial_reuse
+                    ),
+                )
+                with (
+                    unittest.mock.patch.object(
+                        kv_cache_configurator,
+                        "get_schedule",
+                        return_value=SimpleNamespace(
+                            prefill_only_disable_kv_cache=False
+                        ),
+                    ),
+                    unittest.mock.patch.object(
+                        kv_cache_configurator,
+                        "get_parallel",
+                        return_value=SimpleNamespace(attn_tp_size=1, attn_dcp_size=1),
+                    ),
+                    unittest.mock.patch.object(
+                        kv_cache_configurator,
+                        "get_exec",
+                        return_value=SimpleNamespace(
+                            features=SimpleNamespace(enable_memory_saver=False)
+                        ),
+                    ),
+                    unittest.mock.patch.object(
+                        kv_cache_configurator,
+                        "get_disagg",
+                        return_value=SimpleNamespace(enable_pdmux=False),
+                    ),
+                    unittest.mock.patch.object(
+                        kv_cache_configurator,
+                        "get_spec",
+                        return_value=SimpleNamespace(speculative_algorithm=speculative),
+                    ),
+                ):
+                    KVCacheConfigurator._build_mha_kv_pool(
+                        configurator,
+                        max_total_num_tokens=64,
+                        mha_pool_class=pool_cls,
+                    )
+
+                self.assertEqual(captured["enable_kv_cache_copy"], expected)
 
     def test_reset(self):
         """Test reset method."""
@@ -875,6 +1133,489 @@ class TestRadixCache(unittest.TestCase):
                 # Match length should be page-aligned
                 match_len = len(result.device_indices)
                 self.assertEqual(match_len % page_size, 0)
+
+    def test_partial_prefix_match_reports_exact_lcp_without_unaligned_tree_split(self):
+        cache, _, _, cached_indices, _, result = self._build_partial_prefix_cache()
+
+        self.assertEqual(len(result.device_indices), 8)
+        partial_match = result.partial_prefix_match
+        self.assertIsNotNone(partial_match)
+        self.assertEqual(partial_match.exact_match_len, 10)
+        torch.testing.assert_close(partial_match.source_indices, cached_indices[8:10])
+
+        aligned_node = result.last_device_node
+        self.assertEqual(len(aligned_node.key), 8)
+        self.assertEqual(len(aligned_node.children), 1)
+        source_node = next(iter(aligned_node.children.values()))
+        self.assertIs(partial_match.source_node, source_node)
+        self.assertEqual(len(source_node.key), 4)
+        self.assertTrue(
+            all(len(node.key) % 4 == 0 for node in (aligned_node, source_node))
+        )
+        self.assertEqual(cache.total_size(), 12)
+
+    def test_partial_reuse_bundles_discovery_and_private_page_copy(self):
+        for workload in ("lookup_limited", "legacy_reachable"):
+            for partial_reuse in (False, True):
+                with self.subTest(workload=workload, partial_reuse=partial_reuse):
+                    cache, target_indices, _, result = (
+                        self._build_split_child_partial_cache(
+                            workload=workload,
+                            partial_reuse=partial_reuse,
+                        )
+                    )
+                    req = _make_partial_prefix_req(result.device_indices)
+                    copied = cache.materialize_partial_prefix(req, result)
+
+                    if workload == "lookup_limited":
+                        expected_exact = 6 if partial_reuse else 4
+                        expected_kind = "fine_lookup" if partial_reuse else None
+                        expected_source = target_indices[4:6] if partial_reuse else None
+                        expected_copy = partial_reuse
+                        expected_prefix_len = 6 if expected_copy else 4
+                    else:
+                        expected_exact = 10 if partial_reuse else 8
+                        expected_kind = "legacy_reachable" if partial_reuse else None
+                        expected_source = (
+                            target_indices[8:10] if partial_reuse else None
+                        )
+                        expected_copy = partial_reuse
+                        expected_prefix_len = 10 if expected_copy else 8
+
+                    partial_match = result.partial_prefix_match
+                    actual_exact = (
+                        partial_match.exact_match_len
+                        if partial_match is not None
+                        else len(result.device_indices)
+                    )
+                    actual_kind = (
+                        partial_match.match_kind if partial_match is not None else None
+                    )
+                    self.assertEqual(actual_exact, expected_exact)
+                    self.assertEqual(actual_kind, expected_kind)
+                    self.assertEqual(copied, expected_copy)
+                    self.assertEqual(len(req.prefix_indices), expected_prefix_len)
+                    if expected_source is None:
+                        self.assertIsNone(partial_match)
+                    else:
+                        torch.testing.assert_close(
+                            partial_match.source_indices, expected_source
+                        )
+
+                    # Tree-owned match output remains page aligned in all modes.
+                    self.assertEqual(len(result.device_indices) % 4, 0)
+                    cache.abort_partial_prefix(req)
+
+    def test_radix_cache_child_lookup_uses_first_page_hint(self):
+        seen_hints = []
+        original_match = RadixKey.match
+
+        def recording_match(
+            key,
+            other,
+            page_size=1,
+            first_page_matched=False,
+            return_exact=False,
+        ):
+            seen_hints.append(first_page_matched)
+            return original_match(
+                key,
+                other,
+                page_size=page_size,
+                first_page_matched=first_page_matched,
+                return_exact=return_exact,
+            )
+
+        with unittest.mock.patch.object(RadixKey, "match", new=recording_match):
+            self._build_split_child_partial_cache(
+                workload="legacy_reachable",
+                partial_reuse=False,
+            )
+
+        self.assertTrue(seen_hints)
+        self.assertTrue(all(seen_hints))
+
+    def test_exact_matching_and_child_scan_are_feature_gated(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                exact_requests = []
+                original_match = RadixKey.match
+
+                def recording_match(
+                    key,
+                    other,
+                    page_size=1,
+                    first_page_matched=False,
+                    return_exact=False,
+                    _exact_requests=exact_requests,
+                    _original_match=original_match,
+                ):
+                    _exact_requests.append(return_exact)
+                    return _original_match(
+                        key,
+                        other,
+                        page_size=page_size,
+                        first_page_matched=first_page_matched,
+                        return_exact=return_exact,
+                    )
+
+                with unittest.mock.patch.object(RadixKey, "match", new=recording_match):
+                    _, _, _, result = self._build_split_child_partial_cache(
+                        workload="lookup_limited",
+                        partial_reuse=enabled,
+                    )
+
+                self.assertEqual(any(exact_requests), enabled)
+                self.assertEqual(result.partial_prefix_match is not None, enabled)
+
+    def test_partial_prefix_copy_continuation_and_req_mapping(self):
+        cache, allocator, kv_cache, cached_indices, _, result = (
+            self._build_partial_prefix_cache()
+        )
+        req = _make_partial_prefix_req(result.device_indices)
+        source_k_before = kv_cache.k[cached_indices[8:12]].clone()
+        source_v_before = kv_cache.v[cached_indices[8:12]].clone()
+        available_before = allocator.available_size()
+
+        self.assertTrue(cache.materialize_partial_prefix(req, result))
+        self.assertEqual(len(req.prefix_indices), 10)
+        self.assertEqual(req.cache_protected_len, 8)
+        self.assertEqual(allocator.available_size(), available_before - 4)
+        self.assertEqual(cache.total_size(), 12)
+
+        state = req._partial_prefix_copy_state
+        dst_page = state.page_indices
+        src = state.source_indices
+        dst = state.destination_indices
+        self.assertFalse(torch.equal(dst_page, cached_indices[8:12]))
+        self.assertEqual(int(dst_page[0]) // 4, int(dst_page[-1]) // 4)
+
+        kv_cache.move_kv_cache(dst, src)
+        torch.testing.assert_close(kv_cache.k[dst], kv_cache.k[src])
+        torch.testing.assert_close(kv_cache.v[dst], kv_cache.v[src])
+        torch.testing.assert_close(kv_cache.k[cached_indices[8:12]], source_k_before)
+        torch.testing.assert_close(kv_cache.v[cached_indices[8:12]], source_v_before)
+
+        continuation = torch.empty(2, dtype=torch.int64)
+        alloc_extend_naive(
+            prefix_lens=torch.tensor([10]),
+            seq_lens=torch.tensor([12]),
+            last_loc=dst[-1:].clone(),
+            free_pages=allocator.free_pages,
+            out_indices=continuation,
+            page_size=4,
+            device="cpu",
+        )
+        torch.testing.assert_close(continuation, dst_page[2:4])
+        kv_cache.k[continuation] = torch.tensor([[1001, 1002], [1003, 1004]])
+        kv_cache.v[continuation] = torch.tensor([[2001, 2002], [2003, 2004]])
+        torch.testing.assert_close(kv_cache.k[dst_page[2:4]], kv_cache.k[continuation])
+        torch.testing.assert_close(kv_cache.k[cached_indices[8:12]], source_k_before)
+
+        req_to_token = _ReqToTokenPool(width=16)
+        req_to_token.write((0, slice(0, 10)), req.prefix_indices)
+        req_to_token.write((0, slice(10, 12)), continuation)
+        torch.testing.assert_close(
+            req_to_token.req_to_token[0, :10], req.prefix_indices
+        )
+        torch.testing.assert_close(req_to_token.req_to_token[0, 10:12], dst_page[2:4])
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.version.hip is None,
+        "requires standard CUDA",
+    )
+    def test_partial_prefix_uses_real_cuda_all_layer_copy(self):
+        page_size = 4
+        pool_size = 64
+        kv_cache = MHATokenToKVPool(
+            size=pool_size,
+            page_size=page_size,
+            dtype=torch.float16,
+            head_num=2,
+            head_dim=16,
+            layer_num=2,
+            device="cuda",
+            enable_memory_saver=False,
+            enable_alt_stream=False,
+            enable_kv_cache_copy=True,
+            kv_cache_layout="nhd",
+        )
+        allocator = PagedTokenToKVPoolAllocator(
+            size=pool_size,
+            page_size=page_size,
+            dtype=torch.float16,
+            device="cuda",
+            kvcache=kv_cache,
+            need_sort=False,
+        )
+        cache = RadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=object(),
+                token_to_kv_pool_allocator=allocator,
+                page_size=page_size,
+                enable_partial_prefix_reuse=True,
+            )
+        )
+
+        cached_indices = allocator.alloc(12)
+        self.assertIsNotNone(cached_indices)
+        for layer_id, (k_buffer, v_buffer) in enumerate(
+            zip(kv_cache.k_buffer, kv_cache.v_buffer, strict=True)
+        ):
+            values = torch.arange(12 * 2 * 16, dtype=torch.float16, device="cuda").view(
+                12, 2, 16
+            )
+            k_buffer[cached_indices] = values + layer_id * 1000
+            v_buffer[cached_indices] = values + layer_id * 2000 + 500
+
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", range(1, 13))),
+                value=cached_indices,
+            )
+        )
+        result = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", [*range(1, 11), 101, 102])))
+        )
+        req = _make_partial_prefix_req(result.device_indices)
+        self.assertTrue(cache.materialize_partial_prefix(req, result))
+        source_before = [
+            (k[cached_indices[8:12]].clone(), v[cached_indices[8:12]].clone())
+            for k, v in zip(kv_cache.k_buffer, kv_cache.v_buffer, strict=True)
+        ]
+
+        kv_cache.move_kv_cache(
+            req._partial_prefix_copy_state.destination_indices,
+            req._partial_prefix_copy_state.source_indices,
+        )
+        torch.cuda.synchronize()
+
+        for (k_buffer, v_buffer), (source_k, source_v) in zip(
+            zip(kv_cache.k_buffer, kv_cache.v_buffer, strict=True),
+            source_before,
+            strict=True,
+        ):
+            torch.testing.assert_close(
+                k_buffer[req._partial_prefix_copy_state.destination_indices],
+                source_k[:2],
+            )
+            torch.testing.assert_close(
+                v_buffer[req._partial_prefix_copy_state.destination_indices],
+                source_v[:2],
+            )
+            torch.testing.assert_close(k_buffer[cached_indices[8:12]], source_k)
+            torch.testing.assert_close(v_buffer[cached_indices[8:12]], source_v)
+
+        cache.release_partial_prefix_source(req)
+
+    def test_partial_prefix_source_lock_blocks_eviction_until_copy_release(self):
+        cache, _, kv_cache, _, _, result = self._build_partial_prefix_cache()
+        req = _make_partial_prefix_req(result.device_indices)
+        self.assertEqual(cache.evictable_size(), 12)
+        self.assertEqual(cache.protected_size(), 0)
+        self.assertTrue(cache.materialize_partial_prefix(req, result))
+        state = req._partial_prefix_copy_state
+        source_node = state.source_node
+        self.assertGreater(source_node.lock_ref, 0)
+        self.assertEqual(cache.total_size(), 12)
+        self.assertEqual(cache.evictable_size(), 0)
+        self.assertEqual(cache.protected_size(), 12)
+
+        evicted = cache.evict(EvictParams(num_tokens=cache.total_size()))
+        self.assertEqual(evicted.num_tokens_evicted, 0)
+        self.assertEqual(cache.total_size(), 12)
+
+        kv_cache.move_kv_cache(
+            state.destination_indices,
+            state.source_indices,
+        )
+        cache.release_partial_prefix_source(req)
+        self.assertEqual(source_node.lock_ref, 0)
+        self.assertEqual(cache.evictable_size(), 12)
+        self.assertEqual(cache.protected_size(), 0)
+        evicted = cache.evict(EvictParams(num_tokens=cache.total_size()))
+        self.assertEqual(evicted.num_tokens_evicted, 12)
+        self.assertEqual(cache.total_size(), 0)
+
+    def test_partial_prefix_allocation_failure_falls_back_without_lock_leak(self):
+        page_size = 4
+        kv_cache = _FakeKVCache(size=12, page_size=page_size)
+        allocator = PagedTokenToKVPoolAllocator(
+            size=12,
+            page_size=page_size,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=kv_cache,
+            need_sort=False,
+        )
+        cache = RadixCache.create_simulated(
+            mock_allocator=allocator,
+            page_size=page_size,
+            enable_partial_prefix_reuse=True,
+        )
+        cached_indices = allocator.alloc(12)
+        self.assertIsNotNone(cached_indices)
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", range(1, 13))),
+                value=cached_indices,
+            )
+        )
+        result = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", [*range(1, 11), 101, 102])))
+        )
+        req = _make_partial_prefix_req(result.device_indices)
+
+        self.assertEqual(allocator.available_size(), 0)
+        self.assertFalse(cache.materialize_partial_prefix(req, result))
+        self.assertEqual(len(req.prefix_indices), 8)
+        self.assertFalse(hasattr(req, "_partial_prefix_copy_state"))
+        self.assertEqual(cache.evictable_size(), 12)
+        self.assertEqual(cache.protected_size(), 0)
+
+    def test_partial_prefix_finish_inserts_private_page_once(self):
+        cache, allocator, kv_cache, _, query_tokens, result = (
+            self._build_partial_prefix_cache()
+        )
+        req = _make_partial_prefix_req(result.device_indices)
+        self.assertTrue(cache.materialize_partial_prefix(req, result))
+        state = req._partial_prefix_copy_state
+        dst_page = state.page_indices
+        kv_cache.move_kv_cache(
+            state.destination_indices,
+            state.source_indices,
+        )
+        continuation = dst_page[2:4]
+        kv_cache.k[continuation] = torch.tensor([[3001, 3002], [3003, 3004]])
+        kv_cache.v[continuation] = torch.tensor([[4001, 4002], [4003, 4004]])
+        cache.release_partial_prefix_source(req)
+
+        req_to_token = _ReqToTokenPool(width=16)
+        req_to_token.write((0, slice(0, 10)), req.prefix_indices)
+        req_to_token.write((0, slice(10, 12)), continuation)
+        cache.req_to_token_pool = req_to_token
+        cache.inc_lock_ref(result.last_device_node)
+        req.req_pool_idx = 0
+        req.last_node = result.last_device_node
+        req.origin_input_ids = query_tokens[:12]
+        req.output_ids = array("q")
+        req.extra_key = None
+        req.cache_salt = None
+        req.priority = 0
+
+        cache.cache_finished_req(req, kv_len_to_handle=12)
+        self.assertEqual(cache.total_size(), 16)
+        self.assertEqual(allocator.available_size() + cache.total_size(), 64)
+        new_match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(query_tokens[:12]))
+        )
+        self.assertEqual(len(new_match.device_indices), 12)
+        torch.testing.assert_close(new_match.device_indices[8:12], dst_page)
+
+    def test_partial_prefix_flag_changes_extend_start_only_after_copy(self):
+        off_cache, _, _, _, query_tokens, off_result = self._build_partial_prefix_cache(
+            enabled=False
+        )
+        self.assertEqual(len(off_result.device_indices), 8)
+        self.assertIsNone(off_result.partial_prefix_match)
+        self.assertEqual(
+            list(query_tokens[len(off_result.device_indices) :])[:2], [9, 10]
+        )
+        self.assertEqual(off_cache.total_size(), 12)
+
+        on_cache, _, _, _, _, on_result = self._build_partial_prefix_cache(enabled=True)
+        req = _make_partial_prefix_req(on_result.device_indices)
+        on_cache.materialize_partial_prefix(req, on_result)
+        self.assertEqual(len(req.prefix_indices), 10)
+        self.assertEqual(list(query_tokens[len(req.prefix_indices) :])[:2], [101, 102])
+        on_cache.abort_partial_prefix(req)
+
+    def test_schedule_batch_flag_controls_exact_reuse_extend_start(self):
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.utils.common import Range
+
+        class _StopBeforeAllocation(Exception):
+            pass
+
+        for enabled, expected_prefix_len, expected_input_ids in (
+            (False, 8, [9, 10, 101, 102, 103]),
+            (True, 10, [101, 102, 103]),
+        ):
+            with self.subTest(enabled=enabled):
+                cache, _, _, _, query_tokens, result = self._build_partial_prefix_cache(
+                    enabled=enabled
+                )
+                req = _make_partial_prefix_req(result.device_indices)
+                cache.materialize_partial_prefix(req, result)
+                req.origin_input_ids = query_tokens
+                req.full_untruncated_fill_ids = query_tokens
+                req.extend_range = Range(len(req.prefix_indices), len(query_tokens))
+                req.logprob_start_len = -1
+                req.get_fill_ids = lambda query_tokens=query_tokens: query_tokens
+                batch = ScheduleBatch(reqs=[req], tree_cache=cache, device="cpu")
+                captured = {}
+                query_len = len(query_tokens)
+
+                def capture_input_ids(input_ids, _pin, captured=captured):
+                    captured["input_ids"] = [list(ids) for ids in input_ids]
+                    return torch.tensor(
+                        [token for ids in input_ids for token in ids],
+                        dtype=torch.int64,
+                    )
+
+                def stop_at_allocation(
+                    batch_to_allocate,
+                    expected_prefix_len=expected_prefix_len,
+                    query_len=query_len,
+                ):
+                    self.assertEqual(
+                        batch_to_allocate.prefix_lens, [expected_prefix_len]
+                    )
+                    self.assertEqual(
+                        batch_to_allocate.extend_lens,
+                        [query_len - expected_prefix_len],
+                    )
+                    self.assertEqual(
+                        batch_to_allocate.extend_num_tokens,
+                        query_len - expected_prefix_len,
+                    )
+                    raise _StopBeforeAllocation
+
+                with (
+                    unittest.mock.patch(
+                        "sglang.srt.managers.schedule_batch.flatten_arrays_to_pinned_cpu",
+                        side_effect=capture_input_ids,
+                    ),
+                    unittest.mock.patch(
+                        "sglang.srt.managers.schedule_batch.alloc_for_extend",
+                        side_effect=stop_at_allocation,
+                    ),
+                    self.assertRaises(_StopBeforeAllocation),
+                ):
+                    batch.prepare_for_extend()
+
+                self.assertEqual(captured["input_ids"], [expected_input_ids])
+                if enabled:
+                    cache.release_partial_prefix_source(req)
+
+    def test_page_size_one_needs_no_partial_copy(self):
+        cache = RadixCache.create_simulated(
+            page_size=1, enable_partial_prefix_reuse=True
+        )
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 3, 4])),
+                value=torch.tensor([11, 12, 13, 14]),
+            )
+        )
+        result = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3, 9])))
+        )
+        self.assertEqual(len(result.device_indices), 3)
+        self.assertIsNone(result.partial_prefix_match)
+        req = _make_partial_prefix_req(result.device_indices)
+        self.assertFalse(cache.materialize_partial_prefix(req, result))
 
     def test_advanced_prefix_match_with_node_splits(self):
         """Advanced prefix matching: splits inside nodes and across pages."""
