@@ -14,7 +14,6 @@ import subprocess
 from importlib import metadata
 from pathlib import Path
 
-
 REQUIRED_GPQA_COLUMNS = {
     "Question",
     "Correct Answer",

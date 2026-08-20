@@ -4,6 +4,9 @@ import pytest
 import torch
 
 from sglang.srt.layers.attention.minimax_sparse_ops import msa
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _RecordingGraphState:

@@ -9,7 +9,6 @@ import math
 import statistics
 from pathlib import Path
 
-
 CONCURRENCIES = (1, 8, 32, 128)
 SERVING_METRICS = {
     "output_throughput": True,

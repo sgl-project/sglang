@@ -17,7 +17,6 @@ from sglang.test.simple_eval_longbench_v2 import (
     format_longbench_v2_question,
 )
 
-
 DOMAIN_TO_CATEGORY = {
     "Single-Document QA": "single_document_qa",
     "Multi-Document QA": "multi_document_qa",
