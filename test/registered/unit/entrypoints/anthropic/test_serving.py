@@ -882,7 +882,7 @@ class TestAnthropicServing(unittest.TestCase):
             ("low", "low"),
             ("medium", "medium"),
             ("high", "high"),
-            ("xhigh", "max"),  # OpenAI Literal has no xhigh
+            ("xhigh", "xhigh"),  # passed through; OpenAI Literal includes xhigh
             ("max", "max"),
         ]:
             with self.subTest(anthropic_effort=anthropic_effort):
