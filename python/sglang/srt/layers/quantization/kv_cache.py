@@ -29,7 +29,7 @@ class BaseKVCacheMethod(QuantizeMethodBase):
     def __init__(self, quant_config: QuantizationConfig):
         self.quant_config = quant_config
 
-    def create_weights(self, layer: torch.nn.Module):
+    def create_weights(self, layer: torch.nn.Module, **extra_weight_attrs):
         """
         Create "weight" (aka k_scale and v_scale) for an attention layer.
         """
