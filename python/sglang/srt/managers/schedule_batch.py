@@ -216,6 +216,7 @@ def split_cached_prefix_by_tier(
 
 
 def _compute_pad_value(hash: int) -> int:
+    """Compute pad value from hash."""
     return MM_PAD_SHIFT_VALUE + (hash % (1 << 30))
 
 
@@ -337,6 +338,7 @@ class MultimodalDataItem:
     # One and only one of the feature and precomputed_embeddings will be empty
     precomputed_embeddings: Optional[Union[torch.Tensor, np.ndarray]] = None
 
+    # Model-specific data stored in a dictionary
     model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def __getattr__(self, name: str):
@@ -718,6 +720,7 @@ class MultimodalInputs:
 
     def merge(self, other: MultimodalInputs):
 
+        # args needed to be merged
         optional_args = [
             "mm_items",
             "image_pad_len",
@@ -747,6 +750,7 @@ class MultimodalInputs:
 
         for key, val in other.__dict__.items():
             if "_id" in key:
+                # set token_ids
                 if getattr(self, key, None) is None:
                     setattr(self, key, getattr(other, key, None))
         # other args would be kept intact
@@ -791,6 +795,7 @@ class ReqKvInfo:
 
 
 class Req(ReqDllmMixin):
+    """The input and output status of a request."""
 
     def __init__(
         self,
@@ -910,7 +915,9 @@ class Req(ReqDllmMixin):
 
         # Extra key for caller-defined request classification.
         if lora_id is not None:
-            extra_key = (extra_key or "") + lora_id
+            extra_key = (
+                extra_key or ""
+            ) + lora_id  # lora_id is concatenated to the extra key
 
         self.extra_key = extra_key
         self.cache_salt = cache_salt or None
@@ -942,6 +949,7 @@ class Req(ReqDllmMixin):
         self.finished_reason: Optional[BaseFinishReason] = None
         # finished position (in output_ids), used when checking stop conditions with speculative decoding
         self.finished_len = None
+        # Whether this request has finished output
         self.finished_output = None
         # If we want to abort the request in the middle of the event loop,
         # set to_finish instead of directly setting finished_reason.
@@ -1075,6 +1083,7 @@ class Req(ReqDllmMixin):
         self.indexer_topk: Optional[torch.Tensor] = (
             None  # cpu tensor: shape (seqlen, num_indexer_layers, index_topk)
         )
+        # Customized info
         self.customized_info: Optional[Dict[str, List[Any]]] = None
 
         # Embedding (return values)
@@ -1240,6 +1249,7 @@ class Req(ReqDllmMixin):
             self.multimodal_inputs.merge(image_inputs)
 
     def finished(self) -> bool:
+        # Whether request reached finished condition
         return self.finished_reason is not None
 
     def set_extend_range(self, start: int, end: int) -> None:
@@ -1428,6 +1438,7 @@ class Req(ReqDllmMixin):
         )
 
     def tail_str(self, new_accepted_len: int = 1) -> str:
+        # Check stop strings and stop regex patterns together
         if (
             len(self.sampling_params.stop_strs) == 0
             and len(self.sampling_params.stop_regex_strs) == 0
@@ -1443,6 +1454,7 @@ class Req(ReqDllmMixin):
 
         tail_str = self.tail_str()
 
+        # Early return if tail_str is empty
         if not tail_str:
             return False
 
@@ -1453,7 +1465,8 @@ class Req(ReqDllmMixin):
             if stop_str in tail_str:
                 return True
 
-            # Suffix/prefix overlap matters for streaming: emit a stop str arriving split across steps.
+            # Check if tail_str suffix matches stop_str prefix
+            # Only check if stop_str is not empty, it's for stream output
             min_len = min(len(tail_str), len(stop_str))
             for i in range(1, min_len + 1):
                 if tail_str[-i:] == stop_str[:i]:
@@ -1465,10 +1478,10 @@ class Req(ReqDllmMixin):
         if self.sampling_params.ignore_eos:
             return False
 
+        # Check stop token ids
         matched_eos = False
 
         for i, token_id in enumerate(new_accepted_tokens):
-            # Check stop token ids
             if self.sampling_params.stop_token_ids:
                 matched_eos |= token_id in self.sampling_params.stop_token_ids
             if self.eos_token_ids:
@@ -1974,6 +1987,7 @@ def _compute_chunked_req_next_prompt_token(
 
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+    """Store all information of a batch on the scheduler."""
 
     # === Core: request list (ForwardBatch derives lora_ids / rids / grammars / positions from it) ===
     reqs: List[Req]
@@ -1988,6 +2002,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     model_config: ModelConfig = None
     enable_overlap: bool = False
 
+    # Device
     device: str = "cuda"
 
     # HiSparse (engine-level coordinator ref, same across batches)
@@ -2109,13 +2124,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
+    # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
 
+    # Whether to return hidden states
     return_hidden_states: bool = False
     return_hidden_states_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
 
+    # Has grammar
     has_grammar: bool = False
 
+    # The sum of all sequence lengths
     seq_lens_sum: int = None
     extend_num_tokens: Optional[int] = None
 
@@ -2125,6 +2144,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # === Host metadata crossing to ForwardBatch (CPU lists / mirrors) ===
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
 
+    # For multimodal inputs
     multimodal_inputs: Optional[List] = None
 
     # For processing logprobs
@@ -2146,8 +2166,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
 
     # === Compound crossing to ForwardBatch (carry their own device tensors) ===
+    # Sampling info
     sampling_info: SamplingBatchInfo = None
 
+    # Speculative decoding
+    # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
 
     @classmethod
@@ -2214,6 +2237,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for req in self.reqs:
             im = req.multimodal_inputs
             if im is None or im.num_image_tokens is None:
+                # No image input
                 encoder_lens_cpu.append(0)
                 encoder_cached.append(True)
             else:
@@ -2333,8 +2357,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.EXTEND
 
         if self.is_dllm():
+            # For DLLM, we use a separate forward mode
             self.forward_mode = ForwardMode.DLLM_EXTEND
 
+        # Init tensors
         reqs = self.reqs
         input_ids = [r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
@@ -2371,10 +2397,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
 
+        # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
             self
         )
 
+        # Set fields
         input_embeds = []
         all_replace_embeds: List[torch.Tensor] = []
         all_replace_positions: List[int] = []
@@ -2398,6 +2426,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # steps apart and should become one owned-kv allocation step.
             req.kv_committed_len = seq_len
 
+            # If input_embeds are available, store them
             if req.input_embeds is not None:
                 # Slice to match extend_input_len — PrefillAdder truncates
                 # fill_len/extend_input_len on chunk overflow but not input_embeds.
@@ -2701,6 +2730,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_split_prefill(self):
         self.prepare_for_extend()
+        # For split prefill, we need to set the forward mode to SPLIT_PREFILL
         self.forward_mode = ForwardMode.SPLIT_PREFILL
 
     def mix_with_running(self, running_batch: ScheduleBatch):
@@ -2813,6 +2843,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.filter_batch(keep_indices=sorted_indices)
 
+        # Reqs in batch are filtered
         new_estimate_ratio = (
             NewTokenRatioTracker.estimate_new_token_ratio_after_retract(self.reqs)
         )
@@ -3104,6 +3135,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return
 
         if len(keep_indices) == len(self.reqs):
+            # No need to filter
             return
 
         keep_indices_device = torch.tensor(
@@ -3169,6 +3201,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # needs to be called with pre-merged Batch.reqs.
         self.sampling_info.merge_batch(other.sampling_info)
 
+        # Encoder-decoder infos
         if self.model_config.is_encoder_decoder:
             self.encoder_lens = torch.cat([self.encoder_lens, other.encoder_lens])
             self.encoder_lens_cpu = self.encoder_lens_cpu + other.encoder_lens_cpu

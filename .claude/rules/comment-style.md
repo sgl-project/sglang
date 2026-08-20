@@ -22,6 +22,14 @@ theoretically possible: a fact that lives in another file costs everything, a
 grouping the names only half-encode costs a tedious reconstruction, a restated
 line costs nothing.
 
+**Size decides what is worth reviewing.** The test above is aimed at the
+multi-line prose block -- the docstring with an `Args:` list, the paragraph
+restating a function. A comment that already fits on one line costs a reader
+nothing to skip, so a cleanup pass leaves it where it is: deleting it buys one
+line and risks losing the one fact nobody could have recovered. Removing a
+one-liner needs a reason of its own -- it is wrong, it is stale, or it is
+commented-out code -- not merely that the line below says the same thing.
+
 The next three sections are that test applied. A comment either carries a fact
 you cannot see from here (**keep**), carries nothing the code does not already
 carry (**delete**), or carries a real fact whose home is somewhere else
@@ -84,7 +92,8 @@ carry (**delete**), or carries a real fact whose home is somewhere else
 ## Delete: nothing the code does not already carry
 
 - **Restating the code.** The function name, the next line, the branch
-  condition, or the loop body in prose.
+  condition, or the loop body in prose -- as a block. One such line is below
+  the threshold above and stays.
 - **Step-by-step play-by-play.** `# Step 1: ...` / `# Step 2: ...` over
   straight-line code. If the flow needs numbering, extract named helpers.
 - **Naming the callers.** That is what grep is for.

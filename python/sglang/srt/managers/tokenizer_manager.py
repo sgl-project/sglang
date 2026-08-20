@@ -373,9 +373,10 @@ def _build_flat_input_top_logprobs_fields_from_arrays(
 
 
 class InputFormat(Enum):
+    """Input format types for tokenization handling."""
 
-    SINGLE_STRING = 1
-    BATCH_STRINGS = 2
+    SINGLE_STRING = 1  # Regular single text like "Hello world"
+    BATCH_STRINGS = 2  # Regular batch like ["Hello", "World"]
     CROSS_ENCODER_PAIRS = 3  # Cross-encoder pairs like [["query", "document"]]
 
 
@@ -383,6 +384,7 @@ _MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
 
 
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+    """TokenizerManager is a process that tokenizes the text."""
 
     @property
     def serving_chat_class(self):
@@ -401,6 +403,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         *,
         start_pd_bootstrap_service: bool = True,
     ):
+        # Parse args
         self.server_args = server_args
         # In a tokenizer-worker process this is the process's first publish;
         # the in-process path re-projects the object the launcher published.
@@ -460,6 +463,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         server_args = self.server_args
         model_config_class = getattr(self, "model_config_class", ModelConfig)
 
+        # Read model args
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
         self.model_config = model_config_class.from_server_args(server_args)
@@ -475,6 +479,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_tokenizer_and_processor(self):
         server_args = self.server_args
 
+        # Initialize tokenizer and processor
         if self.model_config.is_multimodal and not server_args.language_model_only:
             import_processors("sglang.srt.multimodal.processors")
             if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
@@ -589,6 +594,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._subprocess_watchdog = None
 
     def init_request_logging_and_dumping(self):
+        # TODO: Refactor and organize the log export code.
+        # Request logging
         self.request_logger = RequestLogger(
             log_requests=self.server_args.log_requests,
             log_requests_level=self.server_args.log_requests_level,
@@ -614,10 +621,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
 
     def init_weight_update(self):
+        # Initial weights status
         self.initial_weights_loaded = True
         if self.server_args.checkpoint_engine_wait_weights_before_ready:
             self.initial_weights_loaded = False
 
+        # Weight updates
         # The event to notify the weight sync is finished.
         self.model_update_lock = RWLock()
         self.model_update_result: Optional[Awaitable[UpdateWeightFromDiskReqOutput]] = (
@@ -629,6 +638,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.is_pause_cond = asyncio.Condition()
 
     def init_lora(self):
+        # LoRA
         # Initialize the `LoRARegistry` with initial LoRA adapter paths provided in `server_args`.
         # The registry dynamically updates as adapters are loaded / unloaded during runtime. It
         # serves as the source of truth for available adapters and maps user-friendly LoRA names
@@ -647,6 +657,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self.lora_ref_cache[lora_ref.lora_name] = lora_ref
 
     def init_disaggregation(self, *, start_pd_bootstrap_service: bool = True):
+        # PD Disaggregation
         self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
         # Keep a reference so the bootstrap server is not garbage-collected.
         self.bootstrap_server = (
@@ -657,6 +668,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Single-source counter for auto-assigning fake bootstrap_room.
         self.fake_bootstrap_room_counter = 0
 
+        # Encoder Disaggregation
         self.encoder_bootstrap_server = None
         if self.server_args.language_only:
             from sglang.srt.disaggregation.encode_receiver import (
@@ -681,6 +693,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     def init_metric_collector_watchdog(self):
+        # Metrics
         if self.enable_metrics:
             engine_type = DisaggregationMode.to_engine_type(
                 get_disagg().disaggregation_mode
@@ -756,6 +769,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         self.auto_create_handle_loop()
 
+        # Normalize the request
         obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)
         if (
@@ -784,6 +798,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if self.server_args.language_only:
                 self._handle_epd_disaggregation_encode_request(obj)
 
+            # Log the request
             self.request_logger.log_received_request(obj, self.tokenizer, request)
 
             async with self.is_pause_cond:
@@ -792,6 +807,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             async with self.model_update_lock.reader_lock:
                 await self._validate_and_resolve_lora(obj)
 
+                # Tokenize the request and send it to the scheduler
                 if obj.is_single:
                     tokenized_obj = await self._tokenize_one_request(obj)
                     state = self.rid_to_state[obj.rid]
@@ -833,12 +849,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _prepare_tokenizer_input(
         self, texts: Union[str, List[str]], input_format: InputFormat
     ) -> Union[List[str], List[List[str]]]:
+        """Prepare input for the tokenizer based on detected format."""
         if input_format == InputFormat.SINGLE_STRING:
-            return [texts]
+            return [texts]  # Wrap single string for batch processing
         elif input_format == InputFormat.CROSS_ENCODER_PAIRS:
-            return texts
+            return texts  # Already in correct format: [["query", "doc"]]
         else:  # BATCH_STRINGS
-            return texts
+            return texts  # Already in correct format: ["text1", "text2"]
 
     def _extract_tokenizer_results(
         self,
@@ -850,7 +867,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         Tuple[List[int], Optional[List[int]]],
         Tuple[List[List[int]], Optional[List[List[int]]]],
     ]:
+        """Extract results from tokenizer output based on input format."""
 
+        # For single inputs (string or single cross-encoder pair), extract first element
         if (
             input_format in [InputFormat.SINGLE_STRING, InputFormat.CROSS_ENCODER_PAIRS]
             and original_batch_size == 1
@@ -859,6 +878,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             single_token_type_ids = token_type_ids[0] if token_type_ids else None
             return single_input_ids, single_token_type_ids
 
+        # For true batches, return as-is
         return input_ids, token_type_ids
 
     async def _tokenize_texts(
@@ -870,14 +890,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not texts or self.tokenizer is None:
             raise ValueError("texts cannot be empty and tokenizer must be initialized")
 
+        # Step 1: Detect input format and prepare for tokenization
         input_format = self._detect_input_format(texts, is_cross_encoder)
         tokenizer_input = self._prepare_tokenizer_input(texts, input_format)
         original_batch_size = len(texts) if not isinstance(texts, str) else 1
 
+        # Step 2: Set up tokenizer arguments
         tokenizer_kwargs = (
             {"return_token_type_ids": is_cross_encoder} if is_cross_encoder else {}
         )
 
+        # Step 3: Choose tokenization strategy
         use_async_tokenizer = (
             self.async_dynamic_batch_tokenizer is not None
             and input_format == InputFormat.SINGLE_STRING
@@ -888,6 +911,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             result = await self.async_dynamic_batch_tokenizer.encode(
                 tokenizer_input[0], **tokenizer_kwargs
             )
+            # Convert to batch format for consistency
             input_ids = [result["input_ids"]]
             token_type_ids = (
                 [result["token_type_ids"]]
@@ -924,6 +948,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for ids in input_ids
             ]
 
+        # Step 4: Extract results based on input format
         return self._extract_tokenizer_results(
             input_ids, token_type_ids, input_format, original_batch_size
         )
@@ -932,6 +957,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
+        """Tokenize one request."""
+        # Tokenize
         input_embeds = None
         input_text = obj.text
         token_type_ids = None
@@ -1130,6 +1157,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _validate_one_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
+        """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
         # FIXME: unify the length validation logic with the one in the scheduler.
         _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0
@@ -1235,6 +1263,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
 
     def _validate_for_matryoshka_dim(self, obj: EmbeddingReqInput) -> None:
+        """Validate the request for Matryoshka dim if it has the field set."""
         if obj.dimensions is None:
             return
 
@@ -1286,12 +1315,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ) -> None:
         # Handle both single sequence and batch of sequences
         if isinstance(input_ids[0], list):
+            # Batch of sequences
             for seq in input_ids:
                 if any(id >= vocab_size for id in seq):
                     raise ValueError(
                         f"The input_ids {seq} contains values greater than the vocab size ({vocab_size})."
                     )
         else:
+            # Single sequence
             if any(id >= vocab_size for id in input_ids):
                 raise ValueError(
                     f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
@@ -1306,9 +1337,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         mm_inputs=None,
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
+        """Create a tokenized request object from common parameters."""
         input_ids_arr: Optional[array[int]] = (
             array("q", input_ids) if input_ids is not None else None
         )
+        # Parse sampling parameters
         # Note: if there are preferred sampling params, we use them if they are not
         # explicitly passed in sampling_params
         if self.preferred_sampling_params:
@@ -1380,6 +1413,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 encoder_urls=obj.encoder_urls,
             )
         elif isinstance(obj, EmbeddingReqInput):
+            # Resolve unresolved embed overrides now that input_ids are available
             positional_embed_overrides = obj.positional_embed_overrides
             if (
                 positional_embed_overrides is None
@@ -1429,13 +1463,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def _batch_tokenize_and_process(
         self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]]:
+        """Handle batch tokenization for text inputs only."""
         logger.debug(f"Starting batch tokenization for {batch_size} text requests")
 
+        # If batch does not have text nothing to tokenize
+        # so lets construct the return object
         if not self._batch_has_text(batch_size, obj):
+            # All requests already have input_ids, no need to tokenize
             return [await self._tokenize_one_request(obj[i]) for i in range(batch_size)]
 
         self._validate_batch_tokenization_constraints(batch_size, obj)
 
+        # Collect requests and texts
         requests = [obj[i] for i in range(batch_size)]
         texts = [req.text for req in requests]
 
@@ -1445,10 +1484,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             for req in requests
         )
 
+        # Batch tokenize all texts using unified method
         input_ids_list, token_type_ids_list = await self._tokenize_texts(
             texts, is_cross_encoder_request
         )
 
+        # Process all requests
         tokenized_objs = []
         for i, req in enumerate(requests):
             self._validate_one_request(obj[i], input_ids_list[i])
@@ -1466,6 +1507,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _validate_batch_tokenization_constraints(
         self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ) -> None:
+        """Validate constraints for batch tokenization processing."""
         for i in range(batch_size):
             if self.is_generation and obj[i].contains_mm_input():
                 raise ValueError(
@@ -1483,6 +1525,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _batch_has_text(
         self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ) -> bool:
+        """Check if any request in the batch contains text input."""
         for i in range(batch_size):
             if obj[i].text:
                 return True
@@ -1535,6 +1578,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
         ],
     ):
+        """Send a batch of tokenized requests as a single batched request to the scheduler."""
         prepared_mm_items = []
         dispatched = False
         try:
@@ -1627,6 +1671,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if state.obj.rid in self.rid_to_state:
                 del self.rid_to_state[state.obj.rid]
 
+            # Mark ongoing LoRA request as finished.
             if self.enable_lora and state.obj.lora_path:
                 await self.lora_registry.release(state.obj.lora_id)
             if not is_stream:
@@ -1643,6 +1688,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
+        """Wait for the response of one request."""
         state = self.rid_to_state[obj.rid]
         # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
         is_stream = getattr(obj, "stream", False)
@@ -1695,6 +1741,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 out["text"] = state.get_text()
 
             if finished:
+                # Record response sent time right before we log finished results and metrics.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()
                     out["meta_info"][
@@ -1724,6 +1771,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 break
 
             if is_stream:
+                # Record response sent time right before we send response.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()
                     out["meta_info"][
@@ -1757,6 +1805,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
                 self._send_batch_request(tokenized_objs)
 
+                # Set up generators for each request in the batch
                 for i in range(batch_size):
                     tmp_obj = obj[i]
                     state = self.rid_to_state[tmp_obj.rid]
@@ -1765,6 +1814,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
             else:
+                # Sequential tokenization and processing
                 with (
                     input_blocker_guard_region(
                         dispatch_to_scheduler=self._dispatch_to_scheduler,
@@ -1790,11 +1840,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "many threads to send them one by one with parallel sampling (n > 1)."
                 )
 
+            # Tokenize all requests
             objs = [obj[i] for i in range(batch_size)]
             tokenized_objs = await asyncio.gather(
                 *(self._tokenize_one_request(obj) for obj in objs)
             )
 
+            # Cache the common prefix for parallel sampling
             for i in range(batch_size):
                 tmp_obj = copy.copy(objs[i])
                 tokenized_obj = copy.copy(tokenized_objs[i])
@@ -1812,6 +1864,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self._send_one_request(tokenized_obj)
                 await self._wait_one_response(tmp_obj, request).__anext__()
 
+            # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
                 for _ in range(obj.parallel_sample_num):
                     tmp_obj = copy.copy(objs[i])
@@ -1835,6 +1888,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self.rid_to_state[objs[i].rid].time_stats.set_finished_time()
                 del self.rid_to_state[objs[i].rid]
 
+        # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream
         if not is_stream:
             outputs = await self._collect_batch_responses(generators)
@@ -1901,6 +1955,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         req = AbortReq(rid=rid, abort_all=abort_all)
         self._dispatch_to_scheduler(req)
         if self.enable_metrics:
+            # TODO: also use custom_labels from the request
             self.metrics_collector.observe_one_aborted_request(
                 self.metrics_collector.labels
             )
@@ -1913,6 +1968,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 # we are using the model_update_lock to check if there is still on-going requests.
                 while True:
+                    # TODO: maybe make it async instead of fire-and-forget
                     self.abort_request(abort_all=True)
                     is_locked = await self.model_update_lock.is_locked()
                     if not is_locked:
@@ -2055,6 +2111,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return None
 
     def create_abort_task(self, obj: GenerateReqInput):
+        # Abort the request if the client is disconnected.
         async def abort_request():
             await asyncio.sleep(2)
             if obj.is_single:
@@ -2071,6 +2128,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if self.event_loop is not None:
             return
 
+        # Create and start the handle_loop task
         loop = get_or_create_event_loop()
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.handle_loop))
@@ -2092,6 +2150,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
 
     async def handle_loop(self):
+        """The event loop that handles requests"""
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = await async_sock_recv(self.recv_from_detokenizer)
@@ -2185,6 +2244,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         "cached_tokens": recv_obj.cached_tokens[i],
                     }
                 )
+                # Add detailed cache breakdown if available
                 if (
                     hasattr(recv_obj, "cached_tokens_details")
                     and recv_obj.cached_tokens_details
@@ -2372,6 +2432,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 del self.rid_to_state[rid]
 
+                # Mark ongoing LoRA request as finished.
                 if self.enable_lora and state.obj.lora_path:
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
@@ -2392,6 +2453,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if self.crash_dump_folder and state.finished and state.obj.log_metrics:
                 self.record_request_for_crash_dump(state, out_dict)
 
+        # handle_loop awaits next recv immediately
         for s in pending_notify.values():
             s.event.set()
 
@@ -2403,6 +2465,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         token_ids_logprob: List[int],
         return_text_in_logprobs: bool,
     ):
+        # 1. Handle regular logprobs
         if len(state.input_token_logprobs_val) > len(state.input_token_logprobs):
             state.input_token_logprobs.extend(
                 self.detokenize_logprob_tokens(
@@ -2425,6 +2488,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         meta_info["output_token_logprobs"] = state.output_token_logprobs
         meta_info["output_token_logprobs_length"] = len(state.output_token_logprobs)
 
+        # 2. Handle top logprobs
         if top_logprobs_num > 0:
             # Guarded by the caller's return_logprob check, so obj is a
             # GenerateReqInput here.
@@ -2500,6 +2564,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
             meta_info["output_top_logprobs"] = state.output_top_logprobs
 
+        # 3. Handle token_ids_logprob
         if token_ids_logprob is not None:
             if len(state.input_token_ids_logprobs_val) > len(
                 state.input_token_ids_logprobs
@@ -2662,17 +2727,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ],
         i: int,
     ) -> None:
+        """Calculate speculative decoding metrics, such as acceptance rate and acceptance length metrics."""
         if (
             hasattr(recv_obj, "spec_verify_ct")
             and recv_obj.spec_verify_ct[i] > 0
             and hasattr(recv_obj, "spec_num_correct_drafts")
             and len(recv_obj.spec_num_correct_drafts) > i
         ):
+            # Total number of proposed draft tokens per request.
             num_proposed_drafts = recv_obj.spec_verify_ct[i] * (
                 get_spec().speculative_num_draft_tokens - 1
             )
             num_correct_drafts = recv_obj.spec_num_correct_drafts[i]
 
+            # Calculate per-request acceptance rate and average acceptance length.
             if num_proposed_drafts > 0:
                 # accept_rate: num_correct_drafts / num_proposed_drafts (strict count, no bonus).
                 meta_info["spec_accept_rate"] = num_correct_drafts / num_proposed_drafts
@@ -2708,6 +2776,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 meta_info["spec_accepted_drafts"] = num_correct_drafts
                 meta_info["spec_proposed_drafts"] = num_proposed_drafts
 
+            # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
             if (
                 recv_obj.spec_correct_drafts_histogram
                 and len(recv_obj.spec_correct_drafts_histogram) > i
@@ -2902,13 +2971,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             self.crash_dump_performed = True
 
+        # Dump requests info
         if self.crash_dump_folder:
             logger.error(f"Dumping requests before crash. {self.crash_dump_folder=}")
 
+            # Add finished requests from crash_dump_request_list
             data_to_dump = []
             if self.crash_dump_request_list:
                 data_to_dump.extend(self.crash_dump_request_list)
 
+            # Add unfinished requests from rid_to_state
             unfinished_requests = []
             for rid, state in self.rid_to_state.items():
                 if not state.finished:
@@ -2929,6 +3001,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 data_to_dump.extend(unfinished_requests)
 
             if data_to_dump:
+                # Create a file
                 filename = os.path.join(
                     self.crash_dump_folder,
                     hostname,
@@ -2936,6 +3009,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 os.makedirs(os.path.dirname(filename), exist_ok=True)
 
+                # Write the data to the file
                 data_to_dump_with_server_args = {
                     "server_args": self.server_args,
                     "config_updates": get_context().overrides_log(),
@@ -2964,6 +3038,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"Dumped {len(self.crash_dump_request_list)} finished and {len(unfinished_requests)} unfinished requests before crash to {filename}"
                 )
 
+        # Dump pyspy and cuda coredump
         if should_dump_diagnostics:
             logger.info(
                 "Sleeping 5 seconds before crash diagnostics to let GPU activity settle."
@@ -2995,11 +3070,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         while not self.gracefully_exit:
             await asyncio.sleep(5)
 
+        # Drain requests
         while True:
             remain_num_req = len(self.rid_to_state)
             remaining_rids = list(self.rid_to_state.keys())
 
             if self.server_status == ServerStatus.UnHealthy:
+                # if health check failed, we should exit immediately
                 logger.error(
                     "Signal SIGTERM received while health check failed. Force exiting."
                 )
@@ -3008,6 +3085,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 break
 
             elif get_bool_env_var("SGL_FORCE_SHUTDOWN"):
+                # if force shutdown flag set, exit immediately
                 logger.error(
                     "Signal SIGTERM received while force shutdown flag set. Force exiting."
                 )
@@ -3124,6 +3202,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def scale_elastic_ep(
         self, obj: ScaleElasticEPReqInput
     ) -> ScaleElasticEPReqOutput:
+        """Send a scale request to every DP scheduler."""
         if self.elastic_pending_ep_size is not None:
             return ScaleElasticEPReqOutput(
                 success=False,
@@ -3206,6 +3285,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 f"but max loaded loras is {self.server_args.max_loaded_loras}"
             )
 
+        # Reload all existing LoRA adapters that have been dynamically unloaded
         unregistered_loras = await self.lora_registry.get_unregistered_loras(
             unique_lora_paths
         )
@@ -3236,6 +3316,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"Failed to implicitly load LoRA adapter {lora_path}: {load_result.error_message}"
                 )
 
+        # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
         obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
         # Propagate lora_id to any sub-objects already cached by __getitem__.
         for i, sub_obj in obj.__dict__.get("_sub_obj_cache", {}).items():
@@ -3261,6 +3342,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 external_trace_header = extract_trace_headers(request.headers)
                 obj.external_trace_header = external_trace_header
 
+        # Normalize single/batch into a uniform list of (rid, sub_obj, bootstrap_room)
         if not hasattr(obj, "is_single") or obj.is_single:
             items = [(obj.rid, obj, getattr(obj, "bootstrap_room", None))]
         else:
@@ -3313,6 +3395,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not isinstance(obj, GenerateReqInput) or not obj.contains_mm_input():
             return False
 
+        # Count image / video / audio items for dispatch threshold
         def _count_mm_items(data):
             return (
                 len(data) if isinstance(data, list) else (1 if data is not None else 0)
@@ -3328,11 +3411,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _handle_epd_disaggregation_encode_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ):
+        """Handle EPD-disaggregation mode encoding request."""
         if isinstance(obj, GenerateReqInput) and obj.contains_mm_input():
+            # dispatch to encoder by default
             should_dispatch = True
             if self.server_args.enable_adaptive_dispatch_to_encoder:
                 should_dispatch = self._should_dispatch_to_encoder(obj)
 
+            # Set need_wait_for_mm_inputs flag based on whether we dispatch to encoder
+            # This flag will be used in _tokenize_one_request to determine processing path
             if should_dispatch:
                 obj.need_wait_for_mm_inputs = True
                 if get_disagg().encoder_transfer_backend in [
@@ -3361,11 +3448,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ],
         i: int,
     ) -> Dict[str, Any]:
+        """Convert attributes to span attributes."""
         span_attrs = {}
 
         if not self.enable_trace:
             return span_attrs
 
+        # Token usage attributes
         if not isinstance(recv_obj, BatchEmbeddingOutput):
             span_attrs[SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS] = (
                 recv_obj.completion_tokens[i]
@@ -3377,10 +3466,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             i
         ]
 
+        # Request identifiers
         span_attrs[SpanAttributes.GEN_AI_REQUEST_ID] = (
             str(state.obj.rid) if state.obj.rid else None
         )
 
+        # Sampling parameters
         sampling_params = state.obj.sampling_params or {}
 
         if max_new_tokens := sampling_params.get("max_new_tokens"):
@@ -3398,6 +3489,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if n := sampling_params.get("n"):
             span_attrs[SpanAttributes.GEN_AI_REQUEST_N] = n
 
+        # Response attributes
         span_attrs[SpanAttributes.GEN_AI_RESPONSE_MODEL] = self.served_model_name
 
         finish_reason = (
@@ -3410,11 +3502,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 [finish_reason]
             )
 
+        # Latency attributes
         span_attrs.update(state.time_stats.convert_to_gen_ai_span_attrs())
 
         return span_attrs
 
     def _set_default_priority(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
+        """Set the default priority value."""
         if (
             self.enable_priority_scheduling
             and obj.priority is None

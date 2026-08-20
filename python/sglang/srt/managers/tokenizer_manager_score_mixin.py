@@ -72,14 +72,15 @@ class TokenizerManagerScoreMixin:
         Build a single token sequence for multi-item scoring.
         Format: query<delimiter>item1<delimiter>item2<delimiter>item3<delimiter>
         """
-        combined_sequence = query[:]
+        combined_sequence = query[:]  # Start with query
         delimiter_indices = []
 
         for item in items:
             delimiter_indices.append(len(combined_sequence))
-            combined_sequence.append(delimiter_token_id)
-            combined_sequence.extend(item)
+            combined_sequence.append(delimiter_token_id)  # Add delimiter
+            combined_sequence.extend(item)  # Add item tokens
 
+        # Add final delimiter after the last item for logprob extraction
         delimiter_indices.append(len(combined_sequence))
         combined_sequence.append(delimiter_token_id)
 
@@ -130,11 +131,12 @@ class TokenizerManagerScoreMixin:
         request_id = meta_info.get("id", "<unknown>")
         prompt_tokens = meta_info.get("prompt_tokens", 0)
 
+        # Extract per-delimiter scores from whichever field has them
         input_logprobs = meta_info.get("input_token_ids_logprobs", [])
         embedding = single_result.get("embedding")
 
-        # Generation model: extract label-token logprobs at each delimiter
         if input_logprobs:
+            # Generation model: extract label-token logprobs at each delimiter
             per_delimiter_scores = []
             for logprobs_data in input_logprobs:
                 logprobs = self._extract_logprobs_for_tokens(
@@ -144,8 +146,8 @@ class TokenizerManagerScoreMixin:
                     logprobs, label_token_ids, apply_softmax
                 )
                 per_delimiter_scores.append(score_list)
-        # Classification model: scores are directly in 2D embedding.
         elif embedding is not None:
+            # Classification model: scores are directly in 2D embedding.
             if apply_softmax:
                 scores_tensor = (
                     torch.tensor(embedding)
@@ -164,6 +166,7 @@ class TokenizerManagerScoreMixin:
                 "Expected either input_token_ids_logprobs or embedding."
             )
 
+        # Validate delimiter count
         if len(per_delimiter_scores) != expected_count:
             raise RuntimeError(
                 f"Expected {expected_count} delimiter entries for multi-item scoring "
@@ -171,6 +174,7 @@ class TokenizerManagerScoreMixin:
                 f"Request ID: {request_id}"
             )
 
+        # Skip the first delimiter (query-item boundary)
         scores = per_delimiter_scores[1:]
 
         phs_list = None
@@ -219,6 +223,7 @@ class TokenizerManagerScoreMixin:
                         f"{result['meta_info'].get('id', '<unknown>')}."
                     )
 
+                # Extract logprobs for the first (and only) position
                 logprobs = self._extract_logprobs_for_tokens(
                     output_logprobs[0], label_token_ids
                 )
@@ -342,7 +347,7 @@ class TokenizerManagerScoreMixin:
             query_embed_overrides is not None or item_embed_overrides is not None
         )
 
-        # Query placeholder positions are invariant across items -- resolve once.
+        # Query placeholder positions are invariant across items — resolve once.
         # (No-op returning ([], []) if has_embeds is False or query_embed_overrides is None.)
         q_embeds, q_positions = self._resolve_overrides_for_sequence(
             query,
@@ -365,6 +370,7 @@ class TokenizerManagerScoreMixin:
             if not has_embeds:
                 return None, input_ids, None, delimiter_indices
 
+            # Resolve embed overrides across the combined multi-item-scoring sequence.
             all_embeds: List[torch.Tensor] = list(q_embeds)
             all_positions: List[int] = list(q_positions)
             current_offset = len(query) + 1  # +1 for first delimiter
@@ -591,6 +597,7 @@ class TokenizerManagerScoreMixin:
                         f"does not expose pre-head hidden states."
                     )
 
+        # Create the appropriate request type
         mis_delimiter_indices = [delimiter_indices] if use_multi_item_scoring else None
         if is_generation:
             batch_request = GenerateReqInput(
@@ -645,6 +652,7 @@ class TokenizerManagerScoreMixin:
         if apply_softmax:
             score_list = torch.softmax(torch.tensor(score_list), dim=0).tolist()
         else:
+            # Convert logprobs to probabilities if not using softmax
             score_list = [
                 math.exp(x) if x != float("-inf") else 0.0 for x in score_list
             ]

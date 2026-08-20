@@ -2594,6 +2594,7 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
             image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
 
@@ -2623,8 +2624,10 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        # initialize before returning
         self.init_req_max_new_tokens(req)
 
+        # Validate prompt length
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
@@ -2636,6 +2639,7 @@ class Scheduler(
             return
 
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
+            # When return_logprob is False, logprob_start_len should be ignored
             recv_req.logprob_start_len = -1
 
         if recv_req.logprob_start_len == -1:
@@ -2710,6 +2714,7 @@ class Scheduler(
         """Handle optimized batch generate request."""
         logger.debug(f"Processing batch generate request with {len(recv_req)} requests")
 
+        # Process each request in the batch
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
@@ -2910,6 +2915,7 @@ class Scheduler(
         req.tokenizer = self.tokenizer
         self._maybe_namespace_elastic_radix_cache(req)
 
+        # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
             image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
@@ -2938,6 +2944,7 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        # Validate prompts length
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
@@ -2947,6 +2954,7 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        # Copy more attributes
         req.logprob_start_len = -1
         self._add_request_to_queue(req)
 
@@ -2959,6 +2967,7 @@ class Scheduler(
             f"Processing batch embedding request with {len(recv_req)} requests"
         )
 
+        # Process each request in the batch
         for tokenized_req in recv_req:
             self.handle_embedding_request(tokenized_req)
 
@@ -3032,6 +3041,7 @@ class Scheduler(
         batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         batch.orig_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
         batch.seq_lens_sum = sum(seq_lens)
+        # Stash last token into relay; resolve_forward_inputs will gather.
         last_tokens = torch.tensor(
             [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
         )
@@ -3063,6 +3073,7 @@ class Scheduler(
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
+        # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
 
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
@@ -3115,15 +3126,18 @@ class Scheduler(
             if self.dllm_config is not None and last_batch.reqs:
                 chunked_req_to_exclude.update(last_batch.reqs)
 
+            # Filter batch
             last_bs = last_batch.batch_size()
             last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
 
+            # Merge the new batch into the running batch.
             if not last_batch.is_empty():
                 if running_batch.is_empty():
                     running_batch = last_batch
                 else:
+                    # Merge running_batch with prefill batch
                     running_batch.merge_batch(last_batch)
 
         # For prefill-only batch, filter out finished requests since they
@@ -3355,7 +3369,9 @@ class Scheduler(
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
+                    # skip staging requests that are ongoing prefetch
                     continue
+                # Pop the number of tokens loaded from storage (L3 hits)
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
@@ -3439,6 +3455,7 @@ class Scheduler(
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
+        # Create a new batch
         new_batch = ScheduleBatch.init_new(
             can_run_list,
             self.req_to_token_pool,
@@ -3539,6 +3556,7 @@ class Scheduler(
             batch.batch_is_full = False
             return batch
 
+        # Check if decode out of memory
         if (kv_full_retract_flag := not batch.check_decode_mem()) or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
@@ -3647,6 +3665,7 @@ class Scheduler(
            runs on a single stream and doesn't allocate batch_record_buf, so it
            passes overlap=False.
         """
+        # 1. snapshot
         snapshot_v2_full = not batch.spec_algorithm.is_none()
         sched_snapshot = (
             {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
@@ -3655,9 +3674,11 @@ class Scheduler(
         )
         sched_sampling_info = batch.sampling_info
 
+        # 2. sampling_info substitute
         if sched_sampling_info is not None:
             batch.sampling_info = sched_sampling_info.copy_for_forward()
 
+        # 3. pin for 2-iter tensor lifetime (overlap path only)
         if overlap:
             self.record_batch_in_overlap(batch)
 
@@ -3686,6 +3707,7 @@ class Scheduler(
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
 
+        # Whether to run the profiler
         self.profiler_manager._profile_batch_predicate(batch)
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
@@ -3700,6 +3722,7 @@ class Scheduler(
             for req in batch.reqs:
                 self.maybe_send_cached_prefix_chunk(req)
 
+        # Run forward
         if self.is_generation:
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
@@ -4509,6 +4532,7 @@ class Scheduler(
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                 to_del.append(i)
 
+        # Sort in reverse order to avoid index issues when deleting
         for i in reversed(to_del):
             # Abort method 1: directly pop from the queue
             # This only works for requests that have not started anything.
@@ -5019,6 +5043,7 @@ def configure_scheduler_process(
     """
     kill_itself_when_parent_died()
 
+    # Generate the logger prefix
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
         # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
@@ -5043,12 +5068,15 @@ def configure_scheduler_process(
     if get_parallel().ep_size > 1:
         prefix += f" EP{shown_moe_ep}"
 
+    # Config the process
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
 
+    # Configure the logger
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
 
+    # Set cpu affinity to this gpu process
     if envs.SGLANG_SET_CPU_AFFINITY.get():
         set_gpu_proc_affinity(
             configured_pp_size(), configured_tp_size(), get_parallel().nnodes, gpu_id
@@ -5095,6 +5123,7 @@ def run_scheduler_process(
     )
     parent_process = psutil.Process().parent()
 
+    # Set up tracing
     if server_args.enable_trace:
         process_tracing_init(
             server_args.otlp_traces_endpoint,
@@ -5108,6 +5137,7 @@ def run_scheduler_process(
             thread_label = "Decode Scheduler"
         trace_set_thread_info(thread_label, tp_rank, dp_rank, pp_rank)
 
+    # Create a scheduler and run the event loop
     scheduler = None
     try:
         scheduler = Scheduler(
@@ -5122,6 +5152,7 @@ def run_scheduler_process(
             dp_rank,
         )
 
+        # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
 
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
