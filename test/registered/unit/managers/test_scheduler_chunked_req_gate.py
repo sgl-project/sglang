@@ -3,7 +3,7 @@
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -178,6 +178,36 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
             s, running_batch=s.running_batch, last_batch=s.last_batch
         )
         self.assertIsNone(s.chunked_req)
+
+
+class TestChunkedPrefillBatchFullReset(CustomTestCase):
+    def test_stale_batch_full_reconsiders_waiting_request(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.grammar_manager = MagicMock()
+        scheduler.grammar_manager.has_waiting_grammars.return_value = False
+        scheduler.enable_hierarchical_cache = False
+        scheduler.enable_priority_preemption = False
+        scheduler.is_hybrid_swa = False
+        scheduler.waiting_queue = [MagicMock()]
+        scheduler.chunked_req = None
+        scheduler.min_free_slots_delayer = None
+        scheduler.get_num_allocatable_reqs = MagicMock(return_value=1)
+        scheduler.policy = MagicMock()
+        scheduler.policy.calc_priority.side_effect = RuntimeError("admission attempted")
+
+        running_batch = MagicMock()
+        running_batch.batch_is_full = True
+        running_batch.reqs = [MagicMock(), MagicMock(), MagicMock()]
+
+        with patch(
+            "sglang.srt.managers.scheduler.get_memory",
+            return_value=SimpleNamespace(enable_flexkv=False),
+        ), self.assertRaisesRegex(RuntimeError, "admission attempted"):
+            Scheduler._get_new_batch_prefill_raw(
+                scheduler,
+                prefill_delayer_single_pass=None,
+                running_batch=running_batch,
+            )
 
 
 if __name__ == "__main__":
