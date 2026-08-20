@@ -593,24 +593,9 @@ def prewarm_mhc_pre(
     )
 
     logger.info("DeepSeek V4 MHC prenorm prewarm: %d n_splits buckets", len(buckets))
-
-    mhc_pre_impl = mhc_pre
-    if residual.device.type == "xpu":
-        try:
-            from sgl_kernel import mhc_pre as xpu_mhc_pre
-
-            mhc_pre_impl = xpu_mhc_pre
-            logger.info("DeepSeek V4 MHC prenorm prewarm: using sgl-kernel XPU mhc_pre")
-        except Exception as exc:
-            logger.warning(
-                "DeepSeek V4 MHC prenorm prewarm: failed to import sgl-kernel XPU mhc_pre (%s); "
-                "falling back to local mhc_pre",
-                exc,
-            )
-
     with torch.inference_mode():
         for num_tokens in buckets:
-            mhc_pre_impl(
+            mhc_pre(
                 residual.new_zeros(num_tokens, hc_mult, hidden_size),
                 fn,
                 hc_scale,
