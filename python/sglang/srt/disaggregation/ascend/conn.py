@@ -9,6 +9,7 @@ import numpy.typing as npt
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
+from sglang.srt.disaggregation.utils import build_transfer_entry_pairs
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVBootstrapServer,
     MooncakeKVManager,
@@ -137,17 +138,39 @@ class AscendKVManager(MooncakeKVManager):
 
         if self.pp_size > 1:
             if self.is_mla_backend:
-                src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage = (
-                    self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
-                )
-                layers_params = [
-                    (
-                        src_kv_ptrs[layer_id],
-                        sliced_dst_kv_ptrs[layer_id],
-                        self.kv_args.kv_item_lens[layer_id],
+                # Prefer layer-id pairing so heterogeneous per-layer buffer
+                # groups (e.g. partial-layer DSA indexer + scale) are matched
+                # correctly even when their group length != hidden_kv_layers.
+                src_layer_ids = self.kv_args.kv_layer_ids
+                if src_layer_ids and dst_layer_ids:
+                    pairs = build_transfer_entry_pairs(
+                        src_layer_ids,
+                        dst_layer_ids,
+                        len(self.kv_args.kv_data_ptrs),
+                        len(dst_kv_ptrs),
                     )
-                    for layer_id in range(layers_current_pp_stage)
-                ]
+                    layers_params = [
+                        (
+                            self.kv_args.kv_data_ptrs[i],
+                            dst_kv_ptrs[j],
+                            self.kv_args.kv_item_lens[i],
+                        )
+                        for i, j in pairs
+                    ]
+                else:
+                    src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage = (
+                        self.get_mla_kv_ptrs_with_pp(
+                            self.kv_args.kv_data_ptrs, dst_kv_ptrs
+                        )
+                    )
+                    layers_params = [
+                        (
+                            src_kv_ptrs[layer_id],
+                            sliced_dst_kv_ptrs[layer_id],
+                            self.kv_args.kv_item_lens[layer_id],
+                        )
+                        for layer_id in range(layers_current_pp_stage)
+                    ]
             else:
                 (
                     src_k_ptrs,
