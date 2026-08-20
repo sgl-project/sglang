@@ -17,6 +17,31 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def build_marlin_moe_quant_info(layer: Module) -> MarlinMoeQuantInfo:
+    """Build the Marlin quant_info for an MXFP4 MoE layer.
+
+    Single source for the runner inputs shared by the marlin path of
+    ``Mxfp4MoEMethod.apply`` and :class:`Mxfp4MarlinMoEMethod`, including
+    the dispatcher's EP mapping (global -> local expert ids) when EP is on.
+    """
+    expert_map = getattr(layer.dispatcher, "local_expert_mapping", None)
+    global_num_experts = layer.dispatcher.num_experts if expert_map is not None else -1
+    return MarlinMoeQuantInfo(
+        w13_qweight=layer.w13_weight,
+        w2_qweight=layer.w2_weight,
+        w13_scales=layer.w13_weight_scale,
+        w2_scales=layer.w2_weight_scale,
+        w13_g_idx_sort_indices=None,
+        w2_g_idx_sort_indices=None,
+        weight_bits=4,
+        is_k_full=True,
+        w13_bias=getattr(layer, "w13_weight_bias", None),
+        w2_bias=getattr(layer, "w2_weight_bias", None),
+        expert_map=expert_map,
+        global_num_experts=global_num_experts,
+    )
+
+
 class Mxfp4MarlinMoEMethod:
     """MXFP4 (E8M0 scales) MoE quantization method using the Marlin backend."""
 
@@ -162,18 +187,7 @@ class Mxfp4MarlinMoEMethod:
                 value=0.0,
             )
 
-        quant_info = MarlinMoeQuantInfo(
-            w13_qweight=layer.w13_weight,
-            w2_qweight=layer.w2_weight,
-            w13_scales=layer.w13_weight_scale,
-            w2_scales=layer.w2_weight_scale,
-            w13_g_idx_sort_indices=None,
-            w2_g_idx_sort_indices=None,
-            weight_bits=4,
-            is_k_full=True,
-            w13_bias=getattr(layer, "w13_weight_bias", None),
-            w2_bias=getattr(layer, "w2_weight_bias", None),
-        )
+        quant_info = build_marlin_moe_quant_info(layer)
         runner_output = self.runner.run(
             dispatch_output._replace(hidden_states=hidden_states_padded),
             quant_info=quant_info,

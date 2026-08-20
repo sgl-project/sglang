@@ -6,7 +6,15 @@ import torch
 import triton
 import triton.language as tl
 
-from ..common.utils import _bitonic_merge, get_cu_seqblocks, robust_allocator
+from ..common.utils import (
+    _bitonic_merge,
+    _sort_ids_ascending,
+    check_sparse_kv_fp8,
+    get_cu_seqblocks,
+    robust_allocator,
+    sparse_out_dtype,
+    unit_scale,
+)
 
 
 @triton.heuristics(
@@ -81,6 +89,9 @@ def _flash_attn_fwd_with_block_score_kernel(
     block_size: tl.constexpr,
     # sm_scale
     sm_scale,
+    # per-tensor KV dequant scales (1.0 when the cache is unit-scaled)
+    k_scale,
+    v_scale,
     # gumbel topk
     use_gumbel_topk: tl.constexpr,
     gumbel_seed,
@@ -112,6 +123,7 @@ def _flash_attn_fwd_with_block_score_kernel(
     HAS_SINK: tl.constexpr,
     SCORE_TYPE: tl.constexpr,
     DISABLE_INDEX_VALUE: tl.constexpr,
+    IS_FP8: tl.constexpr,
 ):
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
     sm_scale_log2e = sm_scale * 1.4426950409
@@ -170,7 +182,10 @@ def _flash_attn_fwd_with_block_score_kernel(
     if HAS_SINK:
         m_i = tl.zeros((BLOCK_SIZE_Q,), dtype=tl.float32)
         lse_i = tl.zeros((BLOCK_SIZE_Q,), dtype=tl.float32)
-        qsink = tl.sum(q * sink[None, :], axis=1) * sm_scale_log2e  # (BLOCK_SIZE_Q,)
+        qsink = (
+            tl.sum(q.to(tl.float32) * sink[None, :].to(tl.float32), axis=1)
+            * sm_scale_log2e
+        )  # (BLOCK_SIZE_Q,)
         m_i += qsink
         lse_i += qsink
     else:
@@ -199,8 +214,12 @@ def _flash_attn_fwd_with_block_score_kernel(
             mask=kd_mask[:, None] & pos_mask[None, :],
             other=0.0,
         )
+        if IS_FP8:
+            # fp8 index K cache: widening cast with bf16/fp16 Q, no-op with fp8
+            # Q (fp8 attn-GEMM mode; tl.dot runs fp8x8). Compiled out for bf16.
+            k = k.to(q.dtype)
         # compute qk
-        qk = tl.dot(q, k) * sm_scale_log2e
+        qk = tl.dot(q, k) * (sm_scale_log2e * k_scale)
         if i >= diag_start:
             qk = tl.where(off_q[:, None] >= (i + off_k)[None, :], qk, float("-inf"))
         # K boundary mask: positions beyond seq_len contribute -inf
@@ -251,8 +270,12 @@ def _flash_attn_fwd_with_block_score_kernel(
                 mask=pos_mask[:, None] & vd_mask[None, :],
                 other=0.0,
             )
+            if IS_FP8:
+                # Cast V to the compute dtype (widening for bf16/fp16 Q; no-op
+                # for fp8 Q where P is quantized to e4m3 for the fp8 PV MMA).
+                v = v.to(q.dtype)
             p = p.to(v.dtype)
-            acc_o += tl.dot(p, v)
+            acc_o += tl.dot(p, v) * v_scale
             # update statistics
             m_i = m_ij
             lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
@@ -402,6 +425,9 @@ def _topk_index_kernel(
         * tl.reshape(topk_idx - 1, [BLOCK_SIZE_K // BLOCK_SIZE_T, BLOCK_SIZE_T]),
         axis=0,
     )
+    # Ascending by block id, -1 tail: the MSA fmha_sm100 consumer requires
+    # sorted kv_block_indexes (the bitonic pass above orders by score).
+    topk_idx = _sort_ids_ascending(topk_idx, min(topk, valid_blocks), BLOCK_SIZE_T)
     # save topk
     ti_ptrs = (
         ti_ptr
@@ -438,15 +464,21 @@ def flash_prefill_with_topk_index(
     cu_seqblocks_q: Optional[torch.Tensor] = None,
     max_seqblock_q: Optional[int] = None,
     all_seqblock_q: Optional[int] = None,
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
 ):
     assert score_type in (
         "max",
         "lse",
     ), f"score_type must be 'max' or 'lse', got {score_type!r}"
     triton.set_allocator(robust_allocator)
-    # dtype check
-    assert q.dtype == torch.bfloat16 or q.dtype == torch.float16
-    assert k_cache.dtype == q.dtype
+    # dtype check (v_cache is None under disable_index_value)
+    is_fp8 = check_sparse_kv_fp8(
+        q, k_cache, None if disable_index_value else v_cache, label="prefill indexer"
+    )
+    k_scale = unit_scale(k_scale)
+    v_scale = unit_scale(v_scale)
     assert cu_seqlens.dtype == torch.int32
     # shape
     total_q, num_heads, qk_head_dim = q.shape
@@ -455,7 +487,7 @@ def flash_prefill_with_topk_index(
         # placeholder for BLOCK_SIZE_VD; V is never loaded
         v_head_dim = qk_head_dim
     else:
-        assert v_cache is not None and v_cache.dtype == q.dtype
+        assert v_cache is not None
         assert v_cache.shape[1] == k_cache.shape[1]
         v_head_dim = v_cache.shape[-1]
     gqa_group_size = num_heads // num_kv_heads
@@ -468,6 +500,9 @@ def flash_prefill_with_topk_index(
     ), "init_blocks + local_blocks must be less than topk"
     if sm_scale is None:
         sm_scale = qk_head_dim**-0.5
+    # q_scale multiplies every Q-side logit (QK dot and sink), so it folds into
+    # sm_scale; k_scale must not touch the sink term and stays a kernel arg.
+    sm_scale = sm_scale * unit_scale(q_scale)
     if cu_seqblocks_q is None or max_seqblock_q is None or all_seqblock_q is None:
         cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = get_cu_seqblocks(
             cu_seqlens, max_seqlen_q, block_size_q, block_size_k
@@ -476,7 +511,9 @@ def flash_prefill_with_topk_index(
     if disable_index_value:
         o = None
     else:
-        o = torch.empty(total_q, num_heads, v_head_dim, dtype=q.dtype, device=q.device)
+        o = torch.empty(
+            total_q, num_heads, v_head_dim, dtype=sparse_out_dtype(q), device=q.device
+        )
     score = torch.full(
         (num_heads, total_q, max_seqblock_k),
         float("-inf"),
@@ -507,6 +544,8 @@ def flash_prefill_with_topk_index(
         v_head_dim,
         block_size_k,
         sm_scale,
+        k_scale,
+        v_scale,
         False,
         1,
         q.stride(0),
@@ -529,6 +568,7 @@ def flash_prefill_with_topk_index(
         req_to_token.stride(0),
         SCORE_TYPE=score_type,
         DISABLE_INDEX_VALUE=disable_index_value,
+        IS_FP8=is_fp8,
     )
 
     # topk extraction kernel

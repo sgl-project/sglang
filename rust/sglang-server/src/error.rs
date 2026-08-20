@@ -1,6 +1,5 @@
 //! Error type shared by all stages. Kept `Clone` so a single failure can be
 //! reported to the client stream and logged without moving ownership around.
-#![allow(dead_code)] // TODO: remove when the consumer PR lands
 
 use thiserror::Error;
 

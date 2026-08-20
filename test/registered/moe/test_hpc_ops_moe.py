@@ -3,19 +3,13 @@
 Compares the hpc_ops fused func (hpc.fuse_moe_blockwise) against the triton
 fused_experts reference and an fp32 exact reference on realistic blockwise
 FP8 quantized weights. Skipped when HPC-Ops (https://github.com/Tencent/hpc-ops)
-is not installed or the GPU is older than sm90.
+is not installed or the GPU is not SM90 (the kernels ship sm90a only).
 """
 
-import os
 import unittest
 
 import torch
 
-from sglang.srt.distributed.parallel_state import (
-    init_distributed_environment,
-    initialize_model_parallel,
-    model_parallel_is_initialized,
-)
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.hpc_ops import (
     HpcOpsMoeQuantInfo,
@@ -27,6 +21,7 @@ from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutp
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.layer_ut_utils import init_single_process_dist
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
@@ -35,34 +30,19 @@ register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
 E, TOPK, H, I = 128, 8, 2048, 768
 
 
-def _sm90_or_newer() -> bool:
+def _sm90() -> bool:
     if not torch.cuda.is_available():
         return False
     major, _ = torch.cuda.get_device_capability()
-    return major >= 9
+    return major == 9
 
 
 def _ensure_dist_initialized() -> None:
-    """Single-rank gloo distributed + model-parallel groups (TP=1, EP=1).
-
-    The triton fused_experts reference allocates its output under
+    """The triton fused_experts reference allocates its output under
     ``use_symmetric_memory(get_tp_group(), ...)``, which requires the TP
     group even when symmetric allocation is disabled.
     """
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29633")
-    os.environ.setdefault("RANK", "0")
-    os.environ.setdefault("WORLD_SIZE", "1")
-    os.environ.setdefault("LOCAL_RANK", "0")
-    if not torch.distributed.is_initialized():
-        init_distributed_environment(world_size=1, rank=0, local_rank=0, backend="gloo")
-    if not model_parallel_is_initialized():
-        initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            expert_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            backend="gloo",
-        )
+    init_single_process_dist(master_port=29633)
 
 
 def _quant_blockwise(w: torch.Tensor, block: int = 128):
@@ -76,8 +56,8 @@ def _quant_blockwise(w: torch.Tensor, block: int = 128):
 
 
 @unittest.skipUnless(
-    has_hpc_ops() and _sm90_or_newer(),
-    "requires HPC-Ops (install from source: https://github.com/Tencent/hpc-ops) and sm90+",
+    has_hpc_ops() and _sm90(),
+    "requires HPC-Ops (install from source: https://github.com/Tencent/hpc-ops) and an SM90 (Hopper) GPU",
 )
 class TestHpcOpsMoeBlockwise(CustomTestCase):
 

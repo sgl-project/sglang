@@ -13,7 +13,7 @@ import multiprocessing as mp
 import os
 import time
 from contextlib import ExitStack
-from typing import Any, List, Union
+from typing import Any, List, Optional, Union
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.server_warmup import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     GREEN,
     RESET,
+    globally_suppress_loggers,
     init_logger,
     log_batch_completion,
     log_generation_timer,
@@ -125,12 +126,13 @@ class DiffGenerator:
         Returns:
             The created DiffGenerator
         """
+        globally_suppress_loggers()
         instance = cls(
             server_args=server_args,
         )
         init_diffusion_tracing(server_args, "DiffGenerator")
 
-        logger.info(f"Local mode: {local_mode}")
+        logger.info("Local mode: %s", local_mode)
         if local_mode:
             instance.local_scheduler_process = instance._start_local_server_if_needed()
             instance.owns_scheduler_client = True
@@ -220,6 +222,7 @@ class DiffGenerator:
         )
 
         request_groups: list[list[Req]] = []
+        parent_requests: list[tuple[Req, int]] = []
         image_paths_per_prompt = self._resolve_image_paths_per_prompt(
             prompts, sampling_params_orig.image_path
         )
@@ -243,13 +246,32 @@ class DiffGenerator:
                 sampling_params=sampling_params,
                 external_trace_header=external_trace_header,
             )
-            request_groups.append(
-                expand_request_outputs(
-                    req,
-                    num_prompts=len(prompts),
-                    prompt_index=i,
+            parent_requests.append((req, i))
+
+        for req, prompt_index in parent_requests:
+            sampling_params = req.sampling_params
+            try:
+                if sampling_params.data_type == DataType.VIDEO:
+                    sampling_params.prepare_video_request_for_queue(req)
+                request_groups.append(
+                    expand_request_outputs(
+                        req,
+                        num_prompts=len(prompts),
+                        prompt_index=prompt_index,
+                    )
                 )
-            )
+            except Exception:
+                if sampling_params.data_type == DataType.VIDEO:
+                    sampling_params.cleanup_video_request(req)
+                for prepared_requests in request_groups:
+                    if (
+                        prepared_requests
+                        and prepared_requests[0].data_type == DataType.VIDEO
+                    ):
+                        prepared_requests[0].sampling_params.cleanup_video_request(
+                            prepared_requests[0]
+                        )
+                raise
 
         results: list[GenerationResult] = []
         total_start_time = time.perf_counter()
@@ -285,6 +307,10 @@ class DiffGenerator:
                         )
                         for idx, path in enumerate(output_file_paths):
                             req = requests[idx]
+                            if req.data_type == DataType.VIDEO:
+                                req.sampling_params.validate_video_final_outputs(
+                                    [path], req
+                                )
                             results.append(
                                 GenerationResult(
                                     **self._result_common(
@@ -346,6 +372,11 @@ class DiffGenerator:
 
                         for idx in range(len(samples_out)):
                             req = requests[idx]
+                            output_file_path = req.output_file_path(1, 0)
+                            if req.data_type == DataType.VIDEO and req.save_output:
+                                req.sampling_params.validate_video_final_outputs(
+                                    [output_file_path], req
+                                )
                             results.append(
                                 GenerationResult(
                                     **self._result_common(
@@ -355,12 +386,23 @@ class DiffGenerator:
                                     frames=frames_out[idx],
                                     audio=audios_out[idx],
                                     prompt_index=global_output_index + idx,
-                                    output_file_path=req.output_file_path(1, 0),
+                                    output_file_path=output_file_path,
                                 )
                             )
             except Exception as e:
                 logger.error("Generation failed: %s", e, exc_info=True)
             finally:
+                if requests and requests[0].data_type == DataType.VIDEO:
+                    try:
+                        # Pre-queue resources are shared by the shallow
+                        # per-output Req copies, so one idempotent cleanup is
+                        # sufficient for the whole parent request.
+                        requests[0].sampling_params.cleanup_video_request(requests[0])
+                    except Exception:
+                        logger.warning(
+                            "Failed to clean up model-owned video request resources",
+                            exc_info=True,
+                        )
                 global_output_index += len(requests)
 
         total_gen_time = time.perf_counter() - total_start_time
@@ -430,7 +472,7 @@ class DiffGenerator:
     def _log_summary(self, results: list[GenerationResult]) -> None:
         if not results:
             return
-        if self.server_args.warmup:
+        if self.server_args.warmup_mode != "off":
             total_duration_ms = results[0].metrics.get("total_duration_ms", 0)
             logger.info(
                 f"Warmed-up request processed in {GREEN}%.2f{RESET} seconds (with warmup excluded)",
@@ -505,6 +547,7 @@ class DiffGenerator:
         target: Union[str, List[str]] = "all",
         strength: Union[float, List[float]] = 1.0,
         merge_mode: str | None = None,
+        lora_alpha: Optional[Union[int, List[Optional[int]]]] = None,
     ) -> None:
         """
         Set LoRA adapter(s) for the specified transformer(s).
@@ -521,6 +564,7 @@ class DiffGenerator:
                 - "critic": Apply only to the critic model
             strength: LoRA strength(s) for merge, default 1.0. Can be a float or a list of floats.
             merge_mode: Optional LoRA merge mode: "auto", "merge", or "dynamic".
+            lora_alpha: Training alpha override for adapters that omit it from metadata.
         """
         req = SetLoraReq(
             lora_nickname=lora_nickname,
@@ -528,6 +572,7 @@ class DiffGenerator:
             target=target,
             strength=strength,
             merge_mode=merge_mode,
+            lora_alpha=lora_alpha,
         )
         nickname_str, target_str, strength_str = format_lora_message(
             lora_nickname, target, strength

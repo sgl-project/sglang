@@ -6,6 +6,7 @@ register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="base-c-test-cpu")
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -455,6 +456,22 @@ class TestCopyForForward(CustomTestCase):
 # from_schedule_batch
 class TestFromScheduleBatch(CustomTestCase):
 
+    def setUp(self):
+        super().setUp()
+        # from_schedule_batch reads these two flags from the exec bag; give
+        # each test a mutable stand-in so it does not depend on a published
+        # (or leaked) process context.
+        self._exec_ns = SimpleNamespace(
+            deterministic=SimpleNamespace(enable_deterministic_inference=False),
+            features=SimpleNamespace(enable_custom_logit_processor=False),
+        )
+        exec_patch = patch(
+            "sglang.srt.sampling.sampling_batch_info.get_exec",
+            return_value=self._exec_ns,
+        )
+        exec_patch.start()
+        self.addCleanup(exec_patch.stop)
+
     def _make_req(
         self,
         temp=1.0,
@@ -486,11 +503,8 @@ class TestFromScheduleBatch(CustomTestCase):
         req.tokenizer.eos_token_id = eos_id
         return req
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
-    def test_basic_construction(self, mock_server_args):
+    def test_basic_construction(self):
         """Test that from_schedule_batch correctly extracts sampling params from requests."""
-        mock_server_args.return_value.enable_deterministic_inference = False
-        mock_server_args.return_value.enable_custom_logit_processor = False
 
         reqs = [self._make_req(temp=0.8, top_p=0.9, top_k=50, min_p=0.1)]
         batch = MagicMock()
@@ -503,11 +517,8 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertAlmostEqual(info.top_ps[0].item(), 0.9, places=5)
         self.assertEqual(info.top_ks[0].item(), 50)
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
-    def test_greedy_detection(self, mock_server_args):
+    def test_greedy_detection(self):
         """Test that top_k=1 sets is_all_greedy=True."""
-        mock_server_args.return_value.enable_deterministic_inference = False
-        mock_server_args.return_value.enable_custom_logit_processor = False
 
         reqs = [self._make_req(top_k=1)]
         batch = MagicMock()
@@ -516,11 +527,8 @@ class TestFromScheduleBatch(CustomTestCase):
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
         self.assertTrue(info.is_all_greedy)
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
-    def test_logit_bias_construction(self, mock_server_args):
+    def test_logit_bias_construction(self):
         """Test that logit_bias dict is converted to a tensor with correct values."""
-        mock_server_args.return_value.enable_deterministic_inference = False
-        mock_server_args.return_value.enable_custom_logit_processor = False
 
         reqs = [self._make_req(logit_bias={"5": 2.0, "10": -1.0})]
         batch = MagicMock()
@@ -532,11 +540,9 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertAlmostEqual(info.logit_bias[0, 10].item(), -1.0)
         self.assertAlmostEqual(info.logit_bias[0, 0].item(), 0.0)
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
-    def test_deterministic_seed(self, mock_server_args):
+    def test_deterministic_seed(self):
         """Test that explicit seed=123 is kept and missing seed defaults to 42."""
-        mock_server_args.return_value.enable_deterministic_inference = True
-        mock_server_args.return_value.enable_custom_logit_processor = False
+        self._exec_ns.deterministic.enable_deterministic_inference = True
 
         reqs = [self._make_req(seed=123), self._make_req(seed=None)]
         batch = MagicMock()
@@ -547,11 +553,8 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertEqual(info.sampling_seed[0].item(), 123)
         self.assertEqual(info.sampling_seed[1].item(), 42)  # default
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
-    def test_from_schedule_batch_sampling_flags(self, mock_server_args):
+    def test_from_schedule_batch_sampling_flags(self):
         """Test that sampling flags (need_top_p/top_k/min_p) are set correctly."""
-        mock_server_args.return_value.enable_deterministic_inference = False
-        mock_server_args.return_value.enable_custom_logit_processor = False
 
         reqs = [self._make_req(top_p=0.9, top_k=50, min_p=0.1)]
         batch = MagicMock()
@@ -563,11 +566,8 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertTrue(info.need_min_p_sampling)  # 0.1 > 0
         self.assertFalse(info.is_all_greedy)  # top_k=50 > 1
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
-    def test_no_logit_bias_when_all_none(self, mock_server_args):
+    def test_no_logit_bias_when_all_none(self):
         """Test that logit_bias stays None when no request has logit_bias set."""
-        mock_server_args.return_value.enable_deterministic_inference = False
-        mock_server_args.return_value.enable_custom_logit_processor = False
 
         reqs = [self._make_req(), self._make_req()]
         batch = MagicMock()
@@ -576,15 +576,13 @@ class TestFromScheduleBatch(CustomTestCase):
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
         self.assertIsNone(info.logit_bias)
 
-    @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
-    def test_custom_logit_processor_merging(self, mock_server_args):
+    def test_custom_logit_processor_merging(self):
         """Test deserialization and merging of custom logit processors."""
         from sglang.srt.sampling.custom_logit_processor import (
             DisallowedTokensLogitsProcessor,
         )
 
-        mock_server_args.return_value.enable_deterministic_inference = False
-        mock_server_args.return_value.enable_custom_logit_processor = True
+        self._exec_ns.features.enable_custom_logit_processor = True
 
         proc_str = DisallowedTokensLogitsProcessor.to_str()
         req1 = self._make_req()

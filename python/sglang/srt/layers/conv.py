@@ -14,8 +14,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.layers.amx_utils import PackWeightMethod
-from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.utils import cpu_has_amx_support, is_cpu, use_intel_amx_backend
 
 _is_cpu = is_cpu()
@@ -98,7 +98,7 @@ def _validate_conv_args(
             raise ValueError("padding='same' is not supported for strided convolutions")
 
 
-class Conv2dLayer(MultiPlatformOp):
+class Conv2dLayer(BaseFusedOp):
     """Drop-in replacement for nn.Conv2d. Linear optimization disabled by default."""
 
     def __init__(
@@ -204,7 +204,7 @@ class Conv2dLayer(MultiPlatformOp):
         return self._forward_conv(x)
 
 
-class Conv3dLayer(MultiPlatformOp):
+class Conv3dLayer(BaseFusedOp):
     """Drop-in replacement for nn.Conv3d with automatic linear optimization."""
 
     def __init__(
