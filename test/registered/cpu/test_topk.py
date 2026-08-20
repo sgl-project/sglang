@@ -238,7 +238,14 @@ class TestTopK(CustomTestCase):
 
     def test_topk_softmax_with_correction_bias(self):
         """Bias must affect expert selection without becoming a routing weight."""
-        for num_tokens, num_experts, topk, with_bias, bias_2d, renormalize in itertools.product(
+        for (
+            num_tokens,
+            num_experts,
+            topk,
+            with_bias,
+            bias_2d,
+            renormalize,
+        ) in itertools.product(
             [1, 17, 128],
             [16, 128, 384, 512],
             [1, 2, 4, 8],
