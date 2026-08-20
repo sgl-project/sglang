@@ -3161,11 +3161,13 @@ class Scheduler(
             else:
                 ret = None
 
+        # Handle DP attention and log stats
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
             ret, need_sync=need_mlp_sync
         )
         self._arm_prefill_decode_interval(ret)
 
+        # Handle ngram embedding
         ret = self.ngram_embedding_manager.prepare_for_forward(
             ret, chunked_req=self.chunked_req
         )
@@ -3213,6 +3215,7 @@ class Scheduler(
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+        # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:
@@ -3403,6 +3406,7 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
 
+        # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
             return None, running_batch
@@ -3414,6 +3418,7 @@ class Scheduler(
                 self._add_request_to_queue(req)
 
         if adder.new_chunked_req is not None:
+            # Update chunked prefill
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
@@ -3591,6 +3596,7 @@ class Scheduler(
         if batch.is_empty():
             return batch
 
+        # Update batch tensors
         batch.prepare_for_decode()
         return batch
 
@@ -4450,6 +4456,7 @@ class Scheduler(
         self.weight_updater.save_sharded_model(kwargs)
 
     def handle_rpc_request(self, recv_req: RpcReqInput):
+        # Handle RPC requests
         logger.info(
             f"handle_rpc_request: {recv_req.method}, param: {recv_req.parameters}"
         )

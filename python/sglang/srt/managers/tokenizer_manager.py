@@ -1135,6 +1135,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
 
+        # Validate input length
         if input_token_num >= self.context_len:
             if self.allow_auto_truncate:
                 logger.warning(
@@ -1150,6 +1151,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"model's context length ({self.context_len} tokens)."
                 )
 
+        # Validate total tokens (input + max_new_tokens)
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
         if (
             self.validate_total_tokens
@@ -1176,15 +1178,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 raise ValueError(error_msg)
 
+        # Validate embedding requests
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
             raise ValueError(
                 "This model does not appear to be an embedding model by default. "
                 "Please add `--is-embedding` when launching the server or try another model."
             )
 
+        # Validate Matryoshka embeddings
         if isinstance(obj, EmbeddingReqInput):
             self._validate_for_matryoshka_dim(obj)
 
+        # Validate generation-specific fields
         if isinstance(obj, GenerateReqInput):
             self._validate_token_ids_logprob(obj)
             requested_hidden_mode = get_request_return_hidden_states_mode(
@@ -1279,6 +1284,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _validate_input_ids_in_vocab(
         self, input_ids: Union[List[int], List[List[int]]], vocab_size: int
     ) -> None:
+        # Handle both single sequence and batch of sequences
         if isinstance(input_ids[0], list):
             for seq in input_ids:
                 if any(id >= vocab_size for id in seq):
@@ -1318,6 +1324,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
 
+        # Build return object
         if isinstance(obj, GenerateReqInput):
             session_params = (
                 SessionParams(**obj.session_params) if obj.session_params else None
@@ -1432,6 +1439,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         requests = [obj[i] for i in range(batch_size)]
         texts = [req.text for req in requests]
 
+        # Check if any request is a cross-encoder request
         is_cross_encoder_request = any(
             isinstance(req, EmbeddingReqInput) and req.is_cross_encoder_request
             for req in requests
@@ -1703,6 +1711,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         self.request_metrics_exporter_manager.write_record(obj, out)
                     )
 
+                # Check if this was an abort/error created by scheduler
                 if isinstance(out["meta_info"].get("finish_reason"), dict):
                     abort_out = await self._handle_abort_finish_reason(
                         out, state, is_stream
@@ -2122,6 +2131,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 continue
 
+            # Build meta_info and return value
             meta_info = {
                 "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],

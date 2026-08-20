@@ -485,6 +485,7 @@ class TokenizerManagerScoreMixin:
                         f"Token ID {token_id} is out of vocabulary (vocab size: {vocab_size})"
                     )
 
+        # Check if multi-item scoring is enabled
         use_multi_item_scoring = self.server_args.enable_mis
 
         input_ids = None

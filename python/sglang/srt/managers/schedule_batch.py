@@ -1468,6 +1468,7 @@ class Req(ReqDllmMixin):
         matched_eos = False
 
         for i, token_id in enumerate(new_accepted_tokens):
+            # Check stop token ids
             if self.sampling_params.stop_token_ids:
                 matched_eos |= token_id in self.sampling_params.stop_token_ids
             if self.eos_token_ids:
@@ -1519,6 +1520,7 @@ class Req(ReqDllmMixin):
         ):
             tail_str = self.tail_str(new_accepted_len)
 
+            # Check stop strings
             if len(self.sampling_params.stop_strs) > 0:
                 for stop_str in self.sampling_params.stop_strs:
                     stop_str_in_tail = stop_str in tail_str
@@ -1530,6 +1532,7 @@ class Req(ReqDllmMixin):
                             )
                         return True
 
+            # Check stop regex
             if len(self.sampling_params.stop_regex_strs) > 0:
                 for stop_regex_str in self.sampling_params.stop_regex_strs:
                     # Seatbelt, not validation: patterns are checked at ingress
@@ -2479,6 +2482,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     logprob_start_len = len(req.origin_input_ids)
                 else:
                     logprob_start_len = req.logprob_start_len
+                # Apply logprob_start_len
                 if global_start_idx < logprob_start_len:
                     global_start_idx = logprob_start_len
 
@@ -2579,6 +2583,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_extend(input_ids, seq_lens)
 
+        # Build sampling info
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,
             self.model_config.vocab_size,
@@ -2874,6 +2879,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def prepare_encoder_info_decode(self):
+        # Reset the encoder cached status
         self.encoder_cached = [True] * len(self.reqs)
 
     def prepare_for_idle(self):
@@ -3018,6 +3024,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # the allocator, triggered from mem_cache/common.py.)
         self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
 
+        # Update req-level memory management fields
         for req in self.reqs:
             req.decode_batch_idx += 1
             req.kv_committed_len += 1
