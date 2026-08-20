@@ -1256,6 +1256,23 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             skip_reason = "no server warmup measurements"
         elif workload.workload_units() is None:
             skip_reason = "default workload resolution unknown"
+        else:
+            # A probe that failed at or below the target is a measurement, not
+            # missing data: the card cannot hold the default workload as it is
+            # already configured, and promoting weights would only add to it.
+            blocking = [
+                record
+                for record in records
+                if not record.succeeded
+                and record.workload_units() <= workload.workload_units()
+            ]
+            if blocking:
+                smallest = min(blocking, key=lambda record: record.workload_units())
+                skip_reason = (
+                    f"warmup failed at {smallest.width}x{smallest.height}"
+                    f"x{smallest.num_frames}f, which the default workload "
+                    f"{workload.describe()} meets or exceeds"
+                )
         if skip_reason is not None:
             return RankResidencyReport(
                 rank=self.rank,

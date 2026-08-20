@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.utils.image_io import save_base64_image_to_pa
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     build_warmup_reqs,
+    lighten_warmup_req,
     should_include_warmup_image,
     supports_synthetic_warmup,
 )
@@ -192,7 +193,10 @@ async def maybe_apply_auto_residency(
 
     skip_reason = auto_residency_skip_reason(server_args)
     if skip_reason is not None:
-        logger.debug("Auto residency: skipped (%s)", skip_reason)
+        # Whoever asked for auto needs to hear why it did nothing; on any other
+        # server this is just a note about a mode they did not pick.
+        log = logger.info if server_args.performance_mode == "auto" else logger.debug
+        log("Auto residency: skipped (%s)", skip_reason)
         return
 
     logger.info(
@@ -250,6 +254,34 @@ async def maybe_apply_auto_residency(
         await run_async_client_warmup(
             server_args, forward, fail_open=fail_open, rewarm=True
         )
+
+
+# Enough to clear a probe that overshot the card, few enough that a failure
+# which is not about probe size gives up quickly instead of walking the
+# workload down to nothing.
+MAX_WARMUP_DEGRADE_ATTEMPTS = 3
+
+
+def _is_out_of_memory(error: Any) -> bool:
+    text = str(error).lower()
+    return "out of memory" in text or "outofmemory" in text
+
+
+def _degrade_after_oom(server_args: ServerArgs, req: Req) -> Req | None:
+    """Next warmup probe to try after `req` ran the card out of memory.
+
+    Only memory failures are worth retrying smaller; anything else fails the
+    same way at every size and should surface instead of being shrunk away.
+    """
+    lighter = lighten_warmup_req(server_args, req)
+    if lighter is None:
+        return None
+    logger.warning(
+        "%s ran out of memory; retrying warmup at %s",
+        format_warmup_req(req),
+        format_warmup_req(lighter),
+    )
+    return lighter
 
 
 def format_warmup_req(req_or_group: Any) -> str:
@@ -318,6 +350,14 @@ async def run_async_client_warmup(
             server_args, warmup_input_path=warmup_input_path, rewarm=rewarm
         ):
             response = await forward(req)
+            for _ in range(MAX_WARMUP_DEGRADE_ATTEMPTS):
+                if response.error is None or not _is_out_of_memory(response.error):
+                    break
+                lighter = _degrade_after_oom(server_args, req)
+                if lighter is None:
+                    break
+                req = lighter
+                response = await forward(req)
             if response.error is not None:
                 raise RuntimeError(response.error)
     except Exception:
@@ -341,6 +381,14 @@ def run_sync_client_warmup(
         server_args, warmup_input_path=warmup_input_path
     ):
         response = forward(req)
+        for _ in range(MAX_WARMUP_DEGRADE_ATTEMPTS):
+            if response.error is None or not _is_out_of_memory(response.error):
+                break
+            lighter = _degrade_after_oom(server_args, req)
+            if lighter is None:
+                break
+            req = lighter
+            response = forward(req)
         if response.error is not None:
             raise RuntimeError(response.error)
 

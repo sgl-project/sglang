@@ -56,6 +56,11 @@ ACTIVATION_EXTRAPOLATION_MARGIN = 1.2
 # shape variance, and CUDA graph or compile pools.
 VRAM_RESERVE_FRACTION = 0.10
 MIN_VRAM_RESERVE_BYTES = 4 * GIB_BYTES
+# The absolute floor is sized for datacenter cards, where the fraction dominates
+# anyway (10% of 80 GiB is 8 GiB). Below ~40 GiB the floor takes over, and on a
+# 12 GiB card a flat 4 GiB would fence off a third of the device, so cap it as a
+# share of what is actually there.
+MAX_VRAM_RESERVE_FRACTION = 0.20
 
 AUTO_RESIDENCY_FEATURE_NAME = "auto residency promotion"
 
@@ -197,15 +202,25 @@ def estimate_default_workload_peak_bytes(
     3. One usable size: scale everything above the pre-forward allocated
        baseline (conservative; may block promotion but never over-promotes).
 
-    Returns None when the estimate cannot be trusted: no records, any warmup
-    forward failed (its peak does not cover the full request path), or the
-    target workload is unknown (an unknown target would silently equate the
-    area/frame-capped warmup peak with the real serving peak).
+    Returns None when the estimate cannot be trusted: no successful records,
+    the target workload is unknown (an unknown target would silently equate the
+    area/frame-capped warmup peak with the real serving peak), or a probe at or
+    below the target ran out of memory. That last case is not missing data but
+    a measurement: the card could not hold the target as it is already
+    configured, so making more weights resident can only make it worse. A probe
+    that failed strictly above the target says nothing about the target and is
+    dropped instead.
     """
     records = list(records)
-    if not records or any(not record.succeeded for record in records):
-        return None
     if target_units is None:
+        return None
+    failed_units = [
+        record.workload_units() for record in records if not record.succeeded
+    ]
+    if any(units <= target_units for units in failed_units):
+        return None
+    records = [record for record in records if record.succeeded]
+    if not records:
         return None
 
     peak_by_units: dict[int, int] = {}
@@ -407,7 +422,10 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
 
     estimated_peak = max(report.estimated_peak_bytes for report in reports)
     budget = min(report.budget_bytes for report in reports)
-    reserve = max(int(budget * VRAM_RESERVE_FRACTION), MIN_VRAM_RESERVE_BYTES)
+    reserve = max(
+        int(budget * VRAM_RESERVE_FRACTION),
+        min(MIN_VRAM_RESERVE_BYTES, int(budget * MAX_VRAM_RESERVE_FRACTION)),
+    )
 
     candidates = _consensus_candidates(reports)
     if not candidates:

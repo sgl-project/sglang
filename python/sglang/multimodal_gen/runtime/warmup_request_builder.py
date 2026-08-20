@@ -14,6 +14,7 @@ request transport path as real generation.
 """
 
 from copy import copy
+from dataclasses import replace
 from typing import Any
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
@@ -226,6 +227,56 @@ def _fit_resolution_to_area(
         max(alignment, width // alignment * alignment),
         max(alignment, height // alignment * alignment),
     )
+
+
+def _halve_num_frames(server_args: ServerArgs, num_frames: int) -> int:
+    """Halve the latent frame count, keeping the model's frame arithmetic."""
+    if num_frames <= 1:
+        return num_frames
+    arch_config = getattr(
+        getattr(server_args.pipeline_config, "vae_config", None), "arch_config", None
+    )
+    ratio = getattr(arch_config, "temporal_compression_ratio", None)
+    if not ratio or ratio <= 1:
+        return max(1, num_frames // 2)
+    latent_frames = (num_frames - 1) // ratio + 1
+    # round up: halving 5 latent frames should land on 3 (9 frames), not 2 (5)
+    return ((latent_frames + 1) // 2 - 1) * ratio + 1
+
+
+def lighten_warmup_req(server_args: ServerArgs, req: Req) -> Req | None:
+    """Roughly halve a warmup probe, or None once it cannot shrink further.
+
+    Warmup peak memory tracks width * height * num_frames, so a card that could
+    not hold the full probe usually holds half of it while still walking the
+    same code path. Frames go first: they drive video activation size, and
+    cutting them leaves the spatial kernels at their serving shape.
+    """
+    params = req.sampling_params
+    if params is None:
+        return None
+
+    num_frames = getattr(params, "num_frames", None) or 1
+    lighter_frames = _halve_num_frames(server_args, num_frames)
+    if lighter_frames < num_frames:
+        return _replace_warmup_workload(req, num_frames=lighter_frames)
+
+    width = getattr(params, "width", None)
+    height = getattr(params, "height", None)
+    if not width or not height:
+        return None
+    alignment = _warmup_resolution_alignment(server_args)
+    lighter = _fit_resolution_to_area(width, height, width * height // 2, alignment)
+    # below the alignment floor the fit rounds back up; only take a real cut
+    if lighter[0] * lighter[1] >= width * height:
+        return None
+    return _replace_warmup_workload(req, width=lighter[0], height=lighter[1])
+
+
+def _replace_warmup_workload(req: Req, **changes: int) -> Req:
+    lighter = copy(req)
+    lighter.sampling_params = replace(req.sampling_params, **changes)
+    return lighter
 
 
 def _is_resolution_aligned(resolution: tuple[int, int], alignment: int) -> bool:
