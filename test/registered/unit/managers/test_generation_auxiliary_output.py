@@ -657,3 +657,9 @@ def test_auxiliary_output_consumes_only_newly_visible_tokens():
     commits = output.consume.call_args.args[1]
     assert commits[0].output_index == 1
     assert commits[0].token_ids == (11,)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
