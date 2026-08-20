@@ -717,21 +717,33 @@ def _flash_mla_b12x(
     if mode is None:
         mode = "decode" if B <= 256 else "extend"
 
-    # The SM120 unified-prefill kernel only instantiates fixed single-cache
-    # widths ({128, 512, 1024, 2048}); vLLM pads the DSpark SWA index width
-    # to 512 for the same reason. Decode accepts any 64-multiple width.
-    if mode == "extend" and extra_idx is None and idx.shape[-1] not in (
-        128,
-        512,
-        1024,
-        2048,
-    ):
-        for w in (128, 512, 1024, 2048):
-            if idx.shape[-1] <= w:
-                idx = torch.nn.functional.pad(
-                    idx, (0, w - idx.shape[-1]), value=-1
+    # The SM120 unified-prefill kernel (which also serves the SM121
+    # single-pass decode route) only instantiates fixed single-cache widths
+    # ({128, 512, 1024, 2048}); vLLM pads the DSpark SWA index width to 512
+    # for the same reason. Per-row lengths keep the real counts, so padded
+    # -1 columns are never read past the length.
+    if extra_idx is None and idx.shape[-1] not in (128, 512, 1024, 2048):
+        from sglang.srt.runtime_context import get_resources
+
+        target_w = next(w for w in (512, 1024, 2048) if idx.shape[-1] <= w)
+        buffers = get_resources().buffers
+        key = f"flash_mla_sm120_b12x_padidx:{target_w}:{dev}"
+        buf = buffers.get(key)
+        if buf is None or buf.shape[0] < B:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "b12x index pad buffer too small during CUDA graph "
+                    "capture; the eager pre-capture run must size it first."
                 )
-                break
+            if buf is not None:
+                _B12X_RETIRED_SCRATCH.append(buf)
+            with torch.inference_mode(False):
+                buf = torch.empty(B, target_w, dtype=torch.int32, device=dev)
+            buffers[key] = buf
+        padded = buf[:B]
+        padded.fill_(-1)
+        padded[:, : idx.shape[-1]].copy_(idx)
+        idx = padded
 
     width = idx.shape[-1] + (extra_idx.shape[-1] if extra_idx is not None else 0)
     num_splits_cap = compressed_mla.split_chunks_for_contract(
