@@ -267,7 +267,7 @@ class NativeMmHost:
         map in parallel — the transport the Python TokenizerManager already uses.
         Single-rank serving stays inline, where shm would only add a copy.
         """
-        from sglang.srt.managers.tokenizer_manager import (
+        from sglang.srt.managers.mm_utils import (
             determine_tensor_transport_mode,
         )
 
