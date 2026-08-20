@@ -2639,7 +2639,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
 
-        mask = req.extend_range.length >= checkpoint_grid
+        replayable_extend_len = req.extend_range.length
+        if req.extend_range.end >= len(req.full_untruncated_fill_ids):
+            # Prefix matching intentionally stops before the final input token.
+            # On the last prefill chunk, do not donate a checkpoint that a replay
+            # can never match (for example, 3584 with a 128-token page).
+            replayable_end = req._compute_max_prefix_len(req.extend_range.end)
+            replayable_extend_len = max(replayable_end - len(req.prefix_indices), 0)
+
+        mask = replayable_extend_len >= checkpoint_grid
         track_index = req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
         mamba_track_seqlen = -1
         if mask:
@@ -2656,7 +2664,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # mamba radix cache to track which seqlen this mamba state should store at.
             mamba_track_seqlen_aligned = (
                 len(req.prefix_indices)
-                + (req.extend_range.length // checkpoint_grid) * checkpoint_grid
+                + (replayable_extend_len // checkpoint_grid) * checkpoint_grid
             )
 
             # mamba_track_fla_chunk_aligned is the aligned seqlen based on chunk_size

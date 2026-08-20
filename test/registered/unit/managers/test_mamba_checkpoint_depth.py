@@ -26,8 +26,10 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 CHUNK = 64
 
 
-def _track_seqlen(*, tree_page: int, prefix_len: int, extend_len: int) -> int:
-    """Run one extend through the tracker and report the donated depth."""
+def _track_checkpoint(
+    *, tree_page: int, prefix_len: int, extend_len: int, input_len=None
+):
+    """Run one extend and report the donated depth and kernel track position."""
     server_args = ServerArgs(model_path="dummy", page_size=CHUNK)
     # The property would otherwise load the HF config for the dummy model.
     server_args._mamba_cache_chunk_size = CHUNK
@@ -35,13 +37,17 @@ def _track_seqlen(*, tree_page: int, prefix_len: int, extend_len: int) -> int:
 
     sampling_params = SamplingParams(max_new_tokens=1)
     sampling_params.normalize(None)
+    if input_len is None:
+        input_len = prefix_len + extend_len
+    assert input_len >= prefix_len + extend_len
     req = Req(
         rid="req",
         origin_input_text="",
-        origin_input_ids=array("q", [1] * (prefix_len + extend_len)),
+        origin_input_ids=array("q", [1] * input_len),
         sampling_params=sampling_params,
         vocab_size=128,
     )
+    req._refresh_fill_ids()
     req.prefix_indices = torch.arange(prefix_len, dtype=torch.int64)
     req.set_extend_range(prefix_len, prefix_len + extend_len)
     req.mamba_ping_pong_track_buffer = torch.tensor([0, 1], dtype=torch.int64)
@@ -53,21 +59,41 @@ def _track_seqlen(*, tree_page: int, prefix_len: int, extend_len: int) -> int:
     batch.req_to_token_pool = MagicMock()
     batch.req_to_token_pool.get_mamba_ping_pong_other_idx.return_value = 1
 
-    batch._mamba_radix_cache_v2_req_prepare_for_extend(req)
-    return req.mamba_last_track_seqlen
+    entry = batch._mamba_radix_cache_v2_req_prepare_for_extend(req)
+    return req.mamba_last_track_seqlen, entry.track_seqlen
 
 
 class TestMambaCheckpointDepth(unittest.TestCase):
     def test_widened_tree_page_moves_the_donated_depth_onto_it(self):
         # 4066 tokens past a 16384 prefix: the chunk grid would stop at 20416,
         # which a 256-token page cannot name.
-        depth = _track_seqlen(tree_page=256, prefix_len=16384, extend_len=4066)
+        depth, _ = _track_checkpoint(tree_page=256, prefix_len=16384, extend_len=4066)
         self.assertEqual(depth % 256, 0)
         self.assertEqual(depth, 20224)
 
     def test_unwidened_tree_page_keeps_the_chunk_grid(self):
-        depth = _track_seqlen(tree_page=CHUNK, prefix_len=16384, extend_len=4066)
+        depth, _ = _track_checkpoint(tree_page=CHUNK, prefix_len=16384, extend_len=4066)
         self.assertEqual(depth, 20416)
+
+    def test_final_non_boundary_matches_replay_depth(self):
+        depth, _ = _track_checkpoint(tree_page=128, prefix_len=0, extend_len=3000)
+        self.assertEqual(depth, 2944)
+
+    def test_final_exact_boundary_stops_at_replayable_checkpoint(self):
+        depth, kernel_track_seqlen = _track_checkpoint(
+            tree_page=128, prefix_len=0, extend_len=3584
+        )
+        self.assertEqual(depth, 3456)
+        # The final recurrent state is at 3584. Force an intermediate h lookup
+        # so the state donated under depth 3456 really belongs to that depth.
+        self.assertEqual(kernel_track_seqlen, 3457)
+
+    def test_non_final_exact_boundary_remains_cacheable(self):
+        depth, kernel_track_seqlen = _track_checkpoint(
+            tree_page=128, prefix_len=0, extend_len=3584, input_len=4096
+        )
+        self.assertEqual(depth, 3584)
+        self.assertEqual(kernel_track_seqlen, 3584)
 
 
 if __name__ == "__main__":
