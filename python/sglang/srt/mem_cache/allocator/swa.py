@@ -365,7 +365,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_swa(self, free_index: torch.Tensor):
         """Release only the SWA peers of these FULL slot ids, keeping the full
         side live. The mapping is the source of truth, so callers pass full ids
-        rather than a cached SWA copy that may already read as the sentinel."""
+        rather than a cached SWA copy that may already read as the sentinel.
+
+        `free_index` must start on a page boundary of one request's kv row."""
         if free_index.numel() == 0:
             return
 
@@ -373,24 +375,37 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.swa_free_group.append(self._copy_for_free_group(free_index))
             return
 
-        if self.page_size == 1:
-            mapping_indices = free_index
-        else:
-            mapping_indices = self._expand_to_full_pages(free_index)
+        ps = self.page_size
+        if ps == 1:
+            swa_indices = self.full_to_swa_index_mapping[free_index]
+            if resolve_level() >= InvariantCheckLevel.WARN:
+                expect(_SWA_PEER_MAPPED, swa_indices > 0, msg="caller wants free_full")
+            self.swa_attn_allocator.free(swa_indices)
+            self._clear_mapping(free_index)
+            return
 
-        # No filtering here: every caller owns the host-side proof that this
-        # range's SWA is still live (`free_full` handles the rest), so the
-        # gathered mapping never holds the 0 padding slot. Masking would need a
-        # device-side count and stall the schedule stream.
-        swa_indices = self.full_to_swa_index_mapping[mapping_indices]
+        # One representative per page, at each page's offset 0. Only these are
+        # guaranteed mapped: a partially filled page owns full slots that never
+        # got an SWA peer, so reading the whole page would gather the padding
+        # slot. The stride keeps the shape host-known -- no torch.unique.
+        reps = free_index[::ps]
+        swa_reps = self.full_to_swa_index_mapping[reps]
         if resolve_level() >= InvariantCheckLevel.WARN:
-            expect(_SWA_PEER_MAPPED, swa_indices > 0, msg="caller wants free_full")
-        self.swa_attn_allocator.free(swa_indices)
+            expect(_SWA_PEER_MAPPED, swa_reps > 0, msg="caller wants free_full")
+        # Both sub-pools are same-page_size paged allocators written pairwise, so
+        # a full slot and its peer share an intra-page offset: floor-dividing an
+        # offset-0 representative yields the SWA page id directly.
+        self.swa_attn_allocator.free_page_reps(swa_reps)
+        # Clear whole pages: the unmapped positions already read 0, and building
+        # the span from the representatives keeps the shape host-known.
+        page_starts = (reps // ps) * ps
+        offsets = torch.arange(ps, dtype=reps.dtype, device=reps.device)
+        self._clear_mapping((page_starts[:, None] + offsets[None, :]).reshape(-1))
+
+    def _clear_mapping(self, full_indices: torch.Tensor) -> None:
         # index_fill_ passes the 0 as a kernel argument; `mapping[...] = 0` would
         # copy a host-resident scalar and stall the stream until it drains.
-        self.full_to_swa_index_mapping.index_fill_(
-            0, mapping_indices.to(torch.int64), 0
-        )
+        self.full_to_swa_index_mapping.index_fill_(0, full_indices.to(torch.int64), 0)
 
     def free_full(self, free_index: torch.Tensor):
         """Free the full-attention slots of a range whose SWA peers are already
@@ -414,22 +429,26 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_free_group = []
 
     def free_group_end(self):
-        super().free_group_end()
+        # Not super(): the base concatenates free_group, which puts a later
+        # range's page boundary at an arbitrary stride offset for free_swa.
+        self.is_not_in_free_group = True
+        free_group, self.free_group = self.free_group, []
+        if free_group:
+            # Full side takes one call so torch.unique dedups across entries.
+            self.full_attn_allocator.free(torch.cat(free_group))
+            for indices in free_group:
+                self.free_swa(indices)
         if self.swa_free_group:
             swa_free_group = self.swa_free_group
             self.swa_free_group = []
-            self.free_swa(torch.cat(swa_free_group))
+            # Replay each range on its own: concatenating them would put a
+            # later range's page boundary at an arbitrary stride offset.
+            for indices in swa_free_group:
+                self.free_swa(indices)
         if self.full_free_group:
             full_free_group = self.full_free_group
             self.full_free_group = []
             self.free_full(torch.cat(full_free_group))
-
-    def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
-        pages = torch.unique(indices // self.page_size)
-        page_offsets = torch.arange(
-            self.page_size, dtype=indices.dtype, device=indices.device
-        )
-        return (pages[:, None] * self.page_size + page_offsets[None, :]).reshape(-1)
 
     def resize(self, config) -> None:
         size_full = int(config.full_max_total_num_tokens)
