@@ -875,6 +875,8 @@ class Envs:
     SGLANG_NPU_FUSED_RMS_QUANT = EnvBool(False)
     # Overlap the K3 router gate/top-k with the quantized latent down projection.
     SGLANG_NPU_K3_FRONT_OVERLAP = EnvBool(False)
+    # Overlap K3 KDA's skinny b/f_a/f_b chain with the wide qkvg projection.
+    SGLANG_NPU_K3_BFA_OVERLAP = EnvBool(False)
     SGLANG_NPU_FUSED_KDA_VERIFY_GATES = EnvBool(False)
     SGLANG_NPU_FUSED_KDA_RAGGED_IO = EnvBool(False)
     SGLANG_NPU_FUSED_KDA_ONORM = EnvBool(False)

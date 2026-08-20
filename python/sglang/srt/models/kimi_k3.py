@@ -1830,6 +1830,17 @@ class KimiK3DeltaAttention(nn.Module):
                     prefix=f"{prefix}.g_b_proj",
                 )
 
+        # NPU keeps b_proj and f_a_proj separate because their tiny same-input
+        # GEMMs do not benefit from the CUDA weight merge. During graph replay
+        # the unchanged chain can still overlap the much wider qkvg projection.
+        self._npu_bfa_overlap = (
+            _is_npu
+            and envs.SGLANG_NPU_K3_BFA_OVERLAP.get()
+            and self.do_fuse_qkvbfg
+            and self.use_full_rank_gate
+            and self._bfa_alt_stream is not None
+        )
+
         self.dt_bias = nn.Parameter(
             torch.empty(divide(projection_size, self.attn_tp_size), dtype=torch.float32)
         )
@@ -2061,6 +2072,30 @@ class KimiK3DeltaAttention(nn.Module):
                 forget_gate = gemm(bfa[..., :n_fa], self._bfa_f_b_w)
                 beta = bfa[..., n_fa : n_fa + n_b]
             else:
+                if (
+                    self._npu_bfa_overlap
+                    and get_is_capture_mode()
+                    and 0 < hidden_states.shape[0] <= self._bfa_bs_limit
+                ):
+                    alt = self._bfa_alt_stream
+                    cur = torch.cuda.current_stream()
+                    alt.wait_stream(cur)
+                    # Main-stream kernel first: preserve one graph-internal
+                    # main chain while the skinny projections use the side.
+                    fused_states, _ = self.fused_qkvg_proj(hidden_states)
+                    qkv, g_proj_states = torch.split(
+                        fused_states, self.split_sizes, dim=-1
+                    )
+                    with torch.cuda.stream(alt):
+                        beta = self.b_proj(hidden_states)[0]
+                        forget_gate = self.f_b_proj(
+                            self.f_a_proj(hidden_states)[0]
+                        )[0]
+                    cur.wait_stream(alt)
+                    beta.record_stream(cur)
+                    forget_gate.record_stream(cur)
+                    return qkv, beta, forget_gate, g_proj_states
+
                 fused_states, _ = self.fused_qkvg_proj(hidden_states)
                 qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
                 beta = self.b_proj(hidden_states)[0]
