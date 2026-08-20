@@ -51,6 +51,14 @@ image_cache_init() {
   fi
   IMAGE_CACHE_DIR="${cache_host}/docker-images"
   echo "Image tarball cache: ${IMAGE_CACHE_DIR} (suffix '.tar${IMAGE_CACHE_EXT}')"
+  # Report the volume's actual capacity and what the cache costs on it. The
+  # seed/prune thresholds are only auditable against real numbers, and this is
+  # the one place that already runs on every job. `du` is scoped to the cache
+  # directory: the sibling HF weight cache is hundreds of GB and would take
+  # minutes to walk.
+  df -h "${cache_host}" 2>/dev/null | tail -n 1 \
+    | awk -v p="${cache_host}" '{printf "  volume %s: size=%s used=%s avail=%s (%s full)\n", p, $2, $3, $4, $5}'
+  echo "  cache holds $(find "${IMAGE_CACHE_DIR}" -maxdepth 1 -name '*.tar*' 2>/dev/null | wc -l) tarball(s), $(du -sh "${IMAGE_CACHE_DIR}" 2>/dev/null | cut -f1)"
   # Prune here rather than only before a seed: a job that hits the cache never
   # calls image_cache_save, so pruning from there alone would leave stale
   # tarballs behind whenever the image tag stops advancing.
