@@ -25,6 +25,10 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
     DeepEPNormalCombineInput,
 )
+from sglang.srt.layers.moe.token_dispatcher.moonep import (
+    get_moonep_expert_weight_layout,
+    run_moonep_bf16_expert,
+)
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     TopKOutput,
@@ -299,6 +303,26 @@ class DeepEPMoE(FusedMoE):
                 output = self.forward_cutlass_w4afp8_masked(dispatch_output)
             else:
                 assert False, "forward_deepgemm_masked is deprecated"
+        elif DispatchOutputChecker.format_is_moonep(dispatch_output):
+            weight_layout = get_moonep_expert_weight_layout(
+                self,
+                num_prefetch_slots=(
+                    int(dispatch_output.expert_ids.numel()) - self.num_experts
+                ),
+            )
+            self.dispatcher.prefetch_weight(
+                plan=dispatch_output.plan,
+                weight_layout=weight_layout,
+            )
+            return run_moonep_bf16_expert(
+                dispatch_output,
+                weight_layout,
+                activation=self.moe_runner_config.activation,
+            )
+        else:
+            raise NotImplementedError(
+                f"Unsupported DeepEPMoE dispatch format: {dispatch_output.format}"
+            )
 
         combine_input_wrapper = (
             DeepEPNormalCombineInput
@@ -354,6 +378,7 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     if (
         get_moe_a2a_backend().is_mori()
         or get_moe_a2a_backend().is_deepep()
+        or get_moe_a2a_backend().is_moonep()
         or get_moe_a2a_backend().is_mooncake()
         or get_moe_a2a_backend().is_nixl()
         or get_moe_a2a_backend().is_pplx()

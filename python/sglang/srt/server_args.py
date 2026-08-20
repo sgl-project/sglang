@@ -272,6 +272,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
 MOE_A2A_BACKEND_CHOICES = [
     "none",
     "deepep",
+    "moonep",
     "mooncake",
     "nixl",
     "mori",
@@ -2324,6 +2325,7 @@ class ServerArgs:
         Literal[
             "none",
             "deepep",
+            "moonep",
             "mooncake",
             "nixl",
             "mori",
@@ -6858,6 +6860,15 @@ class ServerArgs:
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
+
+        if a2a_backend == "moonep":
+            logger.warning(
+                "MoonEP MoE is enabled in experimental BF16 PoC mode. "
+                "Cuda graph is disabled while the eager MoonEP dispatch/"
+                "prefetch/compute/combine path is validated."
+            )
+            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
         if (
             self.moe_a2a_backend == "none" and is_npu()
