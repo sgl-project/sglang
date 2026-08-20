@@ -37,15 +37,21 @@ on:
           - mi300
           - mi325
       rocm_version:
-        description: 'ROCm container variant (rocm720 = ROCm 7.2.0, the PR default; rocm700 = ROCm 7.0.0)'
+        description: 'ROCm container variant (ROCm 7.2.0 by default)'
         required: false
         type: choice
         default: rocm720
         options:
           - rocm720
+          - rocm724
           - rocm700
       aiter_ref:
         description: 'Override AITER commit (optional, leave empty to use Dockerfile default)'
+        required: false
+        type: string
+        default: ''
+      amd_ci_image:
+        description: 'Override AMD CI Docker image (optional, e.g. rocm/sgl-dev:tag)'
         required: false
         type: string
         default: ''
@@ -67,12 +73,17 @@ on:
         type: string
         default: mi300
       rocm_version:
-        description: 'ROCm container variant (rocm720 = ROCm 7.2.0, the PR default; rocm700 = ROCm 7.0.0)'
+        description: 'ROCm container variant (ROCm 7.2.0 by default)'
         required: false
         type: string
         default: rocm720
       aiter_ref:
         description: 'Override AITER commit (optional, leave empty to use Dockerfile default)'
+        required: false
+        type: string
+        default: ''
+      amd_ci_image:
+        description: 'Override AMD CI Docker image (optional, e.g. rocm/sgl-dev:tag)'
         required: false
         type: string
         default: ''
@@ -84,6 +95,7 @@ on:
 
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
+  AMD_CI_IMAGE: ${{ inputs.amd_ci_image }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
@@ -145,7 +157,7 @@ jobs:
 
       - name: Start CI container
         # `inputs` is empty on pull_request events, so fall back explicitly to
-        # the ROCm 7.2 PR default. Reusable callers can still request ROCm 7.0.
+        # the ROCm 7.2 PR default. Reusable callers can request another variant.
         run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ inputs.rocm_version || 'rocm720' }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
