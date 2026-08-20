@@ -1014,10 +1014,6 @@ class Envs:
     # read by several call sites; do not use in new code.
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
-    # DeepEP v2 per-rank communication buffer capacity. This is not a model
-    # semantic token limit; large prefill/chunked-prefill workloads may need a
-    # larger value.
-    SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # Opt-in: build the classic deepep dispatcher's buffer as a DeepEP v2
     # ElasticBuffer (MoE-shape ctor, auto-QP sizing). Default keeps the
     # legacy Buffer path byte-identical.
@@ -1025,8 +1021,6 @@ class Envs:
     # Measurement-only wall-clock timing around the V2 dispatch/combine call
     # sites (synchronizes CUDA; never enable in a perf run).
     SGLANG_DEEPEP_V2_TIMING = EnvBool(False)
-    # 0 lets DeepEP v2 ElasticBuffer choose the communication SM count.
-    SGLANG_DEEPEP_V2_NUM_SMS = EnvInt(0)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default
