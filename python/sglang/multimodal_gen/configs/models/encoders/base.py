@@ -78,9 +78,9 @@ class EncoderConfig(ModelConfig):
 
     # Parallel folding: during the encoding stage the whole DiT replica is idle,
     # so TP-shard the encoder across those otherwise-unused GPUs instead of
-    # running it on a single rank. None = replicated, else the group to fold
-    # over ("sp"|"world"); resolved by finalize_encoder_folding.
-    parallel_folding_mode: Literal["sp", "world"] | None = None
+    # leaving it on the DiT TP group. None keeps that TP group; the other modes
+    # override it with a wider group selected by finalize_encoder_folding.
+    parallel_folding_mode: Literal["sp", "world", "replica"] | None = None
 
 
 @dataclass
