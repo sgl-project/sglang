@@ -1,4 +1,5 @@
 import unittest
+from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -12,6 +13,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -31,6 +33,14 @@ class FakeReceiver:
 
 class TestDecodeQueueCleanup(CustomTestCase):
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
+        # resume_retracted_reqs reads the retraction backend off the disagg
+        # bag, so the case publishes a config instead of injecting one.
+        override = get_context().override_server_args(
+            disaggregation_decode_retraction_backup="cpu_tensor"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
         page_size = 128
         fill_len = 574
         physical_tokens_per_req = 5 * page_size
@@ -42,6 +52,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
                 origin_input_ids=[0] * fill_len,
                 output_ids=[],
                 is_retracted=True,
+                retraction_backup=None,
                 load_kv_cache=MagicMock(),
             )
             for i in range(4)
@@ -52,6 +63,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.num_reserved_decode_tokens = 0
         queue.req_to_token_pool = SimpleNamespace(available_size=lambda: len(reqs))
         queue.token_to_kv_pool_allocator = SimpleNamespace(page_size=page_size)
+        queue.tree_cache = MagicMock()
         queue.scheduler = SimpleNamespace(
             sliding_window_size=2047,
             server_args=SimpleNamespace(disable_radix_cache=True),
@@ -178,6 +190,51 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(ready, {})
         self.assertEqual(remaining, [])
 
+    def test_prefetches_prefill_dp_rank_query(self):
+        addr = "127.0.0.1:11500"
+        executor = MagicMock()
+        future = Future()
+        future.set_result({"7": 1})
+        executor.submit.return_value = future
+
+        def decode_req(room):
+            return SimpleNamespace(
+                req=SimpleNamespace(
+                    bootstrap_host="127.0.0.1",
+                    bootstrap_port=11500,
+                    bootstrap_room=room,
+                ),
+                kv_receiver=MagicMock(),
+            )
+
+        first = decode_req(7)
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pending_reqs = [first]
+        queue._prefill_dp_rank_queries = {}
+        queue.kv_manager = SimpleNamespace(
+            prefill_info_table={addr: object()},
+            _ensure_prefill_recompute_executor=lambda: executor,
+        )
+        queue._resolve_prefill_dp_rank = MagicMock(return_value=None)
+        queue._ensure_prefill_info = lambda groups: (groups, [])
+
+        queue.prefetch_prefill_dp_rank_queries()
+        tail = decode_req(8)
+        queue.pending_reqs.append(tail)
+        with patch(
+            "sglang.srt.disaggregation.decode."
+            "CommonKVReceiver.query_prefill_dp_ranks",
+            return_value={"8": 2},
+        ) as query:
+            queue._resolve_pending_reqs()
+
+        _, called_addr, called_rooms = executor.submit.call_args.args
+        self.assertEqual((called_addr, called_rooms), (addr, [7]))
+        query.assert_called_once_with(addr, [8])
+        first.kv_receiver.init.assert_called_once_with(1)
+        tail.kv_receiver.init.assert_called_once_with(2)
+        self.assertEqual(queue.pending_reqs, [])
+
     @patch("sglang.srt.disaggregation.decode.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
     @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
@@ -200,6 +257,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
         queue.queue = [decode_req]
         queue.enable_staging = False
+        queue.enable_deferred_kv_release = False
         queue.gloo_group = MagicMock()
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.tp_rank = 0
