@@ -322,12 +322,26 @@ class UnifiedCacheLinkerWrapper:
         server_args: ServerArgs,
         params: CacheInitParams,
     ):
-        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
-            MooncakeDirectLinker,
-        )
+        backend = server_args.unified_cache_external_linker_backend
+        if backend == "mooncake":
+            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+                MooncakeDirectLinker,
+            )
+
+            linker_cls = MooncakeDirectLinker
+        elif backend == "mori":
+            from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
+                UMBPDirectLinker,
+            )
+
+            linker_cls = UMBPDirectLinker
+        else:
+            raise ValueError(
+                f"Unknown unified cache external linker backend: {backend!r}"
+            )
 
         self.cache = cache
-        self.cache_linker: UnifiedCacheLinker = MooncakeDirectLinker(
+        self.cache_linker: UnifiedCacheLinker = linker_cls(
             server_args,
             params,
             components=set(cache.components),
