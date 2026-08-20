@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 import torch
 from torch import nn
 
+from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
@@ -198,12 +200,9 @@ class QuantizationConfig(ABC):
 
         # If user specified generic "modelopt", auto-detect the specific method
         if user_quant == "modelopt":
-            if quant_algo == "MXFP8":
-                return "mxfp8"
-            elif quant_algo == "FP8":
-                return "modelopt_fp8"
-            elif "NVFP4" in quant_algo or "FP4" in quant_algo:
-                return "modelopt_fp4"
+            canonical_method = canonicalize_modelopt_quant_algo(quant_algo)
+            if canonical_method is not None:
+                return canonical_method
 
         # The hf_quant_config may be a parsed quant config, so we need to check the
         # quant_method.
