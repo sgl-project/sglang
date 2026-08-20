@@ -285,8 +285,11 @@ def main() -> int:
         "--graph-nodes",
         type=int,
         default=64,
-        help="dispatches per graph; ROCm 7.2.0 traces a 4-node graph correctly and "
-        "only starts dropping events on larger ones, so keep this well above that",
+        help="dispatches per graph. 64 is the calibrated value: ROCm 7.2.0 traces a "
+        "4-node graph completely and only starts dropping around 16, while 7.2.4 is "
+        "complete at 64 across repeated runs. Raising it much further is not a "
+        "stricter test -- 7.2.4 has been seen dropping events at 256 -- so a failure "
+        "there does not mean the same thing",
     )
     parser.add_argument(
         "--timeout",
