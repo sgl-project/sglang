@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::{RetryConfig, SamplingPins, DEFAULT_RETRY_ITL_REL_FACTOR};
+use crate::config::{
+    ConflictPolicy, ParamSpec, RetryConfig, SamplingField, SamplingOverrides,
+    DEFAULT_RETRY_ITL_REL_FACTOR,
+};
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::{request_tokens_for, RequestTokens, SelectionContext};
@@ -144,21 +147,19 @@ struct RequestProbe {
     max_tokens: Option<serde_json::Value>,
     #[serde(default)]
     max_completion_tokens: Option<serde_json::Value>,
-    /// Probed only to decide whether a configured `--default-top-k` /
-    /// `--default-top-p` should be injected: a present value means the client
-    /// set it, so the default is skipped. Raw `Value` (like `max_tokens`) so a
-    /// mistyped sampling value doesn't fail the probe — the engine validates
-    /// the schema. `null` deserializes to `None` (same as absent).
+    /// Raw `Value` (like `max_tokens`) so a mistyped sampling value doesn't
+    /// fail the probe — the engine validates the schema. `null` deserializes
+    /// to `None` (same as absent).
     #[serde(default)]
     top_k: Option<serde_json::Value>,
-    /// `top_p` serves double duty: the `--default-top-p` skip decision (like
-    /// `top_k`) and the `--pin-top-p` immutability check.
     #[serde(default)]
     top_p: Option<serde_json::Value>,
-    /// Probed only for the `--pin-*` immutability checks
-    /// ([`enforce_sampling_pins`]): a numeric value differing from the pin is
-    /// rejected with 400. Raw `Value`s for the same lax-schema reason as
-    /// `top_k`. `null` deserializes to `None` (same as absent).
+    /// Probed only for `--override-sampling-params`
+    /// ([`apply_sampling_overrides`]): present means the client set the field,
+    /// which decides both whether the configured value is injected and —
+    /// under `--sampling-param-conflict reject` — whether a differing value
+    /// is 400'd. Raw `Value`s for the same lax-schema reason as `top_k`.
+    /// `null` deserializes to `None` (same as absent).
     #[serde(default)]
     temperature: Option<serde_json::Value>,
     #[serde(default)]
@@ -167,6 +168,22 @@ struct RequestProbe {
     presence_penalty: Option<serde_json::Value>,
     #[serde(default)]
     n: Option<serde_json::Value>,
+}
+
+impl RequestProbe {
+    /// The raw probed value for one sampling parameter, so
+    /// [`apply_sampling_overrides`] can loop over whatever the operator
+    /// configured instead of repeating a per-field ladder.
+    fn sampling_field(&self, field: SamplingField) -> Option<&serde_json::Value> {
+        match field {
+            SamplingField::Temperature => self.temperature.as_ref(),
+            SamplingField::TopP => self.top_p.as_ref(),
+            SamplingField::TopK => self.top_k.as_ref(),
+            SamplingField::FrequencyPenalty => self.frequency_penalty.as_ref(),
+            SamplingField::PresencePenalty => self.presence_penalty.as_ref(),
+            SamplingField::N => self.n.as_ref(),
+        }
+    }
 }
 
 /// RAII guard that records `sgl_router_request_duration_seconds` when
@@ -252,16 +269,12 @@ async fn chat_completions_inner(
     // engine's full context window fills.
     let inject_max_tokens = output_budget_action(ctx.config.model.max_output_tokens, &probe)?;
 
-    // Sampling defaults: inject the configured `--default-top-k` / `--default-top-p`
-    // only when the request omitted the field, so a client value always wins.
-    let inject_top_k = default_when_absent(ctx.config.model.default_top_k, &probe.top_k);
-    let inject_top_p = default_when_absent(ctx.config.model.default_top_p, &probe.top_p);
-
-    // Pinned sampling params (`--pin-*`, parameter immutability): a numeric
-    // value differing from the pin is a 400 here — before admission, like the
-    // output-budget check above — and exact pins for fields the request
-    // omitted come back as the inject-set for the forwarded body.
-    let inject_pins = enforce_sampling_pins(&ctx.config.model.pins, &probe)?;
+    // Fleet-wide sampling overrides (`--override-sampling-params`): under
+    // `reject` a numeric value differing from the configured one is a 400
+    // here — before admission, like the output-budget check above — and
+    // either way the configured values for fields the request omitted come
+    // back as the inject-set for the forwarded body.
+    let inject_sampling = apply_sampling_overrides(&ctx.config.model.sampling_overrides, &probe)?;
 
     // PD pool isolation: for PD-mode deployments, prefill traffic
     // selects from the prefill pool only. Plain-mode deployments fall
@@ -836,9 +849,7 @@ async fn chat_completions_inner(
         bootstrap.as_ref(),
         rid_to_inject,
         inject_max_tokens,
-        inject_top_k,
-        inject_top_p,
-        inject_pins,
+        &inject_sampling,
     )?;
     let at_post_build = start.elapsed();
 
@@ -1584,17 +1595,13 @@ fn build_outgoing_body(
     bootstrap: Option<&BootstrapFields>,
     rid: Option<&str>,
     max_tokens: Option<u64>,
-    top_k: Option<i64>,
-    top_p: Option<f64>,
-    pins: SamplingPins,
+    sampling: &[(SamplingField, serde_json::Number)],
 ) -> Result<Bytes, ApiError> {
     if input_ids.is_none()
         && bootstrap.is_none()
         && rid.is_none()
         && max_tokens.is_none()
-        && top_k.is_none()
-        && top_p.is_none()
-        && pins.is_empty()
+        && sampling.is_empty()
     {
         // Nothing to inject — forward the original bytes (cheap Arc clone).
         return Ok(body.clone());
@@ -1635,38 +1642,15 @@ fn build_outgoing_body(
             serde_json::Value::Number(cap.into()),
         );
     }
-    if let Some(k) = top_k {
-        // Fill-if-absent (the caller decided via `default_when_absent`), so a
-        // client-supplied `top_k` is never overridden.
-        obj.insert("top_k".to_string(), serde_json::Value::Number(k.into()));
-    }
-    if let Some(p) = top_p {
-        // f64 -> JSON number. `from_f64` only returns None for NaN/inf, which
-        // the CLI validation already rules out; skip defensively rather than
-        // emit invalid JSON if it somehow isn't finite.
-        if let Some(n) = serde_json::Number::from_f64(p) {
-            obj.insert("top_p".to_string(), serde_json::Value::Number(n));
-        }
-    }
-    // Pinned sampling params: the caller passes the inject-set from
-    // `enforce_sampling_pins` — pins for fields the request omitted, after
-    // differing values were already rejected with 400 — so writing them here
-    // never masks a client value. Same defensive `from_f64` skip as `top_p`;
-    // CLI validation already excludes NaN/inf.
-    for (field, pinned) in [
-        ("temperature", pins.temperature),
-        ("top_p", pins.top_p),
-        ("frequency_penalty", pins.frequency_penalty),
-        ("presence_penalty", pins.presence_penalty),
-    ] {
-        if let Some(v) = pinned {
-            if let Some(n) = serde_json::Number::from_f64(v) {
-                obj.insert(field.to_string(), serde_json::Value::Number(n));
-            }
-        }
-    }
-    if let Some(n) = pins.n {
-        obj.insert("n".to_string(), serde_json::Value::Number(n.into()));
+    // Fleet-wide sampling overrides: the caller passes the inject-set from
+    // `apply_sampling_overrides` — configured values for fields the request
+    // omitted — so writing them here never masks a client value, in either
+    // conflict mode.
+    for (field, value) in sampling {
+        obj.insert(
+            field.wire_name().to_string(),
+            serde_json::Value::Number(value.clone()),
+        );
     }
     if let Some(ids) = input_ids {
         obj.insert(
@@ -2051,6 +2035,66 @@ fn request_is_multimodal(value: &serde_json::Value) -> bool {
         })
 }
 
+/// Apply the fleet-wide sampling contract (`--override-sampling-params` /
+/// `--sampling-param-conflict`) to one request, before admission.
+///
+/// Returns the inject-set: the configured value for every exact-valued
+/// parameter the request OMITTED, which [`build_outgoing_body`] writes into
+/// the forwarded body so the engine's own defaults can't drift from what the
+/// operator declared. A band ([`ParamSpec::Range`]) names no single value, so
+/// it never injects.
+///
+/// For a parameter the request DID send:
+///   * [`ConflictPolicy::Allow`] forwards the client value untouched, which
+///     is why the mode check comes before any comparison;
+///   * [`ConflictPolicy::Reject`] 400s a numeric value that differs from the
+///     configured one (or falls outside the band) — the Moonshot-style
+///     immutability contract, never a silent rewrite;
+///   * a NON-numeric value is nobody's business but the engine's, which is
+///     authoritative for the request schema and produces the better message
+///     — the same [`lax_number`] philosophy as the output-budget check.
+fn apply_sampling_overrides(
+    overrides: &SamplingOverrides,
+    probe: &RequestProbe,
+) -> Result<Vec<(SamplingField, serde_json::Number)>, ApiError> {
+    let mut inject = Vec::new();
+    for (&field, spec) in &overrides.params {
+        let name = field.wire_name();
+        let Some(requested) = probe.sampling_field(field) else {
+            // Omitted: inject an exact value, leave a band to the engine's
+            // own default.
+            if let ParamSpec::Exact(v) = spec {
+                inject.push((field, v.clone()));
+            }
+            continue;
+        };
+        if overrides.conflict == ConflictPolicy::Allow {
+            continue;
+        }
+        let Some(got) = lax_number(requested) else {
+            continue;
+        };
+        match spec {
+            ParamSpec::Exact(want) => {
+                if Some(got) != want.as_f64() {
+                    return Err(ApiError::BadRequest(format!(
+                        "{name} is immutable for this model: got {got}, expected {want} \
+                         (or omit the field)"
+                    )));
+                }
+            }
+            &ParamSpec::Range { lo, hi } => {
+                if !(lo..=hi).contains(&got) {
+                    return Err(ApiError::BadRequest(format!(
+                        "{name} must be between {lo} and {hi} for this model: got {got}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(inject)
+}
+
 /// Resolve the per-model output-token contract (`--max-output-tokens`)
 /// against what the request asked for.
 ///
@@ -2073,83 +2117,6 @@ fn request_is_multimodal(value: &serde_json::Value) -> bool {
 /// (non-numeric string, bool, …) neither rejects nor injects: it forwards
 /// untouched so the engine — authoritative for the request schema —
 /// produces its own 4xx with the better message.
-/// The sampling default to inject: the configured value, but only when the
-/// request omitted the field. `requested` is the probe's raw `Option<Value>`;
-/// `None` means absent or explicit `null`, in which case the default applies.
-/// A present client value returns `None` (inject nothing), so it always wins.
-fn default_when_absent<T: Copy>(
-    configured: Option<T>,
-    requested: &Option<serde_json::Value>,
-) -> Option<T> {
-    configured.filter(|_| requested.is_none())
-}
-
-/// One pinned parameter's admission decision (see [`enforce_sampling_pins`]):
-/// absent → `Ok(Some(pin))` (inject the pin), numeric and equal → `Ok(None)`
-/// (forward untouched), numeric and different → 400, non-numeric →
-/// `Ok(None)` (forward untouched; the engine — authoritative for the request
-/// schema — produces its own 4xx with the better message, the same
-/// [`lax_number`] philosophy as the output-budget check).
-fn pin_action(
-    field: &'static str,
-    pinned: Option<f64>,
-    requested: &Option<serde_json::Value>,
-) -> Result<Option<f64>, ApiError> {
-    let Some(pin) = pinned else { return Ok(None) };
-    match requested {
-        None => Ok(Some(pin)),
-        Some(v) => match lax_number(v) {
-            Some(x) if x == pin => Ok(None),
-            Some(x) => Err(ApiError::BadRequest(format!(
-                "{field} is immutable for this model: got {x}, expected {pin} \
-                 (or omit the field)"
-            ))),
-            None => Ok(None),
-        },
-    }
-}
-
-/// Enforce the `--pin-*` sampling immutability contract (Moonshot-style: a
-/// pinned parameter may be omitted or sent at exactly the pinned value;
-/// anything else is rejected with 400, never silently rewritten — see
-/// [`crate::config::SamplingPins`]). Returns the inject-set: exact pins for
-/// the fields the request omitted, which [`build_outgoing_body`] writes into
-/// the forwarded body so the engine's own defaults can't drift from the
-/// contract. `temperature_range` only validates — a band names no single
-/// value to inject.
-fn enforce_sampling_pins(
-    pins: &SamplingPins,
-    probe: &RequestProbe,
-) -> Result<SamplingPins, ApiError> {
-    if let (Some((lo, hi)), Some(v)) = (pins.temperature_range, &probe.temperature) {
-        if let Some(x) = lax_number(v) {
-            if !(lo..=hi).contains(&x) {
-                return Err(ApiError::BadRequest(format!(
-                    "temperature must be between {lo} and {hi} for this model: got {x}"
-                )));
-            }
-        }
-    }
-    Ok(SamplingPins {
-        temperature: pin_action("temperature", pins.temperature, &probe.temperature)?,
-        temperature_range: None,
-        top_p: pin_action("top_p", pins.top_p, &probe.top_p)?,
-        frequency_penalty: pin_action(
-            "frequency_penalty",
-            pins.frequency_penalty,
-            &probe.frequency_penalty,
-        )?,
-        presence_penalty: pin_action(
-            "presence_penalty",
-            pins.presence_penalty,
-            &probe.presence_penalty,
-        )?,
-        // n rides the f64 comparison: exact for any plausible choice count
-        // (integers are exact in f64 up to 2^53).
-        n: pin_action("n", pins.n.map(|n| n as f64), &probe.n)?.map(|f| f as u64),
-    })
-}
-
 fn output_budget_action(
     cap: Option<std::num::NonZeroU64>,
     probe: &RequestProbe,
@@ -2552,18 +2519,9 @@ mod tests {
             port: None,
             room: 42,
         };
-        let injected = build_outgoing_body(
-            &body,
-            Some(value),
-            None,
-            Some(&bootstrap),
-            None,
-            None,
-            None,
-            None,
-            SamplingPins::default(),
-        )
-        .unwrap();
+        let injected =
+            build_outgoing_body(&body, Some(value), None, Some(&bootstrap), None, None, &[])
+                .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&injected).unwrap();
         assert_eq!(parsed.get("bootstrap_port"), Some(&serde_json::Value::Null));
         assert_eq!(
@@ -2800,18 +2758,8 @@ mod tests {
             Bytes::from_static(br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let ids = [1u32, 2, 3];
-        let out = build_outgoing_body(
-            &body,
-            Some(value),
-            Some(&ids),
-            None,
-            None,
-            None,
-            None,
-            None,
-            SamplingPins::default(),
-        )
-        .unwrap();
+        let out =
+            build_outgoing_body(&body, Some(value), Some(&ids), None, None, None, &[]).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([1, 2, 3])));
         assert!(
@@ -2826,18 +2774,7 @@ mod tests {
     fn build_outgoing_body_no_injection_returns_original_bytes() {
         let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let out = build_outgoing_body(
-            &body,
-            Some(value),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            SamplingPins::default(),
-        )
-        .unwrap();
+        let out = build_outgoing_body(&body, Some(value), None, None, None, None, &[]).unwrap();
         assert_eq!(
             out, body,
             "no injection must forward the original bytes unchanged"
@@ -2850,105 +2787,62 @@ mod tests {
     #[test]
     fn build_outgoing_body_injects_default_max_tokens() {
         let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
-        let out = build_outgoing_body(
-            &body,
-            None,
-            None,
-            None,
-            None,
-            Some(131072),
-            None,
-            None,
-            SamplingPins::default(),
-        )
-        .unwrap();
+        let out = build_outgoing_body(&body, None, None, None, None, Some(131072), &[]).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed.get("max_tokens"), Some(&serde_json::json!(131072)));
         assert!(parsed.get("messages").is_some());
     }
 
-    #[test]
-    fn build_outgoing_body_injects_default_top_k_and_top_p() {
-        let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
-        let out = build_outgoing_body(
-            &body,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(1000),
-            Some(0.95),
-            SamplingPins::default(),
-        )
-        .unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(parsed.get("top_k"), Some(&serde_json::json!(1000)));
-        assert_eq!(parsed.get("top_p"), Some(&serde_json::json!(0.95)));
-        assert!(parsed.get("messages").is_some());
+    /// Build a [`SamplingOverrides`] from `(wire name, value)` pairs, the way
+    /// `--override-sampling-params` would.
+    fn overrides_of(conflict: ConflictPolicy, entries: &[(&str, f64)]) -> SamplingOverrides {
+        SamplingOverrides {
+            params: entries
+                .iter()
+                .map(|&(name, v)| {
+                    let field = SamplingField::from_wire_name(name).expect("known field");
+                    let n = if field.is_integral() {
+                        serde_json::Number::from(v as i64)
+                    } else {
+                        serde_json::Number::from_f64(v).expect("finite")
+                    };
+                    (field, ParamSpec::Exact(n))
+                })
+                .collect(),
+            conflict,
+        }
     }
 
-    /// Sampling defaults and forwarded `input_ids` must survive the same
-    /// injection. This is the Kimi-K3 / DeepSeek-V4 shape: those are the models
-    /// whose ingress render is forwarded as `input_ids`, so an injection that
-    /// handled only one of the two would leave the fleet-wide sampling defaults
-    /// silently unapplied on exactly the traffic that routes through an encoder.
-    #[test]
-    fn build_outgoing_body_injects_sampling_defaults_alongside_input_ids() {
-        let body =
-            Bytes::from_static(br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#);
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let ids = [1u32, 2, 3];
-        let out = build_outgoing_body(
-            &body,
-            Some(value),
-            Some(&ids),
-            None,
-            None,
-            None,
-            Some(1000),
-            Some(0.95),
-            SamplingPins::default(),
-        )
-        .unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([1, 2, 3])));
-        assert_eq!(parsed.get("top_k"), Some(&serde_json::json!(1000)));
-        assert_eq!(parsed.get("top_p"), Some(&serde_json::json!(0.95)));
-        assert!(parsed.get("messages").is_some());
-    }
-
-    /// The inject-set from `enforce_sampling_pins` (pins for fields the
-    /// request omitted) lands in the forwarded body, and rides the same
-    /// `build_outgoing_body` serialize as the forwarded input_ids — so
+    /// The inject-set from `apply_sampling_overrides` (configured values for
+    /// fields the request omitted) lands in the forwarded body, and rides the
+    /// same `build_outgoing_body` serialize as the forwarded input_ids — so
     /// chat-encoder traffic (Kimi-K3, DSV4) gets the contract too.
     #[test]
-    fn build_outgoing_body_injects_pins_alongside_input_ids() {
+    fn build_outgoing_body_injects_sampling_overrides_alongside_input_ids() {
         let body =
             Bytes::from_static(br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let ids = [1u32, 2, 3];
-        let pins = SamplingPins {
-            top_p: Some(0.95),
-            frequency_penalty: Some(0.0),
-            presence_penalty: Some(0.0),
-            n: Some(1),
-            ..Default::default()
-        };
-        let out = build_outgoing_body(
-            &body,
-            Some(value),
-            Some(&ids),
-            None,
-            None,
-            None,
-            None,
-            None,
-            pins,
+        let overrides = overrides_of(
+            ConflictPolicy::Reject,
+            &[
+                ("top_p", 0.95),
+                ("top_k", 1000.0),
+                ("frequency_penalty", 0.0),
+                ("presence_penalty", 0.0),
+                ("n", 1.0),
+            ],
+        );
+        let inject = apply_sampling_overrides(
+            &overrides,
+            &probe_of(r#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#),
         )
         .unwrap();
+        let out =
+            build_outgoing_body(&body, Some(value), Some(&ids), None, None, None, &inject).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed.get("top_p"), Some(&serde_json::json!(0.95)));
+        assert_eq!(parsed.get("top_k"), Some(&serde_json::json!(1000)));
         assert_eq!(
             parsed.get("frequency_penalty"),
             Some(&serde_json::json!(0.0))
@@ -2957,41 +2851,53 @@ mod tests {
             parsed.get("presence_penalty"),
             Some(&serde_json::json!(0.0))
         );
+        // `n` is engine-typed `int`: the injected literal must not be `1.0`.
         assert_eq!(parsed.get("n"), Some(&serde_json::json!(1)));
         assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([1, 2, 3])));
         assert!(parsed.get("messages").is_some());
     }
 
     /// The Kimi-Vendor-Verifier `tests/params` contract, end to end at the
-    /// decision level: omitted → inject the pin; equal to the pin (each
-    /// mode's documented default) → pass untouched; any other numeric value
-    /// → 400; non-numeric garbage → forwarded for the engine's own schema
-    /// 400. Temperature is a band for K3 ([0, 1]): inside passes, outside
-    /// 400s, and nothing is ever injected for it.
+    /// decision level under `reject`: omitted → inject the configured value;
+    /// equal to it (each mode's documented default) → pass untouched; any
+    /// other numeric value → 400; non-numeric garbage → forwarded for the
+    /// engine's own schema 400. Temperature is a band for K3 ([0, 1]): inside
+    /// passes, outside 400s, and nothing is ever injected for it.
     #[test]
-    fn enforce_sampling_pins_implements_the_verifier_contract() {
-        let pins = SamplingPins {
-            temperature_range: Some((0.0, 1.0)),
-            top_p: Some(0.95),
-            frequency_penalty: Some(0.0),
-            presence_penalty: Some(0.0),
-            n: Some(1),
-            ..Default::default()
-        };
+    fn reject_mode_implements_the_verifier_contract() {
+        let mut overrides = overrides_of(
+            ConflictPolicy::Reject,
+            &[
+                ("top_p", 0.95),
+                ("frequency_penalty", 0.0),
+                ("presence_penalty", 0.0),
+                ("n", 1.0),
+            ],
+        );
+        overrides.params.insert(
+            SamplingField::Temperature,
+            ParamSpec::Range { lo: 0.0, hi: 1.0 },
+        );
 
-        // Omitted params: accepted, exact pins injected, band injects nothing.
+        // Omitted params: accepted, exact values injected, band injects nothing.
         let p = probe_of(r#"{"model":"x","messages":[]}"#);
-        let inject = enforce_sampling_pins(&pins, &p).unwrap();
-        assert_eq!(inject.temperature, None);
-        assert_eq!(inject.temperature_range, None);
-        assert_eq!(inject.top_p, Some(0.95));
-        assert_eq!(inject.frequency_penalty, Some(0.0));
-        assert_eq!(inject.presence_penalty, Some(0.0));
-        assert_eq!(inject.n, Some(1));
+        let inject = apply_sampling_overrides(&overrides, &p).unwrap();
+        assert_eq!(
+            inject
+                .iter()
+                .map(|(f, v)| (f.wire_name(), v.to_string()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("top_p", "0.95".to_string()),
+                ("frequency_penalty", "0.0".to_string()),
+                ("presence_penalty", "0.0".to_string()),
+                ("n", "1".to_string()),
+            ]
+        );
 
         // The verifier's accepted defaults (thinking and non-thinking):
         // temperature 0.0 / 0.6 / 1.0 all inside the band, the rest equal to
-        // their pins. Nothing injected for fields the client already sent.
+        // their configured values.
         for accepted in [
             r#"{"model":"x","messages":[],"temperature":0.0}"#,
             r#"{"model":"x","messages":[],"temperature":0.6}"#,
@@ -3002,12 +2908,14 @@ mod tests {
             r#"{"model":"x","messages":[],"n":1}"#,
         ] {
             let p = probe_of(accepted);
-            let inject = enforce_sampling_pins(&pins, &p)
+            apply_sampling_overrides(&overrides, &p)
                 .unwrap_or_else(|e| panic!("{accepted} must be accepted: {e:?}"));
-            assert_eq!(inject.temperature_range, None);
         }
+
+        // Nothing is injected for a field the client already sent.
         let p = probe_of(r#"{"model":"x","messages":[],"top_p":0.95}"#);
-        assert_eq!(enforce_sampling_pins(&pins, &p).unwrap().top_p, None);
+        let inject = apply_sampling_overrides(&overrides, &p).unwrap();
+        assert!(!inject.iter().any(|(f, _)| *f == SamplingField::TopP));
 
         // The verifier's wrong values: every one is a router 400.
         for rejected in [
@@ -3020,7 +2928,7 @@ mod tests {
             r#"{"model":"x","messages":[],"n":2}"#,
         ] {
             let p = probe_of(rejected);
-            let err = enforce_sampling_pins(&pins, &p)
+            let err = apply_sampling_overrides(&overrides, &p)
                 .expect_err(&format!("{rejected} must be rejected"));
             assert!(
                 matches!(err, ApiError::BadRequest(_)),
@@ -3031,50 +2939,87 @@ mod tests {
         // Non-numeric garbage is not ours to judge: forwarded untouched (no
         // injection either), the engine's schema validation owns the 400.
         let p = probe_of(r#"{"model":"x","messages":[],"top_p":"hot","n":true}"#);
-        let inject = enforce_sampling_pins(&pins, &p).unwrap();
-        assert_eq!(inject.top_p, None);
-        assert_eq!(inject.n, None);
+        let inject = apply_sampling_overrides(&overrides, &p).unwrap();
+        assert!(inject
+            .iter()
+            .all(|(f, _)| !matches!(f, SamplingField::TopP | SamplingField::N)));
 
         // Numeric strings coerce the way the engine's pydantic lax mode
-        // does: "0.95" equals the pin, "0.8" differs and 400s here.
+        // does: "0.95" equals the configured value, "0.8" differs and 400s here.
         let p = probe_of(r#"{"model":"x","messages":[],"top_p":"0.95"}"#);
-        assert!(enforce_sampling_pins(&pins, &p).is_ok());
+        assert!(apply_sampling_overrides(&overrides, &p).is_ok());
         let p = probe_of(r#"{"model":"x","messages":[],"top_p":"0.8"}"#);
-        assert!(enforce_sampling_pins(&pins, &p).is_err());
+        assert!(apply_sampling_overrides(&overrides, &p).is_err());
 
-        // An exact temperature pin (no band) rejects differing values and
-        // injects when absent, like every other pin.
-        let exact = SamplingPins {
-            temperature: Some(1.0),
-            ..Default::default()
-        };
+        // An exact temperature value (no band) rejects differing values and
+        // injects when absent, like every other parameter.
+        let exact = overrides_of(ConflictPolicy::Reject, &[("temperature", 1.0)]);
         let p = probe_of(r#"{"model":"x","messages":[],"temperature":0.6}"#);
-        assert!(enforce_sampling_pins(&exact, &p).is_err());
+        assert!(apply_sampling_overrides(&exact, &p).is_err());
         let p = probe_of(r#"{"model":"x","messages":[]}"#);
         assert_eq!(
-            enforce_sampling_pins(&exact, &p).unwrap().temperature,
-            Some(1.0)
+            apply_sampling_overrides(&exact, &p).unwrap(),
+            vec![(
+                SamplingField::Temperature,
+                serde_json::Number::from_f64(1.0).unwrap()
+            )]
         );
     }
 
-    /// `default_when_absent` fills the configured default only when the request
-    /// omitted the field (absent OR explicit `null`); a client value always wins.
+    /// `allow` mode keeps the fill-when-absent half of the contract and drops
+    /// the rejection half: a client value — right, wrong or garbage — is
+    /// forwarded untouched, so the configured values are fleet-wide defaults.
     #[test]
-    fn default_when_absent_fills_only_when_missing() {
-        // absent -> default applies
+    fn allow_mode_never_rejects_and_never_masks_a_client_value() {
+        let overrides = overrides_of(
+            ConflictPolicy::Allow,
+            &[("temperature", 1.0), ("top_p", 0.95), ("n", 1.0)],
+        );
+
+        // Omitted -> injected, exactly as under `reject`.
         let p = probe_of(r#"{"model":"x","messages":[]}"#);
-        assert_eq!(default_when_absent(Some(1000_i64), &p.top_k), Some(1000));
-        assert_eq!(default_when_absent(Some(0.95_f64), &p.top_p), Some(0.95));
-        // explicit null is treated as absent -> default still applies
-        let p = probe_of(r#"{"model":"x","messages":[],"top_k":null,"top_p":null}"#);
-        assert_eq!(default_when_absent(Some(1000_i64), &p.top_k), Some(1000));
-        // client value present -> default skipped (client wins)
-        let p = probe_of(r#"{"model":"x","messages":[],"top_k":5,"top_p":0.1}"#);
-        assert_eq!(default_when_absent(Some(1000_i64), &p.top_k), None);
-        assert_eq!(default_when_absent(Some(0.95_f64), &p.top_p), None);
-        // no configured default -> nothing injected regardless of the request
-        let p = probe_of(r#"{"model":"x","messages":[]}"#);
-        assert_eq!(default_when_absent(None::<i64>, &p.top_k), None);
+        assert_eq!(
+            apply_sampling_overrides(&overrides, &p)
+                .unwrap()
+                .iter()
+                .map(|(f, _)| f.wire_name())
+                .collect::<Vec<_>>(),
+            vec!["temperature", "top_p", "n"]
+        );
+
+        // Every value that `reject` would 400 is accepted here, and nothing
+        // is injected over it — the client's value reaches the engine.
+        let p = probe_of(r#"{"model":"x","messages":[],"temperature":0.6,"top_p":0.8,"n":4}"#);
+        assert_eq!(apply_sampling_overrides(&overrides, &p).unwrap(), vec![]);
+
+        // Partial overlap: the client set temperature, so only the untouched
+        // parameters are filled in.
+        let p = probe_of(r#"{"model":"x","messages":[],"temperature":0.6}"#);
+        assert_eq!(
+            apply_sampling_overrides(&overrides, &p)
+                .unwrap()
+                .iter()
+                .map(|(f, _)| f.wire_name())
+                .collect::<Vec<_>>(),
+            vec!["top_p", "n"]
+        );
+    }
+
+    /// An explicit `null` is absent for the engine, so it is absent here too:
+    /// the configured value is injected rather than the field being read as a
+    /// client-supplied conflict.
+    #[test]
+    fn explicit_null_counts_as_omitted() {
+        let overrides = overrides_of(ConflictPolicy::Reject, &[("temperature", 1.0)]);
+        let p = probe_of(r#"{"model":"x","messages":[],"temperature":null}"#);
+        assert_eq!(
+            apply_sampling_overrides(&overrides, &p)
+                .unwrap()
+                .iter()
+                .map(|(f, _)| f.wire_name())
+                .collect::<Vec<_>>(),
+            vec!["temperature"]
+        );
     }
 
     fn probe_of(body: &str) -> RequestProbe {
@@ -3205,9 +3150,7 @@ mod tests {
             None,
             Some("router-abc123"),
             None,
-            None,
-            None,
-            SamplingPins::default(),
+            &[],
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -3242,9 +3185,7 @@ mod tests {
             Some(&bootstrap),
             None,
             None,
-            None,
-            None,
-            SamplingPins::default(),
+            &[],
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -3378,18 +3319,8 @@ mod tests {
             port: Some(1),
             room: 2,
         };
-        let out = build_outgoing_body(
-            &body,
-            None,
-            None,
-            Some(&bootstrap),
-            None,
-            None,
-            None,
-            None,
-            SamplingPins::default(),
-        )
-        .unwrap();
+        let out =
+            build_outgoing_body(&body, None, None, Some(&bootstrap), None, None, &[]).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             parsed.get("bootstrap_room"),

@@ -7,6 +7,7 @@
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
+use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 use crate::config::{
@@ -15,9 +16,9 @@ use crate::config::{
     default_stale_request_timeout_secs, default_stream_idle_timeout_secs,
     default_stream_send_stall_secs, default_stream_total_timeout_secs, default_tokenizer_shards,
     resolve_mode, ActiveLoadConfig, AdmissionConfig, CacheAwareConfig, CircuitBreakerConfig,
-    Config, DiscoveryBackend, K8sDiscoveryConfig, LoadGate, LogFormat, ModelConfig,
-    ObservabilityConfig, PolicyKind, ProxyConfig, RetryConfig, SamplingPins, ServerConfig,
-    StaticUrlsDiscoveryConfig, StickyConfig,
+    Config, ConflictPolicy, DiscoveryBackend, K8sDiscoveryConfig, LoadGate, LogFormat, ModelConfig,
+    ObservabilityConfig, ParamSpec, PolicyKind, ProxyConfig, RetryConfig, SamplingField,
+    SamplingOverrides, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
 };
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
@@ -80,52 +81,53 @@ pub struct Cli {
     /// the only output bound.
     #[arg(long)]
     pub max_output_tokens: Option<NonZeroU64>,
-    /// Default `top_k` sampling value. Injected into the forwarded request body
-    /// ONLY when the request sets no `top_k` (a client-supplied value always
-    /// wins). Unset (default) leaves sampling to the engine's own defaults.
-    /// Must be >= 1. Use this to set a fleet-wide default without editing the
-    /// model's `generation_config.json`.
-    #[arg(long)]
-    pub default_top_k: Option<i64>,
-    /// Default `top_p` sampling value, with the same default-when-absent
-    /// semantics as `--default-top-k`. Must be in (0, 1].
-    #[arg(long)]
-    pub default_top_p: Option<f64>,
-    /// Pin `temperature` fleet-wide (parameter immutability, matching how
-    /// Moonshot's API serves Kimi models): a request omitting it gets the
-    /// pinned value injected; a request sending exactly this value passes;
-    /// any other numeric value is REJECTED with 400 before admission —
-    /// never silently rewritten. Must be in [0, 2]. Mutually exclusive with
-    /// `--pin-temperature-range`.
-    #[arg(long)]
-    pub pin_temperature: Option<f64>,
-    /// Accept `temperature` only inside this inclusive `LO:HI` band (e.g.
-    /// `0:1` for Kimi K3), rejecting numeric values outside it with 400.
-    /// Unlike `--pin-temperature` this names no single value, so nothing is
-    /// injected when the request omits temperature — the engine's own
-    /// default applies. Bounds must be in [0, 2] with LO <= HI. Mutually
-    /// exclusive with `--pin-temperature`.
-    #[arg(long, value_name = "LO:HI")]
-    pub pin_temperature_range: Option<String>,
-    /// Pin `top_p` fleet-wide, with the same reject-or-inject semantics as
-    /// `--pin-temperature`. Must be in (0, 1]. Mutually exclusive with
-    /// `--default-top-p` (the pin subsumes the default).
-    #[arg(long)]
-    pub pin_top_p: Option<f64>,
-    /// Pin `frequency_penalty` fleet-wide, with the same reject-or-inject
-    /// semantics as `--pin-temperature`. Must be in [-2, 2] (negative values
-    /// allowed: `--pin-frequency-penalty -0.5`).
-    #[arg(long, allow_negative_numbers = true)]
-    pub pin_frequency_penalty: Option<f64>,
-    /// Pin `presence_penalty` fleet-wide, with the same reject-or-inject
-    /// semantics as `--pin-temperature`. Must be in [-2, 2] (negative values
-    /// allowed).
-    #[arg(long, allow_negative_numbers = true)]
-    pub pin_presence_penalty: Option<f64>,
-    /// Pin `n` (choices per request) fleet-wide, with the same
-    /// reject-or-inject semantics as `--pin-temperature`. Must be >= 1.
-    #[arg(long)]
-    pub pin_n: Option<u64>,
+    /// Sampling parameters fixed fleet-wide for this model, as one JSON
+    /// object keyed by the request-body field names — e.g.
+    /// `{"temperature": 1, "top_p": 0.95, "frequency_penalty": 0,
+    /// "presence_penalty": 0, "n": 1}`. Supported keys: `temperature`,
+    /// `top_p`, `top_k`, `frequency_penalty`, `presence_penalty`, `n`; an
+    /// unrecognized key is a startup error, not a silently dead entry.
+    ///
+    /// A configured value is injected into the forwarded body whenever the
+    /// request OMITS that field, so the engine's own defaults can't drift
+    /// from what the operator declared. What happens to a request that DOES
+    /// send the field is `--sampling-param-conflict`'s decision.
+    ///
+    /// A value may also be an inclusive band, `{"min": LO, "max": HI}`, for a
+    /// parameter that stays tunable inside a range (`{"temperature": {"min":
+    /// 0, "max": 1}}` is Kimi K3's contract). A band names no single value, so
+    /// nothing is injected when the request omits it — the engine's own
+    /// default applies. Because a band can only ever reject, combining one
+    /// with `--sampling-param-conflict allow` is a startup ERROR rather than a
+    /// no-op.
+    ///
+    /// Values are range-checked at startup against each parameter's domain, so
+    /// a misconfiguration fails the launch rather than 400ing every request at
+    /// the engine: `temperature` [0, 2], `top_p` (0, 1], `frequency_penalty` /
+    /// `presence_penalty` [-2, 2], `n` [1, 128], `top_k` >= 1 or exactly -1
+    /// (the engine's "disable / whole vocabulary" spelling, and its own
+    /// default — note that `top_k: 1` is greedy decoding, NOT "disabled").
+    /// These are the OpenAI API's domains, deliberately narrower than what the
+    /// engine itself would accept. A band's bounds must both lie in the
+    /// parameter's contiguous range, so `top_k`'s -1 cannot bound one.
+    #[arg(long, value_name = "JSON")]
+    pub override_sampling_params: Option<String>,
+    /// What a request that sends a value differing from
+    /// `--override-sampling-params` gets: `reject` (the default) 400s it
+    /// before admission, quoting the configured value — parameter
+    /// immutability, matching how Moonshot's API serves Kimi models and what
+    /// the Kimi-Vendor-Verifier `tests/params` suite checks. `allow` forwards
+    /// the client's value to the engine untouched, which degrades the
+    /// configured values to fleet-wide defaults. Only accepted alongside
+    /// `--override-sampling-params`; there is nothing for it to govern
+    /// otherwise.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        requires = "override_sampling_params"
+    )]
+    pub sampling_param_conflict: Option<ConflictPolicy>,
     /// Central kill switch for the ingress tokenize offload: when set, the
     /// router NEVER injects its ingress-computed `input_ids` into the
     /// forwarded body, so the engine always tokenizes from `messages` itself.
@@ -640,79 +642,15 @@ impl Cli {
             return Err(anyhow!("--tokenizer-shards must be at least 1"));
         }
 
-        // Validate the sampling defaults up front: a misconfigured default is an
-        // operator error that should fail at startup, not silently inject an
-        // invalid value the engine 400s on every request.
-        if let Some(p) = self.default_top_p {
-            if !(p > 0.0 && p <= 1.0) {
-                return Err(anyhow!("--default-top-p ({p}) must be in (0, 1]"));
-            }
-        }
-        if let Some(k) = self.default_top_k {
-            if k < 1 {
-                return Err(anyhow!("--default-top-k ({k}) must be >= 1"));
-            }
-        }
-
-        // Pinned sampling params get the same startup-time validation. Range
-        // checks are written as positive containment so NaN fails them too.
-        if let Some(t) = self.pin_temperature {
-            if !(0.0..=2.0).contains(&t) {
-                return Err(anyhow!("--pin-temperature ({t}) must be in [0, 2]"));
-            }
-        }
-        let pin_temperature_range = match &self.pin_temperature_range {
-            None => None,
+        // Fleet-wide sampling overrides: parsed and range-checked here so a
+        // malformed JSON object or an out-of-domain value fails the launch,
+        // rather than 400ing every request once traffic arrives.
+        let sampling_overrides = match &self.override_sampling_params {
+            None => SamplingOverrides::default(),
             Some(raw) => {
-                if self.pin_temperature.is_some() {
-                    return Err(anyhow!(
-                        "--pin-temperature-range cannot be combined with \
-                         --pin-temperature: one names a band, the other a single value"
-                    ));
-                }
-                let (lo, hi) = raw
-                    .split_once(':')
-                    .and_then(|(a, b)| {
-                        Some((a.trim().parse::<f64>().ok()?, b.trim().parse::<f64>().ok()?))
-                    })
-                    .ok_or_else(|| {
-                        anyhow!("--pin-temperature-range ({raw}) must be LO:HI, e.g. 0:1")
-                    })?;
-                if !((0.0..=2.0).contains(&lo) && (0.0..=2.0).contains(&hi) && lo <= hi) {
-                    return Err(anyhow!(
-                        "--pin-temperature-range ({raw}) bounds must be in [0, 2] with LO <= HI"
-                    ));
-                }
-                Some((lo, hi))
+                parse_sampling_overrides(raw, self.sampling_param_conflict.unwrap_or_default())?
             }
         };
-        if let Some(p) = self.pin_top_p {
-            if !(p > 0.0 && p <= 1.0) {
-                return Err(anyhow!("--pin-top-p ({p}) must be in (0, 1]"));
-            }
-            if self.default_top_p.is_some() {
-                return Err(anyhow!(
-                    "--pin-top-p cannot be combined with --default-top-p: the pin \
-                     subsumes the default, so the default could never apply"
-                ));
-            }
-        }
-        for (flag, v) in [
-            ("--pin-frequency-penalty", self.pin_frequency_penalty),
-            ("--pin-presence-penalty", self.pin_presence_penalty),
-        ] {
-            if let Some(v) = v {
-                if !(-2.0..=2.0).contains(&v) {
-                    return Err(anyhow!("{flag} ({v}) must be in [-2, 2]"));
-                }
-            }
-        }
-        if let Some(n) = self.pin_n {
-            if n < 1 {
-                return Err(anyhow!("--pin-n ({n}) must be >= 1"));
-            }
-        }
-
         let circuit_breaker = self.cb_threshold.map(|threshold| CircuitBreakerConfig {
             threshold,
             cool_down_secs: self.cb_cool_down_secs.unwrap_or_else(default_cb_cool_down),
@@ -787,16 +725,7 @@ impl Cli {
                 cache_aware,
                 sticky,
                 max_output_tokens: self.max_output_tokens,
-                default_top_k: self.default_top_k,
-                default_top_p: self.default_top_p,
-                pins: SamplingPins {
-                    temperature: self.pin_temperature,
-                    temperature_range: pin_temperature_range,
-                    top_p: self.pin_top_p,
-                    frequency_penalty: self.pin_frequency_penalty,
-                    presence_penalty: self.pin_presence_penalty,
-                    n: self.pin_n,
-                },
+                sampling_overrides,
                 forward_input_ids: !self.disable_input_ids_offload,
             },
             discovery,
@@ -898,6 +827,316 @@ fn join_selector(terms: &[String]) -> Option<String> {
     }
 }
 
+/// A JSON object decoded to its entries IN ORDER, keeping a repeated key
+/// instead of collapsing it.
+///
+/// `serde_json::Map` keeps only the last value of a duplicated key, so
+/// `{"temperature": 0, "temperature": 1}` would start cleanly and enforce `1`
+/// — the operator's first value gone with no message. Loud beats last-wins for
+/// a flag read once at startup, and `deserialize_map` still rejects a
+/// non-object with the type error the caller wraps.
+struct ObjectEntries(Vec<(String, ParamValue)>);
+
+impl<'de> serde::Deserialize<'de> for ObjectEntries {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct EntryVisitor;
+        impl<'de> serde::de::Visitor<'de> for EntryVisitor {
+            type Value = ObjectEntries;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<ObjectEntries, M::Error> {
+                let mut entries = Vec::new();
+                while let Some(entry) = map.next_entry::<String, ParamValue>()? {
+                    entries.push(entry);
+                }
+                Ok(ObjectEntries(entries))
+            }
+        }
+        d.deserialize_map(EntryVisitor)
+    }
+}
+
+/// One parameter's raw value: a number, a band's entries, or anything else.
+///
+/// A band is carried as ENTRIES for the same reason the outer object is — a
+/// `serde_json::Map` would silently keep only the last of a repeated bound, so
+/// `{"min": 0, "max": 1, "max": 0.5}` would quietly narrow the accepted band
+/// and 400 requests the operator meant to admit. `Other` keeps the offending
+/// value so the caller can name it, rather than degrading a wrong-type
+/// message into a serde type error behind the outer object's context.
+enum ParamValue {
+    Number(serde_json::Number),
+    Band(Vec<(String, serde_json::Value)>),
+    Other(serde_json::Value),
+}
+
+impl<'de> serde::Deserialize<'de> for ParamValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct ValueVisitor;
+        impl<'de> serde::de::Visitor<'de> for ValueVisitor {
+            type Value = ParamValue;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a number or a {\"min\": LO, \"max\": HI} band")
+            }
+
+            fn visit_i64<E>(self, v: i64) -> Result<ParamValue, E> {
+                Ok(ParamValue::Number(v.into()))
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<ParamValue, E> {
+                Ok(ParamValue::Number(v.into()))
+            }
+
+            fn visit_f64<E>(self, v: f64) -> Result<ParamValue, E> {
+                // `from_f64` is None only for NaN/inf, which JSON cannot
+                // express; `checked_value` rejects the null either way.
+                Ok(match serde_json::Number::from_f64(v) {
+                    Some(n) => ParamValue::Number(n),
+                    None => ParamValue::Other(serde_json::Value::Null),
+                })
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<ParamValue, M::Error> {
+                let mut entries = Vec::new();
+                while let Some(entry) = map.next_entry::<String, serde_json::Value>()? {
+                    entries.push(entry);
+                }
+                Ok(ParamValue::Band(entries))
+            }
+
+            fn visit_bool<E>(self, v: bool) -> Result<ParamValue, E> {
+                Ok(ParamValue::Other(v.into()))
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<ParamValue, E> {
+                Ok(ParamValue::Other(v.into()))
+            }
+
+            fn visit_unit<E>(self) -> Result<ParamValue, E> {
+                Ok(ParamValue::Other(serde_json::Value::Null))
+            }
+
+            fn visit_none<E>(self) -> Result<ParamValue, E> {
+                Ok(ParamValue::Other(serde_json::Value::Null))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<ParamValue, A::Error> {
+                let mut items = Vec::new();
+                while let Some(v) = seq.next_element::<serde_json::Value>()? {
+                    items.push(v);
+                }
+                Ok(ParamValue::Other(serde_json::Value::Array(items)))
+            }
+        }
+        d.deserialize_any(ValueVisitor)
+    }
+}
+
+/// Parse `--override-sampling-params` into a [`SamplingOverrides`].
+///
+/// Hand-rolled rather than `serde(deny_unknown_fields)` so every rejection
+/// names the offending key, the value it saw and the domain it violated: this
+/// flag is read once at startup on a router that crash-loops if it is wrong,
+/// so the message an operator gets from `kubectl logs` is the whole debugging
+/// session.
+fn parse_sampling_overrides(raw: &str, conflict: ConflictPolicy) -> Result<SamplingOverrides> {
+    let ObjectEntries(entries) = serde_json::from_str(raw).map_err(|e| {
+        anyhow!(
+            "--override-sampling-params must be a JSON object like \
+             '{{\"temperature\": 1, \"top_p\": 0.95}}': {e}"
+        )
+    })?;
+    if entries.is_empty() {
+        return Err(anyhow!(
+            "--override-sampling-params is empty: pass at least one of {}, or omit the flag",
+            supported_fields()
+        ));
+    }
+    let mut params = BTreeMap::new();
+    for (key, value) in entries {
+        let field = SamplingField::from_wire_name(&key).ok_or_else(|| {
+            anyhow!(
+                "--override-sampling-params: unknown parameter \"{key}\" (supported: {})",
+                supported_fields()
+            )
+        })?;
+        let spec = match value {
+            ParamValue::Number(n) => {
+                ParamSpec::Exact(canonical_number(field, checked_value(field, &n)?, n))
+            }
+            ParamValue::Band(entries) => {
+                let (mut min, mut max) = (None, None);
+                for (bound, v) in entries {
+                    let slot = match bound.as_str() {
+                        "min" => &mut min,
+                        "max" => &mut max,
+                        _ => {
+                            return Err(anyhow!(
+                                "--override-sampling-params: {key} band must be exactly \
+                                 {{\"min\": LO, \"max\": HI}}, got an unexpected \
+                                 \"{bound}\""
+                            ))
+                        }
+                    };
+                    if slot.is_some() {
+                        return Err(anyhow!(
+                            "--override-sampling-params: {key} band sets \"{bound}\" more \
+                             than once"
+                        ));
+                    }
+                    let serde_json::Value::Number(n) = v else {
+                        return Err(anyhow!(
+                            "--override-sampling-params: {key} band needs numeric bounds, \
+                             got {bound}: {v}"
+                        ));
+                    };
+                    *slot = Some(checked_value(field, &n)?);
+                }
+                let (Some(lo), Some(hi)) = (min, max) else {
+                    return Err(anyhow!(
+                        "--override-sampling-params: {key} band must be exactly \
+                         {{\"min\": LO, \"max\": HI}} with numeric bounds"
+                    ));
+                };
+                if lo > hi {
+                    return Err(anyhow!(
+                        "--override-sampling-params: {key} band needs min <= max, got \
+                         min {lo} > max {hi}"
+                    ));
+                }
+                // Bounds are checked one at a time, which is only sufficient
+                // for a contiguous domain. `top_k`'s is not ({-1} ∪ [1, ∞)):
+                // `{"min": -1, "max": 100}` has two individually legal bounds
+                // and would admit `top_k: 0`, which is rejected as an exact
+                // value. -1 is a sentinel, not a range endpoint.
+                if field == SamplingField::TopK && lo < 1.0 {
+                    return Err(anyhow!(
+                        "--override-sampling-params: top_k band bounds must both be >= 1 \
+                         (-1 disables top_k entirely and cannot bound a range)"
+                    ));
+                }
+                // A band only ever rejects, so under `allow` it would be dead
+                // config that silently accepts everything.
+                if conflict == ConflictPolicy::Allow {
+                    return Err(anyhow!(
+                        "--override-sampling-params: the {key} band requires \
+                         --sampling-param-conflict reject — under `allow` nothing is \
+                         rejected and a band names no value to inject"
+                    ));
+                }
+                ParamSpec::Range { lo, hi }
+            }
+            ParamValue::Other(other) => {
+                return Err(anyhow!(
+                    "--override-sampling-params: {key} must be a number or a \
+                     {{\"min\": LO, \"max\": HI}} band, got {other}"
+                ))
+            }
+        };
+        if params.insert(field, spec).is_some() {
+            return Err(anyhow!(
+                "--override-sampling-params: {} is set more than once",
+                field.wire_name()
+            ));
+        }
+    }
+    Ok(SamplingOverrides { params, conflict })
+}
+
+/// Check one configured value against its parameter's domain, at startup
+/// instead of per request. Written as positive containment so a NaN bound
+/// fails too.
+///
+/// These are the OpenAI API's domains, which are NARROWER than what the engine
+/// itself accepts (`SamplingParams.verify` requires only that `temperature` be
+/// non-negative and finite, so it would take `temperature: 5`). Narrower is
+/// deliberate: the values here are injected into request bodies, and a fleet
+/// contract outside the range every OpenAI client library validates against is
+/// far more likely a typo than an intent. The one exception is `top_k`, where
+/// `-1` is the engine's own "disable / whole vocabulary" spelling and its
+/// default — a legitimate thing to fix fleet-wide.
+fn checked_value(field: SamplingField, n: &serde_json::Number) -> Result<f64> {
+    let name = field.wire_name();
+    // `as_f64` is infallible for a JSON number unless serde_json's
+    // `arbitrary_precision` is on (it is not); kept total rather than
+    // `expect`-ing, so enabling that feature can't turn config into a panic.
+    let v = n.as_f64().ok_or_else(|| {
+        anyhow!("--override-sampling-params: {name} ({n}) is not a finite number")
+    })?;
+    let (ok, domain) = match field {
+        SamplingField::Temperature => ((0.0..=2.0).contains(&v), "in [0, 2]"),
+        SamplingField::TopP => (v > 0.0 && v <= 1.0, "in (0, 1]"),
+        SamplingField::TopK => (v >= 1.0 || v == -1.0, ">= 1, or -1 to disable"),
+        SamplingField::FrequencyPenalty | SamplingField::PresencePenalty => {
+            ((-2.0..=2.0).contains(&v), "in [-2, 2]")
+        }
+        // OpenAI caps `n` at 128. Unbounded here, a typo'd digit would be
+        // injected into every request that omits `n` and fan each one out to
+        // that many sequences at the engine — the exact per-request failure
+        // this startup check exists to convert into a launch failure.
+        SamplingField::N => ((1.0..=128.0).contains(&v), "in [1, 128]"),
+    };
+    if !ok {
+        return Err(anyhow!(
+            "--override-sampling-params: {name} ({n}) must be {domain}"
+        ));
+    }
+    if field.is_integral() {
+        if v.fract() != 0.0 {
+            return Err(anyhow!(
+                "--override-sampling-params: {name} ({n}) must be a whole number"
+            ));
+        }
+        // `canonical_number` casts to `i64`, and a Rust float-to-int cast
+        // saturates: an unrepresentable literal would otherwise turn into
+        // `i64::MAX` in every forwarded body instead of failing here.
+        if v > i64::MAX as f64 {
+            return Err(anyhow!(
+                "--override-sampling-params: {name} ({n}) is too large to forward"
+            ));
+        }
+    }
+    Ok(v)
+}
+
+/// Normalize an integer-typed parameter's literal so injection writes `1`
+/// rather than `1.0` for a config that spelled it `1.0` — the engine types
+/// these fields as `int`, and the forwarded body should look like what a
+/// client would have sent. Non-integral fields keep the operator's literal.
+fn canonical_number(
+    field: SamplingField,
+    value: f64,
+    literal: serde_json::Number,
+) -> serde_json::Number {
+    if field.is_integral() {
+        serde_json::Number::from(value as i64)
+    } else {
+        literal
+    }
+}
+
+/// The supported `--override-sampling-params` keys, for error messages.
+fn supported_fields() -> String {
+    SamplingField::ALL
+        .iter()
+        .map(|f| f.wire_name())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -925,163 +1164,221 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn default_top_k_and_top_p_reach_the_model_config() {
-        let c = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--default-top-k",
-            "1000",
-            "--default-top-p",
-            "0.95",
-        ]))
-        .unwrap();
-        assert_eq!(c.model.default_top_k, Some(1000));
-        assert_eq!(c.model.default_top_p, Some(0.95));
-        // Unset -> None: sampling is left entirely to the engine.
-        let c = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
-        assert_eq!(c.model.default_top_k, None);
-        assert_eq!(c.model.default_top_p, None);
-    }
-
-    #[test]
-    fn rejects_out_of_range_default_top_p() {
-        for bad in ["0", "1.5"] {
-            let err = into_config_owned(with_model(&[
-                "--worker-urls",
-                "http://x:30000",
-                "--default-top-p",
-                bad,
-            ]))
-            .unwrap_err()
-            .to_string();
-            assert!(err.contains("default-top-p"), "got: {err}");
+    /// Helper: the exact value configured for one parameter, as an f64.
+    fn exact_of(c: &Config, field: SamplingField) -> Option<f64> {
+        match c.model.sampling_overrides.params.get(&field) {
+            Some(ParamSpec::Exact(n)) => n.as_f64(),
+            _ => None,
         }
-        // Boundary: 1.0 is valid (inclusive upper bound).
-        let c = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--default-top-p",
-            "1",
-        ]))
-        .unwrap();
-        assert_eq!(c.model.default_top_p, Some(1.0));
     }
 
     #[test]
-    fn pin_flags_reach_the_model_config() {
+    fn override_sampling_params_reaches_the_model_config() {
         let c = into_config_owned(with_model(&[
             "--worker-urls",
             "http://x:30000",
-            "--pin-temperature",
-            "1.0",
-            "--pin-top-p",
-            "1.0",
-            "--pin-frequency-penalty",
-            "0",
-            "--pin-presence-penalty",
-            "-0.5",
-            "--pin-n",
-            "1",
+            "--override-sampling-params",
+            r#"{"temperature": 1, "top_p": 1.0, "top_k": 20,
+                "frequency_penalty": 0, "presence_penalty": -0.5, "n": 1}"#,
         ]))
         .unwrap();
-        assert_eq!(c.model.pins.temperature, Some(1.0));
-        assert_eq!(c.model.pins.top_p, Some(1.0));
-        assert_eq!(c.model.pins.frequency_penalty, Some(0.0));
-        assert_eq!(c.model.pins.presence_penalty, Some(-0.5));
-        assert_eq!(c.model.pins.n, Some(1));
-        assert!(!c.model.pins.is_empty());
+        assert_eq!(exact_of(&c, SamplingField::Temperature), Some(1.0));
+        assert_eq!(exact_of(&c, SamplingField::TopP), Some(1.0));
+        assert_eq!(exact_of(&c, SamplingField::TopK), Some(20.0));
+        assert_eq!(exact_of(&c, SamplingField::FrequencyPenalty), Some(0.0));
+        assert_eq!(exact_of(&c, SamplingField::PresencePenalty), Some(-0.5));
+        assert_eq!(exact_of(&c, SamplingField::N), Some(1.0));
+        assert!(!c.model.sampling_overrides.params.is_empty());
+        // Reject is the default mode: declaring a contract is the usual
+        // reason to declare one.
+        assert_eq!(c.model.sampling_overrides.conflict, ConflictPolicy::Reject);
+
         // Unset -> empty: no request is ever validated or injected.
         let c = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
-        assert!(c.model.pins.is_empty());
+        assert!(c.model.sampling_overrides.params.is_empty());
     }
 
     #[test]
-    fn pin_temperature_range_parses_and_excludes_exact_pin() {
+    fn sampling_param_conflict_selects_the_mode() {
         let c = into_config_owned(with_model(&[
             "--worker-urls",
             "http://x:30000",
-            "--pin-temperature-range",
-            "0:1",
+            "--override-sampling-params",
+            r#"{"temperature": 1}"#,
+            "--sampling-param-conflict",
+            "allow",
         ]))
         .unwrap();
-        assert_eq!(c.model.pins.temperature_range, Some((0.0, 1.0)));
-        assert_eq!(c.model.pins.temperature, None);
+        assert_eq!(c.model.sampling_overrides.conflict, ConflictPolicy::Allow);
 
-        for (arg, needle) in [
-            ("--pin-temperature-range=1:0", "LO <= HI"),
-            ("--pin-temperature-range=0:2.5", "LO <= HI"),
-            ("--pin-temperature-range=zero:1", "LO:HI"),
-            ("--pin-temperature-range=0.5", "LO:HI"),
-        ] {
-            let err = into_config_owned(with_model(&["--worker-urls", "http://x:30000", arg]))
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains(needle), "{arg}: got {err}");
-        }
-
+        // The mode alone governs nothing, so clap rejects it (`requires`).
         let err = into_config_owned(with_model(&[
             "--worker-urls",
             "http://x:30000",
-            "--pin-temperature-range",
-            "0:1",
-            "--pin-temperature",
-            "1.0",
+            "--sampling-param-conflict",
+            "reject",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--override-sampling-params"), "got: {err}");
+    }
+
+    #[test]
+    fn override_sampling_params_parses_a_band() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--override-sampling-params",
+            r#"{"temperature": {"min": 0, "max": 1}}"#,
+        ]))
+        .unwrap();
+        assert_eq!(
+            c.model
+                .sampling_overrides
+                .params
+                .get(&SamplingField::Temperature),
+            Some(&ParamSpec::Range { lo: 0.0, hi: 1.0 })
+        );
+
+        for (json, needle) in [
+            (r#"{"temperature": {"min": 1, "max": 0}}"#, "min <= max"),
+            (r#"{"temperature": {"min": 0, "max": 2.5}}"#, "in [0, 2]"),
+            (r#"{"temperature": {"min": 0}}"#, "band must be exactly"),
+            (
+                r#"{"temperature": {"min": 0, "max": 1, "typo": 2}}"#,
+                "unexpected \"typo\"",
+            ),
+            (
+                r#"{"temperature": {"min": 0, "max": 1, "max": 0.5}}"#,
+                "band sets \"max\" more than once",
+            ),
+            (r#"{"temperature": {"min": "0", "max": "1"}}"#, "numeric"),
+        ] {
+            let err = into_config_owned(with_model(&[
+                "--worker-urls",
+                "http://x:30000",
+                "--override-sampling-params",
+                json,
+            ]))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(needle), "{json}: got {err}");
+        }
+
+        // A band only ever rejects, so `allow` would leave it with nothing to do.
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--override-sampling-params",
+            r#"{"temperature": {"min": 0, "max": 1}}"#,
+            "--sampling-param-conflict",
+            "allow",
         ]))
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("cannot be combined with --pin-temperature"),
+            err.contains("requires --sampling-param-conflict reject"),
             "got: {err}"
         );
     }
 
+    /// Every malformed spelling of the flag fails the launch, naming the
+    /// offending key and its domain — this flag is read once at startup on a
+    /// router that crash-loops if it is wrong.
     #[test]
-    fn rejects_out_of_range_pins() {
-        // `=`-form throughout so the negative values aren't read as flags
-        // (only the penalty flags opt into allow_negative_numbers).
-        for (arg, needle) in [
-            ("--pin-temperature=2.5", "pin-temperature"),
-            ("--pin-temperature=-0.1", "pin-temperature"),
-            ("--pin-top-p=0", "pin-top-p"),
-            ("--pin-top-p=1.5", "pin-top-p"),
-            ("--pin-frequency-penalty=2.1", "pin-frequency-penalty"),
-            ("--pin-presence-penalty=-2.1", "pin-presence-penalty"),
-            ("--pin-n=0", "pin-n"),
+    fn rejects_malformed_override_sampling_params() {
+        for (json, needle) in [
+            ("not json", "must be a JSON object"),
+            ("[1, 2]", "must be a JSON object"),
+            ("{}", "is empty"),
+            (r#"{"temp": 1}"#, "unknown parameter"),
+            (r#"{"max_tokens": 100}"#, "unknown parameter"),
+            (r#"{"temperature": 2.5}"#, "in [0, 2]"),
+            (r#"{"temperature": -0.1}"#, "in [0, 2]"),
+            (r#"{"top_p": 0}"#, "in (0, 1]"),
+            (r#"{"top_p": 1.5}"#, "in (0, 1]"),
+            (r#"{"top_k": 0}"#, ">= 1"),
+            (r#"{"top_k": -2}"#, ">= 1"),
+            (
+                r#"{"temperature": 0, "temperature": 1}"#,
+                "temperature is set more than once",
+            ),
+            (r#"[["temperature", 1]]"#, "must be a JSON object"),
+            (r#"{"top_k": 1.5}"#, "whole number"),
+            (r#"{"frequency_penalty": 2.1}"#, "in [-2, 2]"),
+            (r#"{"presence_penalty": -2.1}"#, "in [-2, 2]"),
+            (r#"{"n": 0}"#, "in [1, 128]"),
+            (r#"{"n": 1.5}"#, "whole number"),
+            (r#"{"n": 1e20}"#, "in [1, 128]"),
+            (r#"{"n": 129}"#, "in [1, 128]"),
+            (
+                r#"{"top_k": {"min": -1, "max": 100}}"#,
+                "band bounds must both be >= 1",
+            ),
+            (r#"{"temperature": "1"}"#, "must be a number"),
+            (r#"{"temperature": true}"#, "must be a number"),
+            (r#"{"temperature": null}"#, "must be a number"),
         ] {
-            let err = into_config_owned(with_model(&["--worker-urls", "http://x:30000", arg]))
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains(needle), "{arg}: got {err}");
+            let err = into_config_owned(with_model(&[
+                "--worker-urls",
+                "http://x:30000",
+                "--override-sampling-params",
+                json,
+            ]))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(needle), "{json}: got {err}");
         }
     }
 
+    /// `top_p`'s domain is (0, 1] — the inclusive upper bound is valid, and
+    /// `top_k` has no upper bound, so a large sample width parses.
     #[test]
-    fn rejects_pin_top_p_combined_with_default_top_p() {
-        let err = into_config_owned(with_model(&[
+    fn top_p_upper_bound_and_wide_top_k_are_accepted() {
+        let c = into_config_owned(with_model(&[
             "--worker-urls",
             "http://x:30000",
-            "--pin-top-p",
-            "1.0",
-            "--default-top-p",
-            "0.95",
+            "--override-sampling-params",
+            r#"{"top_p": 1, "top_k": 1000}"#,
         ]))
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("--pin-top-p cannot be combined"), "got: {err}");
+        .unwrap();
+        assert_eq!(exact_of(&c, SamplingField::TopP), Some(1.0));
+        assert_eq!(exact_of(&c, SamplingField::TopK), Some(1000.0));
     }
 
+    /// `top_k: -1` is the engine's own "disable / whole vocabulary" spelling
+    /// (and its default), so a fleet may legitimately fix top_k to it — unlike
+    /// every other parameter, whose domain is the OpenAI one.
     #[test]
-    fn rejects_default_top_k_below_one() {
-        let err = into_config_owned(with_model(&[
+    fn top_k_accepts_the_engines_disable_sentinel() {
+        let c = into_config_owned(with_model(&[
             "--worker-urls",
             "http://x:30000",
-            "--default-top-k",
-            "0",
+            "--override-sampling-params",
+            r#"{"top_k": -1}"#,
         ]))
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("default-top-k"), "got: {err}");
+        .unwrap();
+        assert_eq!(exact_of(&c, SamplingField::TopK), Some(-1.0));
+    }
+
+    /// An integer-typed parameter spelled as a float is normalized, so the
+    /// forwarded body carries `1` and not `1.0` for a field the engine types
+    /// as `int`.
+    #[test]
+    fn integral_params_are_normalized_to_integers() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--override-sampling-params",
+            r#"{"n": 1.0, "top_k": 20.0}"#,
+        ]))
+        .unwrap();
+        for field in [SamplingField::N, SamplingField::TopK] {
+            let Some(ParamSpec::Exact(n)) = c.model.sampling_overrides.params.get(&field) else {
+                panic!("{field:?} must be an exact value");
+            };
+            assert!(n.is_i64(), "{field:?} kept a float literal: {n}");
+        }
     }
 
     /// Parse under a SHARED env lock, so no sibling test can be mutating

@@ -112,9 +112,7 @@ fn build_ctx(worker_url: &str, cache_sim_url: &str) -> Arc<AppContext> {
             cache_aware: None,
             sticky: None,
             max_output_tokens: None,
-            default_top_k: None,
-            default_top_p: None,
-            pins: Default::default(),
+            sampling_overrides: Default::default(),
             forward_input_ids: true,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {

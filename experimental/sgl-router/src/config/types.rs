@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 /// In-memory router configuration, built from CLI flags by
@@ -384,22 +385,12 @@ pub struct ModelConfig {
     /// `NonZeroU64` rules out a `0` cap, which would reject or zero out
     /// every request.
     pub max_output_tokens: Option<NonZeroU64>,
-    /// Default `top_k` sampling value for this model. Injected into the
-    /// forwarded request body ONLY when the request sets no `top_k` — a
-    /// client-supplied value always wins — mirroring `max_output_tokens`'s
-    /// default-when-absent behavior. `None` (default) leaves sampling to the
-    /// engine's own defaults. Passed through verbatim; the engine validates it.
-    pub default_top_k: Option<i64>,
-    /// Default `top_p` sampling value for this model, with the same
-    /// default-when-absent semantics as [`Self::default_top_k`]. `None`
-    /// (default) leaves it to the engine/request.
-    pub default_top_p: Option<f64>,
-    /// Sampling parameters pinned fleet-wide for this model (parameter
-    /// immutability). Unlike the `default_*` knobs above, a request sending
-    /// a different value than the pin is rejected with 400 before admission,
-    /// and an exact pin is injected when the request omits the field — see
-    /// [`SamplingPins`]. Empty (default) preserves today's behavior.
-    pub pins: SamplingPins,
+    /// Sampling parameters fixed fleet-wide for this model, and what happens
+    /// to a request that sends a different value: a 400 before admission, or
+    /// the client value forwarded untouched. Either way the configured value
+    /// is injected when the request omits the field — see
+    /// [`SamplingOverrides`]. Empty (default) preserves today's behavior.
+    pub sampling_overrides: SamplingOverrides,
     /// Whether the chat handler may forward ingress-computed `input_ids` to
     /// the engine so it skips re-tokenizing (the ingress tokenize offload).
     /// `false` gates ONLY the engine-facing forward — ingress tokenization
@@ -408,44 +399,121 @@ pub struct ModelConfig {
     pub forward_input_ids: bool,
 }
 
-/// Sampling parameters an operator pins for the whole fleet (the
-/// `--pin-temperature` / `--pin-temperature-range` / `--pin-top-p` /
-/// `--pin-frequency-penalty` / `--pin-presence-penalty` / `--pin-n` flags).
+/// Sampling parameters an operator fixes for the whole fleet, and what to do
+/// with a request that disagrees (`--override-sampling-params` plus
+/// `--sampling-param-conflict`).
 ///
-/// A pinned parameter is an immutability contract, matching how Moonshot's
-/// API serves Kimi models (and what the Kimi-Vendor-Verifier `tests/params`
-/// suite checks): a request that OMITS the parameter is fine, a request
-/// sending the pinned value (or, for `temperature_range`, any value inside
-/// the range) is fine, and a request sending anything else is REJECTED with
-/// 400 before admission — never silently rewritten. When an exact-pinned
-/// parameter is absent, the pinned value is injected into the forwarded body
-/// so the engine's own defaults can't drift from the contract
-/// (`temperature_range` names no single value, so it never injects).
+/// A configured parameter is always injected into the forwarded body when the
+/// request OMITS it, so the engine's own defaults can't drift from what the
+/// operator declared. What differs between the two [`ConflictPolicy`] modes is
+/// only the request that DOES send the field: `Reject` makes the value an
+/// immutability contract (400 before admission — never a silent rewrite),
+/// while `Allow` lets the client value through untouched, making the
+/// configured value a fleet-wide default.
 ///
-/// Contrast with [`ModelConfig::default_top_k`] / [`ModelConfig::default_top_p`],
-/// which only fill absent fields and let any client value through. The CLI
-/// rejects `--pin-top-p` combined with `--default-top-p`: the pin subsumes
-/// the default, so the combination is an operator error, not a precedence
-/// question.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct SamplingPins {
-    pub temperature: Option<f64>,
-    /// Inclusive `(lo, hi)` band of accepted `temperature` values — for
-    /// contracts that fix every sampling knob but leave temperature tunable
-    /// inside a range (Kimi K3 accepts [0, 1]). Mutually exclusive with
-    /// [`Self::temperature`] (CLI-enforced).
-    pub temperature_range: Option<(f64, f64)>,
-    pub top_p: Option<f64>,
-    pub frequency_penalty: Option<f64>,
-    pub presence_penalty: Option<f64>,
-    pub n: Option<u64>,
+/// `Reject` is what serves Kimi models the way Moonshot's API does (and what
+/// the Kimi-Vendor-Verifier `tests/params` suite checks): omit the
+/// parameter, or send exactly the configured value, or get a 400.
+///
+/// This is the only place sampling parameters are configured: `top_k` and
+/// `top_p` have no separate default flags, so there is never a precedence
+/// question between two knobs naming the same parameter.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SamplingOverrides {
+    /// Configured parameters, keyed so enforcement and injection are one loop
+    /// over whatever the operator set instead of a per-field ladder repeated
+    /// at each site. `BTreeMap` over the field enum also fixes the order
+    /// fields are written into the forwarded body.
+    pub params: BTreeMap<SamplingField, ParamSpec>,
+    /// Applies to every configured parameter: there is deliberately no
+    /// per-parameter mode. The cost is real — an immutable `temperature`
+    /// alongside a merely-defaulted `top_k` was expressible while `--pin-*`
+    /// and `--default-top-*` were separate flags, and is not expressible here.
+    /// It was traded for a single knob an operator can read off one manifest.
+    pub conflict: ConflictPolicy,
 }
 
-impl SamplingPins {
-    /// True when no parameter is pinned — the forwarding fast path uses this
-    /// to skip the body re-serialize entirely.
-    pub fn is_empty(&self) -> bool {
-        *self == Self::default()
+/// What a request sending a value the operator did not configure gets
+/// (`--sampling-param-conflict`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ConflictPolicy {
+    /// 400 before admission, quoting the configured value. The default: the
+    /// point of declaring a fleet-wide sampling contract is usually that it
+    /// holds, and silently serving something other than what the client asked
+    /// for is the one behavior no client can detect.
+    #[default]
+    Reject,
+    /// Forward the client's value to the engine untouched. The configured
+    /// value degrades to a fill-when-absent default.
+    Allow,
+}
+
+/// One configured parameter's value: a single value, or an inclusive band of
+/// accepted ones.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParamSpec {
+    /// A single value: injected when the request omits the field, and under
+    /// [`ConflictPolicy::Reject`] the only value a request may send.
+    ///
+    /// Held as the parsed JSON number rather than an `f64` so injection
+    /// re-emits the operator's literal — `"n": 1` stays `1` and does not
+    /// become `1.0` on the wire for the integer-typed fields.
+    Exact(serde_json::Number),
+    /// An inclusive `[lo, hi]` band of accepted values — for contracts that
+    /// fix most sampling knobs but leave one tunable inside a range (Kimi K3
+    /// accepts `temperature` in [0, 1]). A band names no single value, so it
+    /// never injects; it only rejects out-of-band values, which is why the
+    /// CLI rejects a band under [`ConflictPolicy::Allow`] (nothing would be
+    /// left for it to do).
+    Range { lo: f64, hi: f64 },
+}
+
+/// A sampling parameter that can be fixed fleet-wide. The enum is what makes
+/// a typo in the `--override-sampling-params` JSON a startup error instead of
+/// a key that silently never matches a request field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SamplingField {
+    Temperature,
+    TopP,
+    TopK,
+    FrequencyPenalty,
+    PresencePenalty,
+    N,
+}
+
+impl SamplingField {
+    /// Every field, in the order they are written into the forwarded body.
+    pub const ALL: [Self; 6] = [
+        Self::Temperature,
+        Self::TopP,
+        Self::TopK,
+        Self::FrequencyPenalty,
+        Self::PresencePenalty,
+        Self::N,
+    ];
+
+    /// The request-body key, identical on the wire in and out: the JSON
+    /// config names the parameter exactly as a client sends it.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Temperature => "temperature",
+            Self::TopP => "top_p",
+            Self::TopK => "top_k",
+            Self::FrequencyPenalty => "frequency_penalty",
+            Self::PresencePenalty => "presence_penalty",
+            Self::N => "n",
+        }
+    }
+
+    /// Parse a key from the `--override-sampling-params` JSON object.
+    pub fn from_wire_name(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.wire_name() == key)
+    }
+
+    /// True for the fields the engine types as `int`, which a configured
+    /// value must therefore be integral for.
+    pub const fn is_integral(self) -> bool {
+        matches!(self, Self::TopK | Self::N)
     }
 }
 

@@ -21,6 +21,7 @@ mod inbound_h2c;
 mod pd_bootstrap_injection;
 mod pd_pool_isolation;
 mod roundrobin_input_ids;
+mod sampling_overrides;
 mod sticky_input_ids;
 mod sticky_routing;
 mod timeout;
