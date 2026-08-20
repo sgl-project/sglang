@@ -7,16 +7,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from precompile_fmha_sm100 import runtime_variants
+from run_msa_ab_repetitions import (
+    OFFLINE_THROUGHPUT_ARGS,
+    OFFLINE_THROUGHPUT_DATASET,
+)
 from summarize_msa_repetitions import (
     CONCURRENCIES,
     SERVING_METRICS,
     build_summary,
     expected_order,
-)
-from precompile_fmha_sm100 import runtime_variants
-from run_msa_ab_repetitions import (
-    OFFLINE_THROUGHPUT_ARGS,
-    OFFLINE_THROUGHPUT_DATASET,
 )
 
 

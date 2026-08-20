@@ -17,7 +17,6 @@ from pathlib import Path
 
 from summarize_msa_repetitions import expected_order
 
-
 OFFLINE_THROUGHPUT_DATASET = "random-ids"
 OFFLINE_THROUGHPUT_ARGS = (
     "--dataset-name",
