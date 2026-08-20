@@ -9,6 +9,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
     WeightOnlyFP8Linear,
     dequantize_rowwise_fp8_weight,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 def _make_linear(device: torch.device) -> WeightOnlyFP8Linear:
@@ -27,7 +28,7 @@ def _reference(linear: WeightOnlyFP8Linear, x: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.linear(x, dequant, linear.bias)
 
 
-class TestWeightOnlyFP8DequantCache(unittest.TestCase):
+class TestWeightOnlyFP8DequantCache(CustomTestCase):
     def test_cpu_forward_stays_fp8(self):
         linear = _make_linear(torch.device("cpu"))
         x = torch.randn(4, 64, dtype=torch.bfloat16)
@@ -53,6 +54,22 @@ class TestWeightOnlyFP8DequantCache(unittest.TestCase):
         x = torch.randn(8, 64, device="cuda", dtype=torch.bfloat16)
         linear(x)
         self.assertEqual(linear.weight.dtype, torch.bfloat16)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_inference_mode_promotion_supports_torch_compile(self):
+        linear = _make_linear(torch.device("cuda"))
+        x = torch.randn(8, 64, device="cuda", dtype=torch.bfloat16)
+        reference = _reference(linear, x)
+
+        with torch.inference_mode():
+            eager_out = linear(x)
+        self.assertFalse(linear.weight.is_inference())
+
+        compiled = torch.compile(linear, fullgraph=True)
+        with torch.inference_mode():
+            compiled_out = compiled(x)
+        self.assertTrue(torch.equal(reference, eager_out))
+        self.assertTrue(torch.equal(reference, compiled_out))
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_env_kill_switch(self):

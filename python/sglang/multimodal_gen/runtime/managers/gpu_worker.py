@@ -15,6 +15,13 @@ import numpy as np
 import torch
 from setproctitle import setproctitle
 
+from sglang.multimodal_gen.runtime.utils.logging_utils import (  # isort: skip
+    globally_suppress_loggers,
+)
+
+# spawned workers import model dependencies before entering run_scheduler_process
+globally_suppress_loggers()
+
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
@@ -58,14 +65,11 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin import (
     GPUWorkerPostTrainingMixin,
 )
-from sglang.multimodal_gen.runtime.realtime.session import (
-    RealtimeSessionCache,
-)
+from sglang.multimodal_gen.runtime.realtime.session import RealtimeSessionCache
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
-    globally_suppress_loggers,
     init_logger,
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
@@ -222,7 +226,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
-        current_platform.set_device(current_platform.get_device(self.local_rank))
+        if not current_platform.is_mps():
+            current_platform.set_device(current_platform.get_device(self.local_rank))
         # num_gpus is the total world size across every node; the co-located,
         # CPU-contending worker count on THIS host is num_gpus // nnodes.
         local_num_gpus = self.server_args.num_gpus // self.server_args.nnodes
@@ -283,13 +288,18 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         # apply layerwise offload after lora is applied while building LoRAPipeline
         # otherwise empty offloaded weights could fail lora converting
-        if self.server_args.layerwise_offload_components:
+        if self.server_args.has_layerwise_offload_components():
             configure_layerwise_offload_modules(
                 self.pipeline.modules,
                 self.server_args,
-                component_names=self.server_args.layerwise_offload_components,
+                component_names=(
+                    None
+                    if self.server_args.component_residency is not None
+                    else self.server_args.layerwise_offload_components
+                ),
                 warn_missing=(
-                    self.server_args.is_arg_explicitly_set(
+                    self.server_args.component_residency is not None
+                    or self.server_args.is_arg_explicitly_set(
                         "layerwise_offload_components"
                     )
                     or self.server_args.is_arg_explicitly_set("dit_layerwise_offload")
@@ -305,9 +315,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if output_batch.metrics:
             output_batch.metrics.record_memory_snapshot("mem_analysis", final_snapshot)
 
-        # for details on max_memory_reserved: https://docs.pytorch.org/docs/stable/generated/torch.cuda.memory.max_memory_reserved.html
-        peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
-        peak_allocated_bytes = torch.get_device_module().max_memory_allocated()
+        peak_reserved_bytes = final_snapshot.peak_reserved_mb * (1024**2)
+        peak_allocated_bytes = final_snapshot.peak_allocated_mb * (1024**2)
 
         output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
         peak_reserved_gb = peak_reserved_bytes / (1024**3)
@@ -317,46 +326,24 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             current_platform.get_device_total_memory() / (1024**3) - peak_reserved_gb
         )
         can_stay_resident = self.get_can_stay_resident_components(remaining_gpu_mem_gb)
-        suggested_args_str = self._format_offload_disable_suggestions(can_stay_resident)
 
         pool_overhead_gb = peak_reserved_gb - peak_allocated_gb
-
-        logger.debug(
-            f"Peak GPU memory: {peak_reserved_gb:.2f} GB, "
-            f"Peak allocated: {peak_allocated_gb:.2f} GB, "
-            f"Memory pool overhead: {pool_overhead_gb:.2f} GB ({pool_overhead_gb / peak_reserved_gb * 100:.1f}%), "
-            f"Remaining GPU memory at peak: {remaining_gpu_mem_gb:.2f} GB. "
-            f"Components that could stay resident (based on the last request workload): {can_stay_resident}. "
-            f"Related offload server args to disable: {suggested_args_str}"
+        pool_overhead_pct = (
+            pool_overhead_gb / peak_reserved_gb * 100 if peak_reserved_gb else 0.0
         )
 
-    def _format_offload_disable_suggestions(self, components: List[str]) -> str:
-        component_set = set(components)
-        suggestions = []
-        seen_args = set()
-
-        for component in OFFLOAD_DISABLE_RECOMMENDATION_ORDER:
-            if component not in component_set:
-                continue
-
-            arg = None
-            if component == "vae":
-                arg = "--vae-cpu-offload"
-            elif component == "image_encoder":
-                arg = "--image-encoder-cpu-offload"
-            elif component in ("text_encoder", "text_encoder_2"):
-                arg = "--text-encoder-cpu-offload"
-            elif component == "transformer":
-                if self.server_args.is_dit_layerwise_offload_selected:
-                    arg = "--dit-layerwise-offload"
-                elif self.server_args.dit_cpu_offload:
-                    arg = "--dit-cpu-offload"
-
-            if arg is not None and arg not in seen_args:
-                suggestions.append(arg)
-                seen_args.add(arg)
-
-        return ", ".join(suggestions) if suggestions else "None"
+        logger.debug(
+            "GPU memory: peak=%.2f GB, allocated=%.2f GB, pool=%.2f GB (%.1f%%), "
+            "headroom=%.2f GB. Components that can remain on GPU: %s. "
+            "Adjust --cpu-offload-components or --layerwise-offload-components "
+            "to change residency.",
+            peak_reserved_gb,
+            peak_allocated_gb,
+            pool_overhead_gb,
+            pool_overhead_pct,
+            remaining_gpu_mem_gb,
+            can_stay_resident,
+        )
 
     def execute_forward(
         self, batch: List[Req], return_req: bool = False
@@ -477,7 +464,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         output_batch = None
         forward_failed = False
         try:
-            if self.is_output_rank and not current_platform.is_cpu():
+            if (
+                self.is_output_rank
+                and not current_platform.is_cpu()
+                and not current_platform.is_mps()
+            ):
                 torch.get_device_module().reset_peak_memory_stats()
 
             start_time = (
@@ -701,8 +692,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def _record_output_peak_memory(self, output_batch: OutputBatch) -> None:
         if not self.is_output_rank or current_platform.is_cpu():
             return
-        peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
-        output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
+        output_batch.peak_memory_mb = capture_memory_snapshot().peak_reserved_mb
 
     def _forward_group(self, batch: list[Req]) -> OutputBatch:
         assert self.pipeline is not None
@@ -974,28 +964,28 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if not self.pipeline:
             return can_stay_resident
 
-        # Map memory_usage keys to server_args offload flags.
-        # If the flag is False, the component is already resident, so we do not suggest it.
-        # If the flag is True, it is currently offloaded, so it is a candidate to stay resident.
-        offload_flags = {
-            "transformer": self.server_args.dit_cpu_offload
-            or self.server_args.is_dit_layerwise_offload_selected,
-            "vae": self.server_args.vae_cpu_offload,
-            "text_encoder": self.server_args.text_encoder_cpu_offload,
-            "text_encoder_2": self.server_args.text_encoder_cpu_offload,
-            "image_encoder": self.server_args.image_encoder_cpu_offload,
-        }
-
-        for name in OFFLOAD_DISABLE_RECOMMENDATION_ORDER:
-            # Only consider components that are currently configured to be offloaded
-            is_offload_configured = offload_flags.get(name, False)
-            if not is_offload_configured:
+        memory_usages = self.pipeline.memory_usages
+        ordered_names = [
+            name
+            for name in OFFLOAD_DISABLE_RECOMMENDATION_ORDER
+            if name in memory_usages
+        ]
+        ordered_names.extend(
+            name
+            for name in memory_usages
+            if name not in OFFLOAD_DISABLE_RECOMMENDATION_ORDER
+        )
+        for name in ordered_names:
+            usage = memory_usages[name]
+            if not (
+                self.server_args.should_cpu_offload_component(name)
+                or self.server_args.should_configure_layerwise_offload_for_lazy_component(
+                    name
+                )
+            ):
                 continue
-
-            usage = self.pipeline.memory_usages.get(name)
             if usage is None:
                 continue
-
             if usage <= remaining_gpu_mem_gb:
                 can_stay_resident.append(name)
                 remaining_gpu_mem_gb -= usage
@@ -1009,6 +999,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         target: Union[str, List[str]] = "all",
         strength: Union[float, List[float]] = 1.0,
         merge_mode: str | None = None,
+        lora_alpha: int | None | list[int | None] = None,
     ) -> OutputBatch:
         """
         Set the LoRA adapter(s) for the pipeline.
@@ -1024,7 +1015,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
         self.pipeline.set_lora(
-            lora_nickname, lora_path, target, strength, merge_mode=merge_mode
+            lora_nickname,
+            lora_path,
+            target,
+            strength,
+            merge_mode=merge_mode,
+            lora_alpha=lora_alpha,
         )
         return OutputBatch()
 
