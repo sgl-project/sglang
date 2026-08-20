@@ -19,7 +19,11 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+    cast_q_fp8_for_q8kv8_prefill,
     dequantize_k_cache_paged,
+    fp8_dtype,
+    gather_dequant_requant_fp8_paged,
+    q8kv8_padded_num_heads,
 )
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
@@ -56,8 +60,12 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillWorkspace,
+    use_dsv4_q8kv8_sparse_prefill,
 )
-from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
+from sglang.srt.layers.attention.verify_mask import (
+    VerifyMask,
+    maybe_create_verify_mask,
+)
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -70,7 +78,7 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
     resolve_ragged_verify_layout,
 )
-from sglang.srt.utils import ceil_align, is_cuda, is_xpu
+from sglang.srt.utils import ceil_align, is_cuda, is_sm90_supported, is_xpu
 from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
@@ -552,6 +560,22 @@ class DeepseekV4AttnBackend(
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
+        self.dsv4_prefill_backend: str = getattr(
+            model_runner.server_args, "dsv4_prefill_backend", "auto"
+        )
+        if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
+            if not is_sm90_supported():
+                raise ValueError(
+                    "DeepSeek-V4 flashmla_sparse_q8 prefill requires SM90 CUDA GPUs."
+                )
+            if self.head_dim_v != 512:
+                raise ValueError(
+                    "DeepSeek-V4 flashmla_sparse_q8 prefill requires d_v=512, "
+                    f"got {self.head_dim_v}."
+                )
+        self._q8kv8_qpad_buf = None
+        self._q8kv8_attn_sink_pad = None
+        self._q8kv8_identity_scale = None
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0
@@ -1673,6 +1697,16 @@ class DeepseekV4AttnBackend(
                     or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
                 )
             ):
+                if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
+                    return self._forward_prefill_sparse_q8kv8(
+                        q=q,
+                        layer_id=layer_id,
+                        compress_ratio=compress_ratio,
+                        forward_batch=forward_batch,
+                        token_to_kv_pool=token_to_kv_pool,
+                        core_attn_metadata=core_attn_metadata,
+                        attn_sink=attn_sink,
+                    )
                 return self._forward_prefill_sparse(
                     q=q,
                     layer_id=layer_id,
@@ -1846,6 +1880,216 @@ class DeepseekV4AttnBackend(
             topk_length=combined_lens,
         )
         return o
+
+    def _prepare_q8kv8_q_and_sink(
+        self,
+        q: torch.Tensor,
+        attn_sink: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """Pad TP-local heads to the SM90 kernel's 64-head CTA granularity."""
+        num_tokens, num_heads, head_dim = q.shape
+        padded_heads = q8kv8_padded_num_heads(num_heads)
+
+        qpad = getattr(self, "_q8kv8_qpad_buf", None)
+        if (
+            qpad is None
+            or qpad.shape[0] < num_tokens
+            or qpad.shape[1] != padded_heads
+            or qpad.shape[2] != head_dim
+            or qpad.device != q.device
+        ):
+            qpad = torch.empty(
+                (num_tokens, padded_heads, head_dim),
+                dtype=fp8_dtype,
+                device=q.device,
+            )
+            self._q8kv8_qpad_buf = qpad
+
+        qpad = qpad[:num_tokens]
+
+        q_fp8, _ = cast_q_fp8_for_q8kv8_prefill(
+            q,
+            padded_num_heads=padded_heads,
+            out=qpad,
+        )
+
+        sink_pad = getattr(self, "_q8kv8_attn_sink_pad", None)
+        if (
+            sink_pad is None
+            or sink_pad.shape != (padded_heads,)
+            or sink_pad.device != q.device
+        ):
+            sink_pad = torch.zeros(padded_heads, dtype=torch.float32, device=q.device)
+            self._q8kv8_attn_sink_pad = sink_pad
+
+        sink_pad[:num_heads].copy_(attn_sink.reshape(-1)[:num_heads])
+        if padded_heads > num_heads:
+            sink_pad[num_heads:].zero_()
+
+        scale = getattr(self, "_q8kv8_identity_scale", None)
+        if scale is None or scale.device != q.device:
+            scale = torch.ones((), dtype=torch.float32, device=q.device)
+            self._q8kv8_identity_scale = scale
+
+        return q_fp8, sink_pad, scale, num_heads
+
+    def _forward_prefill_sparse_q8kv8(
+        self,
+        q: torch.Tensor,
+        layer_id: int,
+        compress_ratio: Literal[0, 4, 128],
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        core_attn_metadata: DSV4AttnMetadata,
+        attn_sink: torch.Tensor,
+    ) -> torch.Tensor:
+        """Experimental DeepSeek-V4 sparse prefill path using Q8KV8 kernels.
+
+        This mirrors ``_forward_prefill_sparse``'s cache/index construction, but
+        writes the gathered KV workspace as FP8 and calls the SM90 Q8KV8 sparse
+        prefill kernel. The path is selected by ``--dsv4-prefill-backend
+        flashmla_sparse_q8``; ``SGLANG_DSV4_Q8KV8_PREFILL`` remains as a debug
+        override for focused runtime validation.
+        """
+
+        from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
+            sparse_mla_q8kv8_prefill_fwd,
+        )
+
+        q_flat = q.squeeze(1)
+        if q_flat.ndim != 3:
+            raise ValueError(
+                f"Q8KV8 sparse prefill expects 3D Q after squeeze, got {q_flat.shape}"
+            )
+
+        if attn_sink.numel() != q_flat.shape[1]:
+            raise ValueError(
+                f"attn_sink has {attn_sink.numel()} heads but Q has "
+                f"{q_flat.shape[1]} local heads"
+            )
+
+        q_fp8, attn_sink_pad, identity_scale, active_heads = (
+            self._prepare_q8kv8_q_and_sink(q_flat, attn_sink)
+        )
+
+        if not getattr(self, "_q8kv8_sparse_prefill_log_emitted", False):
+            logger.info(
+                "DSV4_Q8KV8_SPARSE_PREFILL_HIT layer_id=%s "
+                "compress_ratio=%s q_shape=%s padded_heads=%s d_v=%s",
+                layer_id,
+                compress_ratio,
+                tuple(q_flat.shape),
+                q_fp8.shape[1],
+                self.head_dim_v,
+            )
+            self._q8kv8_sparse_prefill_log_emitted = True
+
+        cache = self.forward_metadata.sparse_prefill_cache
+        if cache is None:
+            seq_lens_cpu = forward_batch.seq_lens_cpu
+            assert seq_lens_cpu is not None
+            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+            assert extend_seq_lens_cpu is not None
+            total_swa = sum(
+                min(int(seq_len), int(extend_len) + SWA_WINDOW - 1)
+                for seq_len, extend_len in zip(
+                    seq_lens_cpu.tolist(), extend_seq_lens_cpu, strict=True
+                )
+            )
+            cache = SparsePrefillChunkCache.build(
+                seq_lens=forward_batch.seq_lens.to(torch.int32),
+                extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
+                req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
+                req_to_token=self.req_to_token,
+                full_to_swa=token_to_kv_pool.full_to_swa_index_mapping,
+                swa_window_size=SWA_WINDOW,
+                swa_page_size=token_to_kv_pool.swa_window_size,
+                num_qo_tokens=q_flat.shape[0],
+                max_seq_len=int(seq_lens_cpu.max().item()),
+                total_swa=total_swa,
+            )
+            self.forward_metadata.sparse_prefill_cache = cache
+
+        compressed_slice = None
+        extra_k_cache = None
+        extra_page_size = None
+        flat_token_ids = None
+
+        if compress_ratio == 0:
+            workspace = self.sparse_prefill_workspace.get(
+                cache.swa_token_ids.shape[0] + 1,
+                dtype=fp8_dtype,
+            )
+            combined_indices = cache.c0_combined_indices
+            combined_lens = cache.c0_combined_lens
+            swa_slice = workspace
+        else:
+            extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
+            extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
+
+            if compress_ratio == 128:
+                assert core_attn_metadata.c128_page_indices is not None
+                cache.ensure_c128(core_attn_metadata.c128_page_indices)
+                flat_token_ids = cache.c128_flat_token_ids
+                combined_indices = cache.c128_combined_indices
+                combined_lens = cache.c128_combined_lens
+            else:
+                assert core_attn_metadata.c4_sparse_raw_indices is not None, (
+                    "Q8KV8 sparse-prefill c4 path requires c4_sparse_raw_indices "
+                    "(allocated in init_flashmla_related when is_prefill=True)"
+                )
+                cache.ensure_c4(core_attn_metadata.page_table, extra_page_size)
+                flat_token_ids = cache.c4_flat_token_ids
+                combined_indices, combined_lens = cache.combine_c4_layer(
+                    c4_sparse_raw_indices=core_attn_metadata.c4_sparse_raw_indices[
+                        : cache.num_qo_tokens
+                    ],
+                )
+
+            n_compressed = flat_token_ids.shape[0]
+            workspace = self.sparse_prefill_workspace.get(
+                n_compressed + cache.swa_token_ids.shape[0] + 1,
+                dtype=fp8_dtype,
+            )
+            compressed_slice = workspace[:n_compressed]
+            swa_slice = workspace[n_compressed:]
+
+        if compressed_slice is not None:
+            gather_dequant_requant_fp8_paged(
+                extra_k_cache,
+                flat_token_ids,
+                page_size=extra_page_size,
+                out=compressed_slice,
+            )
+
+        gather_dequant_requant_fp8_paged(
+            token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+            cache.swa_token_ids,
+            page_size=cache.swa_page_size,
+            extra_rows=1,
+            out=swa_slice,
+        )
+
+        sentinel_row = workspace.shape[0] - 1
+        q8_indices = torch.where(
+            combined_indices < 0,
+            torch.full_like(combined_indices, sentinel_row),
+            combined_indices,
+        )
+
+        o, _, _ = sparse_mla_q8kv8_prefill_fwd(
+            q=q_fp8,
+            kv=workspace,
+            indices=q8_indices.unsqueeze(1),
+            sm_scale=self.softmax_scale,
+            q_scale=identity_scale,
+            kv_scale=identity_scale,
+            d_v=self.head_dim_v,
+            attn_sink=attn_sink_pad,
+            topk_length=combined_lens,
+        )
+
+        return o[:, :active_heads]
 
     def expand_prefill_casually(
         self,
