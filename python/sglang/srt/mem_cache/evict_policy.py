@@ -67,13 +67,16 @@ class TLRUStrategy(EvictionStrategy):
         self.next_prompt_estimate = next_prompt_estimate
 
     def get_priority(self, node: TreeNode) -> Tuple[int, float]:
-        # node.convo_length is the branch's high-water depth, i.e. the paper's L,
-        # and deliberately does not shrink when the tail is trimmed. Deriving L
-        # from what is still resident instead would leave the shortened
-        # conversation over budget on the next pass too, and T-LRU would walk it
-        # down to nothing rather than stopping after (threshold - Q_hat) tokens.
-        budget = max(node.convo_length + self.next_prompt_estimate - self.threshold, 0)
-        cached_without_this_node = node.depth - len(node.key)
+        # node._tlru_history_len is the branch's high-water depth, i.e. the
+        # paper's L, and deliberately does not shrink when the tail is trimmed.
+        # Deriving L from what is still resident instead would leave the
+        # shortened conversation over budget on the next pass too, and T-LRU
+        # would walk it down to nothing rather than stopping after
+        # (threshold - Q_hat) tokens.
+        budget = max(
+            node._tlru_history_len + self.next_prompt_estimate - self.threshold, 0
+        )
+        cached_without_this_node = node._tlru_cached_prefix_len - len(node.key)
         tel_safe = cached_without_this_node >= budget
         return (-1 if tel_safe else 0, node.last_access_time)
 

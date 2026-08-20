@@ -53,9 +53,9 @@ class FakeKey:
 class FakeNode:
     """A radix node on one conversation's path; only the fields T-LRU reads."""
 
-    depth: int
+    _tlru_cached_prefix_len: int
     key_len: int
-    convo_length: int
+    _tlru_history_len: int
     last_access_time: float = 0.0
     key: FakeKey = field(init=False)
 
@@ -75,7 +75,10 @@ def chain(node_lens, convo_length=None, t0=0.0):
         depth += n
         nodes.append(
             FakeNode(
-                depth=depth, key_len=n, convo_length=convo, last_access_time=t0 + i
+                _tlru_cached_prefix_len=depth,
+                key_len=n,
+                _tlru_history_len=convo,
+                last_access_time=t0 + i,
             )
         )
     return nodes
@@ -171,7 +174,7 @@ def test_compacted_branch_keeps_shared_prefix_protected():
 def test_budget_clamps_at_zero():
     """A budget below zero must mean nothing needs caching, not wrap around."""
     s = strategy()
-    node = FakeNode(depth=PAGE, key_len=PAGE, convo_length=0)
+    node = FakeNode(_tlru_cached_prefix_len=PAGE, key_len=PAGE, _tlru_history_len=0)
     assert is_tel_safe(s, node)
 
 

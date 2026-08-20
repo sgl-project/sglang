@@ -121,13 +121,10 @@ class UnifiedTreeNode:
         # Namespace-aware hashes used only for external KV events.
         self.event_hash_value: Optional[list[str]] = None
         self.hit_count = 0
-        # T-LRU bookkeeping. depth is the token count on the path root -> self,
-        # i.e. how much of the conversation is cached up to this node.
-        # convo_length is the high-water depth of the whole branch below self and
-        # only ever grows, so a trimmed conversation is still measured against its
-        # full history length. Both are ignored by every other eviction policy.
-        self.depth = 0
-        self.convo_length = 0
+        # T-LRU only (0 under other policies): tokens root -> self, and the
+        # branch's high-water depth, which survives tail trimming.
+        self._tlru_cached_prefix_len = 0
+        self._tlru_history_len = 0
         self.priority = priority
         self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
             _NUM_COMPONENT_TYPES * 2
@@ -173,7 +170,7 @@ class UnifiedTreeNode:
         return node.get_prefix_hash_values(node.parent) + node.hash_value
 
 
-def _set_depth_and_raise_convo_length(
+def _set_tlru_lens_and_raise_history(
     node: UnifiedTreeNode, parent: UnifiedTreeNode
 ) -> None:
     """Record a new node's path depth and raise the branch high-water mark.
@@ -185,16 +182,13 @@ def _set_depth_and_raise_convo_length(
     (roughly extend/split operations, not tokens), and the walk only runs under
     --radix-eviction-policy tlru.
     """
-    if node.key is None:
-        raise ValueError(
-            "_set_depth_and_raise_convo_length requires node.key to be set"
-        )
-    node.depth = parent.depth + len(node.key)
-    if node.convo_length < node.depth:
-        node.convo_length = node.depth
+    assert node.key is not None
+    node._tlru_cached_prefix_len = parent._tlru_cached_prefix_len + len(node.key)
+    if node._tlru_history_len < node._tlru_cached_prefix_len:
+        node._tlru_history_len = node._tlru_cached_prefix_len
     cur = parent
-    while cur is not None and cur.convo_length < node.depth:
-        cur.convo_length = node.depth
+    while cur is not None and cur._tlru_history_len < node._tlru_cached_prefix_len:
+        cur._tlru_history_len = node._tlru_cached_prefix_len
         cur = cur.parent
 
 
@@ -435,8 +429,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             tlru_threshold=params.tlru_threshold,
             tlru_next_prompt_estimate=params.tlru_next_prompt_estimate,
         )
-        # depth/convo_length are read only by TLRUStrategy.get_priority; every
-        # other policy skips the per-insert bookkeeping entirely.
+        # The node _tlru_* lens are read only by TLRUStrategy.get_priority;
+        # every other policy skips the per-insert bookkeeping entirely.
         self.tlru_bookkeeping = params.eviction_policy.lower() == "tlru"
 
         # ``device`` is derived from the construction-time allocator; the
@@ -1102,8 +1096,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             # A split adds no depth to the branch: the new parent sits at
             # split_len tokens and inherits the branch's high-water mark, while
             # child keeps its own depth because its path length is unchanged.
-            new_node.depth = new_node.parent.depth + split_len
-            new_node.convo_length = child.convo_length
+            new_node._tlru_cached_prefix_len = (
+                new_node.parent._tlru_cached_prefix_len + split_len
+            )
+            new_node._tlru_history_len = child._tlru_history_len
         # Split fragments stay on the anchor's root path for the ack's walk.
         new_node.load_back_pending_id = child.load_back_pending_id
 
@@ -1159,7 +1155,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.parent = parent
         new_node.key = key
         if self.tlru_bookkeeping:
-            _set_depth_and_raise_convo_length(new_node, parent)
+            _set_tlru_lens_and_raise_history(new_node, parent)
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
@@ -1823,7 +1819,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.parent = node
         new_node.key = key
         if self.tlru_bookkeeping:
-            _set_depth_and_raise_convo_length(new_node, node)
+            _set_tlru_lens_and_raise_history(new_node, node)
         new_node.hash_value = hash_value
         new_node.component_data[BASE_COMPONENT_TYPE].host_value = host_value.clone()
         node.children[child_key] = new_node
