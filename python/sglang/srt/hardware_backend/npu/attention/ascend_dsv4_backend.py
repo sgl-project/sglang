@@ -2010,27 +2010,26 @@ class DeepseekV4AscendAttnBackend(
             "has_ori_kv": True,
             "has_cmp_kv": False,
         }
-        # The host metadata op reads CPU int32 mirrors — never a D2H sync of the
-        # device tensors (that would drain the stream and stall overlapped prep).
         c1a_kwargs = base_kwargs | common
         if self._is_dspark_draft_worker:
-            cu_q_cpu = fm.actual_seq_lengths_q_pa_cpu
-            if cu_q_cpu is not None and cu_q_cpu.numel() > bs + 1:
-                cu_q_cpu = cu_q_cpu[: bs + 1]
-            host_inputs = {"seqused_kv": fm.seq_lens_cpu_int[:bs].int()}
-            if cu_q_cpu is not None:
-                host_inputs["cu_seqlens_q"] = cu_q_cpu
-            c1a_kwargs = c1a_kwargs | host_inputs
-            metadata_op = torch.ops.npu.sparse_attn_sharedkv_metadata_host
+            seq_lens_cpu = getattr(fm, "seq_lens_cpu_int", None)
+            max_seqlen_kv = (
+                int(seq_lens_cpu[:bs].max().item())
+                if seq_lens_cpu is not None and bs > 0
+                else int(actual_seq_lengths_kv[:bs].max().item())
+            )
+            c1a_kwargs.update(
+                cu_seqlens_ori_kv=actual_seq_lengths_q_pa,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=max_seqlen_kv,
+            )
+            c1a_metadata = torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata(
+                device=str(actual_seq_lengths_kv.device), **c1a_kwargs
+            )
         else:
-            # The device-side op requires tensor args for backend dispatch; pass
-            # the device mirrors just like the pre-refactor call did.
-            c1a_kwargs = c1a_kwargs | {
-                "cu_seqlens_q": actual_seq_lengths_q_pa,
-                "seqused_kv": actual_seq_lengths_kv,
-            }
-            metadata_op = torch.ops.custom.npu_sparse_attn_sharedkv_metadata
-        kernel_metadata = {"c1a_metadata": metadata_op(**c1a_kwargs)}
+            metadata_op, _ = _sparse_attn_ops()
+            c1a_metadata = metadata_op(**c1a_kwargs)
+        kernel_metadata = {"c1a_metadata": c1a_metadata}
 
         if self._dsv4_has_c4:
             c4a_overrides = {
@@ -2039,6 +2038,7 @@ class DeepseekV4AscendAttnBackend(
                 "cmp_topk": self._dsv4_index_topk,
             }
             c4a_kwargs = c1a_kwargs | c4a_overrides
+            metadata_op, _ = _sparse_attn_ops()
             kernel_metadata["c4a_metadata"] = metadata_op(**c4a_kwargs)
 
             if actual_seq_lengths_q_pa is not None:
@@ -2067,6 +2067,7 @@ class DeepseekV4AscendAttnBackend(
         if self._dsv4_has_c128:
             c128a_overrides = {"cmp_ratio": 128, "has_cmp_kv": True}
             c128a_kwargs = c1a_kwargs | c128a_overrides
+            metadata_op, _ = _sparse_attn_ops()
             kernel_metadata["c128a_metadata"] = metadata_op(**c128a_kwargs)
 
         return kernel_metadata
@@ -2112,13 +2113,8 @@ class DeepseekV4AscendAttnBackend(
         pool = self.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)
 
-        _, attn_op = _sparse_attn_ops()
-        # cmp_ratio is implicit for the pre-A5 op but required by the kv-quant one.
-        a5_kwargs = _sparse_attn_kv_quant_kwargs()
-        if a5_kwargs:
-            a5_kwargs["cmp_ratio"] = 1
         attn_kwargs = dict(
-            **a5_kwargs,
+            **({} if self._is_dspark_draft_worker else _sparse_attn_kv_quant_kwargs()),
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
             seqused_kv=fm.actual_seq_lengths_kv,
             ori_mask_mode=4,
@@ -2134,18 +2130,19 @@ class DeepseekV4AscendAttnBackend(
             sinks=attn_sink,
             metadata=fm.kernel_metadata["c1a_metadata"],
             softmax_scale=layer.scaling,
+            cmp_ratio=1,
         )
         if self._is_dspark_draft_worker:
             attn_kwargs["cu_seqlens_ori_kv"] = fm.actual_seq_lengths_q_pa
         ori_sparse_indices = getattr(fm, "ori_sparse_indices", None)
         if ori_sparse_indices is not None:
             attn_kwargs["ori_sparse_indices"] = ori_sparse_indices
+        q_arg = attn_kwargs.pop("q")
         if self._is_dspark_draft_worker:
-            q_arg = attn_kwargs.pop("q")
-            out, _ = torch.ops.npu.sparse_attn_sharedkv(q_arg, **attn_kwargs)
+            out, _ = torch.ops._C_ascend.npu_sparse_attn_sharedkv(q_arg, **attn_kwargs)
         else:
             _, attn_op = _sparse_attn_ops()
-            out, _ = attn_op(**attn_kwargs)
+            out, _ = attn_op(q_arg, **attn_kwargs)
         return out
 
     def _forward_compressed(
@@ -2190,7 +2187,6 @@ class DeepseekV4AscendAttnBackend(
             "(see NPUDeepSeekV4SingleKVPool.kernel_page_size)"
         )
 
-        _, attn_op = _sparse_attn_ops()
         attn_kwargs = dict(
             **_sparse_attn_kv_quant_kwargs(),
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
@@ -2217,12 +2213,9 @@ class DeepseekV4AscendAttnBackend(
             attn_kwargs["cmp_sparse_indices"] = topk.view(-1, 1, topk.shape[-1])
         else:
             attn_kwargs["cmp_sparse_indices"] = None
-        if self._is_dspark_draft_worker:
-            q_arg = attn_kwargs.pop("q")
-            out, _ = torch.ops.npu.sparse_attn_sharedkv(q_arg, **attn_kwargs)
-        else:
-            _, attn_op = _sparse_attn_ops()
-            out, _ = attn_op(**attn_kwargs)
+        q_arg = attn_kwargs.pop("q")
+        _, attn_op = _sparse_attn_ops()
+        out, _ = attn_op(q_arg, **attn_kwargs)
         return out
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
