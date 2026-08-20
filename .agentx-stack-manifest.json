@@ -109,6 +109,14 @@
     "change": "Split the generation-exact P-to-D admission path into profiler-gated preallocation, handshake, local transfer poll, metadata gate, CPU Gloo all-reduce, tensor pack/unpack, and transfer-commit ranges without changing their order or data flow.",
     "scope": "Diagnostic source only; no production optimization or performance claim."
   },
+  "layer2_prealloc_substage_nvtx_overlay": {
+    "parent_commit": "26241fe158447b8a157a16a9c91e80545a829f44",
+    "files": {
+      "python/sglang/srt/disaggregation/decode.py": "605dfbd407dcdb4271c695cd6c0ae27d9120b781c414ed29902bb9466251eeab"
+    },
+    "change": "Split decode-side preallocation into profiler-gated allocation, state-index materialization, page-index materialization, and metadata-send ranges without changing execution order or data flow.",
+    "scope": "Diagnostic source only; no production optimization or performance claim."
+  },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
     "tree": "b0161fbca98775c0f79999f4970de1f14a4426fb"

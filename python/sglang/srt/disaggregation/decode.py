@@ -1221,12 +1221,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     "for PD + chunked prefill."
                 )
 
-            dst_kv_indices = self._pre_alloc(
-                decode_req.req,
-                prefix_indices,
-                prefix_len,
-                total_prefix_len,
-            )
+            with scheduler_nvtx_range("scheduler.pd.prealloc.allocate"):
+                dst_kv_indices = self._pre_alloc(
+                    decode_req.req,
+                    prefix_indices,
+                    prefix_len,
+                    total_prefix_len,
+                )
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
@@ -1359,18 +1360,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         prefix_len=total_prefix_len,
                     )
                 )
-            state_indices: Optional[List] = [
-                payloads[st]() if st in payloads else None for st in state_types
-            ]
+            with scheduler_nvtx_range("scheduler.pd.prealloc.state_indices"):
+                state_indices: Optional[List] = [
+                    payloads[st]() if st in payloads else None for st in state_types
+                ]
 
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert decode_req.metadata_buffer_index is not None
             # int32 for ZMQ serialization -- from_zmq reads np.int32.
-            page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
-                np.int32
-            )
+            with scheduler_nvtx_range("scheduler.pd.prealloc.page_indices"):
+                page_indices = kv_to_page_indices(
+                    kv_indices, kv_transfer_page_size
+                ).astype(np.int32)
             device_page_indices = None
             if (
                 self.scheduler.enable_hisparse
@@ -1407,12 +1410,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.transfer_queue.staging_handler.register_decode_req(
                     decode_req.req.bootstrap_room, decode_req
                 )
-            decode_req.kv_receiver.send_metadata(
-                page_indices,
-                decode_req.metadata_buffer_index,
-                state_indices,
-                **metadata_kwargs,
-            )
+            with scheduler_nvtx_range("scheduler.pd.prealloc.send_metadata"):
+                decode_req.kv_receiver.send_metadata(
+                    page_indices,
+                    decode_req.metadata_buffer_index,
+                    state_indices,
+                    **metadata_kwargs,
+                )
             if decode_req.is_rebootstrap:
                 self.kv_manager.submit_prefill_recompute(
                     decode_req.kv_receiver,
