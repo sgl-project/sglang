@@ -116,6 +116,42 @@ export const config = {
               : []),
           ],
         },
+        {
+          id: "dflash", label: "DFLASH2",
+          // Trained block-diffusion draft, a separate checkpoint. The
+          // selector projects through the target lm_head — including
+          // quantized heads — so it runs on the NVFP4 checkpoint. Offered
+          // only where it was measured: the SM120 pair with NVFP4.
+          disabled: (sel) =>
+            !(["rtx6000", "rtx5090"].includes(sel.hw) && sel.quant === "nvfp4"),
+          disableReason:
+            "DFlash2 recipes are validated on RTX PRO 6000 / RTX 5090 with the NVFP4 checkpoint only",
+          // 5090: mem-fraction re-pins like DSPARK's, and fp32 additionally
+          // re-pins the ratio — the balanced L=9216 value leaves the state
+          // pool one slot short at every serviceable mem-fraction (see the
+          // DFlash2 bullet in Configuration Tips).
+          stripPrefixes: (sel) =>
+            sel.hw === "rtx5090"
+              ? sel.ssmDtype === "float32"
+                ? ["--mem-fraction-static", "--mamba-full-memory-ratio"]
+                : ["--mem-fraction-static"]
+              : [],
+          flags: (sel) => [
+            "--speculative-algorithm DFLASH",
+            "--speculative-draft-model-path incoai/Qwen3.8-27B-DFlash2",
+            "--speculative-num-draft-tokens 8",
+            // Measured on the 5090: bf16 state serves at 0.90 (DSPARK's
+            // pin); fp32 fits only at 0.945 + ratio 10 (0.94 is one state
+            // slot short, 0.95 OOMs at runtime) and leaves the Low-Latency
+            // KV pool a single-request envelope.
+            ...(sel.hw === "rtx5090"
+              ? sel.ssmDtype === "float32"
+                ? ["--mem-fraction-static 0.945",
+                   "--mamba-full-memory-ratio 10"]
+                : ["--mem-fraction-static 0.90"]
+              : []),
+          ],
+        },
       ],
     },
     {
@@ -260,6 +296,11 @@ export const config = {
           flags: ["--speculative-algorithm DSPARK",
                   "--speculative-draft-model-path RadixArk/Qwen3.8-27B-DSpark",
                   "--speculative-draft-attention-backend flashinfer"] },
+        { id: "dflash",  label: "DFlash2",
+          // Same trio as the Deploy panel's DFLASH2 option.
+          flags: ["--speculative-algorithm DFLASH",
+                  "--speculative-draft-model-path incoai/Qwen3.8-27B-DFlash2",
+                  "--speculative-num-draft-tokens 8"] },
       ],
     },
 

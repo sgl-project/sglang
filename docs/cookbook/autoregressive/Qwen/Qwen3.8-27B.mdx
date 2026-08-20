@@ -59,8 +59,9 @@ import { Qwen38MambaRatioCalculator } from "/src/snippets/_qwen38_mamba_ratio_ca
 <Note>
   The RTX 5090 and RTX PRO 6000 cells above — including every Speculative
   Decoding / Serving Strategy / SSM dtype combination — were validated at
-  ISL 8192 / OSL 1024, concurrency 1. The DGX Spark cells cover that same full
-  combination set, but to a weaker standard: each was confirmed to **boot and
+  ISL 8192 / OSL 1024, concurrency 1 (DFLASH2 is offered, and was validated,
+  only on these two cards with the NVFP4 checkpoint). The DGX Spark cells
+  cover that same combination set minus DFLASH2, but to a weaker standard: each was confirmed to **boot and
   serve** at ISL 8192 / OSL 1024, concurrency 1, with no throughput or
   acceptance-length numbers taken. The remaining platforms' recipes carry their
   original validation, which covers the default overlay picks (plus MTP on
@@ -89,7 +90,8 @@ ratio = (S + D) x state_bytes / (L x kv_bytes_per_token)
   slot, and `extra_buffer` frees one more with the overlap scheduler off; the
   calculator reads both knobs.
 - `D` — verify intermediate states under speculative decoding:
-  `--speculative-num-draft-tokens` for EAGLE/MTP (4 at the recommended 3/1/4);
+  `--speculative-num-draft-tokens` for EAGLE/MTP (4 at the recommended 3/1/4)
+  and for DFLASH (8, DFlash2's block size);
   `--speculative-dspark-block-size + 1` for DSPARK, where the block size falls
   back to the draft checkpoint's `block_size` when the flag is omitted (7 for
   `RadixArk/Qwen3.8-27B-DSpark`, so `D = 8`); 0 with speculation off or with
@@ -220,6 +222,25 @@ checkpoint's calibration scales automatically.
   `--enable-linear-replayssm-spec` its draft intermediates move onto a fixed
   ring, so `D = 0` and the ratio returns to the no-spec value. The
   [calculator](#mamba-ratio-calculator) applies both rules.
+- **DFlash2**: a trained block-diffusion draft in a separate checkpoint — add
+  `--speculative-algorithm DFLASH --speculative-draft-model-path
+  incoai/Qwen3.8-27B-DFlash2 --speculative-num-draft-tokens 8` (8 is the
+  draft's block size, and it is the `D` term in the ratio, same value as
+  DSpark's). The selector projects candidates through the target `lm_head`,
+  including quantized heads, so it runs on the NVFP4 checkpoint; the panel
+  offers it where it was measured — RTX PRO 6000 and RTX 5090 with NVFP4.
+  The RTX PRO 6000 recipe needs no changes. On the 32GB RTX 5090 prefer
+  `--mamba-ssm-dtype bfloat16` at `--mem-fraction-static 0.90`: measured
+  strictly better than float32 for this draft (6.1 vs 8.3 ms TPOT, accept
+  3.30 vs 3.09) — the opposite of the EAGLE trade, so measure before assuming.
+  float32 still fits, but only at `--mem-fraction-static 0.945` with
+  `--mamba-full-memory-ratio 10` pinned in place of the balanced value: the
+  L = 9216 ratio leaves the fp32 state pool one slot short at every
+  serviceable mem-fraction (0.94 allocates four of Low-Latency's five slots;
+  0.95 OOMs at runtime), and the re-weighted split leaves the Low-Latency KV
+  pool a single-request envelope (~9.4k tokens) — no headroom for longer
+  requests or radix reuse. The panel's DFLASH2 option applies these re-pins
+  automatically.
 - **Hardware fit**: FP8 weights ~28.5GB (not serviceable beyond bs≤2 on
   32GB cards); NVFP4 weights ~16.5GB (recommended for RTX 5090-class GPUs).
 - `--mamba-radix-cache-strategy extra_buffer_lazy` lowers the state cost per
