@@ -2596,9 +2596,9 @@ def initialize_model_parallel(
             max_world_size=max_world_size,
         )
 
-    # Keep K3 shared-expert collectives inside contiguous TP8 subgroups on NPU.
+    # Keep K3 shared-expert collectives inside small contiguous TP subgroups on NPU.
     # Each subgroup owns disjoint token rows, so this preserves DP4/attention-
-    # TP16 while avoiding cross-node collectives. The same group also makes
+    # TP16 while reducing collective participants. The same group also makes
     # the optional CANN collective-matmul operators legal (maximum TP8).
     global _NPU_FUSED_MATMUL_TP
     assert _NPU_FUSED_MATMUL_TP is None, (
@@ -2607,7 +2607,13 @@ def initialize_model_parallel(
     if envs.SGLANG_NPU_FUSED_COLLECTIVE_MATMUL.get() or (
         _is_npu and envs.SGLANG_K3_SHARED_EXPERTS_ATTN_TP.get()
     ):
-        fused_tp_size = min(attn_tp_size, 8)
+        requested_fused_tp_size = envs.SGLANG_K3_SHARED_EXPERTS_TP_SIZE.get()
+        if requested_fused_tp_size not in (1, 2, 4, 8):
+            raise RuntimeError(
+                "SGLANG_K3_SHARED_EXPERTS_TP_SIZE must be one of 1, 2, 4, 8, "
+                f"got {requested_fused_tp_size}"
+            )
+        fused_tp_size = min(attn_tp_size, requested_fused_tp_size)
         if attn_tp_size % fused_tp_size != 0:
             raise RuntimeError(
                 f"attention TP {attn_tp_size} must be divisible by fused "

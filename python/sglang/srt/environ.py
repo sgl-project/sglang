@@ -864,6 +864,8 @@ class Envs:
     # Keep K3 shared experts and dense MLPs sharded over attention TP.
     SGLANG_K3_SHARED_EXPERTS_ATTN_TP = EnvBool(False)
     SGLANG_K3_DENSE_MLP_ATTN_TP = EnvBool(False)
+    # NPU subgroup used by K3's TP-sharded shared experts.
+    SGLANG_K3_SHARED_EXPERTS_TP_SIZE = EnvInt(8)
     # Fuse attention-TP collectives with dynamic-int8 dense matmuls.
     SGLANG_NPU_FUSED_COLLECTIVE_MATMUL = EnvBool(False)
     # Fuse K3 latent RMSNorm with the dynamic-int8 quantization for up-proj.
