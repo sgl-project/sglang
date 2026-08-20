@@ -255,7 +255,7 @@ class ComponentLoader(ABC):
             model_size = get_memory_usage_of_component(component) or "NA"
             consumed = gpu_mem_before_loading - current_gpu_mem
             logger.info(
-                f"Loaded %s: %s ({source} version). model size: %s GB, resident in %s. avail GPU mem: %.2f GB",
+                f"Loaded %s: %s ({source} version). model size: %s GB, %s. avail GPU mem: %.2f GB",
                 component_name,
                 component.__class__.__name__,
                 model_size,

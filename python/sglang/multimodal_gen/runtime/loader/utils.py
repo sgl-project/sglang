@@ -437,18 +437,21 @@ def format_component_residency(module) -> str:
     the point; saying so beats reporting a zero delta that reads as free.
     """
     totals = component_residency_bytes(module)
+    # `pinned` and `pageable` are the standard CUDA pair, and naming mmap after
+    # the call says what it is: labels a reader has to guess at defeat the point
+    # of splitting host bytes in the first place.
     labels = (
         ("vram", "vram"),
         ("host_pinned", "host pinned"),
-        ("host_mapped", "host mapped"),
-        ("host", "host"),
+        ("host_mapped", "host mmap"),
+        ("host", "host pageable"),
     )
     parts = [
-        f"{label} {totals[key] / BYTES_PER_GB:.2f} GB"
+        f"{label}: {totals[key] / BYTES_PER_GB:.2f} GB"
         for key, label in labels
         if totals.get(key)
     ]
-    return ", ".join(parts) if parts else "no weights of its own"
+    return ", ".join(parts) if parts else "weights: none"
 
 
 # component name ->  ComponentLoader class

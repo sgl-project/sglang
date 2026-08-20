@@ -107,7 +107,7 @@ class TestFormatComponentResidency:
     def test_only_non_zero_places_are_named(self):
         buffer = torch.empty(int(0.5 * 1024**3 / 4), dtype=torch.float32)
         module = _Streamed([_FakeOffloadManager([buffer])])
-        assert format_component_residency(module) == "host 0.50 GB"
+        assert format_component_residency(module) == "host pageable: 0.50 GB"
 
     def test_a_component_without_weights_says_so(self):
-        assert format_component_residency(_Streamed([])) == "no weights of its own"
+        assert format_component_residency(_Streamed([])) == "weights: none"
