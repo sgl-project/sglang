@@ -27,6 +27,7 @@ from sglang.srt.disaggregation.common.staging_handler import (
     STAGING_WATERMARK_WAIT_S,
     DecodeStagingContext,
     PrefillStagingContext,
+    StagingRegisterInfo,
     StagingTransferInfo,
 )
 from sglang.srt.disaggregation.common.utils import (
