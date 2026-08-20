@@ -525,8 +525,8 @@ class TestLTX25DiffusionDecoder(unittest.TestCase):
         import torch
 
         from sglang.multimodal_gen.runtime.models.decoders.ltx_2_5_diffusion_decoder import (
-            LTX2VideoVaeRotaryPosEmbed3D,
             _ROPE_TABLE_CACHE,
+            LTX2VideoVaeRotaryPosEmbed3D,
         )
 
         _ROPE_TABLE_CACHE.clear()
