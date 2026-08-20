@@ -368,7 +368,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # device-side count and stall the schedule stream.
         swa_indices = self.full_to_swa_index_mapping[mapping_indices]
         self.swa_attn_allocator.free(swa_indices)
-        self.full_to_swa_index_mapping[mapping_indices] = 0
+        # index_fill_ passes the 0 as a kernel argument; `mapping[...] = 0` would
+        # copy a host-resident scalar and stall the stream until it drains.
+        self.full_to_swa_index_mapping.index_fill_(
+            0, mapping_indices.to(torch.int64), 0
+        )
 
     def free_full(self, free_index: torch.Tensor):
         """Free the full-attention slots of a range whose SWA peers are already
