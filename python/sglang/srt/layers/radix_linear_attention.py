@@ -74,6 +74,7 @@ class RadixLinearAttention(nn.Module):
 
         self.A_log = A_log
         self.dt_bias = dt_bias
+        self.lower_bound = None
 
     def forward(
         self,

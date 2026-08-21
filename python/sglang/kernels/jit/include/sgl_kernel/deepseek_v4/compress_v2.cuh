@@ -10,6 +10,8 @@
 
 #include <cstdint>
 
+namespace sglang {
+
 namespace device::compress {
 
 /// \brief Per-batch decode plan. Layout: 16 bytes.
@@ -97,3 +99,5 @@ inline auto verify_plan_w(tvm::ffi::TensorView t, SymbolicSize& N, SymbolicDevic
 }
 
 }  // namespace host::compress
+
+}  // namespace sglang

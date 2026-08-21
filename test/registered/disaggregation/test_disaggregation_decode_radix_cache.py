@@ -48,11 +48,13 @@ def _has_mooncake():
 class DisaggregationDecodeRadixCacheTestMixin:
     extra_decode_args = ["--disaggregation-decode-enable-radix-cache"]
     transfer_backend_name = None
+    model_name = DEFAULT_MODEL_NAME_FOR_TEST
+    gsm8k_min_score = 0.80
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
+        cls.model = try_cached_model(cls.model_name)
         cls.transfer_backend = [
             "--disaggregation-transfer-backend",
             cls.transfer_backend_name,
@@ -117,8 +119,8 @@ class DisaggregationDecodeRadixCacheTestMixin:
         metrics_second = run_eval(args)
         print(f"Second run metrics: {metrics_second}")
 
-        self.assertGreater(metrics_first["score"], 0.80)
-        self.assertGreater(metrics_second["score"], 0.80)
+        self.assertGreater(metrics_first["score"], self.gsm8k_min_score)
+        self.assertGreater(metrics_second["score"], self.gsm8k_min_score)
 
         accuracy_drop = metrics_first["score"] - metrics_second["score"]
         self.assertLessEqual(

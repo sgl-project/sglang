@@ -1,6 +1,6 @@
 ---
 name: cookbook-add-model
-description: Add a new model to the SGLang Cookbook (docs_new/, Mintlify), config-driven format — instantiate the model-agnostic template into a per-model config (+ benchmarks) JSX under src/snippets/configs/, an MDX page, the docs.json nav entry, NEW-tag hygiene, and the homepage vendor card. Interactive, multi-phase. Run with /cookbook-add-model.
+description: Add a new model to the SGLang Cookbook (docs/, Mintlify), config-driven format — instantiate the model-agnostic template into a per-model config (+ benchmarks) JSX under src/snippets/configs/, an MDX page, the docs.json nav entry, NEW-tag hygiene, and the homepage vendor card. Interactive, multi-phase. Run with /cookbook-add-model.
 disable-model-invocation: true
 ---
 
@@ -12,16 +12,16 @@ disable-model-invocation: true
 > page (not the user) is the source of truth.
 
 The cookbook is **config-driven**: two shared engines contain NO model-specific code —
-`docs_new/src/snippets/_deployment.jsx` (the 5-dim deploy matrix) and
+`docs/src/snippets/_deployment.jsx` (the 5-dim deploy matrix) and
 `_playground.jsx` (the diff-based override Playground). Adding a model = adding **data**:
 a per-model `config` (+ optional `benchmarks`) consumed by both engines, plus an MDX page
 that imports them. No engine edits.
 
 **Instantiate the model-agnostic template** (NOT a clone of any live cookbook — the
 template is decoupled and covers all hardware + all axes):
-- `templates/config.jsx.tmpl` → `docs_new/src/snippets/configs/<hf-org>/<model-slug>.jsx`
+- `templates/config.jsx.tmpl` → `docs/src/snippets/configs/<hf-org>/<model-slug>.jsx`
 - `templates/benchmarks.jsx.tmpl` → `…/<model-slug>-benchmarks.jsx` (skip if no numbers)
-- `templates/page.mdx.tmpl` → `docs_new/cookbook/<category>/<Vendor>/<ModelName>.mdx`
+- `templates/page.mdx.tmpl` → `docs/cookbook/<category>/<Vendor>/<ModelName>.mdx`
 
 The template uses explicit `__TOKEN__` placeholders; you fill them, prune what the model
 lacks, and replace the EXAMPLE cells with verified recipes. DeepSeek-V4 is a populated
@@ -32,6 +32,7 @@ lacks, and replace the EXAMPLE cells with verified recipes. DeepSeek-V4 is a pop
 - [references/mintlify-authoring.md](references/mintlify-authoring.md) — MDX rules (forbidden syntax, JSX tables, labeled fences) + invocation-example patterns. Read before writing §1–§3 prose.
 - [references/engine-axis.md](references/engine-axis.md) — adding a new Playground feature axis (rare engine work).
 - [references/vendor-logo.md](references/vendor-logo.md) — new-vendor card logo: ask the user for the brand logo, then generate the icon-only 940×525 RGBA PNG (spec + Pillow recipe + `git add -f`).
+- [references/diffusion-authoring.md](references/diffusion-authoring.md) — required opening, tag, command-picker, and feature-overlay contract for diffusion model pages. Read before editing any `docs/cookbook/diffusion/<Vendor>/<Model>.mdx` page.
 
 ## Architecture at a glance
 
@@ -68,9 +69,12 @@ playground reads it), the **`sglang-deploy-sel` custom event** (deploy dispatche
 every change; playground listens — `replaceState` doesn't fire `hashchange`), and the
 shared **`sglang-deploy-env` localStorage key** (HOST/PORT placeholders).
 
-> The template is **autoregressive**. Diffusion / omni pages follow their own category
-> structure — don't force the config-driven template on them; still obey the Mintlify /
-> NEW-tag / docs.json / category-card / validation rules below.
+> The main template is **autoregressive**. Diffusion pages use
+> `templates/diffusion-page.mdx.tmpl` plus
+> [references/diffusion-authoring.md](references/diffusion-authoring.md); do not force the
+> autoregressive deployment matrix on them. Omni pages follow their own category structure.
+> All categories still obey the Mintlify / NEW-tag / docs.json / category-card / validation
+> rules below.
 
 ---
 
@@ -131,6 +135,15 @@ this table (RTX PRO 6000, GH200, future chips) goes in the model's own `config.h
 
 ## Phase 2 — Instantiate the template
 
+For a diffusion model, instantiate `templates/diffusion-page.mdx.tmpl` and keep the
+shared `DiffusionModelTags` component, plus `templates/diffusion-config.jsx.tmpl` for the
+opt-in scoped command builder. Put the compact install command and builder in §1 Quick
+start. The first two paragraphs in §2 Model capabilities are not generic filler: they must
+state the model's capability range, strongest differentiator, when to choose it, and at
+least one real deployment or capability boundary. Put orthogonal runtime features in
+`scope: "serve"` or `scope: "request"`, not in the base recipe; use the schema from
+`references/diffusion-authoring.md`.
+
 1. **Copy** the three template files to their target paths (above). Note the two
    vendor-folder conventions: under `configs/` the folder is the **HuggingFace org**
    (`deepseek-ai`); under `cookbook/` it's the **display vendor** (`DeepSeek`).
@@ -156,26 +169,26 @@ this table (RTX PRO 6000, GH200, future chips) goes in the model's own `config.h
 
 ### Site-wiring (do all three)
 
-- **`docs_new/docs.json`** — add the page under Cookbook → `<category>` → `<Vendor>`, at
+- **`docs/docs.json`** — add the page under Cookbook → `<category>` → `<Vendor>`, at
   the **top** of that vendor's `pages` (root-relative, no `.mdx`:
   `cookbook/<category>/<Vendor>/<Model>`). New vendor group → insert in the section's
   local ordering.
 - **NEW-tag hygiene** — the new page keeps `tag: NEW` (from the template). Scan the
   vendor dir for existing NEW and strip it from siblings; verify ≤1:
-  `grep -rn 'tag: NEW' docs_new/cookbook/<category>/<Vendor>/` → at most one result. (Scan
+  `grep -rn 'tag: NEW' docs/cookbook/<category>/<Vendor>/` → at most one result. (Scan
   files; don't assume the first `docs.json` entry holds NEW.)
-- **Homepage card** — `docs_new/cookbook/<category>/intro.mdx`: if the org already has a
+- **Homepage card** — `docs/cookbook/<category>/intro.mdx`: if the org already has a
   `<Card>`, update only its `href` (keep `img`). If the org is **new**, add a `<Card>`
   (title = nav-group name; keep card order aligned with `docs.json`) **and create its logo**:
   ask the user for the brand logo, then generate the conforming **icon-only 940×525 RGBA
-  transparent** PNG → `docs_new/cards/logos/<org-slug>.png` per
+  transparent** PNG → `docs/cards/logos/<org-slug>.png` per
   [references/vendor-logo.md](references/vendor-logo.md) (track with `git add -f` — `*.png`
   is gitignored repo-wide). Never invent or copy a logo.
 
 ## Phase 3 — Validate
 
 ```bash
-cd docs_new
+cd docs
 mint validate        # frontmatter, missing nav entries, MDX/JSX errors
 mint broken-links
 mint dev             # visual smoke test at http://localhost:3000/cookbook/<category>/<Vendor>/<Model>
@@ -206,6 +219,10 @@ user notes: §1 Model Introduction (description, links, params, license, variant
 Tool-Calling / HiCache — keep only what applies; match the reasoning example to the
 parser's output shape; each runnable block gets an `**Output Example:**`).
 
+For diffusion pages, follow the category-specific Quick start and capability contract in
+`references/diffusion-authoring.md`. Run `node docs/scripts/check_cookbook_configs.mjs` to
+verify the tag widget and introduction structure before rendering the page.
+
 ## Phase 6 — Review
 
 ```
@@ -218,10 +235,10 @@ Always branch — never commit to main directly.
 
 ```bash
 git checkout -b add-<model>-cookbook
-git add docs_new/src/snippets/configs/<hf-org>/<slug>.jsx \
-        docs_new/src/snippets/configs/<hf-org>/<slug>-benchmarks.jsx \
-        docs_new/cookbook/<category>/<Vendor>/<Model>.mdx \
-        docs_new/docs.json docs_new/cookbook/<category>/intro.mdx
+git add docs/src/snippets/configs/<hf-org>/<slug>.jsx \
+        docs/src/snippets/configs/<hf-org>/<slug>-benchmarks.jsx \
+        docs/cookbook/<category>/<Vendor>/<Model>.mdx \
+        docs/docs.json docs/cookbook/<category>/intro.mdx
 git commit -m "Add <Display-Name> cookbook"
 git push -u origin add-<model>-cookbook
 gh pr create --title "Add <Display-Name> cookbook" --body "..."
