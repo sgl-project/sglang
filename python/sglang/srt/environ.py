@@ -595,6 +595,9 @@ class Envs:
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
+    # Deprecated: the unified radix tree is the default tree cache now, so the
+    # registry no longer reads this. Kept because a few model/arch call sites
+    # still assert on it; do not use in new code.
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
     # Registered TreeCore backend serving the unified radix cache.
     SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("python")
@@ -812,6 +815,10 @@ class Envs:
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
     SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
+    # Unified KV wired the fused qk-norm-rope kernel to decode only, so MTP
+    # target-verify kept running the norm+RoPE as separate kernels. Set to 0 to
+    # go back to the unfused chain on the verify path.
+    SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY = EnvBool(True)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
 
     # ===================================================================
@@ -1623,6 +1630,10 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     "SGLANG_DFLASH_PREFILL_REFILL_TARGET": _DeprecatedEnv(
         note="DFlash now auto-enables the min-free-slots delay; unset this env. "
         "To override the threshold, use '--min-free-slots-delay'."
+    ),
+    "SGLANG_ENABLE_UNIFIED_RADIX_TREE": _DeprecatedEnv(
+        note="The unified radix tree is the default tree cache now; unset this "
+        "env. The field is still defined for legacy call sites."
     ),
 }
 
