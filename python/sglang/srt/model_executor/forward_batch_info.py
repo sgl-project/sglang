@@ -1080,7 +1080,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # passes its own positions (uniform num_draft_tokens per request).
         if seq_positions is None:
             seq_positions = batch.spec_info.positions
-        seq_positions = seq_positions.view(batch_size, -1)
+        ragged_layout = getattr(batch.spec_info, "ragged_verify_layout", None)
+        if ragged_layout is None:
+            seq_positions = seq_positions.view(batch_size, -1)
+        else:
+            # Compact verify packs a variable number of positions per request;
+            # graph-tier padding follows the packed real-token prefix. Keep the
+            # original live layout so padding receives zero mRoPE delta rather
+            # than inheriting the final request's delta.
+            seq_positions = seq_positions.reshape(-1)
         # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
         if all(mm_input is None for mm_input in mm_inputs):
             mrope_delta_tensor = torch.zeros(
@@ -1096,9 +1104,23 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 for i in range(batch_size)
             ]
             mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
-        next_input_positions = (
-            (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
-        )
+        if ragged_layout is None:
+            next_input_positions = (seq_positions + mrope_delta_tensor).flatten()
+        else:
+            token_indices = torch.arange(
+                seq_positions.numel(), dtype=torch.int32, device=device
+            )
+            request_indices = torch.searchsorted(
+                ragged_layout.qo_indptr_device[1:], token_indices, right=True
+            )
+            is_real_token = request_indices < ragged_layout.bs
+            safe_request_indices = request_indices.clamp(max=batch_size - 1).long()
+            token_deltas = mrope_delta_tensor.flatten()[safe_request_indices]
+            token_deltas = torch.where(
+                is_real_token, token_deltas, torch.zeros_like(token_deltas)
+            )
+            next_input_positions = seq_positions + token_deltas
+        next_input_positions = next_input_positions.unsqueeze(0).repeat(3, 1)
 
         self.mrope_positions = next_input_positions
 
