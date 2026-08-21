@@ -67,6 +67,28 @@ class LayerLoadingEvent:
         self._num_layers = num_layers
         self.load_events = [device_module.Event() for _ in range(num_layers)]
         self.start_event = device_module.Event()  # start event on controller stream
+        # A CUDA wait issued before an event has ever been recorded does not
+        # wait for a future record. Direct-I/O dispatch therefore publishes a
+        # small CPU-side handoff after the helper has enqueued every per-layer
+        # copy and completion event. The consumer waits only for submission,
+        # not for the copies themselves; GPU execution remains layer-overlapped.
+        self._submission_ready = threading.Event()
+        self._submission_error: Optional[BaseException] = None
+
+    def reset_submission(self):
+        self._submission_error = None
+        self._submission_ready.clear()
+
+    def mark_submitted(self, error: Optional[BaseException] = None):
+        self._submission_error = error
+        self._submission_ready.set()
+
+    def wait_until_submitted(self):
+        self._submission_ready.wait()
+        if self._submission_error is not None:
+            raise RuntimeError(
+                "HiCache load submission failed"
+            ) from self._submission_error
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
@@ -91,14 +113,18 @@ class LayerDoneCounter:
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
-        assert self.events[
-            self.producer_index
-        ].finish_event.query(), (
-            "Producer finish event should be ready before being reused."
-        )
+        producer_event = self.events[self.producer_index]
+        assert (
+            producer_event.finish_event.query()
+        ), "Producer finish event should be ready before being reused."
+        producer_event.reset_submission()
         return self.producer_index
 
     def set_consumer(self, index: int):
+        if index >= 0:
+            # Ensure the CUDA events below have a concrete record in the H2D
+            # stream before model code calls wait_event on them.
+            self.events[index].wait_until_submitted()
         self.consumer_index = index
 
     def wait_until(self, threshold: int):
@@ -978,10 +1004,25 @@ class HiCacheController:
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
         if self.io_backend == "direct":
-            self._enqueue_direct_dispatch(self._start_loading_op, op, producer_id)
+            self._enqueue_direct_dispatch(
+                self._start_loading_op_and_signal_submission, op, producer_id
+            )
         else:
             self._start_loading_op(op, producer_id)
+            producer_event.mark_submitted()
         return producer_id
+
+    def _start_loading_op_and_signal_submission(
+        self, op: CacheOperation, producer_id: int
+    ) -> None:
+        producer_event = self.layer_done_counter.events[producer_id]
+        try:
+            self._start_loading_op(op, producer_id)
+        except BaseException as exc:
+            producer_event.mark_submitted(error=exc)
+            raise
+        else:
+            producer_event.mark_submitted()
 
     def _start_loading_op(self, op: CacheOperation, producer_id: int) -> None:
         host_indices, device_indices, pool_transfers = self._move_op_indices(op)
