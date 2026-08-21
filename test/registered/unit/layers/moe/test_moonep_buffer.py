@@ -7,14 +7,18 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe import DeepEPMode, MoeA2ABackend, MoeRunnerConfig
+from sglang.srt.layers.moe.fused_moe_triton.layer import create_moe_dispatcher
 from sglang.srt.layers.moe.token_dispatcher.moonep import (
     MoonEPBuffer,
+    MoonEPDispatcher,
     MoonEPDispatchOutput,
     MoonEPExpertWeightLayout,
     get_moonep_expert_weight_layout,
     run_moonep_bf16_expert,
 )
-from sglang.srt.runtime_context import reset_context
+from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.runtime_context import get_flags, get_forward, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -31,6 +35,21 @@ class _FakeMoonEPBuffer:
     def destroy(self):
         self.destroy_calls += 1
 
+    def dispatch(
+        self,
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        tokens_per_expert,
+        async_finish,
+    ):
+        return (
+            hidden_states,
+            topk_weights.reshape(-1),
+            torch.tensor([hidden_states.shape[0]], dtype=torch.int32),
+            SimpleNamespace(experts_to_copy=torch.empty(0, dtype=torch.int32)),
+        )
+
 
 def _fake_moonep_module():
     module = types.ModuleType("moonep")
@@ -38,7 +57,7 @@ def _fake_moonep_module():
     return module
 
 
-class TestMoonEPBuffer(unittest.TestCase):
+class _MoonEPBufferTestCase(unittest.TestCase):
     def setUp(self):
         reset_context()
         _FakeMoonEPBuffer.instances.clear()
@@ -50,6 +69,8 @@ class TestMoonEPBuffer(unittest.TestCase):
             reset_context()
             _FakeMoonEPBuffer.instances.clear()
 
+
+class TestMoonEPBuffer(_MoonEPBufferTestCase):
     def test_lazily_constructs_and_reuses_buffer_for_static_key(self):
         group = object()
 
@@ -178,6 +199,171 @@ class TestMoonEPBuffer(unittest.TestCase):
         self.assertIsNone(MoonEPBuffer.get_existing_buffer())
 
 
+class TestMoonEPCapacityLogging(_MoonEPBufferTestCase):
+    LOGGER_NAME = "sglang.srt.layers.moe.token_dispatcher.moonep"
+    LOG_PREFIX = f"DEBUG:{LOGGER_NAME}:"
+
+    @staticmethod
+    def _make_dispatch_inputs(num_tokens):
+        hidden_states = torch.ones((num_tokens, 3), dtype=torch.bfloat16)
+        topk_output = StandardTopKOutput(
+            topk_weights=torch.ones((num_tokens, 2), dtype=torch.float32),
+            topk_ids=torch.arange(num_tokens * 2, dtype=torch.int64).reshape(
+                num_tokens, 2
+            )
+            % 4,
+            router_logits=torch.empty((num_tokens, 4), dtype=torch.float32),
+        )
+        return hidden_states, topk_output
+
+    @staticmethod
+    def _make_dispatcher(capacity, layer_id):
+        with envs.SGLANG_MOONEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(capacity):
+            return MoonEPDispatcher(
+                group=object(),
+                router_topk=2,
+                num_experts=4,
+                hidden_size=3,
+                layer_id=layer_id,
+            )
+
+    def _dispatch_and_capture(
+        self,
+        dispatcher,
+        hidden_states,
+        topk_output,
+        *,
+        rank,
+        is_extend_in_batch,
+    ):
+        with (
+            patch.dict(sys.modules, {"moonep": _fake_moonep_module()}),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.moonep.dist.get_world_size",
+                return_value=1,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.moonep.dist.get_rank",
+                return_value=rank,
+            ),
+            get_forward().scoped(is_extend_in_batch=is_extend_in_batch),
+            self.assertLogs(self.LOGGER_NAME, level="DEBUG") as captured,
+        ):
+            dispatcher.dispatch(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+            )
+        return captured.output
+
+    def test_dispatcher_requires_layer_id_for_attributable_logs(self):
+        with self.assertRaisesRegex(ValueError, "requires layer_id"):
+            MoonEPDispatcher(
+                group=object(),
+                router_topk=2,
+                num_experts=4,
+                hidden_size=3,
+            )
+
+    def test_partial_extend_dispatch_logs_host_capacity_utilization(self):
+        dispatcher = self._make_dispatcher(capacity=4, layer_id=7)
+        hidden_states, topk_output = self._make_dispatch_inputs(num_tokens=2)
+
+        captured = self._dispatch_and_capture(
+            dispatcher,
+            hidden_states,
+            topk_output,
+            rank=3,
+            is_extend_in_batch=True,
+        )
+
+        self.assertEqual(
+            captured,
+            [
+                self.LOG_PREFIX
+                + "phase=extend rank=3 layer_id=7 actual_tokens=2 capacity=4 "
+                "padding_tokens=2 capacity_utilization=0.5 "
+                "static_padding_ratio=0.5"
+            ],
+        )
+
+    def test_factory_threads_layer_id_into_decode_capacity_log(self):
+        group = object()
+        config = MoeRunnerConfig(
+            num_experts=4,
+            num_local_experts=4,
+            hidden_size=3,
+            layer_id=11,
+            top_k=2,
+            params_dtype=torch.bfloat16,
+        )
+        hidden_states, topk_output = self._make_dispatch_inputs(num_tokens=2)
+
+        with (
+            envs.SGLANG_MOONEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(4),
+            get_flags().moe.override(
+                a2a_backend=MoeA2ABackend.MOONEP,
+                deepep_mode=DeepEPMode.AUTO,
+                tbo_enabled=False,
+            ),
+            patch(
+                "sglang.srt.layers.moe.fused_moe_triton.layer._get_deepep_comm_group",
+                return_value=group,
+            ),
+        ):
+            dispatcher = create_moe_dispatcher(config)
+
+        captured = self._dispatch_and_capture(
+            dispatcher,
+            hidden_states,
+            topk_output,
+            rank=0,
+            is_extend_in_batch=False,
+        )
+
+        self.assertEqual(
+            captured,
+            [
+                self.LOG_PREFIX
+                + "phase=decode rank=0 layer_id=11 actual_tokens=2 capacity=4 "
+                "padding_tokens=2 capacity_utilization=0.5 "
+                "static_padding_ratio=0.5"
+            ],
+        )
+
+    def test_full_capacity_dispatch_logs_zero_padding(self):
+        dispatcher = self._make_dispatcher(capacity=2, layer_id=5)
+        hidden_states, topk_output = self._make_dispatch_inputs(num_tokens=2)
+
+        captured = self._dispatch_and_capture(
+            dispatcher,
+            hidden_states,
+            topk_output,
+            rank=1,
+            is_extend_in_batch=False,
+        )
+
+        self.assertEqual(
+            captured,
+            [
+                self.LOG_PREFIX
+                + "phase=decode rank=1 layer_id=5 actual_tokens=2 capacity=2 "
+                "padding_tokens=0 capacity_utilization=1.0 "
+                "static_padding_ratio=0.0"
+            ],
+        )
+
+    def test_over_capacity_dispatch_raises_without_capacity_log(self):
+        dispatcher = self._make_dispatcher(capacity=4, layer_id=5)
+        hidden_states, topk_output = self._make_dispatch_inputs(num_tokens=5)
+
+        with (
+            get_forward().scoped(is_extend_in_batch=True),
+            self.assertNoLogs(self.LOGGER_NAME, level="DEBUG"),
+            self.assertRaisesRegex(ValueError, "more tokens than its static buffer"),
+        ):
+            dispatcher.dispatch(hidden_states, topk_output)
+
+
 class TestMoonEPExpertWeightLayout(unittest.TestCase):
     def _fake_layer(self):
         num_experts, hidden_size, intermediate_size = 3, 4, 5
@@ -289,9 +475,7 @@ class TestMoonEPBf16ExpertRunner(unittest.TestCase):
         for start, end, expert in [(0, 2, 0), (2, 3, 1)]:
             x = hidden_states[start:end]
             y = torch.nn.functional.linear(
-                torch.nn.functional.silu(
-                    torch.nn.functional.linear(x, gate[expert])
-                )
+                torch.nn.functional.silu(torch.nn.functional.linear(x, gate[expert]))
                 * torch.nn.functional.linear(x, up[expert]),
                 down[expert],
             )

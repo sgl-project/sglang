@@ -27,8 +27,8 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.token_dispatcher import (
     DeepEPDispatcher,
-    MoonEPDispatcher,
     MooncakeEPDispatcher,
+    MoonEPDispatcher,
     MoriEPDispatcher,
     NixlEPDispatcher,
     PplxDispatcher,
@@ -1071,7 +1071,7 @@ def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):
 
 
 class MaybeTboDeepEPDispatcher(BaseDispatcher):
-    def __init__(self, **kwargs):
+    def __init__(self, layer_id: Optional[int] = None, **kwargs):
         super().__init__()
         num_inner_dispatchers = 2 if is_tbo_enabled() else 1
         if get_moe_a2a_backend().is_deepep():
@@ -1080,7 +1080,8 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
             ]
         elif get_moe_a2a_backend().is_moonep():
             self._inners = [
-                MoonEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
+                MoonEPDispatcher(layer_id=layer_id, **kwargs)
+                for _ in range(num_inner_dispatchers)
             ]
         elif get_moe_a2a_backend().is_mooncake():
             self._inners = [

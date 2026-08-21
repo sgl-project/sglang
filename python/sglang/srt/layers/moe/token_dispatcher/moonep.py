@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, NamedTuple, NoReturn, Optional
 
@@ -8,6 +9,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -15,9 +17,10 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.topk import TopKOutput
-from sglang.srt.layers.moe.topk import TopKOutputChecker
+from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.utils import DeepEPMode
+
+logger = logging.getLogger(__name__)
 
 
 _MOONEP_UNSUPPORTED_MESSAGE = (
@@ -451,9 +454,7 @@ def run_moonep_bf16_expert(
             f"shape {cu_seqlens.shape}"
         )
     if route_weights_nvs is not None and route_weights_nvs.ndim != 1:
-        raise ValueError(
-            f"route_weights_nvs must be 1D, got {route_weights_nvs.shape}"
-        )
+        raise ValueError(f"route_weights_nvs must be 1D, got {route_weights_nvs.shape}")
 
     output = torch.empty_like(hidden_states)
     prev = 0
@@ -511,7 +512,10 @@ class MoonEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        layer_id: int | None = None,
     ):
+        if layer_id is None:
+            raise ValueError("MoonEPDispatcher requires layer_id for capacity logging.")
         super().__init__()
         self.group = group
         self.router_topk = router_topk
@@ -523,6 +527,7 @@ class MoonEPDispatcher(BaseDispatcher):
         self.deepep_mode = deepep_mode
         self.async_finish = async_finish
         self.return_recv_hook = return_recv_hook
+        self.layer_id = layer_id
         self.expert_mask_gpu = None
         self.num_max_dispatch_tokens_per_rank = (
             envs.SGLANG_MOONEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
@@ -567,6 +572,21 @@ class MoonEPDispatcher(BaseDispatcher):
                 "MoonEP runtime batch has more tokens than its static buffer "
                 f"capacity: num_tokens={num_tokens}, capacity={capacity}. "
                 "Increase SGLANG_MOONEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK."
+            )
+
+        if capacity > 0 and logger.isEnabledFor(logging.DEBUG):
+            padding_tokens = capacity - num_tokens
+            logger.debug(
+                "phase=%s rank=%s layer_id=%s actual_tokens=%s capacity=%s "
+                "padding_tokens=%s capacity_utilization=%s static_padding_ratio=%s",
+                "extend" if get_is_extend_in_batch() else "decode",
+                self._get_rank(),
+                self.layer_id,
+                num_tokens,
+                capacity,
+                padding_tokens,
+                num_tokens / capacity,
+                padding_tokens / capacity,
             )
 
         hidden_states = hidden_states.contiguous()
