@@ -1635,18 +1635,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             src_pages_t = torch.tensor(srcs, dtype=torch.int64, device=self.device)
             dst_pages_t = torch.tensor(dsts, dtype=torch.int64, device=self.device)
             v_moveds_t = self.physical_to_virtual[src_pages_t]
-            invalid_mappings = v_moveds_t < 0
-            if bool(torch.any(invalid_mappings).item()):
-                invalid_index = int(torch.nonzero(invalid_mappings)[0, 0].item())
-                src = srcs[invalid_index]
-                raise AssertionError(
-                    f"MultiEndedAllocator({self.sub_pool_name!r})."
-                    f"_flush: topmost survivor p={src} has p2v=-1; "
-                    "this should be impossible (`_topmost_survivor` "
-                    "excludes `holes_cpu` and `_pending_reuse_pages_cpu`)."
-                    f" State: {self.allocator_state_str()}, "
-                    f"#pending_reuse={len(self._pending_reuse_pages_cpu)}"
-                )
+            torch._assert_async(
+                (v_moveds_t >= 0).all(),
+                "invalid p2v mapping in MultiEndedAllocator._flush",
+            )
             # Expand to token granularity (the move kernel is token-granular).
             if self.page_size == 1:
                 src_t, dst_t = src_pages_t, dst_pages_t
