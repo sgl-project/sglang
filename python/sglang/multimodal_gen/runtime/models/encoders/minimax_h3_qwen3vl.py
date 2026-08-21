@@ -200,7 +200,7 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             try:
                 can_keep_checkpoint_tensor = bool(
-                    getattr(self, "_mps_zero_copy_weight_loading", False)
+                    getattr(self, "_keep_checkpoint_mapping", False)
                     and weight_loader is default_weight_loader
                     and param.device.type == "cpu"
                     and loaded_weight.device.type == "cpu"
