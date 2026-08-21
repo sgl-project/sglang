@@ -25,7 +25,7 @@ from __future__ import annotations
 import inspect
 import logging
 import os
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 from torch.profiler import record_function
@@ -45,10 +45,6 @@ from sglang.srt.mem_cache.unified_memory_pool import (
 from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
 
 logger = logging.getLogger(__name__)
-
-
-# OFF (default): cat unsorted, `_flush` sorts once. ON: sort after each cat.
-_SORT_FREE_LIST_AFTER_MERGE = envs.SGLANG_SORT_FREE_LIST_AFTER_MERGE.get()
 
 
 import atexit
@@ -290,6 +286,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self.free_virtual_ids = None
         self.is_not_in_free_group = True
         self.free_group: List[torch.Tensor] = []
+        # Segment frees buffer page REPRESENTATIVES here (mirrors
+        # `PagedTokenToKVPoolAllocator`), keeping their shape across the merge.
+        self.free_page_reps_group: List[torch.Tensor] = []
         self._inverse_history.clear()
         self._free_phys_pages = torch.empty(0, dtype=torch.int64, device=self.device)
         self._pending_reuse.clear()
@@ -342,6 +341,31 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         if self.grow_direction == "up":
             return self.watermark_physical * self.entry_bytes_per_page
         return self.num_pages * self.entry_bytes_per_page
+
+    def _byte_accounting_violations(self) -> List[str]:
+        """Per-sub-pool conservation strings (empty == healthy): the watermark
+        span must equal live + holes + pending pages, and frontiers must lie
+        inside the buffer. Idle-time diagnostic — pure host arithmetic."""
+        out: List[str] = []
+        total = self.unified_buffer.total_bytes
+        lo_b, hi_b = self._byte_low_frontier(), self._byte_high_frontier()
+        if not (0 <= lo_b <= hi_b <= total):
+            out.append(
+                f"[{self.sub_pool_name}] frontier out of bounds: "
+                f"low={lo_b}, high={hi_b}, total={total}"
+            )
+        if self.lazy_compaction:
+            # Lazy end: the watermark span contains live + holes + pending
+            # (eager has no holes/pending — span == live by construction).
+            holes = int(self._free_phys_pages.numel())
+            pending = len(self._pending_reuse_pages_cpu)
+            wm_span = self._allocated_pages()
+            if wm_span != self.live_page_count + holes + pending:
+                out.append(
+                    f"[{self.sub_pool_name}] span {wm_span} != live "
+                    f"{self.live_page_count} + holes {holes} + pending {pending}"
+                )
+        return out
 
     def _byte_low_frontier(self) -> int:
         """Byte starting this side's allocatable range (grow-up) / just below its lowest live page (grow-down)."""
@@ -450,16 +474,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     return None
 
             if n_drain > 0:
-                if _SORT_FREE_LIST_AFTER_MERGE:
-                    if self.grow_direction == "up":
-                        drained_t = self._free_phys_pages[:n_drain]
-                        self._free_phys_pages = self._free_phys_pages[n_drain:]
-                    else:
-                        drained_t = self._free_phys_pages[-n_drain:].flip(0)
-                        self._free_phys_pages = self._free_phys_pages[:-n_drain]
-                else:
-                    drained_t = self._free_phys_pages[:n_drain]
-                    self._free_phys_pages = self._free_phys_pages[n_drain:]
+                drained_t = self._free_phys_pages[:n_drain]
+                self._free_phys_pages = self._free_phys_pages[n_drain:]
             else:
                 drained_t = None
 
@@ -966,9 +982,16 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     # -- free with eager compaction --
 
-    def free(self, free_index: torch.Tensor) -> None:
+    def free(
+        self, free_index: torch.Tensor, *, _pages: Optional[torch.Tensor] = None
+    ) -> None:
         """Free virtual TOKEN ids: recover virtual PAGE ids, un-map v2p/p2v,
         (if id-owner) recycle the page ids, trigger eager compaction.
+
+        `_pages` carries virtual PAGE ids already derived by `free_segment`
+        from `start_pos` arithmetic; when given, the data-dependent dedup is
+        skipped. Dropped on the free-group path, which has its own
+        representative buffer.
 
         `free_index` is token-granular and need not be page-aligned. EAGER mode
         drops one `wait_stream(forward_stream)` barrier so v2p/p2v writes and the
@@ -984,7 +1007,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 self.free_group.append(self._copy_for_free_group(free_index))
                 return
             if self.lazy_compaction:
-                self._free_lazy(free_index)
+                self._free_lazy(free_index, pages=_pages)
                 return
             # --- EAGER path ---
             # Near-no-op in normal mode (sampling's CPU sync already drained
@@ -994,8 +1017,12 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 with record_function("MultiEndedAlloc.free.wait_stream"):
                     torch.cuda.current_stream().wait_stream(self.forward_stream)
             with record_function("MultiEndedAlloc.free.v2p_lookup"):
-                free_v_pages = torch.unique(
-                    free_index.detach().to(torch.int64) // self.page_size
+                free_v_pages = (
+                    _pages
+                    if _pages is not None
+                    else torch.unique(
+                        free_index.detach().to(torch.int64) // self.page_size
+                    )
                 )
                 freed_p_pages = self.virtual_to_physical[free_v_pages]
             with record_function("MultiEndedAlloc.free.sync_check"):
@@ -1004,12 +1031,54 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     self._raise_stale_slot_assertion(
                         free_v=free_v_pages, freed_p=freed_p_pages
                     )
-            self.virtual_to_physical[free_v_pages] = -1
+            self.virtual_to_physical.index_fill_(0, free_v_pages, -1)
             if self.is_id_owner:
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
             self._compact_pending(freed_p_pages)
 
-    def _free_lazy(self, free_index: torch.Tensor) -> None:
+    def _page_reps_pieces(
+        self, free_index: torch.Tensor, start_pos: int
+    ) -> Tuple[torch.Tensor, ...]:
+        """Page-representative TOKEN slices of one kv-row segment.
+
+        Mirrors `PagedTokenToKVPoolAllocator.free_segment`: a page's tokens sit
+        consecutively in the kv row, so with `start_pos` known on the host the
+        representatives are stride slices -- no `torch.unique`, whose
+        data-dependent output shape forces a device sync.
+
+        Exact for any segment shape: a partial head page is the `[:1]` term, a
+        partial tail page the final stride step.
+        """
+        ps = self.page_size
+        offset = start_pos % ps
+        if offset == 0:
+            return (free_index[::ps],)
+        return (free_index[:1], free_index[ps - offset :: ps])
+
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
+        """Fixed-shape counterpart of `free()`; see `_page_reps_pieces`.
+
+        Contract: see base; a page must be freed by only one call per group.
+        """
+        if free_index is None or free_index.numel() == 0:
+            return
+        if self.page_size == 1:
+            # token == page: nothing to dedup, the plain path is already exact.
+            self.free(free_index)
+            return
+        pieces = self._page_reps_pieces(free_index.detach().to(torch.int64), start_pos)
+        if self.is_not_in_free_group:
+            reps = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
+            self.free(reps, _pages=reps // self.page_size)
+        else:
+            # Buffer the REPRESENTATIVES, not the raw tokens: `free_group_end`
+            # concatenates page ids, so the group merge keeps the shape it
+            # would otherwise lose to `torch.cat` of whole segments.
+            self.free_page_reps_group.extend(pieces)
+
+    def _free_lazy(
+        self, free_index: torch.Tensor, pages: Optional[torch.Tensor] = None
+    ) -> None:
         """Lazy free path: disjoint-element scatters + ONE `torch.cat` onto
         `_free_phys_pages`. No sort, no boundary absorb, no watermark mutation,
         no D2H sync. Boundary absorption is deferred to `_flush`.
@@ -1023,24 +1092,31 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         with record_function("MultiEndedAlloc._free_lazy"):
             with record_function("MultiEndedAlloc._free_lazy.v2p_lookup"):
                 free_v_pages_raw = free_index.detach().to(torch.int64)
-                if self.page_size == 1:
+                if pages is not None:
+                    # `free_segment` already derived these by stride slicing.
+                    free_v_pages = pages
+                elif self.page_size == 1:
                     free_v_pages = free_v_pages_raw
                 else:
                     free_v_pages = torch.unique(free_v_pages_raw // self.page_size)
                 freed_p_pages = self.virtual_to_physical[free_v_pages]
             # Disjoint-element scatters — no barrier (a freed v has no live reader;
             # per-element scatter writes are atomic).
-            self.virtual_to_physical[free_v_pages] = -1
-            self.physical_to_virtual[freed_p_pages] = -1
+            # `index_fill_`, NOT `t[idx] = -1`: the scalar form makes torch
+            # materialise -1 as a CPU tensor and copy it H2D, and a pageable
+            # H2D copy is host-BLOCKING -- the scheduler parks behind the
+            # in-flight forward until the stream drains (~16 ms per free on an
+            # 8192-token prefill). `index_fill_` takes the scalar through the
+            # ATen Scalar overload: one device kernel, no host sync.
+            self.virtual_to_physical.index_fill_(0, free_v_pages, -1)
+            self.physical_to_virtual.index_fill_(0, freed_p_pages, -1)
             if self.is_id_owner:
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
             self._free_phys_pages = torch.cat([self._free_phys_pages, freed_p_pages])
-            if _SORT_FREE_LIST_AFTER_MERGE:
-                self._free_phys_pages, _ = torch.sort(self._free_phys_pages)
             self.live_page_count -= int(freed_p_pages.shape[0])
 
     def _release_phys_pages_batch(self, pages: torch.Tensor) -> None:
-        """Cat `pages` onto `_free_phys_pages` (+ optional sort). Called by `_flush`
+        """Cat `pages` onto `_free_phys_pages`. Called by `_flush`
         at END to merge event-fired compaction-srcs (`released_fired`) AFTER the
         trailing dst-slice, keeping `_free_phys_pages == holes_cpu` during the walk.
 
@@ -1052,8 +1128,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self._stats_n_release_batch += 1
         with record_function("MultiEndedAlloc._release_phys_pages_batch"):
             self._free_phys_pages = torch.cat([self._free_phys_pages, pages])
-            if _SORT_FREE_LIST_AFTER_MERGE:
-                self._free_phys_pages, _ = torch.sort(self._free_phys_pages)
 
     def _compact_pending(self, freed_physical_pages: torch.Tensor) -> None:
         """Eager compaction over the freed PHYSICAL pages: move survivors from the
@@ -1229,7 +1303,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self._stats_peak_pending_pages = max(
             self._stats_peak_pending_pages, cur_pending
         )
-        sort_tag = "ON" if _SORT_FREE_LIST_AFTER_MERGE else "OFF"
         logger.info(
             f"[lazy-stats sub={self.sub_pool_name!r}] "
             f"free_lazy={self._stats_n_free_lazy} "
@@ -1238,7 +1311,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             f"moves={self._stats_n_flush_moves} "
             f"abs={self._stats_n_pages_absorbed}) "
             f"drain={self._stats_n_drain_did_work}/{self._stats_n_drain_calls} "
-            f"sort={sort_tag} "
             f"peak_holes={self._stats_peak_free_list_len} "
             f"peak_pending={self._stats_peak_pending_pages} "
             f"cur_holes={cur_holes} cur_pending={cur_pending} "
@@ -1262,7 +1334,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self._stats_peak_pending_pages = max(
                 self._stats_peak_pending_pages, cur_pending
             )
-            sort_tag = "ON" if _SORT_FREE_LIST_AFTER_MERGE else "OFF"
             self._stats_final_emitted = True
             logger.info(
                 f"[lazy-stats FINAL sub={self.sub_pool_name!r} reason={reason}] "
@@ -1272,7 +1343,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 f"moves={self._stats_n_flush_moves} "
                 f"abs={self._stats_n_pages_absorbed}) "
                 f"drain={self._stats_n_drain_did_work}/{self._stats_n_drain_calls} "
-                f"sort={sort_tag} "
                 f"peak_holes={self._stats_peak_free_list_len} "
                 f"peak_pending={self._stats_peak_pending_pages} "
                 f"cur_holes={cur_holes} cur_pending={cur_pending} "
@@ -1320,8 +1390,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 self._stats_n_drained_pages_total += sum(
                     t.numel() for t in ready_tensors
                 )
-                if _SORT_FREE_LIST_AFTER_MERGE:
-                    self._free_phys_pages, _ = torch.sort(self._free_phys_pages)
 
     def maybe_drain_pending_reuse(self) -> None:
         """Public scheduler hook (once per step): flow fired compaction-src pages
@@ -1459,8 +1527,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         with record_function("MultiEndedAlloc._flush"):
             self._drain_pending_reuse(urgent=urgent)
 
-            # Sort ASCENDING (skip if the env knob keeps the list always-sorted).
-            if not _SORT_FREE_LIST_AFTER_MERGE and self._free_phys_pages.numel() > 1:
+            # Sort ASCENDING.
+            if self._free_phys_pages.numel() > 1:
                 self._free_phys_pages, _ = torch.sort(self._free_phys_pages)
 
             all_cpu = self._free_phys_pages.tolist()  # the ONE D2H sync per flush
@@ -1494,8 +1562,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # deferred to AFTER the trailing dst-slice, keeping `_free_phys_pages`
             # byte-identical to `holes_cpu` for the whole walk. That invariant is
             # what makes the directional dst-slice correct in both directions
-            # (catting srcs mid-flush would chop the wrong end / scramble under
-            # sort=ON, leaving ghost p2v=-1 pages + double-bound dsts). Event-
+            # (catting srcs mid-flush would chop the wrong end, leaving ghost
+            # p2v=-1 pages + double-bound dsts). Event-
             # PENDING srcs still route to `_pending_reuse` (read-race gating).
             released_fired: List[torch.Tensor] = []
 
@@ -1674,7 +1742,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # ONE bulk remap (single-writer on schedule_stream).
             self.virtual_to_physical[v_moveds_t] = dst_pages_t
             self.physical_to_virtual[dst_pages_t] = v_moveds_t
-            self.physical_to_virtual[src_pages_t] = -1
+            self.physical_to_virtual.index_fill_(0, src_pages_t, -1)
             self._inverse_history.append((src_pages_t, dst_pages_t, v_moveds_t))
             # Src disposition — ONE entry per batch. `src_pages_t` is reused as the
             # `_pending_reuse` GPU tensor (no second H2D at drain).
@@ -1719,6 +1787,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     def free_group_begin(self) -> None:
         self.is_not_in_free_group = False
         self.free_group = []
+        self.free_page_reps_group = []
 
     def free_group_end(self) -> None:
         self.is_not_in_free_group = True
@@ -1726,6 +1795,48 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             merged = torch.cat(self.free_group)
             self.free_group = []
             self.free(merged)
+        if self.free_page_reps_group:
+            # Segment frees buffered REPRESENTATIVES, so the merge concatenates
+            # page ids rather than whole token ranges -- `torch.cat` of the
+            # ranges is what would have destroyed the per-segment shape and
+            # forced the position-less dedup.
+            reps = torch.cat(self.free_page_reps_group)
+            self.free_page_reps_group = []
+            self.free(reps, _pages=reps // self.page_size)
+
+
+def _chain_byte_accounting_violations(
+    chain: List[MultiEndedAllocator],
+) -> List[str]:
+    """Conservation for an ordered low→high chain of band allocators: each
+    member's own accounting, plus the frontier total order — a member's low
+    frontier must clear the previous member's high frontier, or the bands
+    overlap in the shared byte buffer.
+
+    Today's chains are the 2-pool end pairs; the N-pool track inserts float
+    middles here (and teaches the walk to skip empty/parked ones).
+    """
+    out: List[str] = []
+    for a in chain:
+        out.extend(a._byte_accounting_violations())
+    frontier = 0
+    for a in chain:
+        lo_b, hi_b = a._byte_low_frontier(), a._byte_high_frontier()
+        if lo_b < frontier:
+            out.append(
+                f"[chain] {a.sub_pool_name} low frontier {lo_b} overlaps the "
+                f"previous pool's high frontier {frontier}"
+            )
+        frontier = max(frontier, hi_b)
+    return out
+
+
+def _end_pair_chain(
+    a: MultiEndedAllocator, b: MultiEndedAllocator
+) -> List[MultiEndedAllocator]:
+    """Order an end pair low→high by grow direction (the factories and the
+    unit fixtures orient the pair differently; the chain check must not care)."""
+    return sorted((a, b), key=lambda x: x.grow_direction != "up")
 
 
 class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -1799,6 +1910,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self.is_not_in_free_group = True
         self.free_group: List[torch.Tensor] = []
+        self.free_page_reps_group: List[torch.Tensor] = []
         # Base init left these None; we use watermark math, not free-lists.
         self.free_pages = torch.empty(0, dtype=torch.int64, device=device)
         self.release_pages = torch.empty(0, dtype=torch.int64, device=device)
@@ -1988,9 +2100,40 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_attn_allocator.clear_inverse_history()
             self.mamba_allocator.clear_inverse_history()
 
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
+        """Fixed-shape counterpart of `free()`; see
+        `MultiEndedAllocator._page_reps_pieces`. The mamba sub-pool is
+        slot-granular and untouched by a token free, so only the full side
+        needs the representatives.
+        """
+        if free_index is None or free_index.numel() == 0:
+            return
+        if self.page_size == 1:
+            self.free(free_index)
+            return
+        pieces = self.full_attn_allocator._page_reps_pieces(
+            free_index.detach().to(torch.int64), start_pos
+        )
+        if self.is_not_in_free_group:
+            self._release_page_reps(pieces)
+        else:
+            self.free_page_reps_group.extend(pieces)
+
+    def _release_page_reps(self, pieces: Sequence[torch.Tensor]) -> None:
+        reps = pieces[0] if len(pieces) == 1 else torch.cat(tuple(pieces))
+        self.full_attn_allocator.free(reps, _pages=reps // self.page_size)
+        self.full_attn_allocator.clear_inverse_history()
+        self.mamba_allocator.clear_inverse_history()
+
+    def verify_byte_accounting(self) -> List[str]:
+        return _chain_byte_accounting_violations(
+            _end_pair_chain(self.mamba_allocator, self.full_attn_allocator)
+        )
+
     def free_group_begin(self) -> None:
         self.is_not_in_free_group = False
         self.free_group = []
+        self.free_page_reps_group = []
 
     def free_group_end(self) -> None:
         self.is_not_in_free_group = True
@@ -2000,12 +2143,17 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_attn_allocator.free(merged)
             self.full_attn_allocator.clear_inverse_history()
             self.mamba_allocator.clear_inverse_history()
+        if self.free_page_reps_group:
+            pieces = self.free_page_reps_group
+            self.free_page_reps_group = []
+            self._release_page_reps(pieces)
 
     def clear(self) -> None:
         self.full_attn_allocator.clear()
         self.mamba_allocator.clear()
         self.is_not_in_free_group = True
         self.free_group = []
+        self.free_page_reps_group = []
 
     # -- Lazy compaction hooks --
 
@@ -2144,6 +2292,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         self.is_not_in_free_group = True
         self.free_group: List[torch.Tensor] = []
+        self.free_page_reps_group: List[torch.Tensor] = []
         # Empty (not None) for the leak checker.
         self.free_pages = torch.empty(0, dtype=torch.int64, device=device)
         self.release_pages = torch.empty(0, dtype=torch.int64, device=device)
@@ -2510,12 +2659,53 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             merged = torch.cat(self.free_group)
             self.free_group = []
             self.free(merged)
+        if self.free_page_reps_group:
+            pieces = self.free_page_reps_group
+            self.free_page_reps_group = []
+            self._release_page_reps(pieces)
+
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
+        """Fixed-shape counterpart of `free()`; see
+        `MultiEndedAllocator._page_reps_pieces`. Both sides share one
+        derivation -- neither repeats the position-less dedup.
+        """
+        if free_index is None or free_index.numel() == 0:
+            return
+        if self.page_size == 1:
+            self.free(free_index)
+            return
+        pieces = self.full_attn_allocator._page_reps_pieces(
+            free_index.detach().to(torch.int64), start_pos
+        )
+        if self.is_not_in_free_group:
+            self._release_page_reps(pieces)
+        else:
+            self.free_page_reps_group.extend(pieces)
+
+    def _release_page_reps(self, pieces: Sequence[torch.Tensor]) -> None:
+        reps = pieces[0] if len(pieces) == 1 else torch.cat(tuple(pieces))
+        v_pages = reps // self.page_size
+        # Same tombstone filter as `free`, but at PAGE granularity (page_size
+        # times smaller): `> 0` strict -- -1 = tombstoned, 0 = padding sink.
+        swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[v_pages]
+        live_pages = v_pages[swa_v2p_pages > 0]
+        if live_pages.numel() > 0:
+            self.swa_attn_allocator.free(live_pages * self.page_size, _pages=live_pages)
+        self.full_attn_allocator.free(reps, _pages=v_pages)
+        self.full_attn_allocator.clear_inverse_history()
+        self.swa_attn_allocator.clear_inverse_history()
+
+    def verify_byte_accounting(self) -> List[str]:
+        return _chain_byte_accounting_violations(
+            _end_pair_chain(self.full_attn_allocator, self.swa_attn_allocator)
+        )
 
     def clear(self) -> None:
         self.full_attn_allocator.clear()
         self.swa_attn_allocator.clear()
         self.is_not_in_free_group = True
         self.free_group = []
+        self.free_page_reps_group = []
 
     # -- Lazy compaction hooks --
 
