@@ -1258,6 +1258,7 @@ class EmbeddingReqInput:
                 lora_id=self.lora_id[i] if self.lora_id is not None else None,
                 positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 http_worker_ipc=self.http_worker_ipc,
+                routing_key=self.routing_key,
                 priority=self.priority,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
                 return_prompt_token_ids=self.return_prompt_token_ids,
@@ -1286,6 +1287,7 @@ class EmbeddingReqInput:
                 lora_id=self.lora_id[i] if self.lora_id is not None else None,
                 positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 http_worker_ipc=self.http_worker_ipc,
+                routing_key=self.routing_key,
                 priority=self.priority,
                 dimensions=self.dimensions,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
@@ -1318,6 +1320,8 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     positional_embed_overrides: Optional[PositionalEmbeds] = None
     # For DP routing
     routed_dp_rank: Optional[int] = None
+    # Routing key for routing-key schedule policy
+    routing_key: Optional[str] = None
     # Priority for the request
     priority: Optional[int] = None
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
