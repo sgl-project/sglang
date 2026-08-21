@@ -27,6 +27,9 @@ import { fileURLToPath } from "node:url";
 const SNIPPETS = join(dirname(fileURLToPath(import.meta.url)), "..", "src", "snippets");
 const CONFIGS = join(SNIPPETS, "configs");
 const DIFFUSION_COOKBOOK = join(SNIPPETS, "..", "..", "cookbook", "diffusion");
+const COOKBOOK_MODEL_TEMPLATE = join(
+  SNIPPETS, "..", "..", "..", ".claude", "skills", "cookbook-add-model",
+  "templates", "config.jsx.tmpl");
 const LEGACY_DIMS = ["variants", "quantizations", "strategies", "nodesOptions"];
 
 const failures = [];
@@ -69,6 +72,19 @@ if (a && b && a !== b) {
 const playgroundSource = readFileSync(join(SNIPPETS, "_playground.jsx"), "utf8");
 if (/\bmatchedCell\s*!==\s*baseCell\b/.test(playgroundSource)) {
   fail("_playground.jsx", "sibling detection compares cloned cells by object identity");
+}
+
+const cookbookModelTemplate = readFileSync(COOKBOOK_MODEL_TEMPLATE, "utf8");
+for (const oldName of [
+  "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS",
+  "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND",
+]) {
+  if (cookbookModelTemplate.includes(oldName)) {
+    fail("config.jsx.tmpl", `still emits removed W4A4 setting ${oldName}`);
+  }
+}
+if (!cookbookModelTemplate.includes("--enable-w4a4-megamoe")) {
+  fail("config.jsx.tmpl", "W4A4 MegaMoE option is missing the server flag");
 }
 
 // --------------------------------------------------------------- 3/4. Configs

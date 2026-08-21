@@ -2390,6 +2390,13 @@ class ServerArgs:
         ),
         NS("exec.moe"),
     ] = "none"
+    enable_w4a4_megamoe: A[
+        bool,
+        "Enable the W4A4 MegaMoE path by setting DeepGEMM's "
+        "DG_USE_FP4_ACTS=1 and DG_USE_MXF4_KIND=1. Use with "
+        "--moe-a2a-backend megamoe.",
+        NS("exec.moe"),
+    ] = False
     moe_runner_backend: A[
         str,
         Arg(
@@ -3652,6 +3659,7 @@ class ServerArgs:
         self._resolved_overrides = []
 
         self._handle_moe_runner_backend_alias()
+        self._handle_w4a4_megamoe_env()
         self._handle_return_hidden_states_mode()
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
@@ -3837,6 +3845,13 @@ class ServerArgs:
             )
         self.moe_runner_backend = "auto"
         self.moe_a2a_backend = "megamoe"
+
+    def _handle_w4a4_megamoe_env(self):
+        if not self.enable_w4a4_megamoe:
+            return
+
+        os.environ["DG_USE_FP4_ACTS"] = "1"
+        os.environ["DG_USE_MXF4_KIND"] = "1"
 
     def _handle_return_hidden_states_mode(self):
         if self.return_hidden_states_mode not in (None, "last", "full"):
