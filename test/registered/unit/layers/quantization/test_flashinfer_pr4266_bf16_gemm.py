@@ -52,3 +52,9 @@ def test_bf16_splitk_env_kill_switch(monkeypatch):
 def test_bf16_splitk_does_not_override_torch_backend(monkeypatch):
     monkeypatch.setenv("SGLANG_ENABLE_BF16_SPLITK_GEMM", "1")
     assert not should_enable_bf16_splitk_gemm(Bf16GemmBackend.TORCH)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
