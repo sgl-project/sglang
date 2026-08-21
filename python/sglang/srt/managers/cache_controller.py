@@ -182,14 +182,12 @@ class CacheOperation:
             -1,
             priority,
             pool_transfers=CacheOperation._merge_pool_transfers(ops),
-            device_values_ready_event=next(
-                (
-                    op.device_values_ready_event
-                    for op in reversed(ops)
-                    if op.device_values_ready_event is not None
-                ),
-                None,
-            ),
+            device_values_ready_event=tuple(
+                op.device_values_ready_event
+                for op in ops
+                if op.device_values_ready_event is not None
+            )
+            or None,
         )
         merged_op.node_ids = node_ids
         return merged_op
@@ -426,7 +424,13 @@ class HiCacheController:
                 # CUDA current streams are thread-local.  Wait on the event
                 # recorded by the scheduler before Tensor.cpu() observes the
                 # allocator output from its current forward stream.
-                dependency.synchronize()
+                dependencies = (
+                    dependency
+                    if isinstance(dependency, (list, tuple))
+                    else (dependency,)
+                )
+                for event in dependencies:
+                    event.synchronize()
                 fn(*args)
             except BaseException as exc:
                 self._direct_dispatch_error = exc

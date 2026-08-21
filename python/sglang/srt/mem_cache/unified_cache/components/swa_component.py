@@ -294,7 +294,7 @@ class SWAComponent(TreeComponent):
                 )
                 return 0
             full_cd.value = value_slice.clone()
-            self.tree_core._record_device_values_ready()
+            self.tree_core._record_device_values_ready(node)
             # This node's SWA component is a tombstone, so old_full owns no SWA
             # slots.  Freeing it through the combined allocator needlessly
             # performs dynamic mapping discovery on CUDA.
@@ -318,7 +318,7 @@ class SWAComponent(TreeComponent):
                 )
                 return start_idx
             node.component_data[BASE_COMPONENT_TYPE].value = new_full.clone()
-            self.tree_core._record_device_values_ready()
+            self.tree_core._record_device_values_ready(node)
             cache_actions.append(
                 FreeComponentDeviceSlot([old_full], component_type=BASE_COMPONENT_TYPE)
             )

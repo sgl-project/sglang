@@ -1383,7 +1383,7 @@ class UnifiedRadixCache(BasePrefixCache):
             node_id=node_id,
             extra_pools=aux_xfers or None,
             defer_start=defer_start,
-            device_values_ready_event=self.tree_core.device_values_ready_event(),
+            device_values_ready_event=self.tree_core.device_values_ready_event(node_id),
         )
 
     def _track_write_through_node(

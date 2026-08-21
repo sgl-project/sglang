@@ -352,13 +352,13 @@ class HybridCacheController(BaseHiCacheController):
         ops = self.write_queue
         self.write_queue = []
         if self.io_backend == "direct":
-            dependency = next(
-                (
+            dependency = (
+                tuple(
                     op.device_values_ready_event
-                    for op in reversed(ops)
+                    for op in ops
                     if op.device_values_ready_event is not None
-                ),
-                None,
+                )
+                or None
             )
             self._enqueue_direct_dispatch(
                 self._merge_and_start_writing_ops,
