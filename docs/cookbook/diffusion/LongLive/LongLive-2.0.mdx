@@ -5,13 +5,15 @@ description: "Serve LongLive 2.0 distilled text-to-video and image-to-video mode
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
-<DiffusionModelTags tags={["video", "text-to-video", "image-to-video", "few-step", "multi-shot"]} />
+<DiffusionModelTags tags={["video", "text/image-to-video", "4-step", "multi-shot", "Wan2.2 5B"]} />
 
 ## 1. Model Introduction
 
-[LongLive 2.0](https://nvlabs.github.io/LongLive/LongLive2/) is a distilled few-step text-to-video and image-to-video model from NVIDIA, built on Wan2.2-TI2V-5B. SGLang serves the Diffusers-format conversion for single-prompt and multi-shot video generation.
+[LongLive 2.0](https://nvlabs.github.io/LongLive/LongLive2/) is NVIDIA's 4-step text/image-to-video model distilled from Wan2.2-TI2V-5B. Its main strength is extending few-step causal generation across prompt changes, so a single request can produce multi-shot sequences without paying a full diffusion schedule for every shot.
 
-For more details, check the [LongLive 2.0 paper](https://arxiv.org/abs/2605.18739) and [LongLive 2.0 GitHub](https://github.com/NVlabs/LongLive). The model weights are released under the NVIDIA Open Model License.
+Choose it for low-step long or multi-shot generation rather than maximum one-shot fidelity. The SGLang path uses a Diffusers conversion of the official weights, and scene continuity still depends on prompt-block and sink settings; validate transitions on the target storyboard.
+
+The model weights use the NVIDIA Open Model License. See the [paper](https://arxiv.org/abs/2605.18739) and [GitHub repository](https://github.com/NVlabs/LongLive) for training details.
 
 ## 2. SGLang-diffusion Installation
 
