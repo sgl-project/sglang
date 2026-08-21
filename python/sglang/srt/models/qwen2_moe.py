@@ -268,6 +268,7 @@ class Qwen2MoeMLP(nn.Module):
 
         if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
             x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))
+            return x
 
         if self._fp8_silu_fuse and gate_up.shape[0] > 0:
             import aiter
@@ -279,8 +280,8 @@ class Qwen2MoeMLP(nn.Module):
             scale = torch.empty((M, 1), dtype=torch.float32, device=gate_up.device)
             aiter.silu_and_mul_quant(out_fp8, gate_up, scale, N)
             x, _ = self.down_proj((out_fp8, scale))
-
             return x
+
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
