@@ -58,6 +58,8 @@ COMMON_ARGS: List[str] = [
     "--disable-radix-cache",
     "--mem-fraction-static",
     "0.85",
+    "--cuda-graph-max-bs-decode",
+    "256",
     "--model-loader-extra-config",
     '{"enable_multithread_load": true}',
     "--watchdog-timeout",
