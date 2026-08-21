@@ -162,6 +162,13 @@ class _DflashDraftSampler:
         self.out[:n].copy_(selected.view(-1))
 
 
+def _get_dflash_embedding_module(draft_model, target_model):
+    draft_embed_module = draft_model.get_input_embeddings()
+    if draft_embed_module is not None:
+        return draft_embed_module
+    return target_model.get_input_embeddings()
+
+
 def _commit_accept(candidates, accept_len, bonus_tokens):
     """The committed block: drafted tokens shifted left, the bonus at the accept
     boundary. Returns it with the commit lengths."""
@@ -1082,19 +1089,38 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         weight = lm_head.weight  # [local_vocab_padded, hidden]
         weight_dtype = weight.dtype
+        quant_method = getattr(lm_head, "quant_method", None)
+        use_quant_method = should_apply_lm_head_quant_method(lm_head, quant_method)
+        logits_dtype = hidden_states.dtype if use_quant_method else weight_dtype
         num_tokens = int(hidden_states.shape[0])
         out_tokens = torch.empty(
             (num_tokens,), dtype=torch.long, device=hidden_states.device
         )
 
         def _cast_hs(x: torch.Tensor) -> torch.Tensor:
+            if use_quant_method:
+                return x
             return x if x.dtype == weight_dtype else x.to(weight_dtype)
+
+        def _compute_local_logits(x: torch.Tensor) -> torch.Tensor:
+            x = _cast_hs(x)
+            if use_quant_method:
+                return quant_method.apply(lm_head, x, None)
+            return torch.matmul(x, weight.T)
+
+        def _compute_local_logits_slice(
+            x: torch.Tensor, start: int, end: int
+        ) -> torch.Tensor:
+            x = _cast_hs(x)
+            if use_quant_method:
+                return quant_method.apply(lm_head, x, None)[:, start:end]
+            return torch.matmul(x, weight[start:end].T)
 
         if not hasattr(lm_head, "shard_indices"):
             for start in range(0, num_tokens, int(chunk_size)):
                 end = min(num_tokens, start + int(chunk_size))
-                hs = _cast_hs(hidden_states[start:end])
-                logits = torch.matmul(hs, weight.T)
+                hs = hidden_states[start:end]
+                logits = _compute_local_logits(hs)
                 out_tokens[start:end] = torch.argmax(logits, dim=-1).to(torch.long)
             return out_tokens
 
@@ -1147,9 +1173,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             fast_chunk_size = max(int(chunk_size), 1024)
             for start in range(0, num_tokens, fast_chunk_size):
                 end = min(num_tokens, start + fast_chunk_size)
-                hs = _cast_hs(hidden_states[start:end])
+                hs = hidden_states[start:end]
                 if num_org > 0:
-                    base_logits = torch.matmul(hs, weight[:num_org].T)
+                    base_logits = _compute_local_logits_slice(hs, 0, num_org)
                     local_max, local_arg = _ensure_local_reduce_buffers(
                         end - start, base_logits.dtype, hs.device
                     )
@@ -1162,12 +1188,19 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         for start in range(0, num_tokens, int(chunk_size)):
             end = min(num_tokens, start + int(chunk_size))
-            hs = _cast_hs(hidden_states[start:end])
+            hs = hidden_states[start:end]
             chunk_len = int(hs.shape[0])
+            quantized_local_logits = (
+                _compute_local_logits(hs) if use_quant_method else None
+            )
 
             # Base vocab logits.
             if num_org > 0:
-                base_logits = torch.matmul(hs, weight[:num_org].T)
+                base_logits = (
+                    quantized_local_logits[:, :num_org]
+                    if quantized_local_logits is not None
+                    else _compute_local_logits_slice(hs, 0, num_org)
+                )
                 local_max, local_arg = _ensure_local_reduce_buffers(
                     chunk_len, base_logits.dtype, hs.device
                 )
@@ -1175,8 +1208,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             else:
                 local_max = torch.full(
                     (chunk_len,),
-                    torch.finfo(weight_dtype).min,
-                    dtype=weight_dtype,
+                    torch.finfo(logits_dtype).min,
+                    dtype=logits_dtype,
                     device=hs.device,
                 )
                 local_arg = torch.zeros(
@@ -1187,8 +1220,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             if num_added > 0:
                 added_slice_start = num_org_padded
                 added_slice_end = num_org_padded + num_added
-                added_logits = torch.matmul(
-                    hs, weight[added_slice_start:added_slice_end].T
+                added_logits = (
+                    quantized_local_logits[:, added_slice_start:added_slice_end]
+                    if quantized_local_logits is not None
+                    else _compute_local_logits_slice(
+                        hs, added_slice_start, added_slice_end
+                    )
                 )
                 added_max, added_arg = torch.max(added_logits, dim=-1)
                 use_added = added_max > local_max
@@ -1749,7 +1786,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
-        embed_module = target_model.get_input_embeddings()
+        embed_module = _get_dflash_embedding_module(self.draft_model, target_model)
         lm_head = getattr(target_model, "lm_head", None)
         if lm_head is None or not (
             hasattr(lm_head, "weight")

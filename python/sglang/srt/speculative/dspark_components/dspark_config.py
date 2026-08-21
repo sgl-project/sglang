@@ -57,6 +57,7 @@ class DSparkDraftConfig(msgspec.Struct, frozen=True):
     mask_token_id: Optional[int]
     markov_rank: int
     markov_head_type: Optional[str]
+    sample_from_anchor: bool
 
     def resolve_gamma(self, *, default: Optional[int] = None) -> Optional[int]:
         return self.gamma if self.gamma is not None else default
@@ -68,7 +69,9 @@ class DSparkDraftConfig(msgspec.Struct, frozen=True):
 class DSparkRuntimeConfig(msgspec.Struct, frozen=True):
     gamma: int
     verify_num_draft_tokens: int
+    query_token_num: int
     mask_token_id: int
+    sample_from_anchor: bool
 
 
 def resolve_runtime_config(
@@ -100,7 +103,8 @@ def resolve_runtime_config(
         if config_gamma is not None and int(config_gamma) != gamma:
             logger.warning(
                 "DSpark gamma mismatch: using gamma=%s (from "
-                "speculative_num_draft_tokens=%s) but draft config block_size=%s.",
+                "speculative_num_draft_tokens=%s) but resolved draft config "
+                "gamma=%s.",
                 gamma,
                 speculative_num_draft_tokens,
                 config_gamma,
@@ -120,22 +124,37 @@ def resolve_runtime_config(
     return DSparkRuntimeConfig(
         gamma=gamma,
         verify_num_draft_tokens=gamma + 1,
+        query_token_num=gamma if draft_config.sample_from_anchor else gamma + 1,
         mask_token_id=mask_token_id,
+        sample_from_anchor=draft_config.sample_from_anchor,
     )
+
+
+def read_draft_checkpoint_config(*, server_args: ServerArgs) -> DSparkDraftConfig:
+    """Load and normalize the DSpark draft checkpoint configuration."""
+    from sglang.srt.arg_groups.overrides import resolved_view
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    draft_hf_config = None
+    if (
+        server_args.speculative_draft_model_path
+        == resolved_view(server_args).model_path
+    ):
+        draft_hf_config = server_args.get_model_config().hf_config
+    if draft_hf_config is None:
+        draft_hf_config = get_config(
+            server_args.speculative_draft_model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.speculative_draft_model_revision,
+            model_override_args=json.loads(server_args.json_model_override_args),
+            model_config_parser=server_args.model_config_parser,
+        )
+    return parse_dspark_draft_config(draft_hf_config=draft_hf_config)
 
 
 def read_draft_checkpoint_gamma(*, server_args: ServerArgs) -> Optional[int]:
-    """Load the draft checkpoint's hf config and read its DSpark gamma
-    (block_size). Raises on config-load failure; callers pick the fallback."""
-    from sglang.srt.utils.hf_transformers_utils import get_config
-
-    draft_hf_config = get_config(
-        server_args.speculative_draft_model_path,
-        trust_remote_code=server_args.trust_remote_code,
-        revision=server_args.speculative_draft_model_revision,
-        model_override_args=json.loads(server_args.json_model_override_args),
-    )
-    return parse_dspark_draft_config(draft_hf_config=draft_hf_config).resolve_gamma(
+    """Load the draft checkpoint config and read its DSpark gamma."""
+    return read_draft_checkpoint_config(server_args=server_args).resolve_gamma(
         default=None
     )
 
@@ -265,9 +284,52 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
             f"DSpark mask_token_id must be non-negative, got {mask_token_id}."
         )
 
-    gamma = (
+    raw_sample_from_anchor = dspark_cfg.get(
+        "sample_from_anchor",
+        _cfg_get(
+            text_config,
+            "sample_from_anchor",
+            _cfg_get(draft_hf_config, "sample_from_anchor", None),
+        ),
+    )
+    raw_bonus_anchor = dspark_cfg.get(
+        "bonus_anchor",
+        _cfg_get(
+            text_config,
+            "dspark_bonus_anchor",
+            _cfg_get(draft_hf_config, "dspark_bonus_anchor", None),
+        ),
+    )
+    if raw_sample_from_anchor is None:
+        sample_from_anchor = (
+            not bool(raw_bonus_anchor) if raw_bonus_anchor is not None else True
+        )
+    else:
+        sample_from_anchor = bool(raw_sample_from_anchor)
+        if raw_bonus_anchor is not None and sample_from_anchor == bool(
+            raw_bonus_anchor
+        ):
+            logger.warning(
+                "DSpark config has conflicting sample_from_anchor=%s and "
+                "dspark_bonus_anchor=%s; sample_from_anchor takes precedence.",
+                sample_from_anchor,
+                bool(raw_bonus_anchor),
+            )
+
+    raw_block_size = (
         int(prefixed_block_size) if prefixed_block_size is not None else base.block_size
     )
+    # Standalone DSpark checkpoints use block_size for the query block. In the
+    # bonus-anchor layout, one query slot is the non-proposed anchor, leaving
+    # block_size - 1 proposed tokens. Bundled dspark_block_size retains its
+    # existing gamma convention.
+    gamma = raw_block_size
+    if prefixed_block_size is None and gamma is not None and not sample_from_anchor:
+        gamma -= 1
+        if gamma < 1:
+            raise ValueError(
+                "DSpark bonus-anchor block_size must be >= 2, " f"got {raw_block_size}."
+            )
 
     if prefixed_target_layer_ids is not None:
         if not isinstance(prefixed_target_layer_ids, (list, tuple)) or not len(
@@ -292,4 +354,5 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         mask_token_id=mask_token_id,
         markov_rank=markov_rank,
         markov_head_type=markov_head_type,
+        sample_from_anchor=sample_from_anchor,
     )

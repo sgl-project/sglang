@@ -80,6 +80,28 @@ class DraftProposal(msgspec.Struct, frozen=True):
     folded: bool = False
 
 
+def select_draft_hidden(
+    hidden_states: torch.Tensor,
+    *,
+    bs: int,
+    query_token_num: int,
+    gamma: int,
+    sample_from_anchor: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    expected_rows = bs * query_token_num
+    if hidden_states.shape[0] != expected_rows:
+        raise RuntimeError(
+            f"DSpark draft returned {hidden_states.shape[0]} hidden rows, "
+            f"expected {expected_rows}."
+        )
+    hidden_by_query = hidden_states.view(bs, query_token_num, *hidden_states.shape[1:])
+    sample_offset = 0 if sample_from_anchor else 1
+    selected = hidden_by_query[:, sample_offset : sample_offset + gamma].contiguous()
+    model_hidden = selected.view(bs * gamma, *hidden_states.shape[1:])
+    sampling_hidden = selected.view(bs, gamma, -1)
+    return model_hidden, sampling_hidden
+
+
 def make_next_draft_input(
     *,
     bonus_tokens: torch.Tensor,
@@ -170,6 +192,7 @@ class DraftBlockProposer:
         draft_model,
         draft_model_runner,
         gamma: int,
+        sample_from_anchor: bool,
         mask_token_id: int,
         draft_block_spec_info,
         dp_moe_sync: bool = False,
@@ -177,10 +200,17 @@ class DraftBlockProposer:
         self.draft_model = draft_model
         self.draft_model_runner = draft_model_runner
         self.gamma = gamma
+        self.sample_from_anchor = bool(sample_from_anchor)
+        self.query_token_num = self.gamma if self.sample_from_anchor else self.gamma + 1
         self._mask_token_id = mask_token_id
         self._draft_block_spec_info = draft_block_spec_info
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
+        self._embed_module = draft_model.embed_tokens
+        if self._embed_module is None:
+            raise RuntimeError(
+                "DSpark draft embedding must be attached before proposal."
+            )
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
@@ -198,10 +228,8 @@ class DraftBlockProposer:
         verify_window: VerifyWindow,
         bs: int,
         device: str,
-        target_model,
         sampling_info,
     ) -> DraftProposal:
-        embed_module = target_model.get_input_embeddings()
         draft_sampler = self._draft_sampler
         all_greedy = sampling_info is None or sampling_info.is_all_greedy
         fwd = self._run_forward(
@@ -210,7 +238,7 @@ class DraftBlockProposer:
             verify_window=verify_window,
             bs=bs,
             device=device,
-            embed_module=embed_module,
+            embed_module=self._embed_module,
             draft_sampler=draft_sampler,
             sampling_info=sampling_info,
         )
@@ -320,16 +348,20 @@ class DraftBlockProposer:
         sampling_info=None,
     ) -> DraftForwardResult:
         gamma = self.gamma
+        query_token_num = self.query_token_num
         prefix_lens = batch.seq_lens
         positions_2d = verify_window.positions_2d
         verify_cache_loc_2d = verify_window.verify_cache_loc_2d
 
         draft_block_ids = torch.full(
-            (bs, gamma), int(self._mask_token_id), dtype=torch.long, device=device
+            (bs, query_token_num),
+            int(self._mask_token_id),
+            dtype=torch.long,
+            device=device,
         )
         draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
-        draft_positions = positions_2d[:, :gamma].reshape(-1)
-        draft_cache_loc = verify_cache_loc_2d[:, :gamma].reshape(-1)
+        draft_positions = positions_2d[:, :query_token_num].reshape(-1)
+        draft_cache_loc = verify_cache_loc_2d[:, :query_token_num].reshape(-1)
 
         draft_owns_embed = envs.SGLANG_DSPARK_EMBED_IN_GRAPH.get() and hasattr(
             self.draft_model, "forward_embed"
@@ -340,7 +372,7 @@ class DraftBlockProposer:
             draft_input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         if batch.seq_lens_cpu is not None:
-            draft_seq_lens_cpu = batch.seq_lens_cpu + gamma
+            draft_seq_lens_cpu = batch.seq_lens_cpu + query_token_num
             draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())
         elif draft_input.nxt_kv_lens_cpu is not None:
             draft_seq_lens_cpu = draft_input.nxt_kv_lens_cpu
@@ -348,7 +380,7 @@ class DraftBlockProposer:
         else:
             raise RuntimeError("DSpark decode expected batch.seq_lens_cpu, got None")
 
-        draft_num_tokens = bs * gamma
+        draft_num_tokens = bs * query_token_num
         draft_forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
             batch_size=bs,
@@ -380,10 +412,16 @@ class DraftBlockProposer:
         raw_hidden = logits_output.hidden_states
         if raw_hidden is None:
             raise RuntimeError("DSpark draft model returned no hidden states.")
-        draft_hidden_3d = raw_hidden.view(bs, gamma, -1)
+        model_hidden, draft_hidden_3d = select_draft_hidden(
+            raw_hidden,
+            bs=bs,
+            query_token_num=query_token_num,
+            gamma=gamma,
+            sample_from_anchor=self.sample_from_anchor,
+        )
         return DraftForwardResult(
             draft_block_ids=draft_block_ids,
-            raw_hidden=raw_hidden,
+            raw_hidden=model_hidden,
             draft_hidden_3d=draft_hidden_3d,
             can_run_graph=draft_out.can_run_graph,
         )

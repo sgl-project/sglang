@@ -25,6 +25,7 @@ for _ in (
     "sglang.srt.speculative.decoupled_spec_io",
     "sglang.srt.speculative.spec_info",
     "sglang.srt.speculative.eagle_info",
+    "sglang.srt.speculative.spec_utils",
 ):
     sys.modules.setdefault(_, MagicMock())
 

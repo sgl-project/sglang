@@ -126,7 +126,11 @@ class CustomSpecAlgo:
         return self.factory(server_args)
 
     def get_num_tokens_per_req_for_target_verify(
-        self, num_draft_tokens: int, is_draft_worker: bool
+        self,
+        num_draft_tokens: int,
+        is_draft_worker: bool,
+        *,
+        sample_from_anchor: bool,
     ) -> int:
         # FIXME: Remove this after the forward mode refactor. Target verify is
         # essentially a fixed sequence length prefill/extend with full cuda
@@ -136,7 +140,11 @@ class CustomSpecAlgo:
         return num_draft_tokens
 
     def get_num_tokens_per_bs_for_target_verify(
-        self, num_draft_tokens: int, is_draft_worker: bool
+        self,
+        num_draft_tokens: int,
+        is_draft_worker: bool,
+        *,
+        sample_from_anchor: bool,
     ) -> int:
         # Deprecated alias; remove together with the FIXME above.
         warnings.warn(
@@ -146,7 +154,9 @@ class CustomSpecAlgo:
             stacklevel=2,
         )
         return self.get_num_tokens_per_req_for_target_verify(
-            num_draft_tokens, is_draft_worker
+            num_draft_tokens,
+            is_draft_worker,
+            sample_from_anchor=sample_from_anchor,
         )
 
     def build_disagg_draft_input(

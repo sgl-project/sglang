@@ -9,6 +9,9 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     SampleStepTokens,
 )
 from sglang.srt.environ import DsparkFoldedSampling, envs
+from sglang.srt.speculative.dspark_components.dspark_draft import (
+    select_draft_hidden,
+)
 from sglang.srt.utils import get_available_gpu_memory
 
 logger = logging.getLogger(__name__)
@@ -17,13 +20,42 @@ logger = logging.getLogger(__name__)
 _CAPTURE_HEADROOM_GB = 1.0
 
 
-def _base_logits_dtype(model) -> torch.dtype:
-    """Dtype of the block logits; a quantized head's packed `weight` carries no
-    logits dtype, its kernel emits the activation (draft param) dtype instead."""
-    weight = model.lm_head.weight
-    if weight.is_floating_point():
-        return weight.dtype
-    return next(model.markov_head.parameters()).dtype
+def _resolve_corrected_logits_dtype(model) -> torch.dtype:
+    """Resolve the floating-point dtype produced by the shared LM head.
+
+    Quantized heads store packed weights in an integer dtype, but their quant
+    method returns floating-point logits. Static folded-sampling buffers must
+    follow that output dtype rather than the packed parameter dtype.
+    """
+    lm_head_weight = model.lm_head.weight
+    if lm_head_weight.dtype.is_floating_point:
+        return lm_head_weight.dtype
+
+    config = model.config
+    for name in ("dtype", "torch_dtype"):
+        dtype = getattr(config, name, None)
+        if isinstance(dtype, str):
+            dtype = {
+                "half": torch.float16,
+                "float16": torch.float16,
+                "float": torch.float32,
+                "float32": torch.float32,
+                "bfloat16": torch.bfloat16,
+            }.get(dtype.lower())
+        if isinstance(dtype, torch.dtype) and dtype.is_floating_point:
+            return dtype
+
+    for module in (model.embed_tokens, model.lm_head):
+        weight = getattr(module, "weight", None)
+        if isinstance(weight, torch.Tensor) and weight.dtype.is_floating_point:
+            return weight.dtype
+
+    parameters = getattr(model.markov_head, "parameters", None)
+    if callable(parameters):
+        for parameter in parameters():
+            if parameter.dtype.is_floating_point:
+                return parameter.dtype
+    return torch.float32
 
 
 def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
@@ -40,6 +72,7 @@ class DsparkDraftSampler:
         *,
         model,
         gamma,
+        sample_from_anchor,
         max_bs,
         device,
         confidence_fn=None,
@@ -49,6 +82,8 @@ class DsparkDraftSampler:
         self.model = model
         self.markov_head = model.markov_head
         self.gamma = int(gamma)
+        self.sample_from_anchor = bool(sample_from_anchor)
+        self.query_token_num = self.gamma if self.sample_from_anchor else self.gamma + 1
         max_bs = int(max_bs)
         if out is not None:
             assert out.shape == (max_bs * self.gamma,) and out.dtype == torch.int64
@@ -68,6 +103,7 @@ class DsparkDraftSampler:
         self.greedy_mask = None
         self.exp_noise = None
         self.corrected_out = None
+        self.corrected_logits_dtype = _resolve_corrected_logits_dtype(model)
         if folded_sampling:
             vocab = int(model.lm_head.org_vocab_size)
             self.temperatures = torch.ones(
@@ -79,7 +115,7 @@ class DsparkDraftSampler:
             )
             self.corrected_out = torch.empty(
                 (max_bs * self.gamma, vocab),
-                dtype=_base_logits_dtype(model),
+                dtype=self.corrected_logits_dtype,
                 device=device,
             )
 
@@ -100,10 +136,17 @@ class DsparkDraftSampler:
         self.greedy_mask[:bs].copy_((sampling_info.top_ks <= 1).view(-1)[:bs])
 
     def __call__(self, hidden_states, input_ids):
-        bs = hidden_states.shape[0] // self.gamma
-        base_logits, confidence_tap = self.model.compute_base_logits(hidden_states)
+        bs = hidden_states.shape[0] // self.query_token_num
+        model_hidden, sample_hidden = select_draft_hidden(
+            hidden_states,
+            bs=bs,
+            query_token_num=self.query_token_num,
+            gamma=self.gamma,
+            sample_from_anchor=self.sample_from_anchor,
+        )
+        base_logits, confidence_tap = self.model.compute_base_logits(model_hidden)
         base_logits = base_logits.view(bs, self.gamma, -1)
-        anchor = input_ids.view(bs, self.gamma)[:, 0]
+        anchor = input_ids.view(bs, self.query_token_num)[:, 0]
 
         if self.folded_sampling:
 
@@ -125,7 +168,7 @@ class DsparkDraftSampler:
         draft_tokens, corrected_logits = self.markov_head.sample_block(
             base_logits,
             first_prev_tokens=anchor,
-            hidden_states=hidden_states.view(bs, self.gamma, -1),
+            hidden_states=sample_hidden,
             sampler=sampler,
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
@@ -135,7 +178,7 @@ class DsparkDraftSampler:
             )
         if self.confidence_out is not None:
             confidence = self.confidence_fn(
-                draft_hidden=hidden_states.view(bs, self.gamma, -1),
+                draft_hidden=sample_hidden,
                 anchor_tokens=anchor,
                 draft_tokens=draft_tokens,
                 confidence_tap=confidence_tap,
@@ -152,8 +195,9 @@ def _resolve_folded_sampling(*, model, gamma, max_bs, device, tp_rank) -> bool:
     if mode == DsparkFoldedSampling.FORCE:
         return True
     vocab = int(model.lm_head.org_vocab_size)
+    corrected_logits_dtype = _resolve_corrected_logits_dtype(model)
     noise_bytes = max_bs * vocab * 4
-    logits_bytes = max_bs * gamma * vocab * _base_logits_dtype(model).itemsize
+    logits_bytes = max_bs * gamma * vocab * corrected_logits_dtype.itemsize
     need_gb = (noise_bytes + logits_bytes) / (1 << 30)
     available_gb = get_available_gpu_memory(
         device, torch.get_device_module().current_device()
@@ -177,6 +221,7 @@ def maybe_build_draft_sampler(
     *,
     draft_model,
     gamma: int,
+    sample_from_anchor: bool,
     max_bs: int,
     device,
     tp_rank: int,
@@ -208,6 +253,7 @@ def maybe_build_draft_sampler(
     return DsparkDraftSampler(
         model=draft_model,
         gamma=gamma,
+        sample_from_anchor=sample_from_anchor,
         max_bs=max_bs,
         device=device,
         confidence_fn=confidence_fn,

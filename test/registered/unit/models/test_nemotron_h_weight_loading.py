@@ -134,6 +134,20 @@ class TestNemotronHWeightLoading(unittest.TestCase):
             skipped.loaded_weight, "non-MTP target weight should be skipped"
         )
 
+    def test_dflash_capture_uses_post_layer_offsets(self):
+        model = self._make_minimal_model()
+
+        model.set_dflash_layers_to_capture([1, 5, 19, 29, 41, 51])
+
+        self.assertTrue(model.capture_aux_hidden_states)
+        self.assertEqual(model.model.layers_to_capture, [2, 6, 20, 30, 42, 52])
+
+    def test_dflash_capture_requires_explicit_layer_ids(self):
+        model = self._make_minimal_model()
+
+        with self.assertRaisesRegex(ValueError, "explicit layer_ids"):
+            model.set_dflash_layers_to_capture(None)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -226,7 +226,11 @@ class SpeculativeAlgorithm(Enum):
             _handle_ngram(server_args)
 
     def get_num_tokens_per_req_for_target_verify(
-        self, num_draft_tokens: int, is_draft_worker: bool
+        self,
+        num_draft_tokens: int,
+        is_draft_worker: bool,
+        *,
+        sample_from_anchor: bool,
     ) -> int:
         # FIXME: Remove this after the forward mode refactor. Target verify is
         # essentially a fixed sequence length prefill/extend with full cuda
@@ -234,11 +238,15 @@ class SpeculativeAlgorithm(Enum):
         # other cases which is not target verify but fixed length prefill.
         # Here, we expose this interface to allow the other use cases.
         if self.is_dspark() and is_draft_worker:
-            return num_draft_tokens - 1
+            return num_draft_tokens - int(sample_from_anchor)
         return num_draft_tokens
 
     def get_num_tokens_per_bs_for_target_verify(
-        self, num_draft_tokens: int, is_draft_worker: bool
+        self,
+        num_draft_tokens: int,
+        is_draft_worker: bool,
+        *,
+        sample_from_anchor: bool,
     ) -> int:
         # Deprecated alias; remove together with the FIXME above.
         warnings.warn(
@@ -248,7 +256,9 @@ class SpeculativeAlgorithm(Enum):
             stacklevel=2,
         )
         return self.get_num_tokens_per_req_for_target_verify(
-            num_draft_tokens, is_draft_worker
+            num_draft_tokens,
+            is_draft_worker,
+            sample_from_anchor=sample_from_anchor,
         )
 
     def create_worker(

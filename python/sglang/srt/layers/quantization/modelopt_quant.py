@@ -1398,6 +1398,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_per_token_activation: Optional[bool] = None,
         is_awq: bool = False,
+        is_w4a16: bool = False,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
@@ -1407,6 +1408,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 "format is experimental and subject to change."
             )
         self.is_awq = is_awq
+        self.is_w4a16 = is_w4a16
         self.group_size = group_size
         if not is_checkpoint_nvfp4_serialized:
             if use_per_token_activation:
@@ -1561,9 +1563,10 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                     "Expected either flat format (config.json) or nested format (hf_quant_config.json)."
                 )
 
-        if quant_method not in ["FP8", "NVFP4", "NVFP4_AWQ"]:
+        if quant_method not in ["FP8", "NVFP4", "NVFP4_AWQ", "W4A16_NVFP4"]:
             raise ValueError(
-                "ModelOpt currently only supports: FP8, NVFP4, NVFP4_AWQ "
+                "ModelOpt currently only supports: FP8, NVFP4, NVFP4_AWQ, "
+                "W4A16_NVFP4 "
                 "quantizations in sglang. Please check the "
                 "quantization config for your model's configuration."
             )
@@ -1586,6 +1589,8 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             exclude_modules,
             config.get("packed_modules_mapping"),
             is_awq="AWQ" in quant_method,
+            is_w4a16=quant_method == "W4A16_NVFP4",
+            use_per_token_activation=(False if quant_method == "W4A16_NVFP4" else None),
         )
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
@@ -1606,7 +1611,11 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         return self._get_quant_method(
             layer,
             prefix,
-            Linear=ModelOptFp4LinearMethod,
+            Linear=(
+                ModelOptNvFp4A16LinearMethod
+                if self.is_w4a16
+                else ModelOptFp4LinearMethod
+            ),
             Moe=ModelOptNvFp4FusedMoEMethod,
         )
 
