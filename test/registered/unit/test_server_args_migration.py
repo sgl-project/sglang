@@ -145,6 +145,16 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
         sa = self._parse(["--stream-output"])
         self.assertTrue(sa.incremental_streaming_output)
 
+    def test_stream_empty_delta_progress_interval(self):
+        """The token-driven stream progress option defaults off and parses as an int."""
+        self.assertEqual(self._parse([]).stream_empty_delta_progress_interval, 0)
+        self.assertEqual(
+            self._parse(
+                ["--stream-empty-delta-progress-interval", "16"]
+            ).stream_empty_delta_progress_interval,
+            16,
+        )
+
     def test_combined_parse(self):
         """Multiple option types parsed together in one invocation."""
         sa = self._parse(

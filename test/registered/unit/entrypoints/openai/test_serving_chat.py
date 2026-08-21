@@ -97,6 +97,8 @@ class _MockTokenizerManager:
             tool_call_parser="hermes",
             reasoning_parser=None,
             stream_response_default_include_usage=False,
+            incremental_streaming_output=False,
+            stream_empty_delta_progress_interval=0,
             default_chat_template_kwargs=None,
         )
         self.model_path = self.server_args.model_path
@@ -2314,6 +2316,7 @@ class ServingChatTestCase(unittest.TestCase):
             prompt_tokens={0: 5},
             reasoning_tokens={0: 0},
             completion_tokens={0: 1},
+            stream_progress_tokens={},
         ):
             chunks.append(chunk)
         return chunks
@@ -2824,6 +2827,7 @@ class ServingChatTestCase(unittest.TestCase):
                 prompt_tokens={0: 10},
                 reasoning_tokens={0: 0},
                 completion_tokens={0: 2},
+                stream_progress_tokens={},
             ):
                 chunks.append(chunk)
             return chunks
@@ -2932,6 +2936,168 @@ class ServingChatTestCase(unittest.TestCase):
             "I am a large language model.",
             f"Streaming deltas produced broken text: {deltas!r}",
         )
+
+    def _run_incremental_chat_stream(self, chunks):
+        """Run an incremental stream whose detokenizer has hidden-text batches."""
+
+        async def _mock_generate():
+            for text, completion_tokens, output_ids, finish_reason in chunks:
+                content = {
+                    "text": text,
+                    "meta_info": {
+                        "id": "chatcmpl-progress-test",
+                        "prompt_tokens": 10,
+                        "completion_tokens": completion_tokens,
+                        "reasoning_tokens": 0,
+                        "cached_tokens": 0,
+                        "finish_reason": finish_reason,
+                        "output_token_logprobs": None,
+                        "output_top_logprobs": None,
+                    },
+                    "index": 0,
+                }
+                if output_ids is not None:
+                    content["output_ids"] = output_ids
+                yield content
+
+        self.tm.generate_request.return_value = _mock_generate()
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=100,
+            stream=True,
+        )
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_mock.return_value.get_prompt.return_value = "Test prompt"
+            adapted_request, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+            return self._run_chat_stream(adapted_request, req)
+
+    def _empty_progress_deltas(self, chunks):
+        return [
+            choice["delta"]
+            for event in self._parse_chunks(chunks)
+            for choice in event.get("choices", [])
+            if choice["delta"].get("content") == ""
+            and choice["delta"].get("role") is None
+            and choice.get("finish_reason") is None
+        ]
+
+    def test_empty_delta_progress_is_default_off(self):
+        self.tm.server_args.incremental_streaming_output = True
+
+        chunks = self._run_incremental_chat_stream(
+            [
+                ("", 3, [1, 2, 3], None),
+                ("", 5, [4, 5], {"type": "stop", "matched": None}),
+            ]
+        )
+
+        self.assertEqual(self._empty_progress_deltas(chunks), [])
+
+    def test_empty_delta_progress_reports_token_driven_hidden_decode(self):
+        self.tm.server_args.incremental_streaming_output = True
+        self.tm.server_args.stream_empty_delta_progress_interval = 3
+
+        chunks = self._run_incremental_chat_stream(
+            [
+                ("", 1, [1], None),
+                ("", 3, [2, 3], None),
+                ("", 4, [4], None),
+                ("visible", 5, [5], None),
+                ("", 7, [6, 7], None),
+                ("", 8, [8], None),
+                ("", 11, [9, 10, 11], {"type": "stop", "matched": None}),
+            ]
+        )
+
+        # Progress appears at generated-token counts 3 and 8. The visible
+        # delta resets the counter at 5, and the terminal batch is never used
+        # as a progress heartbeat.
+        self.assertEqual(len(self._empty_progress_deltas(chunks)), 2)
+        visible_deltas = [
+            choice["delta"].get("content")
+            for event in self._parse_chunks(chunks)
+            for choice in event.get("choices", [])
+            if choice["delta"].get("content")
+        ]
+        self.assertEqual(visible_deltas, ["visible"])
+
+    def test_empty_delta_progress_requires_output_ids(self):
+        self.tm.server_args.incremental_streaming_output = True
+        self.tm.server_args.stream_empty_delta_progress_interval = 1
+
+        chunks = self._run_incremental_chat_stream([("", 3, None, None)])
+
+        self.assertEqual(self._empty_progress_deltas(chunks), [])
+
+    def test_reasoning_delta_resets_empty_delta_progress(self):
+        self.tm.server_args.incremental_streaming_output = True
+        self.tm.server_args.stream_empty_delta_progress_interval = 3
+        self.chat.reasoning_parser = "glm45"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            separate_reasoning=True,
+        )
+        stream_progress_tokens = {}
+
+        def collect(content, completion_tokens):
+            async def run():
+                chunks = []
+                async for chunk in self.chat._generate_stream_content(
+                    content=content,
+                    index=0,
+                    request=req,
+                    stream_offsets={},
+                    reasoning_parser_dict={},
+                    parser_dict={},
+                    has_tool_calls={},
+                    choice_logprobs=None,
+                    finish_reason_type=None,
+                    continuous_usage_stats=False,
+                    prompt_tokens={0: 10},
+                    reasoning_tokens={0: 0},
+                    completion_tokens={0: completion_tokens},
+                    stream_progress_tokens=stream_progress_tokens,
+                ):
+                    chunks.append(chunk)
+                return chunks
+
+            return get_or_create_event_loop().run_until_complete(run())
+
+        def content(completion_tokens, output_ids):
+            return {
+                "text": "",
+                "output_ids": output_ids,
+                "meta_info": {
+                    "id": "chatcmpl-reasoning-progress",
+                    "prompt_tokens": 10,
+                    "completion_tokens": completion_tokens,
+                    "cached_tokens": 0,
+                },
+            }
+
+        with patch.object(
+            self.chat, "_process_reasoning_stream", return_value=("think", "")
+        ):
+            first = collect(content(3, [1, 2, 3]), 3)
+        self.assertEqual(stream_progress_tokens, {0: 3})
+        self.assertEqual(
+            self._parse_chunks(first)[0]["choices"][0]["delta"]["reasoning_content"],
+            "think",
+        )
+
+        with patch.object(
+            self.chat, "_process_reasoning_stream", return_value=(None, "")
+        ):
+            self.assertEqual(collect(content(5, [4, 5]), 5), [])
+            third = collect(content(6, [6]), 6)
+        self.assertEqual(len(self._empty_progress_deltas(third)), 1)
 
     # ------------- X-Data-Parallel-Rank header tests -------------
     def test_extract_routed_dp_rank_from_header_no_header(self):

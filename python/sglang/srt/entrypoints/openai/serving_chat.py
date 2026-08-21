@@ -696,8 +696,10 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt_tokens: Dict[int, int],
         reasoning_tokens: Dict[int, int],
         completion_tokens: Dict[int, int],
+        stream_progress_tokens: Dict[int, int],
     ) -> AsyncGenerator[str, None]:
         """Generate SSE chunks for streaming content."""
+        completion_token_count = completion_tokens.get(index, 0)
         offset = stream_offsets.get(index, 0)
         if self.tokenizer_manager.server_args.incremental_streaming_output:
             delta = content["text"]
@@ -739,6 +741,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     logprobs=remaining_logprobs,
                     usage=usage,
                 )
+                stream_progress_tokens[index] = completion_token_count
                 remaining_logprobs = None
 
         # Handle tool calls
@@ -766,8 +769,23 @@ class OpenAIServingChat(OpenAIServingBase):
                     yield remaining_chunk
 
         else:
-            # Regular content
-            if delta:
+            # A non-printable token can advance decode without producing a text
+            # delta. Optionally emit bounded, token-driven progress so an
+            # intermediary can distinguish active hidden decode from a genuine
+            # delivery stall. This is deliberately not a timer heartbeat.
+            progress_interval = (
+                self.tokenizer_manager.server_args.stream_empty_delta_progress_interval
+            )
+            last_progress_token = stream_progress_tokens.get(index, 0)
+            emit_empty_delta_progress = (
+                self.tokenizer_manager.server_args.incremental_streaming_output
+                and progress_interval > 0
+                and not delta
+                and finish_reason_type is None
+                and bool(content.get("output_ids"))
+                and completion_token_count - last_progress_token >= progress_interval
+            )
+            if delta or emit_empty_delta_progress:
                 usage = None
                 if continuous_usage_stats:
                     usage = UsageProcessor.calculate_token_usage(
@@ -786,6 +804,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     logprobs=remaining_logprobs,
                     usage=usage,
                 )
+                stream_progress_tokens[index] = completion_token_count
                 remaining_logprobs = None
 
         # Flush logprobs still unattached this step — only when a parser is
@@ -1517,6 +1536,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # State tracking for streaming
         is_firsts = {}
         stream_offsets = {}
+        stream_progress_tokens = {}
         n_prev_tokens = {}
         has_tool_calls = {}
         finish_reasons = {}
@@ -1634,6 +1654,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens,
                     reasoning_tokens=reasoning_tokens,
                     completion_tokens=completion_tokens,
+                    stream_progress_tokens=stream_progress_tokens,
                 ):
                     yield chunk
 

@@ -1491,6 +1491,11 @@ class ServerArgs:
     incremental_streaming_output: A[
         bool, "Whether to output as a sequence of disjoint segments.", NS("serving")
     ] = False
+    stream_empty_delta_progress_interval: A[
+        int,
+        "When incremental streaming is enabled, emit an empty content delta after this many generated tokens without an emitted delta. Set to 0 to disable. This reports actual decode progress, not elapsed time.",
+        NS("serving"),
+    ] = 0
     enable_streaming_session: A[
         bool,
         "Enable streaming session mode and StreamingSession wrapper.",
