@@ -128,21 +128,32 @@ export const config = {
           disabled: (sel) => sel.hw === "rtx5090" && sel.quant !== "nvfp4",
           disableReason:
             "On the 32GB RTX 5090 the DFlash2 draft model only fits on top of the NVFP4 weights",
-          // 5090: mem-fraction re-pins like DSPARK's, and fp32 additionally
-          // re-pins the ratio — the balanced L=9216 value leaves the state
-          // pool one slot short at every serviceable mem-fraction (see the
-          // DFlash2 bullet in Configuration Tips).
+          // fp32 is the one case that needs the balanced ratio overridden, so
+          // that family is stripped too and re-emitted below.
           stripPrefixes: (sel) =>
-            sel.hw === "rtx5090" ? ["--mem-fraction-static"] : [],
+            sel.hw === "rtx5090"
+              ? sel.ssmDtype === "float32"
+                ? ["--mem-fraction-static", "--mamba-full-memory-ratio"]
+                : ["--mem-fraction-static"]
+              : [],
           flags: (sel) => [
             "--speculative-algorithm DFLASH",
             "--speculative-draft-model-path incoai/Qwen3.8-27B-DFlash2",
             "--speculative-num-draft-tokens 8",
-            // Measured on the 5090 against main: the bf16 state pool serves at
-            // 0.88 (0.90, DSPARK's pin, OOMs on the first request). fp32 has no
-            // serviceable mem-fraction here at all, so the SSM dtype row greys
-            // it out for this pick.
-            ...(sel.hw === "rtx5090" ? ["--mem-fraction-static 0.88"] : []),
+            // Measured on the 5090 at commit 1cf2b8c, the build the Install
+            // accordion pins for this pick. bf16 serves at 0.88 on the balanced
+            // ratio (0.90, DSPARK's pin, OOMs on the first request). fp32 needs
+            // 0.895 AND the balanced ratio overridden to 10: these cells pin
+            // --max-running-requests 1, so the balanced value provisions KV for
+            // concurrency this recipe never uses, starving the state pool of the
+            // slots fp32 needs. Only High-Throughput reaches fp32 (S=4); the SSM
+            // dtype row greys fp32 out for Low-Latency (S=5).
+            ...(sel.hw === "rtx5090"
+              ? sel.ssmDtype === "float32"
+                ? ["--mem-fraction-static 0.895",
+                   "--mamba-full-memory-ratio 10"]
+                : ["--mem-fraction-static 0.88"]
+              : []),
           ],
         },
       ],
@@ -187,10 +198,21 @@ export const config = {
         // serves, and is the faster cell there anyway.
         {
           id: "float32", label: "float32",
-          disabled: (sel) => sel.hw === "rtx5090" && sel.spec === "dflash",
+          // Only the Low-Latency tier is out of reach: it needs S=5 fp32 slots
+          // (735MB) plus >=9216 KV tokens for one request, and no mem-fraction
+          // holds both -- at 0.8975/r14 the pool buys the 5th slot but KV falls
+          // to 7752 tokens and generation stops after one token, while every
+          // mem-fraction with a big enough pool (>=0.90) dies in graph capture.
+          // High-Throughput needs one slot fewer and does fit; see the DFLASH2
+          // option's pins.
+          disabled: (sel) =>
+            sel.hw === "rtx5090" &&
+            sel.spec === "dflash" &&
+            sel.tier === "low-latency",
           disableReason:
-            "On the 32GB RTX 5090 the fp32 GDN state pool and the prefill CUDA-graph " +
-            "capture do not both fit alongside the DFlash2 draft — use bfloat16",
+            "On the 32GB RTX 5090 the Low-Latency tier cannot hold five fp32 state " +
+            "slots and a full request's KV at once — use bfloat16, or the " +
+            "High-Throughput tier which fits fp32",
           flags: ["--mamba-ssm-dtype float32"],
         },
         {
