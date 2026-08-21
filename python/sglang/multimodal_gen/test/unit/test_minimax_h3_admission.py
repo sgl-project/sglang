@@ -375,6 +375,21 @@ def test_validate_server_args_requires_packed_varlen_backend():
             MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
 
 
+def test_validate_server_args_rejects_transformer_backend_override():
+    config = SimpleNamespace(
+        vae_config=SimpleNamespace(resolved_parallel_decode_mode=lambda: None),
+        dit_config=SimpleNamespace(arch_config=SimpleNamespace(attention_head_dim=128)),
+        _server_arg_value=MiniMaxH3PipelineConfig._server_arg_value,
+    )
+    server_args = SimpleNamespace(
+        component_attention_backends={"transformer": "subblock_sparse_attn"},
+        attention_backend="fa",
+    )
+
+    with pytest.raises(ValueError, match="use --attention-backend instead"):
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+
+
 def test_mps_admission_requires_layerwise_residency_for_every_h3_component():
     config = SimpleNamespace(
         vae_config=SimpleNamespace(resolved_parallel_decode_mode=lambda: None),

@@ -142,11 +142,8 @@ def _sm90_sparse_attention(
     """Run a SubBlock routing plan through the existing SM90 CuTe kernel."""
     BlockSparseTensorsTorch, flash_attn_func = _load_sm90_block_sparse_attention()
 
-    # The router contract permits indices in any order, while the SM90 sparse
-    # pipeline consumes each list from high slot to low slot and applies
-    # sequence-tail masking to the first block. Sort explicitly so the largest
-    # block id -- the possible ragged tail -- occupies the highest slot without
-    # depending on the fused top-k kernel's current ascending output order.
+    # The caller sorts each active sparse prefix for SM90. Dense rows are the
+    # already-sorted complete range; entries beyond each row's count are ignored.
     ordered_index = q2k_block_index
     if block_counts is None:
         block_counts = torch.full(
@@ -224,7 +221,12 @@ def _run_subblock_sparse_attention(
     softmax_scale: float,
     block_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Dispatch the same 64x64 routing plan to Hopper or Blackwell."""
+    """Dispatch a prepared 64x64 routing plan to Hopper or Blackwell.
+
+    SM90 requires every active index prefix to be sorted in ascending order;
+    SM100 accepts the router's original order. Heterogeneous callers must sort
+    compact sparse prefixes before expanding them to full-width dense rows.
+    """
     runner = _get_subblock_sparse_attention_runner(q.device)
     return runner(
         q,
@@ -435,7 +437,12 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
             f"(sparsity {1 - plan.density:.4f})"
         )
         block_counts = None
-        block_index = plan.index.sort(dim=-1).values
+        runner = _get_subblock_sparse_attention_runner(q.device)
+        block_index = (
+            plan.index.sort(dim=-1).values
+            if runner is _sm90_sparse_attention
+            else plan.index
+        )
         kernel_topk = plan.topk
         if sparse_query_block_mask is not None:
             sparse_query_block_mask = sparse_query_block_mask.to(
@@ -528,8 +535,8 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
         """Packed ``[T, H, D]`` rows split into documents by ``cu_seqlens``.
 
         Each packed document keeps its own full K/V context. The optional H3
-        query plan gathers video-containing source blocks into one contiguous,
-        block-aligned Q sequence for SubBlock while non-video Q uses FA.
+        query plan makes pure-video Q blocks sparse and every other Q block
+        dense within one heterogeneous BSA call.
         Documents shorter than ``min_seq_len`` -- in H3, the padding tail --
         stay on the existing dense segment path.
         """

@@ -213,9 +213,12 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                     "pass --enable-torch-compile false"
                 )
         component_backends = server_args.component_attention_backends or {}
-        attention_backend = component_backends.get(
-            "transformer", self._server_arg_value(server_args.attention_backend)
-        )
+        if "transformer" in component_backends:
+            raise ValueError(
+                "MiniMax-H3 resolves DiT attention lazily and does not support "
+                "a transformer component override; use --attention-backend instead"
+            )
+        attention_backend = self._server_arg_value(server_args.attention_backend)
         if attention_backend is None:
             return
         selected_backend = (

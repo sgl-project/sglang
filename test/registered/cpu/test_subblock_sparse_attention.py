@@ -332,47 +332,56 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
         impl.causal = False
         impl.schedule = SimpleNamespace(sparsity=0.75)
         plan = SimpleNamespace(
-            index=torch.zeros(1, 1, 1, 1, dtype=torch.int32),
-            topk=1,
-            num_blocks=1,
-            density=1.0,
+            index=torch.tensor(
+                [[[[7, 1, 4], [6, 2, 0], [5, 0, 3]]]], dtype=torch.int32
+            ),
+            topk=3,
+            num_blocks=8,
+            density=3 / 8,
         )
         impl.router = Mock(route=Mock(return_value=plan))
-        q = torch.tensor([[[[1.0, 0.0]], [[0.0, 1.0]], [[1.0, 1.0]], [[-1.0, 1.0]]]])
-        k = torch.tensor([[[[1.0, 0.0]], [[0.0, 1.0]], [[1.0, 1.0]], [[-1.0, 1.0]]]])
-        v = torch.tensor([[[[1.0, 2.0]], [[3.0, 4.0]], [[5.0, 6.0]], [[7.0, 8.0]]]])
-        query_plan = _minimax_h3_subblock_query_plan(
-            torch.tensor([0, 2]),
-            used_len=4,
-        )
+        q = torch.zeros(1, 3 * 64, 1, 2)
+        k = torch.zeros(1, 8 * 64, 1, 2)
+        v = torch.zeros_like(k)
+        query_plan = {"sparse_query_block_mask": torch.tensor([True, False, True])}
         impl.dense_impl = Mock()
-        sparse_out = torch.tensor(
-            [[[[9.0, 10.0]], [[3.0, 4.0]], [[11.0, 12.0]], [[7.0, 8.0]]]]
-        )
+        sparse_out = torch.ones_like(q)
 
-        with patch(
-            "sglang.multimodal_gen.runtime.layers.attention.backends."
-            "subblock_sparse_attn._run_subblock_sparse_attention",
-            return_value=sparse_out,
-        ) as run_sparse:
-            out = impl._hybrid_query_attention(
-                q,
-                k,
-                v,
-                query_plan,
+        for runner, sparse_rows in (
+            (_sm90_sparse_attention, ([1, 4, 7], [0, 3, 5])),
+            (_sm100_sparse_attention, ([7, 1, 4], [5, 0, 3])),
+        ):
+            with (
+                self.subTest(runner=runner.__name__),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.attention.backends."
+                    "subblock_sparse_attn._run_subblock_sparse_attention",
+                    return_value=sparse_out,
+                ) as run_sparse,
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.attention.backends."
+                    "subblock_sparse_attn._get_subblock_sparse_attention_runner",
+                    return_value=runner,
+                ),
+            ):
+                out = impl._hybrid_query_attention(q, k, v, query_plan)
+
+            impl.dense_impl.forward.assert_not_called()
+            torch.testing.assert_close(out, sparse_out)
+            routing_q = impl.router.route.call_args.args[0]
+            self.assertEqual(routing_q.shape[1], 3 * 64)
+            sparse_call = run_sparse.call_args.args
+            self.assertEqual(sparse_call[0].shape[1], 3 * 64)
+            self.assertIs(sparse_call[1], k)
+            self.assertIs(sparse_call[2], v)
+            self.assertEqual(sparse_call[4], 8)
+            torch.testing.assert_close(
+                sparse_call[6], torch.tensor([[[3, 8, 3]]], dtype=torch.int32)
             )
-
-        impl.dense_impl.forward.assert_not_called()
-        torch.testing.assert_close(out, sparse_out)
-        routing_q = impl.router.route.call_args.args[0]
-        self.assertEqual(routing_q.shape[1], 4)
-        sparse_call = run_sparse.call_args.args
-        self.assertEqual(sparse_call[0].shape[1], 4)
-        self.assertIs(sparse_call[1], k)
-        self.assertIs(sparse_call[2], v)
-        torch.testing.assert_close(
-            sparse_call[6], torch.ones(1, 1, 1, dtype=torch.int32)
-        )
+            block_index = sparse_call[3]
+            self.assertEqual(block_index[0, 0, 0, :3].tolist(), sparse_rows[0])
+            self.assertEqual(block_index[0, 0, 1].tolist(), list(range(8)))
+            self.assertEqual(block_index[0, 0, 2, :3].tolist(), sparse_rows[1])
 
 
 if __name__ == "__main__":
