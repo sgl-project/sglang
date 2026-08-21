@@ -99,6 +99,7 @@ class _StubReq:
     ):
         self.rid = rid
         self.extra_key = None
+        self.cache_salt = None
         self.priority = 0
         self.cache_protected_len = 0
         self.cache_fuzzy_matched_len = 0
