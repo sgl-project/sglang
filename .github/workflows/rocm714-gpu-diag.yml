@@ -34,6 +34,12 @@ jobs:
           - runner: linux-mi35x-gpu-1
             image: bingxche/sgl-test:v0.5.17-rocm714-mi35x-20260820
             reference: rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260211-preview
+          # The 1gpu mi300 pool has taken hours to schedule; this is the same
+          # question asked of a pool that might answer sooner, and a pod with
+          # two of the eight GPUs exposed is a useful extra data point.
+          - runner: linux-mi300-2gpu-sglang
+            image: bingxche/sgl-test:v0.5.17-rocm714-mi30x-20260820
+            reference: rocm/sgl-dev:v0.5.8.post1-rocm720-mi30x-20260211-preview
     runs-on: ${{ matrix.runner }}
     environment: 'prod'
     steps:
