@@ -238,15 +238,9 @@ def build(args: argparse.Namespace) -> dict[str, object]:
 
     if output.exists():
         raise ValueError(f"completed output already exists: {output}")
-    if args.ollama_manifest is not None:
-        if (
-            sha256_file(args.ollama_manifest.resolve(strict=True))
-            != args.ollama_manifest_digest
-        ):
-            raise ValueError("Ollama manifest file hash does not match its digest")
     if args.config_blob is not None:
         if sha256_file(args.config_blob.resolve(strict=True)) != args.config_sha256:
-            raise ValueError("Ollama config blob hash does not match its digest")
+            raise ValueError("DeepSeek config hash does not match its digest")
 
     actual_source_sha256 = sha256_file(source)
     if actual_source_sha256 != args.source_sha256:
@@ -264,7 +258,6 @@ def build(args: argparse.Namespace) -> dict[str, object]:
         )
     validate_inventory_against_reader(source, tensors)
 
-    tensor_map = {row["name"]: row for row in tensors}
     expert_tensors: dict[tuple[int, str], dict] = {}
     for row in tensors:
         match = EXPERT_RE.fullmatch(row["name"])
@@ -328,7 +321,7 @@ def build(args: argparse.Namespace) -> dict[str, object]:
         num_experts=args.num_experts,
         top_k=args.top_k,
         role_count=len(ROLE_NAMES),
-        ollama_manifest_sha256=args.ollama_manifest_digest,
+        model_identity_sha256=args.model_identity_sha256,
         source_blob_sha256=actual_source_sha256,
         config_sha256=args.config_sha256,
     )
@@ -352,7 +345,7 @@ def build(args: argparse.Namespace) -> dict[str, object]:
             raise ValueError("resume checkpoint is not in progress")
         for field, expected in (
             ("source_sha256", actual_source_sha256),
-            ("ollama_manifest_digest", args.ollama_manifest_digest),
+            ("model_identity_sha256", args.model_identity_sha256),
             ("config_sha256", args.config_sha256),
             ("tool_sha256", tool_sha256()),
             ("expected_pack_bytes", expected_pack_bytes),
@@ -388,7 +381,7 @@ def build(args: argparse.Namespace) -> dict[str, object]:
             "status": "in_progress",
             "started_at": started_at,
             "source_sha256": actual_source_sha256,
-            "ollama_manifest_digest": args.ollama_manifest_digest,
+            "model_identity_sha256": args.model_identity_sha256,
             "config_sha256": args.config_sha256,
             "tool_sha256": tool_sha256(),
             "expected_pack_bytes": expected_pack_bytes,
@@ -410,7 +403,7 @@ def build(args: argparse.Namespace) -> dict[str, object]:
                         f"pack cursor mismatch: {stream.tell()} != {object_offset}"
                     )
                 object_generation = generation(
-                    args.ollama_manifest_digest, actual_source_sha256, layer, expert
+                    args.model_identity_sha256, actual_source_sha256, layer, expert
                 )
                 for role in ROLE_NAMES:
                     tensor = expert_tensors[(layer, role)]
@@ -526,7 +519,7 @@ def build(args: argparse.Namespace) -> dict[str, object]:
         "padding_bytes": expected_pack_bytes - data_start - index_count * role_nbytes,
         "model": {
             "ref": args.model_ref,
-            "ollama_manifest_sha256": args.ollama_manifest_digest,
+            "model_identity_sha256": args.model_identity_sha256,
             "config_sha256": args.config_sha256,
             "num_layers": args.num_layers,
             "num_routed_experts": args.num_experts,
@@ -586,9 +579,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--checkpoint", type=Path)
-    parser.add_argument("--model-ref", default="frob/deepseek-v4-flash-0731")
-    parser.add_argument("--ollama-manifest", type=Path)
-    parser.add_argument("--ollama-manifest-digest")
+    parser.add_argument("--model-ref", default="deepseek-v4-flash")
+    parser.add_argument("--model-identity-sha256")
     parser.add_argument("--config-blob", type=Path)
     parser.add_argument("--config-sha256")
     parser.add_argument("--num-layers", type=int, default=43)
@@ -602,7 +594,7 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.inspect:
         return args
-    for name in ("source", "source_sha256", "ollama_manifest_digest", "config_sha256"):
+    for name in ("source", "source_sha256", "model_identity_sha256", "config_sha256"):
         if getattr(args, name) is None:
             parser.error(f"--{name.replace('_', '-')} is required when building")
     args.manifest = args.manifest or args.output.with_name(

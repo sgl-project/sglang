@@ -112,7 +112,7 @@ class TestExpertPackServerArgs(unittest.TestCase):
                 {
                     "source_path": str(source_path),
                     "source_sha256": "1" * 64,
-                    "ollama_manifest_sha256": "2" * 64,
+                    "model_identity_sha256": "2" * 64,
                     "config_sha256": "3" * 64,
                 }
             )
@@ -169,7 +169,7 @@ class TestExpertPackServerArgs(unittest.TestCase):
         self.assertEqual(args.model_loader_extra_config["manifest_path"], str(manifest))
         self.assertEqual(args.model_loader_extra_config["read_splits"], 1)
 
-    def test_suffixless_ollama_deepseek_blob_is_prepared_inside_server_startup(self):
+    def test_suffixless_deepseek_blob_is_prepared_inside_server_startup(self):
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
             gguf = root / f"sha256-{'a' * 64}"

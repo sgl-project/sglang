@@ -28,34 +28,29 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _json_contains_digest(value: object, source_sha256: str) -> bool:
-    if isinstance(value, dict):
-        return any(
-            _json_contains_digest(item, source_sha256) for item in value.values()
-        )
-    if isinstance(value, list):
-        return any(_json_contains_digest(item, source_sha256) for item in value)
-    return isinstance(value, str) and value.removeprefix("sha256:") == source_sha256
-
-
-def find_ollama_manifest(source_sha256: str) -> tuple[Path | None, str]:
-    root = Path.home() / ".ollama" / "models" / "manifests"
-    if root.is_dir():
-        for candidate in sorted(root.rglob("*")):
-            if not candidate.is_file():
-                continue
-            try:
-                value = json.loads(candidate.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError, ValueError):
-                continue
-            if _json_contains_digest(value, source_sha256):
-                return candidate, sha256_file(candidate)
-    return (
-        None,
-        hashlib.sha256(
-            f"sglang-deepseek-expert-pack-v1:{source_sha256}".encode("ascii")
-        ).hexdigest(),
+def write_json_atomic(path: Path, value: object) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
+    temporary.replace(path)
+
+
+def normalize_manifest_identity(manifest_path: Path, manifest: dict) -> None:
+    model = manifest["model"]
+    normalized_model = {
+        "ref": model["ref"],
+        "model_identity_sha256": model["model_identity_sha256"],
+        "config_sha256": model["config_sha256"],
+        "num_layers": model["num_layers"],
+        "num_routed_experts": model["num_routed_experts"],
+        "top_k": model["top_k"],
+        "single_gpu": model["single_gpu"],
+    }
+    if model != normalized_model:
+        manifest["model"] = normalized_model
+        write_json_atomic(manifest_path, manifest)
 
 
 def artifact_paths(source: Path) -> tuple[Path, Path, Path]:
@@ -101,6 +96,10 @@ def validate_pack(
             raise ValueError("pack index SHA-256 does not match manifest")
 
         model = manifest["model"]
+        model_identity_sha256 = model.get(
+            "model_identity_sha256", header.model_identity_sha256
+        )
+        model["model_identity_sha256"] = model_identity_sha256
         expected = (
             (header.index_count, manifest["index_count"], "index count"),
             (header.data_start, manifest["data_start"], "data start"),
@@ -112,6 +111,12 @@ def validate_pack(
                 manifest["source"]["sha256"],
                 "source digest",
             ),
+            (
+                header.model_identity_sha256,
+                model_identity_sha256,
+                "model identity digest",
+            ),
+            (header.config_sha256, model["config_sha256"], "config digest"),
         )
         for actual, wanted, label in expected:
             if actual != wanted:
@@ -133,7 +138,6 @@ def load_build_inputs(args: argparse.Namespace) -> dict[str, object]:
             "ascii"
         )
     ).hexdigest()
-    ollama_manifest, ollama_manifest_digest = find_ollama_manifest(source_sha256)
     return {
         "source": source,
         "source_sha256": source_sha256,
@@ -143,8 +147,6 @@ def load_build_inputs(args: argparse.Namespace) -> dict[str, object]:
         "config_blob": model_config_path,
         "config_sha256": config_sha256,
         "model_identity_sha256": model_identity,
-        "ollama_manifest": ollama_manifest,
-        "ollama_manifest_digest": ollama_manifest_digest,
         "num_layers": int(model_config["num_hidden_layers"]),
         "num_experts": int(model_config["n_routed_experts"]),
         "top_k": int(model_config["num_experts_per_tok"]),
@@ -183,8 +185,8 @@ def build_pack(args: argparse.Namespace, inputs: dict[str, object]) -> None:
         str(checkpoint),
         "--model-ref",
         args.model_ref,
-        "--ollama-manifest-digest",
-        str(inputs["ollama_manifest_digest"]),
+        "--model-identity-sha256",
+        str(inputs["model_identity_sha256"]),
         "--config-blob",
         str(inputs["config_blob"]),
         "--config-sha256",
@@ -200,8 +202,6 @@ def build_pack(args: argparse.Namespace, inputs: dict[str, object]) -> None:
         "--safety-margin-gib",
         str(args.safety_margin_gib),
     ]
-    if inputs["ollama_manifest"] is not None:
-        command.extend(("--ollama-manifest", str(inputs["ollama_manifest"])))
     if args.inventory and args.inventory.is_file():
         command.extend(("--inventory", str(args.inventory.resolve())))
     if resume:
@@ -232,7 +232,8 @@ def main() -> int:
     source = args.gguf.resolve(strict=True)
     expert_pack, expert_pack_manifest, _ = artifact_paths(source)
     valid, reason, manifest = validate_pack(expert_pack, expert_pack_manifest, source)
-    if valid:
+    if valid and manifest is not None:
+        normalize_manifest_identity(expert_pack_manifest, manifest)
         print(f"EXPERT_PACK_VALID path={expert_pack} detail={reason}", flush=True)
         return 0
     print(f"EXPERT_PACK_INVALID path={expert_pack} detail={reason}", flush=True)
@@ -254,6 +255,7 @@ def main() -> int:
     valid, reason, manifest = validate_pack(expert_pack, expert_pack_manifest, source)
     if not valid or manifest is None:
         raise RuntimeError(f"generated expert-pack failed validation: {reason}")
+    normalize_manifest_identity(expert_pack_manifest, manifest)
     print(f"EXPERT_PACK_READY path={expert_pack} detail={reason}", flush=True)
     return 0
 

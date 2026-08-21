@@ -163,7 +163,7 @@ def handle_expert_pack(server_args: Any) -> None:
         required = (
             "source_path",
             "source_sha256",
-            "ollama_manifest_sha256",
+            "model_identity_sha256",
             "config_sha256",
         )
         for name in required:

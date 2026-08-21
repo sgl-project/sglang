@@ -516,8 +516,7 @@ def prepare_raw_deepseek_server_args(
     model_value = manifest_value.get("model") or {}
     source_sha256 = _deepseek_digest(source_value.get("sha256"), "source.sha256")
     model_identity_sha256 = _deepseek_digest(
-        model_value.get("model_identity_sha256")
-        or model_value.get("ollama_manifest_sha256"),
+        model_value.get("model_identity_sha256"),
         "model.model_identity_sha256",
     )
     config_sha256 = _deepseek_digest(
@@ -530,7 +529,7 @@ def prepare_raw_deepseek_server_args(
         "manifest_path": manifest,
         "source_path": source,
         "source_sha256": source_sha256,
-        "ollama_manifest_sha256": model_identity_sha256,
+        "model_identity_sha256": model_identity_sha256,
         "config_sha256": config_sha256,
         "stats_path": artifact_dir / "deepseek-v4-expert-pack.stats.json",
     }.items():

@@ -60,7 +60,7 @@ class ExpertPackHeader:
     num_experts: int
     top_k: int
     role_count: int
-    ollama_manifest_sha256: str
+    model_identity_sha256: str
     source_blob_sha256: str
     config_sha256: str
 
@@ -83,7 +83,7 @@ class ExpertPackHeader:
             num_experts=values[9],
             top_k=values[10],
             role_count=values[11],
-            ollama_manifest_sha256=values[12].hex(),
+            model_identity_sha256=values[12].hex(),
             source_blob_sha256=values[13].hex(),
             config_sha256=values[14].hex(),
         )
@@ -241,7 +241,7 @@ class ExpertPackStore:
         expected_experts: int,
         expected_top_k: int,
         expected_source_sha256: str | None = None,
-        expected_manifest_sha256: str | None = None,
+        expected_model_identity_sha256: str | None = None,
         expected_config_sha256: str | None = None,
         cache_vram_mib: int = 20 * 1024,
         cache_vram_reserve_mib: int = 3 * 1024,
@@ -282,7 +282,7 @@ class ExpertPackStore:
             )
         expected_digests = {
             "source_blob_sha256": expected_source_sha256,
-            "ollama_manifest_sha256": expected_manifest_sha256,
+            "model_identity_sha256": expected_model_identity_sha256,
             "config_sha256": expected_config_sha256,
         }
         for field, expected in expected_digests.items():
@@ -906,7 +906,7 @@ class KimiGGMLExpertPackStore(ExpertPackStore):
             num_experts=expected_experts,
             top_k=expected_top_k,
             role_count=len(ROLE_NAMES),
-            ollama_manifest_sha256="0" * 64,
+            model_identity_sha256="0" * 64,
             source_blob_sha256=str(self.manifest["source"]["inventory_sha256"]),
             config_sha256=str(model["config_sha256"]),
         )

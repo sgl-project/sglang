@@ -72,7 +72,7 @@ class PackHeader:
     num_experts: int
     top_k: int
     role_count: int
-    ollama_manifest_sha256: str
+    model_identity_sha256: str
     source_blob_sha256: str
     config_sha256: str
 
@@ -108,7 +108,7 @@ class PackHeader:
             self.num_experts,
             self.top_k,
             self.role_count,
-            parse_sha256(self.ollama_manifest_sha256, "ollama_manifest_sha256"),
+            parse_sha256(self.model_identity_sha256, "model_identity_sha256"),
             parse_sha256(self.source_blob_sha256, "source_blob_sha256"),
             parse_sha256(self.config_sha256, "config_sha256"),
         )
@@ -130,7 +130,7 @@ class PackHeader:
             num_experts,
             top_k,
             role_count,
-            manifest_digest,
+            model_identity_digest,
             source_digest,
             config_digest,
         ) = HEADER_STRUCT.unpack(raw)
@@ -151,7 +151,7 @@ class PackHeader:
             num_experts=num_experts,
             top_k=top_k,
             role_count=role_count,
-            ollama_manifest_sha256=manifest_digest.hex(),
+            model_identity_sha256=model_identity_digest.hex(),
             source_blob_sha256=source_digest.hex(),
             config_sha256=config_digest.hex(),
         )

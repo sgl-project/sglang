@@ -96,9 +96,9 @@ def validate(args: argparse.Namespace) -> dict[str, object]:
     source = manifest["source"]
     for actual, expected, field in (
         (
-            header.ollama_manifest_sha256,
-            model["ollama_manifest_sha256"],
-            "manifest digest",
+            header.model_identity_sha256,
+            model["model_identity_sha256"],
+            "model identity digest",
         ),
         (header.source_blob_sha256, source["sha256"], "source digest"),
         (header.config_sha256, model["config_sha256"], "config digest"),
@@ -264,9 +264,10 @@ def validate(args: argparse.Namespace) -> dict[str, object]:
     if sample_count:
         seed = int(source["sha256"][:16], 16)
         sampled_entries = random.Random(seed).sample(entries, sample_count)
-        with source_path.open("rb", buffering=0) as source_stream, pack_path.open(
-            "rb", buffering=0
-        ) as pack_stream:
+        with (
+            source_path.open("rb", buffering=0) as source_stream,
+            pack_path.open("rb", buffering=0) as pack_stream,
+        ):
             for entry in sampled_entries:
                 compare_ranges(source_stream, pack_stream, entry)
                 bytes_hashed += entry.pack_nbytes * 2

@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 from gguf import GGUFWriter
@@ -19,6 +20,11 @@ TOOLS = ROOT / "tools" / "expert_pack"
 sys.path.insert(0, str(TOOLS))
 
 from format import ROLE_NAMES, read_header, read_index  # noqa: E402
+from prepare_deepseek_pack import (  # noqa: E402
+    load_build_inputs,
+    normalize_manifest_identity,
+    validate_pack,
+)
 
 
 def sha256(path: Path) -> str:
@@ -50,14 +56,32 @@ def test_synthetic_gguf_round_trip_and_corruption_detection(tmp_path: Path) -> N
     layers = 2
     experts = 4
     source = tmp_path / "synthetic.gguf"
-    ollama_manifest = tmp_path / "ollama-manifest.json"
     config_blob = tmp_path / "config.json"
     pack = tmp_path / "synthetic.expert-pack"
     manifest = tmp_path / "synthetic.expert-pack.manifest.json"
     report = tmp_path / "validation.json"
     create_synthetic_gguf(source, layers, experts)
-    ollama_manifest.write_text('{"synthetic":true}\n', encoding="utf-8")
-    config_blob.write_text('{"architecture":"synthetic"}\n', encoding="utf-8")
+    config_blob.write_text(
+        json.dumps(
+            {
+                "architecture": "synthetic",
+                "num_hidden_layers": layers,
+                "n_routed_experts": experts,
+                "num_experts_per_tok": 2,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    build_inputs = load_build_inputs(
+        SimpleNamespace(gguf=source, model_config=config_blob)
+    )
+    model_identity_sha256 = hashlib.sha256(
+        (
+            f"sglang-deepseek-expert-pack-v1:{sha256(source)}:{sha256(config_blob)}"
+        ).encode("ascii")
+    ).hexdigest()
+    assert build_inputs["model_identity_sha256"] == model_identity_sha256
 
     build_command = [
         sys.executable,
@@ -70,10 +94,8 @@ def test_synthetic_gguf_round_trip_and_corruption_detection(tmp_path: Path) -> N
         str(pack),
         "--manifest",
         str(manifest),
-        "--ollama-manifest",
-        str(ollama_manifest),
-        "--ollama-manifest-digest",
-        sha256(ollama_manifest),
+        "--model-identity-sha256",
+        model_identity_sha256,
         "--config-blob",
         str(config_blob),
         "--config-sha256",
@@ -113,9 +135,10 @@ def test_synthetic_gguf_round_trip_and_corruption_detection(tmp_path: Path) -> N
     assert validation["full_pack_entry_hash_count"] == validation["index_count"]
     assert validation["source_range_compare_count"] == validation["index_count"]
 
-    with pack.open("rb", buffering=0) as pack_stream, source.open(
-        "rb", buffering=0
-    ) as source_stream:
+    with (
+        pack.open("rb", buffering=0) as pack_stream,
+        source.open("rb", buffering=0) as source_stream,
+    ):
         header = read_header(pack_stream)
         entries = read_index(pack_stream, header)
         assert header.num_layers == layers
@@ -126,6 +149,17 @@ def test_synthetic_gguf_round_trip_and_corruption_detection(tmp_path: Path) -> N
             assert source_stream.read(entry.source_slice_nbytes) == pack_stream.read(
                 entry.pack_nbytes
             )
+
+    manifest_value = json.loads(manifest.read_text(encoding="utf-8"))
+    identity = manifest_value["model"].pop("model_identity_sha256")
+    manifest_value["model"]["legacy_identity_sha256"] = identity
+    manifest.write_text(json.dumps(manifest_value), encoding="utf-8")
+    valid, _, normalized_manifest = validate_pack(pack, manifest, source)
+    assert valid and normalized_manifest is not None
+    normalize_manifest_identity(manifest, normalized_manifest)
+    normalized_model = json.loads(manifest.read_text(encoding="utf-8"))["model"]
+    assert normalized_model["model_identity_sha256"] == identity
+    assert "legacy_identity_sha256" not in normalized_model
 
     subprocess.run(
         [sys.executable, str(TOOLS / "build.py"), "--output", str(pack), "--inspect"],

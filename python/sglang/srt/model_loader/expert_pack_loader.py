@@ -101,8 +101,9 @@ def deepseek4_nonexpert_weights_iterator(
                 raise ValueError(
                     f"quantized tensor maps to a non-weight parameter: {tensor.name}"
                 )
-            yield checkpoint_name.removesuffix("weight") + "qweight_type", torch.tensor(
-                int(weight_type), dtype=torch.uint8
+            yield (
+                checkpoint_name.removesuffix("weight") + "qweight_type",
+                torch.tensor(int(weight_type), dtype=torch.uint8),
             )
 
     for tensor in reader.tensors:
@@ -213,7 +214,7 @@ class ExpertPackModelLoader(BaseModelLoader):
             required = (
                 "source_path",
                 "source_sha256",
-                "ollama_manifest_sha256",
+                "model_identity_sha256",
                 "config_sha256",
             )
             missing = [name for name in required if not self.config.get(name)]
@@ -223,7 +224,7 @@ class ExpertPackModelLoader(BaseModelLoader):
                     + ", ".join(sorted(missing))
                 )
             if self.source_path is None or not self.source_path.is_file():
-                raise FileNotFoundError("Ollama source blob is missing")
+                raise FileNotFoundError("DeepSeek source GGUF is missing")
             store = ExpertPackStore(
                 self.pack_path,
                 manifest_path=self.manifest_path,
@@ -231,7 +232,7 @@ class ExpertPackModelLoader(BaseModelLoader):
                 expected_experts=int(hf_config.n_routed_experts),
                 expected_top_k=int(hf_config.num_experts_per_tok),
                 expected_source_sha256=self.config["source_sha256"],
-                expected_manifest_sha256=self.config["ollama_manifest_sha256"],
+                expected_model_identity_sha256=self.config["model_identity_sha256"],
                 expected_config_sha256=self.config["config_sha256"],
                 cache_vram_mib=int(
                     self.config.get(
@@ -309,7 +310,7 @@ class ExpertPackModelLoader(BaseModelLoader):
         store.stats["dense_bytes"] = dense_bytes
         model.expert_pack_store = store
         logger.info(
-            "Loaded exact Ollama expert-pack model: source_sha256=%s "
+            "Loaded verified DeepSeek expert-pack model: source_sha256=%s "
             "pack_sha256=%s dense_bytes=%d resident_experts=0",
             store.header.source_blob_sha256,
             store.pack_sha256,
