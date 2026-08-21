@@ -102,6 +102,7 @@ class MoeRunnerBackend(Enum):
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     EXPERIMENTAL_SGL_TRTLLM = "experimental_sgl_trtllm"
     FLASHINFER_TRTLLM_ROUTED = "flashinfer_trtllm_routed"
+    FLASHINFER_ALPHAMOE = "flashinfer_alphamoe"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
@@ -143,6 +144,9 @@ class MoeRunnerBackend(Enum):
 
     def is_flashinfer_trtllm_routed(self):
         return self == MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
+
+    def is_flashinfer_alphamoe(self):
+        return self == MoeRunnerBackend.FLASHINFER_ALPHAMOE
 
     def is_flashinfer_cutlass(self):
         return self == MoeRunnerBackend.FLASHINFER_CUTLASS
