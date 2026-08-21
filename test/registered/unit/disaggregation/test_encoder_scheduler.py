@@ -108,6 +108,58 @@ def test_scheduler_coalesces_concurrent_submissions():
     asyncio.run(run_test())
 
 
+def test_scheduler_does_not_dispatch_timed_out_queued_request():
+    class FakeEncoder:
+        def __init__(self):
+            self.encode_dispatch_lock = asyncio.Lock()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.batches = []
+
+        async def batch_encode(self, requests, _modality):
+            self.batches.append([request["req_id"] for request in requests])
+            self.started.set()
+            await self.release.wait()
+            return [(1, 2, 3, None, None) for _ in requests]
+
+    async def run_test():
+        encoder = FakeEncoder()
+        scheduler = EncoderScheduler(
+            encoder=encoder,
+            send_sockets=[],
+            max_batch_size=1,
+            request_timeout=1.0,
+        )
+        # Keep the production lower bound while making the test deterministic
+        # and fast after construction.
+        scheduler.request_timeout = 0.01
+        scheduler.start()
+        requests = [
+            {
+                "req_id": f"image-{index}",
+                "modality": "image",
+                "mm_items": [object()],
+                "num_parts": 1,
+                "part_idx": 0,
+            }
+            for index in range(2)
+        ]
+        first_task = asyncio.create_task(scheduler.submit(requests[0]))
+        try:
+            await encoder.started.wait()
+            with pytest.raises(asyncio.TimeoutError):
+                await scheduler.submit(requests[1])
+
+            encoder.release.set()
+            assert await first_task == (1, 2, 3, None, None)
+            await asyncio.sleep(0)
+            assert encoder.batches == [["image-0"]]
+        finally:
+            if not first_task.done():
+                first_task.cancel()
+            await scheduler.stop()
+
+
 @pytest.mark.parametrize(
     ("model_type", "configured", "explicit", "expected"),
     [

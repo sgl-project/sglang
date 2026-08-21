@@ -2874,6 +2874,13 @@ class EncoderScheduler:
     async def _dispatch_group(
         self, group: List[PendingRequest], modality: Modality
     ) -> None:
+        # A request can time out while it is waiting in the queue or while a
+        # previous batch holds the dispatch lock. Do not send timed-out
+        # requests to TP workers or include them in encoder work.
+        group = [p for p in group if not p.future.done()]
+        if not group:
+            return
+
         # Video can't fuse (per-video preprocess kwargs vary).
         if modality not in _BATCHABLE_MODALITIES:
             await self._dispatch_per_request(group, modality)
@@ -2909,6 +2916,13 @@ class EncoderScheduler:
             # lock, while allowing concurrent HTTP handlers to enqueue before
             # waiting on their individual futures.
             async with self.encoder.encode_dispatch_lock:
+                # The lock may have been held until after a request timed out.
+                # Re-check after acquiring it so the canceled request cannot
+                # participate in the broadcast or encoder call.
+                group = [p for p in group if not p.future.done()]
+                if not group:
+                    return
+                requests = [p.request for p in group]
                 for sock in self.send_sockets:
                     sock_send(
                         sock,
@@ -2963,6 +2977,8 @@ class EncoderScheduler:
     ) -> None:
         modality_str = modality.name.lower()
         for p in group:
+            if p.future.done():
+                continue
             req = p.request
             try:
                 start = time.time()
