@@ -46,6 +46,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
+from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 from sglang.srt.utils.tensor_bridge import use_mlx
 
 if TYPE_CHECKING:
@@ -61,6 +62,109 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
+def _device_pool_size_per_token(pool: object) -> float:
+    """Bytes per token for a device KV pool, derived from its geometry.
+
+    The host pool stores the same per-token layout as the device pool, so this
+    gives the host pool's ``size_per_token`` without instantiating it.
+
+    We cannot rely on ``get_kv_size_bytes() / pool.size`` because the device
+    pool may be in post-capture mode (virtual address upper bound only, no
+    physical buffer yet).  Instead, compute from the pool's structural
+    attributes.
+    """
+    # MHA pools: head_dim * head_num * layer_num * dtype_itemsize * 2 (K+V)
+    head_num = getattr(pool, "head_num", None)
+    head_dim = getattr(pool, "head_dim", None)
+    layer_num = getattr(pool, "layer_num", None)
+    dtype = getattr(pool, "store_dtype", None) or getattr(pool, "dtype", None)
+    if (
+        head_num is not None
+        and head_dim is not None
+        and layer_num is not None
+        and dtype is not None
+    ):
+        itemsize = dtype.itemsize if hasattr(dtype, "itemsize") else 2
+        return head_dim * head_num * layer_num * itemsize * 2
+
+    # MLA pools: kv_cache_dim * layer_num * dtype_itemsize
+    kv_cache_dim = getattr(pool, "kv_cache_dim", None)
+    if kv_cache_dim is not None and layer_num is not None and dtype is not None:
+        itemsize = dtype.itemsize if hasattr(dtype, "itemsize") else 2
+        return kv_cache_dim * layer_num * itemsize
+
+    # Fallback: derive from total buffer size (works only if buffers are
+    # allocated, i.e. not in post-capture mode).
+    size_bytes = pool.get_kv_size_bytes()
+    total_bytes = sum(size_bytes) if isinstance(size_bytes, tuple) else size_bytes
+    if pool.size == 0:
+        return 0.0
+    return total_bytes / pool.size
+
+
+def _adjust_hicache_size_for_draft(
+    server_args: ServerArgs,
+    target_device_pool: object,
+    draft_device_pools: tuple[object, ...],
+) -> None:
+    """Reduce ``hicache_size`` so target + draft host pools fit the GB budget.
+
+    The draft host pool must have the same token count as the target (for 1-to-1
+    index sharing in L2 transfers).  When ``--hicache-size`` caps the target
+    pool to *H* GB, the draft pool adds ``H * draft_spt / target_spt`` GB on top.
+    To keep the *total* within *H* GB, shrink the budget by the factor
+    ``target_spt / (target_spt + draft_spt)``.
+
+    Only applies in fixed-size (``hicache_size > 0``) mode; ratio mode already
+    scales both pools proportionally.
+    """
+    if server_args.hicache_size <= 0:
+        return
+    if not draft_device_pools:
+        return
+
+    target_spt = _device_pool_size_per_token(target_device_pool)
+    if target_spt == 0:
+        return
+
+    # In SIDECAR mode only the first draft runner is registered, so we use
+    # just its pool.
+    draft_spt = _device_pool_size_per_token(draft_device_pools[0])
+    if draft_spt == 0:
+        return
+
+    effective = server_args.hicache_size * target_spt / (target_spt + draft_spt)
+    if effective < server_args.hicache_size:
+        logger.info(
+            "Adjusting --hicache-size from %d GB to %.2f GB to account for "
+            "draft host pool memory (target_spt=%.0f, draft_spt=%.0f).",
+            server_args.hicache_size,
+            effective,
+            target_spt,
+            draft_spt,
+        )
+        # Use the resolution-pipeline helper to bypass the strict post-publish
+        # mutation guard on ServerArgs.  This is a one-shot, pre-tree-cache
+        # adjustment: after create_tree_cache() returns, hicache_size is never
+        # read again, so the instance and the memory bag stay in agreement.
+        from sglang.srt.arg_groups.overrides import _apply_fields
+
+        # Reduce both hicache_size AND hicache_ratio.  When the device pool is
+        # in post-capture mode, get_kv_size_bytes returns 0, so
+        # _split_hicache_size gives the KV pool 0 GB and the host pool falls
+        # back to hicache_ratio.  Reducing the ratio too ensures the fallback
+        # also respects the draft budget.
+        ratio_factor = target_spt / (target_spt + draft_spt)
+        effective_ratio = server_args.hicache_ratio * ratio_factor
+        _apply_fields(
+            server_args,
+            {
+                "hicache_size": int(effective),
+                "hicache_ratio": effective_ratio,
+            },
+        )
+
+
 def maybe_register_hicache_draft(
     *,
     tree_cache,
@@ -68,8 +172,6 @@ def maybe_register_hicache_draft(
     server_args: ServerArgs,
     page_size: int,
 ) -> None:
-    from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
-
     if draft_plan.mode != HiCacheDraftMode.SIDECAR:
         return
 
@@ -333,6 +435,24 @@ def build_kv_cache(
         sliding_window_size=sliding_window_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
     )
+
+    # When --hicache-size is set and a SIDECAR draft will be registered,
+    # shrink the budget so the *total* (target + draft) host memory stays
+    # within the user-specified cap.  The draft host pool must match the
+    # target's token count (1-to-1 index sharing), but its per-token byte
+    # cost can be larger than the target's (e.g. quantized target + bf16
+    # draft), causing the combined allocation to exceed --hicache-size.
+    if (
+        enable_hierarchical_cache
+        and hicache_draft_plan is not None
+        and hicache_draft_plan.mode == HiCacheDraftMode.SIDECAR
+    ):
+        target_device_pool = tp_worker.model_runner.token_to_kv_pool
+        _adjust_hicache_size_for_draft(
+            server_args,
+            target_device_pool,
+            hicache_draft_plan.device_pools,
+        )
 
     tree_cache = create_tree_cache(
         TreeCacheBuildContext(
