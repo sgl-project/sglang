@@ -18,7 +18,7 @@ from sglang.srt.models.inkling_common.util import (
     lora_compatible_layout_enabled,
 )
 from sglang.srt.models.llama import LlamaMLP
-from sglang.srt.runtime_context import get_exec, get_server_args
+from sglang.srt.runtime_context import get_exec, get_model
 
 logger = logging.getLogger(__name__)
 
@@ -217,6 +217,7 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
             self.quant_method,
             self.moe_runner_config,
             self.moe_tp_rank,
+            self.moe_tp_size,
         )
         self.quant_method.create_weights(
             layer=self,
@@ -484,7 +485,7 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
         # All shared experts must share one global weight scale (reshard with
         # single_global_scale=True). ModelOpt's input_scale = amax / (6 * 448).
         flat2 = scale2.reshape(-1).float()
-        if get_server_args().load_format == "dummy" and not bool(
+        if get_model().load_format == "dummy" and not bool(
             torch.all(flat2 == flat2[0])
         ):
             # Dummy loading uses per-element noise; replace it with a valid scale.

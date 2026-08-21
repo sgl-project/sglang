@@ -729,12 +729,6 @@ if __name__ == "__main__":
         description="Benchmark serving for diffusion models."
     )
     parser.add_argument(
-        "--backend",
-        type=str,
-        default=None,
-        help="DEPRECATED: --task is deprecated and will be ignored. The task will be inferred from --model.",
-    )
-    parser.add_argument(
         "--base-url",
         type=str,
         default=None,

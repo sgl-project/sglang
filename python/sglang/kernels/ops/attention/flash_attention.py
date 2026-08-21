@@ -48,6 +48,7 @@ def flash_attn_with_kvcache(
     rel_bias_prep_cache=None,
     ver=3,
     out=None,
+    max_seqlen_k: Optional[int] = None,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -194,6 +195,7 @@ def flash_attn_with_kvcache(
             page_table=page_table,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
             rotary_seqlens=rotary_seqlens,
             q_descale=q_descale,
             k_descale=k_descale,
@@ -213,6 +215,7 @@ def flash_attn_with_kvcache(
             rel_bias=rel_bias,
             rel_bias_prep_cache=rel_bias_prep_cache,
             return_softmax_lse=return_softmax_lse,
+            out=out,
         )
     else:
         raise RuntimeError(f"Unknown flash attention version {ver}")
@@ -319,6 +322,7 @@ def flash_attn_varlen_func(
             rel_bias=rel_bias,
             rel_bias_prep_cache=rel_bias_prep_cache,
             return_softmax_lse=return_softmax_lse,
+            out=out,
         )
     else:
         raise RuntimeError(f"Unknown flash attention version {ver}")

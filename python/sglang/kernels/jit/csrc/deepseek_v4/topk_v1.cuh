@@ -9,14 +9,21 @@
 #include <bit>
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
-#ifndef SGL_TOPK
-#define SGL_TOPK 512
-#endif
-
-constexpr uint32_t kTopK = SGL_TOPK;
-constexpr uint32_t kTopKBlockSize = SGL_TOPK;
+// `topk` is a *runtime* value (<= kMaxTopK), so one module serves every k. It
+// used to be baked in via -DSGL_TOPK, which built a separate module per k --
+// and because `kTopK` came from a macro rather than a template parameter, both
+// modules exported identically mangled symbols. The function-local static in
+// setup_kernel_smem_once() is emitted as STB_GNU_UNIQUE, which the loader
+// merges across every loaded object, so whichever module was used second
+// skipped its cudaFuncSetAttribute opt-in and then failed to launch with 64 KB
+// of dynamic shared memory ("invalid argument").
+constexpr uint32_t kMaxTopK = 1024;
+// Fixed, and deliberately not tied to `topk`: run_cumsum() and the histogram
+// init below index up to RADIX + 1 == 257 threads, so a block sized after a
+// small topk would silently skip part of the histogram.
+constexpr uint32_t kTopKBlockSize = kMaxTopK;
 constexpr uint32_t kSMEM = 16 * 1024 * sizeof(uint32_t);  // 64KB (bytes)
 
 struct TopKParams {
@@ -28,6 +35,7 @@ struct TopKParams {
   const int64_t score_stride;
   const int64_t page_table_stride;
   uint32_t page_bits;
+  uint32_t topk;
 };
 
 SGL_DEVICE uint8_t convert_to_uint8(float x) {
@@ -54,14 +62,14 @@ SGL_DEVICE void naive_transform(
     int32_t* __restrict__ indices,
     int32_t* __restrict__ raw_indices,  // optional: output raw abs position indices
     const uint32_t length,
-    const uint32_t page_bits) {
-  static_assert(kTopK <= kTopKBlockSize);
+    const uint32_t page_bits,
+    const uint32_t topk) {
   if (const auto tx = threadIdx.x; tx < length) {
     indices[tx] = page_to_indices(page_table, tx, page_bits);
     if (raw_indices != nullptr) {
       raw_indices[tx] = tx;
     }
-  } else if (kTopK == kTopKBlockSize || tx < kTopK) {
+  } else if (tx < topk) {
     indices[tx] = -1;  // fill invalid indices to -1
     if (raw_indices != nullptr) {
       raw_indices[tx] = -1;
@@ -70,7 +78,8 @@ SGL_DEVICE void naive_transform(
 }
 
 [[maybe_unused]]
-SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const uint32_t length) {
+SGL_DEVICE void
+radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const uint32_t length, const uint32_t topk) {
   constexpr uint32_t RADIX = 256;
   constexpr uint32_t BLOCK_SIZE = kTopKBlockSize;
   constexpr uint32_t SMEM_INPUT_SIZE = kSMEM / (2 * sizeof(int32_t));
@@ -84,7 +93,7 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
   extern __shared__ uint32_t s_input_idx[][kSMEM / (2 * sizeof(int32_t))];
 
   const uint32_t tx = threadIdx.x;
-  uint32_t remain_topk = kTopK;
+  uint32_t remain_topk = topk;
   auto& s_histogram = _s_histogram_buf[0];
 
   const auto run_cumsum = [&] {
@@ -208,7 +217,7 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
           if (round == 3) {
             const auto pos = ::atomicAdd(&s_last_remain, -1);
             if (pos > 0) {
-              output[kTopK - pos] = idx;
+              output[topk - pos] = idx;
             }
           } else {
             const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
@@ -231,7 +240,7 @@ template <bool kUsePDL>
 __global__ void topk_transform_kernel(const __grid_constant__ TopKParams params) {
   const auto &[
     scores, seq_lens, page_table, page_indices, raw_indices, // pointers
-    score_stride, page_table_stride, page_bits // sizes
+    score_stride, page_table_stride, page_bits, topk // sizes
   ] = params;
   const uint32_t work_id = blockIdx.x;
 
@@ -239,19 +248,18 @@ __global__ void topk_transform_kernel(const __grid_constant__ TopKParams params)
   const uint32_t seq_len = seq_lens[work_id];
   const auto score_ptr = scores + work_id * score_stride;
   const auto page_ptr = page_table + work_id * page_table_stride;
-  const auto indices_ptr = page_indices + work_id * kTopK;
-  const auto raw_indices_ptr = raw_indices != nullptr ? raw_indices + work_id * kTopK : nullptr;
+  const auto indices_ptr = page_indices + work_id * topk;
+  const auto raw_indices_ptr = raw_indices != nullptr ? raw_indices + work_id * topk : nullptr;
 
   device::PDLWaitPrimary<kUsePDL>();
 
-  if (seq_len <= kTopK) {
-    naive_transform(score_ptr, page_ptr, indices_ptr, raw_indices_ptr, seq_len, page_bits);
+  if (seq_len <= topk) {
+    naive_transform(score_ptr, page_ptr, indices_ptr, raw_indices_ptr, seq_len, page_bits, topk);
   } else {
-    __shared__ int32_t s_topk_indices[kTopK];
-    radix_topk(score_ptr, s_topk_indices, seq_len);
-    static_assert(kTopK <= kTopKBlockSize);
+    __shared__ int32_t s_topk_indices[kMaxTopK];
+    radix_topk(score_ptr, s_topk_indices, seq_len, topk);
     const auto tx = threadIdx.x;
-    if (kTopK == kTopKBlockSize || tx < kTopK) {
+    if (tx < topk) {
       indices_ptr[tx] = page_to_indices(page_ptr, s_topk_indices[tx], page_bits);
       if (raw_indices_ptr != nullptr) {
         raw_indices_ptr[tx] = s_topk_indices[tx];
@@ -287,6 +295,7 @@ struct TopKKernel {
     auto B = SymbolicSize{"batch_size"};
     auto S = SymbolicSize{"score_stride"};
     auto P = SymbolicSize{"page_table_stride"};
+    auto K = SymbolicSize{"topk"};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
@@ -304,14 +313,14 @@ struct TopKKernel {
         .with_dtype<int32_t>()
         .with_device(device)
         .verify(page_table);
-    TensorMatcher({B, kTopK})  // output, must be contiguous
+    TensorMatcher({B, K})  // output, must be contiguous
         .with_dtype<int32_t>()
         .with_device(device)
         .verify(page_indices);
 
     int32_t* raw_indices_ptr = nullptr;
     if (raw_indices.has_value()) {
-      TensorMatcher({B, kTopK})  // optional raw indices output, must be contiguous
+      TensorMatcher({B, K})  // optional raw indices output, must be contiguous
           .with_dtype<int32_t>()
           .with_device(device)
           .verify(raw_indices.value());
@@ -321,6 +330,8 @@ struct TopKKernel {
     RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
     const auto page_bits = static_cast<uint32_t>(std::countr_zero(page_size));
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
+    const auto topk = static_cast<uint32_t>(K.unwrap());
+    RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 1024]");
     const auto params = TopKParams{
         .scores = static_cast<float*>(scores.data_ptr()),
         .seq_lens = static_cast<int32_t*>(seq_lens.data_ptr()),
@@ -330,6 +341,7 @@ struct TopKKernel {
         .score_stride = S.unwrap(),
         .page_table_stride = P.unwrap(),
         .page_bits = page_bits,
+        .topk = topk,
     };
     constexpr auto kSMEM_ = kSMEM + sizeof(int32_t);  // align up a little
     setup_kernel_smem_once<kernel, kSMEM_>();
@@ -337,4 +349,4 @@ struct TopKKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

@@ -15,7 +15,10 @@ from sglang.srt.layers.attention.linear.linear_metadata import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_parallel,
+    mamba_cache_chunk_size,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -299,7 +302,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         if h_dst is None or h_dst.numel() == 0:
             return None, None
 
-        mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
+        chunk_size = mamba_cache_chunk_size()
         num_prefills = metadata.num_prefills
         track_mask = forward_batch.mamba_track_mask[:num_prefills]
         extend_lens = forward_batch.extend_seq_lens[:num_prefills]
@@ -307,9 +310,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         track_seqlens = forward_batch.mamba_track_seqlens[:num_prefills]
 
         lens_to_track = track_seqlens - prefix_lens
-        boundary_lens = (
-            lens_to_track // mamba_cache_chunk_size
-        ) * mamba_cache_chunk_size
+        boundary_lens = (lens_to_track // chunk_size) * chunk_size
         track_rows = (track_mask & (boundary_lens < extend_lens)).nonzero(
             as_tuple=True
         )[0]

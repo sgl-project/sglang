@@ -8,15 +8,23 @@ import os
 import tempfile
 import time
 from contextlib import ExitStack
-from dataclasses import dataclass, field
-from typing import Any, Callable, List, Union
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Iterator, List, Union
 
 import numpy as np
 import torch
 from setproctitle import setproctitle
 
+from sglang.multimodal_gen.runtime.utils.logging_utils import (  # isort: skip
+    globally_suppress_loggers,
+)
+
+# spawned workers import model dependencies before entering run_scheduler_process
+globally_suppress_loggers()
+
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import (
+    get_replica_group,
     get_sp_group,
     get_tp_rank,
     get_tp_world_size,
@@ -58,14 +66,11 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin import (
     GPUWorkerPostTrainingMixin,
 )
-from sglang.multimodal_gen.runtime.realtime.session import (
-    RealtimeSessionCache,
-)
+from sglang.multimodal_gen.runtime.realtime.session import RealtimeSessionCache
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
-    globally_suppress_loggers,
     init_logger,
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
@@ -82,6 +87,7 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
     trace_slice,
 )
 from sglang.multimodal_gen.utils import kill_itself_when_parent_died
+from sglang.srt.environ import third_party_cache_defaults
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
@@ -136,12 +142,22 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ):
         self.local_rank = local_rank
         self.rank = rank
+        # the rank that materializes output and replies to the client: the
+        # first rank of this DP replica, which is global rank 0 only at dp=1
+        gpus_per_replica = max(1, server_args.num_gpus // (server_args.dp_size or 1))
+        self.is_output_rank = rank % gpus_per_replica == 0
         self.master_port = master_port
         # FIXME: should we use tcp as distribute init method?
         self.server_args = server_args
         self.pipeline: ComposedPipelineBase = None
 
         self.init_device_and_model()
+        self._load_peak_reserved_mb = (
+            0.0
+            if current_platform.is_cpu()
+            else capture_memory_snapshot().peak_reserved_mb
+        )
+        self._runtime_peak_reserved_mb = 0.0
         self.sp_group = get_sp_group()
         self.sp_cpu_group = self.sp_group.cpu_group
         self.tp_group = get_tp_group()
@@ -175,12 +191,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             envs.SGLANG_DIFFUSION_CACHE_ROOT, "torch_compile_cache"
         )
         tmp_root = tempfile.gettempdir()
+        sglang_defaults = third_party_cache_defaults()
         for env_name, sub in (
             ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
             ("TRITON_CACHE_DIR", "triton"),
         ):
             current = os.environ.get(env_name)
-            if current and not current.startswith(tmp_root):
+            if (
+                current
+                and current != sglang_defaults.get(env_name)
+                and not current.startswith(tmp_root)
+            ):
                 # Respect an explicit, non-ephemeral user-provided cache dir.
                 continue
             cache_path = os.path.join(compile_cache_root, sub)
@@ -212,13 +233,23 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
-        torch.get_device_module().set_device(self.local_rank)
-        intra_op_threads = _worker_cpu_intra_op_threads(self.server_args.num_gpus)
+        if not current_platform.is_mps():
+            current_platform.set_device(current_platform.get_device(self.local_rank))
+        # num_gpus is the total world size across every node; the co-located,
+        # CPU-contending worker count on THIS host is num_gpus // nnodes.
+        local_num_gpus = self.server_args.num_gpus // self.server_args.nnodes
+        intra_op_threads = _worker_cpu_intra_op_threads(local_num_gpus)
         if intra_op_threads is not None:
             torch.set_num_threads(intra_op_threads)
-        # Set environment variables for distributed initialization
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = str(self.master_port)
+        # Set environment variables for distributed initialization. Single
+        # node rendezvous stays on loopback; cross-node rendezvous must use
+        # an address every node can reach, so --dist-init-addr takes over.
+        if self.server_args.nnodes > 1:
+            rendezvous_addr = NetworkAddress.parse(self.server_args.dist_init_addr)
+        else:
+            rendezvous_addr = NetworkAddress("127.0.0.1", self.master_port)
+        os.environ["MASTER_ADDR"] = rendezvous_addr.host
+        os.environ["MASTER_PORT"] = str(rendezvous_addr.port)
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["RANK"] = str(self.rank)
         os.environ["WORLD_SIZE"] = str(self.server_args.num_gpus)
@@ -231,11 +262,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             ring_degree=self.server_args.ring_degree,
             sp_size=self.server_args.sp_degree,
             dp_size=self.server_args.dp_size,
-            distributed_init_method=NetworkAddress(
-                "127.0.0.1", self.master_port
-            ).to_tcp(),
+            distributed_init_method=rendezvous_addr.to_tcp(),
             dist_timeout=self.server_args.dist_timeout,
         )
+
+        from sglang.srt.runtime_context import get_context
+        from sglang.srt.server_args import ServerArgs as SrtServerArgs
+
+        if get_context()._server_args is None:
+            get_context().set_server_args(SrtServerArgs(model_path="dummy"))
 
         # set proc title
         if model_parallel_is_initialized():
@@ -260,13 +295,18 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         # apply layerwise offload after lora is applied while building LoRAPipeline
         # otherwise empty offloaded weights could fail lora converting
-        if self.server_args.layerwise_offload_components:
+        if self.server_args.has_layerwise_offload_components():
             configure_layerwise_offload_modules(
                 self.pipeline.modules,
                 self.server_args,
-                component_names=self.server_args.layerwise_offload_components,
+                component_names=(
+                    None
+                    if self.server_args.component_residency is not None
+                    else self.server_args.layerwise_offload_components
+                ),
                 warn_missing=(
-                    self.server_args.is_arg_explicitly_set(
+                    self.server_args.component_residency is not None
+                    or self.server_args.is_arg_explicitly_set(
                         "layerwise_offload_components"
                     )
                     or self.server_args.is_arg_explicitly_set("dit_layerwise_offload")
@@ -282,9 +322,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if output_batch.metrics:
             output_batch.metrics.record_memory_snapshot("mem_analysis", final_snapshot)
 
-        # for details on max_memory_reserved: https://docs.pytorch.org/docs/stable/generated/torch.cuda.memory.max_memory_reserved.html
-        peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
-        peak_allocated_bytes = torch.get_device_module().max_memory_allocated()
+        peak_reserved_bytes = final_snapshot.peak_reserved_mb * (1024**2)
+        peak_allocated_bytes = final_snapshot.peak_allocated_mb * (1024**2)
 
         output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
         peak_reserved_gb = peak_reserved_bytes / (1024**3)
@@ -294,46 +333,24 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             current_platform.get_device_total_memory() / (1024**3) - peak_reserved_gb
         )
         can_stay_resident = self.get_can_stay_resident_components(remaining_gpu_mem_gb)
-        suggested_args_str = self._format_offload_disable_suggestions(can_stay_resident)
 
         pool_overhead_gb = peak_reserved_gb - peak_allocated_gb
-
-        logger.debug(
-            f"Peak GPU memory: {peak_reserved_gb:.2f} GB, "
-            f"Peak allocated: {peak_allocated_gb:.2f} GB, "
-            f"Memory pool overhead: {pool_overhead_gb:.2f} GB ({pool_overhead_gb / peak_reserved_gb * 100:.1f}%), "
-            f"Remaining GPU memory at peak: {remaining_gpu_mem_gb:.2f} GB. "
-            f"Components that could stay resident (based on the last request workload): {can_stay_resident}. "
-            f"Related offload server args to disable: {suggested_args_str}"
+        pool_overhead_pct = (
+            pool_overhead_gb / peak_reserved_gb * 100 if peak_reserved_gb else 0.0
         )
 
-    def _format_offload_disable_suggestions(self, components: List[str]) -> str:
-        component_set = set(components)
-        suggestions = []
-        seen_args = set()
-
-        for component in OFFLOAD_DISABLE_RECOMMENDATION_ORDER:
-            if component not in component_set:
-                continue
-
-            arg = None
-            if component == "vae":
-                arg = "--vae-cpu-offload"
-            elif component == "image_encoder":
-                arg = "--image-encoder-cpu-offload"
-            elif component in ("text_encoder", "text_encoder_2"):
-                arg = "--text-encoder-cpu-offload"
-            elif component == "transformer":
-                if self.server_args.is_dit_layerwise_offload_selected:
-                    arg = "--dit-layerwise-offload"
-                elif self.server_args.dit_cpu_offload:
-                    arg = "--dit-cpu-offload"
-
-            if arg is not None and arg not in seen_args:
-                suggestions.append(arg)
-                seen_args.add(arg)
-
-        return ", ".join(suggestions) if suggestions else "None"
+        logger.debug(
+            "GPU memory: peak=%.2f GB, allocated=%.2f GB, pool=%.2f GB (%.1f%%), "
+            "headroom=%.2f GB. Components that can remain on GPU: %s. "
+            "Adjust --cpu-offload-components or --layerwise-offload-components "
+            "to change residency.",
+            peak_reserved_gb,
+            peak_allocated_gb,
+            pool_overhead_gb,
+            pool_overhead_pct,
+            remaining_gpu_mem_gb,
+            can_stay_resident,
+        )
 
     def execute_forward(
         self, batch: List[Req], return_req: bool = False
@@ -371,6 +388,54 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             error_context=f"request {req.request_id}",
         )
 
+    def execute_forward_sequentially(self, batch: list[Req]) -> Iterator[OutputBatch]:
+        """Yield grouped results after each request finishes its terminal stage."""
+        assert self.pipeline is not None
+        results = self.pipeline.forward_batch_sequentially(batch, self.server_args)
+        group_start_time = time.monotonic()
+
+        try:
+            for req in batch:
+                output_count = (
+                    max(1, int(req.num_outputs_per_prompt or 1))
+                    if self.server_args.pipeline_config.supports_sequential_multi_output_inference()
+                    else 1
+                )
+                output_batch = self._execute_forward_common(
+                    req,
+                    forward_fn=lambda results=results, output_count=output_count: (
+                        self._collect_sequential_outputs(results, output_count)
+                    ),
+                    log_reqs=[req],
+                    return_req=False,
+                    save_output_paths=lambda output_batch, req=req: self._save_output_paths(
+                        req, output_batch
+                    ),
+                    error_context=f"grouped request {req.request_id}",
+                    execution_start_time=group_start_time,
+                    propagate_forward_errors=True,
+                )
+                assert isinstance(output_batch, OutputBatch)
+                yield output_batch
+                del output_batch
+        finally:
+            close = getattr(results, "close", None)
+            if close is not None:
+                close()
+
+    def _collect_sequential_outputs(
+        self,
+        results: Iterator[OutputBatch | Req],
+        output_count: int,
+    ) -> OutputBatch | Req:
+        if output_count == 1:
+            return next(results)
+
+        output_batches = [
+            self._to_output_batch(next(results)) for _ in range(output_count)
+        ]
+        return self._merge_expanded_output_batches(output_batches)
+
     def _execute_forward_batch(self, batch: list[Req]) -> OutputBatch | Req:
         """Execute expanded multi-output requests as one grouped forward."""
         # TODO: support early return or mix-stage execution for reqs in a group
@@ -396,24 +461,35 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         return_req: bool,
         save_output_paths: Callable[[OutputBatch], None],
         error_context: str,
+        execution_start_time: float | None = None,
+        propagate_forward_errors: bool = False,
     ) -> OutputBatch | Req:
         """
         Args:
             forward_fn: the actual forward function for reqs
         """
         output_batch = None
+        forward_failed = False
         try:
-            if self.rank == 0 and not current_platform.is_cpu():
+            if not current_platform.is_cpu() and not current_platform.is_mps():
                 torch.get_device_module().reset_peak_memory_stats()
 
-            start_time = time.monotonic()
+            start_time = (
+                execution_start_time
+                if execution_start_time is not None
+                else time.monotonic()
+            )
             self._realtime_sessions.attach(req)
 
             # capture memory baseline for each req in grouped forward on rank-0
             request_metrics = [
                 item.metrics for item in log_reqs if item.metrics is not None
             ]
-            if self.rank == 0 and request_metrics and not current_platform.is_cpu():
+            if (
+                self.is_output_rank
+                and request_metrics
+                and not current_platform.is_cpu()
+            ):
                 baseline_snapshot = capture_memory_snapshot()
                 for metrics in request_metrics:
                     metrics.record_memory_snapshot("before_forward", baseline_snapshot)
@@ -425,7 +501,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     stack.enter_context(
                         trace_slice(item.trace_ctx, DiffStage.GPU_FORWARD)
                     )
-                result = forward_fn()
+                try:
+                    result = forward_fn()
+                except Exception:
+                    forward_failed = True
+                    raise
 
             # disagg roles return raw Req so callers can keep and transfer intermediate tensors
             # before converting it to OutputBatch
@@ -433,34 +513,40 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 return result
 
             output_batch = self._to_output_batch(result)
-            self._record_output_peak_memory(output_batch)
 
             output_metrics = self._iter_output_metrics(output_batch)
-            if self.rank == 0 and output_metrics and not current_platform.is_cpu():
+            if self.is_output_rank and output_metrics and not current_platform.is_cpu():
                 peak_snapshot = capture_memory_snapshot()
                 for metrics in output_metrics:
                     metrics.record_memory_snapshot("after_forward", peak_snapshot)
-
-            if (
-                self.rank == 0
-                and not req.suppress_logs
-                and not current_platform.is_cpu()
-                and logger.isEnabledFor(logging.DEBUG)
-            ):
-                self.do_mem_analysis(output_batch)
 
             duration_ms = (time.monotonic() - start_time) * 1000
             for metrics in output_metrics:
                 metrics.total_duration_ms = duration_ms
 
             self._materialize_output_transport(output_batch, req, save_output_paths)
+            self._record_output_peak_memory(output_batch)
+
+            collect_perf = (
+                req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING
+            )
+            if collect_perf and not req.is_warmup:
+                self._record_replica_peak_memory(output_metrics)
 
             if (
-                torch.cuda.is_initialized()
+                self.is_output_rank
+                and not req.suppress_logs
+                and not current_platform.is_cpu()
+                and logger.isEnabledFor(logging.DEBUG)
+            ):
+                self.do_mem_analysis(output_batch)
+
+            if (
+                not current_platform.is_cpu()
                 and output_batch.output is None
                 and not req.return_raw_frames
             ):
-                torch.cuda.empty_cache()
+                torch.get_device_module().empty_cache()
 
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
                 if not req.is_warmup:
@@ -479,6 +565,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     tag="server_perf_dump",
                 )
         except Exception as e:
+            if propagate_forward_errors and forward_failed:
+                if isinstance(e, StopIteration):
+                    raise RuntimeError(
+                        "Grouped pipeline returned fewer outputs than requests."
+                    ) from e
+                raise
             logger.error(
                 f"Error executing {error_context}: {e}",
                 exc_info=True,
@@ -490,8 +582,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             output_batch.error = f"Error executing {error_context}: {e}"
             self._record_output_peak_memory(output_batch)
             # clean cache if OOM
-            if torch.cuda.is_initialized():
-                torch.cuda.empty_cache()
+            if not current_platform.is_cpu():
+                torch.get_device_module().empty_cache()
         return output_batch
 
     def _materialize_output_transport(
@@ -510,7 +602,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def _materialize_raw_frame_transport(
         self, output_batch: OutputBatch, req: Req
     ) -> None:
-        if self.rank != 0:
+        if not self.is_output_rank:
             return
         if output_batch.output is not None:
             output_batch.raw_frame_content_type = RAW_RGB_CONTENT_TYPE
@@ -532,7 +624,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         output_batch: OutputBatch,
         save_output_paths: Callable[[OutputBatch], None],
     ) -> None:
-        if self.rank == 0:
+        if self.is_output_rank:
             save_output_paths(output_batch)
         output_batch.output = None
         output_batch.audio = None
@@ -543,7 +635,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> None:
         """materialize the output from tensor to numpy frames for faster serialization"""
         if (
-            self.rank != 0
+            not self.is_output_rank
             or output_batch.output is None
             or not getattr(req, "return_frames", False)
         ):
@@ -607,10 +699,38 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         return np.asarray(materialized.frames)
 
     def _record_output_peak_memory(self, output_batch: OutputBatch) -> None:
-        if self.rank != 0 or current_platform.is_cpu():
+        if current_platform.is_cpu():
             return
-        peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
-        output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
+        peak_reserved_mb = capture_memory_snapshot().peak_reserved_mb
+        self._runtime_peak_reserved_mb = max(
+            self._runtime_peak_reserved_mb, peak_reserved_mb
+        )
+        if self.is_output_rank:
+            output_batch.peak_memory_mb = peak_reserved_mb
+
+    def _record_replica_peak_memory(self, output_metrics: list[Any]) -> None:
+        """Record replica-wide loading and runtime allocator peaks."""
+        if not current_platform.is_cuda():
+            return
+
+        peaks = torch.tensor(
+            [self._load_peak_reserved_mb, self._runtime_peak_reserved_mb],
+            dtype=torch.float64,
+            device=current_platform.get_device(self.local_rank),
+        )
+        peaks = get_replica_group().all_reduce(peaks, op=torch.distributed.ReduceOp.MAX)
+        if not self.is_output_rank:
+            return
+
+        snapshot = capture_memory_snapshot()
+        load_peak_mb, runtime_peak_mb = peaks.tolist()
+        for metrics in output_metrics:
+            metrics.record_memory_snapshot(
+                "load_peak", replace(snapshot, peak_reserved_mb=load_peak_mb)
+            )
+            metrics.record_memory_snapshot(
+                "runtime_peak", replace(snapshot, peak_reserved_mb=runtime_peak_mb)
+            )
 
     def _forward_group(self, batch: list[Req]) -> OutputBatch:
         assert self.pipeline is not None
@@ -620,7 +740,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
     def _save_output_paths(self, req: Req, output_batch: OutputBatch) -> None:
         """save outputs to files"""
-        if self.rank != 0 or output_batch.output is None:
+        if not self.is_output_rank or output_batch.output is None:
             return
 
         dynamic_output_paths = None
@@ -671,7 +791,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         reqs: list[Req],
         output_batch: OutputBatch,
     ) -> None:
-        if self.rank != 0 or output_batch.output is None:
+        if not self.is_output_rank or output_batch.output is None:
             return
         if len(output_batch.output) != len(reqs):
             raise RuntimeError(
@@ -752,6 +872,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             audio=getattr(result, "audio", None),
             audio_sample_rate=getattr(result, "audio_sample_rate", None),
             metrics=result.metrics,
+            usage=getattr(result, "usage", None),
             trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
             trajectory_latents=getattr(result, "trajectory_latents", None),
             rollout_trajectory_data=getattr(result, "rollout_trajectory_data", None),
@@ -786,6 +907,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if output_batch.error is not None and merged.error is None:
             merged.error = output_batch.error
         merged.peak_memory_mb = max(merged.peak_memory_mb, output_batch.peak_memory_mb)
+        if output_batch.usage is not None:
+            if merged.usage is None:
+                merged.usage = {}
+            for key, value in output_batch.usage.items():
+                if isinstance(value, int):
+                    merged.usage[key] = int(merged.usage.get(key, 0)) + value
+                else:
+                    merged.usage[key] = value
         if (
             merged.trajectory_timesteps is None
             and output_batch.trajectory_timesteps is not None
@@ -873,28 +1002,28 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if not self.pipeline:
             return can_stay_resident
 
-        # Map memory_usage keys to server_args offload flags.
-        # If the flag is False, the component is already resident, so we do not suggest it.
-        # If the flag is True, it is currently offloaded, so it is a candidate to stay resident.
-        offload_flags = {
-            "transformer": self.server_args.dit_cpu_offload
-            or self.server_args.is_dit_layerwise_offload_selected,
-            "vae": self.server_args.vae_cpu_offload,
-            "text_encoder": self.server_args.text_encoder_cpu_offload,
-            "text_encoder_2": self.server_args.text_encoder_cpu_offload,
-            "image_encoder": self.server_args.image_encoder_cpu_offload,
-        }
-
-        for name in OFFLOAD_DISABLE_RECOMMENDATION_ORDER:
-            # Only consider components that are currently configured to be offloaded
-            is_offload_configured = offload_flags.get(name, False)
-            if not is_offload_configured:
+        memory_usages = self.pipeline.memory_usages
+        ordered_names = [
+            name
+            for name in OFFLOAD_DISABLE_RECOMMENDATION_ORDER
+            if name in memory_usages
+        ]
+        ordered_names.extend(
+            name
+            for name in memory_usages
+            if name not in OFFLOAD_DISABLE_RECOMMENDATION_ORDER
+        )
+        for name in ordered_names:
+            usage = memory_usages[name]
+            if not (
+                self.server_args.should_cpu_offload_component(name)
+                or self.server_args.should_configure_layerwise_offload_for_lazy_component(
+                    name
+                )
+            ):
                 continue
-
-            usage = self.pipeline.memory_usages.get(name)
             if usage is None:
                 continue
-
             if usage <= remaining_gpu_mem_gb:
                 can_stay_resident.append(name)
                 remaining_gpu_mem_gb -= usage
@@ -908,6 +1037,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         target: Union[str, List[str]] = "all",
         strength: Union[float, List[float]] = 1.0,
         merge_mode: str | None = None,
+        lora_alpha: int | None | list[int | None] = None,
     ) -> OutputBatch:
         """
         Set the LoRA adapter(s) for the pipeline.
@@ -923,7 +1053,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
         self.pipeline.set_lora(
-            lora_nickname, lora_path, target, strength, merge_mode=merge_mode
+            lora_nickname,
+            lora_path,
+            target,
+            strength,
+            merge_mode=merge_mode,
+            lora_alpha=lora_alpha,
         )
         return OutputBatch()
 

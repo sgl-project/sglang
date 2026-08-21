@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 from typing import TYPE_CHECKING
@@ -34,10 +35,16 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         )
 
     if server_args.disaggregation_mode == "decode" and server_args.dcp_size > 1:
-        if server_args.disaggregation_transfer_backend not in ("mooncake", "nixl"):
+        # Fake transfer moves no KV and is only used for synthetic decode
+        # benchmarks, so it does not need the DCP relayout from Mooncake/NIXL.
+        if server_args.disaggregation_transfer_backend not in (
+            "mooncake",
+            "nixl",
+            "fake",
+        ):
             raise ValueError(
                 "PD decode DCP requires --disaggregation-transfer-backend "
-                "mooncake or nixl, got "
+                "mooncake, nixl, or fake for synthetic benchmarking, got "
                 f"{server_args.disaggregation_transfer_backend!r}."
             )
         if server_args.disaggregation_decode_enable_radix_cache:
@@ -101,6 +108,9 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             server_args.disaggregation_transfer_backend != "fake"
         ), "Prefill server does not support 'fake' as the transfer backend"
 
+        if envs.SGLANG_RUST_SERVER.get():
+            _alias_bootstrap_port_to_api_port(server_args)
+
     if server_args.disaggregation_mode in ("prefill", "decode"):
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -111,3 +121,36 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 f"disaggregation_transfer_backend='mooncake' or 'nixl', "
                 f"got '{server_args.disaggregation_transfer_backend}'."
             )
+
+
+def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:
+    """Rust-server prefill serves the KV bootstrap registry on the api listener
+    itself, so the resolved bootstrap port must BE the api port — every internal
+    consumer (KVManager registration, PrefillBootstrapQueue) reads the resolved
+    field and agrees automatically. Decode is untouched: there the field names
+    the PREFILL side's bootstrap port and must stay as the operator set it.
+    """
+    default_port = next(
+        f.default
+        for f in dataclasses.fields(server_args)
+        if f.name == "disaggregation_bootstrap_port"
+    )
+    if server_args.disaggregation_bootstrap_port not in (
+        default_port,
+        server_args.port,
+    ):
+        raise ValueError(
+            "SGLANG_RUST_SERVER serves the PD KV bootstrap registry on the api "
+            "port itself; --disaggregation-bootstrap-port "
+            f"{server_args.disaggregation_bootstrap_port} conflicts with --port "
+            f"{server_args.port}. Drop --disaggregation-bootstrap-port (decode "
+            "nodes and the PD router must then target the prefill api port)."
+        )
+    if server_args.disaggregation_bootstrap_port != server_args.port:
+        logger.info(
+            "SGLANG_RUST_SERVER: KV bootstrap registry is served on the api "
+            "port; disaggregation_bootstrap_port %d -> %d",
+            server_args.disaggregation_bootstrap_port,
+            server_args.port,
+        )
+        server_args.disaggregation_bootstrap_port = server_args.port

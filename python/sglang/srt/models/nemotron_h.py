@@ -279,17 +279,11 @@ class NemotronHMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        overlap = _is_cuda and not torch.compiler.is_compiling()
-        if (
-            overlap
-            and get_moe_a2a_backend().is_flashinfer()
-            and not get_is_capture_mode()
+        if _is_cuda and (
+            not get_moe_a2a_backend().is_flashinfer() or get_is_capture_mode()
         ):
-            overlap = False
-        if overlap:
             return self._forward_core_shared_routed_overlap(hidden_states)
-        else:
-            return self._forward_core_normal(hidden_states)
+        return self._forward_core_normal(hidden_states)
 
     def _forward_core_normal(
         self,
@@ -569,7 +563,16 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
             if get_real_num_tokens(hidden_states, forward_batch) == 0:
                 return torch.zeros_like(hidden_states), residual
 
-            output = self._forward_mamba(hidden_states, forward_batch)
+            if is_in_breakable_cuda_graph():
+                output = torch.empty_like(hidden_states)
+                breakable_nemotron_mamba2_with_output(
+                    hidden_states, output, self.layer_id, False
+                )
+            elif is_in_tc_piecewise_cuda_graph():
+                output = torch.empty_like(hidden_states)
+                nemotron_mamba2_with_output(hidden_states, output, self.layer_id, False)
+            else:
+                output = self._forward_mamba(hidden_states, forward_batch)
             return output, residual
 
         hidden_states, residual = input_norm_maybe_fuse_allreduce(
