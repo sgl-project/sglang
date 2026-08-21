@@ -60,7 +60,7 @@ class GetK:
         cls, pool: "DSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor
     ):
         """
-        :param page_indices: (num_pages,), int32
+        :param page_indices: (num_pages,), int32/int64
         :return: (seq_len, index_head_dim), uint8
         """
 
@@ -76,9 +76,12 @@ class GetK:
         # flat_buf: (whatever,), uint8
         flat_buf = buf.flatten()
 
-        # flat_indices: (num_pages, num_k_bytes_per_page), int32, element := an index into flat_buf that we want to access
-        flat_indices = (page_indices * buf_numel_per_page)[:, None] + torch.arange(
-            num_k_bytes_per_page, dtype=torch.int32, device="cuda"
+        # flat_indices: (num_pages, num_k_bytes_per_page), int64
+        # element := an index into flat_buf that we want to access
+        flat_indices = (
+            page_indices.to(torch.int64) * buf_numel_per_page
+        )[:, None] + torch.arange(
+            num_k_bytes_per_page, dtype=torch.int64, device="cuda"
         )[None, :]
         flat_indices = flat_indices.flatten()[: seq_len * num_k_bytes_per_token]
 
@@ -132,7 +135,7 @@ class GetS:
         cls, pool: "DSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor
     ):
         """
-        :param page_indices: (num_pages,), int32
+        :param page_indices: (num_pages,), int32/int64
         :return: (seq_len, index_head_dim // quant_block_size), uint8
         """
         buf_numel_per_page = buf.shape[1]
@@ -143,8 +146,8 @@ class GetS:
 
         flat_buf = buf.flatten()
         flat_indices = (
-            (page_indices * buf_numel_per_page)[:, None]
-            + torch.arange(num_s_bytes_per_page, dtype=torch.int32, device="cuda")[
+            (page_indices.to(torch.int64) * buf_numel_per_page)[:, None]
+            + torch.arange(num_s_bytes_per_page, dtype=torch.int64, device="cuda")[
                 None, :
             ]
             + s_offset_in_page
@@ -467,7 +470,7 @@ def _get_k_triton_kernel(
     token_offset_in_page = token_id % page_size
 
     # Load the page index from page_indices
-    page_index = tl.load(page_indices_ptr + page_idx)
+    page_index = tl.load(page_indices_ptr + page_idx).to(tl.int64)
 
     # Calculate source offset in buf
     # buf[page_index, token_offset_in_page * index_head_dim : ...]
@@ -544,7 +547,7 @@ def _get_s_triton_kernel(
     token_offset_in_page = token_id % page_size
 
     # Load the page index from page_indices
-    page_index = tl.load(page_indices_ptr + page_idx)
+    page_index = tl.load(page_indices_ptr + page_idx).to(tl.int64)
 
     # Calculate source offset in buf
     # Scales are stored after K data: page_size * index_head_dim offset
@@ -677,7 +680,7 @@ def _get_k_and_s_triton_kernel(
     page_index = tl.load(
         page_indices_ptr + page_idx + page_indices_base,
         mask=token_valid_mask & page_idx_valid_mask,
-    )
+    ).to(tl.int64)
 
     # ===== Load K data =====
     # The address calculation logic for K: page_index * total number of elements in a single page + K offset of the token within the page.
