@@ -57,6 +57,12 @@ class MatchPrefixParams:
     cow_mamba: bool = False
     req: Optional[Req] = None
 
+    # True for cross-request reuse matches (scheduler-side lookups against the
+    # shared radix tree). False (default) for self-match lookups such as the
+    # one in `cache_unfinished_req`, which must keep trusting the device-only
+    # validators for the request's own freshly-computed nodes.
+    for_reuse: bool = False
+
 
 @dataclasses.dataclass
 class InsertParams:
@@ -397,6 +403,15 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         # trailing sliding window for re-prefill; every other cache keeps SWA
         # content-stable and overrides this where relevant.
         return 0
+
+    def restore_swa_windows(
+        self, reqs: Sequence[Req], req_pool_indices_cpu: torch.Tensor
+    ) -> None:
+        # Driven from prepare_for_extend once req_pool_idx is assigned, before the
+        # first forward reads the ring. Only a cache that hands a durable sliding
+        # window back on a prefix hit has anything to put there; a cache that
+        # re-prefills that window instead has nothing to restore.
+        pass
 
     def supports_mamba(self) -> bool:
         return False
