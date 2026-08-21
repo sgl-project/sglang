@@ -181,6 +181,19 @@ def _broadcast_indexer_topk_from_rank0(
     return topk_indices
 
 
+def _make_eager_idle_topk_result(
+    x: torch.Tensor, index_topk: int, return_indices: bool
+) -> Optional[torch.Tensor]:
+    if not return_indices:
+        return None
+    return torch.full(
+        (x.shape[0], index_topk),
+        -1,
+        dtype=torch.int32,
+        device=x.device,
+    )
+
+
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     # from sgl_kernel import hadamard_transform
     if _is_hip:
@@ -1562,6 +1575,21 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         layer_id: int,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
+        # A padded eager IDLE rank has no real requests and therefore no valid
+        # DSA page-table rows to index. Return invalid rows with the physical DP
+        # shape so later MLP/EP collectives still agree across ranks.
+        x_meta = x[0] if isinstance(x, tuple) else x
+        if (
+            _is_cuda
+            and forward_batch.forward_mode.is_idle()
+            and not get_is_capture_mode()
+        ):
+            topk_result = _make_eager_idle_topk_result(
+                x_meta, self.index_topk, return_indices
+            )
+            topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
+            return maybe_capture_indexer_topk(layer_id, topk_result)
+
         if _is_hip:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
         elif not _is_npu:
@@ -1569,10 +1597,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
-
-        # When upstream uses fused FP8 RMSNorm+quant, activations may be passed as
-        # a tuple like (x_fp8, x_scale[, y]). Use `x_meta` for shape/device queries.
-        x_meta = x[0] if isinstance(x, tuple) else x
 
         in_piecewise_or_breakable_cuda_graph = (
             _is_in_piecewise_or_breakable_cuda_graph()

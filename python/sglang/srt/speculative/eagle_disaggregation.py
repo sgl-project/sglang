@@ -97,7 +97,7 @@ def build_eagle_disagg_draft_input(
 
     requires_dsa_seed_for_cuda_graph = _requires_dsa_seed_for_cuda_graph(
         batch.model_config.hf_config,
-        server_args.speculative_eagle_topk,
+        spec.speculative_eagle_topk,
     )
 
     spec_info = EagleDraftInput(

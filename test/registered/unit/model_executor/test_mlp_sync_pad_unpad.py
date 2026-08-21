@@ -15,9 +15,16 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.managers.scheduler_components.dp_attn import MLPSyncBatchInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
+)
+from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
+    EAGLEDraftCudaGraphRunner,
+)
+from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
+    EAGLEDraftExtendCudaGraphRunner,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -60,6 +67,7 @@ class TestMlpSyncPadUnpad(CustomTestCase):
             global_num_tokens=[2, 0, 3],
             global_num_tokens_for_logprob=[2, 0, 3],
             can_run_dp_cuda_graph=True,
+            can_run_dp_draft_cuda_graph=False,
         )
 
         fb.init_mlp_sync_metadata(batch, torch.device("cpu"))
@@ -72,6 +80,52 @@ class TestMlpSyncPadUnpad(CustomTestCase):
             fb.global_num_tokens_for_logprob_gpu, torch.tensor([4, 0, 6])
         )
         self.assertTrue(fb.can_run_dp_cuda_graph)
+        self.assertFalse(fb.can_run_dp_draft_cuda_graph)
+
+    def test_draft_graph_gate_has_an_independent_dp_vote(self):
+        sync_info = MLPSyncBatchInfo(
+            dp_size=1,
+            tp_size=1,
+            cp_size=1,
+            num_tokens=1,
+            num_tokens_for_logprob=1,
+            can_run_decode_cuda_graph=True,
+            can_run_draft_cuda_graph=False,
+            can_run_prefill_cuda_graph=False,
+            is_extend_in_batch=False,
+            local_can_run_tbo=True,
+            local_forward_mode=ForwardMode.DECODE.value,
+        )
+
+        local = sync_info._get_local_tensor(device="cpu")
+        fallback = sync_info._get_fallback_tensor(device="cpu")
+
+        self.assertEqual(local[2].item(), 1)
+        self.assertEqual(local[7].item(), 0)
+        # Idle/inactive ranks stay permissive; an active incompatible rank wins
+        # through the all-gathered min reduction.
+        self.assertEqual(fallback[7].item(), 1)
+
+    def test_draft_only_gate_does_not_disable_draft_extend_graph(self):
+        draft_runner = object.__new__(EAGLEDraftCudaGraphRunner)
+        draft_extend_runner = object.__new__(EAGLEDraftExtendCudaGraphRunner)
+        for runner in (draft_runner, draft_extend_runner):
+            runner.require_mlp_tp_gather = False
+            runner.require_mlp_sync = True
+            runner.disable_padding = False
+            runner.captured_req_width = 1
+            runner.max_bs = 8
+
+        forward_batch = SimpleNamespace(
+            spec_info=SimpleNamespace(num_tokens_per_req=1),
+            batch_size=1,
+            seq_lens=torch.ones(1),
+            can_run_dp_cuda_graph=True,
+            can_run_dp_draft_cuda_graph=False,
+        )
+
+        self.assertFalse(draft_runner.can_run_graph(forward_batch))
+        self.assertTrue(draft_extend_runner.can_run_graph(forward_batch))
 
     def test_draft_input_without_hidden_states_can_be_padded(self):
         spec_info = SimpleNamespace(

@@ -167,6 +167,46 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
     return seqlens_32.contiguous().view(-1, 1)
 
 
+def _trim_trtllm_decode_dp_padding(
+    q_all: torch.Tensor,
+    topk_indices: Optional[torch.Tensor],
+    real_batch_size: int,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], int]:
+    """Align eager decode inputs with metadata planned before DP padding."""
+    physical_batch_size = q_all.shape[0]
+    assert real_batch_size <= physical_batch_size, (
+        f"DSA metadata batch size ({real_batch_size}) exceeds q batch size "
+        f"({physical_batch_size})"
+    )
+    if topk_indices is not None:
+        assert real_batch_size <= topk_indices.shape[0], (
+            f"DSA metadata batch size ({real_batch_size}) exceeds topk batch size "
+            f"({topk_indices.shape[0]})"
+        )
+
+    num_padding_rows = physical_batch_size - real_batch_size
+    if num_padding_rows == 0:
+        return q_all, topk_indices, 0
+
+    return (
+        q_all[:real_batch_size],
+        topk_indices[:real_batch_size] if topk_indices is not None else None,
+        num_padding_rows,
+    )
+
+
+def _restore_trtllm_decode_dp_padding(
+    output: torch.Tensor, num_padding_rows: int
+) -> torch.Tensor:
+    """Restore the physical DP shape required by downstream MLP collectives."""
+    if num_padding_rows == 0:
+        return output
+    return torch.cat(
+        [output, output.new_zeros((num_padding_rows, *output.shape[1:]))],
+        dim=0,
+    )
+
+
 @dataclass(frozen=True)
 class DSAFlashMLAMetadata:
     """Metadata only needed by FlashMLA"""
@@ -3193,9 +3233,24 @@ class DeepseekSparseAttnBackend(
         else:
             q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
+        # Eager DP attention can pad q beyond metadata that was deliberately
+        # planned on the real draft batch. Pad top-k to the physical q shape,
+        # then run decode attention only on metadata-backed rows. The output is
+        # restored below before downstream MLP/EP collectives.
+        if (self.use_fused_topk or not is_prefill) and topk_indices is not None:
+            topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
+
+        num_decode_padding_rows = 0
+        if not is_prefill:
+            q_all, topk_indices, num_decode_padding_rows = (
+                _trim_trtllm_decode_dp_padding(
+                    q_all,
+                    topk_indices,
+                    metadata.cache_seqlens_int32.shape[0],
+                )
+            )
+
         if self.use_fused_topk:
-            if topk_indices is not None:
-                topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         elif is_prefill:
             page_table_1 = transform_index_page_table_prefill(
@@ -3211,8 +3266,6 @@ class DeepseekSparseAttnBackend(
                 cu_seqlens_q=metadata.cu_seqlens_q,
             )
         else:
-            if topk_indices is not None:
-                topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
             page_table_1 = transform_index_page_table_decode(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
@@ -3270,7 +3323,7 @@ class DeepseekSparseAttnBackend(
             multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
         )
 
-        return out
+        return _restore_trtllm_decode_dp_padding(out, num_decode_padding_rows)
 
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int
