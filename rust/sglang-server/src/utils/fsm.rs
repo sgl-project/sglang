@@ -12,7 +12,7 @@
 //! Aborted
 //! ```
 
-use crate::error::Error;
+use super::error::Error;
 
 #[derive(Debug, Clone)]
 pub enum RequestState {
@@ -36,7 +36,7 @@ pub enum RequestState {
     Aborted,
 }
 
-/// Outcome of validation, selecting the ingress branch.
+/// Outcome of validation.
 #[derive(Debug, Clone, Copy)]
 pub enum ValidationOutcome {
     /// Has multimodal inputs → Encoding, where an MM worker runs the native
@@ -52,7 +52,7 @@ pub enum ValidationOutcome {
 /// design's transition table.
 #[derive(Debug)]
 pub enum Event {
-    // --- ingress ---
+    // --- request ---
     Validated(ValidationOutcome),
     NeedsNormalize,
     EncodeDone,
@@ -60,7 +60,7 @@ pub enum Event {
     /// The pre-send checks passed; the request may be pushed to the ring.
     PreSendValidated,
     SchedulerPicked,
-    // --- egress ---
+    // --- response ---
     Chunk {
         finish: bool,
     },
@@ -113,7 +113,7 @@ impl RequestState {
         }
 
         let next = match (&*self, &event) {
-            // ingress
+            // request
             (Received, Validated(_)) => Validating,
             // Generate requests pass through Normalizing (sampling-param
             // normalize/verify); control requests skip it, having none.
@@ -127,12 +127,12 @@ impl RequestState {
             // pre-send checks: expanded image tokens count against the same
             // input + max_new_tokens ceiling as tokenized text.
             (Encoding, EncodeDone) => PreSendValidating,
-            // Every ingress branch funnels through the pre-send checks, so they
+            // Every to-scheduler branch funnels through the pre-send checks, so they
             // run exactly once per request no matter how it got its ids.
             (Tokenizing, TokenizeDone) => PreSendValidating,
             (PreSendValidating, PreSendValidated) => Queued,
             (Queued, SchedulerPicked) => Streaming { chunks_sent: 0 },
-            // egress
+            // response
             (Streaming { chunks_sent }, Chunk { finish: false }) => Streaming {
                 chunks_sent: chunks_sent + 1,
             },
@@ -154,7 +154,7 @@ mod tests {
         state
     }
 
-    /// Every ingress branch — control, client-supplied ids, and text through the
+    /// Every to-scheduler branch — control, client-supplied ids, and text through the
     /// tokenizer pool — must land in `PreSendValidating`, because that is where
     /// the checks needing the final `input_ids` run. A branch that reached
     /// `Queued` directly would skip them silently.

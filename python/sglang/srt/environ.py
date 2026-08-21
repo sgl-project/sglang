@@ -351,6 +351,9 @@ class Envs:
     # ===================================================================
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
+    # Set to true by the check-changes CI job when a PR touches nothing under
+    # rust/; default false so local and scheduled runs never skip the cargo tests.
+    SGLANG_SKIP_RUST_TESTS = EnvBool(False)
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
     # Expand jit_kernel test grids to their full parameter ranges (nightly).
     SGLANG_JIT_KERNEL_RUN_FULL_TESTS = EnvBool(False)
