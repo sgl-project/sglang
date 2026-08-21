@@ -603,6 +603,10 @@ class DeepseekV4AttnBackend(
             DSV4RawDecodeMetadata,
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
+        # Raw cudaMemcpyAsync in the online-c128 planner is invisible to
+        # PyTorch's pinned-memory allocator. Keep transient metadata alive
+        # until the copy and all metadata copies queued before the event finish.
+        self._online_c128_metadata_keep_alive = []
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
         spec_alg = model_runner.spec_algorithm
         self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
@@ -633,11 +637,6 @@ class DeepseekV4AttnBackend(
                 "DSV4 ragged verify does not support context parallel (CP); "
                 "set SGLANG_RAGGED_VERIFY_MODE off for CP runs."
             )
-        if self.online_c128_mtp.enabled():
-            raise NotImplementedError(
-                "DSV4 ragged verify does not support online c128 MTP; "
-                "set SGLANG_RAGGED_VERIFY_MODE off or disable online compress."
-            )
         # Layout invariants (verify_lens >= 1, total == sum) are enforced in
         # RaggedVerifyLayout.__post_init__; don't re-check the device tensor
         # here -- that would D2H-sync the host-free verify prep path.
@@ -663,25 +662,46 @@ class DeepseekV4AttnBackend(
         extend_seq_lens: torch.Tensor,
         use_prefill_cuda_graph: bool,
         online_c128_state_slot_offset: int,
+        ragged_layout: Optional[RaggedVerifyLayout] = None,
     ) -> Optional[FusedCompressMetadata]:
         if not self.online_c128_mtp.enabled():
             return None
 
-        assert seq_lens_cpu is not None
-        num_draft_tokens = self.speculative_num_draft_tokens
-        seq_lens_cpu = [int(x) + num_draft_tokens for x in seq_lens_cpu]
-        extend_lens_cpu = [num_draft_tokens] * len(seq_lens_cpu)
+        if seq_lens_cpu is None:
+            adjusted_seq_lens_cpu = None
+            extend_lens_cpu = None
+            num_q_tokens = (
+                ragged_layout.graph_num_tokens
+                if ragged_layout is not None
+                else len(seq_lens) * self.speculative_num_draft_tokens
+            )
+        else:
+            if ragged_layout is None:
+                extend_lens_cpu = [self.speculative_num_draft_tokens] * len(
+                    seq_lens_cpu
+                )
+            elif ragged_layout.verify_lens_cpu is not None:
+                extend_lens_cpu = ragged_layout.verify_lens_cpu
+            else:
+                extend_lens_cpu = ragged_layout.verify_lens.cpu().tolist()
+            adjusted_seq_lens_cpu = [
+                int(seq_len) + int(extend_len)
+                for seq_len, extend_len in zip(seq_lens_cpu, extend_lens_cpu)
+            ]
+            num_q_tokens = None
+
         return create_paged_compressor_data(
             compress_ratio=128,
             is_prefill=True,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
             req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens + self.speculative_num_draft_tokens,
-            seq_lens_cpu=seq_lens_cpu,
+            seq_lens=seq_lens + extend_seq_lens,
+            seq_lens_cpu=adjusted_seq_lens_cpu,
             extend_lens=extend_seq_lens,
             extend_lens_cpu=extend_lens_cpu,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
+            num_q_tokens=num_q_tokens,
             online_state_slot_offset=online_c128_state_slot_offset,
         )
 
@@ -870,6 +890,7 @@ class DeepseekV4AttnBackend(
                 extend_seq_lens,
                 use_prefill_cuda_graph,
                 online_c128_state_slot_offset,
+                ragged_layout=ragged_layout,
             ),
             extend_start_loc=extend_start_loc,
             verify_lens=verify_lens,
@@ -1289,6 +1310,7 @@ class DeepseekV4AttnBackend(
                 req_pool_indices,
                 seq_lens,
                 verify_bs=verify_bs,
+                ragged_layout=ragged_layout,
             )
             temp_metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=chosen_max_seq_len,
@@ -1377,11 +1399,17 @@ class DeepseekV4AttnBackend(
         else:
             max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
         verify_bs = _get_target_verify_bs(forward_batch)
+        ragged_layout = (
+            self._resolve_verify_layout(forward_batch, bs=len(seq_lens))
+            if logical_forward_mode.is_target_verify()
+            else None
+        )
         online_c128_state_slot_offset = self.online_c128_mtp.prepare_forward(
             logical_forward_mode,
             req_pool_indices,
             seq_lens,
             verify_bs=verify_bs,
+            ragged_layout=ragged_layout,
         )
 
         if logical_forward_mode.is_decode_or_idle():
@@ -1412,7 +1440,6 @@ class DeepseekV4AttnBackend(
                 block_size=block_size,
             )
         elif logical_forward_mode.is_target_verify():
-            ragged_layout = self._resolve_verify_layout(forward_batch, bs=len(seq_lens))
             metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
@@ -1485,8 +1512,26 @@ class DeepseekV4AttnBackend(
             use_prefill_cuda_graph=True,
         )
         assert isinstance(capture_metadata, DSV4Metadata)
+        previous_c128_metadata = capture_metadata.c128_compress_metadata
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
+        self._retain_online_c128_metadata_until_ready(previous_c128_metadata)
         self.forward_metadata = capture_metadata
+
+    def _retain_online_c128_metadata_until_ready(self, metadata) -> None:
+        if metadata is None or not envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+            return
+
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(self.device))
+        self._online_c128_metadata_keep_alive.append((event, metadata))
+
+        first_pending = 0
+        for pending_event, _ in self._online_c128_metadata_keep_alive:
+            if not pending_event.query():
+                break
+            first_pending += 1
+        if first_pending:
+            del self._online_c128_metadata_keep_alive[:first_pending]
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         self.cuda_graph_metadata_of_bucket_and_bs: Dict[
@@ -1541,6 +1586,7 @@ class DeepseekV4AttnBackend(
             self.forward_metadata = temp_metadata
             return
         chosen_metadata.copy_(temp_metadata)
+        self._retain_online_c128_metadata_until_ready(temp_metadata)
         self.forward_metadata = chosen_metadata
 
     def get_cuda_graph_seq_len_fill_value(self):
