@@ -38,9 +38,11 @@ from sglang.srt.speculative.spec_info import SpecInput
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
+from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
-FLA_CHUNK_SIZE = 64
+if is_npu():
+    FLA_CHUNK_SIZE_NPU = 64
 
 
 class MambaAttnBackendBase(AttentionBackend):
@@ -336,8 +338,10 @@ class MambaAttnBackendBase(AttentionBackend):
         if isinstance(self, Mamba2AttnBackend):
             num_h_states = extend_seq_lens // chunk_size
         else:
-            h_chunk_size = FLA_CHUNK_SIZE
-            num_h_states = (extend_seq_lens - 1) // h_chunk_size + 1
+            num_h_states = (extend_seq_lens - 1) // chunk_size + 1
+            if is_npu():
+                h_chunk_size = FLA_CHUNK_SIZE_NPU
+                num_h_states = (extend_seq_lens - 1) // h_chunk_size + 1
 
         track_ssm_src_offset = torch.zeros_like(num_h_states)
         track_ssm_src_offset[1:] = torch.cumsum(num_h_states[:-1], dim=0)
@@ -356,8 +360,12 @@ class MambaAttnBackendBase(AttentionBackend):
         # Unaligned: intermediate state from h.
         # TODO: handle chunk_size % page size != 0
         not_aligned = ~is_aligned
-        lens_aligned = (lens_masked[not_aligned] // chunk_size) * chunk_size
-        track_ssm_h_src = offset_masked[not_aligned] + lens_aligned // h_chunk_size
+        track_ssm_h_src = offset_masked[not_aligned] + (
+            lens_masked[not_aligned] // chunk_size
+        )
+        if is_npu():
+            lens_aligned = (lens_masked[not_aligned] // chunk_size) * chunk_size
+            track_ssm_h_src = offset_masked[not_aligned] + lens_aligned // h_chunk_size
         track_ssm_h_dst = dst_masked[not_aligned]
 
         return (
