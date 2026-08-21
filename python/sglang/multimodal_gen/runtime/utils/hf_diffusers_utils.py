@@ -53,6 +53,7 @@ from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     normalize_flat_modelopt_quant_config,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils.hf_transformers import check_gguf_file
 from sglang.utils import is_in_ci
 
 logger = init_logger(__name__)
@@ -597,19 +598,6 @@ def attach_additional_stop_token_ids(tokenizer):
         tokenizer.additional_stop_token_ids = None
 
 
-def check_gguf_file(model: str | os.PathLike) -> bool:
-    """Check if the file is a GGUF model."""
-    model = Path(model)
-    if not model.is_file():
-        return False
-    elif model.suffix == ".gguf":
-        return True
-
-    with open(model, "rb") as f:
-        header = f.read(4)
-    return header == b"GGUF"
-
-
 def maybe_download_lora(
     model_name_or_path: str,
     local_dir: str | None = None,
@@ -849,6 +837,7 @@ def maybe_download_model(
     is_lora: bool = False,
     allow_patterns: list[str] | None = None,
     force_diffusers_model: bool = False,
+    revision: str | None = None,
     skip_overlay_resolution: bool = False,
 ) -> str:
     """
@@ -860,6 +849,7 @@ def maybe_download_model(
         download: Whether to download the model from Hugging Face Hub
         is_lora: If True, skip model completeness verification (LoRA models don't have transformer/vae directories)
         force_diffusers_model: If True, apply diffusers model check. Otherwise it should be a component model
+        revision: Specific Hugging Face Hub revision to resolve
     Returns:
         Local path to the model
     """
@@ -925,9 +915,11 @@ def maybe_download_model(
         local_path = snapshot_download(
             repo_id=model_name_or_path,
             ignore_patterns=["*.onnx", "*.msgpack"],
+            allow_patterns=allow_patterns,
             local_dir=local_dir,
             local_files_only=True,
             max_workers=8,
+            revision=revision,
         )
         if _is_revisionless_snapshot_root(local_path):
             # A cache miss, so the download below re-resolves and rewrites the ref.
@@ -1020,6 +1012,7 @@ def maybe_download_model(
                     allow_patterns=allow_patterns,
                     local_dir=local_dir,
                     max_workers=8,
+                    revision=revision,
                 )
 
             if not force_diffusers_model:
@@ -1034,9 +1027,11 @@ def maybe_download_model(
                     local_path = snapshot_download(
                         repo_id=model_name_or_path,
                         ignore_patterns=["*.onnx", "*.msgpack"],
+                        allow_patterns=allow_patterns,
                         local_dir=local_dir,
                         max_workers=8,
                         force_download=True,
+                        revision=revision,
                     )
                 if not _verify_diffusers_model_complete(local_path):
                     raise ValueError(
@@ -1081,6 +1076,28 @@ def maybe_download_model(
                 attempt + 1,
                 MAX_RETRIES,
                 e,
+                wait_time,
+            )
+            time.sleep(wait_time)
+        except RuntimeError as e:
+            if "client has been closed" not in str(e).lower():
+                raise ValueError(
+                    f"Could not find model at {model_name_or_path} and failed to download from {_model_hub_name()}: {e}"
+                ) from e
+            if attempt == MAX_RETRIES - 1:
+                raise ValueError(
+                    f"Could not find model at {model_name_or_path} and failed to download from {_model_hub_name()} "
+                    f"after {MAX_RETRIES} attempts due to network error: {e}"
+                ) from e
+            from huggingface_hub.utils._http import close_session
+
+            close_session()
+            wait_time = 2**attempt
+            logger.warning(
+                "Download failed (attempt %d/%d) because the Hugging Face client was closed. "
+                "Retrying in %d seconds...",
+                attempt + 1,
+                MAX_RETRIES,
                 wait_time,
             )
             time.sleep(wait_time)
