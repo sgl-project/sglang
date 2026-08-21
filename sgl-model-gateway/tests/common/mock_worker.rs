@@ -96,6 +96,7 @@ impl MockWorker {
             )
             .route("/flush_cache", post(flush_cache_handler))
             .route("/v1/models", get(v1_models_handler))
+            .route("/abort_request", post(abort_request_handler))
             .with_state(config);
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1469,6 +1470,49 @@ async fn responses_cancel_handler(
 // Configured via a global map keyed by worker port so that tests
 // can enable slow streaming WITHOUT relying on the request payload
 // (the gateway deserializes/re-serializes the body, dropping unknown fields).
+
+// Records every /abort_request body received per worker port, so tests can
+// assert the gateway fanned the abort out to ALL workers with the body intact.
+static ABORTS_RECEIVED: OnceLock<Mutex<Vec<(u16, serde_json::Value)>>> = OnceLock::new();
+
+fn aborts_received() -> &'static Mutex<Vec<(u16, serde_json::Value)>> {
+    ABORTS_RECEIVED.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Clear the recorded aborts (call at the start of a test).
+pub fn clear_aborts_received() {
+    aborts_received().lock().unwrap().clear();
+}
+
+/// Snapshot of (port, body) pairs for every /abort_request received.
+pub fn get_aborts_received() -> Vec<(u16, serde_json::Value)> {
+    aborts_received().lock().unwrap().clone()
+}
+
+async fn abort_request_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    body: Json<serde_json::Value>,
+) -> Response {
+    let config = config.read().await;
+    let port = config.port;
+
+    // Record arrival before the failure check — fan-out must reach every
+    // worker regardless of the response it then returns.
+    aborts_received()
+        .lock()
+        .unwrap()
+        .push((port, body.0.clone()));
+
+    if should_fail(&config).await {
+        return (
+            fail_status_code(port),
+            Json(json!({"error": "Random failure for testing"})),
+        )
+            .into_response();
+    }
+
+    Json(json!({"aborted": true})).into_response()
+}
 
 static SLOW_STREAM_CONFIG: OnceLock<Mutex<HashMap<u16, usize>>> = OnceLock::new();
 
