@@ -6469,12 +6469,9 @@ class ServerArgs:
 
             ragged_mode = read_ragged_verify_mode()
             if ragged_mode is not RaggedVerifyMode.STATIC:
-                # Ragged ring-writes need the KDA fold-every-commit family
-                # (DSPARK/DFLASH) + the triton verify kernel (nv_cutedsl falls
-                # back to it for ragged layouts). The GDN ring-write kernels do
-                # not take the ragged layout and the flashinfer verify kernel
-                # never writes the ring -> a stale ring would be folded; keep
-                # refusing those combinations.
+                # Keep non-static ReplaySSM restricted to direct
+                # DFlash/DSpark verification and a ring-writing Triton kernel
+                # (nv_cutedsl falls back to Triton for compact layouts).
                 _algo = (self.speculative_algorithm or "").upper()
                 verify = self.linear_attn_verify_backend
                 if _algo not in ("DSPARK", "DFLASH") or verify not in (
@@ -6484,7 +6481,7 @@ class ServerArgs:
                     raise ValueError(
                         "--enable-linear-replayssm-spec with "
                         f"SGLANG_RAGGED_VERIFY_MODE={ragged_mode.value} requires the "
-                        "KDA fold-every-commit family (DSPARK/DFLASH) and a "
+                        "DFlash/DSpark fold-every-commit path and a "
                         "ring-writing verify kernel (--linear-attn-verify-backend "
                         "triton or nv_cutedsl); got "
                         f"algorithm={self.speculative_algorithm!r}, "

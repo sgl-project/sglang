@@ -298,20 +298,6 @@ class KVCacheConfigurator:
                 "ReplaySSM with direct target verification is not supported with "
                 "--enable-unified-memory yet."
             )
-        if not is_gdn:
-            return
-
-        from sglang.srt.speculative.ragged_verify import (
-            RaggedVerifyMode,
-            read_ragged_verify_mode,
-        )
-
-        ragged_mode = read_ragged_verify_mode()
-        if ragged_mode is not RaggedVerifyMode.STATIC:
-            raise ValueError(
-                "GDN ReplaySSM requires SGLANG_RAGGED_VERIFY_MODE=static; "
-                f"got {ragged_mode.value!r}."
-            )
 
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         """Apply a resolved MemoryPoolConfig and initialize pools."""

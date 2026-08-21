@@ -983,7 +983,14 @@ class HybridLinearAttnBackend(AttentionBackend):
         if mamba_pool is None or not getattr(mamba_pool, "replayssm_spec_fold", False):
             return None
 
-        if getattr(mamba_pool, "replayssm_is_kda", False):
+        is_kda_pool = getattr(mamba_pool, "replayssm_is_kda", False)
+        if is_kda_pool:
+            from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+
+            assert not isinstance(linear_attn_backend, GDNAttnBackend), (
+                "GDN backend cannot use a KDA ReplaySSM pool; model and pool "
+                "families must match."
+            )
             from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
                 commit_kda_replayssm_after_verify,
             )

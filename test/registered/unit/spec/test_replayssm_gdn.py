@@ -9,7 +9,9 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
-from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
+from sglang.srt.speculative.ragged_verify import (
+    ragged_verify_dense_scatter_indices,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -40,6 +42,8 @@ class TestReplaySSMGDN(CustomTestCase):
                 gdn_commit,
             )
             mamba_pool.replayssm_is_kda = True
+            with self.assertRaisesRegex(AssertionError, "GDN backend"):
+                HybridLinearAttnBackend._resolve_replayssm_verify_commit(gdn_backend)
             self.assertIs(
                 HybridLinearAttnBackend._resolve_replayssm_verify_commit(other_backend),
                 kda_commit,
@@ -98,6 +102,15 @@ class TestReplaySSMGDN(CustomTestCase):
             torch.equal(commit.call_args.kwargs["accept_lens"], torch.tensor([3]))
         )
 
+    def test_gdn_supports_compact_ragged_layout(self):
+        self.assertTrue(GDNAttnBackend.supports_ragged_verify_graph)
+        indices = ragged_verify_dense_scatter_indices(
+            query_start_loc=torch.tensor([0, 4, 6, 7], dtype=torch.int32),
+            seq_len=8,
+            draft_token_num=4,
+        )
+        self.assertTrue(torch.equal(indices, torch.tensor([0, 1, 2, 3, 4, 5, 8, 12])))
+
 
 class TestDirectReplaySSMValidation(CustomTestCase):
     @staticmethod
@@ -107,7 +120,6 @@ class TestDirectReplaySSMValidation(CustomTestCase):
         spec_algorithm=SpeculativeAlgorithm.DFLASH,
         device="cuda",
         unified_memory=False,
-        ragged_mode=RaggedVerifyMode.STATIC,
     ):
         configurator = SimpleNamespace(
             is_draft_worker=False,
@@ -127,9 +139,6 @@ class TestDirectReplaySSMValidation(CustomTestCase):
         ), patch(
             "sglang.srt.mem_cache.kv_cache_configurator.kimi_linear_config",
             return_value=object() if family == "kda" else None,
-        ), patch(
-            "sglang.srt.speculative.ragged_verify.read_ragged_verify_mode",
-            return_value=ragged_mode,
         ):
             KVCacheConfigurator._validate_direct_replayssm_spec(configurator)
 
@@ -138,7 +147,6 @@ class TestDirectReplaySSMValidation(CustomTestCase):
             ({"family": "other"}, "GDN or KDA"),
             ({"device": "npu"}, "CUDA"),
             ({"family": "kda", "unified_memory": True}, "unified-memory"),
-            ({"ragged_mode": RaggedVerifyMode.COMPACT}, "static"),
         )
         for kwargs, message in cases:
             with self.subTest(**kwargs), self.assertRaisesRegex(ValueError, message):
@@ -148,14 +156,12 @@ class TestDirectReplaySSMValidation(CustomTestCase):
         self._validate(
             family="kda",
             spec_algorithm=SpeculativeAlgorithm.DSPARK,
-            ragged_mode=RaggedVerifyMode.COMPACT,
         )
         self._validate(
             family="other",
             spec_algorithm=SpeculativeAlgorithm.NGRAM,
             device="npu",
             unified_memory=True,
-            ragged_mode=RaggedVerifyMode.COMPACT,
         )
 
 
