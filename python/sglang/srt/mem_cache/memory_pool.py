@@ -1074,6 +1074,10 @@ class MambaPool:
             tensors = value if isinstance(value, list) else [value]
             slice_axis = self.conv_slice_axis if field == "conv" else 0
             for state_tensor in tensors:
+                # A ShortConv layer has no temporal state, so that buffer is
+                # empty. Advertising it fails the whole batch registration.
+                if state_tensor.numel() == 0:
+                    continue
                 yield field, state_tensor, slice_axis
 
     def get_contiguous_buf_infos(self):
@@ -3410,6 +3414,9 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
             ],
             device=self.device,
         )
+        # This override replaces the base allocation, so the PD-transfer
+        # descriptors for the packed data buffers are built here too.
+        self._kv_buffer_descs = self._build_kv_buffer_descs()
 
     def _clear_buffers(self):
         del self.k_buffer
@@ -3559,11 +3566,21 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         raise NotImplementedError("CPU offloading is unsupported for MXFP8 KV cache.")
 
-    def get_contiguous_buf_infos(self):
-        raise NotImplementedError(
-            "KV transfer / disaggregation is unsupported for MXFP8 KV cache "
-            "(scale buffers are not exposed)."
-        )
+    def get_kv_scale_buf_infos(self):
+        """(ptrs, lens, item_lens) for the UE8M0 scale buffers, k then v.
+
+        The interleaved layout puts pages on the leading axis, so a page's
+        scales are one contiguous row; the flat layout is per slot.
+        """
+        tensors = self.k_scale_buffer + self.v_scale_buffer
+        ptrs = [t.data_ptr() for t in tensors]
+        lens = [t.nbytes for t in tensors]
+        row_bytes = [t[0].nbytes for t in tensors]
+        if self.mxfp8_sf_interleaved:
+            item_lens = row_bytes
+        else:
+            item_lens = [rb * self.page_size for rb in row_bytes]
+        return ptrs, lens, item_lens
 
     def set_kv_buffer_prefix_valid(self, *args, **kwargs):
         raise NotImplementedError(
@@ -4376,6 +4393,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         index_buf_size: Optional[int] = None,
+        skip_topk_layers: Optional[List[bool]] = None,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -4403,6 +4421,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_buf_size = index_buf_size
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
+
+        self.skip_topk_layers = (
+            list(skip_topk_layers)
+            if skip_topk_layers is not None
+            else [False] * layer_num
+        )
+        assert len(self.skip_topk_layers) == layer_num
 
         if _is_hip:
             if aiter_can_use_preshuffle_paged_mqa():

@@ -356,9 +356,7 @@ stay in **FP8** — keep `SGLANG_DSV4_FP4_EXPERTS=0`. It requires a `sgl-deep-ge
 build with SM90 FP8 MegaMoE support. **Please use the latest image for this
 feature.**
 
-Enable the MegaMoE path with `--moe-a2a-backend megamoe` — or equivalently set
-`SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1`, which auto-configures the same backend:
-
+Enable the MegaMoE path with `--moe-a2a-backend megamoe`
 ```bash Command
 SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096 \
 SGLANG_DSV4_FP4_EXPERTS=0 \
@@ -604,4 +602,4 @@ Larger blocks can improve decode latency when acceptance stays high, but they al
 
 For every candidate, compare with the same recipe without `--speculative-algorithm DSPARK`. Restart the server between the DSpark and non-speculative legs, keep the request corpus, sampling, concurrency, and warmup identical, and give each `bench_serving` leg its own `--flush-cache`. Leave `--speculative-draft-attention-backend` unset unless a separate profiling run justifies an override.
 
-DSpark currently requires CUDA, `pp_size == 1`, and DP Attention disabled. It is not compatible with PD disaggregation on current SGLang releases; turn DSpark off before selecting a prefill or decode role. The DP-Attention and MI355X Flash Official recipes therefore run target-only. If a larger draft block or concurrency causes graph-capture OOM, lower `--mem-fraction-static`, the draft block size, or the configured maximum running requests, then rerun both performance and accuracy gates.
+DSpark currently requires CUDA, `pp_size == 1`, and DP Attention disabled. It is not compatible with PD disaggregation on current SGLang releases; selecting a prefill or decode role in the Playground automatically removes the inherited DSpark flags. The DP-Attention and MI355X Flash Official recipes therefore run target-only. If a larger draft block or concurrency causes graph-capture OOM, lower `--mem-fraction-static`, the draft block size, or the configured maximum running requests, then rerun both performance and accuracy gates.
