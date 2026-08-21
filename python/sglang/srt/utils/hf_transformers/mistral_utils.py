@@ -628,9 +628,35 @@ def patch_mistral_common_tokenizer(tokenizer):
                 adapted.append(msg)
         return adapted
 
+    def _drop_empty_assistant_messages(messages):
+        """Drop assistant turns that carry neither content nor tool calls.
+
+        mistral_common validates conversation structure and rejects such a turn,
+        while other chat templates ignore it, so an OpenAI-compatible request that
+        works everywhere else would fail here. The turn carries no information, and
+        a trailing assistant message is already consumed upstream as the
+        continue_final_message prefix, so removing it cannot drop a prefill.
+        """
+        if not isinstance(messages, list):
+            return messages
+
+        kept = []
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("role") == "assistant":
+                content = msg.get("content")
+                has_text = not (
+                    content is None
+                    or (isinstance(content, str) and not content.strip())
+                )
+                if not has_text and not msg.get("tool_calls"):
+                    continue
+            kept.append(msg)
+        return kept
+
     def _safe_apply_chat_template(messages, **kwargs):
         kwargs.pop("add_generation_prompt", None)
         messages = _adapt_placeholder_messages_for_mistral_common(messages)
+        messages = _drop_empty_assistant_messages(messages)
         return tokenizer._orig_apply_chat_template(messages, **kwargs)
 
     tokenizer.apply_chat_template = _safe_apply_chat_template
