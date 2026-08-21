@@ -248,12 +248,11 @@ def _release_overallocated_kv_indices(
     page_size = allocator.page_size
     spec_algo = get_spec().speculative_algorithm
 
-    # strip_thinking_cache intentionally reports output tokens as overallocated
-    # so they fall into the free path below (#22373).
+    # The cacheable prefix can be shorter than the physical committed KV.
     if spec_algo is None and not get_serving().strip_thinking_cache:
         assert (
-            start_p == end_p
-        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
+            req.kv_committed_len == end_p
+        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}, {req.seqlen=}"
 
     if page_size > 1:
         start_p = ceil_align(start_p, page_size)

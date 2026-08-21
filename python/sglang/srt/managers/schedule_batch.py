@@ -1237,11 +1237,14 @@ class Req(ReqDllmMixin):
         )
 
     def effective_kv_committed_len(self) -> int:
+        # Prefix-cache entries require corresponding token IDs.
+        committed_len = min(self.kv_committed_len, self.seqlen)
+
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
         if get_serving().strip_thinking_cache and self.reasoning_tokens > 0:
-            return min(self.kv_committed_len, len(self.origin_input_ids))
-        return self.kv_committed_len
+            return min(committed_len, len(self.origin_input_ids))
+        return committed_len
 
     def update_spec_correct_drafts_histogram(self, num_correct_drafts: int):
         """Record one step accepted draft count (excludes bonus token) into the histogram."""
