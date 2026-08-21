@@ -861,9 +861,14 @@ def mhc_pre(
                 hidden_block = 256
             elif hc_hidden_size == 28672:
                 hidden_block = 128
+            elif hc_hidden_size == 14336:
+                # 14336 = 4 * 3584 (telechat4). hidden_block=256 -> 14336/256=56.
+                # Caller must pass n_splits_pre dividing 56 so that
+                # (14336//n_splits_pre) % 256 == 0 (e.g. n_splits_pre=8 -> 1792).
+                hidden_block = 256
             else:
                 raise NotImplementedError(
-                    f"mhc_pre splitk kernel only supports hc_hidden_size in {{16384, 28672}}, "
+                    f"mhc_pre splitk kernel only supports hc_hidden_size in {{16384, 28672, 14336}}, "
                     f"got {hc_hidden_size}"
                 )
             kernel_0, _ = mhc_pre_gemm_sqrsum_splitk_kernel(
