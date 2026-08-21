@@ -20,6 +20,7 @@ from sglang.srt.parser.inkling_tokenizer import (
     MESSAGE_MODEL,
     ROLE_MESSAGE_TOKENS,
 )
+from sglang.srt.utils import sort_json
 
 
 class InklingTextTokenizer(Protocol):
@@ -279,19 +280,11 @@ def _as_mapping(value: Any) -> Mapping[str, Any]:
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(
-        _sort_json(value),
+        sort_json(value),
         ensure_ascii=False,
         allow_nan=False,
         separators=(",", ":"),
     )
-
-
-def _sort_json(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {str(key): _sort_json(value[key]) for key in sorted(value)}
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return [_sort_json(item) for item in value]
-    return value
 
 
 def _tool_declare_json(tools: Sequence[Mapping[str, Any]]) -> str:
