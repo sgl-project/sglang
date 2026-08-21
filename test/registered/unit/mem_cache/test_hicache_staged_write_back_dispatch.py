@@ -7,7 +7,12 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
+from sglang.srt.managers import cache_controller as manager_cache_controller
+from sglang.srt.managers.cache_controller import (
+    CacheOperation,
+    HiCacheController,
+    LayerDoneCounter,
+)
 from sglang.srt.mem_cache import l2_transfer as transfer_module
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -18,11 +23,6 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
-from sglang.srt.mem_cache.unified_cache import unified_tree_core
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
-    UnifiedTreeCore,
-    UnifiedTreeNode,
-)
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
@@ -34,6 +34,11 @@ from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.unified_cache import unified_tree_core
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+    UnifiedTreeCore,
+    UnifiedTreeNode,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -272,6 +277,61 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
         controller._num_tokens_by_pool.assert_called_once_with(merged_op)
         self.assertEqual(controller.ack_load_queue[0].node_ids, [7, 7])
+
+    def test_consumer_waits_until_load_events_are_submitted(self):
+        counter = LayerDoneCounter.__new__(LayerDoneCounter)
+        counter.consumer_index = -1
+        event = mock.Mock()
+        counter.events = [event]
+
+        counter.set_consumer(0)
+
+        event.wait_until_submitted.assert_called_once_with()
+        self.assertEqual(counter.consumer_index, 0)
+
+    def test_direct_load_signals_only_after_cuda_submission(self):
+        op = CacheOperation(_indices(0, 4), _indices(4, 8), 7)
+        producer_event = mock.Mock()
+        order = []
+        producer_event.mark_submitted.side_effect = lambda **_: order.append("signal")
+
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.load_queue = [op]
+        controller.io_backend = "direct"
+        controller.layer_done_counter = mock.Mock()
+        controller.layer_done_counter.update_producer.return_value = 0
+        controller.layer_done_counter.events = [producer_event]
+        controller._enqueue_direct_dispatch = mock.Mock()
+        controller._start_loading_op = mock.Mock(
+            side_effect=lambda *_: order.append("submit")
+        )
+
+        self.assertEqual(controller.start_loading(), 0)
+        producer_event.mark_submitted.assert_not_called()
+        dispatch = controller._enqueue_direct_dispatch.call_args
+        self.assertIs(
+            dispatch.args[0].__func__,
+            controller._start_loading_op_and_signal_submission.__func__,
+        )
+
+        dispatch.args[0](*dispatch.args[1:])
+
+        self.assertEqual(order, ["submit", "signal"])
+
+    def test_direct_load_submission_error_unblocks_consumer(self):
+        producer_event = mock.Mock()
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.layer_done_counter = mock.Mock()
+        controller.layer_done_counter.events = [producer_event]
+        failure = RuntimeError("submit failed")
+        controller._start_loading_op = mock.Mock(side_effect=failure)
+
+        with self.assertRaisesRegex(RuntimeError, "submit failed"):
+            controller._start_loading_op_and_signal_submission(
+                CacheOperation(_indices(0, 1), _indices(1, 2), 3), 0
+            )
+
+        producer_event.mark_submitted.assert_called_once_with(error=failure)
 
     def test_l2_transfer_maps_global_layers(self):
         host_pool = mock.Mock()
@@ -1085,7 +1145,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         self.assertEqual(captured["host_indices"].device.type, "cpu")
 
     def test_direct_cache_controller_defers_index_copy_to_dispatch_thread(self):
-        op = ManagerCacheOperation(
+        op = CacheOperation(
             host_indices=_indices(0, 4),
             device_indices=_indices(4, 8),
             node_id=1,
@@ -1159,9 +1219,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
         merged = CacheOperation.merge_ops(ops)
 
-        self.assertEqual(
-            merged.device_values_ready_event, (first_event, latest_event)
-        )
+        self.assertEqual(merged.device_values_ready_event, (first_event, latest_event))
 
     def test_direct_hybrid_normalizes_aux_indices_on_helper_path(self):
         controller = HybridCacheController.__new__(HybridCacheController)
@@ -1200,9 +1258,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         fake_device_module = mock.Mock()
         fake_device_module.Event.side_effect = [first_event, second_event]
 
-        with mock.patch.object(
-            unified_tree_core, "device_module", fake_device_module
-        ):
+        with mock.patch.object(unified_tree_core, "device_module", fake_device_module):
             tree._record_device_values_ready(first_node)
             tree._record_device_values_ready(second_node)
 
@@ -1219,9 +1275,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.start_writing = mock.Mock()
         device_indices = _indices(0, 4)
 
-        host_indices = controller.write(
-            device_indices, node_id=7, defer_start=True
-        )
+        host_indices = controller.write(device_indices, node_id=7, defer_start=True)
 
         self.assertTrue(torch.equal(host_indices, _indices(8, 12)))
         self.assertEqual(len(controller.write_queue), 1)
@@ -1237,9 +1291,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.start_writing = mock.Mock()
         device_indices = _indices(0, 4)
 
-        host_indices = controller.write(
-            device_indices, node_id=9, defer_start=True
-        )
+        host_indices = controller.write(device_indices, node_id=9, defer_start=True)
 
         self.assertTrue(torch.equal(host_indices, _indices(8, 12)))
         self.assertEqual(len(controller.write_queue), 1)
