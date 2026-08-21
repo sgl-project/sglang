@@ -240,6 +240,19 @@ def is_float4_e2m1fn_x2(dtype) -> bool:
     return is_cuda() and dtype == target_dtype
 
 
+# --kv-cache-dtype spellings for the packed FP4 dtype (mem_cache/kv_cache_dtype.py);
+# kept as strings for pre-resolution checks.
+FP4_KV_CACHE_DTYPES = ("nvfp4", "fp4_mx_block16")
+
+
+def is_fp4_dtype(dtype) -> bool:
+    """Whether `dtype` is an FP4 variant. Accepts either a KV-cache dtype
+    string (e.g. the --kv-cache-dtype value) or a torch dtype."""
+    if isinstance(dtype, str):
+        return dtype in FP4_KV_CACHE_DTYPES
+    return is_float4_e2m1fn_x2(dtype)
+
+
 def get_cuda_version():
     if torch.version.cuda:
         return tuple(map(int, torch.version.cuda.split(".")))
