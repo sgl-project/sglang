@@ -211,6 +211,19 @@ class MooncakeKVManager(CommonKVManager):
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
+            # A session that fails once is blacklisted until this TTL
+            # expires, not permanently. A single aborted request can cause
+            # exactly one transfer failure without indicating the session
+            # itself is dead; without an expiry, every future request routed
+            # through that session is silently dropped until the periodic
+            # probe (SGLANG_ENABLE_FAILED_SESSION_PROBE) happens to succeed,
+            # which can wedge decode in KVPoll.WaitingForInput for its full
+            # timeout. A session that is genuinely dead will simply fail
+            # again on the next attempt and get re-blacklisted.
+            self.failed_session_expiry = {}
+            self.failed_session_blacklist_ttl = (
+                envs.SGLANG_FAILED_SESSION_BLACKLIST_TTL_S.get()
+            )
             # Per-room count of chunks not yet transferred; teardown waits for
             # zero so a deferred chunk is not dropped by an early conclude.
             self._staging_outstanding = defaultdict(int)
@@ -1693,7 +1706,7 @@ class MooncakeKVManager(CommonKVManager):
                     if not req.is_dummy:
                         # Early exit if the request has failed
                         with self.session_lock:
-                            if req.mooncake_session_id in self.failed_sessions:
+                            if self._session_blacklisted(req.mooncake_session_id):
                                 self.record_failure(
                                     kv_chunk.room,
                                     f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
@@ -1834,9 +1847,9 @@ class MooncakeKVManager(CommonKVManager):
                         if ret != 0:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
-                                # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
+                                # Failures should never happen if the session is not dead, if the session fails once, blacklist it for failed_session_blacklist_ttl
                                 if self.session_failures[req.mooncake_session_id] >= 1:
-                                    self.failed_sessions.add(req.mooncake_session_id)
+                                    self._blacklist_session(req.mooncake_session_id)
                                     logger.error(
                                         f"Session {req.mooncake_session_id} failed."
                                     )
@@ -1868,9 +1881,7 @@ class MooncakeKVManager(CommonKVManager):
                                         self.session_failures[
                                             req.mooncake_session_id
                                         ] += 1
-                                        self.failed_sessions.add(
-                                            req.mooncake_session_id
-                                        )
+                                        self._blacklist_session(req.mooncake_session_id)
                                     self.record_failure(
                                         kv_chunk.room,
                                         f"Failed to send state components of {kv_chunk.room} to "
@@ -2080,6 +2091,7 @@ class MooncakeKVManager(CommonKVManager):
                             self.failed_sessions.remove(mooncake_session_id)
                         if mooncake_session_id in self.session_failures:
                             del self.session_failures[mooncake_session_id]
+                        self.failed_session_expiry.pop(mooncake_session_id, None)
                     logger.debug(
                         f"Register KVArgs from {mooncake_session_id} successfully"
                     )
@@ -2245,6 +2257,30 @@ class MooncakeKVManager(CommonKVManager):
             if bootstrap_room not in self.request_status:
                 self.addr_to_rooms_tracker[bootstrap_addr].discard(bootstrap_room)
 
+    def _blacklist_session(self, session_id: str) -> None:
+        # Caller must hold self.session_lock.
+        self.failed_sessions.add(session_id)
+        self.failed_session_expiry[session_id] = (
+            time.time() + self.failed_session_blacklist_ttl
+        )
+
+    def _session_blacklisted(self, session_id: str) -> bool:
+        # Caller must hold self.session_lock. Self-clears on TTL expiry so a
+        # transient failure only blocks the session for a bounded window; a
+        # session that is still actually dead fails the next attempt and is
+        # re-blacklisted by _blacklist_session.
+        if session_id not in self.failed_sessions:
+            return False
+        expiry = self.failed_session_expiry.get(session_id)
+        if expiry is not None and time.time() >= expiry:
+            self.failed_sessions.discard(session_id)
+            self.failed_session_expiry.pop(session_id, None)
+            logger.warning(
+                "Session %s blacklist TTL expired; allowing retry", session_id
+            )
+            return False
+        return True
+
     def _run_one_probe_pass(self) -> None:
         with self.session_lock:
             snapshot = list(self.failed_sessions)
@@ -2263,6 +2299,7 @@ class MooncakeKVManager(CommonKVManager):
                     was_blacklisted = session_id in self.failed_sessions
                     self.failed_sessions.discard(session_id)
                     self.session_failures.pop(session_id, None)
+                    self.failed_session_expiry.pop(session_id, None)
                 if was_blacklisted:
                     logger.info(
                         "Session %s recovered via probe; un-blacklisted",
