@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget i
     HostPinBudget,
     describe_host_memory,
     host_copies_would_not_fit,
+    host_memory_available_bytes,
     module_weight_bytes,
     pin_benefit_bytes,
 )
@@ -435,15 +436,21 @@ class LayerwiseOffloadManager:
         none of the overlap -- but it is guaranteed resident, where a mapping can
         be dropped and re-read from disk.
 
-        Which layers get pinned hardly matters. The loop walks 0..n-1 once per
-        denoise step, so every layer is read equally often and any fixed subset
-        of size k covers k/n of the reads. Index order keeps it deterministic.
+        Which layers get pinned matters only through how often each is read.
+        A streamed layer is transferred once per denoise step; a resident one is
+        transferred once per stage, so a pin on it is worth about 1/steps of the
+        same pin on a streamed layer. Streamed layers therefore get the budget
+        first, in streamed order, which is also deterministic. Unpinning a
+        resident layer costs one possibly-faulting arming copy per request and
+        buys a whole layer's worth of per-step overlap.
         """
         totals, mapped = self._layer_byte_totals(layer_groups)
         pinned_bytes = 0
         hosting: Dict[int, str] = {}
         spendable = self._pin_budget.spendable_bytes if self._pin_budget else 0
-        for layer_idx in sorted(totals):
+        streamed = [idx for idx in self._streamed_order if idx in totals]
+        resident = [idx for idx in sorted(totals) if idx not in set(streamed)]
+        for layer_idx in streamed + resident:
             layer_bytes = totals[layer_idx]
             if self.pin_cpu_memory and pinned_bytes + layer_bytes <= spendable:
                 hosting[layer_idx] = "pinned"
@@ -457,10 +464,26 @@ class LayerwiseOffloadManager:
 
         unpinned = [idx for idx, where in hosting.items() if where != "pinned"]
         unpinned_bytes = sum(totals[idx] for idx in unpinned)
-        if unpinned and host_copies_would_not_fit(unpinned_bytes):
+        # The pins are booked but not yet allocated, so the copies have to be
+        # weighed against the pool they will share with them. Asking about the
+        # copies alone counts the same free bytes twice, and the error only ever
+        # says "fits".
+        if unpinned and host_copies_would_not_fit(pinned_bytes + unpinned_bytes):
             for layer_idx in unpinned:
                 if mapped[layer_idx]:
                     hosting[layer_idx] = "mapped"
+            # Demoting removes only the mapped share of a layer; whatever is not
+            # a checkpoint view still has to be copied somewhere.
+            residue = pinned_bytes + sum(totals[idx] - mapped[idx] for idx in unpinned)
+            if host_copies_would_not_fit(residue):
+                logger.warning(
+                    "Layerwise offload: %s has to keep %.2f GiB in host memory "
+                    "that no mapping can absorb, and %.2f GiB is available. "
+                    "Expect the host to be the limit.",
+                    self._pin_component_name,
+                    residue / 1024**3,
+                    host_memory_available_bytes() / 1024**3,
+                )
 
         if unpinned:
             counts = {where: 0 for where in ("pinned", "pageable", "mapped")}

@@ -1353,6 +1353,8 @@ def test_the_mapped_store_survives_the_placeholder(tmp_path, monkeypatch):
     assert manager._mapped_bytes == sum(
         t.numel() * t.element_size() for t in stored.values()
     ), "the byte counter and the store must describe the same weights"
+
+
 def test_only_the_layers_the_budget_covers_are_pinned(tmp_path, monkeypatch):
     if not pathlib.Path("/proc/self/maps").exists():
         pytest.skip("needs /proc to tell a mapping from anonymous memory")
