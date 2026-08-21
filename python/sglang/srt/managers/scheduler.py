@@ -2566,6 +2566,16 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        if self.spec_algorithm.is_eagle() and req.sampling_params.min_p > 0:
+            error_msg = (
+                "min_p is not supported with EAGLE speculative decoding; "
+                "disable min_p or speculative decoding."
+            )
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
         if (
             req.return_sampling_mask
             and self.disaggregation_mode != DisaggregationMode.NULL

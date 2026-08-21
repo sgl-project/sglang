@@ -29,7 +29,7 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
-from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import GrammarMask
@@ -650,6 +650,33 @@ def _verify_coins(
     return coins, coins_for_final_sampling
 
 
+def _apply_joint_top_k_top_p(
+    probs: torch.Tensor,
+    sampling_info: SamplingBatchInfo,
+    draft_token_num: int,
+) -> torch.Tensor:
+    """Match the normal sampler's joint top-k/top-p distribution.
+
+    Top-p must inspect the original distribution. Applying top-k first would
+    renormalize its support and change the cumulative-mass boundary.
+    """
+    from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
+
+    if sampling_info.need_top_p_sampling:
+        probs = top_p_renorm_prob(
+            probs,
+            torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
+        )
+        maybe_detect_nan(probs, "verify: target_probs after top_p_renorm")
+    if sampling_info.need_top_k_sampling:
+        probs = top_k_renorm_prob(
+            probs,
+            torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
+        )
+        maybe_detect_nan(probs, "verify: target_probs after top_k_renorm")
+    return probs
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
@@ -674,7 +701,7 @@ def eagle_sample(
         SIMULATE_ACC_TOKEN_MODE,
         generate_simulated_accept_index,
     )
-    from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
+    from sglang.srt.utils.async_probe import sanitize_nan_logits
 
     device = batch.device
     if batch.forward_mode.is_idle():
@@ -757,11 +784,7 @@ def eagle_sample(
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
     else:
-        from sgl_kernel import (
-            top_k_renorm_prob,
-            top_p_renorm_prob,
-            tree_speculative_sampling_target_only,
-        )
+        from sgl_kernel import tree_speculative_sampling_target_only
 
         from sglang.kernels.ops.speculative.reject_sampling import (
             chain_speculative_sampling_triton,
@@ -787,26 +810,9 @@ def eagle_sample(
                 next_token_logits / expanded_temperature, dim=-1
             )  # (bs * num_draft_tokens, vocab_size)
             maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-            if sampling_info.need_top_k_sampling:
-                target_probs = top_k_renorm_prob(
-                    target_probs,
-                    torch.repeat_interleave(
-                        sampling_info.top_ks, verify_input.draft_token_num, dim=0
-                    ),
-                )  # (bs * num_draft_tokens, vocab_size)
-                maybe_detect_nan(
-                    target_probs, "v2 verify: target_probs after top_k_renorm"
-                )
-            if sampling_info.need_top_p_sampling:
-                target_probs = top_p_renorm_prob(
-                    target_probs,
-                    torch.repeat_interleave(
-                        sampling_info.top_ps, verify_input.draft_token_num, dim=0
-                    ),
-                )
-                maybe_detect_nan(
-                    target_probs, "v2 verify: target_probs after top_p_renorm"
-                )
+            target_probs = _apply_joint_top_k_top_p(
+                target_probs, sampling_info, verify_input.draft_token_num
+            )
             target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
             draft_probs = (
                 verify_input.draft_probs
