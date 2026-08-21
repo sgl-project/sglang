@@ -8,6 +8,7 @@ from collections import defaultdict
 import torch
 
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
+from sglang.srt.observability.startup_phase_registry import startup_phase
 
 logger = logging.getLogger(__name__)
 
@@ -156,7 +157,8 @@ def alloc_with_host_register(
     """
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
-        _cuda_host_register(buffer)
+        with startup_phase("hicache_host_register"):
+            _cuda_host_register(buffer)
     return buffer
 
 
