@@ -211,7 +211,7 @@ class MoeBaseProvider:
         config: Mapping[str, int],
     ) -> None:
         """Launch the shared-rank reduction. It does not wait for the base W2 GEMM."""
-        from sglang.srt.lora.moe.kernels.masked_finalize import (
+        from sglang.srt.lora.moe.kernels.finalize import (
             invoke_shared_rank_reduce,
         )
 
@@ -245,7 +245,7 @@ class MoeBaseProvider:
         Wait for the base W2 GEMM and the reduction. Then finalize the base
         rows and add the shared-B tail.
         """
-        from sglang.srt.lora.moe.kernels.masked_finalize import (
+        from sglang.srt.lora.moe.kernels.finalize import (
             invoke_shared_from_scratch_finalize,
         )
 

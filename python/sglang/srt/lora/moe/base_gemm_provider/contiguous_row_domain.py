@@ -23,10 +23,10 @@ from sglang.srt.lora.moe.activation import ActivationFn
 from sglang.srt.lora.moe.base_gemm_provider.base import (
     MoeBaseProvider,
 )
-from sglang.srt.lora.moe.kernels.masked_activation import (
+from sglang.srt.lora.moe.kernels.activation_delta import (
     _activation_delta_masked_kernel,
 )
-from sglang.srt.lora.moe.kernels.masked_fused_act import (
+from sglang.srt.lora.moe.kernels.fused_act import (
     MASKED_ACT_FAMILIES,
     _b_act_kernel,
     _is_power_of_two,
@@ -535,7 +535,7 @@ def act_delta_contiguous(
     """Run the masked activation kernel over the compact rows.
 
     The launch, the grid and the per-pair arithmetic match
-    :func:`masked_activation.act_delta_masked`. Only the physical row behind
+    :func:`activation_delta.act_delta_masked`. Only the physical row behind
     each ``src2dst`` entry differs. The kernel writes a zero into
     ``activation_lora_input`` once for each invalid pair.
 
@@ -611,7 +611,7 @@ def fused_b_act_contiguous(
     """Run the fused LoRA-B GEMM and the activation over the compact rows.
 
     The kernel, the grid and the per-pair arithmetic match
-    :func:`masked_fused_act.run_masked_fused_act`. Only the shape check
+    :func:`fused_act.run_masked_fused_act`. Only the shape check
     differs, because the compact domain is one flat 2-D buffer. The kernel
     writes a zero into ``act_pairs`` once for each invalid pair.
 

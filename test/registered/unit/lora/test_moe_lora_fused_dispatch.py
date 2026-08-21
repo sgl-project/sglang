@@ -11,7 +11,7 @@ pytest.importorskip("triton")
 from sglang.kernels.ops.moe.ep_moe_kernels import (  # noqa: E402
     moe_ep_deepgemm_preprocess,
 )
-from sglang.srt.lora.moe.kernels.masked_dispatch import (  # noqa: E402
+from sglang.srt.lora.moe.kernels.dispatch import (  # noqa: E402
     fused_masked_preprocess,
 )
 from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402

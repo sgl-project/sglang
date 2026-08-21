@@ -14,10 +14,10 @@ from sglang.srt.lora.moe.execution_plan import (
     RouteRequirement,
     Site,
 )
-from sglang.srt.lora.moe.kernels.masked_finalize import (
+from sglang.srt.lora.moe.kernels.finalize import (
     SHARED_RANK_DEFAULT_CONFIG,
 )
-from sglang.srt.lora.moe.kernels.masked_fused_act import (
+from sglang.srt.lora.moe.kernels.fused_act import (
     FUSED_B_ACT_DEFAULT_CONFIG,
 )
 

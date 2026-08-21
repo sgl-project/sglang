@@ -89,9 +89,9 @@ class TestMaskedFusionSource(unittest.TestCase):
         api = _source("cutedsl_masked/api.py")
         sm100 = _source("cutedsl_masked/kernel.py")
         sm90 = _source("cutedsl_masked/kernel_sm90.py")
-        activation = _source("masked_activation.py")
-        act = _source("masked_fused_act.py")
-        finalize = _source("masked_finalize.py")
+        activation = _source("activation_delta.py")
+        act = _source("fused_act.py")
+        finalize = _source("finalize.py")
         post_reorder = EP_MOE.read_text()
 
         self.assertIn("produce_pdl: bool = False", api)
@@ -294,7 +294,7 @@ class TestMaskedFusionSource(unittest.TestCase):
         self.assertNotIn("base_gemm_state.src2dst", runner)
 
     def test_act_pair_store_is_optional_and_masked_store_is_unconditional(self):
-        source = _source("masked_fused_act.py")
+        source = _source("fused_act.py")
         self.assertIn('("b_activation",)', source)
         self.assertIn("ActivationFn.parse", source)
         self.assertNotIn('("silu", "relu2")', source)
@@ -324,7 +324,7 @@ class TestMaskedFusionSource(unittest.TestCase):
         all four combinations compile. One "swiglu-or-relu2" constant cannot
         express a non-gated silu.
         """
-        source = _source("masked_activation.py")
+        source = _source("activation_delta.py")
         kernel = _function(source, "_activation_delta_masked_kernel")
         wrapper = _function(source, "act_delta_masked")
         self.assertIn("NUM_SLICES", kernel)
@@ -364,7 +364,7 @@ class TestMaskedFusionSource(unittest.TestCase):
         self.assertEqual({fn.value for fn in ActivationFn}, {"silu", "relu2"})
 
     def test_shared_rank_finalize_is_fail_closed_and_two_stage(self):
-        source = _source("masked_finalize.py")
+        source = _source("finalize.py")
         # The wrapper is on the base: both row domains ran it identically.
         wrapper = _function(_source("base.py"), "shared_rank_finalize")
         validator = _function(source, "_validate_shared_route")
@@ -382,8 +382,8 @@ class TestMaskedFusionSource(unittest.TestCase):
         )
 
     def test_config_names_match_the_execution_contract(self):
-        act = _source("masked_fused_act.py")
-        finalize = _source("masked_finalize.py")
+        act = _source("fused_act.py")
+        finalize = _source("finalize.py")
         for key in (
             "BLOCK_SIZE_W",
             "BLOCK_SIZE_K",
@@ -426,15 +426,15 @@ class TestMaskedFusionSource(unittest.TestCase):
         quant.MoeLoraBf16QuantInfo = object
         ep = types.ModuleType("sglang.kernels.ops.moe.ep_moe_kernels")
         ep.post_reorder_deepgemm = lambda *_args, **_kwargs: None
-        activation = types.ModuleType("sglang.srt.lora.moe.kernels.masked_activation")
+        activation = types.ModuleType("sglang.srt.lora.moe.kernels.activation_delta")
         activation.act_delta_masked = lambda *_args, **_kwargs: None
-        dispatch = types.ModuleType("sglang.srt.lora.moe.kernels.masked_dispatch")
+        dispatch = types.ModuleType("sglang.srt.lora.moe.kernels.dispatch")
         dispatch.fused_masked_preprocess = lambda *_args, **_kwargs: None
-        finalize = types.ModuleType("sglang.srt.lora.moe.kernels.masked_finalize")
+        finalize = types.ModuleType("sglang.srt.lora.moe.kernels.finalize")
         finalize.MASKED_FINALIZE_TRITON = "triton"
         finalize.invoke_shared_from_scratch_finalize = lambda **_kwargs: None
         finalize.invoke_shared_rank_reduce = lambda **_kwargs: None
-        act = types.ModuleType("sglang.srt.lora.moe.kernels.masked_fused_act")
+        act = types.ModuleType("sglang.srt.lora.moe.kernels.fused_act")
         act.MASKED_ACT_FAMILIES = ("b_activation",)
         act.MASKED_ACT_TRITON = "triton"
         act.run_masked_fused_act = lambda *_args, **_kwargs: None
