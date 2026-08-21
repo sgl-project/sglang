@@ -13,7 +13,9 @@ from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_interleaved_rope_fp64,
     fused_interleaved_rope_fp64,
+    mark_sana_video_linear_attention_site,
     tensors_equal,
+    try_sana_video_linear_attention,
 )
 from sglang.multimodal_gen.configs.models.dits.sana_video import SanaVideoConfig
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
@@ -237,6 +239,7 @@ class SanaVideoLinearAttention(nn.Module):
         self.to_out = nn.ModuleList(
             [nn.Linear(self.inner_dim, query_dim, bias=True), nn.Identity()]
         )
+        mark_sana_video_linear_attention_site(self)
 
     def forward(
         self,
@@ -263,15 +266,19 @@ class SanaVideoLinearAttention(nn.Module):
 
         query = query.permute(0, 2, 3, 1)
         key = key.permute(0, 2, 3, 1)
-        query_rotate = query_rotate.permute(0, 2, 3, 1).float()
-        key_rotate = key_rotate.permute(0, 2, 3, 1).float()
-        value = value.permute(0, 2, 3, 1).float()
+        query_rotate = query_rotate.permute(0, 2, 3, 1)
+        key_rotate = key_rotate.permute(0, 2, 3, 1)
+        value = value.permute(0, 2, 3, 1)
 
         normalizer = 1.0 / (
             key.sum(dim=-1, keepdim=True).transpose(-2, -1) @ query + 1e-15
         )
-        scores = value @ key_rotate.transpose(-1, -2)
-        hidden_states = (scores @ query_rotate) * normalizer
+        hidden_states = try_sana_video_linear_attention(
+            self, query_rotate, key_rotate, value, normalizer
+        )
+        if hidden_states is None:
+            scores = value.float() @ key_rotate.float().transpose(-1, -2)
+            hidden_states = (scores @ query_rotate.float()) * normalizer
         hidden_states = hidden_states.flatten(1, 2).transpose(1, 2)
         hidden_states = hidden_states.to(original_dtype)
         return self.to_out[0](hidden_states)
