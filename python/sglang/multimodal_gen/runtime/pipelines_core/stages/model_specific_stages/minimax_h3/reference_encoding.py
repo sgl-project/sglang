@@ -35,6 +35,7 @@ from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
     MiniMaxH3VideoVAEArchConfig,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_group
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
     MINIMAX_H3_SUPPORTED_FPS,
 )
@@ -321,7 +322,10 @@ def minimax_h3_encode_reference_audio_rows(
         waveform = _audio_resampler(int(source_rate))(waveform)
     waveform = waveform.to(device)
 
-    with _AudioVAEDeterminismContext():
+    with (
+        _AudioVAEDeterminismContext(),
+        set_forward_context(current_timestep=0, attn_metadata=None),
+    ):
         audio_data = model.preprocess(
             waveform.unsqueeze(1), MINIMAX_H3_AUDIO_SAMPLE_RATE
         )

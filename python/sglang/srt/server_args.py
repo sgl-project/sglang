@@ -359,6 +359,12 @@ DSA_CHOICES = [
 ]
 NSA_CHOICES = DSA_CHOICES  # deprecated alias
 
+DSV4_PREFILL_BACKEND_CHOICES = [
+    "auto",
+    "flashmla_sparse",
+    "flashmla_sparse_q8",
+]
+
 DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
 
 DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = ["auto", "deepgemm", "cutedsl", "aiter"]
@@ -803,6 +809,11 @@ class ServerArgs:
         "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         NS("schedule"),
     ] = None
+    prefill_decode_interval: A[
+        int,
+        "The number of decode rounds to run after a prefill batch before scheduling the next prefill. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.",
+        NS("schedule"),
+    ] = 0
     enable_dynamic_chunking: A[
         bool,
         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
@@ -1800,6 +1811,18 @@ class ServerArgs:
         ),
         NS("exec.kernel"),
     ] = None
+    dsv4_prefill_backend: A[
+        str,
+        Arg(
+            help=(
+                "DeepSeek-V4 sparse prefill backend. 'auto' and "
+                "'flashmla_sparse' use the existing BF16 sparse prefill path; "
+                "'flashmla_sparse_q8' enables the Q8KV8 sparse prefill path."
+            ),
+            choices=DSV4_PREFILL_BACKEND_CHOICES,
+        ),
+        NS("exec.kernel"),
+    ] = "auto"
     dsa_decode_backend: A[
         Optional[str],
         Arg(
@@ -2678,7 +2701,7 @@ class ServerArgs:
     ] = "cache"
     hicache_ratio: A[
         Optional[float],
-        "The ratio of the size of host KV cache memory pool to the size of device pool. Defaults to 2.0 in cache mode, 1.2 in buffer_only mode, or 1.0 for host-pool decode retraction.",
+        "The ratio of the size of host KV cache memory pool to the size of device pool. Defaults to 2.0 in cache mode, 1.2 in buffer_only mode, or 0.2 for backup-only host-pool decode retraction.",
         NS("memory"),
     ] = None
     hicache_size: A[
@@ -3628,6 +3651,7 @@ class ServerArgs:
         self._handle_return_hidden_states_mode()
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
+        self._validate_prefill_decode_interval()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -5633,17 +5657,11 @@ class ServerArgs:
             # enable_multi_layer_eagle for EAGLE moved to the override registry
             # (arg_groups/overrides.py: _mimo_v2_overrides).
 
-            if self.enable_hierarchical_cache:
-                if not envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
-                    raise ValueError(
-                        "Hierarchical cache for MiMoV2 requires the unified "
-                        "radix tree. Set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 "
-                        "to enable --enable-hierarchical-cache for this model."
-                    )
-
-                # MiMoV2 has head_dim != v_head_dim, so the host KV pool uses
-                # asymmetric K/V allocation. Both kernel/page_first and
-                # direct/page_first_direct have split K/V transfer paths.
+            # MiMoV2 hierarchical cache runs on the unified radix tree, which
+            # is the default tree cache now. MiMoV2 has head_dim != v_head_dim,
+            # so the host KV pool uses asymmetric K/V allocation. Both
+            # kernel/page_first and direct/page_first_direct have split K/V
+            # transfer paths.
         elif (
             "Step3p5ForCausalLM" in model_arch
             or "Step3p7ForConditionalGeneration" in model_arch
@@ -8591,6 +8609,10 @@ class ServerArgs:
                 f"--asr-max-concurrent-sessions must be positive "
                 f"(got {self.asr_max_concurrent_sessions})."
             )
+
+    def _validate_prefill_decode_interval(self):
+        if self.prefill_decode_interval < 0:
+            raise ValueError("--prefill-decode-interval must be non-negative.")
 
     def _handle_other_validations(self):
         if self.default_chat_template_kwargs is not None and not isinstance(
