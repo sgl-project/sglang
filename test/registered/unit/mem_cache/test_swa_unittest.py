@@ -227,15 +227,9 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(allocator.swa_available_size(), 16)
 
     @unittest.skipUnless(torch.cuda.is_available(), "sync detection needs CUDA")
-    @unittest.skipUnless(
-        torch.version.hip is None,
-        "sync debug mode does not flag a blocking H2D copy on HIP",
-    )
     def test_clearing_the_mapping_does_not_synchronize(self):
-        """``mapping[idx] = 0`` copies a host-resident scalar, which blocks until
-        every kernel queued on the stream has drained; index_fill_ passes the 0 as
-        a kernel argument. torch's sync debug mode raises on the former, so it
-        distinguishes the two forms.
+        """Clearing the full-to-SWA mapping must not block the stream; writing a
+        host-resident scalar into it does.
         """
         _, allocator, _ = _build_swa_tree(is_eagle=False)
         full_indices = _swa_alloc(allocator, 4)
@@ -257,13 +251,16 @@ class TestSWA(unittest.TestCase):
                 torch.cuda.synchronize()
             return None
 
+        # Gate on the pre-fix form: a detector blind to this sync class would pass
+        # the assert below no matter how the mapping is cleared.
+        pre_fix_error = sync_error(
+            lambda: mapping.__setitem__(full_indices.to(torch.int64), 0)
+        )
+        if pre_fix_error is None:
+            self.skipTest("sync debug mode does not flag a blocking H2D copy here")
+
         self.assertIsNone(
             sync_error(lambda: allocator.clear_full_to_swa_mapping(full_indices))
-        )
-        # Negative control: a detector that never fires would pass the assert
-        # above no matter how the mapping is cleared.
-        self.assertIsNotNone(
-            sync_error(lambda: mapping.__setitem__(full_indices.to(torch.int64), 0))
         )
 
     def test_free_swa_group_owns_deferred_indices(self):

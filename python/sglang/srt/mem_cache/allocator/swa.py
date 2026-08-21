@@ -344,14 +344,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[full_indices] = swa_indices
 
     def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
-        """Reset these full slots to the padding-slot sentinel.
-
-        index_fill_ passes the 0 as a kernel argument, whereas
-        ``mapping[full_indices] = 0`` copies a host-resident scalar and blocks
-        until every kernel already queued on the stream has drained.
-        """
         if full_indices.numel() == 0:
             return
+        # index_fill_ passes the 0 as a kernel argument; mapping[idx] = 0 copies a
+        # host-resident scalar and blocks until the stream drains.
         self.full_to_swa_index_mapping.index_fill_(0, full_indices.to(torch.int64), 0)
 
     def free_swa(self, free_index: torch.Tensor):
