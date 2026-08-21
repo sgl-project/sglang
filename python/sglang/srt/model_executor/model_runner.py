@@ -94,11 +94,14 @@ from sglang.srt.mem_cache.kv_cache_configurator import (
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
+    Phase,
+    check_cuda_graph_backend,
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
+    get_server_return_hidden_states_mode,
 )
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
@@ -981,9 +984,7 @@ class ModelRunner:
         )
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
-        is_scale_joiner = (
-            self.server_args.is_ep_scale_joiner and not self.is_draft_worker
-        )
+        is_scale_joiner = is_ep_scale_joiner() and not self.is_draft_worker
         defer_decode_capture = (
             is_scale_joiner
             and capture_decode_cuda_graph
@@ -1007,18 +1008,12 @@ class ModelRunner:
         if is_scale_joiner:
             if self._elastic_cuda_graph_enabled():
                 self._sync_elastic_cuda_graph_config()
-            if defer_decode_capture:
-                self._recapture_elastic_cuda_graphs()
-                finalize_cuda_graph_capture(self)
+                if defer_decode_capture:
+                    self._recapture_elastic_cuda_graphs()
+                    finalize_cuda_graph_capture(self)
+            # Scheduler startup calls this path even when CUDA graphs are disabled.
             target_size = self.server_args.ep_join_rank_offset + self.ps.tp_size
-            self._elastic_scale_ready_barrier(
-                target_size=target_size,
-                log_tag="JOINER",
-            )
-            state = ElasticEPStateManager.instance()
-            if state is not None:
-                state.scale_phase = "serving_expanded"
-            self._rearm_eplb_after_elastic_scale()
+            self._finalize_elastic_ep_joiner(target_size)
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:
@@ -1942,15 +1937,26 @@ class ModelRunner:
                 target_size,
             )
 
+    def _finalize_elastic_ep_joiner(self, target_size: int) -> None:
+        self._elastic_scale_ready_barrier(target_size=target_size, log_tag="JOINER")
+        state = ElasticEPStateManager.instance()
+        if state is not None:
+            state.scale_phase = "serving_expanded"
+        self._rearm_eplb_after_elastic_scale()
+
     def _sync_elastic_cuda_graph_config(self) -> None:
-        decode_config = self.server_args.cuda_graph_config.decode
-        signature = (decode_config.backend,)
-        if decode_config.backend == Backend.FULL:
+        decode_backend = (
+            Backend.FULL
+            if check_cuda_graph_backend(Phase.DECODE, Backend.FULL)
+            else Backend.DISABLED
+        )
+        signature = (decode_backend,)
+        if decode_backend == Backend.FULL:
             capture_bs, compile_bs = get_batch_sizes_to_capture(
                 self, self.decode_num_tokens_per_req()
             )
             signature = (
-                decode_config.backend,
+                decode_backend,
                 tuple(capture_bs),
                 tuple(compile_bs),
                 self.ps.attn_tp_size,
@@ -1958,7 +1964,7 @@ class ModelRunner:
                 self.decode_attention_backend_str,
                 self.server_args.disable_cuda_graph_padding,
                 self.server_args.enable_two_batch_overlap,
-                self.server_args.enable_return_hidden_states,
+                get_server_return_hidden_states_mode(),
             )
 
         digest = hashlib.sha256(repr(signature).encode()).digest()
@@ -2062,24 +2068,21 @@ class ModelRunner:
             self.server_args.elastic_ep_backend is not None
             and self.server_args.max_ep_size is not None
             and self.server_args.max_ep_size > self.server_args.tp_size
-            and self.server_args.cuda_graph_config.decode.backend == Backend.FULL
+            and check_cuda_graph_backend(Phase.DECODE, Backend.FULL)
         )
 
     def _validate_elastic_cuda_graph_recapture(self) -> None:
         if not self._elastic_cuda_graph_enabled():
             return
 
-        validate = getattr(
-            self.attn_backend, "validate_elastic_cuda_graph_recapture", None
-        )
-        if validate is not None:
-            validate()
+        self.attn_backend.validate_elastic_cuda_graph_recapture()
 
     def _drop_elastic_cuda_graph_state(self) -> None:
         current_platform.synchronize()
         runner = self.decode_cuda_graph_runner
         if runner is not None and runner is not self.eager_runner:
             runner.backend.cleanup()
+            current_platform.synchronize()
         self.decode_cuda_graph_runner = None
         set_global_graph_memory_pool(None)
         gc.collect()
@@ -2168,7 +2171,7 @@ class ModelRunner:
                 ElasticEPStateManager.fail_scale(error)
                 self._reset_eplb_after_elastic_scale_failure()
                 self._report_elastic_scale_failure(error, effective_size)
-                if self.ps.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
+                if self.ps.tp_rank == 0 and not is_ep_scale_joiner():
                     logger.error("[Elastic EP] %s", error)
                 return
             try:
@@ -2178,7 +2181,7 @@ class ModelRunner:
                 ElasticEPStateManager.fail_scale(error)
                 self._reset_eplb_after_elastic_scale_failure()
                 self._report_elastic_scale_failure(error, effective_size)
-                if self.ps.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
+                if self.ps.tp_rank == 0 and not is_ep_scale_joiner():
                     logger.error("[Elastic EP] %s", error)
                 return
             if not ElasticEPStateManager.begin_scale():

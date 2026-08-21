@@ -158,11 +158,7 @@ class HybridAttnBackend(AttentionBackend):
         ).update_verify_buffers_to_fill_after_draft(spec_info, cuda_graph_bs)
 
     def validate_elastic_cuda_graph_recapture(self) -> None:
-        validate = getattr(
-            self.decode_backend, "validate_elastic_cuda_graph_recapture", None
-        )
-        if validate is not None:
-            validate()
+        self.decode_backend.validate_elastic_cuda_graph_recapture()
 
     def forward(
         self,

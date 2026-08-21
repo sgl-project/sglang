@@ -165,9 +165,7 @@ class TboAttnBackend(AttentionBackend):
 
     def validate_elastic_cuda_graph_recapture(self) -> None:
         for backend in (self.primary, *self.children):
-            validate = getattr(backend, "validate_elastic_cuda_graph_recapture", None)
-            if validate is not None:
-                validate()
+            backend.validate_elastic_cuda_graph_recapture()
 
     def get_cuda_graph_seq_len_fill_value(self):
         ans = self.primary.get_cuda_graph_seq_len_fill_value()
