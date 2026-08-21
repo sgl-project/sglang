@@ -207,6 +207,18 @@ For supported native pipelines, set `SGLANG_CACHE_DIT_ENABLED=true` to enable Ca
 
 For supported image pipelines, breakable CUDA graph can be enabled with `--enable-breakable-cuda-graph`, but you must declare every served resolution in `--warmup-resolutions` so warmup captures matching graph signatures.
 
+LongCat-Image is supported by this path. Its DiT always consumes a fixed
+512-token prompt body, so different prompt lengths reuse the same graph without
+model-specific padding. For a 1024x1024 deployment, use:
+
+```bash Command
+sglang serve --model-path meituan-longcat/LongCat-Image \
+  --enable-breakable-cuda-graph \
+  --warmup-resolutions 1024x1024 \
+  --enable-torch-compile false \
+  --port 30010
+```
+
 ### Component Residency
 
 Use `--component-residency COMPONENT=MODE` to assign one runtime residency mode to each native pipeline component:
@@ -245,6 +257,22 @@ sglang generate \
 Values passed to the compatibility option `--layerwise-offload-components` must match loaded component keys, such as `transformer`, `text_encoder`, `image_encoder`, `vae`, `condition_image_encoder`, `spatial_upsampler`, or `vocoder`. Its `default` group selects text encoders, image encoders, and VAEs. Use `all` to select every layerwise-offloadable component.
 
 Layerwise tuning options such as `--dit-offload-prefetch-size`, `--dit-layerwise-resident-layers`, and `--dit-layerwise-residency-policy` continue to control the streamed layer working set. Prefer the smallest component set that solves the memory issue because layerwise offload can increase latency.
+
+Those three set the default for every streamed component. To give one component its own values, use the `component=value` forms, which also accept JSON:
+
+```bash
+sglang serve --model-path <MODEL> \
+  --layerwise-offload-components dit,text_encoder \
+  --layerwise-prefetch-size text_encoder=2 \
+  --layerwise-resident-layers text_encoder=4 \
+  --layerwise-residency-policy text_encoder=strided
+```
+
+- `--layerwise-prefetch-size`: how many layers to fetch ahead. Fractional values are a share of the stack, `>= 1` an absolute count. Deeper prefetch overlaps more of the transfer with compute, at the cost of staging buffers.
+- `--layerwise-resident-layers`: how many layers stay on the GPU instead of being streamed. Resident layers are transferred once at startup, so they are removed from every pass. Fractional values are a share of the stack.
+- `--layerwise-residency-policy`: `leading` keeps the first layers, `strided` spreads them across the stack so the transfers do not arrive as one burst.
+
+A component without an entry keeps the group default, so adding these options changes nothing until one is set. Both knobs trade VRAM for transfer, and the return differs by component: a DiT earns it back once per denoising step, a text encoder or VAE once per request. Measure before raising either.
 
 ## Serve
 
