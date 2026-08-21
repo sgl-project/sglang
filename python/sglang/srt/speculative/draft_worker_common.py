@@ -138,6 +138,9 @@ def make_draft_block_spec_info(
         draft_token=torch.empty((0,), dtype=torch.long, device=device),
         positions=torch.empty((0,), dtype=torch.int64, device=device),
         draft_token_num=int(draft_token_num),
+        # Draft-side shape placeholder: the draft forward is always the block-wide chain,
+        # never the tree, whatever the verify-side beam width is.
+        topk=1,
         custom_mask=None,
         capture_hidden_mode=CaptureHiddenMode.NULL,
     )

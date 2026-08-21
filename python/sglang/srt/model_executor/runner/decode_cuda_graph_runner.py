@@ -1504,6 +1504,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 draft_token=None,
                 positions=None,
                 draft_token_num=self.captured_req_width,
+                # Mirror the live verify input's shape family. Tree width > 1 currently
+                # requires --disable-decode-cuda-graph, so this stays 1 in practice; passing
+                # it through means enabling graph capture later fails loudly (block_size is
+                # missing) instead of replaying a zero-initialized star-shaped tree.
+                topk=self.model_runner.server_args.speculative_eagle_topk or 1,
+                block_size=self.model_runner.server_args.speculative_dflash_block_size,
                 custom_mask=(
                     None
                     if (self.model_runner.is_draft_worker or not build_custom_mask)

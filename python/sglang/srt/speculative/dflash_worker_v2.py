@@ -303,23 +303,37 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
-        if server_args.speculative_num_draft_tokens is None:
-            # Should not happen (ServerArgs should have inferred it), but keep a fallback.
-            self.block_size = int(draft_config.resolve_block_size(default=16))
-        else:
-            self.block_size = int(server_args.speculative_num_draft_tokens)
-            model_block_size = draft_config.block_size
-            if model_block_size is None:
-                model_block_size = getattr(self.draft_model, "block_size", None)
-            if model_block_size is not None and int(model_block_size) != int(
-                self.block_size
-            ):
-                logger.warning(
-                    "DFLASH block size mismatch: using speculative_num_draft_tokens=%s but draft config block_size=%s.",
-                    self.block_size,
-                    model_block_size,
-                )
+        # ServerArgs (_resolve_dflash_widths) resolves three widths and guarantees all are
+        # set: block_size is the draft block width and the longest root-to-leaf chain,
+        # verify_width = 1 + (block_size - 1) * tree_width is what the target verifies in one
+        # forward, and tree_width is the per-depth beam width (1 = today's chain).
+        self.block_size = int(server_args.speculative_dflash_block_size)
+        self.tree_width = int(server_args.speculative_eagle_topk)
+        self.verify_width = int(server_args.speculative_num_draft_tokens)
+        if (
+            draft_config.block_size is not None
+            and int(draft_config.block_size) != self.block_size
+        ):
+            logger.warning(
+                "DFLASH block size mismatch: using speculative_dflash_block_size=%s but draft "
+                "config block_size=%s.",
+                self.block_size,
+                draft_config.block_size,
+            )
         self.draft_model.set_block_size(self.block_size)
+        if self.tree_width > 1:
+            # Phase A resolves the config surface only. Without the beam walk and the tree
+            # metadata the verify forward would still consume chain-shaped kernels, silently
+            # producing chain acceptance lengths under a tree-shaped config -- exactly the
+            # measurement error this feature exists to avoid.
+            raise NotImplementedError(
+                "--speculative-dflash-tree-width > 1 is not wired into the verify path yet "
+                f"(got {self.tree_width}). The config surface resolves, but tree drafting "
+                "still needs the beam walk and tree metadata; run with tree width 1."
+            )
+        # The per-request output stride the scheduler slices results with. Stays block_size,
+        # not verify_width: the committed block is the accepted chain plus its bonus, which is
+        # at most block_size long however wide the tree is.
         self.speculative_num_draft_tokens = int(self.block_size)
 
         self._mask_token = draft_config.mask_token
@@ -1942,6 +1956,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_token=verify_input_ids,
             positions=positions,
             draft_token_num=int(self.block_size),
+            topk=self.tree_width,
+            block_size=int(self.block_size),
             custom_mask=custom_mask,
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )

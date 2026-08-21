@@ -181,78 +181,20 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         )
         server_args.speculative_num_steps = 1
 
-    if server_args.speculative_eagle_topk is None:
-        server_args.speculative_eagle_topk = 1
-    elif int(server_args.speculative_eagle_topk) != 1:
-        logger.warning(
-            "DFLASH only supports speculative_eagle_topk == 1; overriding speculative_eagle_topk=%s to 1.",
-            server_args.speculative_eagle_topk,
-        )
-        server_args.speculative_eagle_topk = 1
-
-    if server_args.speculative_dflash_block_size is not None:
-        if int(server_args.speculative_dflash_block_size) <= 0:
-            raise ValueError(
-                "DFLASH requires --speculative-dflash-block-size to be positive, "
-                f"got {server_args.speculative_dflash_block_size}."
-            )
-        if server_args.speculative_num_draft_tokens is not None and int(
-            server_args.speculative_num_draft_tokens
-        ) != int(server_args.speculative_dflash_block_size):
-            raise ValueError(
-                "Both --speculative-num-draft-tokens and --speculative-dflash-block-size are set "
-                "but they differ. For DFLASH they must match. "
-                f"speculative_num_draft_tokens={server_args.speculative_num_draft_tokens}, "
-                f"speculative_dflash_block_size={server_args.speculative_dflash_block_size}."
-            )
-        server_args.speculative_num_draft_tokens = int(
-            server_args.speculative_dflash_block_size
-        )
-
-    if server_args.speculative_num_draft_tokens is None:
-        from sglang.srt.speculative.dflash_utils import (
-            parse_dflash_draft_config,
-        )
-
-        model_override_args = json.loads(server_args.json_model_override_args)
-        inferred_block_size = None
-        try:
-            from sglang.srt.utils.hf_transformers_utils import get_config
-
-            draft_hf_config = get_config(
-                server_args.speculative_draft_model_path,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.speculative_draft_model_revision,
-                model_override_args=model_override_args,
-            )
-            inferred_block_size = parse_dflash_draft_config(
-                draft_hf_config=draft_hf_config
-            ).resolve_block_size(default=None)
-        except Exception as e:
-            logger.warning(
-                "Failed to infer DFLASH block_size from draft model config; "
-                "defaulting speculative_num_draft_tokens to 16. Error: %s",
-                e,
-            )
-
-        if inferred_block_size is None:
-            inferred_block_size = 16
-            logger.warning(
-                "speculative_num_draft_tokens is not set; defaulting to %d for DFLASH.",
-                inferred_block_size,
-            )
-        server_args.speculative_num_draft_tokens = inferred_block_size
+    _resolve_dflash_widths(server_args)
 
     if server_args.speculative_draft_window_size is not None:
-        draft_tokens = int(server_args.speculative_num_draft_tokens)
-        if server_args.speculative_draft_window_size < draft_tokens:
+        block_size = int(server_args.speculative_dflash_block_size)
+        if server_args.speculative_draft_window_size < block_size:
             raise ValueError(
                 "--speculative-draft-window-size must be >= "
-                "--speculative-num-draft-tokens (block_size). "
-                f"window_size={server_args.speculative_draft_window_size}, block_size={draft_tokens}."
+                "--speculative-dflash-block-size (the draft block width). "
+                f"window_size={server_args.speculative_draft_window_size}, block_size={block_size}."
             )
 
     _resolve_dflash_draft_attention_backend(server_args)
+
+    _validate_dflash_tree_admission(server_args)
 
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48
@@ -265,6 +207,289 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         logger.warning(
             "Mixed chunked prefill is disabled because of using dflash speculative decoding."
         )
+
+
+# Target attention backends that can express a *tree*-shaped TARGET_VERIFY: they either
+# consume `spec_info.custom_mask` + `mask_indptr` directly (triton, flashinfer) or rebuild a
+# compacted page table from it (fa3 cascade attention). Deliberately a positive list, not the
+# complement of `_DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS` -- that set means "can express a
+# *linear* verify with its built-in causal path, so skip building a mask", and it contains
+# exactly the mask-capable backends, so complementing it would reject triton (the SM100
+# default for hybrid-GDN models).
+_DFLASH_TREE_VERIFY_BACKENDS = ("flashinfer", "triton", "fa3")
+
+# Backends that silently compute a causal chain over a tree layout instead of raising: their
+# metadata is scalar-uniform with no per-node visibility, so a wrong answer is the failure mode.
+_DFLASH_TREE_SILENTLY_WRONG_BACKENDS = ("trtllm_mha",)
+
+_DFLASH_TREE_WIDTH_FLAG = "--speculative-dflash-tree-width"
+
+
+def _load_dflash_draft_config(server_args: ServerArgs, *, required: bool):
+    """Parse `dflash_config` out of the draft checkpoint, or return None if unreadable.
+
+    `required=True` raises instead of returning None: tree-width admission validates
+    `tree_width <= selector_top_k` and "checkpoint has a selector" from this config and
+    lives only here (the worker does not re-check), so a swallowed read would turn both
+    checks into silent passes.
+    """
+    from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    try:
+        draft_hf_config = get_config(
+            server_args.speculative_draft_model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.speculative_draft_model_revision,
+            model_override_args=json.loads(server_args.json_model_override_args),
+        )
+        return parse_dflash_draft_config(draft_hf_config=draft_hf_config)
+    except Exception as e:
+        if required:
+            raise ValueError(
+                f"{_DFLASH_TREE_WIDTH_FLAG} > 1 requires reading dflash_config from the draft "
+                f"checkpoint at {server_args.speculative_draft_model_path!r} to validate the "
+                "beam width against selector_top_k, but the config could not be parsed. "
+                f"Fix the draft checkpoint or drop {_DFLASH_TREE_WIDTH_FLAG}. Error: {e}"
+            ) from e
+        logger.warning(
+            "Failed to read DFLASH dflash_config from the draft model config; "
+            "block_size falls back to the built-in default. Error: %s",
+            e,
+        )
+        return None
+
+
+def _resolve_dflash_tree_width(server_args: ServerArgs) -> int:
+    """The beam width kept per draft depth. 1 reproduces today's single-path chain."""
+    if server_args.speculative_eagle_topk is not None:
+        raise ValueError(
+            "--speculative-eagle-topk is EAGLE-only and has no meaning for DFLASH, which "
+            "drafts a whole block in parallel rather than expanding one token at a time. "
+            f"Use {_DFLASH_TREE_WIDTH_FLAG} to widen the DFLASH draft tree instead. Got "
+            f"--speculative-eagle-topk={server_args.speculative_eagle_topk}."
+        )
+
+    if server_args.speculative_dflash_tree_width is None:
+        return 1
+
+    tree_width = int(server_args.speculative_dflash_tree_width)
+    if tree_width < 1:
+        raise ValueError(
+            f"{_DFLASH_TREE_WIDTH_FLAG} must be >= 1 (1 = single-path chain), "
+            f"got {tree_width}."
+        )
+    return tree_width
+
+
+_DFLASH_DEFAULT_BLOCK_SIZE = 16
+
+
+def _resolve_dflash_block_size(
+    server_args: ServerArgs, *, tree_width: int, draft_config
+) -> int:
+    """The draft block width, from (in order) the explicit flag, the
+    --speculative-num-draft-tokens alias, the draft checkpoint, or a hardcoded default."""
+    explicit = server_args.speculative_dflash_block_size
+    alias = server_args.speculative_num_draft_tokens
+
+    if alias is not None and tree_width > 1:
+        raise ValueError(
+            "--speculative-num-draft-tokens is the *verify* window width, and with "
+            f"{_DFLASH_TREE_WIDTH_FLAG} > 1 DFLASH derives it as "
+            "1 + (block_size - 1) * tree_width, so setting it directly is ambiguous. "
+            "Pass the draft block width as --speculative-dflash-block-size instead. Got "
+            f"--speculative-num-draft-tokens={alias}, "
+            f"{_DFLASH_TREE_WIDTH_FLAG}={tree_width}."
+        )
+
+    if explicit is not None:
+        if int(explicit) <= 0:
+            raise ValueError(
+                "DFLASH requires --speculative-dflash-block-size to be positive, "
+                f"got {explicit}."
+            )
+        if alias is not None and int(alias) != int(explicit):
+            raise ValueError(
+                "Both --speculative-num-draft-tokens and --speculative-dflash-block-size are set "
+                "but they differ. At tree width 1 they mean the same thing and must match. "
+                f"speculative_num_draft_tokens={alias}, "
+                f"speculative_dflash_block_size={explicit}."
+            )
+        return int(explicit)
+
+    if alias is not None:
+        return int(alias)
+
+    inferred = (
+        None if draft_config is None else draft_config.resolve_block_size(default=None)
+    )
+    if inferred is None:
+        logger.warning(
+            "DFLASH block_size is not set and could not be inferred from the draft "
+            "checkpoint; defaulting to %d.",
+            _DFLASH_DEFAULT_BLOCK_SIZE,
+        )
+        return _DFLASH_DEFAULT_BLOCK_SIZE
+    return int(inferred)
+
+
+def _resolve_dflash_widths(server_args: ServerArgs) -> None:
+    """Split the one width DFLASH used to carry into three, and write them back.
+
+    Post-conditions, relied on by the worker and by generic KV / scheduler accounting:
+
+      speculative_dflash_block_size  = block_size  (draft block width, never None)
+      speculative_num_draft_tokens   = 1 + (block_size - 1) * tree_width  (verify width)
+      speculative_eagle_topk         = tree_width
+
+    `speculative_eagle_topk` is not a user-facing knob for DFLASH (it is rejected above); it
+    is reused as the carrier for "is this verify a tree" because two correctness-critical
+    gates already read it -- `conv_window_dedup_enabled` (dense conv windows, which tree
+    ancestors need) and the GDN backend's tree-kernel dispatch.
+    """
+    tree_width = _resolve_dflash_tree_width(server_args)
+
+    # W > 1 must read the draft config to validate the beam against selector_top_k; W == 1
+    # only needs it when block_size has no explicit source, so the common single-path launch
+    # keeps its current (config-free) startup path.
+    needs_config = tree_width > 1 or (
+        server_args.speculative_dflash_block_size is None
+        and server_args.speculative_num_draft_tokens is None
+    )
+    draft_config = (
+        _load_dflash_draft_config(server_args, required=tree_width > 1)
+        if needs_config
+        else None
+    )
+
+    block_size = _resolve_dflash_block_size(
+        server_args, tree_width=tree_width, draft_config=draft_config
+    )
+
+    if tree_width > 1:
+        _validate_dflash_tree_selector(
+            draft_config=draft_config, tree_width=tree_width, block_size=block_size
+        )
+
+    server_args.speculative_dflash_block_size = block_size
+    server_args.speculative_num_draft_tokens = 1 + (block_size - 1) * tree_width
+    server_args.speculative_eagle_topk = tree_width
+
+
+def _validate_dflash_tree_selector(
+    *, draft_config, tree_width: int, block_size: int
+) -> None:
+    """The tree is a beam over the candidate selector's transition lattice, so the checkpoint
+    must have a selector and the beam cannot be wider than the lattice's candidate axis."""
+    if not draft_config.selector_rank or not draft_config.selector_top_k:
+        raise ValueError(
+            f"{_DFLASH_TREE_WIDTH_FLAG} > 1 requires a DFlash 2 draft checkpoint with a "
+            "candidate selector (dflash_config.selector_rank / selector_top_k); the tree is "
+            "built from the selector's transition lattice. This checkpoint has "
+            f"selector_rank={draft_config.selector_rank}, "
+            f"selector_top_k={draft_config.selector_top_k}."
+        )
+    if tree_width > int(draft_config.selector_top_k):
+        raise ValueError(
+            f"{_DFLASH_TREE_WIDTH_FLAG} must be <= the draft checkpoint's "
+            f"dflash_config.selector_top_k ({draft_config.selector_top_k}): draft depth 1 has "
+            "only selector_top_k candidates under the root, so a wider beam cannot fill the "
+            f"fixed tree shape. Got {_DFLASH_TREE_WIDTH_FLAG}={tree_width}."
+        )
+    if block_size < 2:
+        raise ValueError(
+            f"{_DFLASH_TREE_WIDTH_FLAG} > 1 needs at least one drafted depth, i.e. "
+            f"--speculative-dflash-block-size >= 2, got {block_size}."
+        )
+
+
+def _dflash_effective_target_backends(server_args: ServerArgs) -> dict[str, str]:
+    """The target-side attention backends that a DFLASH verify forward can land on."""
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    view = resolved_view(server_args)
+    candidates = {
+        "--attention-backend": view.attention_backend,
+        "--prefill-attention-backend": view.prefill_attention_backend,
+        "--decode-attention-backend": view.decode_attention_backend,
+    }
+    return {flag: name for flag, name in candidates.items() if name is not None}
+
+
+def _validate_dflash_tree_backends(server_args: ServerArgs, *, tree_width: int) -> None:
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    for flag, backend in _dflash_effective_target_backends(server_args).items():
+        if backend in _DFLASH_TREE_VERIFY_BACKENDS:
+            continue
+        if backend in _DFLASH_TREE_SILENTLY_WRONG_BACKENDS:
+            raise ValueError(
+                f"{flag}={backend!r} cannot verify a tree-shaped DFLASH draft: it has no "
+                "custom-mask path and its attention metadata carries no per-node visibility, "
+                "so it would silently verify the tree as a causal chain and return wrong "
+                f"tokens rather than failing. Use one of {_DFLASH_TREE_VERIFY_BACKENDS} with "
+                f"{_DFLASH_TREE_WIDTH_FLAG}={tree_width}."
+            )
+        raise ValueError(
+            f"{_DFLASH_TREE_WIDTH_FLAG} > 1 needs a target attention backend that consumes a "
+            f"custom tree mask; only {_DFLASH_TREE_VERIFY_BACKENDS} do. Got {flag}={backend!r}."
+        )
+
+    # DFLASH cannot borrow EAGLE's page-tree gate: that check lives in the EAGLE branch of
+    # this hook, and DFLASH dispatches to _handle_dflash instead, so it never runs here.
+    page_size = int(resolved_view(server_args).page_size)
+    if page_size > 1:
+        raise ValueError(
+            f"{_DFLASH_TREE_WIDTH_FLAG} > 1 is only implemented at --page-size 1; a paged "
+            "tree verify needs the two-pass cascade draft-decode that DFLASH does not "
+            f"implement. Got --page-size {page_size}."
+        )
+
+
+def _validate_dflash_tree_admission(server_args: ServerArgs) -> None:
+    """Reject configurations that are structurally incompatible with a tree-shaped verify.
+
+    Only reached with tree_width > 1; every branch raises rather than degrading, because a
+    silent fallback to chain verify would look like "the tree bought us nothing" in the
+    acceptance-length measurement this feature exists to produce.
+    """
+    tree_width = int(server_args.speculative_eagle_topk)
+    if tree_width <= 1:
+        return
+
+    _validate_dflash_tree_backends(server_args, tree_width=tree_width)
+
+    if server_args.enable_linear_replayssm_spec:
+        raise ValueError(
+            "--enable-linear-replayssm-spec is structurally incompatible with "
+            f"{_DFLASH_TREE_WIDTH_FLAG} > 1: it skips the per-step intermediate SSM states a "
+            "tree needs to restart each node from its parent, and its chunked verify kernel "
+            "uses a strictly-lower causal mask. Drop one of the two. (This is not caught by "
+            "the flag's own topk check, which runs before the speculative hook assigns topk.)"
+        )
+
+    if not (server_args.disable_cuda_graph or server_args.disable_decode_cuda_graph):
+        raise ValueError(
+            f"{_DFLASH_TREE_WIDTH_FLAG} > 1 requires --disable-decode-cuda-graph for now: the "
+            "captured DFLASH verify buffers carry neither the tree custom mask nor the "
+            "retrieve_* tree links, and a zero-initialized retrieve_parent_token replays as a "
+            "star-shaped tree without warning."
+        )
+
+    from sglang.srt.environ import envs
+
+    if (
+        envs.SGLANG_SIMULATE_ACC_LEN.get() > 0
+        and envs.SGLANG_SIMULATE_ACC_TOKEN_MODE.get() == "real-draft-token"
+    ):
+        raise ValueError(
+            "SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token forces an accept length along a "
+            f"linear chain and cannot address tree nodes, so it is invalid with "
+            f"{_DFLASH_TREE_WIDTH_FLAG}={tree_width}. Use SGLANG_SIMULATE_ACC_TOKEN_MODE=fixed "
+            "or unset SGLANG_SIMULATE_ACC_LEN."
+        )
+
 
 
 def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:

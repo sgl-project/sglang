@@ -80,6 +80,7 @@ class TestDflashVerifyRunsMambaTrackHook(CustomTestCase):
             draft_token=torch.tensor([1, 2, 3, 4], dtype=torch.long),
             positions=torch.tensor([0, 1, 2, 3], dtype=torch.long),
             draft_token_num=4,
+            topk=1,
         )
 
     def _run(self, forward_mode):

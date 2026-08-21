@@ -2114,7 +2114,21 @@ class ServerArgs:
     ] = None
     speculative_dflash_block_size: A[
         Optional[int],
-        "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
+        "DFLASH only. Draft block width. Omit to infer it from the draft checkpoint's "
+        "dflash_config.block_size. With --speculative-dflash-tree-width 1 (the default) this "
+        "equals the verify window length, so --speculative-num-draft-tokens is accepted as an "
+        "alias; with a wider tree the verify window is 1 + (block_size - 1) * tree_width and "
+        "this flag is the only way to set the block width. Resolution writes the final value "
+        "back here, so downstream code reads block_size from this field.",
+        NS("spec"),
+    ] = None
+    speculative_dflash_tree_width: A[
+        Optional[int],
+        "DFLASH only. Beam width kept at every draft depth when expanding the candidate "
+        "selector's transition lattice into a tree (1 = today's single-path chain). The target "
+        "then verifies 1 + (block_size - 1) * tree_width tokens per request in one forward. "
+        "Must not exceed the draft checkpoint's dflash_config.selector_top_k. Use this instead "
+        "of --speculative-eagle-topk, which is EAGLE-only and rejected for DFLASH.",
         NS("spec"),
     ] = None
     speculative_dspark_block_size: A[
