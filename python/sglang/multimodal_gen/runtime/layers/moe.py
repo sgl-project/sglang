@@ -8,6 +8,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
+from sglang.srt.layers.moe.topk import StandardTopKOutput
+
 
 class LingBotVideoMLP(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int) -> None:
@@ -87,7 +91,6 @@ class LingBotVideoGroupedExperts(nn.Module):
         self, num_experts: int, hidden_size: int, intermediate_size: int
     ) -> None:
         super().__init__()
-        self.num_experts = num_experts
         self.w13_weight = nn.Parameter(
             torch.empty(num_experts, 2 * intermediate_size, hidden_size)
         )
@@ -131,31 +134,13 @@ class LingBotVideoSparseMoeBlock(nn.Module):
             self.shared_experts = LingBotVideoMLP(
                 hidden_size, intermediate_size * n_shared_experts
             )
-
-    def _run_sglang_triton_experts(
-        self,
-        tokens: torch.Tensor,
-        top_scores: torch.Tensor,
-        top_indices: torch.Tensor,
-    ) -> torch.Tensor:
-        from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
-            fused_experts,
-        )
-        from sglang.srt.layers.moe.topk import StandardTopKOutput
-
-        topk_output = StandardTopKOutput(
-            topk_weights=top_scores.float(),
-            topk_ids=top_indices.to(torch.int32),
-            router_logits=torch.empty(0, device=tokens.device),
-        )
-        # Router pre-scales the topk scores; fused_experts must not apply routed_scaling_factor.
-        runner_config = MoeRunnerConfig(
-            num_experts=self.num_experts,
-            num_local_experts=self.num_experts,
-            hidden_size=self.hidden_size,
-            intermediate_size_per_partition=self.intermediate_size,
-            top_k=self.top_k,
+        # Router pre-scales the topk scores, so routed_scaling_factor stays unset.
+        self.runner_config = MoeRunnerConfig(
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size,
+            top_k=top_k,
             activation="silu",
             is_gated=True,
             inplace=False,
@@ -163,12 +148,24 @@ class LingBotVideoSparseMoeBlock(nn.Module):
             routed_scaling_factor=None,
             gate_up_interleaved=False,
         )
+
+    def _run_sglang_triton_experts(
+        self,
+        tokens: torch.Tensor,
+        top_scores: torch.Tensor,
+        top_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        topk_output = StandardTopKOutput(
+            topk_weights=top_scores.float(),
+            topk_ids=top_indices.to(torch.int32),
+            router_logits=torch.empty(0, device=tokens.device),
+        )
         return fused_experts(
             tokens.contiguous().bfloat16(),
             self.experts.w13_weight.bfloat16(),
             self.experts.w2.bfloat16(),
             topk_output,
-            runner_config,
+            self.runner_config,
         ).type_as(tokens)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

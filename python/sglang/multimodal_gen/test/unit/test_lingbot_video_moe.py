@@ -5,6 +5,7 @@ import os
 import tempfile
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.lingbot_video_moe import (
@@ -17,6 +18,7 @@ from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
     LingBotVideoMoESamplingParams,
 )
 from sglang.multimodal_gen.registry import _get_config_info, get_model_info
+from sglang.multimodal_gen.runtime.distributed import sp_shard_utils as sps
 from sglang.multimodal_gen.runtime.layers.moe import (
     LingBotVideoGroupedExperts,
     LingBotVideoRouter,
@@ -29,6 +31,24 @@ from sglang.multimodal_gen.runtime.models.dits.lingbot_video_moe import (
     LingBotVideoTransformer3DModel,
     _joint_position_ids,
     make_joint_position_ids,
+)
+from sglang.multimodal_gen.runtime.pipelines import (
+    lingbot_video_moe as pipeline_lingbot_video_moe,
+)
+from sglang.multimodal_gen.runtime.pipelines.lingbot_video_moe import (
+    LingBotVideoPipeline,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.auto_negative import (
+    LingBotVideoAutoNegativeStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.rewriter import (
+    LingBotVideoPromptRewriteStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.rewriter_backends import (
+    HTTPRewriterBackend,
+    TransformersRewriterBackend,
+    build_rewriter_backend,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.text_encoding import (
     PROMPT_TEMPLATE,
@@ -205,6 +225,49 @@ def test_attention_single_sample_matches_direct_attention(monkeypatch):
     torch.testing.assert_close(out, expected)
 
 
+def test_attention_rejects_heads_not_divisible_by_ulysses_degree(monkeypatch):
+    monkeypatch.setattr(dits_lingbot_video_moe, "get_tp_world_size", lambda: 1)
+    monkeypatch.setattr(
+        dits_lingbot_video_moe, "get_ulysses_parallel_world_size", lambda: 3
+    )
+    with pytest.raises(ValueError, match="ulysses_degree"):
+        LingBotVideoAttention(
+            hidden_size=32, num_heads=4, norm_eps=1e-6, qkv_bias=True, out_bias=True
+        )
+
+
+def test_shard_sequence_is_off_without_sequence_parallelism():
+    # sp_size must short-circuit first: get_forward_context() asserts when unset.
+    model = object.__new__(LingBotVideoTransformer3DModel)
+    model.sp_size = 1
+    assert model._shard_sequence() is False
+
+
+@pytest.mark.parametrize("sp_size", [2, 3, 4])
+def test_joint_shard_reassembles_the_global_sequence(monkeypatch, sp_size):
+    gt, gh, gw, text_len = 3, 2, 2, 7
+    joint_seq_len = gt * gh * gw + text_len
+    dev = torch.device("cpu")
+    positions = _joint_position_ids(torch.tensor([text_len]), gt, gh, gw, text_len, dev)
+    hidden = torch.arange(joint_seq_len, dtype=torch.float32).view(1, joint_seq_len, 1)
+
+    monkeypatch.setattr(sps, "get_sp_world_size", lambda: sp_size)
+    chunks, pos_chunks = [], []
+    for rank in range(sp_size):
+        monkeypatch.setattr(sps, "get_sp_parallel_rank", lambda rank=rank: rank)
+        shard = sps.build_shard_plan(joint_seq_len)
+        chunks.append(sps.shard_like(hidden, shard))
+        pos_chunks.append(
+            sps.shard_like(
+                positions.reshape(1, joint_seq_len, 3), shard, pad_mode="repeat_last"
+            ).reshape(-1, 3)
+        )
+
+    gathered = torch.cat(chunks, dim=1)[:, :joint_seq_len]
+    torch.testing.assert_close(gathered, hidden)
+    torch.testing.assert_close(torch.cat(pos_chunks)[:joint_seq_len], positions)
+
+
 class _FakeBatchEncoding(dict):
     def to(self, _device):
         return self
@@ -266,16 +329,10 @@ def test_check_inputs_enforces_frame_and_size_contract():
     check = LingBotVideoTextEncodingStage.check_inputs
     check(480, 832, 1)
     check(480, 832, 81)
-    try:
+    with pytest.raises(ValueError, match=r"4n\+1"):
         check(480, 832, 82)
-        raise AssertionError("expected ValueError for num_frames=82")
-    except ValueError:
-        pass
-    try:
+    with pytest.raises(ValueError, match="multiples of 16"):
         check(480, 830, 81)
-        raise AssertionError("expected ValueError for width=830")
-    except ValueError:
-        pass
 
 
 def test_decode_scale_and_shift_invert_vae_normalization():
@@ -365,3 +422,119 @@ def test_joint_position_ids_match_reference_and_cover_padding():
         torch.testing.assert_close(
             vec_b[start : start + real], make_joint_position_ids(t, gt, gh, gw, dev)
         )
+
+
+def test_image_requests_are_split_into_one_request_per_output():
+    params = LingBotVideoMoESamplingParams(
+        request_id="rid",
+        prompt='{"comprehensive_description": "a fox"}',
+        image_path="fox.png",
+        output_path="/tmp",
+        output_file_name="video.mp4",
+        num_outputs_per_prompt=2,
+        seed=[7, 8],
+    )
+
+    outputs = params.expand_video_request_outputs_for_queue(Req(sampling_params=params))
+
+    assert [req.num_outputs_per_prompt for req in outputs] == [1, 1]
+    assert [req.batch_size for req in outputs] == [1, 1]
+    assert [req.seed for req in outputs] == [7, 8]
+    assert all(req.image_path == "fox.png" for req in outputs)
+
+
+def test_single_output_requests_are_left_unsplit():
+    params = LingBotVideoMoESamplingParams(
+        request_id="rid",
+        prompt='{"comprehensive_description": "a fox"}',
+        output_path="/tmp",
+        output_file_name="video.mp4",
+    )
+    batch = Req(sampling_params=params)
+
+    assert params.expand_video_request_outputs_for_queue(batch) == [batch]
+
+
+def test_rewriter_backend_is_off_until_a_url_or_local_model_is_set():
+    config = LingBotVideoMoEPipelineConfig()
+    assert build_rewriter_backend(config) is None
+
+    config.rewriter_url = "http://host:30000"
+    assert isinstance(build_rewriter_backend(config), HTTPRewriterBackend)
+
+    local = LingBotVideoMoEPipelineConfig()
+    local.rewriter_model_path = "/models/base"
+    with pytest.raises(ValueError, match="rewriter_adapter_path"):
+        build_rewriter_backend(local)
+
+    local.rewriter_adapter_path = "/models/adapter"
+    assert isinstance(build_rewriter_backend(local), TransformersRewriterBackend)
+
+
+def _added_stages(**config_overrides) -> list:
+    config = LingBotVideoMoEPipelineConfig()
+    for name, value in config_overrides.items():
+        setattr(config, name, value)
+    added = []
+    pipeline = object.__new__(LingBotVideoPipeline)
+    pipeline.add_stage = lambda stage, *a, **k: added.append(stage)
+    pipeline.get_module = lambda name, default=None: SimpleNamespace(
+        modules=lambda: iter(())
+    )
+    pipeline.add_standard_latent_preparation_stage = lambda *a, **k: None
+    pipeline.add_standard_timestep_preparation_stage = lambda *a, **k: None
+    pipeline.add_standard_decoding_stage = lambda *a, **k: None
+
+    pipeline.create_pipeline_stages(SimpleNamespace(pipeline_config=config))
+    return added
+
+
+def _added_stage_names(**config_overrides) -> list[str]:
+    return [type(stage).__name__ for stage in _added_stages(**config_overrides)]
+
+
+def test_pipeline_skips_the_rewriter_stages_by_default(monkeypatch):
+    # add_stage_if evaluates its argument eagerly, so the guard has to come first.
+    def refuse(*args, **kwargs):
+        raise AssertionError("the rewriter stages must not be constructed")
+
+    monkeypatch.setattr(
+        pipeline_lingbot_video_moe, "LingBotVideoPromptRewriteStage", refuse
+    )
+    monkeypatch.setattr(
+        pipeline_lingbot_video_moe, "LingBotVideoAutoNegativeStage", refuse
+    )
+    assert LingBotVideoMoEPipelineConfig().rewriter_url is None
+
+    added = _added_stage_names()
+
+    assert "InputValidationStage" in added
+
+
+def test_auto_negative_follows_the_rewriter_only_when_asked():
+    served = dict(rewriter_url="http://host:30000")
+
+    assert "LingBotVideoPromptRewriteStage" in _added_stage_names(**served)
+    assert "LingBotVideoAutoNegativeStage" not in _added_stage_names(**served)
+
+    both = _added_stage_names(**served, rewriter_auto_negative=True)
+    assert both.index("LingBotVideoAutoNegativeStage") == (
+        both.index("LingBotVideoPromptRewriteStage") + 1
+    )
+
+
+def test_rewriter_stages_share_one_backend():
+    stages = _added_stages(
+        rewriter_model_path="/models/base",
+        rewriter_adapter_path="/models/adapter",
+        rewriter_auto_negative=True,
+    )
+
+    backends = {
+        id(stage.backend)
+        for stage in stages
+        if isinstance(
+            stage, (LingBotVideoPromptRewriteStage, LingBotVideoAutoNegativeStage)
+        )
+    }
+    assert len(backends) == 1
