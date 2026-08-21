@@ -447,6 +447,7 @@ class LayerwiseOffloadManager:
         totals, mapped = self._layer_byte_totals(layer_groups)
         pinned_bytes = 0
         hosting: Dict[int, str] = {}
+        pin_order: List[int] = []
         spendable = self._pin_budget.spendable_bytes if self._pin_budget else 0
         streamed = [idx for idx in self._streamed_order if idx in totals]
         resident = [idx for idx in sorted(totals) if idx not in set(streamed)]
@@ -455,11 +456,16 @@ class LayerwiseOffloadManager:
             if self.pin_cpu_memory and pinned_bytes + layer_bytes <= spendable:
                 hosting[layer_idx] = "pinned"
                 pinned_bytes += layer_bytes
+                pin_order.append(layer_idx)
             else:
                 hosting[layer_idx] = "pageable"
-        if pinned_bytes and self._pin_budget is not None:
-            self._pin_budget.request(
-                component_name=self._pin_component_name, weight_bytes=pinned_bytes
+
+        def anonymous_bytes() -> int:
+            # What this plan will allocate that the page cache cannot drop: the
+            # pins, the pageable copies, and a mapped layer's non-view share.
+            return sum(
+                totals[idx] if where != "mapped" else totals[idx] - mapped[idx]
+                for idx, where in hosting.items()
             )
 
         unpinned = [idx for idx, where in hosting.items() if where != "pinned"]
@@ -473,17 +479,27 @@ class LayerwiseOffloadManager:
                 if mapped[layer_idx]:
                     hosting[layer_idx] = "mapped"
             # Demoting removes only the mapped share of a layer; whatever is not
-            # a checkpoint view still has to be copied somewhere.
-            residue = pinned_bytes + sum(totals[idx] - mapped[idx] for idx in unpinned)
-            if host_copies_would_not_fit(residue):
+            # a checkpoint view still has to be copied somewhere, and if that
+            # residue plus the pins does not fit either, pins are what there is
+            # to give back. The tail of the pin order holds the least valuable
+            # pins, so they go first.
+            while pin_order and host_copies_would_not_fit(anonymous_bytes()):
+                layer_idx = pin_order.pop()
+                hosting[layer_idx] = "mapped" if mapped[layer_idx] else "pageable"
+                pinned_bytes -= totals[layer_idx]
+            if host_copies_would_not_fit(anonymous_bytes()):
                 logger.warning(
                     "Layerwise offload: %s has to keep %.2f GiB in host memory "
                     "that no mapping can absorb, and %.2f GiB is available. "
                     "Expect the host to be the limit.",
                     self._pin_component_name,
-                    residue / 1024**3,
+                    anonymous_bytes() / 1024**3,
                     host_memory_available_bytes() / 1024**3,
                 )
+        if pinned_bytes and self._pin_budget is not None:
+            self._pin_budget.request(
+                component_name=self._pin_component_name, weight_bytes=pinned_bytes
+            )
 
         if unpinned:
             counts = {where: 0 for where in ("pinned", "pageable", "mapped")}

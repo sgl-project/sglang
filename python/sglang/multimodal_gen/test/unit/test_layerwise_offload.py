@@ -1294,6 +1294,32 @@ class _FileBackedModel(torch.nn.Module):
 _BLOCK_BYTES = 64 * 4
 
 
+class _MixedBlock(torch.nn.Module):
+    """A block that is half checkpoint view, half anonymous memory -- the shape
+    of a layer whose qkv was fused at load while the rest stayed mapped."""
+
+    def __init__(self, path: pathlib.Path) -> None:
+        super().__init__()
+        path.write_bytes(b"\x00" * (64 * 4))
+        mapped = torch.from_file(str(path), shared=True, size=64, dtype=torch.float32)
+        self.weight = torch.nn.Parameter(mapped.reshape(8, 8), requires_grad=False)
+        self.fused = torch.nn.Parameter(
+            torch.zeros(8, 8, dtype=torch.float32), requires_grad=False
+        )
+
+
+class _MixedModel(torch.nn.Module):
+    def __init__(self, path: pathlib.Path, num_blocks: int) -> None:
+        super().__init__()
+        self.blocks = torch.nn.ModuleList(
+            [_MixedBlock(path.with_name(f"{path.name}.{i}")) for i in range(num_blocks)]
+        )
+
+
+# one _MixedBlock: 64 float32 mapped + 64 float32 anonymous
+_MIXED_BLOCK_BYTES = 2 * 64 * 4
+
+
 def _mapped_manager(
     tmp_path,
     monkeypatch,
@@ -1395,12 +1421,14 @@ def test_the_mapped_store_survives_the_placeholder(tmp_path, monkeypatch):
 def test_only_the_layers_the_budget_covers_are_pinned(tmp_path, monkeypatch):
     if not pathlib.Path("/proc/self/maps").exists():
         pytest.skip("needs /proc to tell a mapping from anonymous memory")
-    # 2 GiB of reserve plus room for two of the four layers
+    # The pin budget covers two of the four layers. Available host memory sits
+    # above the copy reserve by less than all four layers but more than the
+    # two pins, so the rest is demoted to the mapping and the pins stand.
     budget = 2 * 1024**3 + 2 * _BLOCK_BYTES
     manager = _mapped_manager(
         tmp_path,
         monkeypatch,
-        available_bytes=budget,
+        available_bytes=4 * 1024**3 + 3 * _BLOCK_BYTES,
         pin_budget_bytes=budget,
         num_blocks=4,
     )
@@ -1409,6 +1437,48 @@ def test_only_the_layers_the_budget_covers_are_pinned(tmp_path, monkeypatch):
     assert pinned == {0, 1}, "the layers the budget covers, taken in index order"
     assert mapped == {2, 3}
     assert not (pinned & mapped), "a layer is in one store or the other"
+
+
+def test_pins_are_given_back_when_the_leftover_copies_do_not_fit(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    # Four half-mapped layers. The budget pins two, but a demoted layer keeps
+    # its anonymous half, and pins plus that residue exceed the host: the plan
+    # must give a pin back rather than allocate more than the machine has.
+    block = _MIXED_BLOCK_BYTES
+    available = 4 * 1024**3 + 3 * block
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+    monkeypatch.setattr(
+        host_memory_budget, "host_memory_available_bytes", lambda: available
+    )
+    model = _MixedModel(tmp_path / "weights.bin", num_blocks=4)
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=4,
+        enabled=True,
+        pin_cpu_memory=True,
+        pin_budget=host_memory_budget.HostPinBudget(
+            available_bytes=2 * 1024**3 + 2 * block
+        ),
+        prefetch_size=1,
+    )
+    on_mapping = {i for i in range(4) if manager._mapped_cpu_weights.get(i)}
+    assert on_mapping == {1, 2, 3}, (
+        "pins 0 and 1 plus the demoted layers' anonymous halves exceed the "
+        "host, so the least valuable pin (layer 1) must be given back"
+    )
+    anonymous = sum(
+        buffer.numel() * buffer.element_size()
+        for store in manager._consolidated_cpu_weights.values()
+        for buffer in store.values()
+    )
+    assert (
+        anonymous < 3 * block
+    ), "what the plan allocates anonymously must fit the host it planned for"
 
 
 def test_every_layer_is_pinned_when_the_budget_covers_them(tmp_path, monkeypatch):
