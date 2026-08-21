@@ -72,22 +72,50 @@ _TokenLogprobT = TypeVar("_TokenLogprobT", bound=_TokenLogprob)
 
 
 def align_token_logprobs_to_text(
-    entries: Sequence[_TokenLogprobT], text: str
+    entries: Sequence[_TokenLogprobT],
+    strip_input: str,
+    cleaned: str,
+    kept_spans: Sequence[tuple[int, int]],
 ) -> Optional[List[_TokenLogprobT]]:
-    """Keep the logprob entries whose token survives text sanitization.
+    """Keep entries whose positional spans survive text sanitization.
 
-    Sanitization only deletes spans, so ``text`` is a subsequence of the
-    concatenated generated tokens: walk both in order and drop the entries whose
-    token was removed. Returns ``None`` when the two cannot be reconciled, since
-    a partially aligned array misleads more than a missing one.
+    The generated tokens must either equal ``strip_input`` or end with it;
+    the latter accounts for reasoning tokens emitted before content. Entries
+    are retained only when their full positional span lies inside one kept
+    span. Return ``None`` when exact alignment is impossible, since a partial
+    array is more misleading than omitting logprobs entirely.
     """
+    full_parts = []
+    for entry in entries:
+        if entry.token is None:
+            return None
+        full_parts.append(entry.token)
+    full = "".join(full_parts)
+    if full == strip_input:
+        offset = 0
+    elif strip_input and full.endswith(strip_input):
+        offset = len(full) - len(strip_input)
+    else:
+        return None
+
     aligned: List[_TokenLogprobT] = []
     cursor = 0
     for entry in entries:
-        if entry.token and text.startswith(entry.token, cursor):
+        token = entry.token
+        end = cursor + len(token)
+        shifted_start = cursor - offset
+        shifted_end = end - offset
+        if (
+            token
+            and end > offset
+            and any(
+                span_start <= shifted_start and shifted_end <= span_end
+                for span_start, span_end in kept_spans
+            )
+        ):
             aligned.append(entry)
-            cursor += len(entry.token)
-    return aligned if cursor == len(text) else None
+        cursor = end
+    return aligned if "".join(entry.token for entry in aligned) == cleaned else None
 
 
 def process_hidden_states_from_ret(

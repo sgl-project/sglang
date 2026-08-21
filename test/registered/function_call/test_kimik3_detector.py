@@ -6,6 +6,7 @@ from openai.types.responses.response_output_text import Logprob
 
 from sglang.srt.entrypoints.openai.protocol import Function, ResponsesRequest, Tool
 from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
+from sglang.srt.entrypoints.openai.utils import align_token_logprobs_to_text
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
@@ -17,6 +18,7 @@ from sglang.srt.function_call.kimik3_format import (
     THINK_OPEN,
     TOOLS_CLOSE,
     TOOLS_OPEN,
+    strip_response_wrappers,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -264,6 +266,28 @@ def _strip(text: str, reasoning_separated: bool = True) -> str:
     return KimiK3Detector().strip_template_artifacts(text, reasoning_separated)
 
 
+def test_stripped_spans_reconstruct_cleaned_text() -> None:
+    detector = KimiK3Detector()
+    cases = [
+        ("plain response", False),
+        (f"{RESPONSE_OPEN}visible{RESPONSE_CLOSE}{MESSAGE_CLOSE}", False),
+        (f"{THINK_OPEN}secret{THINK_CLOSE}visible", True),
+        (f"visible{LEAKED_TOOLS_SECTION}", False),
+        ("   ", False),
+    ]
+    for original, reasoning_separated in cases:
+        cleaned, kept_spans = detector.strip_template_artifacts_spans(
+            original, reasoning_separated
+        )
+        assert "".join(original[start:end] for start, end in kept_spans) == cleaned
+
+
+def test_strip_response_wrappers_preserves_whitespace() -> None:
+    text = " \t\n "
+
+    assert strip_response_wrappers(text) == text
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -423,6 +447,37 @@ def test_logprobs_dropped_when_they_cannot_be_reconciled() -> None:
         f"trace{THINK_CLOSE}answer", output_logprobs=_logprobs("something", "else")
     )
     assert items[0].content[0].logprobs is None
+
+
+def test_alignment_drops_ambiguous_marker_inner_token() -> None:
+    original = f"{RESPONSE_OPEN}response visible"
+    entries = _logprobs("<|open|>", "response", "<|sep|>", "response", " visible")
+    cleaned, kept_spans = KimiK3Detector().strip_template_artifacts_spans(original)
+
+    aligned = align_token_logprobs_to_text(entries, original, cleaned, kept_spans)
+
+    assert cleaned == "response visible"
+    assert [entry.token for entry in aligned or []] == ["response", " visible"]
+
+
+def test_alignment_handles_reasoning_prefix() -> None:
+    strip_input = f"{THINK_CLOSE}visible"
+    entries = _logprobs("secret", THINK_CLOSE, "visible")
+    cleaned, kept_spans = KimiK3Detector().strip_template_artifacts_spans(
+        strip_input, reasoning_separated=True
+    )
+
+    aligned = align_token_logprobs_to_text(entries, strip_input, cleaned, kept_spans)
+
+    assert [entry.token for entry in aligned or []] == ["visible"]
+
+
+def test_alignment_returns_none_for_irreconcilable_input() -> None:
+    entries = _logprobs("prefix", "visible")
+
+    assert (
+        align_token_logprobs_to_text(entries, "expected", "expected", [(0, 8)]) is None
+    )
 
 
 if __name__ == "__main__":

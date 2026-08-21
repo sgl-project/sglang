@@ -1923,14 +1923,14 @@ class OpenAIServingChat(OpenAIServingBase):
             choice_meta_info = (
                 ret_item["meta_info"] if request.return_meta_info else None
             )
-            stripped_text = self._strip_template_artifacts(
+            stripped_text, kept_spans = self._strip_template_artifacts_spans(
                 text, reasoning_separated=reasoning_text is not None
             )
             # Only this cleanup is span deletion; text the other parsers reshaped
             # cannot be realigned.
             if choice_logprobs is not None and stripped_text != text:
                 aligned = align_token_logprobs_to_text(
-                    choice_logprobs.content, stripped_text
+                    choice_logprobs.content, text, stripped_text, kept_spans
                 )
                 choice_logprobs = (
                     None if aligned is None else ChoiceLogprobs(content=aligned)
@@ -2079,6 +2079,15 @@ class OpenAIServingChat(OpenAIServingBase):
         if self._artifact_detector is None:
             return text
         return self._artifact_detector.strip_template_artifacts(
+            text, reasoning_separated=reasoning_separated
+        )
+
+    def _strip_template_artifacts_spans(
+        self, text: str, reasoning_separated: bool = False
+    ) -> tuple[str, list[tuple[int, int]]]:
+        if self._artifact_detector is None:
+            return text, [(0, len(text))] if text else []
+        return self._artifact_detector.strip_template_artifacts_spans(
             text, reasoning_separated=reasoning_separated
         )
 

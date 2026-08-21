@@ -370,6 +370,12 @@ class BaseFormatDetector(ABC):
         """
         return text
 
+    def strip_template_artifacts_spans(
+        self, text: str, reasoning_separated: bool = False
+    ) -> tuple[str, list[tuple[int, int]]]:
+        """Return cleaned text and the original-coordinate spans it kept."""
+        return text, [(0, len(text))] if text else []
+
     def strip_template_markers(self, text: str) -> str:
         """Remove stray template markers, keeping the text they surrounded.
 

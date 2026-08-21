@@ -932,13 +932,15 @@ class OpenAIServingResponses(OpenAIServingChat):
                 logger.error("Required tool JSON parse error: %s", e)
 
         if content:
-            cleaned = self._strip_template_artifacts(
+            cleaned, kept_spans = self._strip_template_artifacts_spans(
                 content, reasoning_separated=reasoning_content is not None
             )
             # Only this cleanup is span deletion; text the other parsers reshaped
             # cannot be realigned.
             if output_logprobs is not None and cleaned != content:
-                output_logprobs = align_token_logprobs_to_text(output_logprobs, cleaned)
+                output_logprobs = align_token_logprobs_to_text(
+                    output_logprobs, content, cleaned, kept_spans
+                )
             content = cleaned
             # Text that was nothing but template syntax still gets a message, so
             # a stop-finished response never comes back without any output item.
