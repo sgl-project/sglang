@@ -1195,11 +1195,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
             )
-        elif (
-            not _is_npu
-            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-            or not self.attn_output_gate
-        ):
+        elif not _is_npu or not self.attn_output_gate:
             q, k, v, gate = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
