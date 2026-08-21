@@ -1,7 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-import json
 import os
 from collections import defaultdict
 from collections.abc import Hashable
@@ -26,8 +25,13 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.lora_format_adapter import (
+from sglang.multimodal_gen.runtime.pipelines_core.lora.format_adapter import (
     normalize_lora_state_dict,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.lora.peft_adapter import (
+    get_peft_lora_alpha,
+    load_peft_config,
+    scale_fused_sections,
 )
 from sglang.multimodal_gen.runtime.server_args import LORA_MERGE_MODES, ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
@@ -98,11 +102,19 @@ def _store_fused_lora_groups(
             or set(b_parts) != set(range(n))
         ):
             continue
-        a, b, fused_alpha = stack_or_compose_fused_lora(
-            [a_parts[i] for i in range(n)],
-            [b_parts[i] for i in range(n)],
+        a_list = [a_parts[i] for i in range(n)]
+        b_list = [b_parts[i] for i in range(n)]
+        scaled_b = scale_fused_sections(
+            a_parts,
+            b_parts,
+            to_merge_params.get(f"{base}.alpha", {}),
             adapter_alpha,
         )
+        a, b, fused_alpha = stack_or_compose_fused_lora(
+            a_list, scaled_b or b_list, None if scaled_b else adapter_alpha
+        )
+        if scaled_b:
+            fused_alpha = a.shape[-2]
         adapter[str(a_key)] = a.to(device)
         adapter[b_key] = b.to(device)
         if fused_alpha is not None:
@@ -823,16 +835,15 @@ class LoRAPipeline(ComposedPipelineBase):
             lora_local_path = maybe_download_lora(lora_path, weight_name=weight_name)
 
         raw_state_dict = load_file(lora_local_path)
-        lora_state_dict = normalize_lora_state_dict(raw_state_dict, logger=logger)
-        adapter_lora_alpha = lora_alpha
-        adapter_config_path = os.path.join(
-            os.path.dirname(lora_local_path), "adapter_config.json"
+        adapter_config = load_peft_config(lora_local_path)
+        lora_state_dict = normalize_lora_state_dict(
+            raw_state_dict,
+            logger=logger,
+            adapter_config=adapter_config,
         )
-        if adapter_lora_alpha is None and os.path.isfile(adapter_config_path):
-            with open(adapter_config_path, encoding="utf-8") as f:
-                adapter_config = json.load(f)
-            if adapter_config.get("lora_alpha") is not None:
-                adapter_lora_alpha = int(adapter_config["lora_alpha"])
+        adapter_lora_alpha = lora_alpha
+        if adapter_lora_alpha is None:
+            adapter_lora_alpha = get_peft_lora_alpha(adapter_config)
 
         if lora_nickname in self.lora_adapters:
             self.lora_adapters[lora_nickname].clear()
