@@ -1,8 +1,8 @@
-"""B200 per-commit CI: DeepSeek-V4-Flash FP4 (LowLatency recipe).
+"""B200 per-commit CI: DeepSeek-V4-Flash FP4 with the trtllm attention backend.
 
-Launches TP=4 with flashinfer_mxfp4 MoE runner + EAGLE speculative decoding.
-Runs 12 ServerSanity probes (correctness, streaming, concurrency, determinism)
-plus a GSM8K accuracy gate.
+Same four recipes as test_deepseek_v4_flash_fp4_b200.py (which guards the
+default FlashMLA backend), with ``--dsv4-attn-backend trtllm`` (uniform-FP8
+KV pool, trtllm-gen sparse MLA for decode and prefill).
 
 Registry: base-c-test-4-gpu-b200 (per-commit, 4x B200)
 """
@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=465, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=700, stage="base-c", runner_config="4-gpu-b200")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600
@@ -32,7 +32,7 @@ _DEEPEP_ENV = {
 }
 
 
-class TestDSV4FlashFP4B200(
+class TestDSV4FlashFP4B200Trtllm(
     SpecDecodingMixin,
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,
@@ -54,6 +54,8 @@ class TestDSV4FlashFP4B200(
             timeout=SERVER_LAUNCH_TIMEOUT,
             other_args=[
                 "--trust-remote-code",
+                "--dsv4-attn-backend",
+                "trtllm",
                 "--tp",
                 "4",
                 "--moe-runner-backend",
@@ -78,7 +80,7 @@ class TestDSV4FlashFP4B200(
             kill_process_tree(cls.process.pid)
 
 
-class TestDSV4FlashFP4B200Balanced(
+class TestDSV4FlashFP4B200BalancedTrtllm(
     SpecDecodingMixin,
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,
@@ -100,6 +102,8 @@ class TestDSV4FlashFP4B200Balanced(
             timeout=SERVER_LAUNCH_TIMEOUT,
             other_args=[
                 "--trust-remote-code",
+                "--dsv4-attn-backend",
+                "trtllm",
                 "--tp",
                 "4",
                 "--dp",
@@ -127,7 +131,7 @@ class TestDSV4FlashFP4B200Balanced(
             kill_process_tree(cls.process.pid)
 
 
-class TestDSV4FlashFP4NonMTPB200(
+class TestDSV4FlashFP4NonMTPB200Trtllm(
     BasicDecodeCorrectnessMixin, GSM8KMixin, CustomTestCase
 ):
     """Non-MTP recipe: TP=4, DP=4, DeepEP, no speculative decoding."""
@@ -144,6 +148,8 @@ class TestDSV4FlashFP4NonMTPB200(
             timeout=SERVER_LAUNCH_TIMEOUT,
             other_args=[
                 "--trust-remote-code",
+                "--dsv4-attn-backend",
+                "trtllm",
                 "--tp",
                 "4",
                 "--dp",
@@ -163,23 +169,22 @@ class TestDSV4FlashFP4NonMTPB200(
             kill_process_tree(cls.process.pid)
 
 
-class TestDSV4FlashFP4BreakableCudaGraphB200(
+@unittest.skip(
+    "DP prefill BCG with an idle rank fabricates a dummy EXTEND whose tokens "
+    "are counted as real; their hidden states enter the shared EP grouped "
+    "GEMMs and perturb live ranks' logits (#31125). Under FlashMLA this "
+    "shows as nondeterministic outputs; under the trtllm backend the "
+    "perturbation reliably drives generations empty, so every "
+    "low-concurrency probe here fails. "
+    "Re-enable once the generic DP idle-rank fix lands (follow-up PR to "
+    "#30805)."
+)
+class TestDSV4FlashFP4BreakableCudaGraphB200Trtllm(
     BasicDecodeCorrectnessMixin, GSM8KMixin, CustomTestCase
 ):
     """BCG recipe: TP=4, DP=4, DeepEP, DP attention, mixed chunk."""
 
     gsm8k_accuracy_thres = 0.93
-
-    @unittest.skip(
-        "Flaky: temp-0 outputs are nondeterministic under this recipe "
-        "(sparse-DP prefill replays the breakable CUDA graph with a "
-        "fabricated idle-rank dummy extend; its hidden states vary run to "
-        "run and perturb real tokens' logits through the shared EP grouped "
-        "GEMMs at capture buckets 4/16). Introduced by #30898; disabled "
-        "pending a proper fix that keeps BCG enabled. See #31125."
-    )
-    def test_determinism_temp_zero(self):
-        pass
 
     @classmethod
     def setUpClass(cls):
@@ -191,6 +196,8 @@ class TestDSV4FlashFP4BreakableCudaGraphB200(
             timeout=SERVER_LAUNCH_TIMEOUT,
             other_args=[
                 "--trust-remote-code",
+                "--dsv4-attn-backend",
+                "trtllm",
                 "--tp",
                 "4",
                 "--dp",

@@ -129,15 +129,11 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     # (arg_groups/overrides.py: _deepseek_v4_kv_cache_dtype), invoked here at
     # its legacy slot.
     from sglang.srt.arg_groups.overrides import (
-        _deepseek_v4_attn_backend_auto,
         _deepseek_v4_kv_cache_dtype,
-        _deepseek_v4_uses_context_parallelism,
         run_post_process_pass,
     )
 
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
-
-    run_post_process_pass(server_args, _deepseek_v4_attn_backend_auto)
 
     if server_args.dsv4_attn_backend == "trtllm":
         from sglang.srt.utils.common import is_sm100_supported
@@ -154,7 +150,13 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         assert (
             not server_args.enable_hisparse
         ), "--dsv4-attn-backend trtllm does not support enable_hisparse."
-        assert not _deepseek_v4_uses_context_parallelism(server_args), (
+        assert not (
+            server_args.attn_cp_size > 1
+            or server_args.dcp_size > 1
+            or server_args.enable_prefill_cp
+            or server_args.enable_prefill_context_parallel
+            or server_args.enable_dsa_prefill_context_parallel
+        ), (
             "--dsv4-attn-backend trtllm does not support context parallelism "
             "(prefill CP, attention CP, or decode CP)."
         )
@@ -179,6 +181,8 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
                 server_args.speculative_eagle_topk == 1
             ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
 
+    # FIXME(follow-up): remove once the overlap+speculative corruption is
+    # root-caused (tracked in the PR #30805 follow-up list).
     # TEMPORARY containment: trtllm + speculative decoding under the overlap
     # scheduler intermittently corrupts an int32 table consumed by the
     # trtllm-gen sparse kernel (illegal memory access in

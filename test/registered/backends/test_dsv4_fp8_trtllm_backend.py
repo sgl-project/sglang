@@ -37,7 +37,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=7200, stage="nightly", runner_config="8-gpu-b200")
+register_cuda_ci(est_time=1200, stage="base-c", runner_config="4-gpu-b200")
 
 DSV4_FLASH_MODEL_PATH = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600
@@ -48,7 +48,7 @@ DSV4_BASE_ENV = {
 SERVER_ARGS = [
     "--trust-remote-code",
     "--tp",
-    "8",
+    "4",
     "--max-running-requests",
     "32",
     "--mem-fraction-static",
@@ -157,7 +157,7 @@ def _greedy_generate(base_url: str, prompt: str, max_new_tokens: int) -> str:
 
 
 class TestDSV4Fp8TrtllmBackend(BasicDecodeCorrectnessMixin, CustomTestCase):
-    """TP8 DSv4-Flash-FP8 with --dsv4-attn-backend trtllm."""
+    """TP4 DSv4-Flash-FP8 with --dsv4-attn-backend trtllm."""
 
     @classmethod
     def setUpClass(cls):
