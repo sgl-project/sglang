@@ -500,7 +500,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
         enable_cuda_shared_overlap = (
             _is_cuda
-            and envs.SGLANG_QWEN_DEEPEP_SHARED_OVERLAP.get()
+            and envs.SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP.get()
             # Breakable CUDA graph joins side streams before the eager DeepEP
             # break, so this path cannot overlap the two expert computations.
             and not is_in_breakable_cuda_graph()
