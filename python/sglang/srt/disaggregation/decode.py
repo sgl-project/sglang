@@ -394,12 +394,25 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
     def _release_matched_prefix_lock(self, req: Req) -> None:
-        params = DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock)
+        params = DecLockRefParams(
+            swa_uuid_for_lock=req.swa_uuid_for_lock,
+            skip_lock_node_ids=req.skip_lock_node_ids,
+        )
         if req.swa_prefix_lock_released:
             self.tree_cache.dec_lock_ref(req.last_node, params, skip_swa=True)
             req.swa_prefix_lock_released = False
         else:
             self.tree_cache.dec_lock_ref(req.last_node, params)
+        req.swa_uuid_for_lock = None
+        req.skip_lock_node_ids = {}
+
+    def _drop_matched_prefix(self, req: Req) -> None:
+        """Release an admission-time hit and restore the state of a cache miss."""
+        self._release_matched_prefix_lock(req)
+        req.last_node = self.tree_cache.root_node_handle(req.extra_key)
+        req.prefix_indices = req.prefix_indices[:0]
+        req.num_matched_prefix_tokens = 0
+        req.cache_protected_len = 0
 
     def _reclaim_swa_tail_capacity(
         self, swa_tail_len: int, req_id: str
@@ -483,6 +496,47 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             full_len + self.num_reserved_decode_tokens,
             swa_len + swa_reserved,
         )
+
+    def _admission_fits(
+        self,
+        req: Req,
+        *,
+        origin_input_len: int,
+        prefix_len: int,
+        full_allocatable_tokens: int,
+        swa_allocatable_tokens: int,
+        retractable_tokens: int,
+        retractable_swa_tokens: int,
+        uses_swa_tail_prealloc: bool,
+    ) -> bool:
+        fill_len = self._pre_alloc_fill_len(req)
+        required_alloc_tokens = self._required_alloc_tokens(
+            fill_len=fill_len, prefix_len=prefix_len
+        )
+        required_tokens_for_request = (
+            required_alloc_tokens + self.num_reserved_decode_tokens
+        )
+        max_new_tokens = min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
+
+        if (
+            max(
+                required_tokens_for_request,
+                origin_input_len - prefix_len + max_new_tokens - retractable_tokens,
+            )
+            > full_allocatable_tokens
+        ):
+            return False
+
+        if uses_swa_tail_prealloc:
+            _, swa_required = self._prealloc_required_tokens(req)
+            _, swa_len = self._prealloc_kv_lens(req)
+            if (
+                max(swa_required, swa_len + max_new_tokens - retractable_swa_tokens)
+                > swa_allocatable_tokens
+            ):
+                return False
+
+        return True
 
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
@@ -637,6 +691,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # boundary needed for the matching dec_lock_ref.
         lock_result = self.tree_cache.inc_lock_ref(result.last_device_node)
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+        req.skip_lock_node_ids = lock_result.skip_lock_node_ids
         return self._build_decode_prefix_match(req, result)
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
@@ -1210,12 +1265,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     self.tree_cache.dec_swa_lock_only(
                         decode_req.req.last_node,
                         decode_req.req.swa_uuid_for_lock,
+                        decode_req.req.skip_lock_node_ids,
                     )
                     decode_req.req.swa_prefix_lock_released = True
 
-                required_alloc_tokens = self._required_alloc_tokens(
-                    fill_len=fill_len, prefix_len=prefix_len
-                )
                 # Matching may lock previously-evictable radix pages, so refresh
                 # the admission budget against the post-lock pool state before we
                 # decide whether this request still fits.
@@ -1236,50 +1289,64 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_indices = None
                 prefix_len = 0
                 total_prefix_len = 0
-                required_alloc_tokens = self._pre_alloc_fill_len(decode_req.req)
 
-            required_tokens_for_request = (
-                required_alloc_tokens + self.num_reserved_decode_tokens
+            admission_kwargs = dict(
+                origin_input_len=origin_input_len,
+                full_allocatable_tokens=full_allocatable_tokens,
+                swa_allocatable_tokens=swa_allocatable_tokens,
+                retractable_tokens=retractable_tokens,
+                retractable_swa_tokens=retractable_swa_tokens,
+                uses_swa_tail_prealloc=uses_swa_tail_prealloc,
             )
-
+            fits = self._admission_fits(
+                decode_req.req,
+                prefix_len=prefix_len,
+                **admission_kwargs,
+            )
             if (
-                max(
-                    required_tokens_for_request,
-                    origin_input_len
-                    - prefix_len
-                    + min(
-                        decode_req.req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKEN,
-                    )
-                    - retractable_tokens,
-                )
-                > full_allocatable_tokens
+                not fits
+                and prefix_match is not None
+                and prefix_match.l1_prefix_len > 0
+                and not self.scheduler.enable_decode_hicache
             ):
-                if prefix_match is not None and prefix_match.l1_prefix_len > 0:
-                    self._release_matched_prefix_lock(decode_req.req)
-                break
-            if required_tokens_for_request > full_allocatable_tokens:
+                # Locking a hit removes its pages from the evictable budget and
+                # can make an otherwise-admissible miss fail this check. Release
+                # it and retry in the same scheduling pass; otherwise every poll
+                # repeats the same hit and head-of-line blocks the queue.
+                self._drop_matched_prefix(decode_req.req)
+                prefix_match = None
+                prefix_indices = None
+                prefix_len = 0
+                total_prefix_len = 0
+
+                full_allocatable_tokens = self._allocatable_token_budgets(
+                    retractable_tokens=retractable_tokens,
+                    count_retracted=True,
+                    extra_reserved_reqs=len(preallocated_reqs),
+                    hicache_reserved_tokens=reserved_restore_tokens,
+                )
+                admission_kwargs["full_allocatable_tokens"] = full_allocatable_tokens
+                if uses_swa_tail_prealloc:
+                    swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
+                        retractable_tokens=retractable_tokens,
+                        retractable_swa_tokens=retractable_swa_tokens,
+                        count_retracted=True,
+                        extra_reserved_reqs=len(preallocated_reqs),
+                    )
+                    admission_kwargs["swa_allocatable_tokens"] = swa_allocatable_tokens
+                fits = self._admission_fits(
+                    decode_req.req,
+                    prefix_len=0,
+                    **admission_kwargs,
+                )
+
+            if not fits:
                 if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                     self._release_matched_prefix_lock(decode_req.req)
                 break
 
             if uses_swa_tail_prealloc:
-                _, swa_required = self._prealloc_required_tokens(decode_req.req)
                 _, swa_len = self._prealloc_kv_lens(decode_req.req)
-                max_new_tokens = min(
-                    decode_req.req.sampling_params.max_new_tokens,
-                    CLIP_MAX_NEW_TOKEN,
-                )
-                if (
-                    max(
-                        swa_required,
-                        swa_len + max_new_tokens - retractable_swa_tokens,
-                    )
-                    > swa_allocatable_tokens
-                ):
-                    if prefix_match is not None and prefix_match.l1_prefix_len > 0:
-                        self._release_matched_prefix_lock(decode_req.req)
-                    break
 
                 reclaim_error = self._reclaim_swa_tail_capacity(
                     swa_len, decode_req.req.rid
