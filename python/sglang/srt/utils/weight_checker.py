@@ -51,9 +51,6 @@ class QuantizedWeight(NamedTuple):
     scale_name: str
 
 
-# Derived caches that no weight update refreshes; reset must not poison them.
-# The GLM gate's _weight_fp32 is deliberately absent: its weight_loader heals
-# it, so poisoning it makes compare verify the cache tracks gate.weight.
 _NON_PERSISTENT_BUFFER_PATTERNS = (
     "cos_sin_cache",
     "inv_freq",
