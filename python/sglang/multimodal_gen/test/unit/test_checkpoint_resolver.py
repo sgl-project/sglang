@@ -5,7 +5,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from sglang.multimodal_gen.checkpoints.resolver import (
+from sglang.multimodal_gen.checkpoint_inspection.resolver import (
     CheckpointFile,
     CheckpointRequest,
     parse_checkpoint_source,
@@ -68,7 +68,7 @@ def test_resolve_remote_inventory_pins_revision_and_filters_subfolder():
     )
 
     with patch(
-        "sglang.multimodal_gen.checkpoints.resolver.HfApi.model_info",
+        "sglang.multimodal_gen.checkpoint_inspection.resolver.HfApi.model_info",
         return_value=model_info,
     ):
         inventory = resolve_checkpoint_inventory(source)

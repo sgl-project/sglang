@@ -6,7 +6,7 @@ import argparse
 import json
 from typing import Any, Mapping
 
-from sglang.multimodal_gen.checkpoints.resolver import (
+from sglang.multimodal_gen.checkpoint_inspection.resolver import (
     CheckpointRequest,
     ResolvedCheckpoint,
     resolve_checkpoint,

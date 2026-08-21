@@ -2,7 +2,7 @@ import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.multimodal_gen.checkpoints.resolver import (
+from sglang.multimodal_gen.checkpoint_inspection.resolver import (
     CheckpointFile,
     CheckpointInventory,
     CheckpointRequest,
