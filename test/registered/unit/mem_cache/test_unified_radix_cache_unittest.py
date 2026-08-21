@@ -4987,6 +4987,58 @@ class UnifiedRadixCacheSuite:
         chain = [n.id for n in chain]
         self.assertEqual(xfer.nodes_to_load, chain[-expected_pages:])
 
+    def test_hicache_swa_load_back_rejects_foreign_pinned_window(self):
+        """A second load-back must not claim nodes pinned by an in-flight one.
+
+        commit_load_back republishes Full device values before the DMA acks, so
+        a later anchor can claim just the still-host-only SWA window of a
+        pinned node and hit the commit pin assert. The spec build must degrade
+        to an empty spec instead (the caller recomputes).
+        """
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the chain construction simple")
+        if self.cfg.sliding_window_size <= self.cfg.page_size:
+            # A window within one page never reaches the pinned ancestor.
+            self.skipTest("window must span past the leaf to reach the pin")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain collapsed below the two-node suffix being tested")
+        self._simulate_backup_tree(cache)
+
+        # Host-only suffix a -> b under a device-resident ancestor.
+        a, b = chain[-2], chain[-1]
+        for n in (a, b):
+            n.component_data[ComponentType.FULL].value = None
+            n.component_data[ComponentType.SWA].value = None
+            cache.tree_core.lru_lists[ComponentType.SWA].remove_node(n)
+            cache.tree_core.host_lru_lists[ComponentType.SWA].insert_mru(n)
+
+        # Anchor `a`: a Full-only load whose SWA slice stays host-only.
+        kv_xfer, _comp_xfers = cache.tree_core.build_load_back_spec(a.id)
+        self.assertEqual(kv_xfer.nodes_to_load, [a.id])
+        device_indices = torch.arange(
+            int(kv_xfer.host_indices.numel()), dtype=torch.int64, device=cache.device
+        )
+        cache.tree_core.commit_load_back(a.id, device_indices, kv_xfer, {})
+        self.assertEqual(a.load_back_pending_id, a.id)
+
+        # Anchor `b` rejects its whole spec: its SWA window claims pinned `a`.
+        kv_xfer, comp_xfers = cache.tree_core.build_load_back_spec(b.id)
+        self.assertEqual(int(kv_xfer.host_indices.numel()), 0)
+        self.assertEqual(kv_xfer.nodes_to_load, [])
+        self.assertEqual(comp_xfers, {})
+
+        # After the ack unpins, the same spec builds fully.
+        cache.tree_core.finish_load_back(a.id)
+        self.assertIsNone(a.load_back_pending_id)
+        kv_xfer, comp_xfers = cache.tree_core.build_load_back_spec(b.id)
+        self.assertEqual(kv_xfer.nodes_to_load, [b.id])
+        self.assertEqual(comp_xfers[ComponentType.SWA][0].nodes_to_load, [a.id, b.id])
+
     def _swa_finalize_setup(self):
         """Build a SWA chain long enough to fill at least the window
         plus one extra page, and host-back every node so we can flip
