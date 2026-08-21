@@ -19,7 +19,10 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
-from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
+from sglang.multimodal_gen.runtime.utils.profiler import (
+    SGLDiffusionProfiler,
+    maybe_record_function,
+)
 
 if TYPE_CHECKING:
     # Only for type checkers; avoids runtime circular import
@@ -112,10 +115,11 @@ class PipelineExecutor(ABC):
     ) -> Any:
         stage_name = stage._component_stage_name()
         self.before_stage(stage, stage_index, payload, server_args)
-        with maybe_nvtx_range(f"stage_{stage_name}", use_nvtx):
-            payload = self.run_stage_with_context(
-                stage, payload, server_args, run_stage
-            )
+        with maybe_record_function(f"STAGE {stage_name}"):
+            with maybe_nvtx_range(f"stage_{stage_name}", use_nvtx):
+                payload = self.run_stage_with_context(
+                    stage, payload, server_args, run_stage
+                )
         return payload
 
     @staticmethod
