@@ -5540,15 +5540,6 @@ class ServerArgs:
             validate_deepseek_v4_cp(self)
             validate_deepseek_v4_mega_moe_token_budget(self)
 
-            # The SM120 marlin fallback moved to the resolution pipeline
-            # (arg_groups/overrides.py: _deepseek_v4_sm120_moe), invoked here
-            # at its legacy slot.
-            from sglang.srt.arg_groups.overrides import (
-                _deepseek_v4_sm120_moe,
-                run_post_process_pass,
-            )
-
-            run_post_process_pass(self, _deepseek_v4_sm120_moe)
             if is_sm120_supported():
                 # SM120 lacks tcgen05/TMEM: disable features that depend on
                 # DeepGEMM or require >99KB SMEM (topk_v2).

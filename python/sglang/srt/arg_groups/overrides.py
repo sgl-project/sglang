@@ -1176,6 +1176,8 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
         elif (
             server_args.device == "cuda"
             and not is_hip()
+            and server_args.moe_a2a_backend == "none"
+            and not envs.SGLANG_DSV4_FP4_DEQUANT.get()
             and model_config.is_fp4_experts
             and (is_sm90_supported() or is_sm100_supported() or is_sm120_supported())
         ):
@@ -1927,20 +1929,6 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
     ], f"{kv_cache_dtype} is not supported for {model_arch}"
     if kv_cache_dtype != view.kv_cache_dtype:
         return {"kv_cache_dtype": kv_cache_dtype}
-    return {}
-
-
-@register_post_process
-def _deepseek_v4_sm120_moe(view: Any) -> dict:
-    """Default DeepSeek V4 MXFP4 experts to FlashInfer CUTLASS on SM120."""
-    hf_config = view.get_model_config().hf_config
-    if hf_config.architectures[0] != "DeepseekV4ForCausalLM":
-        return {}
-    if is_sm120_supported() and view.moe_runner_backend == "auto":
-        logger.info(
-            "Use flashinfer_mxfp4 as MoE runner backend on SM120 for DeepseekV4"
-        )
-        return {"moe_runner_backend": "flashinfer_mxfp4"}
     return {}
 
 
