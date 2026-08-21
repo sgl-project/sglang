@@ -1164,16 +1164,25 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
         overrides["swa_full_tokens_ratio"] = 0.1
         logger.info(f"Setting swa_full_tokens_ratio to 0.1 for {model_arch}.")
 
-    # nvidia/DeepSeek-V4-Pro-NVFP4 uses flashinfer_trtllm_routed MoE runner backend.
-    if (
-        server_args.moe_runner_backend == "auto"
-        and server_args.get_model_config().nvfp4_moe_meta is not None
-    ):
-        overrides["moe_runner_backend"] = "flashinfer_trtllm_routed"
-        logger.info(
-            "Use flashinfer_trtllm_routed as MoE runner backend for "
-            f"{model_arch} hybrid FP8+NVFP4 checkpoint."
-        )
+    if server_args.moe_runner_backend == "auto":
+        model_config = server_args.get_model_config()
+        # nvidia/DeepSeek-V4-Pro-NVFP4 uses the routed TRT-LLM runner.
+        if model_config.nvfp4_moe_meta is not None:
+            overrides["moe_runner_backend"] = "flashinfer_trtllm_routed"
+            logger.info(
+                "Use flashinfer_trtllm_routed as MoE runner backend for "
+                f"{model_arch} hybrid FP8+NVFP4 checkpoint."
+            )
+        elif (
+            server_args.device == "cuda"
+            and not is_hip()
+            and model_config.is_fp4_experts
+            and (is_sm90_supported() or is_sm100_supported() or is_sm120_supported())
+        ):
+            overrides["moe_runner_backend"] = "flashinfer_mxfp4"
+            logger.info(
+                "Use flashinfer_mxfp4 as MoE runner backend for " f"{model_arch}."
+            )
     return overrides
 
 

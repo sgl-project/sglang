@@ -972,19 +972,23 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 device="cuda",
                 swa_full_tokens_ratio=ServerArgs.swa_full_tokens_ratio,
                 moe_runner_backend="auto",
-                get_model_config=lambda: SimpleNamespace(nvfp4_moe_meta=None),
+                get_model_config=lambda: SimpleNamespace(
+                    is_fp4_experts=True, nvfp4_moe_meta=None
+                ),
             )
             defaults.update(kw)
             return SimpleNamespace(**defaults)
 
-        self.assertEqual(
-            _deepseek_v4_overrides(_args(), hf),
-            {
-                "attention_backend": "dsv4",
-                "page_size": 256,
-                "swa_full_tokens_ratio": 0.1,
-            },
-        )
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            self.assertEqual(
+                _deepseek_v4_overrides(_args(), hf),
+                {
+                    "attention_backend": "dsv4",
+                    "moe_runner_backend": "flashinfer_mxfp4",
+                    "page_size": 256,
+                    "swa_full_tokens_ratio": 0.1,
+                },
+            )
         # NPU pool geometry
         self.assertEqual(
             _deepseek_v4_overrides(_args(device="npu"), hf)["page_size"], 128
@@ -994,11 +998,47 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "swa_full_tokens_ratio",
             _deepseek_v4_overrides(_args(swa_full_tokens_ratio=0.5), hf),
         )
+        # An explicit user choice takes precedence over the model default.
+        self.assertNotIn(
+            "moe_runner_backend",
+            _deepseek_v4_overrides(_args(moe_runner_backend="triton"), hf),
+        )
+        # FP8 checkpoints and non-CUDA platforms keep their platform-specific
+        # auto-resolution paths.
+        fp8_model_config = lambda: SimpleNamespace(
+            is_fp4_experts=False, nvfp4_moe_meta=None
+        )
+        self.assertNotIn(
+            "moe_runner_backend",
+            _deepseek_v4_overrides(_args(get_model_config=fp8_model_config), hf),
+        )
+        self.assertNotIn(
+            "moe_runner_backend",
+            _deepseek_v4_overrides(_args(device="npu"), hf),
+        )
+        with patch.object(overrides_module, "is_hip", return_value=True):
+            self.assertNotIn(
+                "moe_runner_backend",
+                _deepseek_v4_overrides(_args(), hf),
+            )
+        # Unsupported NVIDIA architectures keep the generic auto-resolution
+        # path instead of selecting a FlashInfer kernel that cannot launch.
+        with (
+            patch.object(overrides_module, "is_sm90_supported", return_value=False),
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+            patch.object(overrides_module, "is_sm120_supported", return_value=False),
+        ):
+            self.assertNotIn(
+                "moe_runner_backend",
+                _deepseek_v4_overrides(_args(), hf),
+            )
         # nvfp4 hybrid checkpoint routes the MoE runner
         self.assertEqual(
             _deepseek_v4_overrides(
                 _args(
-                    get_model_config=lambda: SimpleNamespace(nvfp4_moe_meta=object())
+                    get_model_config=lambda: SimpleNamespace(
+                        is_fp4_experts=False, nvfp4_moe_meta=object()
+                    )
                 ),
                 hf,
             )["moe_runner_backend"],
