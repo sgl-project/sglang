@@ -226,6 +226,28 @@ def _validate_decode_radix_dsv4_platform(
         )
 
 
+def _validate_decode_radix_swa_compress_platform(
+    *, is_npu_platform: bool, is_hip_platform: bool
+) -> None:
+    # SWA-compress (Gemma4 / MiMo-V2) rides the same [FULL, SWA] unified-tree
+    # path as DSV4 on CUDA: SWAKVPool keeps the full-attention prefix
+    # content-addressable while the SWA tail is transferred fresh per request,
+    # so prefix-match-and-lock needs no compress-specific tree code.
+    if is_npu_platform:
+        raise ValueError(
+            "--disaggregation-decode-enable-radix-cache does not support "
+            "SWA-compress models (e.g. Gemma4 / MiMo-V2) on NPU: the NPU "
+            "MHA sub-pools are not wired for the decode-radix lock path."
+        )
+    if is_hip_platform:
+        raise ValueError(
+            "--disaggregation-decode-enable-radix-cache does not support "
+            "SWA-compress models (e.g. Gemma4 / MiMo-V2) on HIP: the "
+            "unified-kv SWA ring is per-request and not content-stable "
+            "for prefix reuse."
+        )
+
+
 def build_kv_cache(
     *,
     server_args: ServerArgs,
@@ -311,10 +333,9 @@ def build_kv_cache(
                 _validate_decode_radix_dsv4_platform(
                     is_npu_platform=_is_npu, is_hip_platform=_is_hip
                 )
-            if getattr(model_config, "is_hybrid_swa_compress", False):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache does not support "
-                    "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
+            if model_config.is_hybrid_swa_compress:
+                _validate_decode_radix_swa_compress_platform(
+                    is_npu_platform=_is_npu, is_hip_platform=_is_hip
                 )
         if is_hybrid_ssm:
             raise ValueError(
