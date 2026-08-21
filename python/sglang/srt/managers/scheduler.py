@@ -3567,6 +3567,8 @@ class Scheduler(
         batch.filter_batch()
         if batch.is_empty():
             batch.batch_is_full = False
+            if initial_bs > 0:
+                self.metrics_reporter.refresh_and_emit_kv_metrics()
             return batch
 
         # Check if decode out of memory
@@ -3637,6 +3639,7 @@ class Scheduler(
 
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
+            self.metrics_reporter.refresh_and_emit_kv_metrics()
 
         if batch.is_empty():
             return batch
