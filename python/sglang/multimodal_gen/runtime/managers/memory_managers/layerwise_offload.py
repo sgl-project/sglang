@@ -220,7 +220,10 @@ class LayerwiseOffloadManager:
         self.pin_cpu_memory = bool(pin_cpu_memory and not self._synchronous_mps)
         # asked per layer rather than for the whole component; see
         # _plan_pinned_layers
-        self._pin_budget = pin_budget
+        # A missing budget is not a licence to ignore host memory: without one
+        # every layer looked affordable and the copies-do-not-fit check below
+        # was never reached. A private budget reads the same host limit.
+        self._pin_budget = pin_budget if pin_budget is not None else HostPinBudget()
         self._pin_component_name = pin_component_name
         # an explicit MPS zero avoids staging the next layer alongside the
         # active one; MPS has no transfer overlap to recover from that cost
@@ -281,7 +284,7 @@ class LayerwiseOffloadManager:
         # layer_idx -> {name: tensor still viewing the checkpoint file}
         # Weights left on their mapping rather than copied into host memory, so
         # the page cache decides what stays resident. Used when the copies would
-        # not fit; see _keep_weights_on_their_mapping.
+        # not fit; see _plan_layer_hosting.
         self._mapped_cpu_weights: Dict[int, Dict[str, torch.Tensor]] = {}
         self._mapped_bytes = 0
         # mps keeps the original CPU tensor for each layer instead of building a
@@ -418,14 +421,12 @@ class LayerwiseOffloadManager:
     def _plan_layer_hosting(self, layer_groups: Dict) -> Dict[int, str]:
         """Where each layer's weights live on the host: pinned, pageable or mapped.
 
-        Pinning is what lets the copy stream run ahead of compute -- 1.03 s
-        against 1.90 s per step on a measured Wan2.1 run. Measured on H3 against
-        ComfyUI on the same RTX 4090, which stages every weight in host memory:
-        6.75 s per denoise step against 13.37 with nothing pinned.
+        Pinning is what lets the copy stream run ahead of compute; a pageable
+        or mapped source transfers synchronously however it is requested.
 
-        The budget used to be asked for the whole component at once, so H3's DiT
-        -- 60.12 GB of weights against 28.56 GB spendable -- pinned nothing at
-        all. Asking per layer spends what there is.
+        The budget used to be asked for the whole component at once, so a DiT
+        larger than the whole spendable budget pinned nothing at all. Asking
+        per layer spends what there is.
 
         A layer that misses the budget falls back the way it always did, to a
         pageable copy, and only stays on its mapping when those copies do not
@@ -439,9 +440,6 @@ class LayerwiseOffloadManager:
         of size k covers k/n of the reads. Index order keeps it deterministic.
         """
         totals, mapped = self._layer_byte_totals(layer_groups)
-        if self.pin_cpu_memory and self._pin_budget is None:
-            return {idx: "pinned" for idx in totals}
-
         pinned_bytes = 0
         hosting: Dict[int, str] = {}
         spendable = self._pin_budget.spendable_bytes if self._pin_budget else 0
