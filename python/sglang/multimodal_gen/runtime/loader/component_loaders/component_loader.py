@@ -15,6 +15,7 @@ from torch import nn
 from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.layers.attention.roles import AttentionRole
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     component_attn_backend_context_manager,
     get_component_attn_backend_context,
@@ -31,7 +32,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     is_fsdp_managed_module,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_hf_config,
@@ -125,9 +129,12 @@ class ComponentLoader(ABC):
         component_name: str,
         attn_backend: Any,
         component_attn_name: str | None,
+        backend_by_role: dict[AttentionRole, AttentionBackendEnum] | None = None,
     ) -> AutoModel:
         with component_attn_backend_context_manager(
-            attn_backend, component_name=component_attn_name
+            attn_backend,
+            component_name=component_attn_name,
+            backend_by_role=backend_by_role,
         ):
             load_kwargs = self.customized_load_kwargs_for_component(
                 server_args, component_name
@@ -144,9 +151,12 @@ class ComponentLoader(ABC):
         transformers_or_diffusers: str,
         attn_backend: Any,
         component_attn_name: str | None,
+        backend_by_role: dict[AttentionRole, AttentionBackendEnum] | None = None,
     ) -> AutoModel:
         with component_attn_backend_context_manager(
-            attn_backend, component_name=component_attn_name
+            attn_backend,
+            component_name=component_attn_name,
+            backend_by_role=backend_by_role,
         ):
             component = self.load_native(
                 component_model_path,
@@ -180,11 +190,13 @@ class ComponentLoader(ABC):
         )
         attn_backend = None
         component_attn_name = None
+        backend_by_role: dict[AttentionRole, AttentionBackendEnum] | None = None
         if get_component_attn_backend_context() is None:
             attn_backend, matched_backend_key = (
                 server_args.resolve_component_attention_backend(component_name)
             )
             component_attn_name = matched_backend_key or component_name
+            backend_by_role = server_args.resolve_component_backend_by_role(component_name)
             if attn_backend is not None:
                 logger.info(
                     "Using %s backend for component: %s",
@@ -198,6 +210,7 @@ class ComponentLoader(ABC):
                 component_name,
                 attn_backend,
                 component_attn_name,
+                backend_by_role,
             )
             source = "sgl-diffusion"
         except (ComponentCheckpointUnsupportedError, ComponentResidencyError):
@@ -231,6 +244,7 @@ class ComponentLoader(ABC):
                 transformers_or_diffusers,
                 attn_backend,
                 component_attn_name,
+                backend_by_role,
             )
             source = "native"
             logger.warning(

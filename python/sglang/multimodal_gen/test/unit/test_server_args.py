@@ -72,7 +72,11 @@ from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
 from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
     MiniMaxH3Pipeline,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.layers.attention.roles import AttentionRole
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import (
     MAX_SCHEDULER_RPC_TIMEOUT_S,
     ServerArgs,
@@ -248,6 +252,134 @@ class TestServerArgsPathExpansion(unittest.TestCase):
 
         self.assertEqual(
             server_args.component_attention_backends, {"text_encoder": "torch_sdpa"}
+        )
+
+    def test_role_qualified_component_keys_are_normalized(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": (
+                    "transformer.self=sage_attn,transformer.cross=fa3"
+                ),
+            }
+        )
+
+        self.assertEqual(
+            args.component_attention_backends,
+            {"transformer.self": "sage_attn", "transformer.cross": "fa"},
+        )
+
+    def test_role_qualified_component_normalizes_hyphenated_component(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": "text-encoder.cross=torch_sdpa",
+            }
+        )
+
+        self.assertEqual(
+            args.component_attention_backends,
+            {"text_encoder.cross": "torch_sdpa"},
+        )
+
+    def test_invalid_component_attention_role_raises(self):
+        with self.assertRaises(ValueError):
+            self._from_dict_without_model_resolution(
+                {
+                    "model_path": "/data/my-model",
+                    "component_attention_backends": {"transformer.bogus": "fa"},
+                }
+            )
+
+    def test_dynamic_role_qualified_cli_args(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--component-attention-backends.transformer.cross=fa",
+        ]
+
+        with (
+            patch.object(sys, "argv", ["sglang"] + argv),
+            patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ),
+            _mock_cuda_platform(),
+        ):
+            args, unknown_args = parser.parse_known_args(argv)
+            server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertEqual(
+            server_args.component_attention_backends, {"transformer.cross": "fa"}
+        )
+
+    def test_resolve_component_backend_by_role_returns_overrides(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": {
+                    "transformer.self": "sage_attn",
+                    "transformer.cross": "fa",
+                },
+            }
+        )
+
+        backend_by_role = args.resolve_component_backend_by_role("transformer")
+
+        self.assertEqual(
+            backend_by_role,
+            {
+                AttentionRole.SELF: AttentionBackendEnum.SAGE_ATTN,
+                AttentionRole.CROSS: AttentionBackendEnum.FA,
+            },
+        )
+
+    def test_resolve_component_backend_by_role_only_returns_configured_roles(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": {"transformer.cross": "fa"},
+            }
+        )
+
+        backend_by_role = args.resolve_component_backend_by_role("transformer")
+
+        self.assertEqual(
+            backend_by_role, {AttentionRole.CROSS: AttentionBackendEnum.FA}
+        )
+
+    def test_resolve_component_backend_by_role_two_stage_fallback(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": {"transformer.cross": "fa"},
+            }
+        )
+
+        # transformer_2 has no explicit role override, so it inherits the base
+        # transformer.cross entry via the two-stage fallback.
+        backend_by_role = args.resolve_component_backend_by_role("transformer_2")
+
+        self.assertEqual(
+            backend_by_role, {AttentionRole.CROSS: AttentionBackendEnum.FA}
+        )
+
+    def test_resolve_component_backend_by_role_prefers_two_stage_override(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": {
+                    "transformer.cross": "fa",
+                    "transformer_2.cross": "torch_sdpa",
+                },
+            }
+        )
+
+        backend_by_role = args.resolve_component_backend_by_role("transformer_2")
+
+        self.assertEqual(
+            backend_by_role, {AttentionRole.CROSS: AttentionBackendEnum.TORCH_SDPA}
         )
 
     def test_layerwise_offload_components_imply_layerwise(self):

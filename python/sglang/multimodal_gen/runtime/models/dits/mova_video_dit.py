@@ -16,7 +16,11 @@ from torch.distributed.tensor import DTensor
 from sglang.multimodal_gen.configs.models.dits.mova_video import MOVAVideoConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
-from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
+from sglang.multimodal_gen.runtime.layers.attention import (
+    AttentionRole,
+    LocalAttention,
+    USPAttention,
+)
 
 # Reuse SGLang's optimized RMSNorm instead of torch.nn.RMSNorm or custom SlowRMSNorm
 from sglang.multimodal_gen.runtime.layers.layernorm import (
@@ -236,6 +240,7 @@ class CrossAttention(nn.Module):
             head_size=self.head_dim,
             causal=False,
             softmax_scale=None,
+            attention_role=AttentionRole.CROSS,
         )
 
     def forward(self, x: torch.Tensor, y: torch.Tensor):

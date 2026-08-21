@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     wrap_attention_impl_forward,
 )
+from sglang.multimodal_gen.runtime.layers.attention.roles import AttentionRole
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.turbo_layer import (
     async_a2a_communicate,
@@ -330,6 +331,7 @@ class UlyssesAttention(nn.Module):
         softmax_scale: float | None = None,
         causal: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        attention_role: AttentionRole = AttentionRole.SELF,
         prefix: str = "",
         **extra_impl_args,
     ) -> None:
@@ -352,7 +354,10 @@ class UlyssesAttention(nn.Module):
 
         dtype = get_compute_dtype()
         attn_backend = get_attn_backend(
-            head_size, dtype, supported_attention_backends=supported_attention_backends
+            head_size,
+            dtype,
+            supported_attention_backends=supported_attention_backends,
+            attention_role=attention_role,
         )
         impl_cls = attn_backend.get_impl_cls()
 
@@ -597,6 +602,7 @@ class LocalAttention(nn.Module):
         softmax_scale: float | None = None,
         causal: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        attention_role: AttentionRole = AttentionRole.SELF,
         compute_dtype: torch.dtype | None = None,
         **extra_impl_args,
     ) -> None:
@@ -610,7 +616,10 @@ class LocalAttention(nn.Module):
 
         dtype = compute_dtype or get_compute_dtype()
         attn_backend = get_attn_backend(
-            head_size, dtype, supported_attention_backends=supported_attention_backends
+            head_size,
+            dtype,
+            supported_attention_backends=supported_attention_backends,
+            attention_role=attention_role,
         )
         impl_cls = attn_backend.get_impl_cls()
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
@@ -729,7 +738,7 @@ class USPAttention(nn.Module):
         dropout_rate: float = 0.0,
         skip_sequence_parallel: bool = False,
         enable_packed_qkv_input_a2a: bool = False,
-        is_cross_attention: bool = False,
+        attention_role: AttentionRole = AttentionRole.SELF,
         **extra_impl_args,
     ) -> None:
         """
@@ -741,9 +750,11 @@ class USPAttention(nn.Module):
               full KV without any collective communication.
             default_attention_backend:
               fallback used only when no global or component override is active.
-            is_cross_attention:
-              sparse backend preferences may select a compatible dense backend
-              for cross-attention while remaining strict for self-attention.
+            attention_role:
+              selects the per-role backend override (``transformer.cross`` vs
+              ``transformer.self``); for cross-attention, a sparse backend
+              preference may select a compatible dense backend while remaining
+              strict for self-attention.
         """
         super().__init__()
         if softmax_scale is None:
@@ -760,7 +771,7 @@ class USPAttention(nn.Module):
             dtype,
             supported_attention_backends=supported_attention_backends,
             default_attention_backend=default_attention_backend,
-            is_cross_attention=is_cross_attention,
+            attention_role=attention_role,
         )
         if not skip_sequence_parallel and get_ring_parallel_world_size() > 1:
             if not attn_backend.supports_ring_rotation():

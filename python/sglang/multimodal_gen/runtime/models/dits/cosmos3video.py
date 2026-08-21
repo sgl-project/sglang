@@ -27,7 +27,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
-from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.attention import AttentionRole, USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
     apply_qk_norm,
@@ -743,6 +743,7 @@ class Cosmos3CrossAttention(nn.Module):
             causal=False,
             supported_attention_backends=supported_attention_backends,
             prefix=add_prefix("attn", prefix),
+            attention_role=AttentionRole.CROSS,
         )
 
     def forward(

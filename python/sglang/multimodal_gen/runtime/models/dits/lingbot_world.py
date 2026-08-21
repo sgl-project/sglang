@@ -26,7 +26,11 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
     get_ulysses_parallel_world_size,
 )
-from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
+from sglang.multimodal_gen.runtime.layers.attention import (
+    AttentionRole,
+    LocalAttention,
+    USPAttention,
+)
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
     CausalSelfAttentionKVCache,
@@ -408,7 +412,7 @@ class LingBotWorldTransformerBlock(nn.Module):
             supported_attention_backends=supported_attention_backends,
             prefix=add_prefix("attn1", prefix),
             quant_config=quant_config,
-            is_cross_attention=False,
+            attention_role=AttentionRole.SELF,
         )
         if qk_norm == "rms_norm":
             self.norm_q = RMSNorm(self.dim_head, eps=eps)
