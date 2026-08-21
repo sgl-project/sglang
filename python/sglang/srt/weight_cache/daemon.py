@@ -37,6 +37,7 @@ Usage:
 import argparse
 import dataclasses
 import logging
+import multiprocessing
 import os
 import signal
 import socket
@@ -129,72 +130,6 @@ class WeightCacheDaemonArgs:
             timeout=args.timeout,
             force=args.force,
         )
-
-
-def build_weight_cache_daemon_command(
-    server_args: "ServerArgs",
-    *,
-    gpu_id: int,
-    tp_rank: int,
-    pp_rank: int,
-    dist_init_method: str,
-) -> list[str]:
-    """Build the sole subprocess command used by Engine and the standalone launcher."""
-    import sys
-
-    cmd = [
-        sys.executable,
-        "-m",
-        "sglang.srt.weight_cache.daemon",
-        "--model-path",
-        server_args.model_path,
-        "--gpu-id",
-        str(gpu_id),
-        "--tp-size",
-        str(server_args.tp_size),
-        "--tp-rank",
-        str(tp_rank),
-        "--pp-size",
-        str(server_args.pp_size),
-        "--pp-rank",
-        str(pp_rank),
-        "--dp-size",
-        str(server_args.dp_size),
-        "--ep-size",
-        str(server_args.ep_size),
-        "--moe-dp-size",
-        str(server_args.moe_dp_size),
-        "--attn-cp-size",
-        str(server_args.attn_cp_size),
-        "--load-format",
-        server_args.load_format,
-        "--dtype",
-        server_args.dtype,
-        "--dist-init-method",
-        dist_init_method,
-    ]
-    if server_args.enable_dp_attention:
-        cmd.append("--enable-dp-attention")
-    if server_args.enable_dp_lm_head:
-        cmd.append("--enable-dp-lm-head")
-    if server_args.moe_dense_tp_size is not None:
-        cmd += ["--moe-dense-tp-size", str(server_args.moe_dense_tp_size)]
-    if server_args.moe_a2a_backend != "none":
-        cmd += ["--moe-a2a-backend", server_args.moe_a2a_backend]
-    if server_args.deepep_mode != "auto":
-        cmd += ["--deepep-mode", server_args.deepep_mode]
-    if server_args.quantization:
-        cmd += ["--quantization", server_args.quantization]
-    if (
-        server_args.model_loader_extra_config
-        and server_args.model_loader_extra_config != "{}"
-    ):
-        cmd += ["--model-loader-extra-config", server_args.model_loader_extra_config]
-    if server_args.trust_remote_code:
-        cmd += ["--trust-remote-code"]
-    if server_args.revision:
-        cmd += ["--revision", server_args.revision]
-    return cmd
 
 
 class WeightCacheDaemon:
@@ -686,6 +621,24 @@ def run_weight_cache_daemon(
     daemon.serve()
 
 
+def spawn_weight_cache_daemon(
+    server_args: "ServerArgs",
+    *,
+    gpu_id: int,
+    tp_rank: int,
+    pp_rank: int,
+    dist_init_method: str,
+):
+    """Start one daemon from the complete resolved server configuration."""
+    ctx = multiprocessing.get_context("spawn")
+    proc = ctx.Process(
+        target=run_weight_cache_daemon,
+        args=(server_args, gpu_id, tp_rank, pp_rank, dist_init_method),
+    )
+    proc.start()
+    return proc
+
+
 def launch_weight_cache_daemons(
     server_args: "ServerArgs",
     dist_init_method: Optional[str] = None,
@@ -698,9 +651,9 @@ def launch_weight_cache_daemons(
     For multi-node (nnodes>1): spawns this node's share of PP×TP daemons,
     mapping local gpu_id to the correct global (pp_rank, tp_rank).
 
-    Uses subprocess.Popen instead of multiprocessing.Process to avoid
-    initializing CUDA in the parent process, which can degrade CUDA IPC
-    performance in child processes.
+    Uses ``multiprocessing`` with the ``spawn`` start method. The child starts
+    in a clean interpreter and receives the complete resolved ``ServerArgs``
+    through pickle, avoiding a second hand-maintained CLI configuration path.
 
     Usage (single-node):
         python -m sglang.srt.weight_cache.daemon \\
@@ -720,7 +673,6 @@ def launch_weight_cache_daemons(
             --dist-init-method tcp://node0-ip:29500
     """
     import socket as sock_mod
-    import subprocess
 
     # Replicate _calculate_rank_ranges logic from engine.py
     pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
@@ -767,15 +719,13 @@ def launch_weight_cache_daemons(
                 base_gpu_id=server_args.base_gpu_id,
                 gpu_id_step=server_args.gpu_id_step,
             )
-            cmd = build_weight_cache_daemon_command(
+            proc = spawn_weight_cache_daemon(
                 server_args,
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
                 pp_rank=pp_rank,
                 dist_init_method=dist_init_method,
             )
-
-            proc = subprocess.Popen(cmd)
             procs.append(proc)
             logger.info(
                 f"Launched weight cache daemon gpu={gpu_id} "
@@ -805,18 +755,17 @@ def launch_weight_cache_daemons(
                     )
                 # Check if any daemon exited prematurely
                 for p in procs:
-                    retcode = p.poll()
-                    if retcode is not None:
+                    if not p.is_alive():
                         logger.error(
                             f"Weight cache daemon exited prematurely "
-                            f"with code {retcode}"
+                            f"with code {p.exitcode}"
                         )
                         for other in procs:
-                            if other.poll() is None:
+                            if other.is_alive():
                                 other.terminate()
                         raise RuntimeError(
                             f"Weight cache daemon exited prematurely "
-                            f"with code {retcode}"
+                            f"with code {p.exitcode}"
                         )
             logger.info(
                 f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} is ready"
@@ -829,15 +778,15 @@ def launch_weight_cache_daemons(
         f"dist_init_method={dist_init_method})"
     )
 
-    # Monitor daemons — poll all of them and, the moment any one exits,
-    # terminate the rest and raise. A serial proc.wait() would not notice a
+    # Monitor daemons and, the moment any one exits, terminate the rest and
+    # raise. A serial proc.join() would not notice a
     # mid-list death (e.g. procs[1] dying while procs[0] is still alive) until
     # the earlier proc happened to exit, and it never surfaced the failure.
     exited = None
     try:
         while exited is None:
             for proc in procs:
-                if proc.poll() is not None:
+                if not proc.is_alive():
                     exited = proc
                     break
             else:
@@ -847,19 +796,19 @@ def launch_weight_cache_daemons(
         logger.info("Received KeyboardInterrupt, shutting down daemons")
     finally:
         for proc in procs:
-            if proc.poll() is None:
+            if proc.is_alive():
                 proc.terminate()
         for proc in procs:
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
+            proc.join(timeout=5)
+            if proc.is_alive():
                 proc.kill()
+                proc.join()
         logger.info("All weight cache daemons have been terminated")
 
     if exited is not None:
         raise RuntimeError(
             f"Weight cache daemon (pid={exited.pid}) exited with code "
-            f"{exited.returncode}; terminated the remaining daemons."
+            f"{exited.exitcode}; terminated the remaining daemons."
         )
 
 

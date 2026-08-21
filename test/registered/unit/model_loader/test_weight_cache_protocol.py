@@ -7,7 +7,7 @@ These cover the pure-Python logic that the GPU end-to-end test
   - length-prefixed socket framing (send_msg/recv_msg) over socketpair()
   - CacheConfig fingerprint matching / (de)serialization
   - quant-config hashing and method-name extraction
-  - daemon command construction and socket/ready path derivation
+  - daemon spawn configuration and socket/ready path derivation
   - the IPC quantization allowlist (the gate that keeps silently-wrong
     quant methods off the zero-copy path)
   - stale-vs-live daemon file cleanup
@@ -265,11 +265,12 @@ class TestGlobalRankAndPaths(CustomTestCase):
 
 
 class TestDaemonLaunchConfiguration(CustomTestCase):
-    def test_builder_projects_complex_server_layout(self):
-        from sglang.srt.weight_cache.daemon import build_weight_cache_daemon_command
+    def test_spawn_forwards_complete_server_args_without_projection(self):
+        from sglang.srt.weight_cache import daemon
 
-        # The builder consumes Engine's already-resolved ServerArgs. A minimal
-        # namespace keeps this projection test CPU-only and model-independent.
+        # The spawn helper receives Engine's already-resolved ServerArgs. A
+        # minimal namespace keeps this projection test CPU-only and
+        # model-independent; importantly, no EPLB configuration is involved.
         server_args = SimpleNamespace(
             model_path="/models/demo",
             tp_size=8,
@@ -290,29 +291,39 @@ class TestDaemonLaunchConfiguration(CustomTestCase):
             trust_remote_code=True,
             revision="test-revision",
         )
-        command = build_weight_cache_daemon_command(
-            server_args,
-            gpu_id=3,
-            tp_rank=3,
-            pp_rank=0,
-            dist_init_method="tcp://127.0.0.1:29500",
+
+        class FakeProcess:
+            pid = 1234
+
+            def start(self):
+                pass
+
+        class FakeContext:
+            def Process(self, **kwargs):
+                self.kwargs = kwargs
+                return FakeProcess()
+
+        fake_context = FakeContext()
+        from unittest import mock
+
+        with mock.patch.object(
+            daemon.multiprocessing, "get_context", return_value=fake_context
+        ) as get_context:
+            result = daemon.spawn_weight_cache_daemon(
+                server_args,
+                gpu_id=3,
+                tp_rank=3,
+                pp_rank=0,
+                dist_init_method="tcp://127.0.0.1:29500",
+            )
+
+        get_context.assert_called_once_with("spawn")
+        self.assertIsInstance(result, FakeProcess)
+        self.assertIs(fake_context.kwargs["target"], daemon.run_weight_cache_daemon)
+        self.assertEqual(
+            fake_context.kwargs["args"],
+            (server_args, 3, 3, 0, "tcp://127.0.0.1:29500"),
         )
-
-        def value_after(flag):
-            return command[command.index(flag) + 1]
-
-        self.assertEqual(value_after("--gpu-id"), "3")
-        self.assertEqual(value_after("--tp-rank"), "3")
-        self.assertEqual(value_after("--dp-size"), "8")
-        self.assertEqual(value_after("--ep-size"), "8")
-        self.assertEqual(value_after("--moe-dp-size"), "2")
-        self.assertEqual(value_after("--attn-cp-size"), "2")
-        self.assertEqual(value_after("--moe-dense-tp-size"), "1")
-        self.assertEqual(value_after("--moe-a2a-backend"), "mooncake")
-        self.assertEqual(value_after("--deepep-mode"), "low_latency")
-        self.assertIn("--enable-dp-attention", command)
-        self.assertIn("--enable-dp-lm-head", command)
-        self.assertIn("--trust-remote-code", command)
 
 
 class TestIpcQuantAllowlist(CustomTestCase):

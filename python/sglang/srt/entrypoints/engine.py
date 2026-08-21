@@ -710,7 +710,7 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Validate and clean up stale .ready/.sock files from prior runs.
         # If a daemon is still alive at this rank, raise instead of clobbering.
-        from sglang.srt.weight_cache.daemon import build_weight_cache_daemon_command
+        from sglang.srt.weight_cache.daemon import spawn_weight_cache_daemon
         from sglang.srt.weight_cache.protocol import (
             cleanup_stale_daemon_files,
             compute_global_rank,
@@ -733,7 +733,7 @@ class Engine(EngineScoreMixin, EngineBase):
                     base_gpu_id=server_args.base_gpu_id,
                     gpu_id_step=server_args.gpu_id_step,
                 )
-                cmd = build_weight_cache_daemon_command(
+                proc = spawn_weight_cache_daemon(
                     server_args,
                     gpu_id=gpu_id,
                     tp_rank=tp_rank,
@@ -741,7 +741,6 @@ class Engine(EngineScoreMixin, EngineBase):
                     dist_init_method=dist_init_method,
                 )
 
-                proc = subprocess.Popen(cmd)
                 daemon_procs.append(proc)
 
         # Wait for all daemons to be ready (ready file exists). On any failure
@@ -766,10 +765,10 @@ class Engine(EngineScoreMixin, EngineBase):
                             )
                         # Check if daemon process is still alive
                         for p in daemon_procs:
-                            if p.poll() is not None:
+                            if not p.is_alive():
                                 raise RuntimeError(
                                     f"Weight cache daemon (pid={p.pid}) exited prematurely "
-                                    f"with code {p.returncode}"
+                                    f"with code {p.exitcode}"
                                 )
                     logger.info(
                         f"Weight cache daemon for pp_rank={pp_rank} "
@@ -800,17 +799,17 @@ class Engine(EngineScoreMixin, EngineBase):
         if not procs:
             return
         for p in procs:
-            if p.poll() is None:
+            if p.is_alive():
                 p.terminate()  # SIGTERM -> daemon cleanup handler runs
         for p in procs:
-            try:
-                p.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
+            p.join(timeout=timeout)
+            if p.is_alive():
                 logger.warning(
                     f"Weight cache daemon (pid={p.pid}) did not exit within "
                     f"{timeout}s of SIGTERM; sending SIGKILL."
                 )
                 p.kill()
+                p.join()
 
     @classmethod
     def _launch_scheduler_processes(
