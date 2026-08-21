@@ -71,7 +71,15 @@ _TranscriptDeltaCallback = Callable[[str], Awaitable[None]]
 
 
 class RealtimeASRState(msgspec.Struct):
-    """Mutable audio and transcript progress for the current input buffer."""
+    """Mutable per-item progress shared by the endpoint and processor.
+
+    ``transcript`` owns cumulative reconciliation until a successful one-way
+    handoff. ``decoder_suffix`` is created only when that handoff commits, so
+    its presence is also the source of truth that encoder windowing is active.
+    Together with ``encoder_window_disabled``, this represents eligible,
+    active, and cumulative-only items without a separate mode field that could
+    drift out of sync.
+    """
 
     audio: AudioBuffer
     transcript: StreamingASRState
@@ -103,7 +111,12 @@ class RealtimeASRState(msgspec.Struct):
 
 
 class _TranscriptionStep(msgspec.Struct, frozen=True):
-    """Resolved mode, audio range, and text context for one transcription."""
+    """Immutable backend-request snapshot built before generation awaits.
+
+    Execution and commit consume the same instance so the selected mode, PCM
+    range, and windowed decoder context cannot be recomputed from state changed
+    while the request was in flight.
+    """
 
     is_last: bool
     uses_encoder_windows: bool
@@ -114,10 +127,13 @@ class _TranscriptionStep(msgspec.Struct, frozen=True):
 
 
 class _TranscriptionOutcome(msgspec.Struct, frozen=True):
-    """Reconciled text and whether the step's audio may be committed.
+    """Result contract consumed when a transcription step commits.
 
-    ``audio_processed=False`` keeps the covered audio for the next step when
-    the model cannot produce a usable continuation.
+    Windowed decoder updates remain unapplied so the first handoff can be
+    discarded and retried cumulatively if its text is unsafe to reconcile.
+    The cumulative path keeps its existing in-place reconciliation behavior.
+    In both paths, ``audio_processed=False`` retains the covered audio for the
+    next step instead of advancing the processed cursor.
     """
 
     audio_processed: bool
@@ -175,10 +191,13 @@ class RealtimeASRProcessor:
             raise ValueError(
                 "realtime ASR chunk_size_sec is shorter than one PCM sample"
             )
+        if self.chunk_size_bytes % PCM_SAMPLE_WIDTH_BYTES:
+            raise ValueError(
+                "realtime ASR chunk_size_sec must resolve to whole PCM samples"
+            )
         self.max_buffer_bytes = self.max_buffer_seconds * self.pcm_bytes_per_second
-        self._cumulative_fallback_max_bytes = self.max_buffer_bytes
         self._encoder_window_policy = self._resolve_encoder_window_policy(
-            state, server_args
+            state, enabled=server_args.enable_asr_encoder_window
         )
 
     def create_state(self) -> RealtimeASRState:
@@ -195,7 +214,7 @@ class RealtimeASRProcessor:
         )
 
     def _resolve_encoder_window_policy(
-        self, state: StreamingASRState, server_args: ServerArgs
+        self, state: StreamingASRState, *, enabled: bool
     ) -> Optional[_ResolvedEncoderWindowPolicy]:
         """Resolve optional realtime encoder-window settings."""
         declared = self.adapter.realtime_encoder_window_policy
@@ -206,7 +225,7 @@ class RealtimeASRProcessor:
                 "realtime_encoder_window_policy must return "
                 "RealtimeEncoderWindowPolicy or None"
             )
-        if server_args.asr_long_audio_strategy != "encoder_window":
+        if not enabled:
             return None
         # Activate on a fixed inference boundary so large appends and normal
         # chunked input make the same cumulative-to-windowed transition.
@@ -214,23 +233,6 @@ class RealtimeASRProcessor:
             math.ceil(declared.min_audio_sec / state.chunk_size_sec)
             * self.chunk_size_bytes
         )
-        if (
-            server_args.tp_size != 1
-            or server_args.dp_size != 1
-            or server_args.pp_size != 1
-            or server_args.nnodes != 1
-            or server_args.language_only
-            or server_args.disaggregation_mode != "null"
-        ):
-            logger.warning(
-                "[realtime] encoder windowing currently requires a local "
-                "single-GPU runtime; using cumulative ASR with the adapter gate "
-                "as the item limit"
-            )
-            self._cumulative_fallback_max_bytes = min(
-                self.max_buffer_bytes, activation_threshold_bytes
-            )
-            return None
         mm_processor = self.tokenizer_manager.mm_processor
         if mm_processor is None or self.tokenizer_manager.tokenizer is None:
             raise RuntimeError(
@@ -262,7 +264,7 @@ class RealtimeASRProcessor:
         a runtime no-boundary fallback narrows it back to the cumulative cap."""
         policy = self._encoder_window_policy
         if policy is None:
-            return self._cumulative_fallback_max_bytes
+            return self.max_buffer_bytes
         if encoder_window_disabled or not policy.supports_language(language):
             return min(self.max_buffer_bytes, policy.activation_threshold_bytes)
         return self.max_buffer_bytes
@@ -402,7 +404,6 @@ class RealtimeASRProcessor:
             uses_encoder_windows=False,
             start_offset_bytes=0,
             end_offset_bytes=end_offset_bytes,
-            decoder_prefix=transcript.get_prefix_text(),
         )
 
     def _should_use_encoder_windows(
@@ -504,10 +505,10 @@ class RealtimeASRProcessor:
                 # Completing without the final decode would silently drop the
                 # last audio; fail the item instead of publishing it.
                 raise RuntimeError("final realtime ASR request returned no response")
-            # A transient empty backend response (abort, preemption) must not
-            # tear down the session. Only the attempted cursor advances, so the
-            # audio stays unprocessed and the next step or the forced final
-            # decode re-covers it from offset zero.
+            # An empty backend iterator must not commit uncovered audio. Only
+            # the attempted cursor advances, so the next step or forced final
+            # decode re-covers the audio from offset zero. Explicit aborts raise
+            # before this branch and fail the request.
             logger.warning("[realtime] cumulative ASR step returned no response")
             return _TranscriptionOutcome(audio_processed=False)
         if step.is_last and generation.finish_reason == "length":

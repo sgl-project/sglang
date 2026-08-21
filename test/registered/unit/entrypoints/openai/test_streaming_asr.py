@@ -33,6 +33,7 @@ from sglang.srt.entrypoints.openai.transcription_adapters.qwen3_asr import (
     Qwen3ASRAdapter,
 )
 from sglang.srt.multimodal.audio_encoder_windowing import AudioEncoderWindowConfig
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -111,6 +112,7 @@ class _MockTokenizerManager:
         )
         self._fail = fail
         self.served_model_name = "qwen3-asr"
+        self.server_args = SimpleNamespace(incremental_streaming_output=False)
         self.requests = []
         self.processor_kwargs = []
         self.tokenizer = Mock(
@@ -192,16 +194,10 @@ def _process(processor, state, *, is_last=False, language="en", sampling_params=
     )
 
 
-def _server_args(max_buffer_seconds=60, long_audio_strategy="encoder_window"):
+def _server_args(max_buffer_seconds=60, *, enable_encoder_windows=True):
     return SimpleNamespace(
         asr_max_buffer_seconds=max_buffer_seconds,
-        asr_long_audio_strategy=long_audio_strategy,
-        tp_size=1,
-        dp_size=1,
-        pp_size=1,
-        nnodes=1,
-        language_only=False,
-        disaggregation_mode="null",
+        enable_asr_encoder_window=enable_encoder_windows,
     )
 
 
@@ -259,7 +255,7 @@ class TestRealtimeASRProcessorConfig(CustomTestCase):
 
     def test_rejects_invalid_chunk_size(self):
         tokenizer_manager = _MockTokenizerManager("text")
-        for chunk_size_sec in (0.0, -1.0, float("inf"), 1e-20):
+        for chunk_size_sec in (0.0, -1.0, float("inf"), 1e-20, 0.5):
             with self.subTest(chunk_size_sec=chunk_size_sec):
                 with self.assertRaises(ValueError):
                     RealtimeASRProcessor(
@@ -267,6 +263,20 @@ class TestRealtimeASRProcessorConfig(CustomTestCase):
                         _adapter(chunk_size_sec=chunk_size_sec),
                         _server_args(),
                     )
+
+    def test_rejects_encoder_window_on_incompatible_topology(self):
+        server_args = SimpleNamespace(
+            enable_asr_encoder_window=True,
+            tp_size=1,
+            dp_size=2,
+            pp_size=1,
+            nnodes=1,
+            language_only=False,
+            disaggregation_mode="null",
+        )
+
+        with self.assertRaisesRegex(ValueError, "--dp-size=2"):
+            ServerArgs._handle_asr_runtime_compatibility(server_args)
 
 
 def _realtime_connection(transcripts, finish_reasons, *, encoder_windows=True):
@@ -283,7 +293,7 @@ def _realtime_connection(transcripts, finish_reasons, *, encoder_windows=True):
         ),
         _server_args(
             120,
-            long_audio_strategy=("encoder_window" if encoder_windows else "cumulative"),
+            enable_encoder_windows=encoder_windows,
         ),
     )
     connection.config.configured = True
@@ -385,13 +395,72 @@ class TestStreamingASR(CustomTestCase):
         self.assertEqual(result.text, "Hello world")
         self.assertEqual(result.finish_reason, "stop")
 
+    def test_decoder_stream_uses_cumulative_snapshots_by_default(self):
+        tokenizer_manager = _StreamingTokenizerManager(
+            ["hello", "hello world", "hello world again"],
+            incremental=False,
+        )
+        updates = []
+
+        async def collect(text):
+            updates.append(text)
+
+        result = _run(
+            generate_asr_transcript(
+                tokenizer_manager=tokenizer_manager,
+                adapter=_adapter(),
+                audio_data=_AUDIO,
+                sampling_params={},
+                prompt="PROMPT:",
+                on_update=collect,
+            )
+        )
+
+        self.assertEqual(updates, ["hello", "hello world", "hello world again"])
+        self.assertEqual(result.text, "hello world again")
+
+    def test_windowed_stream_fails_if_final_text_revises_published_prefix(self):
+        tokenizer_manager = _StreamingTokenizerManager(
+            ["one two three", "one four"],
+            incremental=False,
+            supports_encoder_windows=True,
+        )
+        processor = RealtimeASRProcessor(
+            tokenizer_manager,
+            _adapter(encoder_window_config=_ENCODER_WINDOW_POLICY),
+            _server_args(120),
+        )
+        state = processor.create_state()
+        state.decoder_suffix = DecoderSuffixState(
+            emitted_text="", pending_suffix="one two"
+        )
+        state.audio.append_pcm(b"\x01\x00\x02\x00")
+        updates = []
+
+        async def collect(text):
+            updates.append(text)
+
+        with self.assertRaisesRegex(RuntimeError, "append-only streamed prefix"):
+            _run(
+                processor.process(
+                    state,
+                    is_last=False,
+                    language="en",
+                    sampling_params={},
+                    on_transcript_delta=collect,
+                )
+            )
+
+        self.assertEqual(updates, ["one"])
+        self.assertEqual(state.audio.last_processed_offset_bytes, 0)
+
     def test_decoder_stream_appends_deltas_without_duplicates(self):
         tokenizer_manager = _StreamingTokenizerManager(["hello", " world", " again"])
         connection = RealtimeConnection(
             Mock(send_text=AsyncMock(), close=AsyncMock()),
             tokenizer_manager,
             _adapter(),
-            _server_args(long_audio_strategy="cumulative"),
+            _server_args(enable_encoder_windows=False),
         )
         connection.config.configured = True
         connection.config.language = "en"
@@ -837,6 +906,7 @@ class TestStreamingASR(CustomTestCase):
             ("a b", "A B你好世界", ("你好世界", True)),
             ("Hello, world!", "hello world你好世界", ("你好世界", True)),
             ("A B", " A B你好世界", ("你好世界", True)),
+            ("A你", "A你好", ("好", True)),
             ("A B", "A Bfoo", ("A Bfoo", False)),
         ):
             with self.subTest(prefix=prefix, decoded=decoded):
@@ -846,6 +916,23 @@ class TestStreamingASR(CustomTestCase):
                     ),
                     expected,
                 )
+
+    def test_bounded_decoder_prefix_starts_at_a_word_boundary(self):
+        class CharacterTokenizer:
+            @staticmethod
+            def encode(text, **_kwargs):
+                return [ord(char) for char in text]
+
+            @staticmethod
+            def decode(token_ids, **_kwargs):
+                return "".join(chr(token_id) for token_id in token_ids)
+
+        state = DecoderSuffixState(emitted_text="alpha middle omega")
+        self.assertEqual(state.get_bounded_prefix(CharacterTokenizer(), 8), "omega")
+        self.assertEqual(
+            state.get_bounded_prefix(CharacterTokenizer(), 20),
+            "alpha middle omega",
+        )
 
     def test_handoff_only_replay_defers_like_an_empty_continuation(self):
         """Bug regression: a decode that replayed only the handoff ("C D")
@@ -1148,29 +1235,9 @@ class TestStreamingASR(CustomTestCase):
         processor = RealtimeASRProcessor(
             tokenizer_manager,
             _adapter(encoder_window_config=_ENCODER_WINDOW_POLICY),
-            _server_args(120, long_audio_strategy="cumulative"),
+            _server_args(120, enable_encoder_windows=False),
         )
         state = processor.create_state()
-        state.audio.append_pcm(b"\x01\x00\x02\x00")
-        _process(processor, state, language=None)
-        self.assertIsNone(tokenizer_manager.processor_kwargs[0])
-
-        tokenizer_manager = _MockTokenizerManager(
-            "hello world", supports_encoder_windows=True
-        )
-        server_args = _server_args(120)
-        server_args.dp_size = 2
-        with self.assertLogs(level="WARNING"):
-            processor = RealtimeASRProcessor(
-                tokenizer_manager,
-                _adapter(
-                    min_audio_sec=60.0,
-                    encoder_window_config=_ENCODER_WINDOW_POLICY,
-                ),
-                server_args,
-            )
-        state = processor.create_state()
-        self.assertEqual(processor.max_item_bytes("en"), 120)
         state.audio.append_pcm(b"\x01\x00\x02\x00")
         _process(processor, state, language=None)
         self.assertIsNone(tokenizer_manager.processor_kwargs[0])

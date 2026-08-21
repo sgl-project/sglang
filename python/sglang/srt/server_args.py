@@ -1451,22 +1451,16 @@ class ServerArgs:
         "Maximum total PCM audio seconds accepted per streaming ASR item before closing the session with a buffer_overflow error. This duration cap is independent of resident-buffer compaction. Default 60s.",
         NS("serving"),
     ] = 60
-    asr_long_audio_strategy: A[
-        str,
-        Arg(
-            help=(
-                "Realtime ASR strategy after the adapter's long-audio threshold. "
-                "'cumulative' preserves the original full-audio path; "
-                "'encoder_window' opts into encoder-aligned rolling context for "
-                "supported models. Encoder windowing currently requires a local "
-                "single-GPU runtime; unsupported distributed or disaggregated "
-                "deployments fall back to cumulative ASR and retain the adapter "
-                "threshold as the item limit."
-            ),
-            choices=("cumulative", "encoder_window"),
-        ),
+    enable_asr_encoder_window: A[
+        bool,
+        "Enable encoder-aligned rolling context for supported realtime ASR "
+        "models after the adapter's long-audio threshold. Raise "
+        "--asr-max-buffer-seconds above that threshold to process longer items. "
+        "Encoder windowing currently requires a local single-GPU runtime; "
+        "incompatible distributed or disaggregated configurations are rejected "
+        "during server startup.",
         NS("serving"),
-    ] = "cumulative"
+    ] = False
     asr_max_concurrent_sessions: A[
         int,
         "Maximum number of concurrent realtime ASR WebSocket sessions served by /v1/realtime. New connections beyond this cap are accepted, sent an error{code:too_many_sessions} frame, and closed. Default 32.",
@@ -3798,6 +3792,9 @@ class ServerArgs:
 
         # Handle Encoder disaggregation.
         self._handle_encoder_disaggregation()
+
+        # Validate ASR topology after DP, PP, and disaggregation are final.
+        self._handle_asr_runtime_compatibility()
 
         # Validate tokenizer settings.
         self._handle_tokenizer_batching()
@@ -8621,6 +8618,30 @@ class ServerArgs:
             raise ValueError(
                 f"--asr-max-concurrent-sessions must be positive "
                 f"(got {self.asr_max_concurrent_sessions})."
+            )
+
+    def _handle_asr_runtime_compatibility(self):
+        """Reject encoder windowing when the resolved topology cannot support it."""
+        if not self.enable_asr_encoder_window:
+            return
+
+        incompatible = []
+        if self.tp_size != 1:
+            incompatible.append(f"--tp-size={self.tp_size}")
+        if self.dp_size != 1:
+            incompatible.append(f"--dp-size={self.dp_size}")
+        if self.pp_size != 1:
+            incompatible.append(f"--pp-size={self.pp_size}")
+        if self.nnodes != 1:
+            incompatible.append(f"--nnodes={self.nnodes}")
+        if self.language_only:
+            incompatible.append("--language-only")
+        if self.disaggregation_mode != "null":
+            incompatible.append(f"--disaggregation-mode={self.disaggregation_mode}")
+        if incompatible:
+            raise ValueError(
+                "--enable-asr-encoder-window currently requires a local "
+                "single-GPU runtime; incompatible settings: " + ", ".join(incompatible)
             )
 
     def _validate_prefill_decode_interval(self):

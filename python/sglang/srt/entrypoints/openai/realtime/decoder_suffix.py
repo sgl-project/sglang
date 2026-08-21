@@ -44,12 +44,17 @@ class DecoderSuffixState(msgspec.Struct):
         tail = self.emitted_text[-max_tokens * _MAX_CHARS_PER_TOKEN :]
         token_ids = tokenizer.encode(tail, add_special_tokens=False)
         if len(token_ids) <= max_tokens:
-            return tail
-        return tokenizer.decode(
+            return (
+                _align_bounded_prefix(self.emitted_text, tail)
+                if len(tail) < len(self.emitted_text)
+                else tail
+            )
+        decoded = tokenizer.decode(
             token_ids[-max_tokens:],
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
-        ).lstrip()
+        )
+        return _align_bounded_prefix(self.emitted_text, decoded)
 
     def reconcile(
         self, decoded_suffix: str, *, is_last: bool, holdback_words: int
@@ -249,7 +254,6 @@ def _split_fused_replay(decoded_word: str, prefix_word: str) -> Optional[str]:
             decoded_word[:index]
         ) == _normalize_overlap_word(prefix_word):
             return decoded_word[index:]
-        return None
     return None
 
 
@@ -258,6 +262,21 @@ def join_text(left: str, right: str) -> str:
         return left or right
     separator = " " if needs_space(left, right) else ""
     return f"{left}{separator}{right}"
+
+
+def _align_bounded_prefix(source: str, suffix: str) -> str:
+    """Drop a leading word fragment introduced by bounded token slicing."""
+    suffix = suffix.lstrip()
+    if not suffix:
+        return ""
+    if source.endswith(suffix):
+        start = len(source) - len(suffix)
+        if start == 0 or source[start - 1].isspace():
+            return suffix
+    for index, char in enumerate(suffix):
+        if char.isspace():
+            return suffix[index:].lstrip()
+    return ""
 
 
 def _common_prefix_len(left: str, right: str) -> int:

@@ -211,13 +211,7 @@ async def generate_asr_transcript(
     )
 
     cumulative_text = ""
-    incremental = bool(
-        getattr(
-            getattr(tokenizer_manager, "server_args", None),
-            "incremental_streaming_output",
-            False,
-        )
-    )
+    incremental = tokenizer_manager.server_args.incremental_streaming_output
     try:
         ret = None
         async for ret in tokenizer_manager.generate_request(
