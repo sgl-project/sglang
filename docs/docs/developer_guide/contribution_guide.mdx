@@ -130,7 +130,7 @@ The rerun commands have the following permission rules:
 | Command | PR author | Other users | Additional rule for fork PRs |
 | --- | --- | --- | --- |
 | `/rerun-failed-ci` | Always allowed on their own PR | Must have `can_rerun_failed_ci` in `CI_PERMISSIONS.json` | None |
-| `/rerun-test`, `/rerun-group` | Automatically receives `can_rerun_test` on their own PR | Must have `can_rerun_test` or the legacy `can_rerun_stage` permission in `CI_PERMISSIONS.json` | The commenter must also have `write` or `admin` repository permission. A fork PR author already has the automatic `can_rerun_test` grant; other fork commenters need both repository permission and a configured selective-rerun permission. |
+| `/rerun-test`, `/rerun-group` | No special allowance; judged as any other commenter | Must have `cooldown_interval_minutes: 0` in `CI_PERMISSIONS.json`, or `write`/`admin` repository permission | None -- the same rule applies wherever the PR comes from |
 
 <Warning>
 Selective reruns do not build or install a PR-local `sglang-kernel` wheel. If a PR changes `python/sglang/kernels/aot/` or code that depends on that AOT change, use the normal/full PR CI workflow. A `/rerun-test` or `/rerun-group` result may use the pinned released kernel and does not validate the combined change.
