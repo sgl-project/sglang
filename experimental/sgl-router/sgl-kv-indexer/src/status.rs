@@ -27,6 +27,22 @@ pub struct IndexerStatusReport {
     pub normalized_load: f64,
     pub ready_workers: u32,
     pub total_workers: u32,
+    /// Per-stream generation/watermark makes READY auditable and prevents a
+    /// process-level heartbeat from hiding partial recovery.
+    #[serde(default)]
+    pub streams: Vec<IndexerStreamStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexerStreamStatus {
+    pub namespace: String,
+    pub worker_id: String,
+    pub dp_rank: u32,
+    pub worker_address: String,
+    pub ready: bool,
+    pub worker_epoch: String,
+    pub watermark: u64,
+    pub worker_generation: String,
 }
 
 /// Shared process state used by the gRPC query path and status reporter.
@@ -37,6 +53,7 @@ pub struct IndexerStatusHandle {
     ready: AtomicBool,
     ready_workers: AtomicUsize,
     total_workers: AtomicUsize,
+    stream_coverage: RwLock<Vec<IndexerStreamStatus>>,
 }
 
 impl IndexerStatusHandle {
@@ -50,6 +67,7 @@ impl IndexerStatusHandle {
             ready: AtomicBool::new(true),
             ready_workers: AtomicUsize::new(0),
             total_workers: AtomicUsize::new(0),
+            stream_coverage: RwLock::new(Vec::new()),
         }
     }
 
@@ -70,6 +88,15 @@ impl IndexerStatusHandle {
         self.ready.store(ready, Ordering::Release);
     }
 
+    pub fn set_stream_coverage(&self, streams: Vec<IndexerStreamStatus>) {
+        let ready_workers = streams.iter().filter(|stream| stream.ready).count();
+        self.set_coverage(ready_workers, streams.len());
+        *self
+            .stream_coverage
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = streams;
+    }
+
     pub fn report(&self, indexer_id: String, endpoint: String) -> IndexerStatusReport {
         let available = self
             .query_semaphore
@@ -83,6 +110,11 @@ impl IndexerStatusHandle {
             normalized_load: in_flight as f64 / self.query_capacity as f64,
             ready_workers: self.ready_workers.load(Ordering::Relaxed) as u32,
             total_workers: self.total_workers.load(Ordering::Relaxed) as u32,
+            streams: self
+                .stream_coverage
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone(),
         }
     }
 }
@@ -203,6 +235,28 @@ fn validate_report(report: &IndexerStatusReport) -> Result<(), StatusReportError
     if report.ready_workers > report.total_workers {
         return Err(StatusReportError::InvalidCoverage);
     }
+    if !report.streams.is_empty() {
+        let ready = report.streams.iter().filter(|stream| stream.ready).count() as u32;
+        let mut identities = std::collections::HashSet::new();
+        let invalid_stream = report.streams.iter().any(|stream| {
+            stream.worker_id.is_empty()
+                || (stream.ready
+                    && !stream.namespace.is_empty()
+                    && (stream.worker_epoch.is_empty() || stream.worker_generation.is_empty()))
+                || !identities.insert((
+                    stream.namespace.as_str(),
+                    stream.worker_id.as_str(),
+                    stream.dp_rank,
+                ))
+        });
+        if invalid_stream
+            || report.streams.len() as u32 != report.total_workers
+            || ready != report.ready_workers
+            || report.ready != (ready == report.total_workers && report.total_workers > 0)
+        {
+            return Err(StatusReportError::InvalidCoverage);
+        }
+    }
     Ok(())
 }
 
@@ -316,6 +370,7 @@ mod tests {
             normalized_load: load,
             ready_workers: usize::from(ready) as u32,
             total_workers: 1,
+            streams: Vec::new(),
         }
     }
 

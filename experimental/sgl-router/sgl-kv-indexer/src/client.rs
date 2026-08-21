@@ -40,6 +40,10 @@ pub struct PrefixMatch {
     pub matched_prefix_blocks: u32,
     /// Opaque worker id, for the caller's logs only.
     pub worker_id: String,
+    /// Canonical placement stream selected by the Indexer.
+    pub stream_id: Option<crate::pb::StreamId>,
+    /// Worker process generation used to fence the Router's load snapshot.
+    pub worker_generation: String,
 }
 
 /// A failed prefix query.
@@ -51,6 +55,9 @@ pub enum PrefixIndexError {
     Timeout,
     /// The client or Indexer shed the query because its in-flight limit was hit.
     Overloaded,
+    /// The replica answered but does not cover every Worker eligible for this
+    /// request. The caller must try another replica or ignore cache affinity.
+    PartialCoverage,
     /// The query exceeded the Indexer's gRPC message-size limit, so no worker's
     /// prefix was scanned. Bounded by prompt length, not by load: retrying the
     /// same prompt cannot succeed.
@@ -65,6 +72,7 @@ impl std::fmt::Display for PrefixIndexError {
             Self::Unreachable => f.write_str("KV Indexer is unreachable"),
             Self::Timeout => f.write_str("KV Indexer query timed out"),
             Self::Overloaded => f.write_str("KV Indexer is overloaded"),
+            Self::PartialCoverage => f.write_str("KV Indexer has partial Worker coverage"),
             Self::QueryTooLarge => {
                 f.write_str("KV Indexer query exceeded the gRPC message-size limit")
             }
@@ -135,6 +143,18 @@ pub trait PrefixIndex: Send + Sync {
     /// Queries the longest contiguous prefix each worker holds for `hashes`
     /// (prompt order, `hashes[0]` first).
     async fn match_prefix(&self, hashes: Vec<i64>) -> Result<PrefixOutcome, PrefixIndexError>;
+
+    /// Same query, restricted to the Router's currently eligible Worker set.
+    /// The result is authoritative only when the Indexer reports complete
+    /// coverage for every address.
+    async fn match_prefix_for_workers(
+        &self,
+        hashes: Vec<i64>,
+        eligible_worker_addresses: Vec<String>,
+    ) -> Result<PrefixOutcome, PrefixIndexError> {
+        let _ = eligible_worker_addresses;
+        self.match_prefix(hashes).await
+    }
 }
 
 /// tonic-backed [`PrefixIndex`] with a lazily-established connection.
@@ -207,11 +227,14 @@ impl GrpcPrefixIndex {
         &self,
         endpoint: &str,
         hashes: &[i64],
+        eligible_worker_addresses: &[String],
     ) -> Result<PrefixOutcome, PrefixIndexError> {
         let mut client = KvIndexerClient::new(self.channel_for(endpoint)?);
         let mut request = tonic::Request::new(MatchExternalKvPrefixRequest {
             hashes: hashes.to_vec(),
             max_blocks: 0,
+            eligible_worker_addresses: eligible_worker_addresses.to_vec(),
+            eligible_streams: Vec::new(),
         });
         request.set_timeout(self.deadline);
         match tokio::time::timeout(self.deadline, client.match_external_kv_prefix(request)).await {
@@ -219,6 +242,9 @@ impl GrpcPrefixIndex {
             Ok(Err(status)) => Err(classify(status.code())),
             Ok(Ok(response)) => {
                 let response = response.into_inner();
+                if !response.complete_coverage {
+                    return Err(PrefixIndexError::PartialCoverage);
+                }
                 if response.matches.is_empty() {
                     return Ok(PrefixOutcome::Empty);
                 }
@@ -229,6 +255,8 @@ impl GrpcPrefixIndex {
                         address: m.worker_address,
                         matched_prefix_blocks: m.matched_prefix_blocks,
                         worker_id: m.worker_id,
+                        stream_id: m.stream_id,
+                        worker_generation: m.worker_generation,
                     })
                     .collect();
                 Ok(PrefixOutcome::Matched {
@@ -248,7 +276,15 @@ fn truncate_prefix_query(hashes: &mut Vec<i64>) -> Option<usize> {
 
 #[tonic::async_trait]
 impl PrefixIndex for GrpcPrefixIndex {
-    async fn match_prefix(&self, mut hashes: Vec<i64>) -> Result<PrefixOutcome, PrefixIndexError> {
+    async fn match_prefix(&self, hashes: Vec<i64>) -> Result<PrefixOutcome, PrefixIndexError> {
+        self.match_prefix_for_workers(hashes, Vec::new()).await
+    }
+
+    async fn match_prefix_for_workers(
+        &self,
+        mut hashes: Vec<i64>,
+        eligible_worker_addresses: Vec<String>,
+    ) -> Result<PrefixOutcome, PrefixIndexError> {
         if hashes.is_empty() {
             return Ok(PrefixOutcome::Empty);
         }
@@ -269,12 +305,16 @@ impl PrefixIndex for GrpcPrefixIndex {
         }
         let mut last_error = PrefixIndexError::Unreachable;
         for candidate in candidates {
-            match self.query_one(&candidate.endpoint, &hashes).await {
+            match self
+                .query_one(&candidate.endpoint, &hashes, &eligible_worker_addresses)
+                .await
+            {
                 Ok(outcome) => return Ok(outcome),
                 Err(
                     error @ (PrefixIndexError::Unreachable
                     | PrefixIndexError::Timeout
-                    | PrefixIndexError::Overloaded),
+                    | PrefixIndexError::Overloaded
+                    | PrefixIndexError::PartialCoverage),
                 ) => {
                     tracing::warn!(
                         indexer_id = %candidate.indexer_id,
@@ -374,6 +414,8 @@ mod tests {
             MatchExternalKvPrefixRequest {
                 hashes,
                 max_blocks: 0,
+                eligible_worker_addresses: Vec::new(),
+                eligible_streams: Vec::new(),
             }
             .encoded_len()
                 <= MAX_GRPC_DECODING_MESSAGE_SIZE
@@ -471,6 +513,8 @@ mod tests {
                 cache_spec: None,
                 worker_epoch: String::new(),
                 enforce_sequence: false,
+                stream_id: None,
+                worker_generation: String::new(),
             })
             .await
             .unwrap();
@@ -486,6 +530,16 @@ mod tests {
                 .await
                 .unwrap();
         });
+        let partial_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let partial_addr = partial_listener.local_addr().unwrap();
+        drop(partial_listener);
+        let partial_server = tokio::spawn(async move {
+            server_builder()
+                .add_service(KvIndexerService::new(InMemoryKvIndexerBackend::new()).into_server())
+                .serve(partial_addr)
+                .await
+                .unwrap();
+        });
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         let index = GrpcPrefixIndex::new(PrefixIndexConfig {
@@ -497,12 +551,24 @@ mod tests {
         let registry = index.status_registry();
         registry
             .record(IndexerStatusReport {
+                indexer_id: "partial".into(),
+                endpoint: format!("http://{partial_addr}"),
+                ready: true,
+                normalized_load: 0.1,
+                ready_workers: 1,
+                total_workers: 1,
+                streams: Vec::new(),
+            })
+            .unwrap();
+        registry
+            .record(IndexerStatusReport {
                 indexer_id: "dead".into(),
                 endpoint: "http://127.0.0.1:1".into(),
                 ready: true,
                 normalized_load: 0.0,
                 ready_workers: 1,
                 total_workers: 1,
+                streams: Vec::new(),
             })
             .unwrap();
         registry
@@ -513,10 +579,14 @@ mod tests {
                 normalized_load: 0.5,
                 ready_workers: 1,
                 total_workers: 1,
+                streams: Vec::new(),
             })
             .unwrap();
 
-        let outcome = index.match_prefix(vec![7]).await.unwrap();
+        let outcome = index
+            .match_prefix_for_workers(vec![7], vec!["http://worker".into()])
+            .await
+            .unwrap();
         assert!(matches!(
             outcome,
             PrefixOutcome::Matched {
@@ -525,5 +595,6 @@ mod tests {
             }
         ));
         server.abort();
+        partial_server.abort();
     }
 }

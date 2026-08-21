@@ -10,17 +10,19 @@ use serde::Deserialize;
 use thiserror::Error;
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
-const REQUEST: &[u8] = b"snapshot-v1";
+const REQUEST_V1: &[u8] = b"snapshot-v1";
+const REQUEST_V2: &[u8] = b"snapshot-v2";
 const HEADER: &[u8] = b"header";
 const CHUNK: &[u8] = b"chunk";
 const END: &[u8] = b"end";
 const ERROR: &[u8] = b"error";
-const VERSION: u32 = 1;
+const VERSION_V1: u32 = 1;
+const VERSION_V2: u32 = 2;
 const MAX_RECORDS: usize = 10_000_000;
 const MAX_HASHES_PER_RECORD: usize = 65_536;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotHeader {
     pub version: u32,
     pub epoch: String,
@@ -29,6 +31,29 @@ pub struct SnapshotHeader {
     pub barrier_seq: i64,
     pub barrier_id: String,
     pub record_count: usize,
+    pub metadata: Option<SnapshotMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotMetadata {
+    pub namespace: String,
+    pub model: String,
+    pub worker_id: String,
+    pub worker_generation: String,
+    pub hash_schema_version: u32,
+    pub page_size: u32,
+    pub is_bigram: bool,
+    pub cache_spec: SnapshotCacheSpec,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct SnapshotCacheSpec {
+    pub version: u32,
+    pub components: u32,
+    pub swa_window_tokens: u32,
+    pub full_tier_mask: u32,
+    pub swa_tier_mask: u32,
+    pub mamba_tier_mask: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -37,10 +62,50 @@ pub struct SnapshotBlock {
     pub block_hashes: Vec<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SnapshotPlacement {
+    pub parent_block_hash: Option<i64>,
+    pub block_hash: i64,
+    pub tier: i32,
+    pub component_mask: u32,
+    pub block_size: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlacementSnapshot {
     pub header: SnapshotHeader,
     pub blocks: Vec<SnapshotBlock>,
+    pub placements: Vec<SnapshotPlacement>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SnapshotHeaderV1 {
+    version: u32,
+    epoch: String,
+    replica_rank: u32,
+    resume_seq: i64,
+    barrier_seq: i64,
+    barrier_id: String,
+    record_count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct SnapshotHeaderV2 {
+    version: u32,
+    namespace: String,
+    model: String,
+    worker_id: String,
+    replica_rank: u32,
+    worker_generation: String,
+    epoch: String,
+    hash_schema_version: u32,
+    page_size: u32,
+    is_bigram: bool,
+    resume_seq: i64,
+    barrier_seq: i64,
+    barrier_id: String,
+    record_count: usize,
+    cache_spec: SnapshotCacheSpec,
 }
 
 #[derive(Debug, Error)]
@@ -66,7 +131,21 @@ pub async fn fetch_snapshot(
 ) -> Result<PlacementSnapshot, SnapshotError> {
     tokio::time::timeout(
         DEFAULT_TIMEOUT,
-        fetch_snapshot_inner(endpoint, expected_rank),
+        fetch_snapshot_inner(endpoint, expected_rank, VERSION_V1),
+    )
+    .await
+    .map_err(|_| SnapshotError::Timeout {
+        endpoint: endpoint.to_owned(),
+    })?
+}
+
+pub async fn fetch_snapshot_v2(
+    endpoint: &str,
+    expected_rank: u32,
+) -> Result<PlacementSnapshot, SnapshotError> {
+    tokio::time::timeout(
+        DEFAULT_TIMEOUT,
+        fetch_snapshot_inner(endpoint, expected_rank, VERSION_V2),
     )
     .await
     .map_err(|_| SnapshotError::Timeout {
@@ -77,6 +156,7 @@ pub async fn fetch_snapshot(
 async fn fetch_snapshot_inner(
     endpoint: &str,
     expected_rank: u32,
+    requested_version: u32,
 ) -> Result<PlacementSnapshot, SnapshotError> {
     let mut socket = DealerSocket::new();
     socket
@@ -87,7 +167,11 @@ async fn fetch_snapshot_inner(
             source,
         })?;
     let mut request = ZmqMessage::from(Bytes::new());
-    request.push_back(Bytes::from_static(REQUEST));
+    request.push_back(Bytes::from_static(if requested_version == VERSION_V2 {
+        REQUEST_V2
+    } else {
+        REQUEST_V1
+    }));
     socket
         .send(request)
         .await
@@ -105,14 +189,65 @@ async fn fetch_snapshot_inner(
     if first.kind != HEADER {
         return Err(SnapshotError::Invalid("header expected".into()));
     }
-    let header: SnapshotHeader = rmp_serde::from_slice(&first.payload)?;
+    let header = if requested_version == VERSION_V2 {
+        let raw: SnapshotHeaderV2 = rmp_serde::from_slice(&first.payload)?;
+        SnapshotHeader {
+            version: raw.version,
+            epoch: raw.epoch,
+            replica_rank: raw.replica_rank,
+            resume_seq: raw.resume_seq,
+            barrier_seq: raw.barrier_seq,
+            barrier_id: raw.barrier_id,
+            record_count: raw.record_count,
+            metadata: Some(SnapshotMetadata {
+                namespace: raw.namespace,
+                model: raw.model,
+                worker_id: raw.worker_id,
+                worker_generation: raw.worker_generation,
+                hash_schema_version: raw.hash_schema_version,
+                page_size: raw.page_size,
+                is_bigram: raw.is_bigram,
+                cache_spec: raw.cache_spec,
+            }),
+        }
+    } else {
+        let raw: SnapshotHeaderV1 = rmp_serde::from_slice(&first.payload)?;
+        SnapshotHeader {
+            version: raw.version,
+            epoch: raw.epoch,
+            replica_rank: raw.replica_rank,
+            resume_seq: raw.resume_seq,
+            barrier_seq: raw.barrier_seq,
+            barrier_id: raw.barrier_id,
+            record_count: raw.record_count,
+            metadata: None,
+        }
+    };
     validate_header(&header, expected_rank)?;
 
     let mut blocks = Vec::with_capacity(header.record_count.min(MAX_RECORDS));
+    let mut placements = Vec::with_capacity(header.record_count.min(MAX_RECORDS));
     loop {
         let reply = recv(&mut socket, endpoint).await?;
         match reply.kind.as_slice() {
             CHUNK => {
+                if requested_version == VERSION_V2 {
+                    let chunk: Vec<SnapshotPlacement> = rmp_serde::from_slice(&reply.payload)?;
+                    if placements.len().saturating_add(chunk.len()) > MAX_RECORDS {
+                        return Err(SnapshotError::Invalid("too many snapshot records".into()));
+                    }
+                    if chunk.iter().any(|record| {
+                        !(1..=3).contains(&record.tier)
+                            || record.component_mask == 0
+                            || record.block_size == 0
+                    }) {
+                        return Err(SnapshotError::Invalid(
+                            "invalid snapshot v2 placement".into(),
+                        ));
+                    }
+                    placements.extend(chunk);
+                    continue;
+                }
                 let chunk: Vec<SnapshotBlock> = rmp_serde::from_slice(&reply.payload)?;
                 if blocks.len().saturating_add(chunk.len()) > MAX_RECORDS {
                     return Err(SnapshotError::Invalid("too many snapshot records".into()));
@@ -143,18 +278,26 @@ async fn fetch_snapshot_inner(
             _ => return Err(SnapshotError::Invalid("unexpected snapshot frame".into())),
         }
     }
-    if blocks.len() != header.record_count {
+    let received = if requested_version == VERSION_V2 {
+        placements.len()
+    } else {
+        blocks.len()
+    };
+    if received != header.record_count {
         return Err(SnapshotError::Invalid(format!(
             "snapshot declared {} records but sent {}",
-            header.record_count,
-            blocks.len()
+            header.record_count, received
         )));
     }
-    Ok(PlacementSnapshot { header, blocks })
+    Ok(PlacementSnapshot {
+        header,
+        blocks,
+        placements,
+    })
 }
 
 fn validate_header(header: &SnapshotHeader, expected_rank: u32) -> Result<(), SnapshotError> {
-    if header.version != VERSION {
+    if !matches!(header.version, VERSION_V1 | VERSION_V2) {
         return Err(SnapshotError::Invalid(format!(
             "unsupported snapshot version {}",
             header.version
@@ -178,6 +321,24 @@ fn validate_header(header: &SnapshotHeader, expected_rank: u32) -> Result<(), Sn
         return Err(SnapshotError::Invalid(
             "snapshot record cap exceeded".into(),
         ));
+    }
+    if header.version == VERSION_V2 {
+        let metadata = header
+            .metadata
+            .as_ref()
+            .ok_or_else(|| SnapshotError::Invalid("snapshot v2 metadata missing".into()))?;
+        if metadata.namespace.is_empty()
+            || metadata.model.is_empty()
+            || metadata.worker_id.is_empty()
+            || metadata.worker_generation.is_empty()
+            || metadata.hash_schema_version == 0
+            || metadata.page_size == 0
+            || metadata.cache_spec.components == 0
+        {
+            return Err(SnapshotError::Invalid(
+                "snapshot v2 metadata is incomplete".into(),
+            ));
+        }
     }
     Ok(())
 }

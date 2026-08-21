@@ -48,11 +48,13 @@ async fn configure_replica(endpoint: &str, suffix: &str) {
                     worker_id: "w1".into(),
                     worker_address: format!("http://w1-{suffix}"),
                     cache_spec: None,
+                    ..Default::default()
                 },
                 ExpectedWorker {
                     worker_id: "w2".into(),
                     worker_address: format!("http://w2-{suffix}"),
                     cache_spec: None,
+                    ..Default::default()
                 },
             ],
         })
@@ -72,6 +74,8 @@ async fn configure_replica(endpoint: &str, suffix: &str) {
                     block_sizes: Vec::new(),
                 }],
                 cache_spec: None,
+                stream_id: None,
+                worker_generation: String::new(),
             })
             .await
             .unwrap();
@@ -86,6 +90,7 @@ fn report(id: &str, endpoint: &str, load: f64, ready: bool) -> IndexerStatusRepo
         normalized_load: load,
         ready_workers: if ready { 2 } else { 0 },
         total_workers: 2,
+        streams: Vec::new(),
     }
 }
 

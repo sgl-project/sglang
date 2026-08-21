@@ -426,8 +426,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self.components_by_type.values()
         )
 
+        self._emit_component_placement = (
+            params.enable_kv_cache_events and len(self.component_types) > 1
+        )
         self.kv_events = KVCacheEventRecorder(
-            enabled=params.enable_kv_cache_events, page_size=self.page_size
+            enabled=params.enable_kv_cache_events,
+            page_size=self.page_size,
+            component_types_for_page=self._component_types_for_page,
         )
 
         self.reset()
@@ -1253,6 +1258,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         for node in reversed(chain):
             self._record_store_event(node, medium=medium)
 
+    def _record_store_event(
+        self, node: UnifiedTreeNode, medium: StorageMedium = StorageMedium.GPU
+    ) -> None:
+        self.kv_events.record_store(node, medium=medium)
+
     def _restate_component_placement(
         self, node: UnifiedTreeNode, medium: StorageMedium
     ) -> None:
@@ -1300,7 +1310,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
-        self.kv_events.record_store(new_node)
+        if self._emit_component_placement:
+            self._note_insert_store_node(new_node)
+        else:
+            self._record_store_event(new_node)
         return new_node
 
     def _unevict_node_on_insert(
@@ -1319,7 +1332,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_duplicate_tracking(node)
         if node.parent is not None:
             self._update_evictable_leaf_sets(node.parent)
-        self.kv_events.record_store(node, medium=StorageMedium.GPU)
+        if self._emit_component_placement:
+            self._note_insert_store_node(node)
+        else:
+            self._record_store_event(node, medium=StorageMedium.GPU)
 
     def _update_evictable_leaf_sets(self, node: UnifiedTreeNode) -> None:
         """Update both device and host leaf sets for a node."""
@@ -2160,8 +2176,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             [kv_xfer],
             cache_actions=cache_actions,
         )
-        for nid in kv_xfer.nodes_to_load or ():
-            self.kv_events.record_store(self.node_by_id(nid), medium=StorageMedium.GPU)
         for ct, xfers in comp_xfers.items():
             self.components_by_type[ct].commit_hicache_transfer(
                 node,
@@ -2220,7 +2234,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 node.write_through_pending_id = None
                 # The backed-up copy becomes a tracked duplicate only now.
                 self._update_duplicate_tracking(node)
-            self.kv_events.record_store(node, medium=StorageMedium.CPU)
+            self._record_store_event(node, medium=StorageMedium.CPU)
 
     def set_component_device_value(
         self, node_id: NodeId, component_type: ComponentType, value: torch.Tensor

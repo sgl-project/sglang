@@ -15,30 +15,73 @@ use zeromq::{Socket, SocketRecv, SubSocket};
 use crate::bridge::{build_apply_request, decode_event_batch, BridgeConfig, BridgeError};
 use crate::pb::kv_indexer_client::KvIndexerClient;
 use crate::pb::{
-    ConfigureExpectedWorkersRequest, ExpectedWorker, InvalidateWorkerRequest,
-    ReplaceExternalKvSnapshotRequest, TierHashes, TierType,
+    AbortExternalKvSnapshotRequest, AppendExternalKvSnapshotRequest,
+    BeginExternalKvSnapshotRequest, CommitExternalKvSnapshotRequest,
+    ConfigureExpectedWorkersRequest, ExpectedWorker, ExternalKvSnapshotMetadata,
+    ExternalKvSnapshotPlacement, InvalidateWorkerRequest, ReplaceExternalKvSnapshotRequest,
+    StreamId, TierHashes, TierType, WorkerCacheSpec,
 };
+use crate::replay::fetch_replay;
 use crate::service::{MAX_ACTIONS_PER_BATCH, MAX_HASHES_PER_REQUEST};
-use crate::snapshot::fetch_snapshot;
+use crate::snapshot::{fetch_snapshot, fetch_snapshot_v2, PlacementSnapshot, SnapshotMetadata};
 
 const RECONNECT_BASE: Duration = Duration::from_millis(100);
 const RECONNECT_CAP: Duration = Duration::from_secs(2);
 const SUBSCRIPTION_SETTLE: Duration = Duration::from_millis(50);
 const BARRIER_TIMEOUT: Duration = Duration::from_secs(5);
 const INDEXER_EPOCH_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const SNAPSHOT_APPEND_PLACEMENTS: usize = 16_384;
 const EPOCH_MARKER: &[u8] = b"\x00sgl-kv-epoch=";
 const BARRIER_MARKER: &[u8] = b"\x00sgl-kv-snapshot=";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BridgeWorkerConfig {
+    #[serde(default)]
+    pub namespace: String,
     pub worker_id: String,
     pub worker_address: String,
     pub event_endpoint: String,
     pub snapshot_endpoint: String,
+    #[serde(default = "default_snapshot_protocol_version")]
+    pub snapshot_protocol_version: u32,
+    #[serde(default)]
+    pub replay_endpoint: Option<String>,
     #[serde(default)]
     pub event_topic: String,
     #[serde(default)]
     pub dp_rank: u32,
+    #[serde(default = "default_hash_schema_version")]
+    pub hash_schema_version: u32,
+    #[serde(default = "default_page_size")]
+    pub page_size: u32,
+    #[serde(default)]
+    pub is_bigram: bool,
+    #[serde(default = "default_model")]
+    pub model: String,
+}
+
+fn default_hash_schema_version() -> u32 {
+    1
+}
+
+fn default_snapshot_protocol_version() -> u32 {
+    2
+}
+
+fn default_page_size() -> u32 {
+    1
+}
+
+fn default_model() -> String {
+    "unknown".into()
+}
+
+fn stream_id(worker: &BridgeWorkerConfig) -> StreamId {
+    StreamId {
+        namespace: worker.namespace.clone(),
+        worker_id: worker.worker_id.clone(),
+        dp_rank: worker.dp_rank,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -75,11 +118,20 @@ impl BridgeFleetConfig {
                         .into(),
                 ));
             }
-            if !ids.insert(worker.worker_id.as_str()) {
+            if !ids.insert((
+                worker.namespace.as_str(),
+                worker.worker_id.as_str(),
+                worker.dp_rank,
+            )) {
                 return Err(BridgeError::Config(format!(
-                    "duplicate worker_id {}",
-                    worker.worker_id
+                    "duplicate stream {}/{}/{}",
+                    worker.namespace, worker.worker_id, worker.dp_rank
                 )));
+            }
+            if !matches!(worker.snapshot_protocol_version, 1 | 2) {
+                return Err(BridgeError::Config(
+                    "snapshot_protocol_version must be 1 or 2".into(),
+                ));
             }
         }
         Ok(Some(Self {
@@ -146,7 +198,7 @@ async fn supervise_worker(
                 continue;
             }
         };
-        if let Err(error) = invalidate_worker(&indexer_endpoint, &worker.worker_id).await {
+        if let Err(error) = invalidate_worker(&indexer_endpoint, &worker).await {
             if error.is_permanent() {
                 return Err(error);
             }
@@ -174,11 +226,15 @@ async fn supervise_worker(
     }
 }
 
-async fn invalidate_worker(indexer_endpoint: &str, worker_id: &str) -> Result<(), BridgeError> {
+async fn invalidate_worker(
+    indexer_endpoint: &str,
+    worker: &BridgeWorkerConfig,
+) -> Result<(), BridgeError> {
     let mut client = connect_indexer(indexer_endpoint).await?;
     client
         .invalidate_worker(InvalidateWorkerRequest {
-            worker_id: worker_id.to_owned(),
+            worker_id: worker.worker_id.clone(),
+            stream_id: Some(stream_id(worker)),
         })
         .await
         .map_err(super::bridge::classify_rpc)?;
@@ -198,12 +254,180 @@ async fn configure_worker_list(
                     worker_id: worker.worker_id.clone(),
                     worker_address: worker.worker_address.clone(),
                     cache_spec: None,
+                    stream_id: Some(stream_id(worker)),
+                    worker_generation: String::new(),
+                    model: worker.model.clone(),
+                    hash_schema_version: worker.hash_schema_version,
+                    page_size: worker.page_size,
+                    is_bigram: worker.is_bigram,
                 })
                 .collect(),
         })
         .await
         .map_err(super::bridge::classify_rpc)?;
     Ok(response.into_inner().indexer_epoch)
+}
+
+fn wire_cache_spec(metadata: &SnapshotMetadata) -> WorkerCacheSpec {
+    WorkerCacheSpec {
+        version: metadata.cache_spec.version,
+        components: metadata.cache_spec.components,
+        swa_window_tokens: metadata.cache_spec.swa_window_tokens,
+        full_tier_mask: metadata.cache_spec.full_tier_mask,
+        swa_tier_mask: metadata.cache_spec.swa_tier_mask,
+        mamba_tier_mask: metadata.cache_spec.mamba_tier_mask,
+    }
+}
+
+fn validate_snapshot_identity(
+    worker: &BridgeWorkerConfig,
+    snapshot: &PlacementSnapshot,
+) -> Result<(String, Option<WorkerCacheSpec>), BridgeError> {
+    let Some(metadata) = snapshot.header.metadata.as_ref() else {
+        if worker.snapshot_protocol_version != 1 {
+            return Err(BridgeError::Decode(
+                "snapshot v2 response did not include v2 metadata".into(),
+            ));
+        }
+        return Ok((String::new(), None));
+    };
+    if metadata.namespace != worker.namespace
+        || metadata.worker_id != worker.worker_id
+        || metadata.model != worker.model
+        || metadata.hash_schema_version != worker.hash_schema_version
+        || metadata.page_size != worker.page_size
+        || metadata.is_bigram != worker.is_bigram
+    {
+        return Err(BridgeError::Decode(
+            "snapshot v2 identity/schema does not match Bridge configuration".into(),
+        ));
+    }
+    Ok((
+        metadata.worker_generation.clone(),
+        Some(wire_cache_spec(metadata)),
+    ))
+}
+
+async fn install_snapshot(
+    client: &mut KvIndexerClient<Channel>,
+    worker: &BridgeWorkerConfig,
+    snapshot: &PlacementSnapshot,
+) -> Result<(String, Option<WorkerCacheSpec>), BridgeError> {
+    let (worker_generation, cache_spec) = validate_snapshot_identity(worker, snapshot)?;
+    if let Some(metadata) = snapshot.header.metadata.as_ref() {
+        let begin = client
+            .begin_external_kv_snapshot(BeginExternalKvSnapshotRequest {
+                stream_id: Some(stream_id(worker)),
+                worker_address: worker.worker_address.clone(),
+                worker_epoch: snapshot.header.epoch.clone(),
+                applied_seq: snapshot.header.barrier_seq as u64,
+                cache_spec,
+                metadata: Some(ExternalKvSnapshotMetadata {
+                    model: metadata.model.clone(),
+                    worker_generation: metadata.worker_generation.clone(),
+                    hash_schema_version: metadata.hash_schema_version,
+                    page_size: metadata.page_size,
+                    is_bigram: metadata.is_bigram,
+                }),
+                snapshot_id: snapshot.header.barrier_id.clone(),
+                expected_placements: snapshot.placements.len() as u64,
+            })
+            .await
+            .map_err(super::bridge::classify_rpc)?
+            .into_inner();
+        for chunk in snapshot.placements.chunks(SNAPSHOT_APPEND_PLACEMENTS) {
+            let append = client
+                .append_external_kv_snapshot(AppendExternalKvSnapshotRequest {
+                    transaction_id: begin.transaction_id.clone(),
+                    placements: chunk
+                        .iter()
+                        .map(|placement| ExternalKvSnapshotPlacement {
+                            block_hash: placement.block_hash,
+                            parent_block_hash: placement.parent_block_hash,
+                            tier: placement.tier,
+                            component_mask: placement.component_mask,
+                            block_size: placement.block_size,
+                        })
+                        .collect(),
+                })
+                .await;
+            if let Err(error) = append {
+                let _ = client
+                    .abort_external_kv_snapshot(AbortExternalKvSnapshotRequest {
+                        transaction_id: begin.transaction_id,
+                    })
+                    .await;
+                return Err(super::bridge::classify_rpc(error));
+            }
+        }
+        client
+            .commit_external_kv_snapshot(CommitExternalKvSnapshotRequest {
+                transaction_id: begin.transaction_id,
+            })
+            .await
+            .map_err(super::bridge::classify_rpc)?;
+        return Ok((worker_generation, Some(wire_cache_spec(metadata))));
+    }
+
+    let mut hashes = Vec::with_capacity(snapshot.blocks.len());
+    for block in &snapshot.blocks {
+        hashes.extend(&block.block_hashes);
+    }
+    client
+        .replace_external_kv_snapshot(ReplaceExternalKvSnapshotRequest {
+            worker_id: worker.worker_id.clone(),
+            worker_address: worker.worker_address.clone(),
+            worker_epoch: snapshot.header.epoch.clone(),
+            applied_seq: snapshot.header.barrier_seq as u64,
+            hashes_by_tier: if hashes.is_empty() {
+                Vec::new()
+            } else {
+                vec![TierHashes {
+                    tier: TierType::TierHbm as i32,
+                    component_masks: Vec::new(),
+                    block_sizes: Vec::new(),
+                    hashes,
+                }]
+            },
+            cache_spec: None,
+            stream_id: Some(stream_id(worker)),
+            worker_generation: String::new(),
+        })
+        .await
+        .map_err(super::bridge::classify_rpc)?;
+    Ok((worker_generation, cache_spec))
+}
+
+async fn apply_live_payload(
+    client: &mut KvIndexerClient<Channel>,
+    bridge_config: &BridgeConfig,
+    worker: &BridgeWorkerConfig,
+    epoch: &str,
+    worker_generation: &str,
+    seq: u64,
+    payload: &[u8],
+) -> Result<(), BridgeError> {
+    let actions = decode_event_batch(payload)?;
+    let mut request = build_apply_request(bridge_config, seq, actions);
+    let total_hashes: usize = request
+        .actions
+        .iter()
+        .map(|action| action.hashes.len())
+        .sum();
+    if request.actions.len() > MAX_ACTIONS_PER_BATCH || total_hashes > MAX_HASHES_PER_REQUEST {
+        return Err(BridgeError::Decode(
+            "recovery-aware event batch exceeds one atomic apply request".into(),
+        ));
+    }
+    request.worker_epoch = epoch.to_owned();
+    request.enforce_sequence = true;
+    request.stream_id = Some(stream_id(worker));
+    request.worker_generation = worker_generation.to_owned();
+    client
+        .apply_external_kv_batch(request)
+        .await
+        .map_err(super::bridge::classify_rpc)?;
+    Ok(())
 }
 
 async fn recover_and_stream(
@@ -220,9 +444,12 @@ async fn recover_and_stream(
     // handshake a bounded head start before asking the worker to emit a barrier.
     tokio::time::sleep(SUBSCRIPTION_SETTLE).await;
 
-    let snapshot = fetch_snapshot(&worker.snapshot_endpoint, worker.dp_rank)
-        .await
-        .map_err(|error| BridgeError::Decode(error.to_string()))?;
+    let snapshot = if worker.snapshot_protocol_version == 2 {
+        fetch_snapshot_v2(&worker.snapshot_endpoint, worker.dp_rank).await
+    } else {
+        fetch_snapshot(&worker.snapshot_endpoint, worker.dp_rank).await
+    }
+    .map_err(|error| BridgeError::Decode(error.to_string()))?;
     let epoch = snapshot.header.epoch.clone();
     let barrier_seq = snapshot.header.barrier_seq as u64;
     let barrier_id = snapshot.header.barrier_id.clone();
@@ -250,32 +477,8 @@ async fn recover_and_stream(
     .await
     .map_err(|_| BridgeError::Decode("timed out waiting for snapshot barrier".into()))??;
 
-    let mut hashes = Vec::with_capacity(snapshot.blocks.len());
-    for block in snapshot.blocks {
-        hashes.extend(block.block_hashes);
-    }
-    client
-        .replace_external_kv_snapshot(ReplaceExternalKvSnapshotRequest {
-            worker_id: worker.worker_id.clone(),
-            worker_address: worker.worker_address.clone(),
-            worker_epoch: epoch.clone(),
-            applied_seq: barrier_seq,
-            hashes_by_tier: if hashes.is_empty() {
-                Vec::new()
-            } else {
-                vec![TierHashes {
-                    tier: TierType::TierHbm as i32,
-                    // snapshot-v1 carries no component metadata; an empty side
-                    // array preserves the legacy whole-block semantics.
-                    component_masks: Vec::new(),
-                    block_sizes: Vec::new(),
-                    hashes,
-                }]
-            },
-            cache_spec: None,
-        })
-        .await
-        .map_err(super::bridge::classify_rpc)?;
+    let (worker_generation, recovered_cache_spec) =
+        install_snapshot(&mut client, worker, &snapshot).await?;
     info!(worker_id = %worker.worker_id, epoch = %epoch, barrier_seq, "worker snapshot installed; stream READY");
 
     let bridge_config = BridgeConfig {
@@ -289,7 +492,7 @@ async fn recover_and_stream(
             TierType::TierDram as i32,
             TierType::TierSsd as i32,
         ],
-        cache_spec: None,
+        cache_spec: recovered_cache_spec,
     };
     let mut expected = barrier_seq.saturating_add(1);
     let mut epoch_check = tokio::time::interval(INDEXER_EPOCH_CHECK_INTERVAL);
@@ -310,30 +513,43 @@ async fn recover_and_stream(
         if frame.epoch.as_deref() != Some(epoch.as_str()) {
             return Err(BridgeError::Decode("worker epoch changed".into()));
         }
-        if frame.seq != expected {
-            return Err(BridgeError::Decode(format!(
-                "event sequence gap: expected {expected}, got {}",
-                frame.seq
-            )));
+        if frame.seq < expected {
+            continue;
         }
-        let actions = decode_event_batch(&frame.payload)?;
-        let mut request = build_apply_request(&bridge_config, frame.seq, actions);
-        let total_hashes: usize = request
-            .actions
-            .iter()
-            .map(|action| action.hashes.len())
-            .sum();
-        if request.actions.len() > MAX_ACTIONS_PER_BATCH || total_hashes > MAX_HASHES_PER_REQUEST {
-            return Err(BridgeError::Decode(
-                "recovery-aware event batch exceeds one atomic apply request".into(),
-            ));
+        if frame.seq > expected {
+            let replay_endpoint = worker.replay_endpoint.as_deref().ok_or_else(|| {
+                BridgeError::Decode(format!(
+                    "event sequence gap: expected {expected}, got {}; replay endpoint unavailable",
+                    frame.seq
+                ))
+            })?;
+            let replayed = fetch_replay(replay_endpoint, &epoch, expected, frame.seq)
+                .await
+                .map_err(|error| BridgeError::Decode(error.to_string()))?;
+            for batch in replayed {
+                apply_live_payload(
+                    &mut client,
+                    &bridge_config,
+                    worker,
+                    &epoch,
+                    &worker_generation,
+                    batch.seq,
+                    &batch.payload,
+                )
+                .await?;
+                expected = expected.saturating_add(1);
+            }
         }
-        request.worker_epoch = epoch.clone();
-        request.enforce_sequence = true;
-        client
-            .apply_external_kv_batch(request)
-            .await
-            .map_err(super::bridge::classify_rpc)?;
+        apply_live_payload(
+            &mut client,
+            &bridge_config,
+            worker,
+            &epoch,
+            &worker_generation,
+            frame.seq,
+            &frame.payload,
+        )
+        .await?;
         expected = expected.saturating_add(1);
     }
 }
@@ -432,6 +648,23 @@ mod tests {
         ]))
     }
 
+    fn stored_component_batch(hash: i64) -> Vec<u8> {
+        encode_value(&Value::Array(vec![
+            Value::from(1.0_f64),
+            Value::Array(vec![Value::Array(vec![
+                Value::String("BlockStored".into()),
+                Value::Array(vec![Value::from(hash)]),
+                Value::Nil,
+                Value::Array(Vec::new()),
+                Value::from(1),
+                Value::Nil,
+                Value::String("GPU".into()),
+                Value::Array(vec![Value::String("full".into())]),
+            ])]),
+            Value::from(0),
+        ]))
+    }
+
     async fn send_pub(pub_socket: &mut PubSocket, topic: &[u8], seq: u64, payload: Vec<u8>) {
         let mut message = ZmqMessage::from(Bytes::copy_from_slice(topic));
         message.push_back(Bytes::copy_from_slice(&seq.to_be_bytes()));
@@ -448,6 +681,21 @@ mod tests {
         let mut reply = ZmqMessage::from(identity);
         reply.push_back(Bytes::new());
         reply.push_back(Bytes::from_static(kind));
+        reply.push_back(Bytes::from(payload));
+        router.send(reply).await.unwrap();
+    }
+
+    async fn send_replay_reply(
+        router: &mut RouterSocket,
+        identity: Bytes,
+        epoch: &'static [u8],
+        seq: i64,
+        payload: Vec<u8>,
+    ) {
+        let mut reply = ZmqMessage::from(identity);
+        reply.push_back(Bytes::new());
+        reply.push_back(Bytes::from_static(epoch));
+        reply.push_back(Bytes::copy_from_slice(&seq.to_be_bytes()));
         reply.push_back(Bytes::from(payload));
         router.send(reply).await.unwrap();
     }
@@ -480,6 +728,8 @@ mod tests {
                 .match_external_kv_prefix(MatchExternalKvPrefixRequest {
                     hashes: hashes.clone(),
                     max_blocks: 0,
+                    eligible_worker_addresses: Vec::new(),
+                    eligible_streams: Vec::new(),
                 })
                 .await
                 .unwrap()
@@ -507,6 +757,12 @@ mod tests {
             Endpoint::Tcp(_, port) => port,
             other => panic!("unexpected endpoint: {other:?}"),
         };
+        let mut replay_router = RouterSocket::new();
+        let replay_endpoint = replay_router.bind("tcp://127.0.0.1:0").await.unwrap();
+        let replay_port = match replay_endpoint {
+            Endpoint::Tcp(_, port) => port,
+            other => panic!("unexpected endpoint: {other:?}"),
+        };
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let indexer_addr = listener.local_addr().unwrap();
@@ -521,14 +777,32 @@ mod tests {
                 &mut snapshot_router,
                 identity.clone(),
                 b"header",
-                rmp_serde::to_vec(&(1_u32, "e1", 0_u32, 1_i64, 0_i64, "b1", 1_usize)).unwrap(),
+                rmp_serde::to_vec(&(
+                    2_u32,
+                    "ns",
+                    "model",
+                    "w1",
+                    0_u32,
+                    "generation-1",
+                    "e1",
+                    1_u32,
+                    1_u32,
+                    false,
+                    1_i64,
+                    0_i64,
+                    "b1",
+                    1_usize,
+                    (1_u32, 1_u32, 0_u32, 6_u32, 2_u32, 6_u32),
+                ))
+                .unwrap(),
             )
             .await;
             send_snapshot_reply(
                 &mut snapshot_router,
                 identity.clone(),
                 b"chunk",
-                rmp_serde::to_vec(&vec![(Option::<i64>::None, vec![1_i64])]).unwrap(),
+                rmp_serde::to_vec(&vec![(Option::<i64>::None, 1_i64, 1_i32, 1_u32, 1_u32)])
+                    .unwrap(),
             )
             .await;
             send_snapshot_reply(&mut snapshot_router, identity, b"end", Vec::new()).await;
@@ -536,7 +810,26 @@ mod tests {
             let barrier_topic = b"kv\0sgl-kv-epoch=e1\0sgl-kv-snapshot=b1";
             send_pub(&mut publisher, barrier_topic, 0, Vec::new()).await;
             tokio::time::sleep(Duration::from_millis(100)).await;
-            send_pub(&mut publisher, b"kv\0sgl-kv-epoch=e1", 1, stored_batch(2)).await;
+            // Skip seq=1 on Live. The Bridge must obtain it from replay-v2
+            // before applying the visible seq=2 batch.
+            send_pub(
+                &mut publisher,
+                b"kv\0sgl-kv-epoch=e1",
+                2,
+                stored_component_batch(3),
+            )
+            .await;
+            let replay = replay_router.recv().await.unwrap();
+            let identity = replay.get(0).unwrap().clone();
+            send_replay_reply(
+                &mut replay_router,
+                identity.clone(),
+                b"e1",
+                1,
+                stored_component_batch(2),
+            )
+            .await;
+            send_replay_reply(&mut replay_router, identity, b"e1", -1, Vec::new()).await;
         });
 
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
@@ -544,12 +837,19 @@ mod tests {
             BridgeFleetConfig {
                 indexer_endpoint: format!("http://{indexer_addr}"),
                 workers: vec![BridgeWorkerConfig {
+                    namespace: "ns".into(),
                     worker_id: "w1".into(),
                     worker_address: "http://w1".into(),
                     event_endpoint: format!("tcp://127.0.0.1:{pub_port}"),
                     snapshot_endpoint: format!("tcp://127.0.0.1:{snapshot_port}"),
+                    snapshot_protocol_version: 2,
+                    replay_endpoint: Some(format!("tcp://127.0.0.1:{replay_port}")),
                     event_topic: "kv".into(),
                     dp_rank: 0,
+                    hash_schema_version: 1,
+                    page_size: 1,
+                    is_bigram: false,
+                    model: "model".into(),
                 }],
             },
             async {
@@ -558,7 +858,7 @@ mod tests {
         ));
 
         let mut client = connect_indexer_client(indexer_addr).await;
-        wait_for_prefix(&mut client, vec![1, 2]).await;
+        wait_for_prefix(&mut client, vec![1, 2, 3]).await;
 
         let _ = stop_tx.send(());
         fleet.await.unwrap().unwrap();
@@ -647,12 +947,19 @@ mod tests {
             BridgeFleetConfig {
                 indexer_endpoint: format!("http://{indexer_addr}"),
                 workers: vec![BridgeWorkerConfig {
+                    namespace: String::new(),
                     worker_id: "w1".into(),
                     worker_address: "http://w1".into(),
                     event_endpoint: format!("tcp://127.0.0.1:{pub_port}"),
                     snapshot_endpoint: format!("tcp://127.0.0.1:{snapshot_port}"),
+                    snapshot_protocol_version: 1,
+                    replay_endpoint: None,
                     event_topic: "kv".into(),
                     dp_rank: 0,
+                    hash_schema_version: 1,
+                    page_size: 1,
+                    is_bigram: false,
+                    model: "unknown".into(),
                 }],
             },
             async {
