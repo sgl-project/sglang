@@ -46,6 +46,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
+from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.tensor_bridge import use_mlx
 
 if TYPE_CHECKING:
@@ -59,6 +60,9 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import HiCacheDraftPlan
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+_is_npu = is_npu()
+_is_hip = is_hip()
 
 
 def maybe_register_hicache_draft(
@@ -201,6 +205,27 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     return backend
 
 
+def _validate_decode_radix_dsv4_platform(
+    *, is_npu_platform: bool, is_hip_platform: bool
+) -> None:
+    # CUDA needs no DSA-specific tree code: c4/c128/indexer rows derive
+    # positionally from the virtual full-id space (full_id // ratio), so the
+    # [FULL, SWA] components already keep every compressed pool coherent.
+    if is_npu_platform:
+        raise ValueError(
+            "--disaggregation-decode-enable-radix-cache does not support "
+            "DeepSeek-V4 (DSA) on NPU: the c4/c128 allocators and the "
+            "tree-level C128 sidecar are not wired for the decode-radix "
+            "lock path."
+        )
+    if is_hip_platform:
+        raise ValueError(
+            "--disaggregation-decode-enable-radix-cache does not support "
+            "DeepSeek-V4 (DSA) on HIP: the unified-kv SWA ring is "
+            "per-request and not content-stable for prefix reuse."
+        )
+
+
 def build_kv_cache(
     *,
     server_args: ServerArgs,
@@ -282,10 +307,9 @@ def build_kv_cache(
                     "device-resident cache and is incompatible with "
                     "--enable-hierarchical-cache."
                 )
-            if getattr(model_config, "is_deepseek_v4_arch", False):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache does not support "
-                    "DeepSeek-V4 (DSA) compressed KV (c4/c128/indexer) yet."
+            if model_config.is_deepseek_v4_arch:
+                _validate_decode_radix_dsv4_platform(
+                    is_npu_platform=_is_npu, is_hip_platform=_is_hip
                 )
             if getattr(model_config, "is_hybrid_swa_compress", False):
                 raise ValueError(

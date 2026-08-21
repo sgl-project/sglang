@@ -50,6 +50,16 @@ class DisaggregationDecodeRadixCacheTestMixin:
     transfer_backend_name = None
     model_name = DEFAULT_MODEL_NAME_FOR_TEST
     gsm8k_min_score = 0.80
+    # SWA hybrids cap prefix reuse at one window+page before the prompt end;
+    # window < page geometries (DSV4: 128 vs 256) reuse nothing below
+    # window + page tokens, so subclasses raise request_length accordingly.
+    cache_hit_request_length = 384
+    cache_hit_output_length = 64
+    two_pass_max_tokens = 512
+    two_pass_num_examples = 500
+    two_pass_num_shots = 6
+    two_pass_num_threads = 100
+    two_pass_max_accuracy_drop = 0.03
 
     @classmethod
     def setUpClass(cls):
@@ -82,9 +92,11 @@ class DisaggregationDecodeRadixCacheTestMixin:
             model_path=self.model,
             num_clients=4,
             num_rounds=3,
-            request_length=384,
-            output_length=64,
+            request_length=self.cache_hit_request_length,
+            output_length=self.cache_hit_output_length,
             max_parallel=4,
+            # The router's /server_info hides the backend page size.
+            page_size=decode_info.get("page_size", 1),
         )
         self.assertGreater(
             result["overall"]["total_cached_tokens"],
@@ -107,10 +119,10 @@ class DisaggregationDecodeRadixCacheTestMixin:
             model=self.model,
             eval_name="gsm8k",
             api="completion",
-            max_tokens=512,
-            num_examples=500,
-            num_threads=100,
-            num_shots=6,
+            max_tokens=self.two_pass_max_tokens,
+            num_examples=self.two_pass_num_examples,
+            num_threads=self.two_pass_num_threads,
+            num_shots=self.two_pass_num_shots,
         )
 
         metrics_first = run_eval(args)
@@ -125,10 +137,10 @@ class DisaggregationDecodeRadixCacheTestMixin:
         accuracy_drop = metrics_first["score"] - metrics_second["score"]
         self.assertLessEqual(
             accuracy_drop,
-            0.03,
+            self.two_pass_max_accuracy_drop,
             f"Second run accuracy dropped by {accuracy_drop:.4f} "
             f"(first={metrics_first['score']:.4f}, second={metrics_second['score']:.4f}), "
-            f"exceeds 3% threshold",
+            f"exceeds {self.two_pass_max_accuracy_drop:.0%} threshold",
         )
 
 

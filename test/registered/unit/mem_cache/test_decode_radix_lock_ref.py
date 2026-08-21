@@ -112,6 +112,51 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         radix_key_len = (895 // 64) * 64
         self.assertGreaterEqual(radix_key_len - swa_start, 127)
 
+    def test_swa_tail_len_dsv4_page256_window128_cap_is_compress_group_aligned(self):
+        # DSV4 geometry: window 128 < page 256. The radix prefix cap must stay
+        # page-aligned (256 is a multiple of the c4/c128 compress ratios 4 and
+        # 128), so a reused prefix boundary never splits a compressed block.
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
+        queue.scheduler = SimpleNamespace(
+            sliding_window_size=128,
+            server_args=SimpleNamespace(disaggregation_decode_enable_radix_cache=True),
+        )
+        queue.token_to_kv_pool_allocator = MagicMock(page_size=256)
+
+        for fill_len in (
+            256,
+            512,
+            513,
+            640,
+            767,
+            768,
+            1024,
+            1025,
+            1279,
+            1280,
+            2049,
+            2200,
+        ):
+            with self.subTest(fill_len=fill_len):
+                tail_len = queue._swa_tail_len(fill_len)
+                cap = fill_len - tail_len
+
+                self.assertEqual(cap % 256, 0)
+                self.assertEqual(cap % 128, 0)
+                self.assertEqual(cap % 4, 0)
+
+                # A complete window stays live before the page-aligned radix
+                # insert boundary, keeping the cache_unfinished_req repoint
+                # match non-empty.
+                radix_key_len = (fill_len // 256) * 256
+                self.assertGreaterEqual(radix_key_len - cap, 128)
+
+                # window < page: prompts up to one page + one window reuse
+                # nothing, so short-prompt workloads cannot hit the cache.
+                if fill_len <= 512:
+                    self.assertEqual(cap, 0)
+
     def test_swa_admission_counts_evictable_capacity(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.scheduler = MagicMock()
