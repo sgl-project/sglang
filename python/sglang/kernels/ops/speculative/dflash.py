@@ -314,3 +314,159 @@ def selector_walk_triton(
         num_warps=1,
     )
     return tokens, q_rows
+
+
+@triton.jit
+def _lane(vector, lanes, index):
+    """Read one lane out of a register-resident per-beam vector."""
+    return tl.sum(tl.where(lanes == index, vector, vector * 0), axis=0)
+
+
+@triton.jit
+def _beam_first_max(tile, flat_index, limit):
+    """(value, flattened index) of the first maximum of a [WIDTH, top_k] tile.
+
+    `flat_index` is `beam * top_k + candidate`, so ties resolve beam-major. That
+    convention is load bearing: the torch reference flattens the same way, and a
+    tie broken the other way picks a different subtree.
+    """
+    best = tl.max(tl.max(tile, axis=1), axis=0)
+    picked = tl.min(tl.min(tl.where(tile == best, flat_index, limit), axis=1), axis=0)
+    return best, picked
+
+
+@triton.jit
+def _selector_beam_walk_kernel(
+    scores_ptr,
+    candidate_ptr,
+    anchor_ptr,
+    tokens_ptr,
+    parents_ptr,
+    slots: tl.constexpr,
+    top_k: tl.constexpr,
+    width: tl.constexpr,
+    WIDTH: tl.constexpr,
+):
+    """One program per request: the beams' carried state -- candidate index, path
+    log-prob, tree node index -- is WIDTH scalars in registers, so the depth-to-depth
+    dependency stays inside one launch exactly like the single-path walk above.
+
+    WIDTH is `next_power_of_2(width)` because `tl.arange` demands a power of two.
+    Padded lanes hold -inf and can never win a slot; that is the same mechanism that
+    folds the first depth (where only beam 0 is live) into the shared loop body.
+    """
+    row = tl.program_id(0)
+    lanes = tl.arange(0, WIDTH)
+    successors = tl.arange(0, top_k)
+    flat_index = lanes[:, None] * top_k + successors[None, :]
+    limit: tl.constexpr = WIDTH * top_k
+    nodes: tl.constexpr = 1 + slots * width
+    neg_inf = float("-inf")
+    live = lanes < width
+
+    tl.store(tokens_ptr + row * nodes, tl.load(anchor_ptr + row))
+    tl.store(parents_ptr + row * nodes, -1)
+
+    state = tl.zeros((WIDTH,), dtype=tl.int32)
+    node = tl.zeros((WIDTH,), dtype=tl.int32)
+    cum = tl.where(lanes == 0, 0.0, neg_inf)
+
+    for slot in range(slots):
+        base = 1 + slot * width
+        candidate_row = candidate_ptr + (row * slots + slot) * top_k
+        # Gather the WIDTH transition rows the beams currently sit on.
+        rows_base = ((row * slots + slot) * top_k + state[:, None]) * top_k
+        transitions = tl.load(
+            scores_ptr + rows_base + successors[None, :],
+            mask=live[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        # log_softmax along the successor axis, one independent row per beam: a row
+        # is the conditional distribution given its predecessor, and only that
+        # normalization makes the depth-wise sums comparable across rows.
+        shifted = transitions - tl.max(transitions, axis=1)[:, None]
+        log_probs = shifted - tl.log(tl.sum(tl.exp(shifted), axis=1))[:, None]
+        scored = tl.where(live[:, None], cum[:, None] + log_probs, neg_inf)
+
+        # The spine takes slot 0: beam 0's own best child, parent pinned to beam 0.
+        # Restricting to beam 0 rather than ranking the whole pool is what keeps the
+        # spine chain equal to the single-path greedy walk, hence the tree a superset
+        # of it. cum[0] is a constant across the row, so it cannot move the argmax.
+        spine_value, spine = _beam_first_max(
+            tl.where(lanes[:, None] == 0, scored, neg_inf), flat_index, limit
+        )
+        tl.store(
+            tokens_ptr + row * nodes + base,
+            tl.load(candidate_row + spine),
+        )
+        tl.store(parents_ptr + row * nodes + base, _lane(node, lanes, 0))
+        next_state = tl.where(lanes == 0, spine.to(tl.int32), 0)
+        next_node = tl.where(lanes == 0, base, 0)
+        next_cum = tl.where(lanes == 0, spine_value, neg_inf)
+
+        # Struck from the pool, so the width picks are distinct (beam, candidate)
+        # pairs -- which is what makes same-parent sibling tokens distinct.
+        remaining = tl.where(flat_index == spine, neg_inf, scored)
+        for beam in range(1, width):
+            value, picked = _beam_first_max(remaining, flat_index, limit)
+            picked_beam = picked // top_k
+            picked_candidate = picked % top_k
+            tl.store(
+                tokens_ptr + row * nodes + base + beam,
+                tl.load(candidate_row + picked_candidate),
+            )
+            # Parents come from the previous depth, so they are always < base: the
+            # BFS order every downstream ancestor-closure scan relies on.
+            tl.store(
+                parents_ptr + row * nodes + base + beam,
+                _lane(node, lanes, picked_beam),
+            )
+            next_state = tl.where(
+                lanes == beam, picked_candidate.to(tl.int32), next_state
+            )
+            next_node = tl.where(lanes == beam, base + beam, next_node)
+            next_cum = tl.where(lanes == beam, value, next_cum)
+            remaining = tl.where(flat_index == picked, neg_inf, remaining)
+
+        state = next_state
+        node = next_node
+        cum = next_cum
+
+
+def selector_beam_walk_triton(
+    *,
+    candidate_ids,
+    scores,
+    anchor_token_ids,
+    beam_width,
+):
+    batch, slots, top_k = candidate_ids.shape
+    width = int(beam_width)
+    if width < 1:
+        raise ValueError(f"DFLASH beam walk needs beam_width >= 1, got {width}.")
+    if width > top_k:
+        raise ValueError(
+            f"DFLASH beam walk beam_width {width} exceeds top_k {top_k}: the first "
+            "depth only has top_k candidates, so a wider beam cannot be filled."
+        )
+    num_nodes = 1 + slots * width
+    tokens = torch.empty((batch, num_nodes), dtype=torch.int64, device=scores.device)
+    parents = torch.empty((batch, num_nodes), dtype=torch.int64, device=scores.device)
+    padded = triton.next_power_of_2(width)
+    _selector_beam_walk_kernel[(batch,)](
+        scores.contiguous(),
+        candidate_ids.contiguous(),
+        anchor_token_ids.contiguous(),
+        tokens,
+        parents,
+        slots=slots,
+        top_k=top_k,
+        width=width,
+        WIDTH=padded,
+        # The whole tile is at most WIDTH * top_k <= 256 registers, same as the
+        # single-path walk above: one warp, no cross-warp reduction.
+        num_warps=1,
+    )
+    return tokens, parents
+
+
