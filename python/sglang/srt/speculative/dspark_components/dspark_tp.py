@@ -13,7 +13,9 @@ class DsparkTpSync:
         self._tp_group = tp_group
         self._enabled = tp_group.world_size > 1
         self._optional_int_buffer = (
-            torch.empty((1,), dtype=torch.int64) if self._enabled else None
+            torch.empty((1,), dtype=torch.int64, device="cpu")
+            if self._enabled
+            else None
         )
 
     def sync(self, values: torch.Tensor) -> torch.Tensor:

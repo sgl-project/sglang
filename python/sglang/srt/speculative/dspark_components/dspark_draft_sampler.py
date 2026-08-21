@@ -167,7 +167,7 @@ def _resolve_folded_sampling(
     need_gb = (noise_bytes + logits_bytes) / (1 << 30)
     if available_memory_gb is None:
         available_memory_gb = get_available_gpu_memory(
-            device, torch.cuda.get_device_module().current_device()
+            device, torch.get_device_module().current_device()
         )
     if available_memory_gb - need_gb >= _CAPTURE_HEADROOM_GB:
         return True
