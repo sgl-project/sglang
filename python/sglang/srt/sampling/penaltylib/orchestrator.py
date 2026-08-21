@@ -52,6 +52,41 @@ class BatchedPenalizerOrchestrator:
         for penalizer in self.penalizers.values():
             penalizer.cumulate_output_tokens(output_ids=output_ids)
 
+    def is_min_new_tokens_active(self) -> bool:
+        """Whether the min_new_tokens seen-token counter needs advancing.
+
+        `is_required` is true as soon as *any* penalizer is required, so callers
+        that only feed min_new_tokens must test this instead -- otherwise a
+        repetition-only request pays for the counter update every step.
+        """
+        from sglang.srt.sampling.penaltylib.min_new_tokens import (
+            BatchedMinNewTokensPenalizer,
+        )
+
+        penalizer = self.penalizers.get(BatchedMinNewTokensPenalizer)
+        return penalizer is not None and penalizer.is_prepared()
+
+    def set_min_new_tokens_output_counts(self, counts: torch.Tensor):
+        """Set only the min_new_tokens seen-token counter, from the exact number
+        of output tokens each request has committed.
+
+        Deliberately narrower than `cumulate_output_tokens`: the repetition,
+        frequency and presence ledgers need the token ids, not just how many
+        there were, so they are left untouched here.
+
+        Args:
+            counts (torch.Tensor): One committed-output-token count per request,
+                in batch order.
+        """
+        from sglang.srt.sampling.penaltylib.min_new_tokens import (
+            BatchedMinNewTokensPenalizer,
+        )
+
+        penalizer = self.penalizers.get(BatchedMinNewTokensPenalizer)
+        if penalizer is None:
+            return
+        penalizer.set_output_token_counts(counts)
+
     def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):
         """
         Apply all penalizers to the logits in-place.
