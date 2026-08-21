@@ -6,9 +6,14 @@ import inspect
 import textwrap
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.communicator import (
+    CommunicateSummableTensorPairFn,
+    LayerCommunicator,
+)
 from sglang.srt.layers.moe.utils import has_replicated_shared_expert
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -52,6 +57,122 @@ class TestDeferredAllReduceDoubleCounts(CustomTestCase):
         wrong = self._layer(tp_size, shared_inside_allreduce=True)
         self.assertTrue(torch.allclose(wrong - correct, torch.full((4, 1), 49.0)))
         self.assertFalse(torch.allclose(wrong, correct))
+
+
+class TestDpReduceScatterSharedExpert(CustomTestCase):
+    def _communicator(self):
+        communicator = LayerCommunicator.__new__(LayerCommunicator)
+        communicator.allow_reduce_scatter = True
+        communicator._communicate_summable_tensor_pair_fn = (
+            CommunicateSummableTensorPairFn._scatter_hidden_states
+        )
+        return communicator
+
+    def test_variable_and_equal_chunk_paths_require_reduce_scatter(self):
+        communicator = self._communicator()
+
+        variable = SimpleNamespace(
+            dp_padding_mode=SimpleNamespace(is_max_len=lambda: False)
+        )
+        with patch(
+            "sglang.srt.layers.communicator.should_use_dp_reduce_scatterv",
+            return_value=True,
+        ):
+            self.assertTrue(communicator.should_use_dp_reduce_scatter(variable))
+
+        equal = SimpleNamespace(
+            dp_padding_mode=SimpleNamespace(is_max_len=lambda: True)
+        )
+        with patch(
+            "sglang.srt.layers.communicator.should_use_dp_reduce_scatterv",
+            return_value=False,
+        ):
+            self.assertTrue(communicator.should_use_dp_reduce_scatter(equal))
+
+        communicator._communicate_summable_tensor_pair_fn = (
+            CommunicateSummableTensorPairFn._trivial
+        )
+        with patch(
+            "sglang.srt.layers.communicator.should_use_dp_reduce_scatterv",
+            return_value=True,
+        ):
+            self.assertFalse(communicator.should_use_dp_reduce_scatter(variable))
+
+    def _check_combine(self, sizes):
+        world_size = len(sizes)
+        rows = sum(sizes)
+        shared = torch.arange(1, rows + 1, dtype=torch.float32).view(rows, 1)
+        routed = [torch.full((rows, 1), float(rank + 1)) for rank in range(world_size)]
+        routed_sum = torch.stack(routed).sum(0)
+        wrong = torch.stack([partial + shared for partial in routed]).sum(0)
+        expected = routed_sum + shared
+
+        for rank in range(world_size):
+            with (
+                patch(
+                    "sglang.srt.layers.communicator.get_dp_global_num_tokens",
+                    return_value=sizes,
+                ),
+                patch(
+                    "sglang.srt.layers.communicator.get_parallel",
+                    return_value=SimpleNamespace(attn_dp_rank=rank),
+                ),
+            ):
+                local_shared = LayerCommunicator.get_dp_local_hidden_states(shared)
+                local_routed = LayerCommunicator.get_dp_local_hidden_states(routed_sum)
+                local_wrong = LayerCommunicator.get_dp_local_hidden_states(wrong)
+                local_expected = LayerCommunicator.get_dp_local_hidden_states(expected)
+
+            fixed = local_routed + local_shared
+            self.assertTrue(torch.equal(fixed, local_expected))
+            self.assertTrue(
+                torch.equal(
+                    local_wrong - fixed,
+                    local_shared * (world_size - 1),
+                )
+            )
+
+    def test_equal_chunk_shared_is_added_once(self):
+        self._check_combine([3, 3, 3, 3])
+
+    def test_variable_chunk_shared_is_added_once(self):
+        self._check_combine([0, 1, 4, 2])
+
+    def test_laguna_moe_can_skip_hoisted_shared_expert(self):
+        laguna = importlib.import_module("sglang.srt.models.laguna")
+
+        class Gate(torch.nn.Module):
+            def forward(self, hidden_states):
+                return hidden_states.new_zeros((hidden_states.shape[0], 2))
+
+        class TopK(torch.nn.Module):
+            def forward(self, hidden_states, router_logits):
+                return None
+
+        class Experts(torch.nn.Module):
+            def forward(self, hidden_states, topk_output):
+                return hidden_states * 2
+
+        class Shared(torch.nn.Module):
+            def forward(self, hidden_states, forward_batch=None):
+                return hidden_states * 10
+
+        moe = laguna.LagunaMoE.__new__(laguna.LagunaMoE)
+        torch.nn.Module.__init__(moe)
+        moe.tp_size = 1
+        moe.routed_scaling_factor = 1.0
+        moe.router_logit_softcapping = 0.0
+        moe._shared_expert_tp1 = True
+        moe.gate = Gate()
+        moe.topk = TopK()
+        moe.experts = Experts()
+        moe.shared_expert = Shared()
+
+        hidden_states = torch.ones(3, 2)
+        with_shared = moe(hidden_states)
+        routed_only = moe(hidden_states, skip_shared_experts=True)
+        self.assertTrue(torch.equal(with_shared, hidden_states * 12))
+        self.assertTrue(torch.equal(routed_only, hidden_states * 2))
 
 
 class TestFusionGatedOnReplicatedSharedExpert(CustomTestCase):
@@ -125,6 +246,21 @@ class TestMandatorySharedExpertHoist(CustomTestCase):
 
         self.assertIn("has_replicated_shared_expert", do_shared_local)
         self.assertNotIn("_SHARED_EXPERT_LOCAL", do_shared_local)
+
+    def test_layer_communicator_dp_models_hoist_shared_expert(self):
+        cases = (
+            ("sglang.srt.models.deepseek_v2", "DeepseekV2DecoderLayer"),
+            ("sglang.srt.models.laguna", "LagunaDecoderLayer"),
+        )
+        for module_name, class_name in cases:
+            module = importlib.import_module(module_name)
+            source = inspect.getsource(getattr(module, class_name).forward)
+            for required in (
+                "should_use_dp_reduce_scatter",
+                "get_dp_local_hidden_states",
+                "skip_shared_experts=True",
+            ):
+                self.assertIn(required, source, f"{class_name}: missing {required}")
 
 
 if __name__ == "__main__":

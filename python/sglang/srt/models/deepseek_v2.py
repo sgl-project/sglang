@@ -2492,18 +2492,29 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        _cp_shared_local = None
+        _has_tp1_shared = has_replicated_shared_expert(self.mlp)
         _cp_hoist_shared = (
-            has_replicated_shared_expert(self.mlp)
+            _has_tp1_shared
             and self.layer_scatter_modes.mlp_mode == ScatterMode.FULL
             and (dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch))
         )
+        _dp_hoist_shared = (
+            _has_tp1_shared
+            and self.layer_communicator.should_use_dp_reduce_scatter(forward_batch)
+        )
+        _hoist_shared = _cp_hoist_shared or _dp_hoist_shared
+        _shared_local = None
+        _local_rows = None
         if _cp_hoist_shared:
             cp_size = get_parallel().attn_cp_size
             cp_rank = get_parallel().attn_cp_rank
-            _cp_local_rows = hidden_states.tensor_split(cp_size)[cp_rank]
-            if _cp_local_rows.shape[0] > 0:
-                _cp_shared_local = self.mlp._forward_shared_experts(_cp_local_rows)
+            _local_rows = hidden_states.tensor_split(cp_size)[cp_rank]
+        elif _dp_hoist_shared:
+            _local_rows = self.layer_communicator.get_dp_local_hidden_states(
+                hidden_states
+            )
+        if _local_rows is not None and _local_rows.shape[0] > 0:
+            _shared_local = self.mlp._forward_shared_experts(_local_rows)
 
         fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -2536,7 +2547,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
             with _mlp_ctx:
-                if _cp_hoist_shared:
+                if _hoist_shared:
                     hidden_states = self.mlp(
                         hidden_states,
                         forward_batch,
@@ -2561,8 +2572,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states, residual, forward_batch
             )
 
-        if _cp_shared_local is not None:
-            hidden_states = hidden_states + _cp_shared_local[: hidden_states.shape[0]]
+        if _shared_local is not None:
+            hidden_states = hidden_states + _shared_local[: hidden_states.shape[0]]
 
         return hidden_states, residual, topk_indices
 
