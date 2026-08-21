@@ -23,6 +23,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+_DIAG_SEEN: set = set()
+
+
+def _diag(tag: str, before: int, after: int) -> None:
+    """TEMPORARY instrumentation for the CI capture-memory investigation."""
+    logger.warning(
+        "[normdiag] %s free_before=%.3fGB free_after=%.3fGB delta=%.1fMB capturing=%s",
+        tag,
+        before / 2**30,
+        after / 2**30,
+        (before - after) / 2**20,
+        torch.cuda.is_current_stream_capturing(),
+    )
+
+
 @cache_once
 def _jit_qknorm_module(head_dim: int, dtype: torch.dtype) -> Module:
     args = make_cpp_args(head_dim, is_arch_support_pdl(), dtype)
@@ -179,13 +194,21 @@ def _jit_rmsnorm_module(
         cast_x_before_out_mul,
         *schedule,
     )
+    _b = torch.cuda.mem_get_info()[0]
     module = load_jit(
         "rmsnorm",
         *args,
         cuda_files=["elementwise/rmsnorm.cuh"],
         cuda_wrappers=[("rmsnorm", f"RMSNormKernel<{args}>::run")],
     )
+    _m = torch.cuda.mem_get_info()[0]
+    _diag(
+        f"build rmsnorm d={hidden_size} {dtype} cast={cast_x_before_out_mul} {schedule}",
+        _b,
+        _m,
+    )
     _warmup_module(module, "rmsnorm", hidden_size, dtype)
+    _diag(f"warm  rmsnorm d={hidden_size} {schedule}", _m, torch.cuda.mem_get_info()[0])
     return module
 
 
@@ -219,13 +242,21 @@ def _jit_fused_add_rmsnorm_module(
     args = make_cpp_args(
         dtype, dim, is_arch_support_pdl(), cast_x_before_out_mul, *schedule
     )
+    _b = torch.cuda.mem_get_info()[0]
     module = load_jit(
         "fused_add_rmsnorm",
         *args,
         cuda_files=["elementwise/rmsnorm.cuh"],
         cuda_wrappers=[("fused_add_rmsnorm", f"FusedAddRMSNormKernel<{args}>::run")],
     )
+    _m = torch.cuda.mem_get_info()[0]
+    _diag(
+        f"build fused_add d={dim} {dtype} cast={cast_x_before_out_mul} {schedule}",
+        _b,
+        _m,
+    )
     _warmup_module(module, "fused_add_rmsnorm", dim, dtype)
+    _diag(f"warm  fused_add d={dim} {schedule}", _m, torch.cuda.mem_get_info()[0])
     return module
 
 
@@ -298,7 +329,21 @@ def rmsnorm(
     modules = _jit_rmsnorm_modules(
         hidden_size, input.dtype, cast_x_before_out_mul, tuple(schedules)
     )
-    module = modules[0 if num_tokens <= threshold else 1]
+    which = 0 if num_tokens <= threshold else 1
+    # TEMPORARY: one line per new (capturing, tokens, schedule) combination
+    if torch.cuda.is_current_stream_capturing():
+        key = (hidden_size, num_tokens, which, cast_x_before_out_mul)
+        if key not in _DIAG_SEEN:
+            _DIAG_SEEN.add(key)
+            logger.warning(
+                "[normdiag] in-capture d=%s tokens=%s sched=%s cast=%s free=%.3fGB",
+                hidden_size,
+                num_tokens,
+                which,
+                cast_x_before_out_mul,
+                torch.cuda.mem_get_info()[0] / 2**30,
+            )
+    module = modules[which]
     module.rmsnorm(input, weight, out, eps)
     return out
 
