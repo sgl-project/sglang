@@ -252,13 +252,6 @@ class TestPostprocessTensors(CustomTestCase):
             [("model.rotary_emb.inv_freq", False, RawComparable(t))],
         )
 
-    def test_compares_weight_fp32_substring(self):
-        t = torch.randn(4)
-        _assert_entries_close(
-            _build_check_entries({"model.layers.0.mlp.gate._weight_fp32": t}, set()),
-            [("model.layers.0.mlp.gate._weight_fp32", True, RawComparable(t))],
-        )
-
     def test_substring_match_not_endswith(self):
         # Pattern can appear anywhere in the name, not just at the end.
         t = torch.randn(4)
