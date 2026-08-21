@@ -479,29 +479,6 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
             block_counts,
         )
 
-    def _dense_query_attention(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        query_indices: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run selected queries through SGLang FA with complete document K/V."""
-        dense_q = q.index_select(1, query_indices)
-        dense_out = self.dense_impl.forward(dense_q, k, v, None)
-        return dense_out[0] if isinstance(dense_out, tuple) else dense_out
-
-    @staticmethod
-    def _query_plan_indices(
-        query_plan: dict[str, Any],
-        name: str,
-        device: torch.device,
-    ) -> torch.Tensor:
-        value = query_plan.get(name)
-        if not isinstance(value, torch.Tensor) or value.ndim != 1:
-            raise ValueError(f"SubBlock query plan {name} must be a rank-1 tensor")
-        return value.to(device=device, dtype=torch.long)
-
     def _hybrid_query_attention(
         self,
         q: torch.Tensor,

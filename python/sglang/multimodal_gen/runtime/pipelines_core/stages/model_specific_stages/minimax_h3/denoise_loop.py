@@ -50,12 +50,12 @@ def _minimax_h3_subblock_video_query_indices(
     return torch.cat([text_pos[text_video_token_mask], latent_video_pos])
 
 
-def _minimax_h3_subblock_dense_query_indices(
+def _minimax_h3_subblock_query_plan(
     video_query_indices: torch.Tensor,
     *,
     used_len: int,
-) -> torch.Tensor:
-    """Return every used query row except explicitly identified video rows."""
+) -> dict[str, torch.Tensor]:
+    """Mark pure-video 64-row Q blocks sparse; every other block stays dense."""
     if used_len < 0:
         raise ValueError(f"used_len must be non-negative, got {used_len}")
     if video_query_indices.ndim != 1:
@@ -73,66 +73,7 @@ def _minimax_h3_subblock_dense_query_indices(
             )
         if torch.unique(video_query_indices).numel() != video_query_indices.numel():
             raise ValueError("video_query_indices must not contain duplicates")
-    dense_mask = torch.ones(
-        used_len, dtype=torch.bool, device=video_query_indices.device
-    )
-    dense_mask[video_query_indices] = False
-    return torch.nonzero(dense_mask, as_tuple=False).view(-1)
-
-
-def _minimax_h3_subblock_query_plan(
-    video_query_indices: torch.Tensor,
-    *,
-    used_len: int,
-) -> dict[str, torch.Tensor | int]:
-    """Build request-static FA/SubBlock query routing for the real segment."""
-    video_query_indices = video_query_indices.view(-1).to(dtype=torch.long)
-    dense_query_indices = _minimax_h3_subblock_dense_query_indices(
-        video_query_indices,
-        used_len=used_len,
-    )
     block_size = _MINIMAX_H3_SUBBLOCK_QUERY_BLOCK_SIZE
-    if video_query_indices.numel() == 0:
-        empty = torch.empty(0, dtype=torch.long, device=video_query_indices.device)
-        query_blocks = -(-used_len // _MINIMAX_H3_SUBBLOCK_QUERY_BLOCK_SIZE)
-        return {
-            "dense_query_indices": dense_query_indices,
-            "video_query_indices": video_query_indices,
-            "sparse_query_gather_indices": empty,
-            "sparse_video_output_indices": empty,
-            "sparse_query_valid_len": 0,
-            "sparse_query_block_mask": torch.zeros(
-                query_blocks,
-                dtype=torch.bool,
-                device=video_query_indices.device,
-            ),
-        }
-
-    video_block_ids = torch.unique(
-        torch.div(video_query_indices, block_size, rounding_mode="floor"),
-        sorted=True,
-    )
-    block_offsets = torch.arange(
-        block_size,
-        dtype=torch.long,
-        device=video_query_indices.device,
-    )
-    block_rows = video_block_ids[:, None] * block_size + block_offsets[None, :]
-    valid_rows = block_rows < used_len
-    sparse_query_valid_len = int(valid_rows.sum())
-    # Selected source blocks stay in ascending order. If the final global
-    # block is selected and ragged, every invalid gather slot is therefore in
-    # one suffix. Repeating its last legal row keeps the gathered kernel Q
-    # block-aligned across SM90/SM100; routing uses only the real prefix, and
-    # every output produced for the repeated suffix is discarded.
-    sparse_query_gather_indices = block_rows.clamp_max(used_len - 1).reshape(-1)
-    video_block_rank = torch.searchsorted(
-        video_block_ids,
-        torch.div(video_query_indices, block_size, rounding_mode="floor"),
-    )
-    sparse_video_output_indices = (
-        video_block_rank * block_size + video_query_indices.remainder(block_size)
-    )
     num_query_blocks = -(-used_len // block_size)
     video_rows_per_block = torch.bincount(
         torch.div(video_query_indices, block_size, rounding_mode="floor"),
@@ -148,16 +89,7 @@ def _minimax_h3_subblock_query_plan(
     # the sparse budget; mixed boundary blocks stay dense so their non-video
     # rows retain exact attention in the single heterogeneous BSA call.
     sparse_query_block_mask = video_rows_per_block == real_rows_per_block
-    if dense_query_indices.numel() + video_query_indices.numel() != used_len:
-        raise ValueError("SubBlock query plan must cover every real query exactly once")
-    return {
-        "dense_query_indices": dense_query_indices,
-        "video_query_indices": video_query_indices,
-        "sparse_query_gather_indices": sparse_query_gather_indices,
-        "sparse_video_output_indices": sparse_video_output_indices,
-        "sparse_query_valid_len": sparse_query_valid_len,
-        "sparse_query_block_mask": sparse_query_block_mask,
-    }
+    return {"sparse_query_block_mask": sparse_query_block_mask}
 
 
 @torch.inference_mode()

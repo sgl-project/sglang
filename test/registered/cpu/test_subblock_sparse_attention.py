@@ -17,7 +17,6 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
     MiniMaxH3DenoiseBranch,
-    _minimax_h3_subblock_dense_query_indices,
     _minimax_h3_subblock_query_plan,
     _minimax_h3_subblock_video_query_indices,
 )
@@ -150,16 +149,6 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
                 min_seq_len=4,
             )
 
-    def test_dense_query_indices_select_every_non_video_row(self):
-        video_indices = torch.tensor([2, 4], dtype=torch.long)
-
-        indices = _minimax_h3_subblock_dense_query_indices(
-            video_indices,
-            used_len=5,
-        )
-
-        torch.testing.assert_close(indices, torch.tensor([0, 1, 3]))
-
     def test_fl2va_keyframe_images_remain_dense(self):
         packed = minimax_h3_packed_sequence(
             text_len=5,
@@ -176,18 +165,11 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
             packed,
             torch.zeros(5, dtype=torch.bool),
         )
-        dense_indices = set(
-            _minimax_h3_subblock_dense_query_indices(
-                video_indices,
-                used_len=int(packed["cu_seqlens"][1]),
-            ).tolist()
-        )
         condition_image_indices = set(
             packed["img_pos"][~packed["update_mask"]].tolist()
         )
 
-        self.assertTrue(condition_image_indices.issubset(dense_indices))
-        self.assertTrue(set(packed["video_pos"].tolist()).isdisjoint(dense_indices))
+        self.assertTrue(condition_image_indices.isdisjoint(video_indices.tolist()))
 
     def test_ref2va_images_are_dense_but_reference_and_target_video_are_sparse(self):
         packed = minimax_h3_packed_sequence_ref2va_blocks(
@@ -208,30 +190,24 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
             ],
             include_video_pos=True,
         )
-        used_len = int(packed["cu_seqlens"][1])
         text_video_mask = torch.tensor([False, True, False, True, False])
         video_indices = _minimax_h3_subblock_video_query_indices(
             packed,
             text_video_mask,
         )
 
-        dense_indices = set(
-            _minimax_h3_subblock_dense_query_indices(
-                video_indices,
-                used_len=used_len,
-            ).tolist()
-        )
         image_indices = set(packed["img_pos"].tolist()) - set(
             packed["video_pos"].tolist()
         )
         text_video_indices = set(packed["text_pos"][text_video_mask].tolist())
         text_non_video_indices = set(packed["text_pos"][~text_video_mask].tolist())
 
-        self.assertTrue(image_indices.issubset(dense_indices))
-        self.assertTrue(set(packed["audio_pos"].tolist()).issubset(dense_indices))
-        self.assertTrue(text_non_video_indices.issubset(dense_indices))
-        self.assertTrue(text_video_indices.isdisjoint(dense_indices))
-        self.assertTrue(set(packed["video_pos"].tolist()).isdisjoint(dense_indices))
+        video_index_set = set(video_indices.tolist())
+        self.assertTrue(image_indices.isdisjoint(video_index_set))
+        self.assertTrue(set(packed["audio_pos"].tolist()).isdisjoint(video_index_set))
+        self.assertTrue(text_non_video_indices.isdisjoint(video_index_set))
+        self.assertTrue(text_video_indices.issubset(video_index_set))
+        self.assertTrue(set(packed["video_pos"].tolist()).issubset(video_index_set))
 
     def test_ref2va_presentation_marks_only_video_vision_blocks_sparse(self):
         class FakeTokenizer:
@@ -284,7 +260,7 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
             torch.tensor([2, 2]),
         ):
             with self.subTest(indices=invalid.tolist()), self.assertRaises(ValueError):
-                _minimax_h3_subblock_dense_query_indices(invalid, used_len=5)
+                _minimax_h3_subblock_query_plan(invalid, used_len=5)
 
     def test_ref2va_video_positions_are_subblock_only_metadata(self):
         kwargs = dict(
@@ -340,21 +316,15 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
         self.assertIsNone(branch.subblock_query_plan)
         self.assertNotIn("subblock_query_plan", branch.static_kwargs)
 
-    def test_query_plan_preserves_original_blocks_and_ragged_tail(self):
+    def test_query_plan_marks_only_pure_video_blocks_sparse(self):
         query_plan = _minimax_h3_subblock_query_plan(
-            torch.tensor([1, 139]),
+            torch.cat([torch.arange(64), torch.arange(128, 140)]),
             used_len=140,
         )
-
-        gather = query_plan["sparse_query_gather_indices"]
-        torch.testing.assert_close(gather[:64], torch.arange(64))
-        torch.testing.assert_close(gather[64:76], torch.arange(128, 140))
-        torch.testing.assert_close(gather[76:], torch.full((52,), 139))
         torch.testing.assert_close(
-            query_plan["sparse_video_output_indices"],
-            torch.tensor([1, 75]),
+            query_plan["sparse_query_block_mask"],
+            torch.tensor([True, False, True]),
         )
-        self.assertEqual(query_plan["sparse_query_valid_len"], 76)
 
     def test_hybrid_query_routing_uses_one_heterogeneous_bsa_call(self):
         impl = object.__new__(SubBlockSparseAttentionImpl)
