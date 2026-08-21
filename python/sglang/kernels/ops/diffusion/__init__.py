@@ -18,7 +18,7 @@ numerics and platform plumbing, ``sites`` the request-scoped mount policy, and
 ``README.md``: several norms look interchangeable and are not.
 
 Resolution is lazy (PEP 562).  The backends have disjoint, heavy dependencies
--- Triton, CUTLASS/CuTe-DSL, FlyDSL (ROCm), MLX (Apple) -- so an eager
+-- Triton, CUTLASS/CuTe-DSL, and FlyDSL (ROCm) -- so an eager
 re-export would turn every one of them into a hard import-time requirement on
 every platform.  ``_EXPORTS`` maps a symbol to its module and the import
 happens on first attribute access.

@@ -21,7 +21,7 @@ free to move; the facade is not. `test_import_surface.py` enforces this, with
 a small allowlist for tests that deliberately exercise one backend.
 
 Resolution is lazy (PEP 562): the backends have disjoint heavy dependencies
-(Triton, CUTLASS/CuTe-DSL, FlyDSL on ROCm, MLX on Apple), so an eager
+(Triton, CUTLASS/CuTe-DSL, and FlyDSL on ROCm), so an eager
 re-export would make all of them import-time requirements everywhere.
 
 ## Layout
