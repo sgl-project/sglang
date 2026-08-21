@@ -394,11 +394,10 @@ def _fused_attn_pooling_online_topk(
                             is_init_masked, 1, T.if_then_else(is_local_masked, 1, 0)
                         )
 
-                        write_pos = topk + p_off
-                        topk_index_shared[write_pos] = p_idx
+                        topk_index_shared[topk + p_off] = p_idx
                         # Use inf for masked blocks to force selection
                         # Compare only index sets, not order
-                        topk_value_shared[write_pos] = T.if_then_else(
+                        topk_value_shared[topk + p_off] = T.if_then_else(
                             is_masked == 1,
                             T.Cast("float32", float("inf")),
                             pool_max_shared[p_off],
