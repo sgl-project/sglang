@@ -185,6 +185,7 @@ impl TokenizerWorker {
 impl Runnable for TokenizerWorker {
     fn run(self) {
         while let Ok(mut req) = self.rx.recv() {
+            crate::ttft_stamp::stamp("tok_start", req.rid.as_str());
             // The tokenizer pool only ever receives generate requests. Encode,
             // then advance the FSM: `TokenizeDone` on success (→ PreSendValidating).
             let event = {
@@ -218,6 +219,7 @@ impl Runnable for TokenizerWorker {
                     Err(err) => Event::Error(err),
                 }
             };
+            crate::ttft_stamp::stamp("tok_done", req.rid.as_str());
             let _ = req.state.apply(event);
             if self.tm.send(TmEvent::Tokenized(req)).is_err() {
                 tracing::error!("tm inbox closed; dropping request");

@@ -22,6 +22,23 @@ use crate::tokenizer_manager::ActivityCounter;
 use crate::tokenizer_manager::Senders;
 use disaggregation::bootstrap as pd_bootstrap;
 
+/// TTFT profiling: CLOCK_MONOTONIC ns at which the request head reached the
+/// handler stack (before the body was read). Stored in request extensions by
+/// [`stamp_request_start`]; logged by the `/generate` handler once the rid is
+/// known.
+#[derive(Clone, Copy)]
+pub(crate) struct RequestStartNs(pub u64);
+
+/// TTFT profiling middleware: stamp request-head arrival into extensions.
+async fn stamp_request_start(
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    req.extensions_mut()
+        .insert(RequestStartNs(crate::ttft_stamp::mono_ns()));
+    next.run(req).await
+}
+
 /// Shared handler state: submission handles, immutable server configuration,
 /// and the API-owned chat formatter.
 #[derive(Clone)]
@@ -66,6 +83,8 @@ pub async fn serve(
     // No body limit, matching the Python server.
     let mut app = router
         .layer(axum::extract::DefaultBodyLimit::disable())
+        // TTFT profiling: stamp request-head arrival before the body is read.
+        .layer(axum::middleware::from_fn(stamp_request_start))
         .with_state(state);
 
     // Prefill-only KV bootstrap registry. Merged AFTER `with_state` — its

@@ -162,7 +162,12 @@ impl Runnable for Ingress {
             match next {
                 Some(Lane::Abort(rid)) => self.on_abort(rid),
                 // A fresh request and one returning from the tokenizer pool.
-                Some(Lane::Event(TmEvent::Ingress(req) | TmEvent::Tokenized(req))) => {
+                Some(Lane::Event(TmEvent::Ingress(req))) => {
+                    crate::ttft_stamp::stamp("ing_pickup", req.rid.as_str());
+                    self.drive(req)
+                }
+                Some(Lane::Event(TmEvent::Tokenized(req))) => {
+                    crate::ttft_stamp::stamp("ing_pickup2", req.rid.as_str());
                     self.drive(req)
                 }
                 Some(Lane::Event(TmEvent::MmEncoded { rid, input_ids })) => {
@@ -541,6 +546,7 @@ impl Ingress {
     /// Serialize the tokenized request to its `TokenizedGenerateReqInput` wire and
     /// push it onto the ingress ring for the scheduler. On backpressure, fail it.
     fn push_to_ring(&self, mut req: Request) {
+        crate::ttft_stamp::stamp("encode_start", req.rid.as_str());
         // Only generate requests reach here (control uses `push_control_to_ring`).
         // Validate + serialize while borrowing `g` immutably; the resulting `Bytes`
         // own their data, so the borrow ends before any `fail(&mut req)`.
@@ -563,7 +569,9 @@ impl Ingress {
 
         if !self.ingress.try_push(IngressMsg { header, ids }) {
             self.fail(&mut req, Error::QueueFull, true); // registered
+            return;
         }
+        crate::ttft_stamp::stamp("ring_push", req.rid.as_str());
         // On success the scheduler owns the request (egress arrives by rid); we
         // drop our `Request` here — the detok shard holds the sink.
     }
