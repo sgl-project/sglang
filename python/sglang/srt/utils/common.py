@@ -3027,6 +3027,8 @@ class SafeUnpickler(pickle.Unpickler):
     # Exact (module, symbol) allowlist for SGLang-internal classes that real
     # payloads reference. Nothing else under sglang.srt.* may be loaded.
     ALLOWED_SGLANG_CLASSES = {
+        ("sglang.srt.disaggregation.encode_receiver", "EmbeddingData"),
+        ("sglang.srt.managers.schedule_batch", "Modality"),
         ("sglang.srt.weight_sync.tensor_bucket", "FlattenedTensorBucket"),
         ("sglang.srt.weight_sync.tensor_bucket", "FlattenedTensorMetadata"),
         (
