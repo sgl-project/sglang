@@ -399,9 +399,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if copy_stream is None:
             copy_stream = torch.cuda.Stream(device=index.device)
             self._state_index_copy_stream = copy_stream
-        host_index = torch.empty_like(index, device="cpu", pin_memory=True)
+        host_index = torch.empty(
+            index.shape, dtype=torch.int32, device="cpu", pin_memory=True
+        )
         with torch.cuda.stream(copy_stream):
-            host_index.copy_(index, non_blocking=True)
+            device_index = index.to(dtype=torch.int32)
+            host_index.copy_(device_index, non_blocking=True)
         copy_stream.synchronize()
         return host_index.numpy()
 
@@ -1281,9 +1284,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             def _mamba_payload():
                 return [
                     self._copy_state_index_to_host(
-                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                            decode_req.req.req_pool_idx
-                        ]
+                        decode_req.req.mamba_pool_idx
                     )
                 ]
 
