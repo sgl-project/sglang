@@ -13,7 +13,7 @@ is exercised as the real method, no mock.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import msgspec.structs
 
@@ -26,6 +26,7 @@ from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
     DPBudget,
     LoadBalanceMethod,
+    run_data_parallel_controller_process,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 
@@ -277,6 +278,58 @@ class TestStatusAwarenessInconsistency(CustomTestCase):
         ctl.total_requests_scheduler(_req())
         # Current behaviour: still dispatches to the inactive worker.
         ctl.workers[2].send_pyobj.assert_called_once()
+
+
+class TestDataParallelControllerProcess(CustomTestCase):
+    def test_monitors_scheduler_processes_during_controller_lifetime(self):
+        scheduler_procs = [MagicMock(pid=10), MagicMock(pid=11)]
+        controller = MagicMock(
+            scheduler_procs=scheduler_procs,
+            max_total_num_tokens=1024,
+            max_req_input_len=512,
+            startup_time={},
+        )
+        server_args = SimpleNamespace(
+            enable_trace=False,
+            node_rank=0,
+            is_ep_scale_joiner=False,
+        )
+
+        with (
+            patch(
+                "sglang.srt.managers.data_parallel_controller.DataParallelController",
+                return_value=controller,
+            ),
+            patch(
+                "sglang.srt.managers.data_parallel_controller.SubprocessWatchdog"
+            ) as watchdog_type,
+            patch("sglang.srt.managers.data_parallel_controller.psutil.Process"),
+            patch(
+                "sglang.srt.managers.data_parallel_controller."
+                "kill_itself_when_parent_died"
+            ),
+            patch("sglang.srt.managers.data_parallel_controller.publish"),
+            patch("sglang.srt.managers.data_parallel_controller.configure_logger"),
+            patch("sglang.srt.managers.data_parallel_controller.faulthandler.enable"),
+            patch(
+                "sglang.srt.managers.data_parallel_controller.setproctitle.setproctitle"
+            ),
+        ):
+            run_data_parallel_controller_process(
+                server_args,
+                MagicMock(),
+                MagicMock(),
+            )
+
+        watchdog_type.assert_called_once_with(
+            processes=scheduler_procs,
+            process_names=["scheduler_0", "scheduler_1"],
+        )
+        watchdog_type.return_value.start.assert_called_once_with()
+        watchdog_type.return_value.stop.assert_called_once_with()
+        controller.event_loop.assert_called_once_with()
+        for proc in scheduler_procs:
+            proc.join.assert_called_once_with()
 
 
 if __name__ == "__main__":
