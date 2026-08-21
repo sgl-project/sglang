@@ -1632,20 +1632,29 @@ def _remote_file_exists(url: str) -> bool | None:
 
 def _load_remote_gt_image(url: str) -> np.ndarray:
     last_error: Exception | None = None
-    for _ in range(3):
+    attempts = 3
+    for attempt in range(1, attempts + 1):
         try:
             resp = requests.get(url, timeout=60)
             try:
                 if resp.status_code == 200:
-                    image = Image.open(io.BytesIO(resp.content)).convert("RGB")
-                    return np.array(image)
+                    with Image.open(io.BytesIO(resp.content)) as image:
+                        return np.array(image.convert("RGB"))
                 last_error = FileNotFoundError(f"GT image not found: {url}")
                 if resp.status_code not in (403, 429) and resp.status_code < 500:
                     break
             finally:
                 resp.close()
-        except requests.RequestException as exc:
+        except (OSError, ValueError, requests.RequestException) as exc:
             last_error = exc
+        if attempt < attempts:
+            logger.warning(
+                "GT image download failed (attempt %d/%d), retrying: %s",
+                attempt,
+                attempts,
+                url,
+            )
+            time.sleep(attempt)
     raise FileNotFoundError(f"GT image not found: {url}") from last_error
 
 
