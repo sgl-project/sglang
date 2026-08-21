@@ -763,13 +763,9 @@ class KVCacheConfigurator:
 
         disagg = get_disagg()
         is_decode = disagg.disaggregation_mode == "decode"
-        if is_decode or disagg.enable_pd_role_switch:
-            # Extra slots for pre-allocated requests. Role switching needs a
-            # role-agnostic pool: the decode-flavored DecodeReqToTokenPool is a
-            # superset of ReqToTokenPool, so a prefill instance can use it and
-            # later flip to decode without reallocation. Preserve the original
-            # decode value exactly; only a role-switch prefill needs the fallback
-            # because extra_slots is defaulted for decode at startup.
+        use_decode_pool = is_decode or disagg.enable_pd_role_switch
+        if use_decode_pool:
+            # Decode uses this pool normally; role-switch prefill avoids reallocating.
             pre_alloc_size = disagg.disaggregation_decode_extra_slots
             if not is_decode:
                 pre_alloc_size = pre_alloc_size or 0

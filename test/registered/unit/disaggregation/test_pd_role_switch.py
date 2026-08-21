@@ -73,6 +73,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         )
         self.assertIsInstance(out, PdRoleSwitchReqOutput)
         self.assertFalse(out.success)
+        self.assertTrue(out.safe_to_restore)
         self.assertIn("enable-pd-role-switch", out.message)
         s.teardown_disaggregation.assert_not_called()
 
@@ -80,6 +81,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s = self._scheduler(DisaggregationMode.PREFILL)
         out = Scheduler.handle_pd_role_switch(s, PdRoleSwitchReqInput(new_role="both"))
         self.assertFalse(out.success)
+        self.assertTrue(out.safe_to_restore)
         self.assertIn("invalid new_role", out.message)
         s.teardown_disaggregation.assert_not_called()
 
@@ -89,6 +91,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
             s, PdRoleSwitchReqInput(new_role="decode")
         )
         self.assertFalse(out.success)
+        self.assertTrue(out.safe_to_restore)
         self.assertIn("not running in PD", out.message)
         s.teardown_disaggregation.assert_not_called()
 
@@ -109,6 +112,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
             s, PdRoleSwitchReqInput(new_role="decode")
         )
         self.assertFalse(out.success)
+        self.assertTrue(out.safe_to_restore)
         self.assertIn("not idle", out.message)
         s.teardown_disaggregation.assert_not_called()
 
@@ -153,6 +157,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
             s, PdRoleSwitchReqInput(new_role="decode")
         )
         self.assertFalse(out.success)
+        self.assertFalse(out.safe_to_restore)
         self.assertIn("in progress", out.message)
         s.teardown_disaggregation.assert_not_called()
 
@@ -163,6 +168,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
             s, PdRoleSwitchReqInput(new_role="decode")
         )
         self.assertFalse(out.success)
+        self.assertFalse(out.safe_to_restore)
         self.assertIn("unhealthy", out.message)
         s.teardown_disaggregation.assert_not_called()
 
@@ -177,6 +183,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
 
         # Fail loud (notify), mark unhealthy, no in-place rollback attempt.
         self.assertFalse(out.success)
+        self.assertFalse(out.safe_to_restore)
         self.assertIn("unhealthy", out.message)
         self.assertIn("restart", out.message)
         self.assertTrue(s._pd_role_switch_unhealthy)
@@ -205,6 +212,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         )
 
         self.assertFalse(out.success)
+        self.assertFalse(out.safe_to_restore)
         self.assertIn("unhealthy", out.message)
         self.assertIn("restart", out.message)
         self.assertTrue(s._pd_role_switch_unhealthy)
@@ -242,6 +250,7 @@ class TestPdRoleSwitchReqSerialization(unittest.TestCase):
         self.assertEqual(d["old_role"], "prefill")
         self.assertEqual(d["new_role"], "decode")
         self.assertEqual(d["message"], "ok")
+        self.assertEqual(d["safe_to_restore"], False)
 
 
 class TestPdRoleSwitchStartupValidation(unittest.TestCase):

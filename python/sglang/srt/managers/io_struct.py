@@ -2015,6 +2015,7 @@ class PdRoleSwitchReqOutput(BaseReq, kw_only=True):
     message: str = ""
     old_role: str = ""
     new_role: str = ""
+    safe_to_restore: bool = False
 
 
 class AbortReq(BaseReq, kw_only=True):

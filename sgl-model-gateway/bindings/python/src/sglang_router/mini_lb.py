@@ -316,9 +316,8 @@ async def pd_role_switch(request_data: dict):
     safe while serving, by default the LB first removes the server from its
     routing lists (so no new requests arrive), then retries the switch while
     the server drains its in-flight requests, and only then registers it
-    under the new role. On failure/timeout the server is restored to its
-    original role so it is never dropped from routing. Set "drain": false for
-    a single best-effort attempt without quiescing."""
+    under the new role. A failed server is restored only when the backend
+    confirms that no role state changed."""
     worker_url = request_data.get("worker_url")
     new_role = request_data.get("new_role")
     if worker_url is None:
@@ -348,8 +347,7 @@ async def pd_role_switch(request_data: dict):
         if drain and not_idle and asyncio.get_event_loop().time() < deadline:
             await asyncio.sleep(1.0)
             continue
-        # Give up: restore the original role so the node is not lost.
-        if drain and old_role is not None:
+        if drain and old_role is not None and result.get("safe_to_restore", False):
             lb.add_worker(worker_url, old_role, old_port)
         return ORJSONResponse(content=result, status_code=status)
 

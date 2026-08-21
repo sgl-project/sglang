@@ -853,9 +853,11 @@ class TokenizerControlMixin:
                 message="--enable-pd-role-switch is not set on this server",
                 old_role=self.server_args.disaggregation_mode,
                 new_role=obj.new_role,
+                safe_to_restore=True,
             )
         results = await self.pd_role_switch_communicator(obj)
         all_success = all(r.success for r in results)
+        safe_to_restore = bool(results) and all(r.safe_to_restore for r in results)
         if all_success:
             # Keep the tokenizer-manager's view of the role in sync so future
             # control ops and bootstrap routing behave consistently.
@@ -872,6 +874,7 @@ class TokenizerControlMixin:
             message=msg,
             old_role=results[0].old_role if results else "",
             new_role=obj.new_role,
+            safe_to_restore=safe_to_restore,
         )
 
     async def get_internal_state(self: TokenizerManager) -> List[Dict[Any, Any]]:

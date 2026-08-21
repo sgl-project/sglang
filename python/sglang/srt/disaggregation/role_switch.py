@@ -8,7 +8,7 @@ Kept out of scheduler.py to avoid growing it further.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import PdRoleSwitchReqInput, PdRoleSwitchReqOutput
@@ -47,17 +47,21 @@ def handle_pd_role_switch(
     old_role = scheduler.disaggregation_mode.value
     new_role = (recv_req.new_role or "").lower()
 
-    def _fail(msg: str) -> PdRoleSwitchReqOutput:
+    def _fail(msg: str, safe_to_restore: bool = False) -> PdRoleSwitchReqOutput:
         logger.warning(
             "PD role switch rejected (%s -> %s): %s", old_role, new_role, msg
         )
         return PdRoleSwitchReqOutput(
-            success=False, message=msg, old_role=old_role, new_role=new_role
+            success=False,
+            message=msg,
+            old_role=old_role,
+            new_role=new_role,
+            safe_to_restore=safe_to_restore,
         )
 
-    reason = _reject_reason(scheduler, new_role)
-    if reason is not None:
-        return _fail(reason)
+    rejection = _reject_reason(scheduler, new_role)
+    if rejection is not None:
+        return _fail(*rejection)
     if new_role == old_role:
         return PdRoleSwitchReqOutput(
             success=True,
@@ -66,7 +70,10 @@ def handle_pd_role_switch(
             new_role=new_role,
         )
     if not scheduler.is_fully_idle():
-        return _fail("instance is not idle; drain all requests before switching")
+        return _fail(
+            "instance is not idle; drain all requests before switching",
+            safe_to_restore=True,
+        )
 
     scheduler._pd_role_switch_in_progress = True
     try:
@@ -114,38 +121,43 @@ def handle_pd_role_switch(
         scheduler._pd_role_switch_in_progress = False
 
 
-def _reject_reason(scheduler: Scheduler, new_role: str) -> Optional[str]:
+def _reject_reason(scheduler: Scheduler, new_role: str) -> Optional[Tuple[str, bool]]:
     """Why the switch must be rejected before draining, or None to proceed.
 
     Table-driven: the first failing precondition's message is returned.
     """
     sa = scheduler.server_args
     km = _current_kv_manager(scheduler)
-    # (failed?, lazy message). Messages are callables so only the selected one
-    # is built (avoids touching fields irrelevant to the failing check).
+    # (failed?, safe to restore routing?, lazy message)
     checks = (
         (
             not sa.enable_pd_role_switch,
+            True,
             lambda: "--enable-pd-role-switch is not set on this instance",
         ),
         (
             scheduler._pd_role_switch_unhealthy,
+            False,
             lambda: "instance is unhealthy after a failed role switch; restart required",
         ),
         (
             scheduler._pd_role_switch_in_progress,
+            False,
             lambda: "another role switch is already in progress",
         ),
         (
             new_role not in ("prefill", "decode"),
+            True,
             lambda: f"invalid new_role={new_role!r}",
         ),
         (
             scheduler.disaggregation_mode == DisaggregationMode.NULL,
+            True,
             lambda: "instance is not running in PD disaggregation mode",
         ),
         (
             km is not None and not km.supports_role_switch,
+            True,
             lambda: f"transfer backend {sa.disaggregation_transfer_backend!r} "
             "does not support runtime role switch",
         ),
@@ -155,7 +167,10 @@ def _reject_reason(scheduler: Scheduler, new_role: str) -> Optional[str]:
             "supported with runtime role switch",
         ),
     )
-    return next((msg() for failed, msg in checks if failed), None)
+    return next(
+        ((msg(), safe_to_restore) for failed, safe_to_restore, msg in checks if failed),
+        None,
+    )
 
 
 def _current_kv_manager(scheduler: Scheduler):
