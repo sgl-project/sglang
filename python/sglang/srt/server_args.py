@@ -367,7 +367,7 @@ DSV4_PREFILL_BACKEND_CHOICES = [
 
 DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
 
-DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = ["auto", "deepgemm", "cutedsl", "aiter"]
+DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = ["auto", "deepgemm", "cutedsl", "aiter", "torch"]
 
 MAMBA_RADIX_CACHE_STRATEGY_CHOICES = [
     "auto",
@@ -1835,7 +1835,7 @@ class ServerArgs:
     dsa_paged_mqa_logits_backend: A[
         str,
         Arg(
-            help="DSA indexer paged MQA logits kernel backend. Options: 'auto' (default; DeepGEMM on CUDA, aiter on ROCm), 'deepgemm', 'cutedsl' (CuTe DSL kernel, SM 100 (Blackwell) only; wins at low batch size and long context), 'aiter' (ROCm only).",
+            help="DSA indexer paged MQA logits kernel backend. Options: 'auto' (default; DeepGEMM on CUDA, aiter on ROCm), 'deepgemm', 'cutedsl' (CuTe DSL kernel, SM 100 (Blackwell) only; wins at low batch size and long context), 'aiter' (ROCm only), 'torch' (pure-torch fallback, any CUDA arch, e.g. SM120/SM121 where neither DeepGEMM nor CuteDSL run; slower, opt-in only).",
             choices=DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES,
         ),
         NS("exec.kernel"),
