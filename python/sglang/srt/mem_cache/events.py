@@ -27,12 +27,30 @@ from sglang.srt.disaggregation.kv_events import (
     BlockStoredMetadata,
     BlockStoredWithMetadata,
     StorageMedium,
+    cache_salt_extra_keys,
 )
 from sglang.srt.mem_cache.utils import (
     compute_node_event_hash_values,
     compute_node_hash_values,
     hash_str_to_int64,
 )
+
+
+def _same_placement(a, b) -> bool:
+    """Whether two events describe blocks sitting in the same place.
+
+    The cache-group and locality/ownership fields describe the blocks as a
+    whole, so events that disagree on any of them cannot share one block-hash
+    list. Nothing populates most of them today; comparing them here keeps
+    coalescing correct once something does.
+    """
+    return (
+        a.group_idx == b.group_idx
+        and a.kv_cache_spec_kind == b.kv_cache_spec_kind
+        and a.kv_cache_spec_sliding_window == b.kv_cache_spec_sliding_window
+        and a.locality == b.locality
+        and a.ownership == b.ownership
+    )
 
 
 class KVCacheEventRecorder:
@@ -58,7 +76,7 @@ class KVCacheEventRecorder:
             tail = self._queue[-1]
 
             if isinstance(tail, BlockRemoved) and isinstance(event, BlockRemoved):
-                if tail.medium == event.medium:
+                if tail.medium == event.medium and _same_placement(tail, event):
                     tail.block_hashes.extend(event.block_hashes)
                     return
 
@@ -76,6 +94,11 @@ class KVCacheEventRecorder:
                     and tail.lora_id == event.lora_id
                     and tail.block_size == event.block_size
                     and tail_metadata == event_metadata
+                    and tail.lora_name == event.lora_name
+                    # extra_keys is per-block, so merging two events that carry
+                    # different ones would misalign it with block_hashes.
+                    and tail.extra_keys == event.extra_keys
+                    and _same_placement(tail, event)
                     and tail.block_hashes
                     and event.parent_block_hash == tail.block_hashes[-1]
                 ):
@@ -147,6 +170,9 @@ class KVCacheEventRecorder:
                 "block_size": len(page_tokens),
                 "lora_id": None,
                 "medium": medium,
+                # The salt also rides in the positional extra_keys slot, which
+                # is where a cross-framework consumer reads it from.
+                "extra_keys": cache_salt_extra_keys(node.key.cache_salt),
             }
             if node.key.cache_salt is None:
                 event = BlockStored(**event_args)
