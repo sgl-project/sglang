@@ -574,17 +574,17 @@ def _is_mxfp4_pack_quantized(hf_config: Any) -> bool:
 def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     # MoE runner default, independent of the attention-backend gate above.
     # trtllm-gen fused MoE (flashinfer_mxfp4) beats marlin on both the decode
-    # (M=bs) and the target-verify (M=bs*(gamma+1)) regimes on SM100/SM103;
-    # FlashInfer 0.6.17+ ships the required SiTU kernels and is a pinned
-    # project dependency.
+    # (M=bs) and the target-verify (M=bs*(gamma+1)) regimes on SM100/SM103.
+    # SM107 uses the same packed-MXFP4 runner; leaving auto unresolved falls
+    # back to BF16 weight materialization during model loading.
     if server_args.moe_runner_backend != "auto":
         return {}
-    if not (is_sm100_supported() and get_device_sm() in (100, 103)):
+    if not (is_sm100_supported() and get_device_sm() in (100, 103, 107)):
         return {}
     if not _is_mxfp4_pack_quantized(hf_config):
         return {}
     logger.info(
-        "Kimi-K3 on SM100/SM103: moe_runner_backend=flashinfer_mxfp4 "
+        "Kimi-K3 on SM100/SM103/SM107: moe_runner_backend=flashinfer_mxfp4 "
         "(FlashInfer SiTU kernels)."
     )
     return {"moe_runner_backend": "flashinfer_mxfp4"}
@@ -2405,13 +2405,53 @@ def _data_parallelism_defaults(view: Any) -> dict:
 
 
 @register_post_process
+def _tp_lm_head_all_to_all_default(view: Any) -> dict:
+    """Enable the TP LM-head all-to-all path only for pure-DP decode nodes.
+
+    Prefill-only and colocated nodes keep the feature disabled by default: the
+    LM-head weight layout is fixed at load time, so enabling the TP path would
+    also move their long prefills away from the communication-free DP LM head.
+    An explicit CLI value always wins.
+    """
+    if view.enable_tp_lm_head_all_to_all is not None:
+        return {}
+
+    enable = (
+        view.disaggregation_mode == "decode"
+        and view.enable_dp_attention
+        and view.dp_size > 1
+        and view.tp_size == view.dp_size
+        and view.attn_cp_size == 1
+        and not view.enable_dp_lm_head
+    )
+    return {"enable_tp_lm_head_all_to_all": enable}
+
+
+@register_post_process
 def _dp_lm_head_validation(view: Any) -> dict:
     """Read-only validation pass: dp-attention is a prerequisite for the
-    dp LM head. Reads the mid-resolution values through the view."""
+    dp LM head and the TP LM-head all-to-all path. Reads the mid-resolution
+    values through the view."""
     if view.enable_dp_lm_head:
         assert (
             view.enable_dp_attention
         ), "Please enable dp attention when setting enable_dp_lm_head. "
+    if view.enable_tp_lm_head_all_to_all:
+        assert view.enable_dp_attention, (
+            "Please enable dp attention when setting " "enable_tp_lm_head_all_to_all."
+        )
+        assert not view.enable_dp_lm_head, (
+            "--enable-tp-lm-head-all-to-all uses a TP-sharded LM head and is "
+            "incompatible with --enable-dp-lm-head."
+        )
+        assert view.tp_size == view.dp_size, (
+            "--enable-tp-lm-head-all-to-all currently requires tp_size == "
+            f"dp_size, got tp_size={view.tp_size}, dp_size={view.dp_size}."
+        )
+        assert view.attn_cp_size == 1, (
+            "--enable-tp-lm-head-all-to-all currently requires "
+            f"attn_cp_size == 1, got {view.attn_cp_size}."
+        )
     return {}
 
 
@@ -2547,12 +2587,6 @@ def _a2a_backend_overrides(view: Any) -> dict:
             "requires the DeepEP or MegaMOE backend."
         )
         moe_a2a_backend = "deepep"
-    if envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get() and moe_a2a_backend != "megamoe":
-        moe_a2a_backend = "megamoe"
-        logger.info(
-            "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE is set, "
-            "auto-configuring --moe-a2a-backend megamoe."
-        )
     if moe_a2a_backend != view.moe_a2a_backend:
         return {"moe_a2a_backend": moe_a2a_backend}
     return {}

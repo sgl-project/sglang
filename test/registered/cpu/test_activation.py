@@ -1,6 +1,7 @@
 import sys
 
 import pytest
+import sgl_kernel  # noqa: F401
 import torch
 
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler

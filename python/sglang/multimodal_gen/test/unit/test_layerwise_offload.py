@@ -1,3 +1,4 @@
+import pathlib
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -14,6 +15,9 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
     component_residency_strategies as component_residency_strategies_mod,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers import (
+    host_memory_budget,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
     layerwise_offload as layerwise_offload_mod,
@@ -190,6 +194,8 @@ class _TestServerArgs(SimpleNamespace):
     record_component_layerwise_capability = (
         ServerArgs.record_component_layerwise_capability
     )
+    _parse_component_value_map = staticmethod(ServerArgs._parse_component_value_map)
+    layerwise_tuning_for = ServerArgs.layerwise_tuning_for
 
 
 def _server_args(**kwargs):
@@ -210,7 +216,13 @@ def _server_args(**kwargs):
         dit_offload_prefetch_size=1,
         dit_layerwise_resident_layers=0.0,
         dit_layerwise_residency_policy=RESIDENCY_POLICY_LEADING,
+        layerwise_prefetch_size={},
+        layerwise_resident_layers={},
+        layerwise_residency_policy={},
         pin_cpu_memory=False,
+        # the pin budget ranks candidates by bytes x steps, and reads the step
+        # count off the pipeline's sampling defaults
+        pipeline_class_name=None,
     )
     defaults.update(kwargs)
     return _TestServerArgs(**defaults)
@@ -749,6 +761,25 @@ class _AuxiliaryResidentComponent(_ResidentComponent):
     layerwise_offload_dit_group_enabled = False
 
 
+class _MultiGroupComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
+    layer_names = ["small_blocks", "large_blocks"]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.small_blocks = torch.nn.ModuleList([_DummyBlock()])
+        self.large_blocks = torch.nn.ModuleList(
+            [_DummyBlock(), _DummyBlock(), _DummyBlock()]
+        )
+        self.non_layer = torch.nn.Parameter(torch.ones(2))
+        self.to_parameter_shapes = []
+
+    def to(self, *args, **kwargs):
+        self.to_parameter_shapes.append(
+            {name: tuple(param.shape) for name, param in self.named_parameters()}
+        )
+        return super().to(*args, **kwargs)
+
+
 def _patch_fake_device(monkeypatch):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
@@ -914,6 +945,36 @@ def test_configure_resolves_residency_policy(monkeypatch):
     assert comp.layerwise_offload_managers[0].residency_policy == (
         RESIDENCY_POLICY_STRIDED
     )
+
+
+def test_configure_offloads_all_layer_groups_before_moving_non_layers(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    model = _MultiGroupComponent()
+    initialization_order = []
+    initialize_layer_weights = LayerwiseOffloadManager._initialize_layer_weights
+
+    def record_initialization(manager):
+        initialization_order.append(manager.layers_attr_str)
+        initialize_layer_weights(manager)
+
+    monkeypatch.setattr(
+        LayerwiseOffloadManager,
+        "_initialize_layer_weights",
+        record_initialization,
+    )
+
+    model.configure_layerwise_offload(_server_args())
+
+    assert initialization_order == ["large_blocks", "small_blocks"]
+    assert [
+        manager.layers_attr_str for manager in model.layerwise_offload_managers
+    ] == ["small_blocks", "large_blocks"]
+    assert len(model.to_parameter_shapes) == 1
+    shapes_at_move = model.to_parameter_shapes[0]
+    assert shapes_at_move["non_layer"] == (2,)
+    for name, shape in shapes_at_move.items():
+        if name != "non_layer":
+            assert shape == (1,), name
 
 
 def test_holds_residents_reflects_configuration(monkeypatch):
@@ -1169,3 +1230,166 @@ def test_strided_forward_leaves_exactly_the_resident_set(monkeypatch):
     resident = set(range(8)) - set(manager._streamed_order)
     assert resident <= manager._gpu_layers
     assert len(manager._gpu_layers) <= len(resident) + manager.prefetch_size
+
+
+class _FileBackedBlock(torch.nn.Module):
+    """A block whose weight is a view into a file, as a loaded checkpoint is."""
+
+    def __init__(self, path: pathlib.Path) -> None:
+        super().__init__()
+        path.write_bytes(b"\x00" * (64 * 4))
+        mapped = torch.from_file(str(path), shared=True, size=64, dtype=torch.float32)
+        self.weight = torch.nn.Parameter(mapped.reshape(8, 8), requires_grad=False)
+
+
+class _FileBackedModel(torch.nn.Module):
+    def __init__(self, path: pathlib.Path) -> None:
+        super().__init__()
+        self.blocks = torch.nn.ModuleList([_FileBackedBlock(path)])
+
+
+def _mapped_manager(tmp_path, monkeypatch, *, available_gib):
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+    # Two bindings for one fact: the budget module's copy is what decides
+    # whether the copies fit, and layerwise_offload's own is what the log reports.
+    available_bytes = int(available_gib * 1024**3)
+    for module in (host_memory_budget, layerwise_offload_mod):
+        monkeypatch.setattr(
+            module, "host_memory_available_bytes", lambda: available_bytes
+        )
+    model = _FileBackedModel(tmp_path / "weights.bin")
+    return LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=1,
+        enabled=True,
+        pin_cpu_memory=True,
+        prefetch_size=1,
+    )
+
+
+def test_weights_stay_on_the_mapping_when_copies_do_not_fit(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    # the reserve alone exceeds this, so no copy can be afforded
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    assert manager._mapped_cpu_weights[0], "expected the weight to stay mapped"
+    assert manager._weight_metadata[0]["blocks.0.weight"]["mapped"] is True
+    assert not manager._consolidated_cpu_weights.get(0)
+
+
+def test_weights_are_copied_when_they_fit(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=64)
+    assert not manager._mapped_cpu_weights[0], "a copy was affordable"
+    assert manager._consolidated_cpu_weights[0]
+
+
+def test_a_mapped_weight_is_not_written_back(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    before = manager._mapped_cpu_weights[0]["blocks.0.weight"].clone()
+    manager._gpu_layers.add(0)
+    manager.sync_layer_to_cpu(0)
+    after = manager._mapped_cpu_weights[0]["blocks.0.weight"]
+    assert torch.equal(before, after), "writeback must not touch the checkpoint"
+
+
+def test_the_mapped_store_survives_the_placeholder(tmp_path, monkeypatch):
+    """The store must not hold the parameter it is about to have overwritten.
+
+    `_to_local_tensor` returns the parameter itself for anything that is not a
+    DTensor, so storing it directly stores the parameter. `Tensor.data = ...`
+    then swaps that object's storage in place rather than rebinding a name, so
+    the store is left holding the `(1,)` placeholder. Nothing raises: the reload
+    does `gpu_tensor.copy_(cpu_tensor)`, and a one-element source broadcasts
+    into the full shape, so the layer is silently reconstructed from one value.
+    """
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    stored = manager._mapped_cpu_weights[0]
+    assert stored, "expected the weight to stay mapped"
+
+    parameters = dict(manager.model.named_parameters())
+    for name, tensor in stored.items():
+        assert tensor.numel() > 1, (
+            f"{name} holds {tensor.numel()} element(s): the store is holding the "
+            "placeholder that was assigned to the parameter, not the weight"
+        )
+        assert tensor is not parameters[name], (
+            f"{name} in the store is the parameter object itself, so assigning "
+            "to the parameter's .data will overwrite the store"
+        )
+    assert manager._mapped_bytes == sum(
+        t.numel() * t.element_size() for t in stored.values()
+    ), "the byte counter and the store must describe the same weights"
+
+
+def test_mapped_weights_are_visible_to_checksums(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    names = {name for name, _ in manager.iter_cpu_weights()}
+    assert "blocks.0.weight" in names
+
+
+def test_layerwise_tuning_defaults_match_the_group():
+    """No per-component entry: the DiT group keeps its knobs, auxiliaries do not."""
+    args = _server_args(
+        dit_offload_prefetch_size=3,
+        dit_layerwise_resident_layers=20,
+        dit_layerwise_residency_policy=RESIDENCY_POLICY_STRIDED,
+    )
+    assert args.layerwise_tuning_for("transformer", dit_group=True) == (
+        3.0,
+        20.0,
+        RESIDENCY_POLICY_STRIDED,
+    )
+    assert args.layerwise_tuning_for("text_encoder", dit_group=False) == (
+        0.0,
+        0.0,
+        RESIDENCY_POLICY_LEADING,
+    )
+
+
+def test_layerwise_tuning_per_component_entry_wins():
+    """An auxiliary component can be tuned; its layers cost the same per pass."""
+    args = _server_args(
+        dit_offload_prefetch_size=3,
+        dit_layerwise_resident_layers=20,
+        layerwise_prefetch_size="text_encoder=2",
+        layerwise_resident_layers="text_encoder=4",
+        layerwise_residency_policy={"text_encoder": RESIDENCY_POLICY_STRIDED},
+    )
+    assert args.layerwise_tuning_for("text_encoder", dit_group=False) == (
+        2.0,
+        4.0,
+        RESIDENCY_POLICY_STRIDED,
+    )
+    # an entry for one component leaves every other component alone
+    assert args.layerwise_tuning_for("vae", dit_group=False) == (
+        0.0,
+        0.0,
+        RESIDENCY_POLICY_LEADING,
+    )
+    assert args.layerwise_tuning_for("transformer", dit_group=True)[:2] == (3.0, 20.0)
+
+
+def test_layerwise_tuning_rejects_unknown_policy():
+    args = _server_args(layerwise_residency_policy="vae=sideways")
+    with pytest.raises(ValueError, match="unknown residency policy"):
+        args.layerwise_tuning_for("vae", dit_group=False)
+
+
+def test_layerwise_tuning_accepts_json_and_pair_forms():
+    pair = _server_args(layerwise_resident_layers="vae=6,text_encoder=2")
+    assert pair.layerwise_tuning_for("vae", dit_group=False)[1] == 6.0
+    assert pair.layerwise_tuning_for("text_encoder", dit_group=False)[1] == 2.0
+    as_json = _server_args(layerwise_resident_layers='{"vae": 6}')
+    assert as_json.layerwise_tuning_for("vae", dit_group=False)[1] == 6.0

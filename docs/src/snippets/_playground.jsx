@@ -825,6 +825,8 @@ export const Playground = ({ config }) => {
               || head === "--speculative-eagle-topk"
               || head === "--speculative-num-draft-tokens"
               || head === "--speculative-dspark-block-size"
+              || head === "--enable-linear-replayssm-spec"
+              || head === "--linear-replayssm-cache-len"
               || head === "--speculative-ngram-max-bfs-breadth";
         });
         if (baseSpec.length === 0) return "off";
@@ -850,7 +852,8 @@ export const Playground = ({ config }) => {
         flags = h.stripFlagsByFirstToken(flags, [
           "--speculative-algorithm", "--speculative-num-steps",
           "--speculative-eagle-topk", "--speculative-num-draft-tokens",
-          "--speculative-dspark-block-size",
+          "--speculative-dspark-block-size", "--enable-linear-replayssm-spec",
+          "--linear-replayssm-cache-len",
           "--speculative-ngram-max-bfs-breadth",
         ]);
         const preset = (fc.options || []).find((p) => p.id === value);
@@ -909,10 +912,6 @@ export const Playground = ({ config }) => {
           "--disaggregation-mode", "--disaggregation-transfer-backend",
           "--disaggregation-ib-device", "--disaggregation-bootstrap-port",
         ]);
-        const specAlgorithm = (h.findFlagArg(flags, "--speculative-algorithm") || "").toUpperCase();
-        if ((fc.incompatibleSpeculativeAlgorithms || []).includes(specAlgorithm)) {
-          return { flags, env };
-        }
         const backends = fc.transferBackends || [];
         // A config that omits `modes` has the role on the Deploy panel instead;
         // this card then only tunes the transport for whatever role is selected.
@@ -921,6 +920,16 @@ export const Playground = ({ config }) => {
           : ((sel && sel.pdMode) || "off");
 
         if (mode === "prefill" || mode === "decode") {
+          // PD and some speculative algorithms cannot run together. Keep the
+          // PD card reachable for a speculative base recipe, then make the
+          // user's explicit PD-role selection win by removing the whole
+          // speculative flag family before composing the role command.
+          const specAlgorithm = (h.findFlagArg(
+            flags, "--speculative-algorithm") || "").toUpperCase();
+          if ((fc.incompatibleSpeculativeAlgorithms || []).includes(specAlgorithm)) {
+            flags = flags.filter((flag) =>
+              !flag.split(/[\s=]/)[0].startsWith("--speculative-"));
+          }
           const backend = value.transferBackend || (backends[0] || {}).id || "mooncake";
           const adds = [
             `--disaggregation-mode ${mode}`,
