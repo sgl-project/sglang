@@ -286,9 +286,19 @@ class ServerArgsAutoTuner:
         if not layerwise_components:
             return
 
+        min_available_gb = self._get_min_available_device_memory_gb()
         logger.info(
-            "Auto memory policy for %s selected layerwise offload components: %s",
+            "Auto memory policy for %s: %s of free device memory selects "
+            "layerwise offload for %s. Explicit placement flags always win, "
+            "and the per-component lines below say where each one's weights "
+            "landed -- see the model's cookbook page for what to expect from "
+            "your memory budget.",
             args.pipeline_config.__class__.__name__,
+            (
+                f"{min_available_gb:.1f} GiB"
+                if min_available_gb is not None
+                else "an unknown amount"
+            ),
             ", ".join(layerwise_components),
         )
         args.layerwise_offload_components = layerwise_components
