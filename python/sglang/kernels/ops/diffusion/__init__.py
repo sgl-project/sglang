@@ -201,6 +201,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "LTX-2 QK-norm + split RoPE.",
     ),
     (
+        "diffusion.ltx25_decoder_rope",
+        KernelBackend.JIT,
+        "rope.ltx25_decoder_rope_jit:fused_ltx25_decoder_rope",
+        _CUDA,
+        "Paired LTX-2.5 decoder 3D RoPE.",
+    ),
+    (
         "diffusion.rope_rotate_half",
         KernelBackend.TRITON,
         "rope.rope_rotate_half_bitexact:fused_rope_rotate_half_bitexact",
@@ -393,6 +400,8 @@ _EXPORTS: dict[str, str] = {
     "can_use_ltx2_qknorm_split_rope_cuda": "rope.ltx2_qknorm_split_rope_jit",
     "ltx2_qknorm_split_rope_cuda": "rope.ltx2_qknorm_split_rope_jit",
     "apply_ltx2_split_rotary_emb": "rope.ltx2_rotary_triton",
+    "can_use_ltx25_decoder_rope": "rope.ltx25_decoder_rope_jit",
+    "fused_ltx25_decoder_rope": "rope.ltx25_decoder_rope_jit",
     "can_use_fused_inplace_qknorm_rope": "rope.qknorm_rope_jit",
     "fused_inplace_qknorm_rope": "rope.qknorm_rope_jit",
     "fused_qknorm_rope_pack_kv": "rope.qknorm_rope_jit",

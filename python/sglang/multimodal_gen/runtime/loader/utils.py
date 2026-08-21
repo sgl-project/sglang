@@ -357,6 +357,44 @@ def _read_process_mappings() -> tuple[list[int], list[int], list[bool]] | None:
     return [r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows]
 
 
+class MappedRegions:
+    """Answers whether a tensor's bytes live in a file mapping.
+
+    Built once and reused. The lookup table comes from /proc/self/maps, so
+    rebuilding it per tensor would be quadratic over a checkpoint's worth of
+    weights -- H3's DiT alone has tens of thousands.
+
+    A snapshot, not a live view: mappings created after construction are
+    unknown to it. Callers that need to classify freshly loaded weights should
+    build one after loading, which is when the mappings exist.
+    """
+
+    def __init__(self) -> None:
+        self._maps = _read_process_mappings()
+
+    @property
+    def available(self) -> bool:
+        """False where /proc is absent, in which case nothing is classified."""
+        return self._maps is not None
+
+    def holds_pointer(self, pointer: int) -> bool:
+        if self._maps is None or pointer == 0:
+            return False
+        starts, ends, backed = self._maps
+        index = bisect.bisect_right(starts, pointer) - 1
+        if index < 0 or pointer >= ends[index]:
+            return False
+        return backed[index]
+
+    def holds(self, tensor: torch.Tensor) -> bool:
+        if tensor.device.type != "cpu":
+            return False
+        try:
+            return self.holds_pointer(tensor.untyped_storage().data_ptr())
+        except Exception:
+            return False
+
+
 def component_residency_bytes(module) -> Dict[str, int]:
     """Where a component's weights actually sit, in bytes.
 
@@ -380,16 +418,10 @@ def component_residency_bytes(module) -> Dict[str, int]:
 
     totals = {"vram": 0, "host_pinned": 0, "host_mapped": 0, "host": 0}
     seen: set[int] = set()
-    mappings = _read_process_mappings()
+    regions = MappedRegions()
 
     def is_file_backed(pointer: int) -> bool:
-        if mappings is None:
-            return False
-        starts, ends, backed = mappings
-        index = bisect.bisect_right(starts, pointer) - 1
-        if index < 0 or pointer >= ends[index]:
-            return False
-        return backed[index]
+        return regions.holds_pointer(pointer)
 
     def add(tensor: torch.Tensor) -> None:
         try:

@@ -99,6 +99,7 @@ These fusion families mount under `quality="high"`:
 | `rope_rotate_half` | Triton | bit-exact | `chunk` → `cat(-x2, x1)` → two muls + add → `cat(tail)`, about 7 kernels per projection |
 | `interleaved_rope_fp64` | JIT CUDA | bit-exact | paired SANA-Video Q/K RoPE with fp64 tables, about 14 eager kernels |
 | `ltx2_qknorm_split_rope` | JIT CUDA | close (validated on B200) | LTX-2 QK-norm + split RoPE |
+| `ltx25_decoder_rope` | JIT CUDA | bit-exact | paired LTX-2.5 decoder 3D RoPE from cached compact axis tables |
 | `hunyuan_qkv_rope_pack` | Triton | bit-exact | QKV pack and RoPE in one pass |
 
 ### Activation
@@ -143,6 +144,7 @@ Kernels are written against a specific eager chain in a specific model, so cover
 | Z-Image | BF16-native RMSNorm scale / tanh-residual, per-head QK RMSNorm |
 | Ideogram 4 | gate RMSNorm, SwiGLU, rotate-half RoPE, modulate, residual-gate add |
 | LTX-2 | QK-norm + split RoPE, ada-values split, RMSNorm+modulate, modulate, residual-gate add, linear+GELU |
+| LTX-2.5 decoder | paired 3D RoPE with shared axis-table cache |
 | HunyuanVideo | QKV+RoPE pack, strided QK RMSNorm, linear+GELU |
 | SANA-Video | paired fp64 interleaved RoPE |
 | Sana | LN+modulate, GLUMB bias+SiLU / bias+GLU, residual-gate add |
