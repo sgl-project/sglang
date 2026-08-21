@@ -33,12 +33,15 @@ from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, Union
+import logging
 
 import torch
 
 from sglang.kernels.ops.attention.position import compute_position_triton
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
 )
@@ -670,7 +673,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.mark_forward_metadata_ready()
 
     def init_mlp_sync_metadata(
-        self, batch: ScheduleBatch, device: Union[str, torch.device]
+        self, model_runner, batch: ScheduleBatch, device: Union[str, torch.device]
     ) -> None:
         """Populate per-rank token counts for DP-attention MLP synchronization."""
         if batch.global_num_tokens is None:
@@ -693,14 +696,100 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self.original_global_num_tokens_cpu = batch.global_num_tokens
         self.global_num_tokens_cpu = global_num_tokens
-        self.global_num_tokens_gpu = torch.tensor(
-            global_num_tokens, dtype=torch.int64
-        ).to(device, non_blocking=True)
+        if envs.SGLANG_NPU_PINNED_MEMORY_DP.get() and batch.forward_mode.is_decode():
+            cpu_buf, gpu_view, n = self._copy_list_to_pinned_buf(
+                model_runner,
+                device,
+                global_num_tokens,
+                torch.int64,
+                "global_num_tokens",
+            )
+            gpu_view.copy_(cpu_buf, non_blocking=True)
+            self.global_num_tokens_gpu = gpu_view
+        else:
+            self.global_num_tokens_gpu = torch.tensor(
+                global_num_tokens, dtype=torch.int64
+            ).to(device, non_blocking=True)
         self.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
-        self.global_num_tokens_for_logprob_gpu = torch.tensor(
-            global_num_tokens_for_logprob, dtype=torch.int64
-        ).to(device, non_blocking=True)
+        if envs.SGLANG_NPU_PINNED_MEMORY_DP.get() and batch.forward_mode.is_decode():
+            cpu_buf, gpu_view, n = self._copy_list_to_pinned_buf(
+                model_runner,
+                device,
+                global_num_tokens_for_logprob,
+                torch.int64,
+                "global_num_tokens_for_logprob",
+            )
+            gpu_view.copy_(cpu_buf, non_blocking=True)
+            self.global_num_tokens_for_logprob_gpu = gpu_view
+        else:
+            self.global_num_tokens_for_logprob_gpu = torch.tensor(
+                global_num_tokens_for_logprob, dtype=torch.int64
+            ).to(device, non_blocking=True)
         self.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
+
+    @staticmethod
+    def _get_pinned_scalar_buf(model_runner, device, dtype, attr_name):
+        """Lazily create a double-buffered pinned CPU + device scalar buffer."""
+        cpu_attr = f"_init_new_pinned_{attr_name}"
+        gpu_attr = f"_init_new_gpu_{attr_name}"
+        toggle_attr = f"_init_new_toggle_{attr_name}"
+        if not hasattr(model_runner, cpu_attr):
+            setattr(
+                model_runner,
+                cpu_attr,
+                torch.empty((2, 1), dtype=dtype, pin_memory=True),
+            )
+            setattr(
+                model_runner,
+                gpu_attr,
+                torch.empty((2, 1), dtype=dtype, device=device),
+            )
+            setattr(model_runner, toggle_attr, 0)
+        toggle = getattr(model_runner, toggle_attr)
+        cpu_buf = getattr(model_runner, cpu_attr)[toggle]
+        gpu_buf = getattr(model_runner, gpu_attr)[toggle]
+        setattr(model_runner, toggle_attr, 1 - toggle)
+        return cpu_buf, gpu_buf
+
+    @staticmethod
+    def _copy_list_to_pinned_buf(model_runner, device, values, dtype, attr_name):
+        """Lazily create a double-buffered pinned CPU + device list buffer.
+
+        The selected CPU buffer row is filled with ``values`` and a contiguous
+        device buffer of the same length is returned.  Caller must enqueue the
+        async H2D.  Double buffering prevents the CPU from overwriting a pinned
+        source that the device may still be reading.
+        """
+        n = len(values)
+        cpu_attr = f"_init_new_pinned_{attr_name}"
+        gpu_attr = f"_init_new_gpu_{attr_name}"
+        toggle_attr = f"_init_new_toggle_{attr_name}"
+        if (
+            not hasattr(model_runner, cpu_attr)
+            or getattr(model_runner, cpu_attr).shape[1] < n
+        ):
+            # Resize. First synchronize the device to ensure all pending DMAs
+            # on the old buffer have finished before deleting it.
+            if hasattr(model_runner, cpu_attr):
+                torch.get_device_module(device).synchronize()
+                delattr(model_runner, cpu_attr)
+                delattr(model_runner, gpu_attr)
+                delattr(model_runner, toggle_attr)
+            setattr(
+                model_runner,
+                cpu_attr,
+                torch.empty((2, n), dtype=dtype, pin_memory=True),
+            )
+            setattr(
+                model_runner, gpu_attr, torch.empty((2, n), dtype=dtype, device=device)
+            )
+            setattr(model_runner, toggle_attr, 0)
+        toggle = getattr(model_runner, toggle_attr)
+        cpu_buf = getattr(model_runner, cpu_attr)[toggle]
+        gpu_buf = getattr(model_runner, gpu_attr)[toggle]
+        setattr(model_runner, toggle_attr, 1 - toggle)
+        cpu_buf[:n].copy_(torch.tensor(values, dtype=dtype))
+        return cpu_buf[:n], gpu_buf[:n], n
 
     @classmethod
     def init_new(
@@ -836,12 +925,23 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
         if enable_num_token_non_padded():
-            ret.num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32).to(
-                device, non_blocking=True
-            )
+            if (
+                envs.SGLANG_NPU_PINNED_MEMORY_DP.get()
+                and batch.forward_mode.is_decode()
+            ):
+                cpu_buf, gpu_buf = cls._get_pinned_scalar_buf(
+                    model_runner, device, torch.int32, "num_token_non_padded"
+                )
+                cpu_buf.fill_(num_tokens)
+                gpu_buf.copy_(cpu_buf, non_blocking=True)
+                ret.num_token_non_padded = gpu_buf
+            else:
+                ret.num_token_non_padded = torch.tensor(
+                    num_tokens, dtype=torch.int32
+                ).to(device, non_blocking=True)
         ret.num_token_non_padded_cpu = num_tokens
 
-        ret.init_mlp_sync_metadata(batch, device)
+        ret.init_mlp_sync_metadata(model_runner, batch, device)
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
@@ -1145,6 +1245,32 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self._compute_mrope_positions_extend(model_runner, batch)
 
+    def _npu_mrope_supported(self, batch: ScheduleBatch, batch_size: int) -> bool:
+        """Whether every request's mrope data fits the NPU fast path.
+
+        Data-shape driven: requests whose decode position is exactly
+        ``seq_len - 1 + delta`` (scalar delta, pre-loaded onto NPU, no
+        precomputed per-token decode positions) take the fast path;
+        anything else falls back to the original CPU path below.
+        """
+        for i in range(batch_size):
+            mm = batch.multimodal_inputs[i]
+            if mm is None:
+                continue
+            if (
+                mm.mrope_position_delta is None
+                or mm.mrope_position_delta.numel() != 1
+                or mm.mrope_position_delta_npu is None
+            ):
+                return False
+            if (
+                mm.mrope_positions is not None
+                and mm.mrope_positions.shape[1] >= self.seq_lens_cpu[i]
+            ):
+                # relies on precomputed per-token decode positions
+                return False
+        return True
+
     def _compute_mrope_positions_decode(
         self, model_runner: ModelRunner, batch: ScheduleBatch
     ):
@@ -1153,6 +1279,74 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         mm_inputs = batch.multimodal_inputs
         rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         seq_lens_int64 = self.seq_lens.to(torch.int64)
+
+        if (
+            self.forward_mode.is_decode()
+            and envs.SGLANG_NPU_MROPE_NPU_COMPUTE.get()
+            and self._npu_mrope_supported(batch, batch_size)
+        ):
+            # NPU-side compute, zero per-step H2D.
+            # seq_lens is already on NPU; delta_npu was pre-loaded during
+            # prefill (scheduler._maybe_compute_mrope_positions).
+            # One torch.stack + one vector expression -> result on NPU.
+            device = model_runner.device
+
+            if rl_on_policy_target is not None:
+                positions = (
+                    self.seq_lens[:batch_size]
+                    .sub(1)
+                    .unsqueeze(0)
+                    .expand(3, batch_size)
+                    .contiguous()
+                )
+            elif all(mm is None for mm in batch.multimodal_inputs):
+                # Pure text batch - no MROPE delta needed.
+                # Single vector expression, no loop, no per-request tensor ops.
+                positions = (
+                    self.seq_lens[:batch_size]
+                    .sub(1)
+                    .unsqueeze(0)
+                    .expand(3, batch_size)
+                    .contiguous()
+                )
+            else:
+                deltas_list = []
+                n_mm_none = 0  # mm is None (text-only request)
+                n_delta_npu_none = 0  # mm not None but delta_npu not set
+                n_ok = 0  # using pre-loaded delta_npu
+                for i in range(batch_size):
+                    mm = batch.multimodal_inputs[i]
+                    if mm is not None and mm.mrope_position_delta_npu is not None:
+                        deltas_list.append(mm.mrope_position_delta_npu)
+                        n_ok += 1
+                    else:  # fallback strategy
+                        deltas_list.append(
+                            torch.zeros(1, dtype=torch.int64, device=device)
+                        )
+                        if mm is None:
+                            n_mm_none += 1
+                        else:
+                            n_delta_npu_none += 1
+                if envs.SGLANG_NPU_MROPE_NPU_LOGPRINT.get() and (
+                    n_delta_npu_none > 0 or n_mm_none > 0
+                ):
+                    logger.warning(
+                        f"NPU decode fallback: ok={n_ok}"
+                        f" mm_none={n_mm_none}"
+                        f" delta_npu_none={n_delta_npu_none}"
+                        f" bs={batch_size}"
+                    )
+                deltas_npu = torch.cat(deltas_list)  # (bs,) single NPU kernel
+                positions = (
+                    self.seq_lens[:batch_size]
+                    .sub(1)
+                    .add(deltas_npu)
+                    .unsqueeze(0)
+                    .expand(3, batch_size)
+                    .contiguous()
+                )
+            self.mrope_positions = positions  # already on NPU
+            return
 
         # Some multimodal models (e.g. image generation models) provide
         # precomputed MRoPE positions. In this case, positions cannot be

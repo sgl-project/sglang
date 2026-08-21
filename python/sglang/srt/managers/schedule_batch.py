@@ -607,6 +607,7 @@ class MultimodalInputs:
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[torch.Tensor] = None
     mrope_position_delta_repeated_cache: Optional[torch.Tensor] = None
+    mrope_position_delta_npu: Optional[torch.Tensor] = None
 
     # Moss-VL related
     vision_position_ids: Optional[torch.Tensor] = None

@@ -2339,11 +2339,30 @@ class Scheduler(
         return True
 
     def _maybe_compute_mrope_positions(self, req) -> None:
-        """Compute M-RoPE positions when they are missing (e.g. gRPC preprocessed path)."""
+        """Compute M-RoPE positions when they are missing (e.g. gRPC preprocessed path).
+
+        When SGLANG_NPU_MROPE_NPU_COMPUTE is enabled, also pre-loads the
+        mrope_position_delta onto NPU so decode can compute positions
+        entirely on-device with zero per-step H2D.
+        """
         if self._mm_processor is None:
             return
         mm = req.multimodal_inputs
-        if mm is None or mm.mrope_positions is not None:
+        if mm is None:
+            return
+
+        # Pre-load delta onto NPU during prefill.
+        if (
+            envs.SGLANG_NPU_MROPE_NPU_COMPUTE.get()
+            and mm.mrope_position_delta is not None
+            and mm.mrope_position_delta_npu is None
+            and mm.mrope_position_delta.numel() == 1
+        ):
+            mm.mrope_position_delta_npu = mm.mrope_position_delta.view(1).to(
+                device=self.device, non_blocking=True
+            )
+
+        if mm.mrope_positions is not None:
             return
 
         mrope_positions, mrope_position_delta = (
@@ -2354,6 +2373,15 @@ class Scheduler(
         if mrope_positions is not None:
             mm.mrope_positions = mrope_positions
             mm.mrope_position_delta = mrope_position_delta
+            if (
+                envs.SGLANG_NPU_MROPE_NPU_COMPUTE.get()
+                and mm.mrope_position_delta_npu is None
+                and mrope_position_delta is not None
+                and mrope_position_delta.numel() == 1
+            ):
+                mm.mrope_position_delta_npu = mrope_position_delta.view(1).to(
+                    device=self.device, non_blocking=True
+                )
 
     def _maybe_namespace_elastic_radix_cache(self, req: Req) -> None:
         if (

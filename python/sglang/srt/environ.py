@@ -846,6 +846,45 @@ class Envs:
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NPU_USE_TRITON_KV_CACHE_STORE"
     )
+    # Pre-load mrope_position_delta onto NPU during prefill and compute
+    # mrope_positions directly on NPU during decode, eliminating per-step
+    # H2D and its HBM bandwidth contention with compute kernels.
+    SGLANG_NPU_MROPE_NPU_COMPUTE = EnvBool(False)
+    # Debug logging for MRope NPU compute.
+    SGLANG_NPU_MROPE_NPU_LOGPRINT = EnvBool(False)
+    # Double-buffered graphs plus a persistent update thread: capture two graph
+    # instances per shape and alternate replay, with a persistent thread calling
+    # graph.update() (FIA operator parameter replay) inside the device window of
+    # the current step's computation, removing device idle time between steps
+    # caused by update.
+    SGLANG_NPU_GRAPH_DOUBLE_BUFFER = EnvBool(False)
+    # Lookahead dispatch (option A2): when double buffering is enabled, pre-
+    # dispatch the next step's update (decode predicts seq_lens+1) immediately
+    # after each replay for the other instance, so update starts at the
+    # beginning of the compute window and no longer depends on the main thread
+    # reaching execute; on misprediction, re-do update synchronously before
+    # replay, falling back to dispatch-wait mode. Only effective when
+    # DOUBLE_BUFFER is enabled.
+    SGLANG_NPU_GRAPH_DOUBLE_BUFFER_LOOKAHEAD = EnvBool(False)
+    # Test flag: enable pinned memory for DP.
+    SGLANG_NPU_PINNED_MEMORY_DP = EnvBool(False)
+    # GDN linear attention decode: use Triton fused causal_conv1d kernel (single
+    # kernel handles conv state in-place advancement + weighted sum + SiLU)
+    # instead of the PyTorch decomposed path (~10 small operators per layer).
+    # When disabled (default), keep the transpose+clone+write-back decomposed
+    # path. Note: the decomposed path does not add conv bias, while the fused
+    # path does; they differ numerically when bias is non-zero (fused path
+    # matches prefill).
+    SGLANG_NPU_GDN_CONV_FUSED = EnvBool(False)
+    # GDN input projection qkvz/ba split+reshape+concat goes through a Triton
+    # fused kernel, replacing the small-operator cluster produced by
+    # fix_query_key_value_ordering + contiguous + torch.cat.
+    SGLANG_NPU_FUSED_QKVZBA_SPLIT = EnvBool(False)
+    # Sigmoid-gated multiply (attention output gating / shared expert gating)
+    # goes through a Triton fused kernel, replacing Sigmoid + (Inplace)Mul.
+    SGLANG_NPU_FUSED_SIGMOID_MUL = EnvBool(False)
+    SGLANG_NPU_GDN_UPDATE_FUSED = EnvBool(False)
+
     # Quantize x to int8 in the dispatch operator (vendor alias consumed by the
     # Ascend DeepEP library; the MTP draft-build scopes override it to False).
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
