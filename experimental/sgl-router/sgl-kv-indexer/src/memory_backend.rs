@@ -332,12 +332,27 @@ impl InMemoryKvIndexerBackend {
         for (stream, expected) in configured {
             let worker = state.workers.entry(stream).or_default();
             worker.address = expected.worker_address;
-            worker.spec = expected.cache_spec;
-            worker.worker_generation = expected.worker_generation;
-            worker.model = expected.model;
-            worker.hash_schema_version = expected.hash_schema_version;
-            worker.page_size = expected.page_size;
-            worker.is_bigram = expected.is_bigram;
+            // Bridge configuration is the desired topology. Empty dynamic
+            // fields mean "learn from Snapshot v2", not "erase the recovered
+            // value". This method is also the idle Indexer-epoch heartbeat,
+            // so blindly assigning None/empty every second would clear the
+            // generation and component spec of an otherwise READY stream.
+            if expected.cache_spec.is_some() {
+                worker.spec = expected.cache_spec;
+            }
+            if !expected.worker_generation.is_empty() {
+                worker.worker_generation = expected.worker_generation;
+            }
+            if !expected.model.is_empty() {
+                worker.model = expected.model;
+            }
+            if expected.hash_schema_version != 0 {
+                worker.hash_schema_version = expected.hash_schema_version;
+                worker.is_bigram = expected.is_bigram;
+            }
+            if expected.page_size != 0 {
+                worker.page_size = expected.page_size;
+            }
         }
         self.refresh_status(&state);
         Ok(coverage_response(&state, &self.instance_epoch))
@@ -1368,6 +1383,17 @@ mod tests {
             })
             .await
             .unwrap();
+        // The Bridge uses this same RPC as an Indexer-process heartbeat.
+        // Topology-only configuration must preserve Snapshot-owned fields.
+        let mut heartbeat = expected_stream("worker", 0, "http://worker");
+        heartbeat.worker_generation.clear();
+        heartbeat.cache_spec = None;
+        backend
+            .configure_expected_workers(ConfigureExpectedWorkersRequest {
+                workers: vec![heartbeat],
+            })
+            .await
+            .unwrap();
         let after = backend
             .match_external_kv_prefix(MatchExternalKvPrefixRequest {
                 hashes: (0..COUNT).map(|hash| hash as i64).collect(),
@@ -1379,6 +1405,7 @@ mod tests {
         assert!(after.complete_coverage);
         assert_eq!(after.best_prefix_blocks as usize, COUNT);
         assert_eq!(after.coverage[0].watermark, 7);
+        assert_eq!(after.coverage[0].worker_generation, "generation-1");
     }
 
     #[tokio::test]
