@@ -15,11 +15,11 @@ import torch
 from sglang.srt.layers.attention.cutedsl_mla_backend import CuteDslMLABackend
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
-    FP4_KV_CACHE_DTYPES,
     TRTLLMMLABackend,
     varlen_absorbed_mla_shape_ok,
     varlen_absorbed_mla_supported,
 )
+from sglang.srt.utils import FP4_KV_CACHE_DTYPES
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -91,13 +91,16 @@ class TestVarlenAbsorbedCapabilityContract(CustomTestCase):
         return ServerArgs(model_path="dummy")
 
     def test_server_args_delegates_to_the_backend_predicate(self):
+        from sglang.srt.arg_groups.cuda_graph_hook import (
+            trtllm_mla_has_varlen_absorbed,
+        )
+
         args = self._server_args()
         for supported in (True, False):
             with self.subTest(supported=supported):
                 with (
-                    patch.object(
-                        args,
-                        "_resolved_attention_backends",
+                    patch(
+                        "sglang.srt.arg_groups.overrides.attention_backends_of",
                         return_value=("trtllm_mla", "trtllm_mla"),
                     ),
                     patch(
@@ -105,16 +108,21 @@ class TestVarlenAbsorbedCapabilityContract(CustomTestCase):
                         return_value=supported,
                     ) as helper,
                 ):
-                    lacks = args._trtllm_mla_lacks_varlen_absorbed()
-                self.assertEqual(lacks, not supported)
+                    has = trtllm_mla_has_varlen_absorbed(args)
+                self.assertEqual(has, supported)
                 helper.assert_called_once_with(args.kv_cache_dtype)
 
     def test_other_backends_are_never_excluded(self):
+        from sglang.srt.arg_groups.cuda_graph_hook import (
+            trtllm_mla_has_varlen_absorbed,
+        )
+
         args = self._server_args()
-        with patch.object(
-            args, "_resolved_attention_backends", return_value=("fa3", "fa3")
+        with patch(
+            "sglang.srt.arg_groups.overrides.attention_backends_of",
+            return_value=("fa3", "fa3"),
         ):
-            self.assertFalse(args._trtllm_mla_lacks_varlen_absorbed())
+            self.assertTrue(trtllm_mla_has_varlen_absorbed(args))
 
     def test_fp4_kv_spellings_match_the_dtype_resolver(self):
         # A --kv-cache-dtype spelling that resolves to the packed 4-bit dtype but
@@ -147,14 +155,14 @@ class TestVarlenAbsorbedCapabilityContract(CustomTestCase):
         # ServerArgs passes the CLI string, the backend passes a torch dtype.
         if not hasattr(torch, "float4_e2m1fn_x2"):
             self.skipTest("torch build has no float4_e2m1fn_x2")
-        with patch(f"{self._BACKEND}.get_device_capability", return_value=(10, 0)):
+        with patch(f"{self._BACKEND}.is_sm100_supported", return_value=True):
             self.assertFalse(varlen_absorbed_mla_supported("nvfp4"))
             self.assertFalse(varlen_absorbed_mla_supported(torch.float4_e2m1fn_x2))
             self.assertTrue(varlen_absorbed_mla_supported("fp8_e4m3"))
             self.assertTrue(varlen_absorbed_mla_supported(torch.float8_e4m3fn))
 
     def test_non_sm10_is_unsupported_whatever_the_kv_dtype(self):
-        with patch(f"{self._BACKEND}.get_device_capability", return_value=(9, 0)):
+        with patch(f"{self._BACKEND}.is_sm100_supported", return_value=False):
             self.assertFalse(varlen_absorbed_mla_supported("fp8_e4m3"))
             self.assertFalse(varlen_absorbed_mla_supported(torch.float8_e4m3fn))
 

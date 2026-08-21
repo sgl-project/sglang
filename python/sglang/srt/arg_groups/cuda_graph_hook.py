@@ -124,12 +124,9 @@ def apply_cuda_graph_compatibility(server_args: Any):
         and not model_config_of(
             server_args
         ).is_multimodal_breakable_cuda_graph_supported
-        # trtllm_mla was excluded here while any captured prefill graph forced
-        # it onto the FlashInfer paged-MLA fallback. It now serves that extend
-        # with absorbed MLA over a ragged q, so keep the exclusion only for the
-        # configurations where that path is unavailable and the fallback (and
-        # its regression) would come back.
-        and not trtllm_mla_lacks_varlen_absorbed(server_args)
+        # Only trtllm_mla configs that still need the FlashInfer paged-MLA
+        # fallback (see trtllm_mla_backend.py) stay excluded.
+        and trtllm_mla_has_varlen_absorbed(server_args)
     ):
         logger.info(
             "Using tc_piecewise CUDA graph for validated multimodal " "decoder prefill."
@@ -150,21 +147,16 @@ def apply_cuda_graph_compatibility(server_args: Any):
         disable_full_prefill_cudagraph_if_incompatible(server_args)
 
 
-def trtllm_mla_lacks_varlen_absorbed(server_args: Any) -> bool:
-    """True when prefill runs on trtllm_mla but the backend cannot serve a
-    captured-graph extend with absorbed MLA over a ragged query, so a
-    tc_piecewise upgrade would land it back on the FlashInfer paged-MLA
-    fallback. Reads the backend's own predicate so the two cannot drift.
-    """
+def trtllm_mla_has_varlen_absorbed(server_args: Any) -> bool:
     from sglang.srt.arg_groups.overrides import attention_backends_of
 
     if attention_backends_of(resolved_view(server_args))[0] != "trtllm_mla":
-        return False
+        return True
     from sglang.srt.layers.attention.trtllm_mla_backend import (
         varlen_absorbed_mla_supported,
     )
 
-    return not varlen_absorbed_mla_supported(server_args.kv_cache_dtype)
+    return varlen_absorbed_mla_supported(server_args.kv_cache_dtype)
 
 
 def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
