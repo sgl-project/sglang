@@ -48,6 +48,7 @@ from sglang.srt.disaggregation.utils import (
     is_aborted,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
+    is_mla_or_hybrid_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_pp,
     prepare_abort,
@@ -156,6 +157,23 @@ class PrefillBootstrapQueue:
             self.scheduler.tp_worker.model_runner.effective_max_total_num_tokens
         )
         self.transfer_backend = transfer_backend
+        if envs.SGLANG_DISAGG_DCP_STAGING_BUFFER.get():
+            if self.transfer_backend != TransferBackend.MOONCAKE:
+                raise RuntimeError(
+                    "SGLANG_DISAGG_DCP_STAGING_BUFFER currently requires the "
+                    "Mooncake transfer backend."
+                )
+            if not is_mla_or_hybrid_mla_backend(self.token_to_kv_pool):
+                raise RuntimeError(
+                    "SGLANG_DISAGG_DCP_STAGING_BUFFER is only supported for "
+                    "MLA or hybrid-MLA DCP relayout."
+                )
+            size_mb = envs.SGLANG_DISAGG_DCP_STAGING_BUFFER_SIZE_MB.get()
+            if size_mb <= 0:
+                raise RuntimeError(
+                    "SGLANG_DISAGG_DCP_STAGING_BUFFER_SIZE_MB must be positive, "
+                    f"got {size_mb}."
+                )
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
             if self.is_mla_backend:
                 raise RuntimeError(
