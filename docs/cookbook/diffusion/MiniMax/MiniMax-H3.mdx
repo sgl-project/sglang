@@ -1206,12 +1206,19 @@ the shortfall lands decides the throughput.
 
 **Two budgets, and what each one buys**
 
-| | 12 GB VRAM + 32 GB host | VRAM budget only, host free |
+| | 12 GB VRAM + 32 GB host | host free, VRAM 16 GB |
 | --- | ---: | ---: |
-| Peak VRAM | ≤ 12 GiB | ≤ 12 GiB |
+| Recipe | A | B |
+| Peak VRAM | ≤ 12 GiB | ≤ 16 GiB (OOMs at 12) |
 | Host anonymous (must fit) | 24.5 GiB | 116.7 GB pinned |
-| Denoise, 864×480 / 124 frames / 20 NFE | 17.38 s/it | **6.10 s/it** |
+| Denoise, 864×480 / 124 frames / 20 NFE | 16.8 - 18.7 s/it | **6.01 s/it** |
 | Runs at all | yes | yes |
+
+The left column is one configuration measured twice, at 318.94 s and 356.37 s;
+the 12% spread tracked host load on a shared machine, so treat smaller
+differences than that as unresolved. The right column is 120.92 s at a 16 GiB
+allocator cap. Four resident DiT layers is what Recipe B buys its speed with,
+and it is also why 12 GiB is not enough for it.
 
 Read the host row carefully, because the two numbers are not the same kind of
 memory. *Anonymous* host memory — pinned buffers and pageable copies — has to fit,
@@ -1222,11 +1229,22 @@ VRAM with `torch.cuda.set_per_process_memory_fraction` and let the allocator fai
 rather than reading `nvidia-smi`, which reports the caching allocator's reserved
 pool and overstates the requirement.
 
-Inside 32 GB the weights cannot be held, so roughly 49 GiB per denoise step is
-re-read from the checkpoint mapping at about 3.4 GB/s. That is arithmetic, not a
-tuning gap: no lossless setting removes it, and an NVMe is a requirement rather
-than a recommendation. Giving the host room to pin the weights instead is what
-takes the step from 17.38 s to 6.10 s.
+Inside 32 GB the weights cannot be pinned, so each denoise step copies about
+60 GiB from the checkpoint mapping, and a mapped source is synchronous however
+the copy is requested: the driver stages it through its own buffer, so the
+transfer neither overlaps compute nor runs at pinned bandwidth. That is where
+the step goes, and giving the host room to pin the weights instead is what takes
+it to 6.01 s.
+
+Two caveats on the constrained number, both from instrumenting the run rather
+than from arithmetic. The machine it was measured on has 2 TB of host memory, so
+the kernel kept all 107.7 GiB of mapped checkpoint pages resident: major faults
+across a whole request were 6, and `read_bytes` was zero. Nothing was read from
+disk. A real 32 GB host cannot cache 107.7 GiB, so it will fault and re-read,
+and should be expected to be slower than the figures here rather than equal to
+them — an NVMe is a requirement, not a recommendation. Measure your own machine
+with major faults (`/proc/<pid>/stat`) on the worker process, not on the
+launcher, which holds no weights.
 
 **Recipe A — fits 12 GB VRAM + 32 GB host**
 
@@ -1267,14 +1285,21 @@ Recipe B pins 116.7 GB of host memory (DiT 61.56 GB, text encoder 46.18 GB, VAE
 Same unpruned bf16 checkpoints, same card, same sampler settings (cfg 1.0,
 euler_ancestral, sigma shift 12.0/3.0, seed 1101), 864×480 / 124 frames / 20 NFE:
 
-| | denoise | host memory | peak VRAM |
+| | denoise | host anonymous | peak VRAM |
 | --- | ---: | ---: | ---: |
-| sglang, Recipe B | **6.10 s/it** | 116.7 GB pinned | ≤ 12 GiB |
+| sglang, Recipe B | **6.01 s/it** | 116.7 GB pinned | ≤ 16 GiB |
 | ComfyUI KSampler | 6.58–6.59 s/it | 116.5 GiB | 13048 MiB |
+| ComfyUI, `--fast-disk` | 6.57–6.60 s/it | 57.5 GiB | 12880 MiB |
 
-Both need about 116 GB of host memory to reach those numbers, and neither fits
-Recipe A's budget there. Inside 12 GB + 32 GB, ComfyUI cannot run these weights at
-all; the path it ships for 12 GB cards uses
+Both need far more host memory than Recipe A's budget to reach those numbers.
+ComfyUI does ship a mode for this: `--fast-disk` prefers disk-backed loading
+over RAM and halves its anonymous footprint at no measurable cost in speed,
+which is the closest thing it has to Recipe A. It still needs 57.5 GiB, so
+inside 12 GB + 32 GB it cannot run these weights. Pushing further the other way
+costs rather than saves: adding `--novram --cache-none --disable-pinned-memory`
+took anonymous memory back up to 69.1 GiB and the request from 346 s to 750 s.
+
+The path ComfyUI ships for 12 GB cards uses
 `minimax_h3_fl2va_pruned_int8_convrot` and `qwen3vl_32b_minimax_h3_nvfp4_awq`,
 i.e. an int8 DiT and an NVFP4 text encoder, and its pruned bf16 file is 40.2 GB
 against the unpruned 66.3 GB. Those are different weights, so it is not a
