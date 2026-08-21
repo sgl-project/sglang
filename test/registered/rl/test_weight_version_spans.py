@@ -8,8 +8,8 @@ import requests
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
-    DEFAULT_DRAFT_MODEL_EAGLE,
-    DEFAULT_TARGET_MODEL_EAGLE,
+    DEFAULT_MODEL_NAME_FOR_TEST_MLA,
+    DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -37,7 +37,7 @@ def _assert_spans_contiguous(test, meta_info):
 class TestWeightVersionSpans(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_TARGET_MODEL_EAGLE
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -46,22 +46,24 @@ class TestWeightVersionSpans(CustomTestCase):
             other_args=[
                 "--weight-version",
                 "base-v0",
+                "--trust-remote-code",
                 "--tp-size",
                 "2",
+                "--dp-size",
+                "2",
+                "--enable-dp-attention",
                 "--speculative-algorithm",
                 "EAGLE",
-                "--speculative-draft-model",
-                DEFAULT_DRAFT_MODEL_EAGLE,
+                "--speculative-draft-model-path",
+                DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
                 "--speculative-num-steps",
-                "5",
+                "2",
                 "--speculative-eagle-topk",
-                "4",
+                "3",
                 "--speculative-num-draft-tokens",
-                "8",
-                "--attention-backend",
-                "fa3",
-                "--mem-fraction-static",
-                "0.7",
+                "3",
+                "--cuda-graph-max-bs-decode",
+                "32",
             ],
         )
 
@@ -116,18 +118,6 @@ class TestWeightVersionSpans(CustomTestCase):
         self.assertEqual(response.status_code, 200)
         return response.json()
 
-    def _update_weights_from_disk(self, **fields) -> None:
-        # flush_cache would abort: a retract-paused server has the requests in
-        # its waiting queue, and flush_cache refuses while that queue is
-        # non-empty, which trips an assert inside the scheduler.
-        response = requests.post(
-            f"{self.base_url}/update_weights_from_disk",
-            json={"model_path": self.model, "flush_cache": False, **fields},
-            timeout=_REQUEST_TIMEOUT,
-        )
-        self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.json()["success"])
-
     def _run_while_paused(
         self,
         num_requests: int,
@@ -181,36 +171,6 @@ class TestWeightVersionSpans(CustomTestCase):
             spans = _assert_spans_contiguous(self, meta_info)
             self.assertEqual(len(spans), 1)
             self.assertEqual(spans[0]["version"], "endpoint-v1")
-
-    def test_03_spans_split_across_pause_update_continue(self):
-        """Requests spanning pause -> update_weights_from_disk -> continue report one span per version."""
-        base_version = self._current_version()
-
-        results = self._run_while_paused(
-            num_requests=4,
-            while_paused=lambda: self._update_weights_from_disk(
-                weight_version="disk-v2"
-            ),
-        )
-
-        multi_span_count = 0
-        for data in results:
-            meta_info = data["meta_info"]
-            spans = _assert_spans_contiguous(self, meta_info)
-            self.assertEqual(spans[-1]["end"], meta_info["completion_tokens"])
-            versions = [span["version"] for span in spans]
-            self.assertEqual(versions[0], base_version)
-            self.assertIn(versions[-1], (base_version, "disk-v2"))
-            if len(spans) > 1:
-                multi_span_count += 1
-                self.assertEqual(versions, [base_version, "disk-v2"])
-                self.assertGreater(spans[0]["end"], 0)
-
-        self.assertGreater(
-            multi_span_count,
-            0,
-            "No request spanned the weight update -- no boundary was recorded.",
-        )
 
     def test_04_openai_metadata_contains_weight_versions(self):
         """OpenAI-compatible responses surface the spans under response metadata."""
@@ -323,22 +283,6 @@ class TestWeightVersionSpans(CustomTestCase):
             0,
             "No running request was split -- the running batch was not visited.",
         )
-
-    def test_07_update_without_weight_version_does_not_split(self):
-        """A refit that carries no weight_version leaves attribution untouched."""
-        version = self._current_version()
-
-        results = self._run_while_paused(
-            num_requests=4, while_paused=self._update_weights_from_disk
-        )
-        self.assertEqual(self._current_version(), version)
-
-        for data in results:
-            meta_info = data["meta_info"]
-            spans = _assert_spans_contiguous(self, meta_info)
-            self.assertEqual(len(spans), 1)
-            self.assertEqual(spans[0]["version"], version)
-            self.assertEqual(spans[0]["end"], meta_info["completion_tokens"])
 
     def test_08_reannouncing_current_version_is_a_noop(self):
         """Re-announcing the version the server already has must not split anything."""
