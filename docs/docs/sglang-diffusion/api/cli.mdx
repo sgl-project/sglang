@@ -203,7 +203,7 @@ sglang generate \
 HTTP server-only arguments are ignored by `sglang generate`.
 </Note>
 
-For supported native pipelines, set `SGLANG_CACHE_DIT_ENABLED=true` to enable Cache-DiT. For the diffusers backend, use `--backend diffusers --cache-dit-config ...`. See [Cache-DiT](../cache_dit).
+For supported native pipelines, set `SGLANG_CACHE_DIT_ENABLED=true` to enable Cache-DiT. It can run with DiT layerwise offload; it cannot run with FSDP. For the diffusers backend, use `--backend diffusers --cache-dit-config ...`. See [Cache-DiT](../cache_dit).
 
 For supported image pipelines, breakable CUDA graph can be enabled with `--enable-breakable-cuda-graph`, but you must declare every served resolution in `--warmup-resolutions` so warmup captures matching graph signatures.
 
@@ -244,7 +244,7 @@ sglang generate \
 
 Values passed to the compatibility option `--layerwise-offload-components` must match loaded component keys, such as `transformer`, `text_encoder`, `image_encoder`, `vae`, `condition_image_encoder`, `spatial_upsampler`, or `vocoder`. Its `default` group selects text encoders, image encoders, and VAEs. Use `all` to select every layerwise-offloadable component.
 
-Layerwise tuning options such as `--dit-offload-prefetch-size`, `--dit-layerwise-resident-layers`, and `--dit-layerwise-residency-policy` continue to control the streamed layer working set. Prefer the smallest component set that solves the memory issue because layerwise offload can increase latency.
+Layerwise tuning options such as `--dit-offload-prefetch-size`, `--dit-layerwise-resident-layers`, and `--dit-layerwise-residency-policy` continue to control the streamed layer working set. Prefer the smallest component set that solves the memory issue because layerwise offload can increase latency. DiT layerwise offload can run with Cache-DiT: skipped blocks are not streamed, and the first layer after a skip may sync-load. Cache-DiT remains incompatible with FSDP.
 
 Those three set the default for every streamed component. To give one component its own values, use the `component=value` forms, which also accept JSON:
 
