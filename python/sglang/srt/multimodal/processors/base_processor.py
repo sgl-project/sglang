@@ -802,7 +802,7 @@ class BaseMultimodalProcessor(ABC):
             data_str = str(data)
             if len(data_str) > 100:
                 data_str = data_str[:100] + "..."
-            raise RuntimeError(f"Error while loading data {data_str}: {e}") from e
+            raise ValueError(f"Error while loading data {data_str}: {e}") from e
 
     @staticmethod
     def _get_preprocessed_input_format(data):
@@ -1175,9 +1175,9 @@ class BaseMultimodalProcessor(ABC):
                     modality.name,
                     idx,
                 )
-                raise RuntimeError(
+                raise ValueError(
                     f"An exception occurred while loading {modality.name} data at index {idx}: {e}"
-                )
+                ) from e
 
             if modality == Modality.IMAGE:
                 images[idx] = result
@@ -1307,17 +1307,17 @@ class BaseMultimodalProcessor(ABC):
                 if has_precomputed_input:
                     new_text_parts += [text_part]
                     continue
-                raise RuntimeError(
+                raise ValueError(
                     f"An exception occurred while loading multimodal data: {e}"
-                )
+                ) from e
             except ValueError as e:
                 raise ValueError(
                     f"An exception occurred while loading multimodal data: {e}"
                 ) from e
             except Exception as e:
-                raise RuntimeError(
+                raise ValueError(
                     f"An exception occurred while loading multimodal data: {e}"
-                )
+                ) from e
         return BaseMultiModalProcessorOutput(
             images=images,
             audios=audios,

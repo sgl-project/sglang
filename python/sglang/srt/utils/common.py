@@ -1859,7 +1859,12 @@ def _load_image(
                     "Failed to decode JPEG on GPU, falling back to CPU. Error: %s",
                     e,
                 )
-    return Image.open(BytesIO(image_bytes))
+    try:
+        image = Image.open(BytesIO(image_bytes))
+        image.load()
+        return image
+    except (UnidentifiedImageError, OSError) as e:
+        raise ValueError(f"Invalid image data: {e}") from e
 
 
 def load_image(
