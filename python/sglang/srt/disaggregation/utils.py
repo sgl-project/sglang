@@ -1179,9 +1179,9 @@ def setup_state_kv_args(
             )
 
     # DSV4 NextN shares the target allocator, so target and draft use the same
-    # local SWA indices. Keep draft buffers in a separate positional component
-    # to avoid mixing them into the target's heterogeneous state layout, while
-    # reusing the existing SWA transport dispatch on both GPU and NPU.
+    # local SWA indices. Keep draft buffers in a separate state component to
+    # avoid mixing them into the target's heterogeneous layout. Explicit stage
+    # IDs preserve this separation when prefill and decode use different PP.
     if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool) and isinstance(
         draft_token_to_kv_pool, DeepSeekV4TokenToKVPool
     ):
@@ -1255,12 +1255,21 @@ def setup_state_kv_args(
             draft_state_type = StateType.SWA
 
         if draft_ptrs:
+            draft_layer_ids = (
+                draft_token_to_kv_pool.get_draft_swa_state_layer_ids()
+            )
+            if len(draft_layer_ids) != len(draft_ptrs):
+                raise RuntimeError(
+                    "DSV4 draft SWA state layer IDs do not match buffer count: "
+                    f"layers={len(draft_layer_ids)}, buffers={len(draft_ptrs)}"
+                )
             append_state_component(
                 kv_args,
                 draft_state_type,
                 draft_ptrs,
                 draft_lens,
                 draft_item_lens,
+                layer_ids=draft_layer_ids,
             )
 
     if (

@@ -306,6 +306,10 @@ class SWAComponent(TreeComponent):
 
         is_tombstone = node.component_data[self.component_type].value is None
         if not is_tombstone:
+            # This overlap is beyond prev_prefix_len, so the model recomputed
+            # the node and populated its canonical draft sidecar.
+            if self.draft_swa_sidecar is not None:
+                self.draft_swa_sidecar.mark_device(node)
             return prefix_len
 
         full_cd = node.component_data[BASE_COMPONENT_TYPE]

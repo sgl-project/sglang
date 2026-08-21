@@ -154,6 +154,40 @@ class TestDSV4DraftSWASidecar(unittest.TestCase):
         )
         self.assertTrue(covered_exact_match(node))
 
+    def test_recomputed_overlap_commits_sidecar_coverage(self):
+        root = SimpleNamespace(parent=None, component_data=[None, None, None])
+        swa_data = SimpleNamespace(
+            metadata={},
+            value=torch.arange(256),
+            host_value=None,
+        )
+        node = SimpleNamespace(
+            id=1,
+            parent=root,
+            component_data=[None, swa_data, None],
+        )
+        cache = SimpleNamespace(
+            page_size=256,
+            sliding_window_size=128,
+            tree_core=SimpleNamespace(root_node=root),
+        )
+        sidecar = DraftSWASidecarComponent(cache)
+        swa = object.__new__(SWAComponent)
+        swa.draft_swa_sidecar = sidecar
+        swa.component_type = ComponentType.SWA
+
+        consumed = swa.update_component_on_insert_overlap(
+            node=node,
+            prefix_len=256,
+            total_prefix_len=256,
+            value_slice=torch.arange(256),
+            params=SimpleNamespace(prev_prefix_len=256),
+            cache_actions=[],
+        )
+
+        self.assertEqual(consumed, 256)
+        self.assertTrue(sidecar.has_device_window(node))
+
     def test_rollout_defaults_on_and_keeps_explicit_fallback(self):
         spec = SimpleNamespace(is_dspark=lambda: True)
         with (
@@ -336,6 +370,7 @@ class TestDSV4DraftSWASidecar(unittest.TestCase):
             head_dim=4,
             kv_buffer=[backing],
         )
+        pool._stage_start = 40
         pool.compress_state_pools = []
         pool.indexer_compress_state_pools = []
 
@@ -348,6 +383,7 @@ class TestDSV4DraftSWASidecar(unittest.TestCase):
         self.assertLess(committed[0].nbytes, backing.nbytes)
         self.assertEqual(data_lens, [committed[0].nbytes])
         self.assertEqual(item_lens, [committed[0][0].nbytes])
+        self.assertEqual(pool.get_draft_swa_state_layer_ids(), [40])
 
     def test_unified_hicache_uses_logical_swa_component(self):
         device_buffers = [torch.empty((5, 2048), dtype=torch.uint8)]
