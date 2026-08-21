@@ -263,6 +263,16 @@ def resolve_max_seqlen(
     return int(seq_lens.max().item())
 
 
+def resolve_ascend_actual_seq_lengths(
+    forward_metadata: VisionAttentionMetadata,
+) -> torch.Tensor:
+    """Return cumulative sequence ends required by Ascend TND attention."""
+    cu_seqlens = forward_metadata.cu_seqlens
+    if cu_seqlens.is_npu:
+        cu_seqlens = cu_seqlens.to("cpu")
+    return cu_seqlens[1:].to(torch.int32)
+
+
 def resolve_precomputed_max_seqlen(
     cu_seqlens: torch.Tensor, max_seqlen: int | torch.Tensor | None
 ) -> int:
@@ -862,11 +872,8 @@ class VisionAscendAttention(nn.Module):
             )
 
         if forward_metadata is not None:
-            # TND fused attention expects cumulative seqlens (cu_seqlens[1:]),
-            # not per-sequence lengths in forward_metadata.seq_lens.
-            cu = forward_metadata.cu_seqlens.to("cpu")
             output = torch.empty_like(q)
-            seq_len_arg = cu[1:].to(torch.int32)
+            seq_len_arg = resolve_ascend_actual_seq_lengths(forward_metadata)
         elif envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             if "output_ws" not in kwargs:
                 raise RuntimeError("output_ws should be prepared for npu-graph mode")
