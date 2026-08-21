@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import (
     _backfill_ltx2_audio_vae_latent_stats,
+    _match_checkpoint_dtypes,
     _require_native_loader_for_quantized_vae,
     _should_use_channels_last_3d,
 )
@@ -39,6 +40,27 @@ class _FakeServerArgs:
 
     def should_start_component_on_cpu(self, _component_name):
         return False
+
+
+class TestMatchCheckpointDtypes(unittest.TestCase):
+    """Assignment replaces a parameter, so only matching dtypes may stay mapped."""
+
+    def test_a_matching_tensor_is_left_alone(self):
+        loaded = {"w": torch.zeros(4, dtype=torch.float32)}
+        before = loaded["w"]
+        _match_checkpoint_dtypes(loaded, {"w": torch.zeros(4, dtype=torch.float32)})
+        self.assertIs(loaded["w"], before)
+
+    def test_a_mismatched_tensor_is_converted(self):
+        loaded = {"w": torch.zeros(4, dtype=torch.float32)}
+        _match_checkpoint_dtypes(loaded, {"w": torch.zeros(4, dtype=torch.bfloat16)})
+        self.assertEqual(loaded["w"].dtype, torch.bfloat16)
+
+    def test_a_tensor_the_module_does_not_want_is_left_alone(self):
+        loaded = {"extra": torch.zeros(4, dtype=torch.float32)}
+        before = loaded["extra"]
+        _match_checkpoint_dtypes(loaded, {})
+        self.assertIs(loaded["extra"], before)
 
 
 class TestVAELoader(unittest.TestCase):

@@ -124,6 +124,21 @@ def _should_use_channels_last_3d(
     return False
 
 
+def _match_checkpoint_dtypes(loaded: dict, target_state: dict) -> dict:
+    """Convert checkpoint tensors whose dtype differs from their parameter's.
+
+    Assignment replaces the parameter rather than writing through it, so a
+    mismatched dtype would silently change the module's. Converting makes a
+    copy, which is the point: only the tensors that already match can stay on
+    the mapping.
+    """
+    for name, tensor in list(loaded.items()):
+        param = target_state.get(name)
+        if param is not None and param.dtype != tensor.dtype:
+            loaded[name] = tensor.to(dtype=param.dtype)
+    return loaded
+
+
 class VAELoader(ComponentLoader):
     """Shared loader for (video/audio) VAE modules."""
 
@@ -242,10 +257,21 @@ class VAELoader(ComponentLoader):
             loaded.update(safetensors_load_file(sf_path))
         _backfill_ltx2_audio_vae_latent_stats(loaded, component_name)
         strict_load = native_only
+        # `loaded` holds views into the safetensors mapping. When the component
+        # starts on the CPU, assigning them keeps the weights file-backed
+        # instead of copying them into anonymous host memory: the page cache
+        # can drop and refetch file-backed bytes, a copy it cannot. MPS always
+        # did this; on any other host the copy is anonymous memory the pin
+        # budget can then not spend -- MiniMax-H3's video VAE is 9.70 GiB of a
+        # 32 GiB budget. A tensor whose dtype differs from its parameter's is
+        # converted, which copies exactly the tensors that cannot stay.
+        keep_mapping = component_starts_on_cpu
+        if keep_mapping:
+            _match_checkpoint_dtypes(loaded, vae.state_dict())
         vae.load_state_dict(
             loaded,
             strict=strict_load,
-            assign=bool(cpu_offload_flag and current_platform.is_mps()),
+            assign=keep_mapping,
         )
 
         if not strict_load:
