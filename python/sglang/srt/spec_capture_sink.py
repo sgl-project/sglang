@@ -70,12 +70,48 @@ def _load_cudart() -> ctypes.CDLL:
             ctypes.c_void_p,
         ]
         library.cudaMemcpyAsync.restype = ctypes.c_int
+        library.cudaMalloc.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_size_t,
+        ]
+        library.cudaMalloc.restype = ctypes.c_int
+        library.cudaFree.argtypes = [ctypes.c_void_p]
+        library.cudaFree.restype = ctypes.c_int
         return library
-    raise RuntimeError("unable to load libcudart for MNNVL D2D staging")
+    raise RuntimeError("unable to load libcudart for GPU-direct staging")
 
 
 _CUDART: Optional[ctypes.CDLL] = None
 _CUDART_LOCK = threading.Lock()
+
+
+def _get_cudart() -> ctypes.CDLL:
+    global _CUDART
+    if _CUDART is None:
+        with _CUDART_LOCK:
+            if _CUDART is None:
+                _CUDART = _load_cudart()
+    return _CUDART
+
+
+def _cuda_malloc(nbytes: int) -> int:
+    address = ctypes.c_void_p()
+    status = _get_cudart().cudaMalloc(
+        ctypes.byref(address),
+        ctypes.c_size_t(nbytes),
+    )
+    if status != 0 or address.value is None:
+        raise MemoryError(
+            f"cudaMalloc failed for GPU-direct arena ({nbytes} bytes): "
+            f"status {status}"
+        )
+    return int(address.value)
+
+
+def _cuda_free(address: int) -> None:
+    status = _get_cudart().cudaFree(ctypes.c_void_p(address))
+    if status != 0:
+        raise RuntimeError(f"cudaFree failed with status {status}")
 
 
 def _copy_to_address(
@@ -85,12 +121,7 @@ def _copy_to_address(
     *,
     stream: torch.cuda.Stream,
 ) -> None:
-    global _CUDART
-    if _CUDART is None:
-        with _CUDART_LOCK:
-            if _CUDART is None:
-                _CUDART = _load_cudart()
-    status = _CUDART.cudaMemcpyAsync(
+    status = _get_cudart().cudaMemcpyAsync(
         ctypes.c_void_p(destination),
         ctypes.c_void_p(source),
         ctypes.c_size_t(length),
@@ -187,6 +218,8 @@ class SpecCaptureSink:
         self._arena_address = 0
         self._arena_bytes = 0
         self._arena_free: List[Tuple[int, int]] = []
+        self._arena_registered = False
+        self._arena_cuda_allocated = False
         if self.backend in {"nvlink", "nvlink_intra"}:
             if self.max_resident_bytes is None:
                 raise ValueError(
@@ -203,6 +236,31 @@ class SpecCaptureSink:
                     f"Mooncake MNNVL arena allocation failed "
                     f"({self._arena_bytes} bytes)"
                 )
+            self._arena_free = [(0, self._arena_bytes)]
+        elif self.max_resident_bytes is not None:
+            # PyTorch expandable segments use CUDA VMM addresses that
+            # nvidia-peermem may reject. Keep one raw cudaMalloc allocation
+            # registered for the RDMA process lifetime and suballocate it.
+            self._arena_bytes = int(self.max_resident_bytes)
+            self._arena_address = _cuda_malloc(self._arena_bytes)
+            self._arena_cuda_allocated = True
+            try:
+                with self._engine_lock:
+                    status = self._engine.register_memory(
+                        self._arena_address, self._arena_bytes
+                    )
+                if status is not None and int(status) != 0:
+                    raise RuntimeError(
+                        "Mooncake RDMA arena registration failed with status "
+                        f"{status}"
+                    )
+            except BaseException:
+                _cuda_free(self._arena_address)
+                self._arena_address = 0
+                self._arena_bytes = 0
+                self._arena_cuda_allocated = False
+                raise
+            self._arena_registered = True
             self._arena_free = [(0, self._arena_bytes)]
         self._copy_stream = torch.cuda.Stream(device=self.device)
         self._executor = ThreadPoolExecutor(
@@ -359,7 +417,7 @@ class SpecCaptureSink:
         dtype = _DTYPE_STR.get(
             source.dtype, str(source.dtype).replace("torch.", "")
         )
-        if self.backend in {"nvlink", "nvlink_intra"}:
+        if self._arena_address:
             with self._lock:
                 allocation_offset, allocation_nbytes = (
                     self._arena_allocate_locked(nbytes)
@@ -403,7 +461,7 @@ class SpecCaptureSink:
         )
 
     def _free_buffer(self, buffer: _PublishedBuffer) -> None:
-        if self.backend in {"nvlink", "nvlink_intra"}:
+        if self._arena_address and buffer.tensor is None:
             with self._lock:
                 self._arena_free_locked(
                     buffer.allocation_offset,
@@ -701,14 +759,30 @@ class SpecCaptureSink:
             for sample_id, resident in list(self._residents.items()):
                 self._free_sample_locked(sample_id, resident.generation)
         if self._arena_address:
-            with self._engine_lock:
-                status = self._engine.free_managed_buffer(
-                    self._arena_address, self._arena_bytes
-                )
-            if status is not None and int(status) != 0:
-                logger.error(
-                    "Mooncake arena release failed with status %s", status
-                )
+            if self._arena_registered:
+                with self._engine_lock:
+                    status = self._engine.unregister_memory(self._arena_address)
+                if status is not None and int(status) != 0:
+                    logger.error(
+                        "Mooncake RDMA arena unregister failed with status %s",
+                        status,
+                    )
+                self._arena_registered = False
+            if self._arena_cuda_allocated:
+                try:
+                    _cuda_free(self._arena_address)
+                except RuntimeError:
+                    logger.exception("CUDA arena release failed")
+                self._arena_cuda_allocated = False
+            else:
+                with self._engine_lock:
+                    status = self._engine.free_managed_buffer(
+                        self._arena_address, self._arena_bytes
+                    )
+                if status is not None and int(status) != 0:
+                    logger.error(
+                        "Mooncake arena release failed with status %s", status
+                    )
             self._arena_address = 0
         self._control_server.shutdown()
         self._control_server.server_close()
