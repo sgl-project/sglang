@@ -625,6 +625,47 @@ class TestNamedStreams(_IsolatedServerArgs):
         reset_context()
         self.assertEqual(get_context().resources.streams, {})
 
+    def test_reset_runs_resource_finalizers_in_lifo_order(self):
+        reset_context()
+        finalized = []
+        resources = get_context().resources
+        resources.register_finalizer("first", lambda: finalized.append("first"))
+        resources.register_finalizer("second", lambda: finalized.append("second"))
+
+        reset_context()
+
+        self.assertEqual(finalized, ["second", "first"])
+
+    def test_resource_finalizer_names_are_unique(self):
+        reset_context()
+        resources = get_context().resources
+        resources.register_finalizer("shared", lambda: None)
+
+        with self.assertRaisesRegex(ValueError, "shared.*already registered"):
+            resources.register_finalizer("shared", lambda: None)
+
+    def test_reset_reports_cleanup_failures_after_running_every_finalizer(self):
+        reset_context()
+        finalized = []
+        resources = get_context().resources
+        resources.register_finalizer("first", lambda: finalized.append("first"))
+
+        def fail_cleanup():
+            finalized.append("broken")
+            raise ValueError("boom")
+
+        resources.register_finalizer("broken", fail_cleanup)
+        resources.register_finalizer("last", lambda: finalized.append("last"))
+
+        with self.assertRaisesRegex(RuntimeError, "broken") as cm:
+            reset_context()
+
+        self.assertIsInstance(cm.exception.__cause__, ValueError)
+        self.assertEqual(finalized, ["last", "broken", "first"])
+        self.assertIsNot(get_context().resources, resources)
+        resources.cleanup()
+        self.assertEqual(finalized, ["last", "broken", "first"])
+
     def test_capturer_slots_roundtrip_and_reset(self):
         from sglang.srt.state_capturer.indexer_topk import (
             get_global_indexer_capturer,

@@ -51,7 +51,7 @@ import functools
 import os
 import sys
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -460,6 +460,35 @@ class Resources(_FlagGroupBase):
     tcp_store: Any = None
     # Trace verbosity; the accessor seeds it lazily from SGLANG_TRACE_LEVEL.
     trace_level: Any = None
+    # Named teardown callbacks for process-level resources. Resource-owning
+    # modules register once when they allocate; reset runs them in reverse
+    # construction order before dropping the registry.
+    _finalizers: dict[str, Callable[[], None]] = dataclasses.field(
+        default_factory=dict, repr=False
+    )
+
+    def register_finalizer(self, name: str, finalizer: Callable[[], None]) -> None:
+        if name in self._finalizers:
+            raise ValueError(f"resource finalizer {name!r} is already registered")
+        self._finalizers[name] = finalizer
+
+    def cleanup(self) -> None:
+        finalizers = tuple(self._finalizers.items())
+        self._finalizers.clear()
+        failures = []
+        for name, finalizer in reversed(finalizers):
+            try:
+                finalizer()
+            except Exception as exc:
+                failures.append((name, exc))
+
+        if failures:
+            details = ", ".join(
+                f"{name}: {type(exc).__name__}({exc})" for name, exc in failures
+            )
+            raise RuntimeError(
+                f"{len(failures)} resource finalizer(s) failed: {details}"
+            ) from failures[0][1]
 
 
 class ForwardFlags:
@@ -1384,6 +1413,12 @@ def reset_context() -> None:
 
     Wrapper subsystems (``parallel``) hold no state and are unaffected.
     """
+    cleanup_error = None
+    try:
+        _CONTEXT.resources.cleanup()
+    except RuntimeError as exc:
+        cleanup_error = exc
+
     _CONTEXT._server_args = None
     _CONTEXT._config_bags = None
     _adaptive_draft_token_bound.cache_clear()
@@ -1394,6 +1429,8 @@ def reset_context() -> None:
     _CONTEXT.resources = Resources()
     _CONTEXT.forward = ForwardFlags()
     set_global_dwdp_manager(None)
+    if cleanup_error is not None:
+        raise cleanup_error
 
 
 def mamba_extra_buffer_enabled() -> bool:
