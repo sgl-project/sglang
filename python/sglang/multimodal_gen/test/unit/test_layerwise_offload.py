@@ -429,6 +429,43 @@ def test_layerwise_pipeline_selection_uses_dit_group(monkeypatch):
     assert is_layerwise_offloaded_module(layerwise_module)
 
 
+def test_pin_budget_ranks_by_steps_resolved_from_model_index(monkeypatch):
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+
+    import sglang.multimodal_gen.registry as registry_mod
+
+    class _Sampling:
+        num_inference_steps = 50
+
+    monkeypatch.setattr(
+        registry_mod,
+        "get_model_info",
+        lambda *args, **kwargs: SimpleNamespace(sampling_param_cls=_Sampling),
+    )
+
+    # Same byte size on purpose: with the steps resolved, the stepped DiT
+    # outranks the encoder; with the silent steps=1 fallback the ranking
+    # ties and stable sort keeps the encoder first.
+    text_encoder = _NestedEncoderDummyModel()
+    transformer = _NestedDummyModel()
+    modules = {"text_encoder": text_encoder, "transformer": transformer}
+
+    configured = configure_layerwise_offload_modules(
+        modules,
+        _server_args(model_path="/models/minimax-h3"),
+        component_names=["text_encoder", "transformer"],
+    )
+
+    assert configured == ["transformer", "text_encoder"], (
+        "the pipeline is resolved from model_index when no override is set, "
+        "so the stepped DiT must claim the pin budget before the "
+        "once-per-request encoder"
+    )
+
+
 def test_layerwise_configuration_filters_by_component_name(monkeypatch):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule

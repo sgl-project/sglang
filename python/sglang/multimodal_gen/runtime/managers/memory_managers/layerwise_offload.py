@@ -1636,15 +1636,38 @@ def configure_layerwise_offload_modules(
         )
 
     def _default_num_inference_steps() -> int:
-        from sglang.multimodal_gen.registry import get_pipeline_config_classes
+        from sglang.multimodal_gen.registry import (
+            get_model_info,
+            get_pipeline_config_classes,
+        )
 
+        sampling_cls = None
         pipeline_class_name = server_args.pipeline_class_name
-        if not pipeline_class_name:
+        if pipeline_class_name:
+            config_classes = get_pipeline_config_classes(pipeline_class_name)
+            if config_classes is not None:
+                sampling_cls = config_classes[1]
+        else:
+            # The override is normally unset. Resolve the pipeline the way
+            # build_pipeline does -- a cache hit by now -- because falling
+            # back to 1 here turns the benefit ranking into a bare-bytes
+            # ranking, and a once-per-request encoder can then outrank the
+            # stepped DiT for the pin budget.
+            model_path = getattr(server_args, "model_path", None)
+            if model_path:
+                model_info = get_model_info(
+                    model_path,
+                    backend=getattr(server_args, "backend", None),
+                    model_id=getattr(server_args, "model_id", None),
+                )
+                if model_info is not None:
+                    sampling_cls = model_info.sampling_param_cls
+        if sampling_cls is None:
             return 1
-        config_classes = get_pipeline_config_classes(pipeline_class_name)
-        if config_classes is None:
+        steps = getattr(sampling_cls(), "num_inference_steps", None)
+        if not steps:
             return 1
-        return max(1, int(config_classes[1]().num_inference_steps))
+        return max(1, int(steps))
 
     default_steps = _default_num_inference_steps()
 
