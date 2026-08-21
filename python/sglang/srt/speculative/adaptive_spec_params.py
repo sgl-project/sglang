@@ -64,11 +64,10 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
             f"speculative_eagle_topk={server_args.speculative_eagle_topk} "
             "(only topk=1 is supported)"
         )
-    if resolved_view(server_args).enable_dp_attention:
-        return (
-            "enable_dp_attention=True is not supported "
-            "(adaptive tier decisions are not synchronized across DP ranks)"
-        )
+    # enable_dp_attention IS supported: tier decisions are synchronized across
+    # DP ranks via a min-reduce in the scheduler's MLP-sync all_gather
+    # (dp_attn.MLPSyncBatchInfo.local_adaptive_steps), so all ranks run equal
+    # draft-token shapes. See AdaptiveController(sync_across_dp=...).
     if resolved_view(server_args).enable_multi_layer_eagle:
         return (
             "enable_multi_layer_eagle=True is not supported "

@@ -71,13 +71,22 @@ class AdaptiveController:
       2. Call on_verify_complete(num_correct_drafts_per_req) after each decode verify.
     """
 
-    def __init__(self, worker: AdaptiveSpecWorker, config_path: str | None = None):
+    def __init__(
+        self,
+        worker: AdaptiveSpecWorker,
+        config_path: str | None = None,
+        sync_across_dp: bool = False,
+    ):
         self.worker = worker
         self.params = AdaptiveSpeculativeParams(
             initial_steps=worker.speculative_num_steps,
             cfg_path=config_path,
         )
         self._states: dict[int, SpecRuntimeState] = {}
+        # Under DP attention the tier swap is driven by a cross-rank consensus
+        # (dp_attn min-reduce) so all ranks keep equal draft-token shapes. The
+        # local EMA path must then only *update* params, never swap directly.
+        self.sync_across_dp = sync_across_dp
 
     @property
     def candidate_steps(self) -> list[int]:
@@ -115,14 +124,25 @@ class AdaptiveController:
         if target != self.worker.speculative_num_steps:
             self._activate(target)
 
+    def activate_step(self, speculative_num_steps: int) -> None:
+        """Activate an externally-decided tier (e.g. the DP-consensus step)."""
+        if speculative_num_steps != self.worker.speculative_num_steps:
+            self._activate(speculative_num_steps)
+
     def on_verify_complete(
         self, num_correct_drafts_per_req: list[int], batch_size: int
     ) -> None:
-        """Feed verify results; switch runtime state if EMA warrants it."""
+        """Feed verify results; switch runtime state if EMA warrants it.
+
+        Under DP attention only the EMA is updated here — the actual tier swap
+        is deferred to the next round's cross-rank consensus, so a rank never
+        swaps out of lockstep with its peers (which would mismatch draft-token
+        shapes and hang the DP collective).
+        """
         new_step = self.params.on_verify_complete(
             num_correct_drafts_per_req, batch_size
         )
-        if new_step is not None:
+        if new_step is not None and not self.sync_across_dp:
             self._activate(new_step)
 
     def _activate(self, speculative_num_steps: int) -> None:
