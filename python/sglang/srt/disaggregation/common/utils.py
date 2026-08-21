@@ -32,6 +32,10 @@ class TransferKVChunk:
     # Set when the staging worker first counts this chunk toward the per-room
     # outstanding count; stays set across re-enqueue on a watermark defer.
     staging_counted: bool = False
+    # Monotonic timestamp of the first staging deferral, set by the worker on
+    # re-enqueue; fail the room when a chunk never becomes ready past
+    # STAGING_MAX_WAIT_S (wedged decode-side staging allocator).
+    staging_first_attempt: Optional[float] = None
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:
