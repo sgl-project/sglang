@@ -13,6 +13,7 @@
 # ==============================================================================
 """The base class of a backend for grammar-guided constrained decoding."""
 
+import json
 import logging
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -158,6 +159,35 @@ class GrammarMask(NamedTuple):
         self.grammar.apply_vocab_mask(logits=logits, vocab_mask=self.vocab_mask)
 
 
+def _grammar_key_contains_nul(key_type: str, key_string: str) -> bool:
+    """A NUL in a spec segfaults xgrammar's regex converter, which a JSON schema
+    also reaches through `pattern` (possibly escaped). Drop once the upstream fix
+    https://github.com/mlc-ai/xgrammar/pull/850 is in our pinned version.
+    """
+    if "\x00" in key_string:
+        return True
+    if key_type not in ("json", "structural_tag"):
+        return False
+    try:
+        decoded = json.loads(key_string)
+    except ValueError:
+        # Malformed JSON: the backend's own parse reports it as a normal error.
+        return False
+
+    stack = [decoded]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, str):
+            if "\x00" in node:
+                return True
+        elif isinstance(node, dict):
+            stack.extend(node.keys())
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return False
+
+
 class InvalidGrammarObject(BaseGrammarObject):
     """Represents a grammar that failed to compile, carrying the original error message."""
 
@@ -231,6 +261,11 @@ class BaseGrammarBackend:
     ) -> BaseGrammarObject:
         s = time.perf_counter()
         key_type, key_string = key
+        if _grammar_key_contains_nul(key_type, key_string):
+            logger.error(f"Rejecting {key_type} grammar containing a NUL byte")
+            return InvalidGrammarObject(
+                f"Invalid {key_type}: NUL bytes (\\u0000) are not allowed"
+            )
         if key_type == "json":
             grammar = self.dispatch_json(key_string)
         elif key_type == "regex":

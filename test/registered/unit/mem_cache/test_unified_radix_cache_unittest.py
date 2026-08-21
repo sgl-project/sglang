@@ -65,6 +65,7 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     EvictLayer,
     TreeComponent,
 )
+from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     DecSwaLockOnlyResult,
@@ -7134,6 +7135,93 @@ class TestSWAWindowUnderBigramKey(CustomTestCase):
             DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
         )
         cache.sanity_check()
+
+
+class TestUnifiedRadixCacheStorageAttachBackfill(CustomTestCase):
+    """Enabling a storage backend must hash nodes that predate it.
+
+    Page hashes chain off the parent's last hash, so a node hashed against an
+    unhashed parent restarts the chain mid-sequence: its L3 keys then cover only a
+    suffix of the prefix they claim to represent, which aliases any unrelated
+    request that happens to start with those tokens.
+    """
+
+    cfg = CacheConfig(
+        page_size=4,
+        components=(ComponentType.FULL,),
+        kv_size=64,
+        max_context_len=64,
+    )
+
+    prefix_tokens = array("q", [1, 2, 3, 4, 5, 6, 7, 8])
+    suffix_tokens = array("q", [9, 10, 11, 12])
+
+    def _build_two_level_tree(self, *, storage_on_from_the_start: bool):
+        """A parent node plus a child extending it, built with storage on or off."""
+        cache, allocator, _ = build_fixture(self.cfg)
+        cache.enable_storage = storage_on_from_the_start
+        for tokens in (self.prefix_tokens, self.prefix_tokens + self.suffix_tokens):
+            value = allocator.alloc(len(tokens))
+            self.assertIsNotNone(value)
+            cache.insert(InsertParams(key=RadixKey(tokens), value=value))
+        return cache
+
+    @staticmethod
+    def _hashes_by_token_ids(cache):
+        """Every non-root node's token ids mapped to its hash chain."""
+        root = cache.tree_core.root_node
+        hashes = {}
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if node is not root:
+                hashes[tuple(node.key.token_ids)] = node.hash_value
+            stack.extend(node.children.values())
+        return hashes
+
+    def test_backfill_reproduces_hashing_from_the_start(self):
+        expected = self._hashes_by_token_ids(
+            self._build_two_level_tree(storage_on_from_the_start=True)
+        )
+        self.assertEqual(len(expected), 2, "expected a parent and a child node")
+
+        late = self._build_two_level_tree(storage_on_from_the_start=False)
+        self.assertTrue(
+            all(h is None for h in self._hashes_by_token_ids(late).values()),
+            "nodes built while storage was disabled must start unhashed",
+        )
+
+        self.assertEqual(late.tree_core.backfill_missing_hash_values(), len(expected))
+        self.assertEqual(
+            self._hashes_by_token_ids(late),
+            expected,
+            "a backfilled chain must be identical to one hashed from the start",
+        )
+
+    def test_backfill_is_idempotent(self):
+        cache = self._build_two_level_tree(storage_on_from_the_start=True)
+        before = self._hashes_by_token_ids(cache)
+        self.assertEqual(cache.tree_core.backfill_missing_hash_values(), 0)
+        self.assertEqual(self._hashes_by_token_ids(cache), before)
+
+    def test_enabling_storage_backfills_the_tree(self):
+        """The tree is hashed by the time `enable_storage` flips on."""
+        cache = self._build_two_level_tree(storage_on_from_the_start=False)
+        StorageAttachment(cache).apply_runtime_config(
+            storage_backend="file",
+            prefetch_threshold=64,
+            prefetch_timeout_base=1.0,
+            prefetch_timeout_per_ki_token=0.25,
+            hicache_storage_pass_prefix_keys=False,
+            enable_storage=True,
+            enable_storage_metrics=False,
+            extra_metric_labels=None,
+        )
+        self.assertTrue(cache.enable_storage)
+        self.assertTrue(
+            all(h for h in self._hashes_by_token_ids(cache).values()),
+            "every node must carry a hash chain once storage is enabled",
+        )
 
 
 if __name__ == "__main__":
