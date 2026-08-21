@@ -35,6 +35,24 @@ def _fake_attn(backend: str, rocm_fused_decode_mla: bool = True):
     )
 
 
+def _fake_one_shot_attn():
+    return SimpleNamespace(
+        flashinfer_mla_disable_ragged=False,
+        chunked_prefix_cache_threshold=0,
+        disable_chunked_prefix_cache=False,
+    )
+
+
+def _fake_one_shot_forward_batch(extend_seq_lens):
+    return SimpleNamespace(
+        forward_mode=SimpleNamespace(is_extend_without_speculative=lambda: True),
+        extend_prefix_lens_cpu=[0] * len(extend_seq_lens),
+        extend_seq_lens_cpu=extend_seq_lens,
+        seq_lens_cpu=extend_seq_lens,
+        get_max_chunk_capacity=lambda: 128 * 1024,
+    )
+
+
 class TestDispatchMLASubtype(CustomTestCase):
     def test_hip_aiter_decode_takes_fused_rope(self):
         # aiter + fused-decode + decode -> fused ROPE fast path (unchanged).
@@ -60,6 +78,35 @@ class TestDispatchMLASubtype(CustomTestCase):
                 _fake_attn("aiter"), _fake_forward_batch(is_decode=False)
             )
         self.assertEqual(method, AttnForwardMethod.MLA)
+
+
+class TestMhaOneShotDpAttentionPadding(CustomTestCase):
+    def test_unaligned_extend_falls_back_to_mla(self):
+        # TP8/DP2 gives attn_tp_size=4. A one-token request is padded to four
+        # Q rows, so the ragged ONE_SHOT wrapper cannot use its one-token
+        # indptr safely.
+        with mock.patch.object(
+            abh,
+            "get_parallel",
+            create=True,
+            return_value=SimpleNamespace(attn_tp_size=4),
+        ):
+            method = abh.handle_attention_flashinfer(
+                _fake_one_shot_attn(), _fake_one_shot_forward_batch([1])
+            )
+        self.assertEqual(method, AttnForwardMethod.MLA)
+
+    def test_aligned_extend_keeps_one_shot(self):
+        with mock.patch.object(
+            abh,
+            "get_parallel",
+            create=True,
+            return_value=SimpleNamespace(attn_tp_size=4),
+        ):
+            method = abh.handle_attention_flashinfer(
+                _fake_one_shot_attn(), _fake_one_shot_forward_batch([4])
+            )
+        self.assertEqual(method, AttnForwardMethod.MHA_ONE_SHOT)
 
 
 class TestResolveRocmForwardMethod(CustomTestCase):
