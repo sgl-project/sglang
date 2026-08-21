@@ -671,14 +671,10 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
             # request-time merge/unmerge without keeping another DiT resident.
             if distilled_lora_strength is None:
                 distilled_lora_strength = float(self.STAGE_2_DISTILLED_LORA_STRENGTH)
-            if self._stage1_lora_path is not None and distilled_lora_strength != 0.0:
+            if self._stage1_lora_path and distilled_lora_strength != 0.0:
                 # Dynamic LoRA supports only one adapter per target, but
                 # original stage2 may need both the user LoRA and the
                 # distilled LoRA on the same transformer.
-                logger.info(
-                    "LTX2 original stage2 requires multiple adapters on "
-                    "transformer; forcing merge_weights=True."
-                )
                 return True
             return False
         return self._should_merge_stage2_distilled_lora(self.server_args)
