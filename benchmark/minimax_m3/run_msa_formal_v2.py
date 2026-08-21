@@ -24,7 +24,6 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-
 CONCURRENCIES = (1, 8, 32, 128)
 NUM_PROMPTS = 256
 SEED = 20260819
@@ -148,7 +147,10 @@ def verify_file_manifest(
             f"{label} runtime aggregate mismatch: "
             f"{actual_aggregate} != {expected_aggregate_sha256}"
         )
-    if manifest.get("file_count") != len(expected) or manifest.get("total_bytes") != total_bytes:
+    if (
+        manifest.get("file_count") != len(expected)
+        or manifest.get("total_bytes") != total_bytes
+    ):
         raise RuntimeError(f"{label} manifest count/size metadata mismatch")
     return {
         "schema_version": 1,
@@ -199,9 +201,7 @@ def fixed_parity_required(mode: str) -> bool:
 
 
 def within_noninferiority_margin(delta: float, margin: float) -> bool:
-    return delta >= -margin or math.isclose(
-        delta, -margin, rel_tol=0.0, abs_tol=1e-12
-    )
+    return delta >= -margin or math.isclose(delta, -margin, rel_tol=0.0, abs_tol=1e-12)
 
 
 def route_fragments(role: str) -> tuple[str, ...]:
@@ -351,7 +351,9 @@ def validate_route(log_path: Path, role: str) -> str:
     for line in log_path.read_text(errors="replace").splitlines():
         if all(fragment in line for fragment in wanted):
             return line
-    raise RuntimeError(f"server did not confirm {role} route {wanted}:\n{tail(log_path)}")
+    raise RuntimeError(
+        f"server did not confirm {role} route {wanted}:\n{tail(log_path)}"
+    )
 
 
 def run_checked(command: list[str], *, cwd: Path, env: dict[str, str]) -> None:
@@ -394,7 +396,9 @@ class ThermalSampler:
             capture_output=True,
         )
         if result.returncode:
-            self.errors.append(result.stderr.strip() or f"nvidia-smi={result.returncode}")
+            self.errors.append(
+                result.stderr.strip() or f"nvidia-smi={result.returncode}"
+            )
         else:
             handle.write(result.stdout)
             handle.flush()
@@ -421,7 +425,9 @@ class ThermalSampler:
             self._sample(handle)
 
 
-def thermal_failures(path: Path, sampler_errors: list[str]) -> tuple[dict[str, int], list[str]]:
+def thermal_failures(
+    path: Path, sampler_errors: list[str]
+) -> tuple[dict[str, int], list[str]]:
     with path.open() as source:
         rows = list(csv.DictReader(source))
     counts = {str(index): 0 for index in range(4)}
@@ -467,9 +473,7 @@ def measured_audit(
     data, matches = log_segment(log_path, start, end)
     text = data.decode(errors="replace")
     posts = len(
-        re.findall(
-            rf'POST {re.escape(expected_endpoint)} HTTP/1\.1" 200 OK', text
-        )
+        re.findall(rf'POST {re.escape(expected_endpoint)} HTTP/1\.1" 200 OK', text)
     )
     counts, thermals = thermal_failures(role_dir / "thermal.csv", sampler.errors)
     failures: list[str] = []
@@ -572,10 +576,16 @@ def validate_fixed_parity_payload(payload: dict, role: str, model: str) -> None:
         and [row.get("name") for row in rows] == names
         and all(row.get("exact_expected") is True for row in rows)
         and all(row.get("content") == row.get("expected") for row in rows)
-        and all(isinstance(row.get("prompt_tokens"), int) and row["prompt_tokens"] > 0 for row in rows)
+        and all(
+            isinstance(row.get("prompt_tokens"), int) and row["prompt_tokens"] > 0
+            for row in rows
+        )
         and rows[1]["prompt_tokens"] >= 32768
         and rows[2]["prompt_tokens"] >= 65536
-        and all(re.fullmatch(r"[0-9a-f]{64}", str(row.get("response_sha256", ""))) for row in rows)
+        and all(
+            re.fullmatch(r"[0-9a-f]{64}", str(row.get("response_sha256", "")))
+            for row in rows
+        )
         and all(isinstance(row.get("usage"), dict) for row in rows)
     )
     if not valid:
@@ -598,14 +608,18 @@ def validate_serving_record(row: dict, concurrency: int) -> None:
     }
     for key, value in expected.items():
         if row.get(key) != value:
-            raise RuntimeError(f"c{concurrency} {key}={row.get(key)!r}, expected {value!r}")
+            raise RuntimeError(
+                f"c{concurrency} {key}={row.get(key)!r}, expected {value!r}"
+            )
     ratio = float(row.get("random_range_ratio", float("nan")))
     if not math.isfinite(ratio) or ratio != 1.0:
         raise RuntimeError(f"c{concurrency} random_range_ratio={ratio!r}, expected 1.0")
     for key in ("output_throughput", "median_ttft_ms"):
         value = float(row.get(key, float("nan")))
         if not math.isfinite(value) or value <= 0:
-            raise RuntimeError(f"c{concurrency} {key} must be finite and positive: {value!r}")
+            raise RuntimeError(
+                f"c{concurrency} {key} must be finite and positive: {value!r}"
+            )
 
 
 def ensure_absent_output(path: Path, label: str) -> None:
@@ -946,9 +960,7 @@ def run_accuracy(
         json.dumps(gpqa_output_receipt, indent=2, sort_keys=True) + "\n"
     )
 
-    longbench_metrics = Path(
-        f"/tmp/longbench_v2_{args.model.replace('/', '_')}.json"
-    )
+    longbench_metrics = Path(f"/tmp/longbench_v2_{args.model.replace('/', '_')}.json")
     ensure_absent_output(longbench_metrics, "LongBench metrics")
     longbench_started_ns = time.time_ns()
     run_checked_log(
@@ -1056,7 +1068,9 @@ def run_role(
     if not prelaunch_clear:
         raise RuntimeError(f"port is not clear before {role} launch")
     launch = server_command(args)
-    print(f"+ {args.mode}/rep{repetition:02d}/{role}: {command_text(launch)}", flush=True)
+    print(
+        f"+ {args.mode}/rep{repetition:02d}/{role}: {command_text(launch)}", flush=True
+    )
     process: subprocess.Popen | None = None
     route_line = ""
     measured: dict | None = None
@@ -1092,7 +1106,9 @@ def run_role(
                 else:
                     expected_posts = run_speed(args, repo, environment, role_dir)
                 if process.poll() is not None:
-                    raise RuntimeError(f"server exited during {role}:\n{tail(server_log)}")
+                    raise RuntimeError(
+                        f"server exited during {role}:\n{tail(server_log)}"
+                    )
             finally:
                 sampler.stop()
             log.flush()
@@ -1158,9 +1174,7 @@ def run_role(
             if fixed_parity_required(args.mode)
             else None
         ),
-        "measured_window_audit_sha256": sha256(
-            role_dir / "measured_window_audit.json"
-        ),
+        "measured_window_audit_sha256": sha256(role_dir / "measured_window_audit.json"),
         "failures": lifecycle_problems,
     }
     (role_dir / "lifecycle_route_cache_receipt.json").write_text(
@@ -1273,15 +1287,23 @@ def summarize_accuracy(root: Path) -> dict:
         )
         gpqa_delta = audit["summary"]["delta_questions"]
         source_lb = float(
-            json.loads((rep_dir / "external" / "longbench_v2.json").read_text())["score"]
+            json.loads((rep_dir / "external" / "longbench_v2.json").read_text())[
+                "score"
+            ]
         )
         export_lb = float(
-            json.loads((rep_dir / "flashinfer" / "longbench_v2.json").read_text())["score"]
+            json.loads((rep_dir / "flashinfer" / "longbench_v2.json").read_text())[
+                "score"
+            ]
         )
         if not math.isfinite(source_lb) or not 0 <= source_lb <= 1:
-            raise RuntimeError(f"rep{repetition:02d} external LongBench invalid: {source_lb!r}")
+            raise RuntimeError(
+                f"rep{repetition:02d} external LongBench invalid: {source_lb!r}"
+            )
         if not math.isfinite(export_lb) or not 0 <= export_lb <= 1:
-            raise RuntimeError(f"rep{repetition:02d} FlashInfer LongBench invalid: {export_lb!r}")
+            raise RuntimeError(
+                f"rep{repetition:02d} FlashInfer LongBench invalid: {export_lb!r}"
+            )
         lb_delta = export_lb - source_lb
         gpqa_pass = gpqa_delta >= -GPQA_MARGIN_QUESTIONS
         lb_pass = within_noninferiority_margin(lb_delta, LONGBENCH_MARGIN)
@@ -1343,13 +1365,23 @@ def summarize_speed(root: Path, mode: str, min_median_gain: float) -> dict:
     repetitions = []
     gains = {str(value): [] for value in CONCURRENCIES}
     for repetition in range(1, 4):
-        rep = {"repetition": repetition, "order": expected_order(mode, repetition), "metrics": {}}
+        rep = {
+            "repetition": repetition,
+            "order": expected_order(mode, repetition),
+            "metrics": {},
+        }
         for concurrency in CONCURRENCIES:
             left = last_jsonl(
-                root / f"rep{repetition:02d}" / baseline / f"serving_c{concurrency}.jsonl"
+                root
+                / f"rep{repetition:02d}"
+                / baseline
+                / f"serving_c{concurrency}.jsonl"
             )
             right = last_jsonl(
-                root / f"rep{repetition:02d}" / candidate / f"serving_c{concurrency}.jsonl"
+                root
+                / f"rep{repetition:02d}"
+                / candidate
+                / f"serving_c{concurrency}.jsonl"
             )
             validate_serving_record(left, concurrency)
             validate_serving_record(right, concurrency)
@@ -1357,9 +1389,7 @@ def summarize_speed(root: Path, mode: str, min_median_gain: float) -> dict:
             right_throughput = float(right["output_throughput"])
             left_ttft = float(left["median_ttft_ms"])
             right_ttft = float(right["median_ttft_ms"])
-            throughput_gain = (
-                right_throughput / left_throughput - 1
-            )
+            throughput_gain = right_throughput / left_throughput - 1
             ttft_reduction = 1 - right_ttft / left_ttft
             if not math.isfinite(throughput_gain) or not math.isfinite(ttft_reduction):
                 raise RuntimeError(
@@ -1449,14 +1479,20 @@ def run_test_only(output: Path | None) -> None:
     )
     passed("loopback_api_key_default_and_preservation_contract")
     require(
-        orders["accuracy"] == [
-            ["external", "flashinfer"], ["flashinfer", "external"], ["external", "flashinfer"]
+        orders["accuracy"]
+        == [
+            ["external", "flashinfer"],
+            ["flashinfer", "external"],
+            ["external", "flashinfer"],
         ],
         "accuracy order contract mismatch",
     )
     require(
-        orders["triton-speed"] == [
-            ["triton", "flashinfer"], ["flashinfer", "triton"], ["triton", "flashinfer"]
+        orders["triton-speed"]
+        == [
+            ["triton", "flashinfer"],
+            ["flashinfer", "triton"],
+            ["triton", "flashinfer"],
         ],
         "triton speed order contract mismatch",
     )
@@ -1502,8 +1538,14 @@ def run_test_only(output: Path | None) -> None:
             ]
             for sample in range(2):
                 for index in range(4):
-                    value = "Active" if active and sample == 0 and index == 0 else "Not Active"
-                    rows.append(f"t{sample},{index},40,100,1000,2000,{value},Not Active")
+                    value = (
+                        "Active"
+                        if active and sample == 0 and index == 0
+                        else "Not Active"
+                    )
+                    rows.append(
+                        f"t{sample},{index},40,100,1000,2000,{value},Not Active"
+                    )
             thermal_path.write_text("\n".join(rows) + "\n")
 
         sampler = argparse.Namespace(errors=[])
@@ -1511,11 +1553,19 @@ def run_test_only(output: Path | None) -> None:
         post = 'POST /v1/chat/completions HTTP/1.1" 200 OK\n'
         server_log.write_text(startup + post)
         write_thermal()
-        require(measured_audit(
-            role_dir=role_dir, log_path=server_log, start=len(startup.encode()),
-            end=server_log.stat().st_size, sampler=sampler, expected_posts=1,
-            expected_endpoint="/v1/chat/completions",
-        )["status"] == "pass", "measured offset contract failed")
+        require(
+            measured_audit(
+                role_dir=role_dir,
+                log_path=server_log,
+                start=len(startup.encode()),
+                end=server_log.stat().st_size,
+                sampler=sampler,
+                expected_posts=1,
+                expected_endpoint="/v1/chat/completions",
+            )["status"]
+            == "pass",
+            "measured offset contract failed",
+        )
         passed("measured_offset_excludes_startup_jit")
         expect_failure(
             "measured_log_shrink_rejected",
@@ -1526,8 +1576,12 @@ def run_test_only(output: Path | None) -> None:
         expect_failure(
             "measured_post_count_rejected",
             lambda: measured_audit(
-                role_dir=role_dir, log_path=server_log, start=len(startup.encode()),
-                end=server_log.stat().st_size, sampler=sampler, expected_posts=2,
+                role_dir=role_dir,
+                log_path=server_log,
+                start=len(startup.encode()),
+                end=server_log.stat().st_size,
+                sampler=sampler,
+                expected_posts=2,
                 expected_endpoint="/v1/chat/completions",
             ),
             contains="/v1/chat/completions posts 1/2",
@@ -1535,7 +1589,11 @@ def run_test_only(output: Path | None) -> None:
         for test_id, bad_line, wanted in (
             ("measured_jit_rejected", "NVRTC compilation\n", "jit_or_compilation"),
             ("measured_error_rejected", "RuntimeError: boom\n", "errors"),
-            ("measured_generic_error_rejected", "[worker ERROR] request aborted\n", "errors"),
+            (
+                "measured_generic_error_rejected",
+                "[worker ERROR] request aborted\n",
+                "errors",
+            ),
             ("measured_retry_rejected", "retrying request\n", "retries"),
         ):
             server_log.write_text(post + bad_line)
@@ -1543,8 +1601,12 @@ def run_test_only(output: Path | None) -> None:
             expect_failure(
                 test_id,
                 lambda: measured_audit(
-                    role_dir=role_dir, log_path=server_log, start=0,
-                    end=server_log.stat().st_size, sampler=sampler, expected_posts=1,
+                    role_dir=role_dir,
+                    log_path=server_log,
+                    start=0,
+                    end=server_log.stat().st_size,
+                    sampler=sampler,
+                    expected_posts=1,
                     expected_endpoint="/v1/chat/completions",
                 ),
                 contains=wanted,
@@ -1554,16 +1616,19 @@ def run_test_only(output: Path | None) -> None:
         expect_failure(
             "thermal_throttle_rejected",
             lambda: measured_audit(
-                role_dir=role_dir, log_path=server_log, start=0,
-                end=server_log.stat().st_size, sampler=sampler, expected_posts=1,
+                role_dir=role_dir,
+                log_path=server_log,
+                start=0,
+                end=server_log.stat().st_size,
+                sampler=sampler,
+                expected_posts=1,
                 expected_endpoint="/v1/chat/completions",
             ),
             contains="thermal_slowdown",
         )
 
         server_log.write_text(
-            'POST /generate HTTP/1.1" 200 OK\n'
-            'POST /generate HTTP/1.1" 200 OK\n'
+            'POST /generate HTTP/1.1" 200 OK\n' 'POST /generate HTTP/1.1" 200 OK\n'
         )
         write_thermal()
         require(
@@ -1699,8 +1764,11 @@ def run_test_only(output: Path | None) -> None:
         )
 
     args = argparse.Namespace(
-        python="python", base_url="http://127.0.0.1:30000", model="/model",
-        gpqa_dataset=Path("/gpqa.csv"), longbench_subset=Path("/longbench.json"),
+        python="python",
+        base_url="http://127.0.0.1:30000",
+        model="/model",
+        gpqa_dataset=Path("/gpqa.csv"),
+        longbench_subset=Path("/longbench.json"),
     )
     command = speed_command(args, Path("/out.jsonl"), 32)
     option = lambda name: command[command.index(name) + 1]
@@ -1708,7 +1776,9 @@ def run_test_only(output: Path | None) -> None:
     require(option("--num-prompts") == "256", "speed prompt count drifted")
     require(option("--random-input-len") == "8192", "speed input length drifted")
     require(option("--random-output-len") == "1024", "speed output length drifted")
-    require(option("--warmup-requests") == "0", "speed implicit warmup was not disabled")
+    require(
+        option("--warmup-requests") == "0", "speed implicit warmup was not disabled"
+    )
     require(option("--max-concurrency") == "32", "speed concurrency drifted")
     require(
         option("--seed") == str(SEED) and "--flush-cache" in command,
@@ -1728,18 +1798,15 @@ def run_test_only(output: Path | None) -> None:
     gpqa_option = lambda name: gpqa[gpqa.index(name) + 1]
     lb_option = lambda name: longbench[longbench.index(name) + 1]
     require(
-        gpqa_option("--num-examples") == "198"
-        and gpqa_option("--num-threads") == "1",
+        gpqa_option("--num-examples") == "198" and gpqa_option("--num-threads") == "1",
         "GPQA fixed workload drifted",
     )
     require(
-        "--per-example-output" in gpqa
-        and "--per-example-private-responses" in gpqa,
+        "--per-example-output" in gpqa and "--per-example-private-responses" in gpqa,
         "GPQA evidence flags are incomplete",
     )
     require(
-        lb_option("--num-examples") == "100"
-        and lb_option("--num-threads") == "1",
+        lb_option("--num-examples") == "100" and lb_option("--num-threads") == "1",
         "LongBench fixed workload drifted",
     )
     passed("accuracy_fixed_workload_and_private_evidence_contract")
@@ -1748,7 +1815,8 @@ def run_test_only(output: Path | None) -> None:
         cache = Path(directory) / "cache"
         initialize_fresh_cache(cache)
         expect_failure(
-            "stale_cache_rejected", lambda: initialize_fresh_cache(cache),
+            "stale_cache_rejected",
+            lambda: initialize_fresh_cache(cache),
             contains="already exists",
         )
         first = arm_cache_environment(cache)
@@ -1779,21 +1847,27 @@ def run_test_only(output: Path | None) -> None:
         source.unlink()
         expect_failure(
             "missing_fresh_output_rejected",
-            lambda: claim_fresh_json_output(source, destination, time.time_ns(), "synthetic"),
+            lambda: claim_fresh_json_output(
+                source, destination, time.time_ns(), "synthetic"
+            ),
             contains="was not created",
         )
         started_ns = time.time_ns()
         source.write_bytes(b"")
         expect_failure(
             "empty_fresh_output_rejected",
-            lambda: claim_fresh_json_output(source, destination, started_ns, "synthetic"),
+            lambda: claim_fresh_json_output(
+                source, destination, started_ns, "synthetic"
+            ),
             contains="empty",
         )
         source.write_text('{"score": 1}\n')
         os.utime(source, ns=(1, 1))
         expect_failure(
             "stale_output_mtime_rejected",
-            lambda: claim_fresh_json_output(source, destination, started_ns, "synthetic"),
+            lambda: claim_fresh_json_output(
+                source, destination, started_ns, "synthetic"
+            ),
             contains="predates start",
         )
         source.unlink()
@@ -1803,7 +1877,9 @@ def run_test_only(output: Path | None) -> None:
             source, destination, started_ns, "synthetic"
         )
         require(payload == {"score": 1}, "fresh output payload drifted")
-        require(not source.exists() and destination.is_file(), "fresh output was not moved")
+        require(
+            not source.exists() and destination.is_file(), "fresh output was not moved"
+        )
         require(
             receipt["source_sha256"] == sha256(destination)
             and receipt["source_mtime_ns"] >= started_ns
@@ -1818,25 +1894,42 @@ def run_test_only(output: Path | None) -> None:
         (repo / "tracked").write_text("frozen\n")
         subprocess.run(["git", "-C", str(repo), "add", "tracked"], check=True)
         subprocess.run(
-            ["git", "-C", str(repo), "-c", "user.name=Formal V2",
-             "-c", "user.email=formal-v2@example.invalid", "commit", "-qm", "frozen"],
+            [
+                "git",
+                "-C",
+                str(repo),
+                "-c",
+                "user.name=Formal V2",
+                "-c",
+                "user.email=formal-v2@example.invalid",
+                "commit",
+                "-qm",
+                "frozen",
+            ],
             check=True,
         )
-        head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
-        tree = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"], text=True).strip()
+        head = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        tree = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"], text=True
+        ).strip()
         validate_checkout(repo, head, tree, "synthetic")
         passed("frozen_checkout_positive")
         expect_failure(
-            "stale_head_rejected", lambda: validate_checkout(repo, "0" * 40, tree, "synthetic"),
+            "stale_head_rejected",
+            lambda: validate_checkout(repo, "0" * 40, tree, "synthetic"),
             contains="head=",
         )
         expect_failure(
-            "stale_tree_rejected", lambda: validate_checkout(repo, head, "0" * 40, "synthetic"),
+            "stale_tree_rejected",
+            lambda: validate_checkout(repo, head, "0" * 40, "synthetic"),
             contains="tree=",
         )
         (repo / "untracked").write_text("dirty\n")
         expect_failure(
-            "dirty_checkout_rejected", lambda: validate_checkout(repo, head, tree, "synthetic"),
+            "dirty_checkout_rejected",
+            lambda: validate_checkout(repo, head, tree, "synthetic"),
             contains="dirty=",
         )
 
@@ -1853,7 +1946,8 @@ def run_test_only(output: Path | None) -> None:
             ("stale_bundle_hash_rejected", "bundle"),
         ):
             expect_failure(
-                test_id, lambda label=label: require_sha256(path, expected, label),
+                test_id,
+                lambda label=label: require_sha256(path, expected, label),
                 contains="SHA-256 mismatch",
             )
 
@@ -1910,7 +2004,11 @@ def run_test_only(output: Path | None) -> None:
         expect_failure(
             "model_file_tamper_rejected",
             lambda: verify_file_manifest(
-                root, manifest, sha256(manifest), aggregate.hexdigest(), "synthetic model"
+                root,
+                manifest,
+                sha256(manifest),
+                aggregate.hexdigest(),
+                "synthetic model",
             ),
             contains="file mismatch",
         )
@@ -1919,7 +2017,11 @@ def run_test_only(output: Path | None) -> None:
         expect_failure(
             "model_file_set_drift_rejected",
             lambda: verify_file_manifest(
-                root, manifest, sha256(manifest), aggregate.hexdigest(), "synthetic model"
+                root,
+                manifest,
+                sha256(manifest),
+                aggregate.hexdigest(),
+                "synthetic model",
             ),
             contains="file-set mismatch",
         )
@@ -1984,10 +2086,18 @@ def run_test_only(output: Path | None) -> None:
                 role_dir = rep / role
                 role_dir.mkdir(parents=True)
                 correct_limit = 100 if role == "external" else 98
-                rows = [{"question_id": f"q{index:03d}", "correct": index < correct_limit,
-                         "parsed_answer": "A", "response_sha256": f"{index:064x}"}
-                        for index in range(GPQA_TOTAL)]
-                (role_dir / "gpqa_per_example.json").write_text(json.dumps({"examples": rows}) + "\n")
+                rows = [
+                    {
+                        "question_id": f"q{index:03d}",
+                        "correct": index < correct_limit,
+                        "parsed_answer": "A",
+                        "response_sha256": f"{index:064x}",
+                    }
+                    for index in range(GPQA_TOTAL)
+                ]
+                (role_dir / "gpqa_per_example.json").write_text(
+                    json.dumps({"examples": rows}) + "\n"
+                )
                 (role_dir / "longbench_v2.json").write_text(
                     json.dumps({"score": 0.64 if role == "external" else 0.61}) + "\n"
                 )
@@ -2005,8 +2115,12 @@ def run_test_only(output: Path | None) -> None:
             payload = json.loads((role_dir / "gpqa_per_example.json").read_text())
             payload["examples"][98]["correct"] = True
             (role_dir / "gpqa_per_example.json").write_text(json.dumps(payload) + "\n")
-            (role_dir / "longbench_v2.json").write_text(json.dumps({"score": 0.62}) + "\n")
-        require(summarize_accuracy(root)["status"] == "pass", "accuracy boundary failed")
+            (role_dir / "longbench_v2.json").write_text(
+                json.dumps({"score": 0.62}) + "\n"
+            )
+        require(
+            summarize_accuracy(root)["status"] == "pass", "accuracy boundary failed"
+        )
         passed("accuracy_boundary_positive")
         passed("longbench_exact_float_boundary_positive")
         require(
@@ -2027,7 +2141,8 @@ def run_test_only(output: Path | None) -> None:
                         + "\n"
                     )
         expect_failure(
-            "speed_median_gate_rejected", lambda: summarize_speed(root, "external-speed", 0.0),
+            "speed_median_gate_rejected",
+            lambda: summarize_speed(root, "external-speed", 0.0),
             contains="median throughput gain",
         )
         for path in root.glob("rep*/flashinfer/serving_c*.jsonl"):
@@ -2061,15 +2176,29 @@ def run_test_only(output: Path | None) -> None:
     )
     passed("server_lifecycle_positive")
     for test_id, kwargs, wanted in (
-        ("prelaunch_port_occupied_rejected",
-         {"prelaunch_clear": False, "poststop_clear": True, "measured": {"status": "pass"}},
-         "before launch"),
-        ("teardown_port_cleanup_rejected",
-         {"prelaunch_clear": True, "poststop_clear": False, "measured": {"status": "pass"}},
-         "after teardown"),
-        ("missing_measured_audit_rejected",
-         {"prelaunch_clear": True, "poststop_clear": True, "measured": None},
-         "measured audit"),
+        (
+            "prelaunch_port_occupied_rejected",
+            {
+                "prelaunch_clear": False,
+                "poststop_clear": True,
+                "measured": {"status": "pass"},
+            },
+            "before launch",
+        ),
+        (
+            "teardown_port_cleanup_rejected",
+            {
+                "prelaunch_clear": True,
+                "poststop_clear": False,
+                "measured": {"status": "pass"},
+            },
+            "after teardown",
+        ),
+        (
+            "missing_measured_audit_rejected",
+            {"prelaunch_clear": True, "poststop_clear": True, "measured": None},
+            "measured audit",
+        ),
     ):
         expect_failure(
             test_id,
@@ -2088,7 +2217,10 @@ def run_test_only(output: Path | None) -> None:
         "test_count": len(results),
         "test_results": results,
         "orders": orders,
-        "roles": {role: list(route_fragments(role)) for role in ("external", "flashinfer", "triton")},
+        "roles": {
+            role: list(route_fragments(role))
+            for role in ("external", "flashinfer", "triton")
+        },
         "gpqa_margin_questions": GPQA_MARGIN_QUESTIONS,
         "longbench_margin": LONGBENCH_MARGIN,
         "private_evidence_mode": "0600",
@@ -2188,9 +2320,7 @@ def main() -> None:
         "model config",
     )
     require_sha256(args.gpqa_dataset, args.expected_gpqa_sha256, "GPQA")
-    require_sha256(
-        args.longbench_subset, args.expected_longbench_sha256, "LongBench"
-    )
+    require_sha256(args.longbench_subset, args.expected_longbench_sha256, "LongBench")
     require_sha256(
         Path(str(args.longbench_subset) + ".manifest.json"),
         args.expected_longbench_manifest_sha256,

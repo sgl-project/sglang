@@ -16,8 +16,8 @@ from probe_msa_e2e_dependencies import (
     REQUIRED_TP4_SM103_ROUTES,
     probe_blackwell_msa_route_manifest,
 )
+from run_msa_formal_v2 import run_test_only as run_formal_v2_self_tests
 from run_msa_formal_v2 import (
-    run_test_only as run_formal_v2_self_tests,
     server_healthy,
 )
 
@@ -156,9 +156,7 @@ class MSAFormalV2Test(unittest.TestCase):
             receipt = json.loads(receipt_path.read_text())
 
         passed = {
-            row["id"]
-            for row in receipt["test_results"]
-            if row.get("status") == "pass"
+            row["id"] for row in receipt["test_results"] if row.get("status") == "pass"
         }
         self.assertEqual(receipt["status"], "pass")
         self.assertGreaterEqual(receipt["test_count"], 87)
