@@ -11,7 +11,7 @@ from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, publish_role
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -102,6 +102,10 @@ class RotaryEmbedding(BaseFusedOp):
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
+        self._force_native = (
+            publish_role() is not None
+            and get_exec().deterministic.rl_on_policy_target is not None
+        )
 
         cache = self._compute_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability.
@@ -137,7 +141,7 @@ class RotaryEmbedding(BaseFusedOp):
         self._apply_rotary_emb_wrapped = apply_rotary_emb
 
         # XXX (MUSA): Implement sgl_kernel.rotary_embedding support for MUSA backend
-        if get_exec().deterministic.rl_on_policy_target is not None or _is_musa:
+        if self._force_native or _is_musa:
             self._forward_method = self.forward_native
             self._apply_rotary_emb_wrapped = torch.compile(
                 dynamic=True,
@@ -160,9 +164,7 @@ class RotaryEmbedding(BaseFusedOp):
         # use CPU to compute the cache and then move it to GPU. However, we
         # create the cache on GPU for faster initialization. This may cause
         # a slight numerical difference between the HF implementation and ours.
-        init_device = (
-            "cpu" if get_exec().deterministic.rl_on_policy_target is not None else None
-        )
+        init_device = "cpu" if self._force_native else None
         inv_freq = 1.0 / (
             base
             ** (
@@ -172,7 +174,7 @@ class RotaryEmbedding(BaseFusedOp):
                 / self.rotary_dim
             )
         )
-        if get_exec().deterministic.rl_on_policy_target is not None:
+        if self._force_native:
             inv_freq = inv_freq.cuda()
         return inv_freq
 
