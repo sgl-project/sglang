@@ -1056,7 +1056,6 @@ class ModelRunner:
         # This can reduce thread conflicts and speed up weight loading.
         if self.device != "cpu":
             torch.set_num_threads(1)
-        if self.device == "cuda":
             maybe_downgrade_dtype_for_legacy_gpu(
                 server_args=self.server_args, model_config=self.model_config
             )
