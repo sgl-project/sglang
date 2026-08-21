@@ -1563,7 +1563,7 @@ class DeepseekV4AscendAttnBackend(
         # The host metadata op reads CPU int32 mirrors — never a D2H sync of the
         # device tensors (that would drain the stream and stall overlapped prep).
         c1a_kwargs = base_kwargs | common
-        if self._use_host_sparse_metadata:
+        if self._is_dspark_draft_worker:
             cu_q_cpu = fm.actual_seq_lengths_q_pa_cpu
             if cu_q_cpu is not None and cu_q_cpu.numel() > bs + 1:
                 cu_q_cpu = cu_q_cpu[: bs + 1]
@@ -1590,7 +1590,7 @@ class DeepseekV4AscendAttnBackend(
             }
             c4a_kwargs = c1a_kwargs | c4a_overrides
             kernel_metadata["c4a_metadata"] = (
-                torch.ops.npu.sparse_attn_sharedkv_metadata_host(**c4a_kwargs)
+                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c4a_kwargs)
             )
 
             if actual_seq_lengths_q_pa is not None:
@@ -1620,7 +1620,7 @@ class DeepseekV4AscendAttnBackend(
             c128a_overrides = {"cmp_ratio": 128, "has_cmp_kv": True}
             c128a_kwargs = c1a_kwargs | c128a_overrides
             kernel_metadata["c128a_metadata"] = (
-                torch.ops.npu.sparse_attn_sharedkv_metadata_host(**c128a_kwargs)
+                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c128a_kwargs)
             )
 
         return kernel_metadata
