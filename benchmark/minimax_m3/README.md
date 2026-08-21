@@ -117,97 +117,94 @@ test -r /shared/eval/longbench_v2_m3_100_min32k.json
 test -r /shared/eval/longbench_v2_m3_100_min32k.json.manifest.json
 ```
 
-For the publishable gate, use the automated driver inside an already-created,
-exclusive 4x GB300 Slurm allocation. This command is suitable as the payload of
-an `sbatch --wrap` or session-specific job script:
+For publishable evidence, use the one canonical driver inside a fresh,
+exclusive 4x GB300 allocation. Freeze the SGLang and FlashInfer commit and tree,
+the full checkpoint file manifest and aggregate (with the config hash as an
+additional fast check), and both evaluation inputs before starting. The three modes
+must use distinct output and cache roots:
 
 ```bash
-export MODEL=MiniMaxAI/MiniMax-M3-MXFP8
-export LONGBENCH_SUBSET=/shared/eval/longbench_v2_m3_100_min32k.json
-export GPQA_DATASET=/shared/eval/gpqa_diamond.csv
-export FLASHINFER_SOURCE_DIR=/workspace/flashinfer
-export FLASHINFER_HEAD=<exact-final-source-commit>
-export OUTPUT_ROOT=/shared/results/msa_gb300_tp4_$(date -u +%Y%m%dT%H%M%SZ)
-export EXPECTED_TVM_FFI_VERSION=0.1.9
-export GPQA_SCORE_TOLERANCE=0
-export LONGBENCH_SCORE_TOLERANCE=0.01
-export MINFER_FMHA_CACHE_DIR=/workspace/run/cache/fmha_sm100
-export BASELINE_FMHA_PRECOMPILE_RECEIPT=/shared/results/fmha_sm100_precompile.json
-export SERVER_TIMEOUT=7200
-bash benchmark/minimax_m3/run_msa_ab_gb300.sh
+COMMON=(
+  --model /model
+  --gpqa-dataset /shared/eval/gpqa_diamond.csv
+  --longbench-subset /shared/eval/longbench_v2_m3_100_min32k.json
+  --flashinfer-source-dir /workspace/flashinfer
+  --expected-flashinfer-head "${FLASHINFER_HEAD}"
+  --expected-flashinfer-tree "${FLASHINFER_TREE}"
+  --sglang-source-dir /workspace/sglang
+  --expected-sglang-head "${SGLANG_HEAD}"
+  --expected-sglang-tree "${SGLANG_TREE}"
+  --expected-model-config-sha256 "${MODEL_CONFIG_SHA256}"
+  --model-manifest /shared/input/model-checkpoint-manifest.json
+  --expected-model-manifest-sha256 "${MODEL_MANIFEST_SHA256}"
+  --expected-model-aggregate-sha256 "${MODEL_AGGREGATE_SHA256}"
+  --expected-gpqa-sha256 "${GPQA_SHA256}"
+  --expected-longbench-sha256 "${LONGBENCH_SHA256}"
+  --expected-longbench-manifest-sha256 "${LONGBENCH_MANIFEST_SHA256}"
+  --server-timeout 7200
+)
+
+python benchmark/minimax_m3/run_msa_formal_v2.py \
+  "${COMMON[@]}" --mode accuracy \
+  --output-root /shared/results/msa_accuracy \
+  --cache-root /workspace/cache/msa_accuracy
+
+python benchmark/minimax_m3/run_msa_formal_v2.py \
+  "${COMMON[@]}" --mode external-speed \
+  --output-root /shared/results/msa_external_speed \
+  --cache-root /workspace/cache/msa_external_speed \
+  --min-median-throughput-gain 0
+
+python benchmark/minimax_m3/run_msa_formal_v2.py \
+  "${COMMON[@]}" --mode triton-speed \
+  --output-root /shared/results/msa_triton_speed \
+  --cache-root /workspace/cache/msa_triton_speed \
+  --min-median-throughput-gain 0
 ```
 
-Before the first server starts, the driver serially compiles and validates the
-BF16 sparse-paged `fmha_sm100` variants reachable by this TP4 gate, plus its
-plan, reduction, and sparse-top-k modules. The baseline package only protects
-JIT compilation within one process; serial precompilation prevents four TP
-workers from racing on the same shared `.so` while preserving one identical
-completed cache for all six server starts.
+Each mode runs exactly three fresh, alternating pairs. Accuracy uses
+`external,flashinfer`, `flashinfer,external`, `external,flashinfer`; the Triton
+speed reference uses the analogous `triton,flashinfer` order. Every arm gets a
+new server and isolated JIT/cache directories. The driver verifies the selected
+route, sends one unmeasured fixed-seed 8K/1K warmup, brackets the measured server
+log by byte offset, and rejects port reuse, JIT activity, errors, retries,
+timeouts, client exhaustion, thermal throttling, or an unexpected count of
+successful requests. It never resumes into an existing result root.
+For the loopback OpenAI-compatible evaluator client, the runner supplies the
+non-secret dummy key `EMPTY` only when `OPENAI_API_KEY` is absent; an explicitly
+provided value is preserved.
+Before launching a server, every allocation re-hashes the complete checkpoint,
+requires its exact file set, and compares every file plus the aggregate against
+the frozen manifest; a config hash alone is not a checkpoint identity.
 
-For a fresh run, the driver refuses an existing output root and runs exactly
-three complete repetitions in `baseline,candidate`, `candidate,baseline`, then
-`baseline,candidate` order. Every backend gets a fresh server. The driver waits
-for `/health_generate`, verifies one startup-log line contains the requested
-`main_attn`, `msa_decode=True`, `msa_owns_decode=True`, and
-`decode_cuda_graph=True`, sends an unmeasured 8K/1K warmup, and only then starts
-the full gate. Both warmup and serving sweeps use the fixed-seed, offline
-`random-ids` generator and send token IDs directly, so the 8K input length is
-exact and they never depend on an implicit dataset download. It stops the
-server between providers and fails if the old server still owns the port.
-If an allocation ends between complete repetitions, set `START_REPETITION` to
-2 or 3 and reuse the output root. Resume is fail-closed: immutable manifest
-inputs and every completed pair are revalidated, while an incomplete target
-repetition is never overwritten.
+Build the Python environment once as an immutable input, not independently in
+the three formal allocations. Resolve the complete transitive wheel closure for
+the target Python ABI and platform into a session-local wheelhouse, record the
+exact filename, size, and SHA-256 of every wheel plus an aggregate, and reject
+missing or extra files. Each allocation must verify that manifest, install only
+those explicit wheel paths with `PIP_NO_INDEX=1`, `--no-index`, and `--no-deps`,
+then run the dependency/import preflight. Do not use a network package index in
+a formal allocation.
 
-Each repetition is compared independently. `summary.json` then reports the
-three raw values, backend median, gain computed from backend medians, and median
-paired gain for every concurrency and metric. It also rejects provider-order
-drift, dataset-hash drift, and any visible temperature-zero fixed answer that
-changes across the six server runs. Hidden reasoning text and its response hash
-remain in the evidence for auditing, but are not an equality gate: equivalent
-exact answers can legitimately use different reasoning traces. By default,
-candidate median output throughput may not regress at any concurrency.
+Accuracy and speed are separate experiments. Accuracy runs exact visible-answer
+probes at short, 32K, and 64K lengths, all 198 GPQA-Diamond questions at one
+client thread, and the deterministic 100-example LongBench-v2 subset at one
+thread. Both every pair and the three-run aggregate must stay within one GPQA
+question and 0.02 LongBench score. Private GPQA responses are mode `0600`;
+public per-example evidence contains hashes rather than response text. GPQA is
+materially harder than saturated GSM8K, while LongBench directly exercises
+long-context page selection and decode replay.
 
-For a single diagnostic run, start one server manually and run:
+The two speed modes send no accuracy requests. Each arm runs exactly 256 native
+SGLang `/generate` requests at concurrency 1, 8, 32, and 128, with fixed-seed
+`random-ids`, 8192 input tokens, 1024 output tokens, range ratio 1, and implicit
+benchmark warmups disabled. The consumer rejects duplicate JSONL records,
+partial or failed request counts, workload drift, non-finite values, and a
+negative median output-throughput gain at any concurrency. Keep clocks and
+power limits fixed and retain the complete receipts and logs for review.
+
+Run the executable fail-closed contract without a GPU with:
 
 ```bash
-BASE_URL=http://127.0.0.1:30000 \
-MODEL=MiniMaxAI/MiniMax-M3-MXFP8 \
-LABEL=external \
-OUTPUT_DIR=/shared/results/msa_external \
-LONGBENCH_SUBSET=/shared/eval/longbench_v2_m3_100_min32k.json \
-GPQA_DATASET=/shared/eval/gpqa_diamond.csv \
-bash benchmark/minimax_m3/run_msa_gate.sh
+python benchmark/minimax_m3/run_msa_formal_v2.py --test-only
 ```
-
-Use `LABEL=flashinfer` and a new output directory for the candidate, then check
-the accuracy contract:
-
-```bash
-python benchmark/minimax_m3/compare_msa_gate.py \
-  --baseline-dir /shared/results/msa_external \
-  --candidate-dir /shared/results/msa_flashinfer \
-  --gpqa-score-tolerance 0.0051 \
-  --longbench-score-tolerance 0.02
-```
-
-The mandatory accuracy gates are exact temperature-zero visible-answer parity
-for the fixed probes (with tokenizer-measured 32K and 64K prompt lengths), an
-explicit one-answer (1/198, rounded up to 0.0051) noninferiority margin on all
-198 GPQA-Diamond questions, and a two-answer (0.02) margin on the deterministic
-100-example category-balanced LongBench-v2 subset whose prompts are 32K--512K
-tokens. Both the per-pair checks and the three-run backend medians enforce those
-margins. The runner requires the two margins as inputs and records them in its
-manifests and comparison JSON. GPQA is materially harder than saturated GSM8K;
-LongBench directly exercises MSA's long-context page selection and decode
-replay without admitting prompts beyond the model's serving envelope.
-
-The single-pair comparison command also reports fractional speedup for
-request/output-token throughput and median/p99 TTFT and inter-token latency. Pass
-`--min-output-throughput-gain 0` to make non-regression at every concurrency a
-hard gate. The automated three-repetition gate applies non-regression to the
-backend medians instead, which is less sensitive to one noisy pair. Keep
-clocks/power limits fixed, and reject evidence with errors, retries, compilation
-during a measured serving interval, or thermal throttling. The gate records the
-server-log byte offsets bracketing every serving interval to make that review
-exact rather than timestamp-based.
