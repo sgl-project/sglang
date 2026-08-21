@@ -824,7 +824,8 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["moe_runner_backend"] = "deep_gemm"
         elif (
             server_args.moe_runner_backend == "auto"
-            and quant_resolved == "modelopt_mixed"
+            and server_args.get_model_config().quantization
+            in ("modelopt_mixed", "modelopt_fp4")
         ):
             overrides["moe_runner_backend"] = "flashinfer_trtllm_routed"
         logger.info(
