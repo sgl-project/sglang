@@ -7,22 +7,13 @@ metatags:
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 import { QwenImageEditDeployment } from '/src/snippets/diffusion/qwen-image-edit-deployment.jsx';
 
-<DiffusionModelTags tags={["image", "image editing", "text rendering", "character consistency"]} />
+<DiffusionModelTags tags={["image editing", "text replacement", "character consistency", "multi-person", "20B"]} />
 
 ## 1. Model Introduction
 
-[Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) is an enhanced version over Qwen-Image-Edit-2509, featuring multiple improvements—including notably better consistency. Built upon the 20B Qwen-Image model, Qwen-Image-Edit-2511 successfully extends Qwen-Image's unique text rendering capabilities to image editing tasks, enabling precise text editing.
+[Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) is the 20B editing counterpart to Qwen-Image. It is strongest at changing text, materials, lighting, viewpoint, or composition while reducing drift in regions that were not requested to change.
 
-Key Enhancements in Qwen-Image-Edit-2511:
-
-- **Mitigate Image Drift**: Reduces unwanted changes in non-edited regions of the image.
-- **Improved Character Consistency**: The model can perform imaginative edits based on an input portrait while preserving the identity and visual characteristics of the subject.
-- **Multi-Person Consistency**: Enhanced consistency in multi-person group photos, enabling high-fidelity fusion of two separate person images into a coherent group shot.
-- **Integrated LoRA Capabilities**: Selected popular community-created LoRAs are integrated directly into the base model, unlocking their effects without extra tuning (e.g., lighting enhancement, viewpoint generation).
-- **Enhanced Industrial Design Generation**: Special attention to practical engineering scenarios, including batch industrial product design and material replacement for industrial components.
-- **Strengthened Geometric Reasoning**: Stronger geometric reasoning capability for generating auxiliary construction lines for design or annotation purposes.
-
-For more details, please refer to the [official Qwen-Image-Edit-2511 HuggingFace page](https://huggingface.co/Qwen/Qwen-Image-Edit-2511), the [Blog](https://qwenlm.github.io/blog/qwen-image-edit-2511/), and the [Tech Report](https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/Qwen_Image.pdf).
+Choose it for identity-sensitive portrait edits, multi-person composition, typography replacement, and geometry-aware design work. It is substantially heavier than small specialist editors, and consistency is improved rather than guaranteed; evaluate untouched-region drift on the actual editing workload.
 
 ## 2. SGLang-diffusion Installation
 
