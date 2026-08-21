@@ -18,6 +18,15 @@ logger = logging.getLogger(__name__)
 _CAPTURE_HEADROOM_GB = 1.0
 
 
+def _base_logits_dtype(model) -> torch.dtype:
+    """Dtype of the block logits; a quantized head's packed `weight` carries no
+    logits dtype, its kernel emits the activation (draft param) dtype instead."""
+    weight = model.lm_head.weight
+    if weight.is_floating_point():
+        return weight.dtype
+    return next(model.markov_head.parameters()).dtype
+
+
 def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
     del step_idx
     return torch.argmax(step_logits, dim=-1)
@@ -73,7 +82,7 @@ class DsparkDraftSampler:
             )
             self.corrected_out = torch.empty(
                 (max_bs * self.gamma, vocab),
-                dtype=model.lm_head.weight.dtype,
+                dtype=_base_logits_dtype(model),
                 device=device,
             )
 
@@ -154,11 +163,11 @@ def _resolve_folded_sampling(
         return True
     vocab = int(model.lm_head.org_vocab_size)
     noise_bytes = max_bs * vocab * 4
-    logits_bytes = max_bs * gamma * vocab * model.lm_head.weight.dtype.itemsize
+    logits_bytes = max_bs * gamma * vocab * _base_logits_dtype(model).itemsize
     need_gb = (noise_bytes + logits_bytes) / (1 << 30)
     if available_memory_gb is None:
         available_memory_gb = get_available_gpu_memory(
-            device, torch.cuda.current_device()
+            device, torch.cuda.get_device_module().current_device()
         )
     if available_memory_gb - need_gb >= _CAPTURE_HEADROOM_GB:
         return True
