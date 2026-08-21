@@ -98,6 +98,15 @@ sgl-eval run gsm8k \\
         { id: "current", label: "Inherited from base" },
         { id: "off", label: "Off (greedy)" },
         { id: "nextn", label: "NEXTN (built-in MTP)", flags: ["--speculative-algorithm NEXTN"] },
+        {
+          id: "dspark",
+          label: "DSPARK (draft model)",
+          flags: [
+            "--speculative-algorithm DSPARK",
+            "--speculative-draft-model-path inclusionAI/Ling-3.0-flash-dspark",
+            "--enable-linear-replayssm-spec",
+          ],
+        },
       ],
     },
     hicache: {
