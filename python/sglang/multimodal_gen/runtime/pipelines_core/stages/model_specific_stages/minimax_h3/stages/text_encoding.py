@@ -27,6 +27,27 @@ logger = init_logger(__name__)
 _MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY = "minimax_h3_single_copy_text_encode"
 
 
+def _attach_text_video_token_mask(
+    positive: dict,
+    *,
+    enabled: bool,
+    mask: torch.Tensor | None = None,
+) -> None:
+    """Attach SubBlock-only provenance without touching other backends."""
+    if not enabled:
+        return
+    text_len = int(positive["text_len"])
+    if mask is None:
+        mask = torch.zeros(text_len, dtype=torch.bool)
+    else:
+        mask = mask.view(-1).to(dtype=torch.bool)
+        if mask.shape[0] != text_len:
+            raise ValueError(
+                f"text video mask length {mask.shape[0]} != text_len {text_len}"
+            )
+    positive["text_video_token_mask"] = mask
+
+
 class MiniMaxH3TextEncodingStage(TextEncodingStage):
     deduplicated_output_fields = ("prompt_embeds", "prompt_seq_lens")
     deduplicated_extra_output_keys = (MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY,)
@@ -54,7 +75,13 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         plan = minimax_h3_plan_from_batch(batch)
         if plan is not None:
             try:
-                self._encode_from_plan(batch, plan)
+                self._encode_from_plan(
+                    batch,
+                    plan,
+                    include_video_token_mask=(
+                        server_args.attention_backend == "subblock_sparse_attn"
+                    ),
+                )
                 self._publish_native_text_conditioning(batch)
                 if current_platform.is_mps():
                     self._finish_active_component_use()
@@ -229,7 +256,13 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         batch.prompt_embeds = [hidden_states]
         batch.prompt_seq_lens = [[text_len]]
 
-    def _encode_from_plan(self, batch: Req, plan) -> None:
+    def _encode_from_plan(
+        self,
+        batch: Req,
+        plan,
+        *,
+        include_video_token_mask: bool = False,
+    ) -> None:
         """Encode the positive Qwen3VL presentation into layer-50 states.
 
         MiniMax H3 only supports the CFG-distilled model path, so every task
@@ -276,24 +309,35 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             )
         with set_forward_context(current_timestep=0, attn_metadata=None):
             if plan.task == "ref2va":
-                embeddings = self._encode_ref2va(batch, plan, encode_ids)
+                embeddings = self._encode_ref2va(
+                    batch,
+                    plan,
+                    encode_ids,
+                    include_video_token_mask=include_video_token_mask,
+                )
             elif keyframes:
                 embeddings = self._encode_fl2va_keyframes(
                     batch,
                     plan,
                     encode_ids,
                     prompt=prompt,
+                    include_video_token_mask=include_video_token_mask,
                 )
             else:
                 positive_ids = minimax_h3_text_only_ids(self.tokenizer, prompt)
+                positive = {
+                    "hidden_states": encode_ids(positive_ids),
+                    "text_len": int(positive_ids.shape[0]),
+                    "text_token_tags": torch.ones(
+                        int(positive_ids.shape[0]), dtype=torch.long
+                    ),
+                }
+                _attach_text_video_token_mask(
+                    positive,
+                    enabled=include_video_token_mask,
+                )
                 embeddings = {
-                    "positive": {
-                        "hidden_states": encode_ids(positive_ids),
-                        "text_len": int(positive_ids.shape[0]),
-                        "text_token_tags": torch.ones(
-                            int(positive_ids.shape[0]), dtype=torch.long
-                        ),
-                    }
+                    "positive": positive,
                 }
         batch.extra[MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY] = embeddings
 
@@ -304,6 +348,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         encode_ids,
         *,
         prompt: str,
+        include_video_token_mask: bool = False,
     ) -> dict:
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.canvas import (
             minimax_h3_prepared_keyframes,
@@ -347,15 +392,25 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
         )
-        return {
-            "positive": {
-                "hidden_states": pos_hidden,
-                "text_len": int(pos_ids.shape[0]),
-                "text_token_tags": pos_tags,
-            },
+        positive = {
+            "hidden_states": pos_hidden,
+            "text_len": int(pos_ids.shape[0]),
+            "text_token_tags": pos_tags,
         }
+        _attach_text_video_token_mask(
+            positive,
+            enabled=include_video_token_mask,
+        )
+        return {"positive": positive}
 
-    def _encode_ref2va(self, batch: Req, plan, encode_ids) -> dict:
+    def _encode_ref2va(
+        self,
+        batch: Req,
+        plan,
+        encode_ids,
+        *,
+        include_video_token_mask: bool = False,
+    ) -> dict:
         """Encode the positive ref2va presentation.
 
         Per condition in order — image i: '<Picture i>: ' label +
@@ -518,14 +573,20 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                 video_block_timestamps.append(timestamps)
 
         if has_video:
-            pos_ids, pos_tags = minimax_h3_ref2va_video_presentation(
+            presentation = minimax_h3_ref2va_video_presentation(
                 self.tokenizer,
                 prompt=plan.prompt,
                 condition_labels=condition_labels,
                 image_token_count=n_image_tokens,
                 video_block_token_counts=video_block_token_counts,
                 video_block_timestamps=video_block_timestamps,
+                return_video_mask=include_video_token_mask,
             )
+            if include_video_token_mask:
+                pos_ids, pos_tags, pos_video_mask = presentation
+            else:
+                pos_ids, pos_tags = presentation
+                pos_video_mask = None
         else:
             pos_ids, pos_tags = minimax_h3_ref2va_presentation(
                 self.tokenizer,
@@ -533,6 +594,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                 condition_labels=condition_labels,
                 image_token_count=n_image_tokens,
             )
+            pos_video_mask = None
         pos_hidden = encode_ids(
             pos_ids,
             pixel_values=pixel_values,
@@ -542,13 +604,17 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         )
         if batch.extra.get(_MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY):
             batch.extra.pop(MINIMAX_H3_PREPARED_REFERENCE_VIDEO_EXTRA_KEY, None)
-        return {
-            "positive": {
-                "hidden_states": pos_hidden,
-                "text_len": int(pos_ids.shape[0]),
-                "text_token_tags": pos_tags,
-            },
+        positive = {
+            "hidden_states": pos_hidden,
+            "text_len": int(pos_ids.shape[0]),
+            "text_token_tags": pos_tags,
         }
+        _attach_text_video_token_mask(
+            positive,
+            enabled=include_video_token_mask,
+            mask=pos_video_mask,
+        )
+        return {"positive": positive}
 
 
 __all__ = ["MiniMaxH3TextEncodingStage"]

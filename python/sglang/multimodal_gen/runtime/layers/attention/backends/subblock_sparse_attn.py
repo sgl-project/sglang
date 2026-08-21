@@ -401,16 +401,31 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
         )
 
     def _sparse_attention(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        routing_q: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """q, k, v: ``[1, S, H, 128]`` bf16 -> same shape."""
+        """Q ``[1, Sq, H, 128]`` against K/V ``[1, Sk, H, 128]``."""
         plan = self.router.route(
-            q, k, sparsity=self.schedule.sparsity, softmax_scale=self.softmax_scale
+            q if routing_q is None else routing_q,
+            k,
+            sparsity=self.schedule.sparsity,
+            softmax_scale=self.softmax_scale,
         )
+        expected_q_blocks = -(-q.shape[1] // SUBBLOCK_SPARSE_BLOCK_SIZE)
+        if plan.index.shape[2] != expected_q_blocks:
+            raise ValueError(
+                "SubBlock routing/kernel query-block mismatch: "
+                f"plan has {plan.index.shape[2]}, kernel needs {expected_q_blocks}"
+            )
         # Proof that the sparse path actually ran, with the shape it ran on --
         # the construction-time log above only says the layer was eligible.
         logger.info_once(
-            f"SubBlock sparse attention active: S={k.shape[1]} heads={q.shape[2]} "
+            f"SubBlock sparse attention active: Sq={q.shape[1]} "
+            f"Sk={k.shape[1]} heads={q.shape[2]} "
             f"keeping {plan.topk}/{plan.num_blocks} key blocks per query block "
             f"(sparsity {1 - plan.density:.4f})"
         )
@@ -422,6 +437,94 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
             plan.topk,
             self.softmax_scale,
         )
+
+    def _dense_query_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        query_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run selected queries through SGLang FA with complete document K/V."""
+        dense_q = q.index_select(1, query_indices)
+        dense_out = self.dense_impl.forward(dense_q, k, v, None)
+        return dense_out[0] if isinstance(dense_out, tuple) else dense_out
+
+    @staticmethod
+    def _query_plan_indices(
+        query_plan: dict[str, Any],
+        name: str,
+        device: torch.device,
+    ) -> torch.Tensor:
+        value = query_plan.get(name)
+        if not isinstance(value, torch.Tensor) or value.ndim != 1:
+            raise ValueError(f"SubBlock query plan {name} must be a rank-1 tensor")
+        return value.to(device=device, dtype=torch.long)
+
+    def _hybrid_query_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        query_plan: dict[str, Any],
+    ) -> torch.Tensor:
+        """Combine dense non-video Q with sparse outputs from video Q blocks.
+
+        Every original 64-row block containing at least one video query is
+        routed intact so SubBlock sees the same query-block contents as the
+        unsplit sequence. Non-video rows inside those boundary blocks are
+        therefore computed by SubBlock too, but their sparse outputs are
+        discarded; only video rows consume sparse results.
+        """
+        dense_indices = self._query_plan_indices(
+            query_plan, "dense_query_indices", q.device
+        )
+        video_indices = self._query_plan_indices(
+            query_plan, "video_query_indices", q.device
+        )
+        sparse_gather = self._query_plan_indices(
+            query_plan, "sparse_query_gather_indices", q.device
+        )
+        sparse_video_outputs = self._query_plan_indices(
+            query_plan, "sparse_video_output_indices", q.device
+        )
+        sparse_valid_len = query_plan.get("sparse_query_valid_len")
+        if not isinstance(sparse_valid_len, int):
+            raise ValueError(
+                "SubBlock query plan sparse_query_valid_len must be an integer"
+            )
+        if dense_indices.numel() + video_indices.numel() != q.shape[1]:
+            raise ValueError("SubBlock query plan must cover every query row")
+
+        out = torch.empty_like(q)
+        if dense_indices.numel():
+            dense_out = self._dense_query_attention(q, k, v, dense_indices)
+            out.index_copy_(1, dense_indices, dense_out)
+        if video_indices.numel():
+            if sparse_gather.numel() % SUBBLOCK_SPARSE_BLOCK_SIZE:
+                raise ValueError(
+                    "SubBlock sparse query gather must contain full blocks"
+                )
+            if not 0 < sparse_valid_len <= sparse_gather.numel():
+                raise ValueError("SubBlock sparse query valid length is out of range")
+            if sparse_video_outputs.numel() != video_indices.numel():
+                raise ValueError(
+                    "SubBlock sparse video source/destination sizes must match"
+                )
+            sparse_q = q.index_select(1, sparse_gather)
+            sparse_out = self._sparse_attention(
+                sparse_q,
+                k,
+                v,
+                routing_q=sparse_q[:, :sparse_valid_len],
+            )
+            video_out = sparse_out.index_select(1, sparse_video_outputs)
+            out.index_copy_(1, video_indices, video_out)
+        logger.info_once(
+            "SubBlock hybrid query routing active: non-video queries use "
+            "dense FA and video query blocks use sparse attention"
+        )
+        return out
 
     def forward(
         self,
@@ -444,12 +547,15 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
+        first_segment_query_plan: dict[str, Any] | None = None,
     ) -> torch.Tensor:
         """Packed ``[T, H, D]`` rows split into documents by ``cu_seqlens``.
 
-        The block-sparse kernel takes one contiguous sequence, so each packed
-        document is routed on its own. Documents shorter than ``min_seq_len``
-        -- in MiniMax H3 the padding tail -- go through the dense kernel.
+        Each packed document keeps its own full K/V context. The optional H3
+        query plan gathers video-containing source blocks into one contiguous,
+        block-aligned Q sequence for SubBlock while non-video Q uses FA.
+        Documents shorter than ``min_seq_len`` -- in H3, the padding tail --
+        stay on the existing dense segment path.
         """
 
         def all_dense() -> torch.Tensor:
@@ -487,14 +593,26 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
         for start, stop in segments:
             # Deliberately not `.contiguous()`. After the Ulysses all-to-all,
             # q/k/v are last-dim slices of one packed buffer, so they are
-            # strided; both the block-sparse kernel and SDPA permute them
-            # anyway, and forcing contiguity here measured as a wasted
+            # strided; the attention kernels handle those views directly, and
+            # forcing contiguity here measured as a wasted
             # full-tensor copy (0.46 ms per call at S=37.7k on B200).
             q_seg = query[start:stop].unsqueeze(0)
             k_seg = key[start:stop].unsqueeze(0)
             v_seg = value[start:stop].unsqueeze(0)
             if (start, stop) in sparse_segments:
-                seg_out = self._sparse_attention(q_seg, k_seg, v_seg)
+                query_plan = (
+                    first_segment_query_plan if (start, stop) == segments[0] else None
+                )
+                seg_out = (
+                    self._sparse_attention(q_seg, k_seg, v_seg)
+                    if query_plan is None
+                    else self._hybrid_query_attention(
+                        q_seg,
+                        k_seg,
+                        v_seg,
+                        query_plan,
+                    )
+                )
             else:
                 seg_out = self._dense_segment(q_seg, k_seg, v_seg)
             out[start:stop] = seg_out[0]

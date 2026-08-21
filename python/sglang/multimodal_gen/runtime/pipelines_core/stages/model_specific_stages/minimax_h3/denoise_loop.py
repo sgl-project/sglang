@@ -28,6 +28,114 @@ MINIMAX_H3_AUDIO_REF_COND_TIMESTEP = 1.0
 # (24 * 1 * 2 * 2 = 96); audio rows carry the 32-dim audio latent.
 MINIMAX_H3_VIDEO_ROW_WIDTH = 96
 MINIMAX_H3_AUDIO_ROW_WIDTH = 32
+_MINIMAX_H3_SUBBLOCK_QUERY_BLOCK_SIZE = 64
+
+
+def _minimax_h3_subblock_video_query_indices(
+    packed: dict[str, torch.Tensor],
+    text_video_token_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Return first-segment-relative query rows that contain video."""
+    text_pos = packed["text_pos"].view(-1).to(dtype=torch.long)
+    text_video_token_mask = text_video_token_mask.view(-1).to(
+        device=text_pos.device,
+        dtype=torch.bool,
+    )
+    if text_video_token_mask.shape[0] != text_pos.shape[0]:
+        raise ValueError(
+            "text_video_token_mask must align with packed text rows "
+            f"({text_pos.shape[0]}), got {text_video_token_mask.shape[0]}"
+        )
+    latent_video_pos = packed["video_pos"].view(-1).to(dtype=torch.long)
+    return torch.cat([text_pos[text_video_token_mask], latent_video_pos])
+
+
+def _minimax_h3_subblock_dense_query_indices(
+    video_query_indices: torch.Tensor,
+    *,
+    used_len: int,
+) -> torch.Tensor:
+    """Return every used query row except explicitly identified video rows."""
+    if used_len < 0:
+        raise ValueError(f"used_len must be non-negative, got {used_len}")
+    if video_query_indices.ndim != 1:
+        raise ValueError(
+            f"video_query_indices must be rank 1, got {list(video_query_indices.shape)}"
+        )
+    video_query_indices = video_query_indices.to(dtype=torch.long)
+    if video_query_indices.numel():
+        first = int(video_query_indices.min())
+        last = int(video_query_indices.max())
+        if first < 0 or last >= used_len:
+            raise ValueError(
+                "video_query_indices must be first-segment-relative and in "
+                f"[0, {used_len}), got min={first}, max={last}"
+            )
+        if torch.unique(video_query_indices).numel() != video_query_indices.numel():
+            raise ValueError("video_query_indices must not contain duplicates")
+    dense_mask = torch.ones(
+        used_len, dtype=torch.bool, device=video_query_indices.device
+    )
+    dense_mask[video_query_indices] = False
+    return torch.nonzero(dense_mask, as_tuple=False).view(-1)
+
+
+def _minimax_h3_subblock_query_plan(
+    video_query_indices: torch.Tensor,
+    *,
+    used_len: int,
+) -> dict[str, torch.Tensor | int]:
+    """Build request-static FA/SubBlock query routing for the real segment."""
+    video_query_indices = video_query_indices.view(-1).to(dtype=torch.long)
+    dense_query_indices = _minimax_h3_subblock_dense_query_indices(
+        video_query_indices,
+        used_len=used_len,
+    )
+    block_size = _MINIMAX_H3_SUBBLOCK_QUERY_BLOCK_SIZE
+    if video_query_indices.numel() == 0:
+        empty = torch.empty(0, dtype=torch.long, device=video_query_indices.device)
+        return {
+            "dense_query_indices": dense_query_indices,
+            "video_query_indices": video_query_indices,
+            "sparse_query_gather_indices": empty,
+            "sparse_video_output_indices": empty,
+            "sparse_query_valid_len": 0,
+        }
+
+    video_block_ids = torch.unique(
+        torch.div(video_query_indices, block_size, rounding_mode="floor"),
+        sorted=True,
+    )
+    block_offsets = torch.arange(
+        block_size,
+        dtype=torch.long,
+        device=video_query_indices.device,
+    )
+    block_rows = video_block_ids[:, None] * block_size + block_offsets[None, :]
+    valid_rows = block_rows < used_len
+    sparse_query_valid_len = int(valid_rows.sum())
+    # Selected source blocks stay in ascending order. If the final global
+    # block is selected and ragged, every invalid gather slot is therefore in
+    # one suffix. Repeating its last legal row keeps the gathered kernel Q
+    # block-aligned across SM90/SM100; routing uses only the real prefix, and
+    # every output produced for the repeated suffix is discarded.
+    sparse_query_gather_indices = block_rows.clamp_max(used_len - 1).reshape(-1)
+    video_block_rank = torch.searchsorted(
+        video_block_ids,
+        torch.div(video_query_indices, block_size, rounding_mode="floor"),
+    )
+    sparse_video_output_indices = (
+        video_block_rank * block_size + video_query_indices.remainder(block_size)
+    )
+    if dense_query_indices.numel() + video_query_indices.numel() != used_len:
+        raise ValueError("SubBlock query plan must cover every real query exactly once")
+    return {
+        "dense_query_indices": dense_query_indices,
+        "video_query_indices": video_query_indices,
+        "sparse_query_gather_indices": sparse_query_gather_indices,
+        "sparse_video_output_indices": sparse_video_output_indices,
+        "sparse_query_valid_len": sparse_query_valid_len,
+    }
 
 
 @torch.inference_mode()
@@ -95,7 +203,9 @@ class MiniMaxH3DenoiseBranch:
 
     `packed` is a minimax_h3_packed_sequence(...) result (or equivalent layout
     dict); `text_embeddings` is the branch's [text_len, 5120] hidden states;
-    `token_tags` must already carry any fl2va vision-span overrides.
+    `token_tags` must already carry any fl2va vision-span overrides, and
+    `video_query_indices` explicitly identifies the only rows eligible for
+    SubBlock sparsity.
     """
 
     def __init__(
@@ -105,6 +215,7 @@ class MiniMaxH3DenoiseBranch:
         text_embeddings: torch.Tensor,
         token_tags: torch.Tensor,
         device: torch.device,
+        video_query_indices: torch.Tensor | None = None,
     ) -> None:
         seq_len = int(packed["seq_len"])
         self.seq_len = seq_len
@@ -183,6 +294,22 @@ class MiniMaxH3DenoiseBranch:
         sp_world_size = ulysses_world_size * ring_world_size
         sp_rank = ring_rank * ulysses_world_size + ulysses_rank
         token_tags_host = token_tags.view(-1).to(dtype=torch.long)
+        host_subblock_query_plan = (
+            _minimax_h3_subblock_query_plan(
+                video_query_indices.view(-1).to(dtype=torch.long),
+                used_len=int(cu[1]),
+            )
+            if video_query_indices is not None
+            else None
+        )
+        self.subblock_query_plan = (
+            {
+                name: value.to(device) if isinstance(value, torch.Tensor) else value
+                for name, value in host_subblock_query_plan.items()
+            }
+            if host_subblock_query_plan is not None
+            else None
+        )
         local_seq_len = seq_len // sp_world_size
         local_row_start = sp_rank * local_seq_len
         local_row_stop = local_row_start + local_seq_len
@@ -228,6 +355,8 @@ class MiniMaxH3DenoiseBranch:
                 "max_seqlen_q": text_len,
             },
         }
+        if self.subblock_query_plan is not None:
+            self.static_kwargs["subblock_query_plan"] = self.subblock_query_plan
 
     def forward_kwargs(
         self,
