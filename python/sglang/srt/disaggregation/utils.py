@@ -1005,8 +1005,10 @@ def setup_state_kv_args(
     from sglang.srt.mem_cache.memory_pool import (
         DSATokenToKVPool,
         HybridLinearKVPool,
+        MHATokenToKVPoolMXFP8,
         MiniMaxSparseKVPool,
     )
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
     kv_args.state_types = []
     kv_args.state_data_ptrs = []
@@ -1017,6 +1019,13 @@ def setup_state_kv_args(
     kv_args.state_layer_ids = []
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
+
+    if isinstance(token_to_kv_pool, MHATokenToKVPoolMXFP8):
+        append_state_component(
+            kv_args,
+            StateType.BLOCK_SCALE,
+            *token_to_kv_pool.get_kv_scale_buf_infos(),
+        )
 
     if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
         if token_to_kv_pool.index_kv_pool is not None:
@@ -1036,6 +1045,23 @@ def setup_state_kv_args(
             append_state_component(
                 kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
             )
+            # MXFP8 KV: each sub-pool's block scales ride as their own component
+            # so they inherit the index payload of the KV they describe.
+            # Only the concrete SWAKVPool owns a full sub-pool; other
+            # BaseSWAKVPool implementations describe their state per entry.
+            if isinstance(token_to_kv_pool, SWAKVPool) and isinstance(
+                token_to_kv_pool.full_kv_pool, MHATokenToKVPoolMXFP8
+            ):
+                append_state_component(
+                    kv_args,
+                    StateType.BLOCK_SCALE,
+                    *token_to_kv_pool.get_kv_scale_buf_infos(),
+                )
+                append_state_component(
+                    kv_args,
+                    StateType.BLOCK_SCALE_SWA,
+                    *token_to_kv_pool.get_swa_kv_scale_buf_infos(),
+                )
             # unified_kv: the SWA ring lives in the unified buffers (no separate
             # swa_kv_pool) and is addressed per-row, so ship it as SWA_RING.
             if getattr(token_to_kv_pool, "_unified_kv", False) and hasattr(
