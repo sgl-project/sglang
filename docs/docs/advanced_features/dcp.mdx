@@ -158,10 +158,10 @@ Draft steps use the same backend against the replicated draft cache, so they ski
 A dense prefill page cannot be copied directly into striped decode storage. The PD sender uses the decode rank's DCP metadata to select and pack the right rows. See [PD disaggregation](/docs/advanced_features/pd_disaggregation) for the transfer engines.
 
 - Equal DCP sizes require matching DCP ranks and use the existing page path.
-- DCP1 prefill to DCP decode gathers owned MLA rows into a contiguous pack, then RDMA dest-contiguous blocks. Disable with `SGLANG_DISAGG_DCP_PACK=0`.
+- DCP1 prefill to DCP decode uses token relayout for MLA and hybrid-MLA pools.
 - All other DCP-size transitions are rejected.
 
-The plan includes the exact token count, so stale rows do not leak out of a partial final page. Mooncake and NIXL use the same plan. KDA state keeps its attention-TP mapping and bypasses DCP filtering. DSPARK on this path is not part of the packed transfer; see [PR #34343](https://github.com/sgl-project/sglang/pull/34343).
+The plan includes the exact token count, so stale rows do not leak out of a partial final page. Mooncake and NIXL use the same plan. KDA state keeps its attention-TP mapping and bypasses DCP filtering.
 
 This composition requires Mooncake or NIXL, matching physical page size and KV dtype, prefill attention CP `1`, and decode chunk cache. Decode radix cache and HiCache are not supported here.
 
