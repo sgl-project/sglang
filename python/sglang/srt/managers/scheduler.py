@@ -82,7 +82,7 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
-from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
+from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -2583,13 +2583,11 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        uses_top_k_or_top_p_truncation = (
-            req.sampling_params.top_k != TOP_K_ALL or req.sampling_params.top_p < 1.0
-        )
-        if req.return_sampling_mask and not uses_top_k_or_top_p_truncation:
+        if req.return_sampling_mask and req.sampling_params.top_k == TOP_K_ALL:
             error_msg = (
-                "return_sampling_mask cannot return the full vocabulary; set "
-                "top_p < 1 or a finite top_k."
+                "return_sampling_mask requires finite top_k; top_p-only sampling "
+                "is valid but can return huge masks in the tail, blowing up "
+                "metadata, so we need a safety cap."
             )
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
@@ -4560,6 +4558,10 @@ class Scheduler(
                 self._pending_chunked_abort_req = chunked_req
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
+        # Abort requests still waiting for encoder embeddings (EPD language-only)
+        if self.mm_receiver is not None:
+            self.mm_receiver.abort_waiting_requests(recv_req)
+
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):

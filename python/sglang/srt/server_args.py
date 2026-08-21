@@ -5680,17 +5680,11 @@ class ServerArgs:
             # enable_multi_layer_eagle for EAGLE moved to the override registry
             # (arg_groups/overrides.py: _mimo_v2_overrides).
 
-            if self.enable_hierarchical_cache:
-                if not envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
-                    raise ValueError(
-                        "Hierarchical cache for MiMoV2 requires the unified "
-                        "radix tree. Set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 "
-                        "to enable --enable-hierarchical-cache for this model."
-                    )
-
-                # MiMoV2 has head_dim != v_head_dim, so the host KV pool uses
-                # asymmetric K/V allocation. Both kernel/page_first and
-                # direct/page_first_direct have split K/V transfer paths.
+            # MiMoV2 hierarchical cache runs on the unified radix tree, which
+            # is the default tree cache now. MiMoV2 has head_dim != v_head_dim,
+            # so the host KV pool uses asymmetric K/V allocation. Both
+            # kernel/page_first and direct/page_first_direct have split K/V
+            # transfer paths.
         elif (
             "Step3p5ForCausalLM" in model_arch
             or "Step3p7ForConditionalGeneration" in model_arch
