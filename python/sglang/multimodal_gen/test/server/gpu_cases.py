@@ -489,6 +489,9 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
                 "--pipeline-class-name LingBotWorldCausalDMDPipeline --warmup-mode off"
             ],
             text_encoder_cpu_offload=True,
+            env_vars={
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            },
         ),
         REALTIME_MODEL_sampling_params,
         run_component_accuracy_check=False,
@@ -652,6 +655,7 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
             output_size="1344x768",
             seconds=5,
             output_format="mp4",
+            expect_audio_output=True,
             num_outputs_per_prompt=1,
             extras={
                 "task": "fl2va",
@@ -683,7 +687,7 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
         run_component_accuracy_check=False,
         run_models_api_check=False,
         run_t2v_input_reference_check=False,
-    )
+    ),
 ]
 
 TWO_GPU_CASES = [
@@ -700,7 +704,9 @@ TWO_GPU_CASES = [
                 "--performance-mode",
                 "memory",
                 "--layerwise-offload-components",
-                "dit,text_encoder,vae",
+                "dit,text_encoder",
+                "--component-residency",
+                "vae=resident",
                 "--dit-offload-prefetch-size",
                 "1",
                 "--dit-layerwise-resident-layers",
@@ -721,6 +727,7 @@ TWO_GPU_CASES = [
             output_size="1344x768",
             seconds=4,
             output_format="mp4",
+            expect_audio_output=True,
             num_outputs_per_prompt=1,
             extras={
                 "task": "t2va",
@@ -737,6 +744,73 @@ TWO_GPU_CASES = [
             },
         ),
         run_perf_check=True,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
+        "minimax_h3_ref2va_video_audio_2gpu_h100",
+        DiffusionServerArgs(
+            model_path="MiniMaxAI/MiniMax-H3",
+            modality="video",
+            tp_size=2,
+            ulysses_degree=1,
+            extras=[
+                "--model-variant",
+                "ref2va",
+                "--revision",
+                "42ed227ee7df40d41602854ae760620d6eb651fe",
+                "--performance-mode",
+                "memory",
+                "--layerwise-offload-components",
+                "dit,text_encoder",
+                "--component-residency",
+                "vae=resident",
+                "--dit-offload-prefetch-size",
+                "1",
+                "--dit-layerwise-resident-layers",
+                "20",
+                "--enable-torch-compile",
+                "false",
+            ],
+        ),
+        DiffusionSamplingParams(
+            prompt=(
+                "Follow the motion and appearance of <Video 1> while moving the "
+                "scene to a quiet moonlit room, and use <Audio 1> as the sound "
+                "reference with coherent timing."
+            ),
+            output_size="1344x768",
+            seconds=4,
+            output_format="mp4",
+            expect_audio_output=True,
+            num_outputs_per_prompt=1,
+            extras={
+                "task": "ref2va",
+                "conditions": [
+                    {
+                        "type": "video_audio",
+                        "uri": (
+                            "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/"
+                            "42ed227ee7df40d41602854ae760620d6eb651fe/assets/"
+                            "ref2va.mp4"
+                        ),
+                        "role": "reference",
+                    }
+                ],
+                "target": {
+                    "short_edge": 768,
+                    "aspect_ratio": "16:9",
+                    "duration_seconds": 4.0,
+                },
+                "num_inference_steps": 8,
+                "flow_shift": 12.0,
+                "audio_flow_shift": 3.0,
+                "seed": 42,
+            },
+        ),
+        run_perf_check=False,
         run_consistency_check=True,
         run_component_accuracy_check=False,
         run_models_api_check=False,
@@ -1175,6 +1249,8 @@ STANDALONE_FILES = {
         "../single_test_file/test_disagg_server.py",
         "../single_test_file/test_ar_models.py",
         "../single_test_file/test_ipc_a2a_2_gpu.py",
+        "../single_test_file/test_encoder_fold_srt_linear_2_gpu.py",
+        "../single_test_file/test_encoder_fold_srt_2_gpu.py",
         "../single_test_file/test_diffusion_bcg_tp2_zimage_turbo.py",
         "../single_test_file/test_dp_serving_2_gpu.py",
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py",
@@ -1213,6 +1289,8 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_ar_models.py": 600.0,
         # no model load; the cost is the one-time JIT build of the sync kernels
         "../single_test_file/test_ipc_a2a_2_gpu.py": 240.0,
+        "../single_test_file/test_encoder_fold_srt_linear_2_gpu.py": 120.0,
+        "../single_test_file/test_encoder_fold_srt_2_gpu.py": 240.0,
         # ~60 s locally with a warm HF cache (load + one capture + 4 steps);
         # padded for cold-cache CI.
         "../single_test_file/test_diffusion_bcg_tp2_zimage_turbo.py": 180.0,
