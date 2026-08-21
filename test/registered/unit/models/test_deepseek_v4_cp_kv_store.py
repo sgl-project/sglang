@@ -47,7 +47,10 @@ class TestDeepseekV4CPKVStore(unittest.TestCase):
             store_cache=mock.Mock(),
         )
         forward_batch = SimpleNamespace(
-            forward_mode=SimpleNamespace(is_decode_or_idle=lambda: False)
+            forward_mode=SimpleNamespace(
+                is_decode_or_idle=lambda: False,
+                is_target_verify=lambda: False,
+            )
         )
 
         def fused_store(*, kv, q, **_):

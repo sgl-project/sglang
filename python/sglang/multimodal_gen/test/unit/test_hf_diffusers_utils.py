@@ -204,6 +204,31 @@ def test_complete_cached_snapshot_is_served_without_download(
     assert calls == ["probe"]
 
 
+def test_cached_snapshot_respects_requested_revision(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_snapshot_download(**kwargs):
+        calls.append(kwargs)
+        return str(tmp_path)
+
+    monkeypatch.setattr(hf_diffusers_utils, "snapshot_download", fake_snapshot_download)
+
+    assert maybe_download_model("org/repo", revision="a" * 40, download=False) == str(
+        tmp_path
+    )
+    assert calls == [
+        {
+            "repo_id": "org/repo",
+            "ignore_patterns": ["*.onnx", "*.msgpack"],
+            "allow_patterns": None,
+            "local_dir": None,
+            "local_files_only": True,
+            "max_workers": 8,
+            "revision": "a" * 40,
+        }
+    ]
+
+
 def test_partially_populated_cached_snapshot_is_served_without_download(
     recording_snapshot_download, tmp_path
 ):

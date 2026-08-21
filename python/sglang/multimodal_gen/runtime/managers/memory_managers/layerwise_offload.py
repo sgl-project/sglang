@@ -8,10 +8,19 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.loader.utils import MappedRegions
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_RESIDENCY_GROUPS,
     LAYERWISE_OFFLOAD,
     ComponentResidencyError,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    HostPinBudget,
+    describe_host_memory,
+    host_copies_would_not_fit,
+    host_memory_available_bytes,
+    module_weight_bytes,
+    pin_benefit_bytes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_ALL_COMPONENTS,
@@ -81,6 +90,98 @@ def compute_streamed_layers(
 
 
 # Adapted from skywork AI Infra diffusion optimize
+# Below this a table is not worth a per-request round trip; above it the ratio
+# of table size to rows actually read makes residency clearly wasteful.
+HOST_RESIDENT_TABLE_MIN_BYTES = 256 * 1024**2
+
+
+def _resolve_submodule(root: torch.nn.Module, path: str) -> torch.nn.Module | None:
+    current: Any = root
+    for part in path.split("."):
+        current = getattr(current, part, None)
+        if current is None:
+            return None
+    return current if isinstance(current, torch.nn.Module) else None
+
+
+def _host_resident_tables(model: torch.nn.Module) -> List[torch.nn.Module]:
+    """Declared vocab tables large enough that device residency is waste.
+
+    A table is read by gather, not by GEMM: one row per token, so a 512-token
+    prompt touches 8 MiB of umT5-XXL's 3.91 GiB table. Streaming it layer by
+    layer would be worse than resident -- 3.91 GiB moved to read 8 MiB -- so it
+    belongs in host memory with the lookup running there.
+
+    Opt-in per model rather than discovered by shape. The bridge is a forward
+    hook, so it only covers the table's own ``__call__``; a model that also
+    reads the weight directly -- a tied ``lm_head``, a functional gather inside
+    a third-party backbone -- would see a host tensor mid-graph. Only a model
+    whose table is reached solely through its forward may list it.
+    """
+    tables = []
+    for module in model.modules():
+        for path in getattr(module, "host_resident_table_names", ()) or ():
+            table = _resolve_submodule(module, path)
+            weight = getattr(table, "weight", None)
+            if weight is None or not hasattr(weight, "dim") or weight.dim() != 2:
+                continue
+            # A sharded table is already divided by the world size, and its
+            # output feeds an all-reduce that expects a device tensor.
+            if getattr(table, "tp_size", 1) != 1:
+                continue
+            if weight.numel() * weight.element_size() < HOST_RESIDENT_TABLE_MIN_BYTES:
+                continue
+            if table not in tables:
+                tables.append(table)
+    return tables
+
+
+def detach_host_resident_tables(
+    model: torch.nn.Module,
+) -> List[Tuple[torch.nn.Module, torch.Tensor]]:
+    """Swap large vocab tables for placeholders so a `.to(device)` skips them."""
+    detached = []
+    for module in _host_resident_tables(model):
+        weight = module.weight
+        detached.append((module, weight.data))
+        weight.data = torch.empty(0, dtype=weight.dtype, device=weight.device)
+    return detached
+
+
+def restore_host_resident_tables(
+    detached: List[Tuple[torch.nn.Module, torch.Tensor]],
+    device: torch.device | str,
+) -> None:
+    for module, data in detached:
+        module.weight.data = data
+        _install_host_gather_hooks(module, device)
+        logger.info(
+            "Keeping %s (%.2f GiB) in host memory: a gather reads one row per "
+            "token, so residency buys almost nothing.",
+            type(module).__name__,
+            data.numel() * data.element_size() / (1024**3),
+        )
+
+
+def _install_host_gather_hooks(
+    module: torch.nn.Module, device: torch.device | str
+) -> None:
+    """Run this module's gather on the host, move only the result."""
+
+    def _inputs_to_host(_module, args, kwargs):
+        if not args or not torch.is_tensor(args[0]):
+            return None
+        return (args[0].to("cpu"),) + args[1:], kwargs
+
+    def _output_to_device(_module, _args, output):
+        if not torch.is_tensor(output):
+            return output
+        return output.to(device, non_blocking=True)
+
+    module.register_forward_pre_hook(_inputs_to_host, with_kwargs=True)
+    module.register_forward_hook(_output_to_device)
+
+
 class LayerwiseOffloadManager:
     """A lightweight layerwise CPU offload manager.
 
@@ -172,6 +273,12 @@ class LayerwiseOffloadManager:
         # layer_idx -> {name: pinned_cpu_tensor_with_original_stride}
         # stores tensors whose original non-contiguous stride/layout must be preserved
         self._strided_cpu_weights: Dict[int, Dict[str, torch.Tensor]] = {}
+        # layer_idx -> {name: tensor still viewing the checkpoint file}
+        # Weights left on their mapping rather than copied into host memory, so
+        # the page cache decides what stays resident. Used when the copies would
+        # not fit; see _keep_weights_on_their_mapping.
+        self._mapped_cpu_weights: Dict[int, Dict[str, torch.Tensor]] = {}
+        self._mapped_bytes = 0
         # mps keeps the original CPU tensor for each layer instead of building a
         # second flattened host copy
         self._mps_cpu_weights: Dict[int, Dict[str, torch.Tensor]] = {}
@@ -187,6 +294,9 @@ class LayerwiseOffloadManager:
         self._named_buffers: Dict[str, torch.Tensor] = {}
         self._offload_placeholders: Dict[torch.dtype, torch.Tensor] = {}
         self._has_dtensor_weights = False
+        # A snapshot of this process's mappings, taken now because the weights
+        # have just been loaded and their mappings exist.
+        self._mapped_regions = MappedRegions()
         # Store forward hooks for removal
         self._forward_hooks: List[Any] = []
 
@@ -273,10 +383,54 @@ class LayerwiseOffloadManager:
         # Keep non-layer parameters resident on GPU. Layer tensors have already
         # been replaced by tiny device placeholders, so this does not reload the
         # offloaded layer weights.
+        host_resident = detach_host_resident_tables(self.model)
         if not self._has_dtensor_weights:
             self.model.to(self.device)
+        restore_host_resident_tables(host_resident, self.device)
 
         self._finalize_initialization()
+
+    def _keep_weights_on_their_mapping(self, layer_groups: Dict) -> bool:
+        """Whether to leave file-backed weights on their mapping.
+
+        Copying them into host memory buys pinning, and pinning is what lets the
+        copy stream run ahead of compute -- worth 1.03 s against 1.90 s per step
+        on a measured Wan2.1 run, so it is not given up lightly.
+
+        It is given up when the copies do not fit. H3's DiT is 61.73 GiB of
+        weights, of which 50.53 GiB arrive as views into the checkpoint; on a
+        32 GiB host the copy cannot be made at all, and the choice is between a
+        mapping and not running. Above that, page-cache residency makes the read
+        nearly as fast as pinned -- 12.38 GB/s against 13.39 measured -- and what
+        is lost is the overlap, not the bandwidth.
+        """
+        if not self._mapped_regions.available:
+            return False
+        mapped_bytes = sum(
+            tensor.untyped_storage().nbytes()
+            for dtype_to_params in layer_groups.values()
+            for weights in dtype_to_params.values()
+            for _, weight in weights
+            for tensor in (self._to_local_tensor(weight),)
+            if self._mapped_regions.holds(tensor)
+        )
+        if mapped_bytes <= 0:
+            return False
+        # The copies land in host memory on top of the page cache already holding
+        # these bytes, so the room needed is the copy itself plus a reserve.
+        if not host_copies_would_not_fit(mapped_bytes):
+            return False
+        available = host_memory_available_bytes()
+        logger.info(
+            "Layerwise offload: leaving %.2f GiB of weights on the checkpoint "
+            "mapping -- copying them into host memory needs more than the "
+            "%.2f GiB available. The page cache decides what stays resident, so "
+            "reads may come from disk; the copies cannot be pinned, so they run "
+            "on the compute stream instead of ahead of it.",
+            mapped_bytes / 1024**3,
+            available / 1024**3,
+        )
+        return True
 
     def _initialize_layer_weights(self) -> None:
         self._named_parameters = dict(self.model.named_parameters())
@@ -297,16 +451,36 @@ class LayerwiseOffloadManager:
                 local_tensor.dtype, []
             ).append((name, tensor))
 
+        keep_mapping = self._keep_weights_on_their_mapping(layer_groups)
+
         # 2. concat and offload (in pinned memory)
         for layer_idx, dtype_to_params in layer_groups.items():
             self._consolidated_cpu_weights[layer_idx] = {}
             self._strided_cpu_weights[layer_idx] = {}
+            self._mapped_cpu_weights[layer_idx] = {}
             self._weight_metadata[layer_idx] = {}
 
             for dtype, weights in dtype_to_params.items():
                 contiguous_weights: List[Tuple[str, torch.Tensor, torch.Tensor]] = []
                 for name, weight in weights:
                     local_weight = self._to_local_tensor(weight)
+                    if keep_mapping and self._mapped_regions.holds(local_weight):
+                        # Already a view into the checkpoint. Copying it would
+                        # add a second copy of bytes the page cache holds
+                        # anyway, and that copy is what does not fit.
+                        self._mapped_cpu_weights[layer_idx][name] = local_weight
+                        self._weight_metadata[layer_idx][name] = {
+                            "dtype": local_weight.dtype,
+                            "shape": tuple(local_weight.shape),
+                            "stride": local_weight.stride(),
+                            "preserve_strides": False,
+                            "mapped": True,
+                        }
+                        self._mapped_bytes += local_weight.untyped_storage().nbytes()
+                        weight.data = self._get_shared_empty_tensor_for_target(
+                            weight, local_weight.dtype
+                        )
+                        continue
                     if local_weight.is_contiguous():
                         contiguous_weights.append((name, weight, local_weight))
                         continue
@@ -529,7 +703,9 @@ class LayerwiseOffloadManager:
                     )
             self._gpu_layers.add(layer_idx)
             return
-        if layer_idx not in self._consolidated_cpu_weights:
+        if layer_idx not in self._consolidated_cpu_weights and not (
+            self._mapped_cpu_weights.get(layer_idx)
+        ):
             return
         if self.copy_stream is not None:
             self.copy_stream.wait_stream(torch.get_device_module().current_stream())
@@ -546,7 +722,9 @@ class LayerwiseOffloadManager:
             torch.no_grad(),
             stream_context,
         ):
-            for dtype, cpu_buffer in self._consolidated_cpu_weights[layer_idx].items():
+            for dtype, cpu_buffer in self._consolidated_cpu_weights.get(
+                layer_idx, {}
+            ).items():
                 gpu_buffer = torch.empty(
                     cpu_buffer.shape, dtype=dtype, device=self.device
                 )
@@ -557,6 +735,18 @@ class LayerwiseOffloadManager:
             # so the recorded event covers both flat-buffer and stride-preserving copies.
             for name, meta in self._weight_metadata[layer_idx].items():
                 target = self.get_target_with_name(name)
+                if meta.get("mapped", False):
+                    # Straight from the mapping. Not pinned, so this copy runs
+                    # on the compute stream rather than ahead of it, and a page
+                    # the kernel has reclaimed is faulted back in here.
+                    cpu_tensor = self._mapped_cpu_weights[layer_idx][name]
+                    gpu_tensor = torch.empty(
+                        meta["shape"], dtype=meta["dtype"], device=self.device
+                    )
+                    gpu_tensor.copy_(cpu_tensor, non_blocking=False)
+                    target.data = self._wrap_for_target(target, gpu_tensor)
+                    continue
+
                 if meta.get("preserve_strides", False):
                     # Recreate the original view layout instead of flatten+view.
                     # ModelOpt FP8 relies on a transposed runtime weight layout,
@@ -666,6 +856,12 @@ class LayerwiseOffloadManager:
 
         # Collect current GPU weights and write back to CPU buffer
         for name, meta in self._weight_metadata.get(layer_idx, {}).items():
+            if meta.get("mapped", False):
+                # The store is the checkpoint file. Inference does not mutate
+                # weights, so there is nothing to write back; writing would
+                # copy-on-write the mapping into the anonymous memory this
+                # exists to avoid.
+                continue
             target = self.get_target_with_name(name)
             target_local = self._to_local_tensor(target)
             if meta.get("preserve_strides", False):
@@ -803,6 +999,10 @@ class LayerwiseOffloadManager:
 
         for layer_idx in sorted(self._weight_metadata):
             for name, meta in self._weight_metadata[layer_idx].items():
+                if meta.get("mapped", False):
+                    yield name, self._mapped_cpu_weights[layer_idx][name]
+                    continue
+
                 if meta.get("preserve_strides", False):
                     # Some quantized weights rely on a non-contiguous layout.
                     # Yield the strided tensor directly instead of rebuilding it
@@ -892,6 +1092,10 @@ class LayerwiseOffloadableModuleMixin:
 
     # The list of names of this module's layer/block ModuleList or Sequential attributes.
     layer_names: List[str] = []
+
+    # Dotted paths to gather-only vocab tables that may stay in host memory
+    # under layerwise offload. See _host_resident_tables for what qualifies.
+    host_resident_table_names: List[str] = []
     layerwise_offload_managers: list[LayerwiseOffloadManager] = []
 
     def _capture_mps_cpu_non_layer_weights(self) -> None:
@@ -986,14 +1190,23 @@ class LayerwiseOffloadableModuleMixin:
             for name, tensor in self._mps_cpu_buffers.items():
                 buffers[name].data = tensor
 
-    def configure_layerwise_offload(self, server_args: ServerArgs):
+    def configure_layerwise_offload(
+        self,
+        server_args: ServerArgs,
+        *,
+        pin_budget: HostPinBudget | None = None,
+        component_name: str | None = None,
+    ):
         self.layerwise_offload_managers = []
         named_modules = dict(self.named_modules())
         configured_layer_names = []
-        # These legacy tuning knobs are explicitly DiT-scoped. Auxiliary
-        # components still support layerwise streaming, but their layers run
-        # once per component use and get no reuse benefit from DiT residency.
-        dit_tuning_enabled = self.layerwise_offload_dit_group_enabled
+        # `--dit-*` is the group default these fall back to, not a scope.
+        prefetch_value, resident_value, residency_policy = (
+            server_args.layerwise_tuning_for(
+                component_name,
+                dit_group=self.layerwise_offload_dit_group_enabled,
+            )
+        )
         for layer_name in self.layer_names:
             module_list = named_modules.get(layer_name)
             if not isinstance(module_list, (torch.nn.ModuleList, torch.nn.Sequential)):
@@ -1002,9 +1215,6 @@ class LayerwiseOffloadableModuleMixin:
                 continue
 
             num_layers = len(module_list)
-            prefetch_value = (
-                server_args.dit_offload_prefetch_size if dit_tuning_enabled else 0.0
-            )
             if current_platform.is_mps() and prefetch_value == 0.0:
                 prefetch_size = 0
             elif prefetch_value < 1.0:
@@ -1012,9 +1222,6 @@ class LayerwiseOffloadableModuleMixin:
             else:
                 prefetch_size = int(prefetch_value)
 
-            resident_value = (
-                server_args.dit_layerwise_resident_layers if dit_tuning_enabled else 0.0
-            )
             if resident_value <= 0:
                 resident_layers = 0
             elif resident_value < 1.0:
@@ -1022,20 +1229,26 @@ class LayerwiseOffloadableModuleMixin:
             else:
                 resident_layers = min(num_layers, int(resident_value))
 
+            # Pinning these weights is what lets the copy stream run ahead of
+            # compute, but pinned pages are the ones the kernel cannot reclaim,
+            # so a component only gets them while the budget lasts.
+            pin_cpu_memory = server_args.pin_cpu_memory
+            if pin_cpu_memory and pin_budget is not None:
+                pin_cpu_memory = pin_budget.request(
+                    component_name=f"{component_name or type(self).__name__}.{layer_name}",
+                    weight_bytes=module_weight_bytes(module_list),
+                )
+
             manager = LayerwiseOffloadManager(
                 model=self,
                 layers_attr_str=layer_name,
                 num_layers=num_layers,
                 enabled=True,
-                pin_cpu_memory=server_args.pin_cpu_memory,
+                pin_cpu_memory=pin_cpu_memory,
                 prefetch_size=prefetch_size,
                 resident_layers=resident_layers,
                 initialize=False,
-                residency_policy=(
-                    server_args.dit_layerwise_residency_policy
-                    if dit_tuning_enabled
-                    else RESIDENCY_POLICY_LEADING
-                ),
+                residency_policy=residency_policy,
             )
             self.layerwise_offload_managers.append(manager)
             configured_layer_names.append(layer_name)
@@ -1067,7 +1280,10 @@ class LayerwiseOffloadableModuleMixin:
             if enabled_managers and not any(
                 manager._has_dtensor_weights for manager in enabled_managers
             ):
-                self.to(enabled_managers[0].device)
+                device = enabled_managers[0].device
+                host_resident = detach_host_resident_tables(self)
+                self.to(device)
+                restore_host_resident_tables(host_resident, device)
 
             for manager in enabled_managers:
                 manager._finalize_initialization()
@@ -1335,6 +1551,49 @@ def configure_layerwise_offload_modules(
             sorted(unsupported_component_names),
         )
 
+    def _default_num_inference_steps() -> int:
+        from sglang.multimodal_gen.registry import get_pipeline_config_classes
+
+        pipeline_class_name = server_args.pipeline_class_name
+        if not pipeline_class_name:
+            return 1
+        config_classes = get_pipeline_config_classes(pipeline_class_name)
+        if config_classes is None:
+            return 1
+        return max(1, int(config_classes[1]().num_inference_steps))
+
+    default_steps = _default_num_inference_steps()
+
+    def _h2d_bytes_a_pin_would_save(name: str) -> int:
+        """What pinning this component is worth, in bytes moved per request.
+
+        A DiT under layerwise offload re-streams its layers on every denoise
+        step; everything else transfers once. Ranking on the product rather
+        than on "is it the DiT" matters for few-step models, where a large
+        one-shot text encoder can move more bytes per request than a small DiT
+        stepped four times.
+        """
+        module = modules[name]
+        if not isinstance(module, LayerwiseOffloadableModuleMixin):
+            return 0
+        return pin_benefit_bytes(
+            weight_bytes=module_weight_bytes(module),
+            uses_per_request=(
+                default_steps if module.layerwise_offload_dit_group_enabled else 1
+            ),
+        )
+
+    # Offer the budget in descending order of what a pin saves, so the bytes
+    # that would move most often claim it first. sorted() is stable, so equal
+    # rankings keep their original order.
+    selected_pipeline_component_names = sorted(
+        selected_pipeline_component_names,
+        key=_h2d_bytes_a_pin_would_save,
+        reverse=True,
+    )
+    pin_budget = HostPinBudget()
+    logger.info("Layerwise offload: %s", describe_host_memory())
+
     for component_name in selected_pipeline_component_names:
         module = modules[component_name]
         if not isinstance(module, LayerwiseOffloadableModuleMixin):
@@ -1350,7 +1609,9 @@ def configure_layerwise_offload_modules(
         configured_module_ids.add(module_id)
 
         if not is_layerwise_offloaded_module(module):
-            module.configure_layerwise_offload(server_args)
+            module.configure_layerwise_offload(
+                server_args, pin_budget=pin_budget, component_name=component_name
+            )
         if not is_layerwise_offloaded_module(module):
             raise ComponentResidencyError(
                 f"Component {component_name!r} did not enable layerwise offload"
