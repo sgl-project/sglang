@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
 
 logger = logging.getLogger(__name__)
+FLA_CHUNK_SIZE = 64
 
 
 class MambaAttnBackendBase(AttentionBackend):
@@ -335,7 +336,8 @@ class MambaAttnBackendBase(AttentionBackend):
         if isinstance(self, Mamba2AttnBackend):
             num_h_states = extend_seq_lens // chunk_size
         else:
-            num_h_states = (extend_seq_lens - 1) // chunk_size + 1
+            h_chunk_size = FLA_CHUNK_SIZE
+            num_h_states = (extend_seq_lens - 1) // h_chunk_size + 1
 
         track_ssm_src_offset = torch.zeros_like(num_h_states)
         track_ssm_src_offset[1:] = torch.cumsum(num_h_states[:-1], dim=0)
@@ -354,9 +356,8 @@ class MambaAttnBackendBase(AttentionBackend):
         # Unaligned: intermediate state from h.
         # TODO: handle chunk_size % page size != 0
         not_aligned = ~is_aligned
-        track_ssm_h_src = offset_masked[not_aligned] + (
-            lens_masked[not_aligned] // chunk_size
-        )
+        lens_aligned = (lens_masked[not_aligned] // chunk_size) * chunk_size
+        track_ssm_h_src = offset_masked[not_aligned] + lens_aligned // h_chunk_size
         track_ssm_h_dst = dst_masked[not_aligned]
 
         return (
