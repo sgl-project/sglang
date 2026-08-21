@@ -257,10 +257,12 @@ def chain_speculative_sampling_torch(
             num_accept[accept] += 1
             # The accepted token is stored at the previously accepted slot,
             # before last_idx advances to this step's slot.
-            predicts[last_idx[accept]] = draft_token[accept]
+            predicts[last_idx[accept]] = draft_token[accept].to(predicts.dtype)
             cur_prob_row = torch.where(accept, step, cur_prob_row)
             step_idx = retrive_index[:, step]
-            accept_index[rows[accept], num_accept[accept]] = step_idx[accept]
+            accept_index[rows[accept], num_accept[accept]] = step_idx[accept].to(
+                accept_index.dtype
+            )
             last_idx = torch.where(accept, step_idx.to(torch.long), last_idx)
         live = accept
 
@@ -288,4 +290,4 @@ def chain_speculative_sampling_torch(
     final_token = torch.where(
         found, first_hit, torch.full_like(first_hit, vocab_size - 1)
     )
-    predicts[last_idx] = final_token
+    predicts[last_idx] = final_token.to(predicts.dtype)
