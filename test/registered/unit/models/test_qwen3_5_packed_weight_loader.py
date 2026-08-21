@@ -39,6 +39,54 @@ def _make_per_tensor_scale_param(num_shards):
     )
 
 
+class TestBindPackedWeightLoaders(unittest.TestCase):
+    """Tests for packed parameter loader binding."""
+
+    def test_binds_weight_scale_2(self):
+        original_loader = MagicMock()
+        param = SimpleNamespace(weight_loader=original_loader)
+        module = SimpleNamespace(weight_scale_2=param)
+        layer = object.__new__(Qwen3_5GatedDeltaNet)
+
+        layer._bind_packed_weight_loaders(module)
+
+        self.assertIsNot(param.weight_loader, original_loader)
+
+
+class TestConv1dWeightLoader(unittest.TestCase):
+    """Tests for Conv1d singleton-channel compatibility."""
+
+    def test_adds_singleton_channel(self):
+        param = SimpleNamespace(data=torch.empty(2, 1, 4))
+        original_loader = MagicMock()
+        loader = Qwen3_5GatedDeltaNet._make_conv1d_weight_loader(original_loader)
+        loaded_weight = torch.empty(2, 4)
+
+        loader(param, loaded_weight)
+
+        self.assertEqual(original_loader.call_args.args[1].shape, (2, 1, 4))
+
+    def test_removes_singleton_channel(self):
+        param = SimpleNamespace(data=torch.empty(2, 4))
+        original_loader = MagicMock()
+        loader = Qwen3_5GatedDeltaNet._make_conv1d_weight_loader(original_loader)
+        loaded_weight = torch.empty(2, 1, 4)
+
+        loader(param, loaded_weight)
+
+        self.assertEqual(original_loader.call_args.args[1].shape, (2, 4))
+
+    def test_preserves_other_shape_mismatch(self):
+        param = SimpleNamespace(data=torch.empty(2, 1, 4))
+        original_loader = MagicMock()
+        loader = Qwen3_5GatedDeltaNet._make_conv1d_weight_loader(original_loader)
+        loaded_weight = torch.empty(2, 2, 4)
+
+        loader(param, loaded_weight)
+
+        self.assertIs(original_loader.call_args.args[1], loaded_weight)
+
+
 class TestMakePackedWeightLoader(unittest.TestCase):
     """Tests for _make_packed_weight_loader broadcast / split logic."""
 
