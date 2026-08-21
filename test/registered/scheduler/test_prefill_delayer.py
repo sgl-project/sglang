@@ -67,6 +67,7 @@ class NegotiateTestCase:
     # to exercise the legacy slot-only code paths.
     queue_min_ratio: Optional[float] = None
     max_delay_ms: Optional[float] = None
+    prefill_max_requests: Optional[int] = None
     # Expected accumulated wait surfaced on the final (release) outcome. When
     # set, asserts the wait histograms would observe this value instead of 0.
     expected_wait_forward_passes: Optional[int] = None
@@ -90,6 +91,7 @@ def _run_negotiate_test(rank, test_cases):
                 disable_overlap_schedule=False,
                 prefill_delayer_queue_min_ratio=case.queue_min_ratio,
                 prefill_delayer_max_delay_ms=case.max_delay_ms,
+                prefill_max_requests=case.prefill_max_requests,
             ),
             max_delay_passes=case.max_delay_passes,
             token_usage_low_watermark=case.token_usage_low_watermark,
@@ -285,6 +287,34 @@ _NEGOTIATE_TEST_CASES = [
                 running_batch=[100, 100, 100, 100],
                 max_prefill_bs=[80, 80, 80, 80],
                 waiting_queue_len=[10, 10, 10, 10],
+                max_running_requests=1024,
+            ),
+        ],
+        expected_allow=False,
+        expected_reason="delay",
+    ),
+    NegotiateTestCase(
+        name="queue_trigger_uses_admission_capacity",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        queue_min_ratio=0.02,
+        max_delay_ms=5000,
+        prefill_max_requests=128,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[500, 500, 500, 500],
+                max_prefill_bs=[1, 1, 1, 1],
+                waiting_queue_len=[1, 1, 1, 1],
+                max_running_requests=1024,
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[500, 500, 500, 500],
+                max_prefill_bs=[1, 1, 1, 1],
+                waiting_queue_len=[1, 1, 1, 1],
                 max_running_requests=1024,
             ),
         ],

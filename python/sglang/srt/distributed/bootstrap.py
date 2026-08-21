@@ -45,6 +45,14 @@ logger = logging.getLogger(__name__)
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
 
+# A representative per-peer payload for materializing the PyNCCL P2P
+# connections used by TP LM-head all-to-all. The input/output tensors are
+# temporary; NCCL owns the transport resources retained after the warmup.
+# In dsv4-pro, assume bs per dp is 120 and the vocab_size is 129280.
+# Therefore, the chunk size that each peer sends is 120*129280/8=1.849MB.
+# The total warmup bytes per peer should be 1.849*2 = 4MB
+_TP_ALL_TO_ALL_WARMUP_BYTES_PER_PEER = 4 << 20
+
 
 class TorchDistributedResult(msgspec.Struct, frozen=True, kw_only=True):
     tp_group: object
@@ -109,6 +117,17 @@ def init_torch_distributed(
             _prewarm_nccl(
                 tp_size=ps.tp_size, pp_size=ps.pp_size, moe_ep_size=ps.moe_ep_size
             )
+
+        # CUDA graph capture enables the PyNCCL communicator for TP LM-head
+        # all-to-all. Exercise that exact send/recv path before measuring
+        # pre_model_load_memory so its persistent transport allocations are
+        # included in later KV-cache sizing instead of appearing during capture.
+        if (
+            device == "cuda"
+            and get_parallel().enable_tp_lm_head_all_to_all
+            and ps.tp_size > 1
+        ):
+            _prewarm_tp_lm_head_all_to_all()
 
     pre_model_load_memory = get_available_gpu_memory(
         device,
@@ -268,6 +287,40 @@ def _prewarm_nccl(*, tp_size: int, pp_size: int, moe_ep_size: int) -> None:
     logger.info(
         f"NCCL/RCCL/HCCL warmup completed in {warmup_elapsed:.3f}s "
         f"(tp_size={tp_size}, pp_size={pp_size}, ep_size={moe_ep_size})"
+    )
+
+
+def _prewarm_tp_lm_head_all_to_all() -> None:
+    """Materialize PyNCCL P2P resources before model-memory accounting."""
+    warmup_start = time.perf_counter()
+    tp_group = get_tp_group()
+    pynccl_comm = tp_group.pynccl_comm
+    if pynccl_comm is None or not pynccl_comm.available:
+        raise RuntimeError(
+            "--enable-tp-lm-head-all-to-all requires an available PyNCCL "
+            "communicator for CUDA graph capture."
+        )
+
+    numel = tp_group.world_size * _TP_ALL_TO_ALL_WARMUP_BYTES_PER_PEER
+    warmup_input = torch.empty(numel, dtype=torch.uint8, device=tp_group.device)
+    warmup_output = torch.empty_like(warmup_input)
+
+    # PyNCCL is disabled outside graph-capture contexts by default. Enable it
+    # explicitly so eager startup does not fall back to ProcessGroupNCCL and
+    # miss the P2P resources required by the captured all-to-all.
+    with pynccl_comm.change_state(enable=True):
+        pynccl_comm.all_to_all_single(warmup_output, warmup_input)
+    current_platform.synchronize()
+
+    del warmup_input, warmup_output
+    current_platform.empty_cache()
+    warmup_elapsed = time.perf_counter() - warmup_start
+    logger.info(
+        "TP LM-head PyNCCL all-to-all warmup completed in %.3fs "
+        "(tp_size=%d, bytes_per_peer=%d)",
+        warmup_elapsed,
+        tp_group.world_size,
+        _TP_ALL_TO_ALL_WARMUP_BYTES_PER_PEER,
     )
 
 

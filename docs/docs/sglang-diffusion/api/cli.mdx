@@ -92,7 +92,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--ulysses-degree {N}` and `--ring-degree {N}`: USP parallelism controls
 - `--kv-gather-degree {N}`: sequence-parallel degree that splits rows inside attention and exchanges with one K/V all-gather (queries stay local) instead of Ulysses all-to-all. Non-causal attention only; does not compose with `--ulysses-degree`/`--ring-degree` yet. When no SP degree is set explicitly, `sp_degree=2` defaults to `kv_gather_degree=2` (its measured-win zone) and higher degrees default to Ulysses; under that auto assignment, attention calls the gather path cannot take fall back to the Ulysses exchange, while an explicit degree fails instead of degrading.
 - `--enable-cfg-parallel {true|false}`: enable or explicitly disable CFG parallelism
-- `--encoder-parallel {auto|fold|dp|replicate}`: how the text/image encoders use the GPUs the DiT replica leaves idle during encoding. `auto` (the default for both `generate` and `serve`) TP-folds an encoder wide enough to pay for the per-layer all-reduce, selects DP for a server batch when it can engage, and otherwise replicates; `fold` forces the shard whenever the dims allow it; `dp` splits a batched encode across ranks and needs `--batching-max-size > 1` to engage; `replicate` encodes redundantly on every rank. `fold` and `replicate` are bitwise-identical to single-GPU encoding. See [Encoder Parallelism](/docs/sglang-diffusion/encoder_parallel).
+- `--encoder-parallel {auto|fold|dp|replicate}`: how text/image encoders use the GPUs in each DiT replica. `auto` TP-folds an encoder wide enough to benefit, selects batch DP when it can engage, and otherwise keeps the existing encoder TP layout; `fold` shards across the full replica whenever dimensions allow; `dp` splits a batched encode across encoder copies and composes with encoder TP; `replicate` disables folding and batch DP. Encoder collectives never cross `--dp-size` replicas. See [Encoder Parallelism](/docs/sglang-diffusion/encoder_parallel).
 - `--warmup-mode {off|request|server}`: control startup warmup for `sglang serve`; `off` skips warmup, `request` primes the request path, and `server` runs a full synthetic server warmup before serving traffic
 - `--enable-torch-compile {true|false}`: compile native diffusion hot paths. When no warmup mode is configured, this also enables server warmup so first real requests do not pay compile latency.
 - `--offload-during-compile {true|false}`: when compile warmup is active, temporarily layerwise-offload DiT weights and move resident non-DiT components off-device so `max-autotune` fits on tighter-memory GPUs; the configured serving residency is restored before real traffic. Skipped under existing layerwise offload, Cache-DiT, or FSDP.
@@ -125,9 +125,16 @@ For quantized transformer checkpoints, prefer:
 
 - `--model-path` for the base pipeline
 - `--transformer-path` for a quantized `transformers` transformer component folder
-- `--transformer-weights-path` for a quantized safetensors file, directory, or repo
+- `--transformer-weights-path` for a quantized safetensors file, directory,
+  repo, or a supported GGUF transformer file
 - `--quantization` for online quantization (apply quantization to unquantized models at load time, activations are quantized dynamically)
 - `--quantization-ignored-layers` layer name patterns to keep unquantized (e.g. `attention.to_`)
+
+Component checkpoint paths are selected separately, so changing DiT precision
+never silently changes prompt embeddings. For a native text encoder:
+
+- `--component-paths.text_encoder {MODEL}` replaces the text-encoder checkpoint; `--text-encoder-path {MODEL}` is its shorter alias
+- Quantization metadata is auto-detected from that checkpoint. Each native encoder must explicitly support the serialized format; this is not blanket quantization support for every component, and unsupported combinations fail before weight loading.
 
 For supported realtime causal video models, `--kv-cache-quant {off|int4|int2}`
 compresses completed KV-cache chunks independently of transformer weight
@@ -238,6 +245,22 @@ sglang generate \
 Values passed to the compatibility option `--layerwise-offload-components` must match loaded component keys, such as `transformer`, `text_encoder`, `image_encoder`, `vae`, `condition_image_encoder`, `spatial_upsampler`, or `vocoder`. Its `default` group selects text encoders, image encoders, and VAEs. Use `all` to select every layerwise-offloadable component.
 
 Layerwise tuning options such as `--dit-offload-prefetch-size`, `--dit-layerwise-resident-layers`, and `--dit-layerwise-residency-policy` continue to control the streamed layer working set. Prefer the smallest component set that solves the memory issue because layerwise offload can increase latency.
+
+Those three set the default for every streamed component. To give one component its own values, use the `component=value` forms, which also accept JSON:
+
+```bash
+sglang serve --model-path <MODEL> \
+  --layerwise-offload-components dit,text_encoder \
+  --layerwise-prefetch-size text_encoder=2 \
+  --layerwise-resident-layers text_encoder=4 \
+  --layerwise-residency-policy text_encoder=strided
+```
+
+- `--layerwise-prefetch-size`: how many layers to fetch ahead. Fractional values are a share of the stack, `>= 1` an absolute count. Deeper prefetch overlaps more of the transfer with compute, at the cost of staging buffers.
+- `--layerwise-resident-layers`: how many layers stay on the GPU instead of being streamed. Resident layers are transferred once at startup, so they are removed from every pass. Fractional values are a share of the stack.
+- `--layerwise-residency-policy`: `leading` keeps the first layers, `strided` spreads them across the stack so the transfers do not arrive as one burst.
+
+A component without an entry keeps the group default, so adding these options changes nothing until one is set. Both knobs trade VRAM for transfer, and the return differs by component: a DiT earns it back once per denoising step, a text encoder or VAE once per request. Measure before raising either.
 
 ## Serve
 
