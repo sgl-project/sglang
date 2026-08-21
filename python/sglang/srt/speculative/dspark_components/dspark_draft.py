@@ -342,9 +342,9 @@ class DraftBlockProposer:
         if batch.seq_lens_cpu is not None:
             draft_seq_lens_cpu = batch.seq_lens_cpu + gamma
             draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())
-        elif draft_input.reserved_seq_lens_cpu is not None:
-            draft_seq_lens_cpu = draft_input.reserved_seq_lens_cpu
-            draft_seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+        elif draft_input.nxt_kv_lens_cpu is not None:
+            draft_seq_lens_cpu = draft_input.nxt_kv_lens_cpu
+            draft_seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
         else:
             raise RuntimeError("DSpark decode expected batch.seq_lens_cpu, got None")
 
@@ -396,6 +396,10 @@ class DraftBlockProposer:
         forward_batch.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
         if not self._dp_moe_sync or batch.global_num_tokens is None:
             return
+        # Graph bucket selection uses the raw per-rank request counts.  Keep
+        # them separate from global_num_tokens_cpu below, which is scaled into
+        # draft-token units for DP/MoE synchronization.
+        forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
         gnt, gnt_logprob = spec_scale_global_num_tokens(
             self._draft_block_spec_info,
             batch.global_num_tokens,

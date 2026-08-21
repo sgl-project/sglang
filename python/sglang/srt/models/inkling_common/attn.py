@@ -6,6 +6,9 @@ from functools import cache
 import torch
 from torch import nn
 
+from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
+    is_batch_invariant,
+)
 from sglang.kernels.ops.attention.inkling_rel_proj import rel_proj_small_t
 from sglang.kernels.ops.attention.inkling_row_scale import row_compact_bf16
 from sglang.kernels.ops.attention.log_scaling_tau import (
@@ -943,7 +946,15 @@ class InklingAttention(nn.Module):
             # stay bf16 here and the MXFP8 pool's set_kv_buffer quantizes and
             # stores them in one fused kernel (absent descales signal it).
 
-        if envs.SGLANG_OPT_USE_INKLING_SHEARED_BIAS.get() and fa4:
+        # The sheared-bias kernel is not batch invariant: its bias tile geometry
+        # follows the query count, so the same absolute (q, k) pair accumulates in
+        # a different order for a few-query decode step than for a many-query
+        # prefill. Deterministic mode takes the score_mod path instead.
+        if (
+            envs.SGLANG_OPT_USE_INKLING_SHEARED_BIAS.get()
+            and fa4
+            and not is_batch_invariant()
+        ):
             # FA4 sheared-bias kernel: pass rel_logits directly; the kernel shears
             # it into a column-aligned pre-softmax bias.
             attn_output = self.attn(

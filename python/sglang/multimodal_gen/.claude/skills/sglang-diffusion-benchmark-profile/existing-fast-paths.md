@@ -10,33 +10,39 @@ framework-specific optimization workflow.
 - `python/sglang/multimodal_gen/runtime/layers/elementwise.py`
 - `python/sglang/multimodal_gen/runtime/layers/fused_scale_shift_gate.py`
 - `python/sglang/multimodal_gen/runtime/layers/rotary_embedding/utils.py`
-- `python/sglang/kernels/ops/diffusion/triton/scale_shift.py`
-- `python/sglang/kernels/ops/diffusion/modulate_scale_shift.py`
-- `python/sglang/kernels/ops/diffusion/fused_ln_modulate.py`
-- `python/sglang/kernels/ops/diffusion/quality_gate.py`
-- `python/sglang/kernels/ops/diffusion/bitexact_gate.py`
-- `python/sglang/kernels/ops/diffusion/group_norm_silu.py`
-- `python/sglang/kernels/ops/diffusion/triton/group_norm_silu.py`
-- `python/sglang/kernels/ops/diffusion/triton/group_norm_silu_twopass.py`
-- `python/sglang/kernels/ops/diffusion/triton/norm.py`
-- `python/sglang/kernels/ops/diffusion/triton/rmsnorm_onepass.py`
-- `python/sglang/kernels/ops/diffusion/triton/layernorm_modulate.py`
-- `python/sglang/kernels/ops/diffusion/triton/native_bf16_rmsnorm.py`
-- `python/sglang/kernels/ops/diffusion/triton/zimage_native_norm.py`
-- `python/sglang/kernels/ops/diffusion/triton/rotary.py`
-- `python/sglang/kernels/ops/diffusion/triton/ltx2_rotary.py`
-- `python/sglang/kernels/ops/diffusion/ltx2_qknorm_split_rope.py`
-- `python/sglang/kernels/ops/diffusion/ltx2_rmsnorm_modulate.py`
-- `python/sglang/kernels/ops/diffusion/triton/indexed_modulation.py`
-- `python/sglang/kernels/ops/diffusion/triton/ulysses_qkv.py`
-- `python/sglang/kernels/ops/diffusion/usp_relayout.py`
+- `python/sglang/kernels/ops/diffusion/modulate/scale_shift_triton.py`
+- `python/sglang/kernels/ops/diffusion/modulate/modulate_scale_shift_jit.py`
+- `python/sglang/kernels/ops/diffusion/sites/fused_ln_modulate_site.py`
+- `python/sglang/kernels/ops/diffusion/sites/quality_gate.py`
+- `python/sglang/kernels/ops/diffusion/sites/bitexact_gate.py`
+- `python/sglang/kernels/ops/diffusion/norm/group_norm_silu.py`
+- `python/sglang/kernels/ops/diffusion/norm/group_norm_silu_triton.py`
+- `python/sglang/kernels/ops/diffusion/norm/group_norm_silu_twopass_triton.py`
+- `python/sglang/kernels/ops/diffusion/norm/norm_triton.py`
+- `python/sglang/kernels/ops/diffusion/norm/rmsnorm_onepass_triton.py`
+- `python/sglang/kernels/ops/diffusion/norm/layernorm_modulate_triton.py`
+- `python/sglang/kernels/ops/diffusion/norm/native_bf16_rmsnorm_triton.py`
+- `python/sglang/kernels/ops/diffusion/norm/zimage_qk_rmsnorm_triton.py`
+- `python/sglang/kernels/ops/diffusion/rope/rotary_triton.py`
+- `python/sglang/kernels/ops/diffusion/rope/ltx2_rotary_triton.py`
+- `python/sglang/kernels/ops/diffusion/rope/ltx2_qknorm_split_rope_jit.py`
+- `python/sglang/kernels/ops/diffusion/sites/ltx2_rmsnorm_modulate_site.py`
+- `python/sglang/kernels/ops/diffusion/modulate/indexed_modulation_triton.py`
+- `python/sglang/kernels/ops/diffusion/layout/ulysses_qkv_triton.py`
+- `python/sglang/kernels/ops/diffusion/layout/usp_relayout_jit.py`
 - `python/sglang/multimodal_gen/runtime/layers/usp.py`
 - `python/sglang/multimodal_gen/runtime/models/dits/minimax_h3.py`
-- `python/sglang/kernels/ops/diffusion/residual_gate_add.py`
+- `python/sglang/multimodal_gen/runtime/models/dits/longcat_image.py`
+- `python/sglang/multimodal_gen/runtime/models/dits/sana_video.py`
+- `python/sglang/multimodal_gen/runtime/models/dits/lingbot_video_moe.py`
+- `python/sglang/multimodal_gen/runtime/models/decoders/ltx_2_5_diffusion_decoder.py`
+- `python/sglang/multimodal_gen/runtime/layers/moe.py`
+- `python/sglang/srt/layers/moe/topk.py`
+- `python/sglang/kernels/ops/diffusion/modulate/residual_gate_add_jit.py`
 - `python/sglang/kernels/jit/csrc/diffusion/residual_gate_add.cuh`
-- `python/sglang/kernels/ops/diffusion/triton/varlen_pack_pad.py`
-- `python/sglang/kernels/ops/diffusion/triton/wan_causal_cache.py`
-- `python/sglang/kernels/ops/diffusion/cutedsl/scale_residual_norm_scale_shift.py`
+- `python/sglang/kernels/ops/diffusion/layout/varlen_pack_pad_triton.py`
+- `python/sglang/kernels/ops/diffusion/layout/wan_causal_cache_triton.py`
+- `python/sglang/kernels/ops/diffusion/norm/scale_residual_norm_cutedsl.py`
 - `python/sglang/multimodal_gen/runtime/models/vaes/fast_path_gate.py`
 - `python/sglang/multimodal_gen/runtime/models/vaes/flux2_vae_cuda_opt.py`
 - `python/sglang/multimodal_gen/runtime/models/vaes/wan_vae_cuda_opt.py`
@@ -249,7 +255,7 @@ framework-specific optimization workflow.
 **QK Norm + RoPE Optimization**
 
 - Entry point: `apply_qk_norm_rope` in `layernorm.py`.
-- Fast path: JIT fused inplace QK norm + RoPE from `python/sglang/kernels/ops/diffusion/qknorm_rope.py` via `fused_inplace_qknorm_rope`.
+- Fast path: JIT fused inplace QK norm + RoPE from `python/sglang/kernels/ops/diffusion/rope/qknorm_rope_jit.py` via `fused_inplace_qknorm_rope`.
 - Toggle: `SGLANG_ENABLE_FUSED_QKNORM_ROPE=1` keeps the fused path enabled by default.
 - Preconditions for fused path:
   - CUDA only.
@@ -289,6 +295,28 @@ framework-specific optimization workflow.
 - Scope: this is a mainline SANA model fast path. Query projection in cross-attention remains separate because it uses denoising hidden states, while K/V share step-invariant encoder hidden states.
 - Workflow rule: if a SANA trace shows separate self-attention `to_q`, `to_k`, `to_v` GEMMs, or separate cross-attention `to_k` and `to_v` GEMMs, treat that as a regressed existing packed-projection path before proposing a new GEMM fusion.
 
+**Recent Model Audit Boundaries**
+
+- LongCat-Image currently has split image/text QKV projections and performs
+  joint-stream `cat`/split inside each single block. Do not misclassify those
+  as a missed existing packed path; they are model-local structural
+  opportunities that need their own weight-loader and parity coverage.
+- SANA-Video already packs self QKV and cross KV. Its conv/modulation formulas
+  mirror SANA, but it does not yet call SANA's bit-exact bias-SiLU, bias-GLU,
+  residual-gate, LayerNorm-modulation, or one-time contiguous-layout helpers.
+  Reuse or extract those helpers before authoring a video-only kernel.
+- LingBot Video MoE's router implements sigmoid+bias grouped top-k in
+  `multimodal_gen/runtime/layers/moe.py`. Check parameter and output-order
+  compatibility with `srt/layers/moe/topk.py::biased_grouped_topk` before
+  writing a new router kernel.
+- LTX-2.5 reuses the mature LTX-2 DiT paths. Treat the optional diffusion
+  decoder separately: confirm NATTEN `na3d` is active, then inspect its
+  per-block 3D RoPE construction and split QKV/SwiGLU projections.
+- Cosmos3 Edge inherits the existing Cosmos3 attention-prep fusions. Profile
+  the dense squared-ReLU MLP before proposing another Cosmos kernel, and do not
+  repeat the closed experimental Cosmos BCG direction without solving its
+  model-state lifecycle problem.
+
 **Common Entry Points in Diffusion Models**
 - AdaLN modulation: `LayerNormScaleShift`, `RMSNormScaleShift`, `ScaleResidual*` in `layernorm.py`.
 - Bit-exact adaLN modulation / LayerNorm folding: `modulate_scale_shift` and
@@ -310,12 +338,12 @@ framework-specific optimization workflow.
 - LTX2 split RoPE: `apply_ltx2_split_rotary_emb` in `ltx_2.py`.
 - LTX2 RMSNorm+modulate and FFN GELU epilogue under `quality="high"`:
   `mark_ltx2_rms_norm_modulate_site` / `fused_ltx2_rms_norm_modulate` in
-  `kernels/ops/diffusion/ltx2_rmsnorm_modulate.py` (mount-based
+  `kernels/ops/diffusion/sites/ltx2_rmsnorm_modulate_site.py` (mount-based
   `QualityGatedFusion`, not a first-sight `BitExactFusionGate` — the fused
   kernel is <=1 ULP off aten, so it is request-gated instead of verified),
   wired at the six `LTX2TransformerBlock` adaLN sites in `ltx_2.py`.
 - LTX2 residual-gate add: `ltx_2.py` calls `residual_gate_add` from
-  `kernels/ops/diffusion/residual_gate_add.py` directly for attention,
+  `kernels/ops/diffusion/modulate/residual_gate_add_jit.py` directly for attention,
   cross-attention, and MLP residual updates.
 - Wan causal VAE: `cat_pad_channels_last_3d` and `dup_up3d_add` in
   `wanvae.py`, backed by `triton/wan_causal_cache.py`.
@@ -339,9 +367,10 @@ framework-specific optimization workflow.
 - Breakable CUDA graph: `runtime/breakable_cuda_graph/runner.py` captures
   fixed-resolution DiT segments around eager attention/collectives for
   supported pipelines. It is mutually exclusive with `torch.compile` and
-  Cache-DiT, requires every served resolution in `--warmup-resolutions`, and
-  uses `--bcg-text-buckets` for prompt signatures. Check this path before
-  proposing a second graph-capture mechanism for launch-bound traces.
+  Cache-DiT. The model's default resolution is captured automatically; put
+  every additional served resolution in `--warmup-resolutions`, and use
+  `--bcg-text-buckets` for prompt signatures. Check this path before proposing
+  a second graph-capture mechanism for launch-bound traces.
 - Dual-stream diffusion models: `use_dual_stream = True` in models such as `hunyuan3d.py` is an existing overlap family.
 - Workflow rule: if a hotspot is communication-heavy, rule out these in-repo overlap families before proposing a brand new overlap design.
 
@@ -361,6 +390,9 @@ relying on any file path, flag, or claim about whether the work has merged.
   - #20429 Qwen-Image layernorm and `fuse_scale_shift_gate_select01` work.
   - #20530 MOVA fused RMSNorm + interleaved RoPE.
   - #29361 LTX2 residual-gate CUDA fast path for `residual + update * gate`.
+  - #34172 LTX2 quality-high fusion; #34305/#34314 Ideogram eager fusions.
+  - #34584 Wan TI2V modulation/RoPE; #34616 FLUX2; #34617 Hunyuan;
+    #34619 GLM; #34620 ERNIE; #34928 SANA; #34932 Cosmos3.
 - VAE and decode-side acceleration:
   - #22531 LTX2 parallel VAE support and #20927 batched tiled VAE decode (draft).
 - Attention, communication, and runtime scheduling:
@@ -375,6 +407,9 @@ relying on any file path, flag, or claim about whether the work has merged.
   - #20447 TeaCache support for GLM-Image, Qwen-Image, and related models.
   - #19516 Qwen-Image CUDA Graph.
   - #21912 Z-Image Turbo FP8 full quantization and CUDA Graph.
+  - #34174 automatic default-resolution BCG warmup; #34210 Z-Image BCG
+    correctness; #34929 LTX2.3 BCG. #34618 is a closed Cosmos BCG experiment,
+    not a reusable mainline fast path.
 
 **Constraints and Fallbacks**
 - `scale_shift` Triton requires CUDA + contiguous `x`. NPU swaps to native.
