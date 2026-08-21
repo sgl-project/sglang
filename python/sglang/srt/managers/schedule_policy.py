@@ -935,6 +935,14 @@ class PrefillAdder:
                 if self.rem_dllm_tokens >= self.dllm_block_size
                 else 0
             )
+        else:
+            # A positive sub-block budget rounds down to 0, it does NOT take
+            # the whole-block fallback: the fallback only overrides a
+            # rem_total_tokens driven negative by the upfront max_new_tokens
+            # charge, while a small positive budget is genuine and a full
+            # block would overshoot it. The min above caps at block_size, so
+            # this yields exactly one block or nothing.
+            _rem_tokens = _rem_tokens // self.dllm_block_size * self.dllm_block_size
 
         return _rem_tokens
 

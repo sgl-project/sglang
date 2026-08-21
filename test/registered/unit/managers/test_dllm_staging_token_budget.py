@@ -85,15 +85,28 @@ class TestDllmStagingTokenBudgetFallbackCap(CustomTestCase):
         )
         self.assertEqual(adder._get_dllm_remain_tokens(), self.BLOCK_SIZE)
 
-    def test_normal_budget_path_is_unaffected(self):
-        # Positive rem_total_tokens: min(rem_dllm, block, total), unchanged
-        # by the cap.
+    def test_normal_path_rounds_sub_block_budget_to_zero(self):
+        # Positive rem_total_tokens below one block: round to 0 (NO_TOKEN),
+        # not to a ragged 20-token row — and not to the whole-block fallback,
+        # since a small positive budget is genuine and a full block would
+        # overshoot it.
         adder = _make_adder(
             rem_dllm_tokens=4096,
             dllm_block_size=self.BLOCK_SIZE,
             available_tokens=20,
         )
-        self.assertEqual(adder._get_dllm_remain_tokens(), 20)
+        self.assertEqual(adder._get_dllm_remain_tokens(), 0)
+
+    def test_normal_path_grants_one_full_block(self):
+        # Positive rem_total_tokens at or above one block: grant exactly one
+        # block (the min already caps at block_size).
+        for available in (self.BLOCK_SIZE, 100):
+            adder = _make_adder(
+                rem_dllm_tokens=4096,
+                dllm_block_size=self.BLOCK_SIZE,
+                available_tokens=available,
+            )
+            self.assertEqual(adder._get_dllm_remain_tokens(), self.BLOCK_SIZE)
 
 
 if __name__ == "__main__":
