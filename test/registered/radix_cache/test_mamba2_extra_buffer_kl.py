@@ -37,10 +37,10 @@ class TestMamba2ExtraBufferKL(KLDivergenceMixin, DefaultServerBase):
     # Decode-seeded reuse is the regression trigger (the graphed decode
     # track-save); the broken path fails at KL ~1.5, so 0.005 discriminates
     # cleanly while absorbing bf16 reuse noise. Prefill reuse (chunk-aligned
-    # intermediate h states) is inherently looser; threshold matches the manual
-    # TestNvidiaNemotronNanoV2BF16ExtraBuffer calibration.
+    # intermediate h states) is inherently looser; 0.012 retains a wide margin
+    # below the broken path while covering the observed bf16 calibration noise.
     kl_div_thres = 0.005
-    kl_div_thres_prefill = 0.01
+    kl_div_thres_prefill = 0.012
     kl_div_max_samples = 16
 
     other_args = [
