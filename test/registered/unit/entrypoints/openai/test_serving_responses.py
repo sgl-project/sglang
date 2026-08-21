@@ -1,6 +1,6 @@
 import asyncio
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from openai.types.responses import (
     ResponseOutputMessage,
@@ -22,6 +22,7 @@ from sglang.srt.entrypoints.openai.serving_responses import (
     _should_emit_normal_text_as_message,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -247,7 +248,116 @@ class ChatToolForwardingTestCase(CustomTestCase):
         self.assertEqual(engine_prompts, [[4, 5, 6]])
 
 
-class ReasoningRequestForwardingTestCase(unittest.TestCase):
+class DpRankForwardingTestCase(CustomTestCase):
+    def _capture_adapted_request(self, raw_request=None):
+        serving = make_serving()
+        serving.default_chat_template_kwargs = {}
+        rendered = MessageProcessingResult(
+            prompt="prompt",
+            prompt_ids=[1, 2, 3],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+        captured = {}
+
+        async def fake_generate(
+            request_id,
+            request_prompt,
+            adapted_request,
+            sampling_params,
+            context,
+            **kwargs,
+        ):
+            captured["adapted_request"] = adapted_request
+            context.append_output(
+                {
+                    "text": "done",
+                    "meta_info": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                    },
+                }
+            )
+            yield context
+
+        serving._generate_with_builtin_tools = fake_generate
+        request = ResponsesRequest(
+            model="x",
+            input="answer",
+            routed_dp_rank=4,
+            disagg_prefill_dp_rank=2,
+            store=False,
+        )
+
+        with patch.object(
+            serving, "_apply_conversation_template", return_value=rendered
+        ):
+            response = asyncio.run(serving.create_responses(request, raw_request))
+
+        self.assertEqual(response.status, "completed")
+        return captured["adapted_request"]
+
+    def test_create_responses_forwards_body_dp_rank(self):
+        adapted_request = self._capture_adapted_request()
+
+        self.assertEqual(adapted_request.routed_dp_rank, 4)
+        self.assertEqual(adapted_request.disagg_prefill_dp_rank, 2)
+
+    def test_header_dp_rank_overrides_body_for_responses(self):
+        raw_request = Mock(headers={"x-data-parallel-rank": "6"})
+        adapted_request = self._capture_adapted_request(raw_request)
+
+        self.assertEqual(adapted_request.routed_dp_rank, 6)
+        self.assertEqual(adapted_request.disagg_prefill_dp_rank, 2)
+
+    def test_builtin_tool_continuation_preserves_dp_rank(self):
+        serving = make_serving()
+        captured_requests = []
+
+        def fake_generate_request(request, raw_request):
+            captured_requests.append(request)
+
+            async def generate():
+                yield {"text": "done"}
+
+            return generate()
+
+        serving.tokenizer_manager.generate_request = fake_generate_request
+        context = Mock()
+        context.need_builtin_tool_call.side_effect = [True, False]
+        context.call_tool = AsyncMock(return_value=["tool output"])
+        context.render_for_completion.return_value = [4, 5, 6]
+        request = GenerateReqInput(
+            input_ids=[1, 2, 3],
+            sampling_params={"max_new_tokens": 16},
+            routed_dp_rank=4,
+            disagg_prefill_dp_rank=2,
+        )
+
+        async def run_generation():
+            return [
+                output
+                async for output in serving._generate_with_builtin_tools(
+                    "resp_dp_rank",
+                    [1, 2, 3],
+                    request,
+                    request.sampling_params,
+                    context,
+                )
+            ]
+
+        asyncio.run(run_generation())
+
+        self.assertEqual(len(captured_requests), 2)
+        self.assertEqual(captured_requests[1].routed_dp_rank, 4)
+        self.assertEqual(captured_requests[1].disagg_prefill_dp_rank, 2)
+
+
+class ReasoningRequestForwardingTestCase(CustomTestCase):
     def test_create_responses_uses_processed_reasoning_state(self):
         serving = make_serving()
         serving.reasoning_parser = "deepseek-r1"
