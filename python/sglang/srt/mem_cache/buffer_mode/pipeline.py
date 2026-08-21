@@ -57,7 +57,6 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache.components import SWAComponent
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
