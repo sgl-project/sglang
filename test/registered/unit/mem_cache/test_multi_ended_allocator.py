@@ -1033,6 +1033,47 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         )
         composite.swa_attn_allocator.clear_inverse_history.assert_called_once_with()
 
+    def test_composite_swa_request_release_uses_cpu_frontier(self):
+        composite = object.__new__(UnifiedSWATokenToKVPoolAllocator)
+        composite.page_size = self.PAGE_SIZE
+        composite.is_not_in_free_group = True
+        composite.full_attn_allocator = Mock()
+        composite.swa_attn_allocator = Mock()
+        first = torch.arange(8, 16)
+        second = torch.arange(16, 24)
+        segments = [(first, 0), (second, 8)]
+
+        with patch("torch.unique", side_effect=AssertionError("unexpected unique")):
+            composite.free_request_segments(segments, swa_evicted_seqlen=12)
+
+        composite.full_attn_allocator.free_segments.assert_called_once_with(segments)
+        swa_segments = composite.swa_attn_allocator.free_segments.call_args.args[0]
+        self.assertEqual(len(swa_segments), 1)
+        torch.testing.assert_close(swa_segments[0][0], second[4:])
+        self.assertEqual(swa_segments[0][1], 12)
+        composite.full_attn_allocator.clear_inverse_history.assert_called_once_with()
+        composite.swa_attn_allocator.clear_inverse_history.assert_called_once_with()
+
+    def test_composite_swa_request_release_survives_free_group(self):
+        composite = object.__new__(UnifiedSWATokenToKVPoolAllocator)
+        composite.page_size = self.PAGE_SIZE
+        composite.is_not_in_free_group = True
+        composite.free_group = []
+        composite.request_free_segments_group = []
+        composite.full_attn_allocator = Mock()
+        composite.swa_attn_allocator = Mock()
+        indices = torch.arange(8, 16)
+
+        composite.free_group_begin()
+        composite.free_request_segments([(indices, 8)], swa_evicted_seqlen=12)
+        indices.zero_()
+        composite.free_group_end()
+
+        released = composite.full_attn_allocator.free_segments.call_args.args[0]
+        torch.testing.assert_close(released[0][0], torch.arange(8, 16))
+        swa_segments = composite.swa_attn_allocator.free_segments.call_args.args[0]
+        torch.testing.assert_close(swa_segments[0][0], torch.arange(12, 16))
+
     def _stamp_tokens(
         self, alloc: MultiEndedAllocator, kv: _FakeKVCache, v_tokens: torch.Tensor
     ):

@@ -2206,6 +2206,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         self.is_not_in_free_group = True
         self.free_group: List[torch.Tensor] = []
+        self.request_free_segments_group = []
         # Empty (not None) for the leak checker.
         self.free_pages = torch.empty(0, dtype=torch.int64, device=device)
         self.release_pages = torch.empty(0, dtype=torch.int64, device=device)
@@ -2565,6 +2566,49 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.swa_attn_allocator.free_segment(free_index, start_pos=start_pos)
         self.swa_attn_allocator.clear_inverse_history()
 
+    def free_request_segments(self, segments, *, swa_evicted_seqlen: int) -> None:
+        """Release full KV and the still-live SWA suffix for one request.
+
+        The unified allocator uses the same virtual token IDs for both pools, so
+        it must not use the parent allocator's full-to-SWA mapping tensor.  The
+        CPU-maintained eviction frontier identifies the SWA-owned suffix without
+        any data-dependent GPU discovery.
+        """
+        request_segments = [
+            (indices, start_pos)
+            for indices, start_pos in segments
+            if indices.numel() > 0
+        ]
+        if not request_segments:
+            return
+        if not self.is_not_in_free_group:
+            self.request_free_segments_group.append(
+                (
+                    [
+                        (self._copy_for_free_group(indices), start_pos)
+                        for indices, start_pos in request_segments
+                    ],
+                    swa_evicted_seqlen,
+                )
+            )
+            return
+
+        self.full_attn_allocator.free_segments(request_segments)
+
+        live_swa_segments = []
+        for free_index, start_pos in request_segments:
+            end_pos = start_pos + free_index.numel()
+            live_start = max(start_pos, swa_evicted_seqlen)
+            if live_start < end_pos:
+                live_swa_segments.append(
+                    (free_index[live_start - start_pos :], live_start)
+                )
+        if live_swa_segments:
+            self.swa_attn_allocator.free_segments(live_swa_segments)
+
+        self.full_attn_allocator.clear_inverse_history()
+        self.swa_attn_allocator.clear_inverse_history()
+
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:
@@ -2583,6 +2627,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def free_group_begin(self) -> None:
         self.is_not_in_free_group = False
         self.free_group = []
+        self.request_free_segments_group = []
 
     def free_group_end(self) -> None:
         self.is_not_in_free_group = True
@@ -2590,12 +2635,20 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             merged = torch.cat(self.free_group)
             self.free_group = []
             self.free(merged)
+        if self.request_free_segments_group:
+            request_groups = self.request_free_segments_group
+            self.request_free_segments_group = []
+            for segments, swa_evicted_seqlen in request_groups:
+                self.free_request_segments(
+                    segments, swa_evicted_seqlen=swa_evicted_seqlen
+                )
 
     def clear(self) -> None:
         self.full_attn_allocator.clear()
         self.swa_attn_allocator.clear()
         self.is_not_in_free_group = True
         self.free_group = []
+        self.request_free_segments_group = []
 
     # -- Lazy compaction hooks --
 
