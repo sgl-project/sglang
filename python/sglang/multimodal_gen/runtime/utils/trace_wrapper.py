@@ -7,6 +7,7 @@ start/end bookkeeping.
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -37,10 +38,17 @@ def init_diffusion_tracing(server_args, thread_label: str):
         trace_set_thread_info,
     )
 
+    # Priority: --otlp-service-name > OTEL_SERVICE_NAME > "sglang-diffusion"
+    service_name = (
+        server_args.otlp_service_name
+        or os.getenv("OTEL_SERVICE_NAME")
+        or "sglang-diffusion"
+    )
+
     # srt owns TraceReqContext and filters spans through its trace_modules list
     process_tracing_init(
         server_args.otlp_traces_endpoint,
-        "sglang-diffusion",
+        service_name,
         trace_modules=DIFFUSION_TRACE_MODULE,
     )
     trace_set_thread_info(thread_label)
