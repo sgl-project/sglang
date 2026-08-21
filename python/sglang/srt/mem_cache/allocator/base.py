@@ -51,6 +51,39 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def size_full(self):
         return self.size
 
+    # -- scheduler-facing capacity hooks --
+    # The scheduler calls these UNCONDITIONALLY (zero feature branches on its
+    # side); the defaults reproduce the historical token behavior exactly, and
+    # unified composites override them with byte-denominated logic.
+
+    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
+        """Ask the prefix cache to evict unlocked entries until this allocator
+        can serve ``num_tokens`` (or nothing evictable remains). Default = the
+        shared token-count eviction; joint-byte composites override (evicting
+        one multi-lifetime tree node frees bytes on several sides at once).
+        """
+        from sglang.srt.mem_cache.common import evict_from_tree_cache
+
+        evict_from_tree_cache(tree_cache, num_tokens)
+
+    def check_decode_capacity(self, *, num_tokens: int, tree_cache) -> bool:
+        """Whether the NEXT decode step's ``num_tokens`` allocation fits,
+        evicting reclaimable cache first. The retract loop converges on this
+        same check, so allocator-side shortfalls retract gracefully instead of
+        tripping fail-loud alloc errors. Default reproduces the historical
+        ``ScheduleBatch.check_decode_mem`` body; unified composites override
+        with byte gates + per-step reservations of their own.
+        """
+        self.evict_to_free_tokens(tree_cache, num_tokens)
+        return self.available_size() >= num_tokens
+
+    def verify_byte_accounting(self) -> list:
+        """Idle-time conservation diagnostic: recompute this allocator's
+        byte/slot accounting and return human-readable violation strings
+        (empty == healthy). Default: static pools have no byte model.
+        """
+        return []
+
     def debug_print(self) -> str:
         return ""
 

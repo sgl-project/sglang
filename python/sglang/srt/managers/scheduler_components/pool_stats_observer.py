@@ -11,6 +11,10 @@ from typing import (
     Tuple,
 )
 
+from sglang.srt.mem_cache.multi_ended_allocator import (
+    UnifiedMambaSWATokenToKVPoolAllocator,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -283,9 +287,24 @@ class SchedulerPoolStatsObserver:
         )
 
     def _get_swa_token_info(self) -> PoolStats:
-        full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+        # `*_num_used` below is `static_cap - (available + evictable)`, so the
+        # available term must be denominated the SAME way as the static cap.
+        # The unified tri-pool's `full_available_size()` is BYTE-coordinated
+        # across a floating boundary: once swa or mamba borrow full's bytes it
+        # dips below the per-side conserve cap, and subtracting it from the
+        # static `full_tokens_per_layer` charges the borrowed bytes as
+        # "used" — inflating `#full token` and `token usage` by a large factor
+        # (observed ~25-90x on tri models). Use the slot-conservation view
+        # there, exactly as the idle leak invariant does for the same
+        # expression.
+        allocator = self.token_to_kv_pool_allocator
+        if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
+            full_available_size = allocator.conserve_full_available_size()
+            swa_available_size = allocator.conserve_swa_available_size()
+        else:
+            full_available_size = allocator.full_available_size()
+            swa_available_size = allocator.swa_available_size()
         full_evictable_size = self.tree_cache.full_evictable_size()
-        swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
         swa_evictable_size = self.tree_cache.swa_evictable_size()
         full_num_used = self.full_tokens_per_layer - (
             full_available_size + full_evictable_size

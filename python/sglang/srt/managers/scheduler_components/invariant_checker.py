@@ -23,6 +23,9 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.multi_ended_allocator import (
+    UnifiedMambaSWATokenToKVPoolAllocator,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
     ceil_align,
@@ -114,9 +117,18 @@ class SchedulerInvariantChecker:
                 // allocator.page_size
                 * allocator.page_size
             )
+        full_available = ps.full_available_size
+        if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
+            # Tri-pool (Inkling): full/swa/mamba share one byte buffer with a
+            # FLOATING boundary, so the leak invariant must see the SLOT-CONSERVATION
+            # view (static cap − live). `ps.full_available_size` reports
+            # `min(conserve, byte-coordinated)`; once swa/mamba borrow full's bytes the
+            # byte term dips below the conserve cap and the borrowed bytes read as a
+            # phantom leak against the static `full_tokens_per_layer` total.
+            full_available = allocator.conserve_full_available_size()
         leak, msg = self._check_pool_invariant(
             "full",
-            ps.full_available_size,
+            full_available,
             full_evictable_size,
             protected,
             session_held,
@@ -132,9 +144,15 @@ class SchedulerInvariantChecker:
         return leak, msg
 
     def _check_swa_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
+        allocator = self.token_to_kv_pool_allocator
+        swa_available = ps.swa_available_size
+        if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
+            # Tri-pool: same floating-boundary phantom as the full pool — use the
+            # slot-conservation view, not the byte-coordinated min (see _check_full_pool).
+            swa_available = allocator.conserve_swa_available_size()
         return self._check_pool_invariant(
             "swa",
-            ps.swa_available_size,
+            swa_available,
             ps.swa_evictable_size,
             self.tree_cache.swa_protected_size(),
             self.pool_stats_observer.session_held_swa_tokens(),

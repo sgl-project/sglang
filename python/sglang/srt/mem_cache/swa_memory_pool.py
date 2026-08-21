@@ -166,6 +166,20 @@ class SWAKVPool(BaseSWAKVPool):
         else:
             return self.full_kv_pool.get_value_buffer(layer_id_pool)
 
+    def get_v_head_dim(self):
+        # The FULL side's value head dim, mirroring HybridLinearKVPool's
+        # get_v_head_dim(): a caller asking a pool for "the" v_head_dim wants
+        # the full-attention geometry, and every full layer in this pool
+        # shares it. Reached when a model is BOTH mambaish and hybrid-SWA
+        # (Inkling-class): TritonAttnBackend's mambaish branch asks the pool
+        # instead of indexing layer 0 (which need not be full attention), and
+        # that branch is taken whenever the SWA and full v_head_dims MATCH --
+        # the asymmetric case is handled earlier from model_config. Use
+        # start_layer, not 0, so pipeline parallelism (start_layer > 0) works.
+        return self.full_kv_pool.get_value_buffer(self.full_kv_pool.start_layer).shape[
+            -1
+        ]
+
     def get_kv_buffer(self, layer_id: int):
         self._wait_for_layer(layer_id)
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
