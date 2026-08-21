@@ -72,6 +72,9 @@ from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
 )
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    UnifiedCacheLinkerWrapper,
+)
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
     NodeId,
     UnifiedLRUList,
@@ -238,6 +241,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
         self.hicache_storage_pass_prefix_keys = False
+        self.linker: Optional[UnifiedCacheLinkerWrapper] = None
         # Buffer-only host memory mode (host RAM as transient GPU↔storage
         # staging, not an L2 tier); resolved in init_hicache, which also
         # constructs the pipeline collaborator (None = cache mode).
@@ -335,7 +339,15 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self.work_list.append(send_work)
 
+    def init_cache_linker(
+        self, server_args: ServerArgs, params: CacheInitParams
+    ) -> None:
+        """Attach an external KV store directly to the device pools (direct L3)."""
+        self.linker = UnifiedCacheLinkerWrapper(self, server_args, params)
+
     def reset(self) -> None:
+        if self.linker is not None:
+            self.linker.reset()
         self._reset_full()
 
     def _reset_full(self) -> None:
@@ -489,6 +501,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self.register_sidecar_pool(spec)
 
     def release_host_resources(self) -> None:
+        if self.linker is not None:
+            self.linker.close()
         if self.host_pool_group is not None:
             self.host_pool_group.destroy()
 
@@ -510,6 +524,8 @@ class UnifiedRadixCache(BasePrefixCache):
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
+        if self.linker is not None and params.req is not None:
+            result = self.linker.match(params.key, params.req, result)
         return result
 
     def is_chunk_cache(self) -> bool:
@@ -986,7 +1002,10 @@ class UnifiedRadixCache(BasePrefixCache):
             for indices in action.indices:
                 self.token_to_kv_pool_allocator.free_segment(indices, start_pos=0)
         elif isinstance(action, BackupKV):
-            self._execute_and_commit_kv_backup(action)
+            if self.linker is not None:
+                self.linker.offload_nodes(action.node_ids)
+            else:
+                self._execute_and_commit_kv_backup(action)
         else:
             raise AssertionError(f"unhandled CacheAction: {type(action).__name__}")
 
@@ -1925,6 +1944,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True)
     def release_aborted_request(self, rid: str) -> None:
+        if self.linker is not None:
+            self.linker.release_request(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         if (
             self.buffer_pipeline is not None
@@ -2497,6 +2518,8 @@ class UnifiedRadixCache(BasePrefixCache):
         mem_quota = params.mem_quota
         req = params.req
         assert req is not None
+        if self.linker is not None and self.linker.has_hit(req.rid):
+            return self.linker.load_back(req)
         last_best_match_device_node_id = req.last_node
 
         if (
@@ -2531,6 +2554,27 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        if self.linker is not None:
+            finish_counts = torch.tensor(
+                [
+                    self.linker.num_completed_loads(),
+                    self.linker.num_completed_offloads(),
+                ],
+                dtype=torch.int,
+                device="cpu",
+            )
+            self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
+            load_count, offload_count = map(int, finish_counts.tolist())
+            self.linker.drain_loads(load_count)
+            local_successes = self.linker.take_completed_offloads(offload_count)
+            if local_successes:
+                successes = torch.tensor(local_successes, dtype=torch.int, device="cpu")
+                self._all_reduce_attn_groups(successes, torch.distributed.ReduceOp.MIN)
+                self.linker.commit_completed_offloads(
+                    [bool(success) for success in successes.tolist()]
+                )
+            return
+
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
 
@@ -2588,6 +2632,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""
+        if self.linker is not None:
+            return self.linker.start_layer_wise_loading()
         if self.cache_controller is not None:
             return self.cache_controller.start_loading()
         return 0
