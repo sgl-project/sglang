@@ -190,6 +190,8 @@ class _TestServerArgs(SimpleNamespace):
     record_component_layerwise_capability = (
         ServerArgs.record_component_layerwise_capability
     )
+    _parse_component_value_map = staticmethod(ServerArgs._parse_component_value_map)
+    layerwise_tuning_for = ServerArgs.layerwise_tuning_for
 
 
 def _server_args(**kwargs):
@@ -210,7 +212,13 @@ def _server_args(**kwargs):
         dit_offload_prefetch_size=1,
         dit_layerwise_resident_layers=0.0,
         dit_layerwise_residency_policy=RESIDENCY_POLICY_LEADING,
+        layerwise_prefetch_size={},
+        layerwise_resident_layers={},
+        layerwise_residency_policy={},
         pin_cpu_memory=False,
+        # the pin budget ranks candidates by bytes x steps, and reads the step
+        # count off the pipeline's sampling defaults
+        pipeline_class_name=None,
     )
     defaults.update(kwargs)
     return _TestServerArgs(**defaults)
@@ -749,6 +757,25 @@ class _AuxiliaryResidentComponent(_ResidentComponent):
     layerwise_offload_dit_group_enabled = False
 
 
+class _MultiGroupComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
+    layer_names = ["small_blocks", "large_blocks"]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.small_blocks = torch.nn.ModuleList([_DummyBlock()])
+        self.large_blocks = torch.nn.ModuleList(
+            [_DummyBlock(), _DummyBlock(), _DummyBlock()]
+        )
+        self.non_layer = torch.nn.Parameter(torch.ones(2))
+        self.to_parameter_shapes = []
+
+    def to(self, *args, **kwargs):
+        self.to_parameter_shapes.append(
+            {name: tuple(param.shape) for name, param in self.named_parameters()}
+        )
+        return super().to(*args, **kwargs)
+
+
 def _patch_fake_device(monkeypatch):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
@@ -914,6 +941,36 @@ def test_configure_resolves_residency_policy(monkeypatch):
     assert comp.layerwise_offload_managers[0].residency_policy == (
         RESIDENCY_POLICY_STRIDED
     )
+
+
+def test_configure_offloads_all_layer_groups_before_moving_non_layers(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    model = _MultiGroupComponent()
+    initialization_order = []
+    initialize_layer_weights = LayerwiseOffloadManager._initialize_layer_weights
+
+    def record_initialization(manager):
+        initialization_order.append(manager.layers_attr_str)
+        initialize_layer_weights(manager)
+
+    monkeypatch.setattr(
+        LayerwiseOffloadManager,
+        "_initialize_layer_weights",
+        record_initialization,
+    )
+
+    model.configure_layerwise_offload(_server_args())
+
+    assert initialization_order == ["large_blocks", "small_blocks"]
+    assert [
+        manager.layers_attr_str for manager in model.layerwise_offload_managers
+    ] == ["small_blocks", "large_blocks"]
+    assert len(model.to_parameter_shapes) == 1
+    shapes_at_move = model.to_parameter_shapes[0]
+    assert shapes_at_move["non_layer"] == (2,)
+    for name, shape in shapes_at_move.items():
+        if name != "non_layer":
+            assert shape == (1,), name
 
 
 def test_holds_residents_reflects_configuration(monkeypatch):
@@ -1169,3 +1226,59 @@ def test_strided_forward_leaves_exactly_the_resident_set(monkeypatch):
     resident = set(range(8)) - set(manager._streamed_order)
     assert resident <= manager._gpu_layers
     assert len(manager._gpu_layers) <= len(resident) + manager.prefetch_size
+
+
+def test_layerwise_tuning_defaults_match_the_group():
+    """No per-component entry: the DiT group keeps its knobs, auxiliaries do not."""
+    args = _server_args(
+        dit_offload_prefetch_size=3,
+        dit_layerwise_resident_layers=20,
+        dit_layerwise_residency_policy=RESIDENCY_POLICY_STRIDED,
+    )
+    assert args.layerwise_tuning_for("transformer", dit_group=True) == (
+        3.0,
+        20.0,
+        RESIDENCY_POLICY_STRIDED,
+    )
+    assert args.layerwise_tuning_for("text_encoder", dit_group=False) == (
+        0.0,
+        0.0,
+        RESIDENCY_POLICY_LEADING,
+    )
+
+
+def test_layerwise_tuning_per_component_entry_wins():
+    """An auxiliary component can be tuned; its layers cost the same per pass."""
+    args = _server_args(
+        dit_offload_prefetch_size=3,
+        dit_layerwise_resident_layers=20,
+        layerwise_prefetch_size="text_encoder=2",
+        layerwise_resident_layers="text_encoder=4",
+        layerwise_residency_policy={"text_encoder": RESIDENCY_POLICY_STRIDED},
+    )
+    assert args.layerwise_tuning_for("text_encoder", dit_group=False) == (
+        2.0,
+        4.0,
+        RESIDENCY_POLICY_STRIDED,
+    )
+    # an entry for one component leaves every other component alone
+    assert args.layerwise_tuning_for("vae", dit_group=False) == (
+        0.0,
+        0.0,
+        RESIDENCY_POLICY_LEADING,
+    )
+    assert args.layerwise_tuning_for("transformer", dit_group=True)[:2] == (3.0, 20.0)
+
+
+def test_layerwise_tuning_rejects_unknown_policy():
+    args = _server_args(layerwise_residency_policy="vae=sideways")
+    with pytest.raises(ValueError, match="unknown residency policy"):
+        args.layerwise_tuning_for("vae", dit_group=False)
+
+
+def test_layerwise_tuning_accepts_json_and_pair_forms():
+    pair = _server_args(layerwise_resident_layers="vae=6,text_encoder=2")
+    assert pair.layerwise_tuning_for("vae", dit_group=False)[1] == 6.0
+    assert pair.layerwise_tuning_for("text_encoder", dit_group=False)[1] == 2.0
+    as_json = _server_args(layerwise_resident_layers='{"vae": 6}')
+    assert as_json.layerwise_tuning_for("vae", dit_group=False)[1] == 6.0
