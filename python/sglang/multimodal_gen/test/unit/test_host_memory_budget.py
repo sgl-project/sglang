@@ -6,8 +6,10 @@ import torch.nn as nn
 from sglang.multimodal_gen.runtime.managers.memory_managers import host_memory_budget
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
     GIB_BYTES,
+    HOST_COPY_RESERVE_BYTES,
     HostPinBudget,
     cgroup_memory_limit_bytes,
+    host_copies_would_not_fit,
     host_memory_available_bytes,
     module_weight_bytes,
     pin_benefit_bytes,
@@ -96,6 +98,49 @@ class TestCgroupLimit:
             lambda: type("VM", (), {"available": 12 * GIB_BYTES})(),
         )
         assert host_memory_available_bytes() == 12 * GIB_BYTES
+
+
+def _host_has(monkeypatch, tmp_path, available_bytes):
+    _point_at(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        host_memory_budget.psutil,
+        "virtual_memory",
+        lambda: type("VM", (), {"available": available_bytes})(),
+    )
+
+
+class TestHostCopiesWouldNotFit:
+    def test_a_checkpoint_larger_than_the_host_does_not_fit(
+        self, monkeypatch, tmp_path
+    ):
+        # the measured H3 case: a 62 GiB encoder against a 32 GiB host
+        _host_has(monkeypatch, tmp_path, 32 * GIB_BYTES)
+        assert host_copies_would_not_fit(62 * GIB_BYTES)
+
+    def test_a_checkpoint_well_under_the_host_fits(self, monkeypatch, tmp_path):
+        _host_has(monkeypatch, tmp_path, 128 * GIB_BYTES)
+        assert not host_copies_would_not_fit(20 * GIB_BYTES)
+
+    def test_the_reserve_is_not_available_to_the_copy(self, monkeypatch, tmp_path):
+        # a copy that fits only by eating the reserve is treated as not fitting
+        _host_has(monkeypatch, tmp_path, 40 * GIB_BYTES)
+        spendable = 40 * GIB_BYTES - HOST_COPY_RESERVE_BYTES
+        assert host_copies_would_not_fit(spendable)
+        assert not host_copies_would_not_fit(spendable - 1)
+
+    def test_nothing_to_copy_always_fits(self, monkeypatch, tmp_path):
+        _host_has(monkeypatch, tmp_path, 0)
+        assert not host_copies_would_not_fit(0)
+
+    def test_the_cgroup_cap_decides_and_not_the_machine(self, monkeypatch, tmp_path):
+        # psutil sees the whole box; only the cap makes the copy impossible
+        _point_at(monkeypatch, tmp_path, v2=(32 * GIB_BYTES, 0))
+        monkeypatch.setattr(
+            host_memory_budget.psutil,
+            "virtual_memory",
+            lambda: type("VM", (), {"available": 900 * GIB_BYTES})(),
+        )
+        assert host_copies_would_not_fit(62 * GIB_BYTES)
 
 
 class TestNestedCgroup:
