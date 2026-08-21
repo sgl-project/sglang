@@ -60,7 +60,6 @@ class KVArgs:
     # per tensor when the single contiguous slice already matches the layout.
     state_conv_shard_groups: List[List[Optional[List[int]]]]
     ib_device: str
-    ib_traffic_class: str
     gpu_id: int
     kv_head_num: int
     total_kv_head_num: int
