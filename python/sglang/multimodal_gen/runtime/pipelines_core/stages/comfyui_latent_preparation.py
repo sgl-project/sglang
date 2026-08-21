@@ -15,6 +15,12 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
+from sglang.multimodal_gen.runtime.pipelines_core.comfyui_session import (
+    bind_comfyui_session,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    get_or_create_request_scheduler,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation import (
     LatentPreparationStage,
 )
@@ -59,6 +65,10 @@ class ComfyUILatentPreparationStage(LatentPreparationStage):
             return any(ComfyUILatentPreparationStage._has_tensor(v) for v in value)
         return False
 
+    def verify_input(self, batch, server_args):
+        bind_comfyui_session(batch)
+        return super().verify_input(batch, server_args)
+
     def forward(self, batch, server_args):
         """
         Prepare latents with device mismatch fix for ComfyUI pipelines.
@@ -98,6 +108,15 @@ class ComfyUILatentPreparationStage(LatentPreparationStage):
                                     setattr(batch, attr_name, fixed_value)
                             except (AttributeError, TypeError):
                                 continue
+
+        # Session restore also happens in verify_input: later sampler steps
+        # omit cached conditioning, but PipelineStage verifies before forward.
+        bind_comfyui_session(batch)
+
+        # DenoisingStage reads batch.scheduler. Native pipelines attach it in
+        # TimestepPreparationStage; ComfyUI already owns the timestep schedule,
+        # so we only bind the pass-through scheduler onto the request.
+        get_or_create_request_scheduler(batch, self.scheduler)
 
         original_latents_shape = None
         if batch.latents is not None:
