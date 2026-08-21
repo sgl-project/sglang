@@ -226,6 +226,46 @@ class TestSWA(unittest.TestCase):
         allocator.free_swa(full_indices[1:2])
         self.assertEqual(allocator.swa_available_size(), 16)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "sync detection needs CUDA")
+    @unittest.skipUnless(
+        torch.version.hip is None,
+        "sync debug mode does not flag a blocking H2D copy on HIP",
+    )
+    def test_clearing_the_mapping_does_not_synchronize(self):
+        """``mapping[idx] = 0`` copies a host-resident scalar, which blocks until
+        every kernel queued on the stream has drained; index_fill_ passes the 0 as
+        a kernel argument. torch's sync debug mode raises on the former, so it
+        distinguishes the two forms.
+        """
+        _, allocator, _ = _build_swa_tree(is_eagle=False)
+        full_indices = _swa_alloc(allocator, 4)
+        mapping = allocator.full_to_swa_index_mapping
+
+        # Warm up outside the window: a first-time cudaMalloc can synchronize on
+        # its own, which the detector would report as this call's fault.
+        allocator.clear_full_to_swa_mapping(full_indices)
+
+        def sync_error(fn):
+            torch.cuda.synchronize()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                fn()
+            except RuntimeError as exc:
+                return exc
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+                torch.cuda.synchronize()
+            return None
+
+        self.assertIsNone(
+            sync_error(lambda: allocator.clear_full_to_swa_mapping(full_indices))
+        )
+        # Negative control: a detector that never fires would pass the assert
+        # above no matter how the mapping is cleared.
+        self.assertIsNotNone(
+            sync_error(lambda: mapping.__setitem__(full_indices.to(torch.int64), 0))
+        )
+
     def test_free_swa_group_owns_deferred_indices(self):
         _, allocator, _ = _build_swa_tree(
             is_eagle=False,

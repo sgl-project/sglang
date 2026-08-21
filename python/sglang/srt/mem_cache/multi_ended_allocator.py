@@ -2498,6 +2498,12 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         """
         return
 
+    def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
+        """No-op stub, paired with set_full_to_swa_mapping: no mapping tensor to
+        clear in shared mode.
+        """
+        return
+
     # -- free-group --
 
     def free_group_begin(self) -> None:
