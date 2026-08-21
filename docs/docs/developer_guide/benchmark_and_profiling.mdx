@@ -388,14 +388,16 @@ To check whether an image traces graph-launched kernels, run this inside it on a
 python3 scripts/ci/amd/check_hip_graph_profiling.py
 ```
 
-The `rocm724` images (`lmsysorg/sglang-rocm:*-rocm724-*` daily, `lmsysorg/sglang:*-rocm724-*` per release) install ROCm 7.2.4, which carries the fix — but installing it is not the same as using it. The torch wheel vendors its own HIP and roctracer under `torch/lib` and `libtorch_hip.so` has `RPATH $ORIGIN`, so the profiler runs through those 7.2.0 copies unless you preload the image's, and `LD_LIBRARY_PATH` does not override an `RPATH`. Set this before starting the process — after `import torch` is too late:
+Use a `rocm724` image (`lmsysorg/sglang-rocm:*-rocm724-*` daily, `lmsysorg/sglang:*-rocm724-*` per release). Those install ROCm 7.2.4 and point torch at it, so graph-launched kernels are traced with CUDA graphs left on.
+
+Installing 7.2.4 is not by itself enough, which matters for images built before that was addressed: the torch wheel vendors its own HIP and roctracer under `torch/lib`, and `libtorch_hip.so` has `RPATH $ORIGIN`, so the profiler runs through those 7.2.0 copies and `LD_LIBRARY_PATH` cannot override an `RPATH`. On such an image, preload the ROCm copies before starting the process — after `import torch` is too late:
 
 ```bash Command
 export LD_PRELOAD=/opt/rocm/lib/libamdhip64.so.7.2.70204:/opt/rocm/lib/libroctracer64.so.4.1.70204
 python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
 ```
 
-The probe above prints which libraries torch actually mapped, so use it to confirm the preload took effect rather than assuming it did.
+The probe above prints which libraries torch actually mapped, so use it to tell the two situations apart rather than assuming.
 
 On a `rocm720` image, or wherever preloading is not an option, profile with CUDA graphs disabled so that every kernel is launched eagerly and reaches the trace. Decode numbers collected this way exclude the graph-replay path, so use them to attribute kernel time rather than to measure decode latency.
 
