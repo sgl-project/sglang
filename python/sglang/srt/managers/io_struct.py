@@ -2008,6 +2008,8 @@ class PdRoleSwitchReqInput(BaseReq, kw_only=True):
     # Optional decode bs to capture on a flip to decode (capture-to-fit);
     # None uses the server's configured decode bs list.
     decode_cuda_graph_bs: Optional[List[int]] = None
+    # Measured graph footprint from a matching decode peer.
+    decode_cuda_graph_memory_gb: Optional[float] = None
 
 
 class PdRoleSwitchReqOutput(BaseReq, kw_only=True):

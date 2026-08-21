@@ -14,6 +14,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import PdRoleSwitchReqInput, PdRoleSwitchReqOutput
 from sglang.srt.runtime_context import get_context
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver
+from sglang.srt.utils import get_available_gpu_memory
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -74,6 +75,34 @@ def handle_pd_role_switch(
             "instance is not idle; drain all requests before switching",
             safe_to_restore=True,
         )
+
+    required_graph_gb = recv_req.decode_cuda_graph_memory_gb
+    if (
+        new_role == "decode"
+        and required_graph_gb is not None
+        and not scheduler.tp_worker.get_decode_cuda_graph_bs()
+    ):
+        if required_graph_gb < 0:
+            return _fail(
+                "decode_cuda_graph_memory_gb must be non-negative",
+                safe_to_restore=True,
+            )
+        try:
+            available_graph_gb = get_available_gpu_memory(
+                scheduler.device, scheduler.ps.gpu_id
+            )
+        except Exception as e:
+            return _fail(
+                f"failed to check decode CUDA graph headroom: {e}",
+                safe_to_restore=True,
+            )
+        if available_graph_gb < required_graph_gb:
+            return _fail(
+                "insufficient decode CUDA graph headroom: "
+                f"required={required_graph_gb:.3f} GB, "
+                f"available={available_graph_gb:.3f} GB",
+                safe_to_restore=True,
+            )
 
     scheduler._pd_role_switch_in_progress = True
     try:

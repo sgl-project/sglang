@@ -116,6 +116,43 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         self.assertIn("not idle", out.message)
         s.teardown_disaggregation.assert_not_called()
 
+    def test_rejected_when_decode_graph_headroom_is_insufficient(self):
+        s = self._scheduler(DisaggregationMode.PREFILL)
+        s.device = "cuda"
+        s.ps = SimpleNamespace(gpu_id=0)
+        s.tp_worker.get_decode_cuda_graph_bs.return_value = []
+        with patch.object(role_switch, "get_available_gpu_memory", return_value=0.5):
+            out = Scheduler.handle_pd_role_switch(
+                s,
+                PdRoleSwitchReqInput(
+                    new_role="decode",
+                    decode_cuda_graph_memory_gb=1.0,
+                ),
+            )
+
+        self.assertFalse(out.success)
+        self.assertTrue(out.safe_to_restore)
+        self.assertIn("insufficient decode CUDA graph headroom", out.message)
+        s.teardown_disaggregation.assert_not_called()
+        self.assertEqual(rc.get_disagg().disaggregation_mode, "prefill")
+
+    def test_decode_graph_headroom_allows_flip(self):
+        s = self._scheduler(DisaggregationMode.PREFILL)
+        s.device = "cuda"
+        s.ps = SimpleNamespace(gpu_id=0)
+        s.tp_worker.get_decode_cuda_graph_bs.return_value = []
+        with patch.object(role_switch, "get_available_gpu_memory", return_value=1.0):
+            out = Scheduler.handle_pd_role_switch(
+                s,
+                PdRoleSwitchReqInput(
+                    new_role="decode",
+                    decode_cuda_graph_memory_gb=1.0,
+                ),
+            )
+
+        self.assertTrue(out.success)
+        s.teardown_disaggregation.assert_called_once_with(s)
+
     def test_successful_flip_orchestration(self):
         s = self._scheduler(DisaggregationMode.PREFILL)
         out = Scheduler.handle_pd_role_switch(
@@ -233,11 +270,18 @@ class TestPdRoleSwitchReqSerialization(unittest.TestCase):
     """
 
     def test_req_accepts_optional_decode_cuda_graph_bs(self):
-        req = PdRoleSwitchReqInput(new_role="decode", decode_cuda_graph_bs=[1, 2, 4])
+        req = PdRoleSwitchReqInput(
+            new_role="decode",
+            decode_cuda_graph_bs=[1, 2, 4],
+            decode_cuda_graph_memory_gb=1.25,
+        )
         self.assertEqual(req.new_role, "decode")
         self.assertEqual(req.decode_cuda_graph_bs, [1, 2, 4])
+        self.assertEqual(req.decode_cuda_graph_memory_gb, 1.25)
         # Field is optional and defaults to None.
-        self.assertIsNone(PdRoleSwitchReqInput(new_role="prefill").decode_cuda_graph_bs)
+        default_req = PdRoleSwitchReqInput(new_role="prefill")
+        self.assertIsNone(default_req.decode_cuda_graph_bs)
+        self.assertIsNone(default_req.decode_cuda_graph_memory_gb)
 
     def test_resp_is_json_encodable(self):
         from sglang.srt.utils.msgspec_utils import msgspec_to_builtins

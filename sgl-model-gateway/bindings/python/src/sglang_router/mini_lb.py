@@ -310,7 +310,7 @@ async def pd_role_switch(request_data: dict):
     """Switch a running server's PD role (prefill<->decode) at runtime and
     update the LB's routing lists. Body: {"worker_url", "new_role":
     "prefill"|"decode", "bootstrap_port"?, "decode_cuda_graph_bs"?,
-    "drain"?, "drain_timeout_secs"?}.
+    "decode_cuda_graph_memory_gb"?, "drain"?, "drain_timeout_secs"?}.
 
     The backend rejects a switch unless the instance is idle. To make this
     safe while serving, by default the LB first removes the server from its
@@ -330,8 +330,9 @@ async def pd_role_switch(request_data: dict):
     old_role, old_port = lb.current_role_and_port(worker_url)
 
     body = {"new_role": new_role}
-    if request_data.get("decode_cuda_graph_bs") is not None:
-        body["decode_cuda_graph_bs"] = request_data["decode_cuda_graph_bs"]
+    for field in ("decode_cuda_graph_bs", "decode_cuda_graph_memory_gb"):
+        if request_data.get(field) is not None:
+            body[field] = request_data[field]
 
     # Stop routing new requests to this server so it can drain to idle.
     if drain and old_role is not None:

@@ -4384,7 +4384,7 @@ class Scheduler(
         draft_graph_memory_usage = (
             None if self.draft_worker is None else self.draft_worker.graph_memory_usage
         )
-        ret["memory_usage"] = build_memory_usage(
+        memory_usage = build_memory_usage(
             weight_gb=self.tp_worker.model_runner.weight_load_mem_usage,
             kv_cache_gb=self.token_to_kv_pool_allocator.get_kvcache().mem_usage,
             startup_available_gb=self.startup_available_gpu_memory_gb,
@@ -4393,6 +4393,7 @@ class Scheduler(
             target_graph_memory_usage=self.tp_worker.graph_memory_usage,
             draft_graph_memory_usage=draft_graph_memory_usage,
         )
+        ret["memory_usage"] = memory_usage
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
         # PD role switch: expose this instance's role and the decode CUDA graph
@@ -4402,6 +4403,13 @@ class Scheduler(
         # flipped to decode captures a size-matched graph set.
         ret["disaggregation_mode"] = get_disagg().disaggregation_mode
         ret["decode_cuda_graph_bs"] = self.tp_worker.get_decode_cuda_graph_bs()
+        ret["decode_cuda_graph_memory_gb"] = round(
+            sum(
+                memory_usage["graph"][phase]
+                for phase in ("decode", "target_verify", "draft_decode", "draft_extend")
+            ),
+            3,
+        )
 
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
