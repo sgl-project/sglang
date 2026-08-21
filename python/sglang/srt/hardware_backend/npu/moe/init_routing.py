@@ -11,23 +11,12 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang.srt.hardware_backend.npu.device_op import get_device_operator
+
 # ``npu_moe_init_routing_v2`` quant_mode selecting MXFP8: the op emits an
 # float8_e4m3fn payload plus an e8m0 block scale, fusing the activation quant
 # that would otherwise need a separate ``npu_dynamic_mx_quant`` pass.
 MXFP8_QUANT_MODE = 3
-
-
-def _normalize_mxfp_scale(scale: torch.Tensor) -> torch.Tensor:
-    """Reshape a flat 2D e8m0 block scale ``[N, M]`` into pair-split ``[N, M//2, 2]``.
-
-    ``npu_moe_init_routing_v2(quant_mode=3)`` emits the scale flat, while the
-    grouped matmul wants the pair-split view. Already-3D scales (what
-    ``npu_dynamic_mx_quant`` returns) pass through untouched. Mirrors
-    vllm-ascend's ``maybe_normalize_mxfp_scale_layout``.
-    """
-    if scale is None or scale.ndim != 2:
-        return scale
-    return scale.reshape(scale.shape[0], scale.shape[1] // 2, 2)
 
 
 class BaseInitRouting(ABC):
@@ -114,7 +103,9 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
         if self.quant_mode == -1:
             pertoken_scale = None
         elif self.quant_mode == MXFP8_QUANT_MODE:
-            pertoken_scale = _normalize_mxfp_scale(pertoken_scale)
+            pertoken_scale = (
+                get_device_operator().normalize_mxfp_scale_layout(pertoken_scale)
+            )
         expert_tokens = expert_tokens.to(torch.int64)
         return hidden_states, expanded_row_idx, expert_tokens, pertoken_scale
 
