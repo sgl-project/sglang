@@ -297,7 +297,12 @@ framework-specific optimization workflow.
 
 **Recent Model Audit Boundaries**
 
-- LongCat-Image currently has split image/text QKV projections and performs
+- LongCat-Image supports breakable CUDA graph at fixed, captured resolutions.
+  Its DiT always receives a 512-token prompt body, so different raw prompt
+  lengths reuse the same graph signature without padding. A model-specific
+  pass-through padder prevents the generic buckets from expanding this fixed
+  shape into unused graph signatures.
+  The model still has split image/text QKV projections and performs
   joint-stream `cat`/split inside each single block. Do not misclassify those
   as a missed existing packed path; they are model-local structural
   opportunities that need their own weight-loader and parity coverage.
@@ -371,6 +376,11 @@ framework-specific optimization workflow.
   every additional served resolution in `--warmup-resolutions`, and use
   `--bcg-text-buckets` for prompt signatures. Check this path before proposing
   a second graph-capture mechanism for launch-bound traces.
+- LongCat-Image uses this generic runner directly: one 1024x1024 capture covers
+  short and long prompts because text conditioning is fixed at 512 tokens.
+  Keep eager as the baseline because the gain is hardware-dependent; an H200
+  50-step, three-prompt run measured 177.0--177.3 ms/step eager versus
+  173.1--173.3 ms/step with BCG, with bit-exact final images.
 - Dual-stream diffusion models: `use_dual_stream = True` in models such as `hunyuan3d.py` is an existing overlap family.
 - Workflow rule: if a hotspot is communication-heavy, rule out these in-repo overlap families before proposing a brand new overlap design.
 
