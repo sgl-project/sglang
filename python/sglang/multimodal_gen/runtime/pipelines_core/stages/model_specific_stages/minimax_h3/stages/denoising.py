@@ -16,7 +16,7 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     is_fsdp_managed_module,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
@@ -404,29 +405,119 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
     ) -> None:
         quality = getattr(batch.sampling_params, "quality", "lossless")
         explicit_fields = getattr(batch.sampling_params, "_explicit_fields", ())
-        generic_requested = (
-            super()._cache_dit_requested() and "quality" not in explicit_fields
+        enable_override = batch.sampling_params.enable_cache_dit
+        generic_enabled = (
+            super()._cache_dit_requested()
+            if enable_override is None
+            else enable_override
         )
-        desired_mode = (
-            "high" if quality == "high" else ("generic" if generic_requested else None)
-        )
+        generic_requested = generic_enabled and "quality" not in explicit_fields
+        if enable_override is False:
+            # The per-request kill switch wins over quality="high".
+            desired_mode = None
+        elif quality == "high":
+            desired_mode = "high"
+        else:
+            desired_mode = "generic" if generic_requested else None
         current_mode = getattr(self, "_minimax_h3_cache_mode", None)
         self._minimax_h3_quality = quality
+
+        if self.server_args.enable_breakable_cuda_graph:
+            if desired_mode is not None:
+                super()._maybe_enable_cache_dit(num_inference_steps, batch)
+            return
 
         # H3 is monolithic-only, and the scheduler executes one worker batch at
         # a time. Combined with `quality` in the dynamic-batch signature, this
         # makes the process-wide hook transition safe at this batch boundary.
         if self._cache_dit_enabled and current_mode != desired_mode:
-            self.transformer = disable_cache_on_transformer(self.transformer)
-            self._cache_dit_enabled = False
-            self._cached_num_steps = None
+            # Unmount first: the blocks must stay preserved for as long as
+            # Cache-DiT still holds references to their inputs. Settle the state
+            # fields before restoring the in-place path, so a failure there
+            # costs throughput rather than leaving the stage inconsistent.
+            self._unmount_cache_dit()
             self._minimax_h3_cache_mode = None
+            self._set_cache_dit_input_preservation(False)
 
         if desired_mode is None:
             return
-        super()._maybe_enable_cache_dit(num_inference_steps, batch)
+
+        # Arm before delegating whenever this H3 stage requests caching,
+        # without predicting whether the parent will accept the mount.
+        # cache_dit.enable_cache swaps `blocks` for a single CachedBlocks
+        # wrapper, so the real blocks are only reachable beforehand -- and a
+        # wrong prediction would hand Cache-DiT unpreserved blocks, whose
+        # residuals read as zero, which is silent. Arming is one boolean per
+        # block and nothing runs before the parent decides, so guessing
+        # conservatively costs approximately nothing.
+        was_enabled = self._cache_dit_enabled
+        if not was_enabled:
+            self._set_cache_dit_input_preservation(True)
+        try:
+            super()._maybe_enable_cache_dit(num_inference_steps, batch)
+        except Exception:
+            if not was_enabled:
+                self._disarm_after_failed_mount()
+            raise
+
         if self._cache_dit_enabled:
             self._minimax_h3_cache_mode = desired_mode
+        elif not was_enabled:
+            # The parent declined to mount, for example because breakable
+            # CUDA graphs are enabled or this is an ordinary warmup. Nothing
+            # holds the block inputs, so go back to the in-place path.
+            self._set_cache_dit_input_preservation(False)
+
+    def _disarm_after_failed_mount(self) -> None:
+        """Restore the in-place path only once Cache-DiT is confirmed gone.
+
+        cache_dit.enable_cache swaps the block list before the rest of the mount
+        runs, so a later failure can leave caching attached. Disarming then
+        would hand Cache-DiT unpreserved blocks and silently reproduce the
+        zero-residual bug, so if the unmount does not succeed we stay armed and
+        pay throughput instead.
+        """
+        try:
+            self.transformer = disable_cache_on_transformer(self.transformer)
+        except Exception:
+            logger.warning(
+                "Could not unmount Cache-DiT after a failed mount; leaving "
+                "MiniMax-H3 input preservation on",
+                exc_info=True,
+            )
+            return
+        # The parent may have flipped these before failing; leaving them set
+        # would send the next request down the refresh path with nothing
+        # mounted.
+        self._cache_dit_enabled = False
+        self._cached_num_steps = None
+        self._cache_dit_active_key = None
+        self._minimax_h3_cache_mode = None
+        self._set_cache_dit_input_preservation(False)
+
+    def _set_cache_dit_input_preservation(self, enabled: bool) -> None:
+        """Flip input preservation on the H3 model, failing closed.
+
+        Skipping this silently would put us back where this stage started: cache
+        mounted, residuals reading as zero, no hits and nothing logged. If the
+        model cannot be reached, that is a wiring bug and should surface here.
+        """
+        model = self.transformer
+        for _ in range(4):  # unwrap compile/parallel wrappers, if any
+            if hasattr(model, "set_cache_dit_input_preservation"):
+                break
+            inner = getattr(model, "_orig_mod", None) or getattr(model, "module", None)
+            if inner is None:
+                break
+            model = inner
+        setter = getattr(model, "set_cache_dit_input_preservation", None)
+        if not callable(setter):
+            raise TypeError(
+                "MiniMax-H3 Cache-DiT requires set_cache_dit_input_preservation() "
+                f"on the transformer, but {type(self.transformer).__name__} does "
+                "not expose it"
+            )
+        setter(enabled)
 
     def _cache_dit_scm_masks(
         self, primary_num_steps: int, secondary_num_steps: int | None = None
@@ -515,9 +606,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
         ctx = _resolve_full_loop_context(batch)
 
-        if not torch.cuda.is_available():
-            raise RuntimeError("MiniMax H3 full-loop denoise requires CUDA")
-        device = torch.device("cuda")
+        if not (current_platform.is_cuda() or current_platform.is_mps()):
+            raise RuntimeError("MiniMax H3 full-loop denoise requires CUDA or MPS")
+        device = current_platform.get_local_torch_device()
         sigmas_video = [float(v) for v in ctx.sigmas["video"]]
         self._maybe_enable_cache_dit_and_torch_compile(
             len(sigmas_video) - 1,

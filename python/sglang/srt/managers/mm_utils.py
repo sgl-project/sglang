@@ -709,6 +709,7 @@ def general_mm_embed_routine(
                                 if (
                                     isinstance(precomputed_embeddings, torch.Tensor)
                                     and precomputed_embeddings.is_cuda
+                                    and not mm_item.keep_device_embedding
                                 ):
                                     mm_item.precomputed_embeddings = (
                                         precomputed_embeddings.to(
@@ -1336,11 +1337,11 @@ def _get_is_default_transport():
     global _is_default_tensor_transport
     if _is_default_tensor_transport is None:
         from sglang.srt.managers.tokenizer_manager import (
-            _determine_tensor_transport_mode,
+            determine_tensor_transport_mode,
         )
 
         _is_default_tensor_transport = (
-            _determine_tensor_transport_mode(get_server_args()) == "default"
+            determine_tensor_transport_mode(get_server_args()) == "default"
         )
     return _is_default_tensor_transport
 

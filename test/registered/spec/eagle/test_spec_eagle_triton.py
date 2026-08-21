@@ -32,8 +32,6 @@ class TestEagle3Triton(
     """Overlap scheduler on triton (kits listed in bases)."""
 
     attention_backend = "triton"
-    max_running_requests = 64
-    cuda_graph_max_bs_decode = 64
     gsm8k_num_examples = 200
     gsm8k_check_accept_len = False
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)

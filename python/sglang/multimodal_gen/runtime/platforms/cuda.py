@@ -151,16 +151,33 @@ class _SageAttentionBackendResolver(_CudaAttentionBackendResolver):
     def resolve(cls, platform) -> str | AttentionBackendEnum:
         try:
             from sageattention import sageattn  # noqa: F401
+        except ImportError:
+            logger.info(
+                "Sage Attention backend is not installed (To install it, run `pip install git+https://github.com/thu-ml/SageAttention.git@d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4 --no-build-isolation`). Falling back to Flash Attention."
+            )
+            return AttentionBackendEnum.FA
 
+        if platform.is_hopper():
+            try:
+                # fixed SM90 bindings retain the fake implementation under its own name
+                from sageattention.sm90_compile import (  # noqa: F401
+                    qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf_fake_impl,
+                )
+            except ImportError:
+                logger.warning(
+                    "Installed Sage Attention is missing the SM90 binding fix. Falling back to Flash Attention. Reinstall with `pip install --force-reinstall git+https://github.com/thu-ml/SageAttention.git@d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4 --no-build-isolation`."
+                )
+                return AttentionBackendEnum.FA
+
+        try:
             from sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn import (  # noqa: F401
                 SageAttentionBackend,
             )
 
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn.SageAttentionBackend"
-        except ImportError as e:
-            logger.info(e)
+        except ImportError:
             logger.info(
-                "Sage Attention backend is not installed (To install it, run `pip install sageattention==2.2.0 --no-build-isolation`). Falling back to Flash Attention."
+                "Sage Attention backend failed to import. Falling back to Flash Attention."
             )
             return AttentionBackendEnum.FA
 
@@ -176,8 +193,7 @@ class _SageAttention3BackendResolver(_CudaAttentionBackendResolver):
             )
 
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3.SageAttention3Backend"
-        except ImportError as e:
-            logger.info(e)
+        except ImportError:
             logger.info(
                 "Sage Attention 3 backend is not installed (To install it, see https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell#installation). Falling back to Torch SDPA."
             )
@@ -236,6 +252,30 @@ class _SparseVideoGen2AttentionBackendResolver(_CudaAttentionBackendResolver):
             ) from e
 
 
+class _SolAttnBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.SOL_ATTN
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        try:
+            from sol_attn import sol_attn  # noqa: F401
+
+            from sglang.multimodal_gen.runtime.layers.attention.backends.sol_attn import (  # noqa: F401
+                SolAttnBackend,
+            )
+
+            return (
+                "sglang.multimodal_gen.runtime.layers.attention.backends.sol_attn."
+                "SolAttnBackend"
+            )
+        except ImportError as e:
+            logger.error("Failed to import Sol-Attn backend: %s", str(e))
+            raise ImportError(
+                "Sol-Attn backend is not installed. Install it with "
+                "`pip install git+https://github.com/NVlabs/Sana.git@sol-engine#subdirectory=techniques/sparse_backends`."
+            ) from e
+
+
 class _VMOBAAttentionBackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.VMOBA_ATTN
 
@@ -252,6 +292,58 @@ class _VMOBAAttentionBackendResolver(_CudaAttentionBackendResolver):
         except ImportError as e:
             logger.error("Failed to import Video MoBA Attention backend: %s", str(e))
             raise ImportError("Video MoBA Attention backend is not installed. ") from e
+
+
+class _SubBlockSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+
+    # Hopper uses SGLang's SM90 CuTe-DSL block-sparse kernel. Blackwell uses the
+    # FlashInfer blk64 kernel built specifically for sm_100a; 10.3 and 12.x do
+    # not have a compatible cubin and must still fail closed.
+    supported_capabilities = {(9, 0), (10, 0)}
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        capability = platform.get_device_capability()
+        capability_tuple = (
+            (capability.major, capability.minor) if capability is not None else None
+        )
+        if capability_tuple not in cls.supported_capabilities:
+            found = capability.as_version_str() if capability else "unknown"
+            raise ValueError(
+                "SubBlock sparse attention needs compute capability 9.0 "
+                f"(Hopper) or 10.0 (B200 / GB200); this device reports {found}."
+            )
+        try:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (  # noqa: F401
+                SubBlockSparseAttentionBackend,
+            )
+
+            if capability_tuple == (9, 0):
+                # Importing catches missing/incompatible CuTe-DSL and Quack;
+                # the CUDA kernel itself is compiled lazily on the first call.
+                from sglang.kernels.ops.attention.flash_attn.cute.block_sparsity import (  # noqa: F401
+                    BlockSparseTensorsTorch,
+                )
+                from sglang.kernels.ops.attention.flash_attn.cute.interface import (  # noqa: F401
+                    flash_attn_func,
+                )
+            else:
+                from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (  # noqa: F401
+                    load_bsa_attn_blk64_fwd,
+                )
+
+                load_bsa_attn_blk64_fwd()
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn.SubBlockSparseAttentionBackend"
+        except Exception as e:
+            logger.error("Failed to import SubBlock sparse attention: %s", str(e))
+            dependency = (
+                "SGLang's SM90 CuTe-DSL FlashAttention dependencies"
+                if capability_tuple == (9, 0)
+                else "FlashInfer with the blk64 block-sparse kernel "
+                "(flashinfer.cute_dsl.sparse.bsa_attn_blk64_fwd)"
+            )
+            raise ImportError(f"SubBlock sparse attention needs {dependency}.") from e
 
 
 class _FlashAttention2BackendResolver(_CudaAttentionBackendResolver):
@@ -293,7 +385,9 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _SageAttention3BackendResolver,
         _VideoSparseAttentionBackendResolver,
         _SparseVideoGen2AttentionBackendResolver,
+        _SolAttnBackendResolver,
         _VMOBAAttentionBackendResolver,
+        _SubBlockSparseAttentionBackendResolver,
         _FlashAttention2BackendResolver,
         _FlashAttentionBackendResolver,
     )
@@ -550,7 +644,8 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
-        """Install the quality-gated FLUX.2 / Wan VAE decoder fast paths.
+        """Install the quality-gated FLUX.2 / AutoencoderKL / Wan VAE decoder
+        fast paths.
 
         Requests with quality == "high" run the fast paths; the "lossless"
         default runs the original module path bit-for-bit. See
@@ -558,6 +653,7 @@ class CudaPlatformBase(Platform):
         """
         try:
             from sglang.multimodal_gen.runtime.models.vaes.flux2_vae_cuda_opt import (
+                maybe_optimize_autoencoder_kl,
                 maybe_optimize_flux2_vae,
             )
             from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
@@ -565,6 +661,7 @@ class CudaPlatformBase(Platform):
             )
 
             vae = maybe_optimize_flux2_vae(vae)
+            vae = maybe_optimize_autoencoder_kl(vae)
             vae = maybe_optimize_wan_vae(vae)
         except Exception:
             logger.warning(

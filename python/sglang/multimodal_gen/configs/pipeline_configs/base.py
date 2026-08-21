@@ -226,6 +226,9 @@ class PipelineConfig:
     vae_precision: str = "fp32"
     vae_decode_precision: str | None = None
     vae_tiling: bool = True
+    # Bounds the attention grid the diffusion decoder's stages see, which is
+    # what makes a full-length decode tractable.
+    diffusion_decoder_tiling: bool = True
     vae_slicing: bool = False
     vae_sp: bool = True
 
@@ -271,6 +274,16 @@ class PipelineConfig:
         """Validate model-owned constraints after server args are normalized."""
 
         del server_args
+
+    def supports_action_endpoint(self) -> bool:
+        """Whether this pipeline exposes the generic action generation API."""
+
+        return self.task_type.is_action_gen()
+
+    def supports_openpi_endpoint(self) -> bool:
+        """Whether this pipeline implements the OpenPI policy websocket."""
+
+        return False
 
     # Wan2.2 TI2V parameters
     boundary_ratio: float | None = None
@@ -834,6 +847,13 @@ class PipelineConfig:
             dest=f"{prefix_with_dot.replace('-', '_')}vae_tiling",
             default=PipelineConfig.vae_tiling,
             help="Enable VAE tiling",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}diffusion-decoder-tiling",
+            action=StoreBoolean,
+            dest=f"{prefix_with_dot.replace('-', '_')}diffusion_decoder_tiling",
+            default=PipelineConfig.diffusion_decoder_tiling,
+            help="Enable tiling for the LTX-2.5 diffusion decoder",
         )
         parser.add_argument(
             f"--{prefix_with_dot}vae-slicing",
