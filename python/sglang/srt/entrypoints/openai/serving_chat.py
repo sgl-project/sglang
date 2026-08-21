@@ -935,12 +935,19 @@ class OpenAIServingChat(OpenAIServingBase):
 
         The reasoning parser is told the same thing, so channel-framed formats
         keep their framing intact exactly when a tool-call parser consumes it.
+
+        With an inventory declared, tool_choice="none" turns parsing off. With no
+        inventory at all there is nothing for "none" to suppress -- and the model
+        can still emit a call the conversation history established -- so parse
+        anyway rather than leak raw tool-call tokens into content. Surfacing such
+        a call also needs SGLANG_FORWARD_UNKNOWN_TOOLS, since its name is by
+        definition not in the request's tool list.
         """
-        return bool(
-            request.tool_choice != "none"
-            and self._effective_tools(request)
-            and self.tool_call_parser
-        )
+        if not self.tool_call_parser:
+            return False
+        if self._effective_tools(request):
+            return request.tool_choice != "none"
+        return True
 
     def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
         """Validate that the input is valid."""

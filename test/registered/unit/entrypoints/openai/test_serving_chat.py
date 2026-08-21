@@ -1240,6 +1240,50 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.assertIsNone(result.stop)
 
+    # ------------- tool-call parser gate -------------
+
+    def test_tool_parsing_runs_when_no_inventory_is_declared(self):
+        """With no `tools`, tool_choice defaults to "none" and the parser used to
+        be skipped entirely, so a tool call the history established leaked its raw
+        tokens into content (report case
+        TestToolCallBasic::test_13_13_undefined_tool_retry_after_error).
+        There is nothing for "none" to suppress when nothing was declared."""
+        self.tm._config_overrides["tool_call_parser"] = "qwen25"
+        chat = OpenAIServingChat(self.tm, self.template_manager)
+        request = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "call list_skills"}]
+        )
+        self.assertEqual(request.tool_choice, "none")
+        self.assertTrue(chat._tool_call_parsing_active(request))
+
+    def test_explicit_tool_choice_none_still_suppresses_parsing(self):
+        """With an inventory declared, "none" must keep turning parsing off."""
+        self.tm._config_overrides["tool_call_parser"] = "qwen25"
+        chat = OpenAIServingChat(self.tm, self.template_manager)
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather in Paris?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            tool_choice="none",
+        )
+        self.assertFalse(chat._tool_call_parsing_active(request))
+
+    def test_no_parser_configured_means_no_parsing(self):
+        self.tm._config_overrides["tool_call_parser"] = None
+        chat = OpenAIServingChat(self.tm, self.template_manager)
+        request = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "hi"}]
+        )
+        self.assertFalse(chat._tool_call_parsing_active(request))
+
     def test_kimi_k3_encoder_receives_wire_request_fields(self):
         self.template_manager.chat_template_name = None
         self.chat.chat_encoding_spec = "kimi_k3"

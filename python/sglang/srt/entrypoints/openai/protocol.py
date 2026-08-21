@@ -346,7 +346,7 @@ class CompletionRequest(BaseModel):
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
     suffix: Optional[str] = None
-    temperature: float = 1.0
+    temperature: float = Field(default=1.0, ge=0.0, le=2.0)
     top_p: float = 1.0
     user: Optional[str] = None
     return_hidden_states: Union[bool, Literal["last"]] = False
@@ -885,7 +885,7 @@ class ChatCompletionRequest(BaseModel):
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
-    temperature: Optional[float] = None
+    temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
     top_p: Optional[float] = None
     user: Optional[str] = None
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
@@ -1017,6 +1017,63 @@ class ChatCompletionRequest(BaseModel):
         if isinstance(value, bool):
             raise ValueError("reasoning_effort must not be a boolean")
         return value
+
+    @model_validator(mode="after")
+    def validate_tool_message_pairing(self):
+        """Every `tool` message must answer an open assistant tool_call.
+
+        OpenAI rejects a `tool` message whose `tool_call_id` no preceding
+        assistant `tool_calls` produced, and an assistant `tool_calls` block that
+        is left partly unanswered. Without this the model is asked to reason over
+        a tool result it never requested.
+        """
+        open_calls: set[str] = set()
+        open_from = -1
+        saw_tool_calls = False
+
+        def unanswered(position: int):
+            return ValueError(
+                f"messages[{open_from}] has tool_calls {sorted(open_calls)} with no "
+                f"matching tool message before messages[{position}]; every tool call "
+                "must be answered by a 'tool' message carrying its tool_call_id"
+            )
+
+        for position, message in enumerate(self.messages):
+            if message.role == "tool":
+                call_id = message.tool_call_id
+                if call_id is None:
+                    # Some clients omit the id entirely. Nothing to cross-check,
+                    # so treat it as closing the open block rather than failing.
+                    open_calls = set()
+                    continue
+                if call_id not in open_calls:
+                    if not saw_tool_calls:
+                        # A history trimmed by the context window can start after
+                        # the assistant turn that opened this call. Nothing to
+                        # cross-check against, so do not judge it.
+                        continue
+                    raise ValueError(
+                        f"messages[{position}] has tool_call_id {call_id!r}, which no "
+                        "preceding assistant message requested"
+                    )
+                open_calls.discard(call_id)
+                continue
+
+            if open_calls:
+                raise unanswered(position)
+
+            if message.role == "assistant":
+                open_calls = {
+                    call.id for call in message.tool_calls or [] if call.id is not None
+                }
+                open_from = position
+                saw_tool_calls = saw_tool_calls or bool(open_calls)
+
+        # A continued final assistant turn is still being generated, so its own
+        # tool calls have not been answered yet by construction.
+        if open_calls and not self.continue_final_message:
+            raise unanswered(len(self.messages))
+        return self
 
     @model_validator(mode="before")
     @classmethod

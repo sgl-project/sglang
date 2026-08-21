@@ -822,6 +822,129 @@ class TestMiniMaxCompat(unittest.TestCase):
             )
 
 
+class TestTemperatureRange(unittest.TestCase):
+    """OpenAI documents temperature as [0, 2]; out-of-range used to be accepted
+    and then generate to the context limit (report case
+    TestErrorCodes::test_20_03, which timed out at 300s instead of 400ing)."""
+
+    def test_chat_rejects_out_of_range(self):
+        for temperature in (-0.1, 2.1, 5.0):
+            with self.assertRaises(ValidationError):
+                ChatCompletionRequest(
+                    model="test-model",
+                    messages=[{"role": "user", "content": "Hi"}],
+                    temperature=temperature,
+                )
+
+    def test_chat_accepts_the_documented_range(self):
+        for temperature in (0, 0.5, 1, 2):
+            request = ChatCompletionRequest(
+                model="test-model",
+                messages=[{"role": "user", "content": "Hi"}],
+                temperature=temperature,
+            )
+            self.assertEqual(request.temperature, temperature)
+
+    def test_completion_rejects_out_of_range(self):
+        with self.assertRaises(ValidationError):
+            CompletionRequest(model="test-model", prompt="Hi", temperature=5.0)
+
+
+class TestToolMessagePairing(unittest.TestCase):
+    """A `tool` message must answer an open assistant tool_call, and an assistant
+    tool_calls block must not be left partly unanswered (report cases
+    TestToolCallEdge::test_16_08 / test_16_09, which returned 200 and answered
+    from a tool result the model never requested)."""
+
+    @staticmethod
+    def _assistant(*call_ids):
+        return {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{}"},
+                }
+                for call_id in call_ids
+            ],
+        }
+
+    def _build(self, messages, **kwargs):
+        return ChatCompletionRequest(model="test-model", messages=messages, **kwargs)
+
+    def test_unknown_tool_call_id_rejected(self):
+        with self.assertRaises(ValidationError):
+            self._build(
+                [
+                    {"role": "user", "content": "What's the weather?"},
+                    self._assistant("call_1"),
+                    {"role": "tool", "tool_call_id": "call_999", "content": "sunny"},
+                ]
+            )
+
+    def test_partly_answered_block_rejected(self):
+        with self.assertRaises(ValidationError):
+            self._build(
+                [
+                    {"role": "user", "content": "Beijing and Shanghai?"},
+                    self._assistant("call_1", "call_2"),
+                    {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+                ]
+            )
+
+    def test_unanswered_block_before_next_turn_rejected(self):
+        with self.assertRaises(ValidationError):
+            self._build(
+                [
+                    {"role": "user", "content": "hi"},
+                    self._assistant("call_1"),
+                    {"role": "user", "content": "never mind"},
+                ]
+            )
+
+    def test_answered_block_accepted(self):
+        request = self._build(
+            [
+                {"role": "user", "content": "What's the weather?"},
+                self._assistant("call_1"),
+                {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+                {"role": "user", "content": "and Shanghai?"},
+            ]
+        )
+        self.assertEqual(len(request.messages), 4)
+
+    def test_parallel_calls_answered_out_of_order_accepted(self):
+        request = self._build(
+            [
+                {"role": "user", "content": "Beijing and Shanghai?"},
+                self._assistant("call_1", "call_2"),
+                {"role": "tool", "tool_call_id": "call_2", "content": "rain"},
+                {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+            ]
+        )
+        self.assertEqual(len(request.messages), 4)
+
+    def test_history_trimmed_before_the_requesting_turn_accepted(self):
+        # A context-window-trimmed history can start after the assistant turn
+        # that opened the call; there is nothing to cross-check it against.
+        request = self._build(
+            [
+                {"role": "tool", "tool_call_id": "call_dropped", "content": "sunny"},
+                {"role": "user", "content": "thanks"},
+            ]
+        )
+        self.assertEqual(len(request.messages), 2)
+
+    def test_continue_final_message_may_end_on_open_calls(self):
+        request = self._build(
+            [{"role": "user", "content": "hi"}, self._assistant("call_1")],
+            continue_final_message=True,
+        )
+        self.assertEqual(len(request.messages), 2)
+
+
 class TestParsedResponseFieldsProtocol(unittest.TestCase):
     """Test ParsedResponseFields protocol."""
 
