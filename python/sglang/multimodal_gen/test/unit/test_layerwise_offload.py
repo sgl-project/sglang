@@ -1300,6 +1300,37 @@ def test_a_mapped_weight_is_not_written_back(tmp_path, monkeypatch):
     assert torch.equal(before, after), "writeback must not touch the checkpoint"
 
 
+def test_the_mapped_store_survives_the_placeholder(tmp_path, monkeypatch):
+    """The store must not hold the parameter it is about to have overwritten.
+
+    `_to_local_tensor` returns the parameter itself for anything that is not a
+    DTensor, so storing it directly stores the parameter. `Tensor.data = ...`
+    then swaps that object's storage in place rather than rebinding a name, so
+    the store is left holding the `(1,)` placeholder. Nothing raises: the reload
+    does `gpu_tensor.copy_(cpu_tensor)`, and a one-element source broadcasts
+    into the full shape, so the layer is silently reconstructed from one value.
+    """
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    stored = manager._mapped_cpu_weights[0]
+    assert stored, "expected the weight to stay mapped"
+
+    parameters = dict(manager.model.named_parameters())
+    for name, tensor in stored.items():
+        assert tensor.numel() > 1, (
+            f"{name} holds {tensor.numel()} element(s): the store is holding the "
+            "placeholder that was assigned to the parameter, not the weight"
+        )
+        assert tensor is not parameters[name], (
+            f"{name} in the store is the parameter object itself, so assigning "
+            "to the parameter's .data will overwrite the store"
+        )
+    assert manager._mapped_bytes == sum(
+        t.numel() * t.element_size() for t in stored.values()
+    ), "the byte counter and the store must describe the same weights"
+
+
 def test_mapped_weights_are_visible_to_checksums(tmp_path, monkeypatch):
     if not pathlib.Path("/proc/self/maps").exists():
         pytest.skip("needs /proc to tell a mapping from anonymous memory")
