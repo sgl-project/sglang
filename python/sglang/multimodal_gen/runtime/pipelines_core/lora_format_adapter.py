@@ -81,8 +81,7 @@ def _looks_like_kohya_minimax_h3(state_dict: Mapping[str, torch.Tensor]) -> bool
     if not state_dict:
         return False
     return any(
-        k.startswith("lora_unet_blocks_") and "_attn_qkv_proj." in k
-        for k in state_dict
+        k.startswith("lora_unet_blocks_") and "_attn_qkv_proj." in k for k in state_dict
     )
 
 
