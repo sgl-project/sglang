@@ -97,6 +97,10 @@ class WeightCacheDaemon:
         trust_remote_code: bool = False,
         revision: Optional[str] = None,
         dist_init_method: Optional[str] = None,
+        enable_weight_heterogeneous_copy: bool = False,
+        weight_heterogeneous_copy: bool = False,
+        weight_heterogeneous_transfer_registry_url: Optional[str] = None,
+        socket_rank: Optional[int] = None,
     ):
         self.model_path = model_path
         self.gpu_id = gpu_id
@@ -113,16 +117,41 @@ class WeightCacheDaemon:
         self.trust_remote_code = trust_remote_code
         self.revision = revision
         self.dist_init_method = dist_init_method
-
-        self.socket_path = get_socket_path(
-            compute_global_rank(tp_size, pp_rank, tp_rank)
+        self.enable_weight_heterogeneous_copy = enable_weight_heterogeneous_copy
+        self.weight_heterogeneous_copy = weight_heterogeneous_copy
+        self.weight_heterogeneous_transfer_registry_url = (
+            weight_heterogeneous_transfer_registry_url
         )
-        self.ready_path = get_ready_path(compute_global_rank(tp_size, pp_rank, tp_rank))
+        if enable_weight_heterogeneous_copy and weight_heterogeneous_copy:
+            raise ValueError(
+                "source and target heterogeneous-transfer gates are mutually exclusive"
+            )
+        self.weight_heterogeneous_transfer_enabled = bool(
+            enable_weight_heterogeneous_copy or weight_heterogeneous_copy
+        )
+        if (
+            self.weight_heterogeneous_transfer_enabled
+            and not weight_heterogeneous_transfer_registry_url
+        ):
+            raise ValueError(
+                "heterogeneous weight transfer requires a manifest registry URL"
+            )
+
+        if socket_rank is None:
+            socket_rank = (
+                gpu_id
+                if self.weight_heterogeneous_transfer_enabled
+                else compute_global_rank(tp_size, pp_rank, tp_rank)
+            )
+        self.socket_path = get_socket_path(socket_rank)
+        self.ready_path = get_ready_path(socket_rank)
 
         self.model = None
         self.config: Optional[CacheConfig] = None
         # name -> {"handle": base64_str, "shape": list, "dtype": str, "is_param": bool}
         self.state_entries: Dict[str, Dict[str, Any]] = {}
+        self.weights_manifest_state: Optional[Any] = None
+        self.weight_heterogeneous_transfer_stats: Optional[Dict[str, int]] = None
 
     def _init_distributed(self, server_args, model_config):
         """Initialize the distributed backend required for model loading.
@@ -184,7 +213,12 @@ class WeightCacheDaemon:
         )
 
     def load(self):
-        """Full loading pipeline: disk → TP shard → quantize → export IPC handles."""
+        """Create this daemon's immutable model shard and export IPC handles.
+
+        A normal source loads from disk. A heterogeneous-transfer target allocates the
+        requested TP layout with the dummy loader, then overwrites every logical
+        weight range from the source generation before becoming ready.
+        """
         # CUDA IPC weight sharing relies on torch's _share_cuda_ handle export,
         # which only exists on CUDA-alike platforms (CUDA / ROCm). Fail loud here
         # instead of dying deep inside the export with an opaque error.
@@ -220,9 +254,20 @@ class WeightCacheDaemon:
             pp_size=self.pp_size,
             dp_size=self.dp_size,
             ep_size=self.ep_size,
-            load_format=self.load_format,
-            model_loader_extra_config=self.model_loader_extra_config,
+            load_format=(
+                "dummy" if self.weight_heterogeneous_copy else self.load_format
+            ),
+            model_loader_extra_config=(
+                "{}"
+                if self.weight_heterogeneous_copy
+                else self.model_loader_extra_config
+            ),
         )
+        # Heterogeneous copy needs one canonical, resolved model identifier across
+        # source and target. Keep the original weight-cache path untouched when
+        # the feature is disabled.
+        if self.weight_heterogeneous_transfer_enabled:
+            self.model_path = server_args.model_path
         publish(server_args, role="weight_cache_daemon")
 
         # Initialize distributed backend for model loading
@@ -279,15 +324,25 @@ class WeightCacheDaemon:
 
         # Build load config
         load_config = LoadConfig(
-            load_format=self.load_format,
-            model_loader_extra_config=self.model_loader_extra_config,
+            load_format=(
+                "dummy" if self.weight_heterogeneous_copy else self.load_format
+            ),
+            model_loader_extra_config=(
+                {} if self.weight_heterogeneous_copy else self.model_loader_extra_config
+            ),
             tp_rank=self.tp_rank,
         )
 
-        logger.info(
-            f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
-            f"Loading model from disk: {self.model_path}"
-        )
+        if self.weight_heterogeneous_copy:
+            logger.info(
+                f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
+                f"Allocating target parallel layout: {self.model_path}"
+            )
+        else:
+            logger.info(
+                f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
+                f"Loading model from disk: {self.model_path}"
+            )
         tic = time.perf_counter()
 
         # Load model using DefaultModelLoader (includes TP sharding + quant post-process)
@@ -298,15 +353,98 @@ class WeightCacheDaemon:
         )
 
         elapsed = time.perf_counter() - tic
-        logger.info(
-            f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
-            f"Model loaded from disk in {elapsed:.2f}s"
-        )
+        if self.weight_heterogeneous_copy:
+            logger.info(
+                f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
+                f"Model allocated in {elapsed:.2f}s"
+            )
+        else:
+            logger.info(
+                f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
+                f"Model loaded from disk in {elapsed:.2f}s"
+            )
 
         # Ensure every post-processing kernel has retired before we export the
         # memory: clients map these tensors read-only via IPC and would otherwise
         # risk observing half-written weights.
         current_platform.synchronize()
+
+        if self.weight_heterogeneous_transfer_enabled:
+            from .weight_heterogeneous_transfer import (
+                WeightsManifestState,
+                validate_weight_heterogeneous_transfer_configuration,
+            )
+
+            validate_weight_heterogeneous_transfer_configuration(
+                tp_size=self.tp_size,
+                dp_size=self.dp_size,
+                ep_size=self.ep_size,
+                pp_size=self.pp_size,
+                quantization=self.quantization or model_config.quantization,
+            )
+            self.weights_manifest_state = WeightsManifestState.create(
+                model=self.model,
+                model_config=model_config,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+                pp_size=self.pp_size,
+                pp_rank=self.pp_rank,
+                ep_size=self.ep_size,
+                gpu_id=self.gpu_id,
+                revision=(
+                    self.revision
+                    or getattr(model_config.hf_config, "_commit_hash", None)
+                    or "local"
+                ),
+                is_source_daemon=self.enable_weight_heterogeneous_copy,
+            )
+
+        if self.enable_weight_heterogeneous_copy:
+            from .weight_heterogeneous_transfer import (
+                register_source_weights_manifest,
+            )
+
+            register_source_weights_manifest(
+                self.weight_heterogeneous_transfer_registry_url,
+                global_rank=compute_global_rank(
+                    self.tp_size, self.pp_rank, self.tp_rank
+                ),
+                gpu_id=self.gpu_id,
+                tp_size=self.tp_size,
+                pp_size=self.pp_size,
+                ep_size=self.ep_size,
+                manifest_state=self.weights_manifest_state,
+            )
+            logger.info(
+                "[WeightCacheDaemon gpu=%s] Registered source weight manifest at %s",
+                self.gpu_id,
+                self.weight_heterogeneous_transfer_registry_url,
+            )
+
+        if self.weight_heterogeneous_copy:
+            from .weight_heterogeneous_transfer import (
+                transfer_weights_from_source_daemons,
+            )
+
+            self.weight_heterogeneous_transfer_stats = (
+                transfer_weights_from_source_daemons(
+                    target_manifest_state=self.weights_manifest_state,
+                    model=self.model,
+                    gpu_id=self.gpu_id,
+                    registry_url=self.weight_heterogeneous_transfer_registry_url,
+                )
+            )
+            logger.info(
+                "[WeightCacheDaemon gpu=%s tp_rank=%s] Received heterogeneous "
+                "weights from %s: %s",
+                self.gpu_id,
+                self.tp_rank,
+                self.weight_heterogeneous_transfer_registry_url,
+                self.weight_heterogeneous_transfer_stats,
+            )
+            # Ensure every Mooncake write has retired before IPC clients may map
+            # the target buffers read-only.
+            current_platform.synchronize()
 
         # Export all parameters and buffers as IPC handles
         self._export_state()
@@ -420,9 +558,13 @@ class WeightCacheDaemon:
         with open(self.ready_path, "w") as f:
             f.write(f"pid={os.getpid()}\n")
             f.write(f"config={self.config.to_dict()}\n")
+            if self.weight_heterogeneous_transfer_stats is not None:
+                f.write(
+                    f"weight_heterogeneous_transfer={self.weight_heterogeneous_transfer_stats}\n"
+                )
 
         logger.info(
-            f"[WeightCacheDaemon gpu={self.gpu_id}] " f"Listening on {self.socket_path}"
+            f"[WeightCacheDaemon gpu={self.gpu_id}] Listening on {self.socket_path}"
         )
 
         self._running = True
@@ -526,6 +668,9 @@ class WeightCacheDaemon:
 
     def shutdown(self):
         """Release GPU memory and clean up."""
+        if self.weights_manifest_state is not None:
+            self.weights_manifest_state.close()
+            self.weights_manifest_state = None
         if dist.is_initialized():
             dist.destroy_process_group()
         if self.model is not None:
@@ -552,6 +697,10 @@ def run_weight_cache_daemon(
     trust_remote_code: bool = False,
     revision: Optional[str] = None,
     dist_init_method: Optional[str] = None,
+    enable_weight_heterogeneous_copy: bool = False,
+    weight_heterogeneous_copy: bool = False,
+    weight_heterogeneous_transfer_registry_url: Optional[str] = None,
+    socket_rank: Optional[int] = None,
 ):
     """Entry point for running a weight cache daemon process."""
     logging.basicConfig(
@@ -583,6 +732,12 @@ def run_weight_cache_daemon(
         trust_remote_code=trust_remote_code,
         revision=revision,
         dist_init_method=dist_init_method,
+        enable_weight_heterogeneous_copy=enable_weight_heterogeneous_copy,
+        weight_heterogeneous_copy=weight_heterogeneous_copy,
+        weight_heterogeneous_transfer_registry_url=(
+            weight_heterogeneous_transfer_registry_url
+        ),
+        socket_rank=socket_rank,
     )
 
     daemon.load()
@@ -608,6 +763,12 @@ def launch_weight_cache_daemons(
     dist_init_method: Optional[str] = None,
     timeout: int = 1800,
     force: bool = False,
+    enable_weight_heterogeneous_copy: bool = False,
+    weight_heterogeneous_copy: bool = False,
+    weight_heterogeneous_transfer_server_host: str = "0.0.0.0",
+    weight_heterogeneous_transfer_server_port: int = 31999,
+    weight_heterogeneous_transfer_source_ip: Optional[str] = None,
+    weight_heterogeneous_transfer_source_port: Optional[int] = None,
 ):
     """Launch weight cache daemon processes for this node's PP×TP ranks.
 
@@ -639,6 +800,48 @@ def launch_weight_cache_daemons(
     import socket as sock_mod
     import subprocess
     import sys
+
+    if enable_weight_heterogeneous_copy and weight_heterogeneous_copy:
+        raise ValueError(
+            "--enable-weight-heterogeneous-copy and "
+            "--weight-heterogeneous-copy are mutually exclusive"
+        )
+    weight_heterogeneous_transfer_enabled = bool(
+        enable_weight_heterogeneous_copy or weight_heterogeneous_copy
+    )
+    if weight_heterogeneous_transfer_enabled and nnodes != 1:
+        raise ValueError("heterogeneous weight copy is single-node only")
+    if (
+        enable_weight_heterogeneous_copy
+        and weight_heterogeneous_transfer_server_port <= 0
+    ):
+        raise ValueError("weight manifest server port must be positive")
+    if weight_heterogeneous_copy and (
+        not weight_heterogeneous_transfer_source_ip
+        or not weight_heterogeneous_transfer_source_port
+    ):
+        raise ValueError(
+            "target heterogeneous transfer requires source IP and source port"
+        )
+
+    weight_manifest_server = None
+    weight_manifest_registry_url = None
+    if enable_weight_heterogeneous_copy:
+        from .weight_manifest_server import WeightManifestServer
+
+        weight_manifest_server = WeightManifestServer(
+            host=weight_heterogeneous_transfer_server_host,
+            port=weight_heterogeneous_transfer_server_port,
+            expected_rank_count=tp_size * pp_size,
+        )
+        weight_manifest_registry_url = (
+            f"http://127.0.0.1:{weight_heterogeneous_transfer_server_port}"
+        )
+    elif weight_heterogeneous_copy:
+        weight_manifest_registry_url = (
+            f"http://{weight_heterogeneous_transfer_source_ip}:"
+            f"{weight_heterogeneous_transfer_source_port}"
+        )
 
     # Replicate _calculate_rank_ranges logic from engine.py
     pp_size_per_node = max(pp_size // nnodes, 1)
@@ -674,8 +877,15 @@ def launch_weight_cache_daemons(
     # Validate and clean up stale .ready/.sock files from prior runs.
     for pp_rank in pp_rank_range:
         for tp_rank in tp_rank_range:
-            global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
-            cleanup_stale_daemon_files(global_rank, force=force)
+            socket_rank = compute_local_gpu_id(
+                pp_rank,
+                tp_rank,
+                pp_size_per_node,
+                tp_size_per_node,
+                base_gpu_id=base_gpu_id,
+                gpu_id_step=gpu_id_step,
+            )
+            cleanup_stale_daemon_files(socket_rank, force=force)
 
     procs = []
     for pp_rank in pp_rank_range:
@@ -714,6 +924,8 @@ def launch_weight_cache_daemons(
                 dtype,
                 "--dist-init-method",
                 dist_init_method,
+                "--weight-cache-socket-rank",
+                str(gpu_id),
             ]
             if quantization:
                 cmd += ["--quantization", quantization]
@@ -723,6 +935,15 @@ def launch_weight_cache_daemons(
                 cmd += ["--trust-remote-code"]
             if revision:
                 cmd += ["--revision", revision]
+            if enable_weight_heterogeneous_copy:
+                cmd += ["--enable-weight-heterogeneous-copy"]
+            if weight_heterogeneous_copy:
+                cmd += ["--weight-heterogeneous-copy"]
+            if weight_heterogeneous_transfer_enabled:
+                cmd += [
+                    "--weight-heterogeneous-transfer-registry-url",
+                    weight_manifest_registry_url,
+                ]
 
             proc = subprocess.Popen(cmd)
             procs.append(proc)
@@ -737,8 +958,15 @@ def launch_weight_cache_daemons(
     start_time = time.time()
     for pp_rank in pp_rank_range:
         for tp_rank in tp_rank_range:
-            global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
-            ready_path = get_ready_path(global_rank)
+            socket_rank = compute_local_gpu_id(
+                pp_rank,
+                tp_rank,
+                pp_size_per_node,
+                tp_size_per_node,
+                base_gpu_id=base_gpu_id,
+                gpu_id_step=gpu_id_step,
+            )
+            ready_path = get_ready_path(socket_rank)
             while not os.path.exists(ready_path):
                 time.sleep(check_interval)
                 if time.time() - start_time > timeout:
@@ -803,6 +1031,8 @@ def launch_weight_cache_daemons(
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        if weight_manifest_server is not None:
+            weight_manifest_server.close()
         logger.info("All weight cache daemons have been terminated")
 
     if exited is not None:
@@ -869,6 +1099,49 @@ if __name__ == "__main__":
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--revision", default=None, help="Model revision")
     parser.add_argument(
+        "--enable-weight-heterogeneous-copy",
+        action="store_true",
+        help="Expose this source daemon group's immutable weight manifest.",
+    )
+    parser.add_argument(
+        "--weight-heterogeneous-copy",
+        action="store_true",
+        help="Copy immutable weights from a source manifest registry.",
+    )
+    parser.add_argument(
+        "--weight-heterogeneous-transfer-server-host",
+        default="0.0.0.0",
+        help="Source manifest server bind host.",
+    )
+    parser.add_argument(
+        "--weight-heterogeneous-transfer-server-port",
+        type=int,
+        default=31999,
+        help="Source manifest server port.",
+    )
+    parser.add_argument(
+        "--weight-heterogeneous-transfer-source-ip",
+        default=None,
+        help="Source manifest server IP for a target daemon launcher.",
+    )
+    parser.add_argument(
+        "--weight-heterogeneous-transfer-source-port",
+        type=int,
+        default=None,
+        help="Source manifest server port for a target daemon launcher.",
+    )
+    parser.add_argument(
+        "--weight-heterogeneous-transfer-registry-url",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--weight-cache-socket-rank",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--dist-init-method",
         default=None,
         help="Distributed init method (e.g. tcp://node0-ip:29500). "
@@ -892,6 +1165,26 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    if args.enable_weight_heterogeneous_copy and args.weight_heterogeneous_copy:
+        parser.error(
+            "--enable-weight-heterogeneous-copy and "
+            "--weight-heterogeneous-copy are mutually exclusive"
+        )
+    weight_heterogeneous_transfer_enabled = bool(
+        args.enable_weight_heterogeneous_copy or args.weight_heterogeneous_copy
+    )
+    if weight_heterogeneous_transfer_enabled and args.nnodes != 1:
+        parser.error("heterogeneous weight copy is single-node only")
+    if (
+        args.weight_heterogeneous_copy
+        and not args.weight_heterogeneous_transfer_registry_url
+        and (
+            not args.weight_heterogeneous_transfer_source_ip
+            or not args.weight_heterogeneous_transfer_source_port
+        )
+    ):
+        parser.error("target heterogeneous transfer requires source IP and source port")
+
     if args.gpu_id is not None or args.tp_rank is not None:
         # Single-rank mode: launch one daemon for the specified rank
         gpu_id = args.gpu_id if args.gpu_id is not None else args.tp_rank
@@ -899,27 +1192,62 @@ if __name__ == "__main__":
         # Refuse to clobber a live daemon already holding this rank (mirrors the
         # multi-rank launcher and the engine path, which the multi-rank spawns
         # of this same entrypoint rely on). --force kills and takes over.
+        socket_rank = args.weight_cache_socket_rank
+        if socket_rank is None:
+            socket_rank = (
+                gpu_id
+                if weight_heterogeneous_transfer_enabled
+                else compute_global_rank(args.tp_size, args.pp_rank, tp_rank)
+            )
         cleanup_stale_daemon_files(
-            compute_global_rank(args.tp_size, args.pp_rank, tp_rank),
+            socket_rank,
             force=args.force,
         )
-        run_weight_cache_daemon(
-            model_path=args.model_path,
-            gpu_id=gpu_id,
-            tp_size=args.tp_size,
-            tp_rank=tp_rank,
-            pp_size=args.pp_size,
-            pp_rank=args.pp_rank,
-            dp_size=args.dp_size,
-            ep_size=args.ep_size,
-            load_format=args.load_format,
-            dtype=args.dtype,
-            quantization=args.quantization,
-            model_loader_extra_config=args.model_loader_extra_config,
-            trust_remote_code=args.trust_remote_code,
-            revision=args.revision,
-            dist_init_method=args.dist_init_method,
-        )
+        weight_manifest_server = None
+        registry_url = args.weight_heterogeneous_transfer_registry_url
+        if registry_url is None and args.enable_weight_heterogeneous_copy:
+            from .weight_manifest_server import WeightManifestServer
+
+            weight_manifest_server = WeightManifestServer(
+                host=args.weight_heterogeneous_transfer_server_host,
+                port=args.weight_heterogeneous_transfer_server_port,
+                expected_rank_count=1,
+            )
+            registry_url = (
+                f"http://127.0.0.1:{args.weight_heterogeneous_transfer_server_port}"
+            )
+        elif registry_url is None and args.weight_heterogeneous_copy:
+            registry_url = (
+                f"http://{args.weight_heterogeneous_transfer_source_ip}:"
+                f"{args.weight_heterogeneous_transfer_source_port}"
+            )
+        try:
+            run_weight_cache_daemon(
+                model_path=args.model_path,
+                gpu_id=gpu_id,
+                tp_size=args.tp_size,
+                tp_rank=tp_rank,
+                pp_size=args.pp_size,
+                pp_rank=args.pp_rank,
+                dp_size=args.dp_size,
+                ep_size=args.ep_size,
+                load_format=args.load_format,
+                dtype=args.dtype,
+                quantization=args.quantization,
+                model_loader_extra_config=args.model_loader_extra_config,
+                trust_remote_code=args.trust_remote_code,
+                revision=args.revision,
+                dist_init_method=args.dist_init_method,
+                enable_weight_heterogeneous_copy=(
+                    args.enable_weight_heterogeneous_copy
+                ),
+                weight_heterogeneous_copy=args.weight_heterogeneous_copy,
+                weight_heterogeneous_transfer_registry_url=registry_url,
+                socket_rank=socket_rank,
+            )
+        finally:
+            if weight_manifest_server is not None:
+                weight_manifest_server.close()
     else:
         # Multi-rank mode: launch daemons for this node's TP ranks
         launch_weight_cache_daemons(
@@ -941,4 +1269,18 @@ if __name__ == "__main__":
             dist_init_method=args.dist_init_method,
             timeout=args.timeout,
             force=args.force,
+            enable_weight_heterogeneous_copy=args.enable_weight_heterogeneous_copy,
+            weight_heterogeneous_copy=args.weight_heterogeneous_copy,
+            weight_heterogeneous_transfer_server_host=(
+                args.weight_heterogeneous_transfer_server_host
+            ),
+            weight_heterogeneous_transfer_server_port=(
+                args.weight_heterogeneous_transfer_server_port
+            ),
+            weight_heterogeneous_transfer_source_ip=(
+                args.weight_heterogeneous_transfer_source_ip
+            ),
+            weight_heterogeneous_transfer_source_port=(
+                args.weight_heterogeneous_transfer_source_port
+            ),
         )

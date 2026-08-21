@@ -148,6 +148,13 @@ class IpcModelLoader(BaseModelLoader):
         # meta storage. We must recreate them from the now-valid tensors.
         self._rebuild_stale_views(model)
 
+        # This only reconnects client-local tensor views and never writes the
+        # daemon-owned IPC tensors. It is safe for both disk-loaded source
+        # daemons and heterogeneous-copy targets.
+        from .weight_heterogeneous_transfer import rebuild_client_derived_weight_state
+
+        rebuild_client_derived_weight_state(model)
+
         # The model now points into the daemon's GPU memory via CUDA IPC. If the
         # daemon dies, those pointers dangle, so watch it and fail loud.
         self._start_daemon_liveness_watchdog(cache_data.get("pid"))

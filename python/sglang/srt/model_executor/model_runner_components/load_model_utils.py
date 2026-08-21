@@ -237,6 +237,7 @@ def maybe_enable_ipc_weight_cache(
     tp_size: int,
     pp_rank: int,
     tp_rank: int,
+    gpu_id: int,
 ) -> None:
     """Switch ``load_config`` onto the IPC weight-cache path, in place.
 
@@ -252,16 +253,20 @@ def maybe_enable_ipc_weight_cache(
         load_config.fallback_load_format = load_config.load_format
         load_config.load_format = LoadFormat.IPC_CACHE
 
-    # Compute socket path using global rank (tp_size * pp_rank + tp_rank) so
-    # each daemon has a unique socket even across PP stages and nodes.
+    # Standalone daemons use physical GPU ids so independent groups can coexist
+    # on one node. Engine-owned daemons retain their logical global-rank paths.
     if load_config.weight_cache_socket is None:
         from sglang.srt.weight_cache.protocol import (
             compute_global_rank,
             get_socket_path,
         )
 
-        global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
-        load_config.weight_cache_socket = get_socket_path(global_rank=global_rank)
+        socket_rank = (
+            gpu_id
+            if server_args.weight_cache_mode == "client"
+            else compute_global_rank(tp_size, pp_rank, tp_rank)
+        )
+        load_config.weight_cache_socket = get_socket_path(socket_rank)
 
 
 def load_model_with_memory_saver(
