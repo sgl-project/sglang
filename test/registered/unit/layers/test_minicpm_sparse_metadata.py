@@ -2,24 +2,38 @@ import subprocess
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
 
-from sglang.srt.layers.attention import attention_registry
-from sglang.srt.layers.attention.minicpm import backend as backend_module
-from sglang.srt.layers.attention.minicpm import sparse_utils
-from sglang.srt.layers.attention.minicpm.attention_adapter import (
-    MiniCPMFlashAttentionAdapter,
-)
-from sglang.srt.layers.attention.minicpm.backend import (
-    MiniCPMSparseBackend,
-    _gather_compressed_keys,
-    _transpose_head_group_layout,
-)
-from sglang.srt.layers.attention.minicpm.sparse_utils import CompressionLevelMetadata
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+with patch.dict(
+    sys.modules,
+    {
+        module: MagicMock()
+        for module in (
+            "sgl_kernel",
+            "sgl_kernel.quantization",
+            "sgl_kernel.scalar_type",
+        )
+    },
+):
+    from sglang.srt.layers.attention import attention_registry
+    from sglang.srt.layers.attention.minicpm import backend as backend_module
+    from sglang.srt.layers.attention.minicpm import sparse_utils
+    from sglang.srt.layers.attention.minicpm.attention_adapter import (
+        MiniCPMFlashAttentionAdapter,
+    )
+    from sglang.srt.layers.attention.minicpm.backend import (
+        MiniCPMSparseBackend,
+        _gather_compressed_keys,
+        _transpose_head_group_layout,
+    )
+    from sglang.srt.layers.attention.minicpm.sparse_utils import (
+        CompressionLevelMetadata,
+    )
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -171,10 +185,18 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             self.assertIs(_runner, runner)
             return use_flashinfer
 
-        with patch.object(
-            backend_module,
-            "MiniCPMSparseBackend",
-            side_effect=build,
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.layers.attention.minicpm.backend": backend_module,
+                },
+            ),
+            patch.object(
+                backend_module,
+                "MiniCPMSparseBackend",
+                side_effect=build,
+            ),
         ):
             flashattn = attention_registry.ATTENTION_BACKENDS["minicpm_flashattn"](
                 runner
