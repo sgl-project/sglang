@@ -16,10 +16,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 from sglang.srt.hardware_backend.npu.attention.ragged_verify_utils import (
     get_npu_bucketed_ragged_verify_layout,
 )
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel
@@ -105,25 +105,13 @@ class CompressorAscendBackendMixin:
 
     @staticmethod
     def _ragged_verify_layout(forward_batch: ForwardBatch):
-        if not forward_batch.forward_mode.is_target_verify():
-            return None
         layout = resolve_ragged_verify_layout(forward_batch)
-        if layout is None:
-            return None
-        padded_bs = int(forward_batch.batch_size)
-        if padded_bs < layout.bs:
-            raise RuntimeError(
-                "Invalid DSpark NPU ragged verify request geometry: "
-                f"forward_bs={padded_bs} < layout_bs={layout.bs}."
-            )
-        if padded_bs != layout.bs:
-            spec_info = getattr(forward_batch, "spec_info", None)
-            cap = int(getattr(spec_info, "draft_token_num", 1) or 1)
+        if layout is not None and layout.bs != forward_batch.batch_size:
             layout = get_npu_bucketed_ragged_verify_layout(
-                spec_info=spec_info,
+                spec_info=forward_batch.spec_info,
                 layout=layout,
-                padded_bs=padded_bs,
-                cap=cap,
+                padded_bs=forward_batch.batch_size,
+                cap=forward_batch.spec_info.draft_token_num,
             )
         return layout
 
@@ -1075,19 +1063,6 @@ class DeepseekV4AscendAttnBackend(
             )
             for ratio, state_pool in self._dsv4_state_pools_by_ratio.items()
         }
-        metadata.dsv4_max_input_capacity = tokens_per_req
-        metadata.dsv4_explicit_state_block_tables = {
-            ratio: torch.full(
-                (
-                    bs,
-                    (2 if ratio == 4 else 1) * ratio + tokens_per_req,
-                ),
-                state_pool.dummy_state_loc,
-                dtype=torch.int32,
-                device=device,
-            )
-            for ratio, state_pool in self._dsv4_state_pools_by_ratio.items()
-        }
 
         metadata.positions_cmp_padding_c4 = torch.zeros(
             c4_pad, dtype=torch.int64, device=device
@@ -1194,22 +1169,14 @@ class DeepseekV4AscendAttnBackend(
                 live_seq_lens_cpu = torch.zeros_like(raw_seq_lens_cpu)
                 final_seq_lens_cpu = live_seq_lens_cpu
             elif ragged_layout is not None:
-                if explicit_live_cpu is None:
-                    raise RuntimeError(
-                        "DSV4 compact graph replay requires "
-                        "spec_info.live_seq_lens_cpu."
-                    )
-                explicit_live_cpu = torch.as_tensor(
-                    explicit_live_cpu,
+                live_seq_lens_cpu = forward_batch.spec_info.live_seq_lens_cpu.to(
                     dtype=raw_seq_lens_cpu.dtype,
                     device=raw_seq_lens_cpu.device,
-                ).flatten()
-                live_seq_lens_cpu = torch.zeros_like(raw_seq_lens_cpu)
-                num_live_rows = min(raw_bs, explicit_live_cpu.numel())
-                if num_live_rows > 0:
-                    live_seq_lens_cpu[:num_live_rows].copy_(
-                        explicit_live_cpu[:num_live_rows]
-                    )
+                ).flatten()[:raw_bs]
+                live_seq_lens_cpu = F.pad(
+                    live_seq_lens_cpu,
+                    (0, bs - live_seq_lens_cpu.numel()),
+                )
                 # Query rows beyond raw_bs are graph-tier ghosts. Keep their
                 # Q indptr geometry intact, but do not allocate/write target
                 # compressor state for them.
@@ -1575,23 +1542,6 @@ class DeepseekV4AscendAttnBackend(
 
         device = forward_batch.seq_lens.device
         ragged_layout = self._ragged_verify_layout(forward_batch)
-        if ragged_layout is not None:
-            physical_tokens = int(forward_batch.input_ids.numel())
-            layout_tokens = int(ragged_layout.graph_num_tokens)
-            # DP/EP MLP synchronization may append token rows after the
-            # compact layout is built.  Keep those physical rows for the MoE
-            # collectives, while the ragged Q indptr / seqused metadata below
-            # continues to describe only the valid compact prefix.
-            valid_tokens = getattr(forward_batch, "_original_num_tokens", None)
-            if valid_tokens is None:
-                valid_tokens = forward_batch.num_token_non_padded_cpu
-            valid_tokens = int(valid_tokens)
-            if physical_tokens < layout_tokens or valid_tokens != layout_tokens:
-                raise RuntimeError(
-                    "Invalid DSpark NPU eager compact token geometry: "
-                    f"physical_tokens={physical_tokens}, "
-                    f"valid_tokens={valid_tokens}, layout_tokens={layout_tokens}."
-                )
         # cu_seqlens_q must hold per-request QUERY token counts, not KV lengths.
         if (
             forward_batch.forward_mode.is_extend()
@@ -1986,29 +1936,13 @@ class DeepseekV4AscendAttnBackend(
         verify_seq_lens_cpu = fm.seq_lens_cpu_int[:bs]
         if ragged_layout is not None:
             verify_lens_cpu = ragged_layout.verify_lens.to("cpu").to(torch.int64)
-            live_seq_lens_cpu = getattr(
-                getattr(forward_batch, "spec_info", None),
-                "live_seq_lens_cpu",
-                None,
+            live_seq_lens_cpu = forward_batch.spec_info.live_seq_lens_cpu.to(
+                torch.int64
+            ).flatten()[:bs]
+            live_seq_lens_cpu = F.pad(
+                live_seq_lens_cpu,
+                (0, bs - live_seq_lens_cpu.numel()),
             )
-            if live_seq_lens_cpu is None:
-                live_seq_lens_cpu = forward_batch.seq_lens[:bs].cpu()
-            live_seq_lens_cpu = torch.as_tensor(
-                live_seq_lens_cpu, dtype=torch.int64
-            ).flatten()
-            if live_seq_lens_cpu.numel() < bs:
-                live_seq_lens_cpu = torch.cat(
-                    [
-                        live_seq_lens_cpu,
-                        torch.zeros(
-                            bs - live_seq_lens_cpu.numel(),
-                            dtype=torch.int64,
-                            device=live_seq_lens_cpu.device,
-                        ),
-                    ]
-                )
-            else:
-                live_seq_lens_cpu = live_seq_lens_cpu[:bs]
             verify_seq_lens_cpu = live_seq_lens_cpu + verify_lens_cpu
         padding_sizes = {}
         for ratio in (4, 128):

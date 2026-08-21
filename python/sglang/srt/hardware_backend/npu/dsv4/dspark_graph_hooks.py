@@ -29,13 +29,7 @@ def make_dspark_verify_epilogue_capture_hook(epilogue):
         ):
             return
 
-        metadata = runner.model_runner.attn_backend.forward_metadata
-        live_prefix_lens = getattr(metadata, "start_pos", None)
-        if live_prefix_lens is None:
-            raise RuntimeError(
-                "DSpark NPU folded epilogue requires DSV4 "
-                "forward_metadata.start_pos."
-            )
+        live_prefix_lens = runner.model_runner.attn_backend.forward_metadata.start_pos
         epilogue(
             compact_logits=out.next_token_logits,
             compact_hidden=out.hidden_states,
