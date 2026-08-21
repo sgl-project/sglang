@@ -225,34 +225,8 @@ class DeepseekModelNextN(nn.Module):
             else:
                 hidden_states = input_embeds
 
-            if hidden_states.shape[0] > 0:
-                previous_hidden_states = forward_batch.spec_info.hidden_states
-                if self.rot_weight is not None:
-                    previous_hidden_states = torch.matmul(
-                        previous_hidden_states, self.rot_weight
-                    )
-                if _is_cuda:
-                    eh_input = fused_eh_norm(
-                        hidden_states,
-                        previous_hidden_states,
-                        self.enorm.weight,
-                        self.hnorm.weight,
-                        self.enorm.variance_epsilon,
-                    )
-                else:
-                    eh_input = torch.cat(
-                        (
-                            self.enorm(hidden_states),
-                            self.hnorm(previous_hidden_states),
-                        ),
-                        dim=-1,
-                    )
-                if isinstance(self.eh_proj, ReplicatedLinear):
-                    hidden_states, _ = self.eh_proj(eh_input)
-                else:
-                    hidden_states = self.eh_proj(eh_input)
-
-            # CP-v2 shards/gathers hidden states at the eager-runner boundary.
+            # CP-v2 shards/gathers at the eager-runner boundary instead.
+            spec_hidden = forward_batch.spec_info.hidden_states
             cp_v2_active = is_cp_v2_active(forward_batch)
             use_cp_v1 = (
                 dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
@@ -261,6 +235,32 @@ class DeepseekModelNextN(nn.Module):
             if use_cp_v1:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
                 positions = cp_split_and_rebuild_position(forward_batch, positions)
+                spec_hidden = cp_split_and_rebuild_data(forward_batch, spec_hidden)
+
+            if hidden_states.shape[0] > 0:
+                if self.rot_weight is not None:
+                    spec_hidden = torch.matmul(spec_hidden, self.rot_weight)
+                if _is_cuda:
+                    eh_input = fused_eh_norm(
+                        hidden_states,
+                        spec_hidden,
+                        self.enorm.weight,
+                        self.hnorm.weight,
+                        self.enorm.variance_epsilon,
+                    )
+                else:
+                    eh_input = torch.cat(
+                        (
+                            self.enorm(hidden_states),
+                            self.hnorm(spec_hidden),
+                        ),
+                        dim=-1,
+                    )
+                if isinstance(self.eh_proj, ReplicatedLinear):
+                    hidden_states, _ = self.eh_proj(eh_input)
+                else:
+                    hidden_states = self.eh_proj(eh_input)
+
             residual = None
             index_topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
             with get_global_expert_distribution_recorder().disable_this_region():
