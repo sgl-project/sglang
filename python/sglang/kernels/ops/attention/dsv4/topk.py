@@ -116,6 +116,15 @@ def topk_transform_ragged_v2(
     They are invalid for that row and the buffer must have no other consumer.
     ``seq_lens`` entries must be NON-NEGATIVE, as for the paged entry point.
     """
+    if is_xpu():
+        torch.ops.sgl_kernel.fast_topk_transform_ragged_fused(
+            scores,
+            seq_lens,
+            out_indices,
+            out_offsets,
+            row_starts,
+        )
+        return
     module = _jit_topk_v2_module()
     module.topk_transform_ragged(scores, seq_lens, row_starts, out_offsets, out_indices)
 
@@ -156,7 +165,6 @@ def topk_transform_512_v2(
             out_page_indices,
             page_size,
             metadata,
-            out_raw_indices,
         )
         return
     module = _jit_topk_v2_module()
