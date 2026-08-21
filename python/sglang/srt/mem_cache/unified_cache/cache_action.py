@@ -99,5 +99,24 @@ class SWARebuild(ComponentAction, frozen=True):
     component_type: ComponentType = ComponentType.SWA
 
 
+class BindCapturedSWAHost(ComponentAction, frozen=True):
+    """Strict bit-exact SWA: claim the prefill-captured host window for a freshly
+    inserted SWA node.
+
+    Must be emitted after the node's ``SWARebuild``, since the bind only applies
+    to a node that already carries its SWA device value.
+
+    ``node_end`` is the node's absolute end token position, passed explicitly
+    rather than derived from a start offset plus the value length: between the
+    emit and the apply, ``_maybe_split_leaf_for_swa_lock`` can cap the leaf to
+    its trailing window, which shortens the value while leaving the end boundary
+    (the capture's staging key) unchanged.
+    """
+
+    node_id: NodeId
+    node_end: int
+    component_type: ComponentType = ComponentType.SWA
+
+
 # Cache-owned actions, applied by UnifiedRadixCache itself.
 CacheAction = ReplaceWriteThroughOnNodeSplit | FreeDeviceKV | BackupKV

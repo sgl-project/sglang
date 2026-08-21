@@ -214,6 +214,41 @@ class CompressorBackendMixin:
         kv_score_input = compressor.compute_kv_score(x, forward_batch)
 
         state_pool = compressor.get_state_pool(self)
+
+        # Strict SWA-HiCache c4 overlap-state capture for the UNIFIED-KV prefill
+        # path. Legacy capture (compress_extend_paged) is dead here, so without
+        # this the state staging is empty and strict reuse is rejected. Must run
+        # BEFORE compress mutates kv_score_input; gated to the extend path (decode
+        # has its own capture_compress_state_windows_decode) and ratio==4.
+        if (
+            compressor.ratio == 4
+            and forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+            and getattr(
+                self.token_to_kv_pool,
+                (
+                    "_c4_indexer_state_host_pool"
+                    if compressor.is_in_indexer
+                    else "_c4_state_host_pool"
+                ),
+                None,
+            )
+            is not None
+        ):
+            from sglang.srt.layers.attention.dsv4.compress_hip import (
+                capture_c4_state_windows_unified,
+            )
+
+            capture_c4_state_windows_unified(
+                backend=self,
+                state_pool=state_pool,
+                kv_score_input=kv_score_input,
+                forward_batch=forward_batch,
+                is_indexer=compressor.is_in_indexer,
+                layer_id=layer_id,
+                ratio=compressor.ratio,
+            )
+
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )

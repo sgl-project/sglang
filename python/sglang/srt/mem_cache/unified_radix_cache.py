@@ -819,6 +819,20 @@ class UnifiedRadixCache(BasePrefixCache):
         if is_insert and result is not None and result.last_device_node is not None:
             req.last_node = result.last_device_node
 
+        # Strict SWA: the request is done — drop its per-request device SWA
+        # ring values along the finished prefix so any later cross-request
+        # reuse restores the true window from host rather than trusting
+        # the recycled device ring. Per-node gates (SWA lock_ref==0, host copy
+        # committed) are enforced inside evict_device_on_owner_release; nodes
+        # still held by another active request (lock_ref>0) are left intact.
+        swa_comp = self.components.get(ComponentType.SWA)
+        if swa_comp is not None:
+            node = self.tree_core.node_by_id(req.last_node)
+            root_node = self.tree_core.root_node
+            while node is not None and node is not root_node:
+                swa_comp.evict_device_on_owner_release(node)
+                node = node.parent
+
         # cleanup
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(
@@ -1228,6 +1242,37 @@ class UnifiedRadixCache(BasePrefixCache):
                 assert transfer.host_indices is not None
                 self.host_pool_group.get_pool(transfer.name).free(transfer.host_indices)
 
+    def _note_binding_full_coevict(self, full_tokens: int, leaves: int) -> None:
+        """Full-host copies freed by an auxiliary component's (strict SWA)
+        pressure: that pool is the binding constraint and may throttle the
+        Full hit rate."""
+        if full_tokens <= 0 or leaves <= 0:
+            return
+        self._binding_full_coevict_tokens = (
+            getattr(self, "_binding_full_coevict_tokens", 0) + full_tokens
+        )
+        self._binding_full_coevict_leaves = (
+            getattr(self, "_binding_full_coevict_leaves", 0) + leaves
+        )
+        # Warn once, after enough samples to recommend a stable ratio.
+        if getattr(self, "_binding_full_coevict_warned", False):
+            return
+        if self._binding_full_coevict_leaves < 16:
+            return
+        self._binding_full_coevict_warned = True
+        avg_prefix_tokens = (
+            self._binding_full_coevict_tokens / self._binding_full_coevict_leaves
+        )
+        logger.warning(
+            "[SWA-HiCache] SWA host pool is the binding constraint: strict "
+            "co-eviction dropped Full-host copies to free SWA space, lowering "
+            "Full hit rate. Raise --hicache-swa-offload-page-stride to shrink "
+            "the SWA host footprint (coarser reuse granularity), or run "
+            "best-effort (SGLANG_UNIFIED_KV_BIT_EXACT_HICACHE=0) for "
+            "short-prefix workloads. Observed avg cached-prefix ~%.0f tokens.",
+            avg_prefix_tokens,
+        )
+
     # ---- HiCache: Backup / LoadBack ----
 
     def _execute_and_commit_kv_backup(
@@ -1280,7 +1325,14 @@ class UnifiedRadixCache(BasePrefixCache):
             needed = kv_tokens - host_avail
             if self.evict_host(needed) < needed:
                 return None
-        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        # Strict SWA rides carry no device source (the host page was filled by
+        # the capture kernel directly); they must not reach the D->H writer.
+        aux_xfers = [
+            x
+            for xfers in comp_xfers.values()
+            for x in xfers
+            if x.device_indices is not None
+        ]
         aux_xfers.extend(sidecar_xfers)
         return self.cache_controller.write(
             device_value, node_id=node_id, extra_pools=aux_xfers or None
@@ -1388,6 +1440,23 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> bool:
         # Build the KV + per-component aux transfers.
         kv_xfer, comp_xfers = self.tree_core.build_load_back_spec(node_id, req=req)
+        # unified_kv positional SWA: the device ring slot depends on req_pool_idx,
+        # which prepare_for_extend assigns after this point, so the SWA windows
+        # cannot be transferred here. Stash them on the Req instead; the scheduler
+        # calls restore_swa_windows once the index is known. Done cache-side
+        # because component hooks take primitives, not Req.
+        swa_comp = self.components.get(ComponentType.SWA)
+        if (
+            swa_comp is not None
+            and getattr(swa_comp, "_unified_positional_swa", False)
+            and req is not None
+            and ComponentType.SWA in comp_xfers
+        ):
+            windows = swa_comp.take_positional_restore_windows(
+                comp_xfers.pop(ComponentType.SWA)
+            )
+            if windows:
+                req._swa_restore_windows = windows
         kv_tokens = len(kv_xfer.host_indices)
         sidecar_xfers = self._build_sidecar_transfers(
             CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
@@ -2483,6 +2552,22 @@ class UnifiedRadixCache(BasePrefixCache):
             finish_count -= 1
 
     # ---- HiCache: Scheduler Entry Points ----
+
+    def restore_swa_windows(self, reqs, req_pool_indices_cpu):
+        """Deferred positional SWA restore (unified_kv), driven from
+        prepare_for_extend once req_pool_idx is assigned. For each req that
+        stashed a reuse window at load_back, copy the host SWA window into its
+        per-request unified_kv ring block before the first forward reads it."""
+        swa_comp = self.components.get(ComponentType.SWA)
+        if swa_comp is None or not getattr(swa_comp, "_unified_positional_swa", False):
+            return
+        if self.cache_controller is None:
+            return
+        io_backend = self.cache_controller.io_backend
+        idx = req_pool_indices_cpu.tolist()
+        for i, req in enumerate(reqs):
+            if getattr(req, "_swa_restore_windows", None):
+                swa_comp.restore_pending_swa_windows(req, int(idx[i]), io_backend)
 
     def init_load_back(
         self,
