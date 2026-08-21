@@ -36,6 +36,7 @@ from sglang.srt.models.deepseek_v4 import (
     DeepseekV4ForCausalLM,
     MqaAttentionBase,
     _dequant_fp8_wo_a_streaming,
+    _dsv4_mqa_padded_num_heads,
     hc_head_torch,
     make_hc_head_params,
 )
@@ -57,8 +58,6 @@ from sglang.srt.utils import add_prefix, is_blackwell_supported
 from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
 logger = logging.getLogger(__name__)
-
-_PAD_NUM_HEADS = 64
 
 # DSpark confidence is a per-token score that must stay in [0, 1].
 _CONFIDENCE = Invariant(
@@ -207,11 +206,12 @@ class DSparkAttention(MqaAttentionBase):
             and hidden_states.shape[0] <= self._multi_stream_bs_limit
         )
 
+        pad_num_heads = _dsv4_mqa_padded_num_heads(self.n_local_heads, self.n_heads)
         q_padded: Optional[torch.Tensor] = None
         q_out: Optional[torch.Tensor] = None
-        if self.n_local_heads < _PAD_NUM_HEADS:
+        if self.n_local_heads < pad_num_heads:
             q_padded = hidden_states.new_empty(
-                hidden_states.shape[0], _PAD_NUM_HEADS, self.head_dim
+                hidden_states.shape[0], pad_num_heads, self.head_dim
             )
             q_out = q_padded[:, : self.n_local_heads, :]
 
