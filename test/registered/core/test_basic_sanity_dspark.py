@@ -94,6 +94,49 @@ class TestBasicSanityDSpark(
         if cls.process is not None:
             kill_process_tree(cls.process.pid)
 
+    def test_sampling_mask(self):
+        import requests
+
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": ["The capital of France is"] * 2,
+                "sampling_params": [
+                    {
+                        "temperature": 0.0,
+                        "top_k": 1,
+                        "max_new_tokens": 7,
+                        "ignore_eos": True,
+                    },
+                    {
+                        "temperature": 1.0,
+                        "top_k": 10,
+                        "top_p": 0.95,
+                        "max_new_tokens": 7,
+                        "ignore_eos": True,
+                    },
+                ],
+                "return_sampling_mask": True,
+            },
+            timeout=60,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        outputs = response.json()
+        self.assertEqual(len(outputs), 2)
+        for request_idx, output in enumerate(outputs):
+            output_ids = output["output_ids"]
+            meta_info = output["meta_info"]
+            masks = meta_info["output_token_sampling_mask"]
+            logprobs = meta_info["output_token_sampling_logprobs"]
+            self.assertEqual(len(output_ids), 7)
+            self.assertEqual(len(masks), len(output_ids))
+            self.assertEqual(len(logprobs), len(output_ids))
+            for output_id, mask, logprob in zip(output_ids, masks, logprobs):
+                self.assertIn(output_id, mask)
+                if request_idx == 0:
+                    self.assertEqual(mask, [output_id])
+                    self.assertEqual(logprob, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
