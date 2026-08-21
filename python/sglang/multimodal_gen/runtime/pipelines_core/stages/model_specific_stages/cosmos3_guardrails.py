@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import os
 import shutil
 from functools import lru_cache
 from pathlib import Path
@@ -69,11 +70,20 @@ def _mirror_symlinked_nltk_data() -> None:
             if str(mirror) in nltk.data.path:
                 continue
             if not mirror.is_dir():
-                staging = mirror.with_name(mirror.name + ".tmp")
+                # Every GPU worker process runs this at pipeline construction on
+                # a shared filesystem, so stage under a per-process name and
+                # publish with an atomic rename; whichever process publishes
+                # first wins and the others adopt its mirror.
+                staging = mirror.with_name(f"{mirror.name}.{os.getpid()}.tmp")
                 shutil.rmtree(staging, ignore_errors=True)
                 # symlinks=False dereferences: the copy holds real file contents.
                 shutil.copytree(root, staging, symlinks=False)
-                staging.rename(mirror)
+                try:
+                    staging.rename(mirror)
+                except OSError:
+                    shutil.rmtree(staging, ignore_errors=True)
+                    if not mirror.is_dir():
+                        raise
             nltk.data.path.insert(nltk.data.path.index(entry), str(mirror))
             logger.info(
                 "Mirrored symlinked nltk_data %s -> %s (hardened-NLTK compatibility)",
