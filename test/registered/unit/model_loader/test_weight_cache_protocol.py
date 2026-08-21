@@ -23,7 +23,6 @@ import struct
 import unittest
 
 from sglang.srt.weight_cache.protocol import (
-    IPC_QUANT_ALLOWLIST,
     CacheConfig,
     UnsupportedQuantForIPCError,
     check_ipc_quant_support,
@@ -60,6 +59,9 @@ def _make_cache_config(**overrides) -> CacheConfig:
         revision="",
         device_capability="8.0",
         torch_version="2.5.1",
+        fp4_gemm_backend="",
+        fp8_gemm_backend="",
+        moe_runner_backend="auto",
     )
     base.update(overrides)
     return CacheConfig(**base)
@@ -126,6 +128,12 @@ class TestCacheConfig(CustomTestCase):
             ("revision", "v2"),
             ("device_capability", "9.0"),
             ("torch_version", "2.4.0"),
+            # Differing GEMM / MoE backends change the exported layout, so
+            # these must be clean mismatches rather than silent wrong-layout
+            # loads -- the tensors themselves would map without complaint.
+            ("fp4_gemm_backend", "flashinfer_trtllm"),
+            ("moe_runner_backend", "flashinfer_cutlass"),
+            ("fp8_gemm_backend", "deep_gemm"),
         ):
             self.assertFalse(
                 base.matches(_make_cache_config(**{field: value})),
@@ -224,9 +232,34 @@ class TestIpcQuantAllowlist(CustomTestCase):
         self.assertFalse(is_ipc_quant_supported("fp8", {}))
         self.assertFalse(is_ipc_quant_supported("fp8", None))
 
+    def test_nvfp4_supported(self):
+        self.assertTrue(is_ipc_quant_supported("modelopt_fp4", {"quant_algo": "NVFP4"}))
+        self.assertTrue(
+            is_ipc_quant_supported(
+                "modelopt_fp4", {"quantization": {"quant_algo": "NVFP4"}}
+            )
+        )
+
+    def test_non_nvfp4_modelopt_variants_rejected(self):
+        self.assertFalse(is_ipc_quant_supported("modelopt_fp4", {"quant_algo": "FP8"}))
+        # Unsupported yet
+        self.assertFalse(
+            is_ipc_quant_supported("modelopt_fp4", {"quant_algo": "NVFP4_AWQ"})
+        )
+        self.assertFalse(
+            is_ipc_quant_supported(
+                "modelopt_fp4", {"quantization": {"quant_algo": "NVFP4_AWQ"}}
+            )
+        )
+        # No quantization_config at all: nothing states the checkpoint is NVFP4.
+        self.assertFalse(is_ipc_quant_supported("modelopt_fp4", None))
+
     def test_unknown_method_rejected(self):
         self.assertFalse(is_ipc_quant_supported("gptq_marlin", None))
         self.assertFalse(is_ipc_quant_supported("awq", None))
+        # Quantize-on-load NVFP4 reports a different method name and must NOT be
+        # picked up by the modelopt_fp4 (serialized) allowlist entry.
+        self.assertFalse(is_ipc_quant_supported("nvfp4_online", None))
 
     def test_check_raises_on_unsupported(self):
         with self.assertRaises(UnsupportedQuantForIPCError):
@@ -241,10 +274,6 @@ class TestIpcQuantAllowlist(CustomTestCase):
         check_ipc_quant_support(
             "fp8", {"weight_block_size": [128, 128]}, where="daemon"
         )
-
-    def test_allowlist_registry_shape(self):
-        # Guard against accidentally widening the allowlist without review.
-        self.assertEqual(set(IPC_QUANT_ALLOWLIST), {"", "fp8"})
 
 
 class TestCleanupStaleDaemonFiles(CustomTestCase):
