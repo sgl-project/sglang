@@ -1023,7 +1023,7 @@ class UnifiedRadixCache(BasePrefixCache):
             new_indices[req.kv.cache_protected_len :],
         )
 
-        self._dec_req_lock(req)
+        self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
         # Opt-in: leave the matched-prefix mamba evictable during decode (it is
         # already COW'd to the request's own slot, never read from this node again).
         # Safe only because any future COW source is the COWing request's own
