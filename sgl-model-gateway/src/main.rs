@@ -336,21 +336,33 @@ struct CliArgs {
     )]
     tcp_keepalive_secs: u64,
 
-    // ==================== Rate Limiting ====================
-    /// Maximum concurrent requests (-1 to disable)
-    #[arg(long, default_value_t = -1, help_heading = "Rate Limiting")]
+    // ==================== Request Admission and Local QPS ====================
+    /// Hard in-flight request lifecycle limit per Router Pod (<= 0 disables)
+    #[arg(
+        long,
+        default_value_t = -1,
+        help_heading = "Request Admission and Local QPS"
+    )]
     max_concurrent_requests: i32,
 
-    /// Queue size for pending requests when limit reached
-    #[arg(long, default_value_t = 100, help_heading = "Rate Limiting")]
+    /// Total outstanding waiter cap when the hard in-flight limit is reached
+    #[arg(
+        long,
+        default_value_t = 100,
+        help_heading = "Request Admission and Local QPS"
+    )]
     queue_size: usize,
 
-    /// Maximum time in seconds a request can wait in queue
-    #[arg(long, default_value_t = 60, help_heading = "Rate Limiting")]
+    /// Per-request admission queue deadline in seconds
+    #[arg(
+        long,
+        default_value_t = 60,
+        help_heading = "Request Admission and Local QPS"
+    )]
     queue_timeout_secs: u64,
 
-    /// Token bucket refill rate (tokens per second)
-    #[arg(long, help_heading = "Rate Limiting")]
+    /// Optional independent local QPS; unset/0 disables, positive R sets capacity/refill to R
+    #[arg(long, help_heading = "Request Admission and Local QPS")]
     rate_limit_tokens_per_second: Option<i32>,
 
     // ==================== Retry Configuration ====================

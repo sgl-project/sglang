@@ -6,12 +6,12 @@ use data_connector::{
 };
 use reqwest::Client;
 use smg::{
-    app_context::AppContext,
+    app_context::{request_limiters_from_config, AppContext},
     config::RouterConfig,
     core::{
         BasicWorkerBuilder, LoadMonitor, ModelCard, RuntimeType, Worker, WorkerRegistry, WorkerType,
     },
-    middleware::{AuthConfig, TokenBucket},
+    middleware::AuthConfig,
     policies::PolicyRegistry,
     routers::RouterTrait,
     server::{build_app, AppState},
@@ -26,20 +26,7 @@ pub fn create_test_app(
     client: Client,
     router_config: &RouterConfig,
 ) -> Router {
-    // Initialize rate limiter
-    let rate_limiter = match router_config.max_concurrent_requests {
-        n if n <= 0 => None,
-        n => {
-            let rate_limit_tokens = router_config
-                .rate_limit_tokens_per_second
-                .filter(|&t| t > 0)
-                .unwrap_or(n);
-            Some(Arc::new(TokenBucket::new(
-                n as usize,
-                rate_limit_tokens as usize,
-            )))
-        }
-    };
+    let request_limiters = request_limiters_from_config(router_config);
 
     // Initialize registries
     let worker_registry = Arc::new(WorkerRegistry::new());
@@ -67,7 +54,8 @@ pub fn create_test_app(
         AppContext::builder()
             .router_config(router_config.clone())
             .client(client)
-            .rate_limiter(rate_limiter)
+            .admission_limiter(request_limiters.admission_limiter)
+            .rate_limiter(request_limiters.rate_limiter)
             .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
             .reasoning_parser_factory(None) // reasoning_parser_factory
             .tool_parser_factory(None) // tool_parser_factory
@@ -87,7 +75,6 @@ pub fn create_test_app(
     let app_state = Arc::new(AppState {
         router,
         context: app_context,
-        concurrency_queue_tx: None,
         router_manager: None,
         mesh_handler: None,
         mesh_sync_manager: None,
@@ -129,7 +116,6 @@ pub fn create_test_app_with_context(
     let app_state = Arc::new(AppState {
         router,
         context: app_context.clone(),
-        concurrency_queue_tx: None,
         router_manager: None,
         mesh_handler: None,
         mesh_sync_manager: None,
@@ -167,8 +153,14 @@ pub fn create_test_app_with_context(
 /// Create a minimal test AppContext for unit tests
 #[allow(dead_code)]
 pub async fn create_test_app_context() -> Arc<AppContext> {
-    let router_config = RouterConfig::default();
+    create_test_app_context_with_config(RouterConfig::default()).await
+}
+
+/// Create a minimal test AppContext with an explicit router configuration.
+#[allow(dead_code)]
+pub async fn create_test_app_context_with_config(router_config: RouterConfig) -> Arc<AppContext> {
     let client = Client::new();
+    let request_limiters = request_limiters_from_config(&router_config);
 
     // Initialize empty OnceLocks
     let worker_job_queue = Arc::new(OnceLock::new());
@@ -201,7 +193,8 @@ pub async fn create_test_app_context() -> Arc<AppContext> {
         AppContext::builder()
             .router_config(router_config)
             .client(client)
-            .rate_limiter(None)
+            .admission_limiter(request_limiters.admission_limiter)
+            .rate_limiter(request_limiters.rate_limiter)
             .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
             .reasoning_parser_factory(None)
             .tool_parser_factory(None)

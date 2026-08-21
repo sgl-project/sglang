@@ -19,7 +19,7 @@ use data_connector::{
     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
 };
 use smg::{
-    app_context::AppContext,
+    app_context::{request_limiters_from_config, AppContext},
     config::RouterConfig,
     core::{LoadMonitor, WorkerRegistry},
     policies::PolicyRegistry,
@@ -42,6 +42,7 @@ use uuid::Uuid;
 /// Create a test AppContext with WASM manager initialized
 async fn create_test_context_with_wasm() -> Arc<AppContext> {
     let config = RouterConfig::default();
+    let request_limiters = request_limiters_from_config(&config);
 
     // Initialize WASM manager first
     let wasm_manager = Arc::new(
@@ -78,7 +79,8 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
         AppContext::builder()
             .router_config(config.clone())
             .client(client)
-            .rate_limiter(None)
+            .admission_limiter(request_limiters.admission_limiter)
+            .rate_limiter(request_limiters.rate_limiter)
             .tokenizer_registry(tokenizer_registry)
             .reasoning_parser_factory(None)
             .tool_parser_factory(None)
@@ -177,7 +179,6 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
     let app_state = Arc::new(AppState {
         router,
         context: app_context.clone(),
-        concurrency_queue_tx: None,
         router_manager: None,
         mesh_handler: None,
         mesh_sync_manager: None,

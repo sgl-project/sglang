@@ -207,10 +207,10 @@ class Router:
         bootstrap_port_annotation: Kubernetes annotation name for bootstrap port (PD mode).
             Default: 'sglang.ai/bootstrap-port'
         request_timeout_secs: Request timeout in seconds. Default: 600
-        max_concurrent_requests: Maximum number of concurrent requests allowed for rate limiting. Default: 256
-        queue_size: Queue size for pending requests when max concurrent limit reached (0 = no queue, return 429 immediately). Default: 100
-        queue_timeout_secs: Maximum time (in seconds) a request can wait in queue before timing out. Default: 60
-        rate_limit_tokens_per_second: Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests. Default: None
+        max_concurrent_requests: Hard in-flight request lifecycle limit per Router Pod. Values <= 0 disable admission control. Default: -1
+        queue_size: Total outstanding waiter cap when the hard in-flight limit is reached (0 = no queue, return 429 immediately). Default: 100
+        queue_timeout_secs: Per-request admission queue deadline in seconds. Default: 60
+        rate_limit_tokens_per_second: Optional independent local QPS. Unset/0 disables it; positive R sets token bucket capacity and refill rate to R. Default: None
         cors_allowed_origins: List of allowed origins for CORS. Empty list allows all origins. Default: []
         health_failure_threshold: Number of consecutive health check failures before marking worker unhealthy. Default: 3
         health_success_threshold: Number of consecutive health check successes before marking worker healthy. Default: 2
