@@ -166,6 +166,7 @@ def get_attn_backend(
         )
 
     selected_backend = selected_attention_backend
+    selected_from_global_cli = False
     selection_is_explicit = selected_backend is not None
     if selected_backend is None:
         selected_backend = get_global_forced_attn_backend()
@@ -188,6 +189,7 @@ def get_attn_backend(
             selection_is_explicit = isinstance(
                 server_args, ServerArgs
             ) and server_args.is_arg_explicitly_set("attention_backend")
+            selected_from_global_cli = selection_is_explicit
 
     if selected_backend is None:
         selected_backend = default_attention_backend
@@ -195,6 +197,11 @@ def get_attn_backend(
     allowed_fallback_reason = None
     if selected_backend is None:
         allowed_fallback_reason = "platform default fallback"
+    elif selected_from_global_cli and default_attention_backend is not None:
+        # A global CLI backend applies to the main diffusion component, but may
+        # not be valid for auxiliary components such as a VAE.  Those
+        # components can opt into a safe fallback by declaring their default.
+        allowed_fallback_reason = "component default fallback"
     elif is_cross_attention and selected_backend.is_sparse:
         allowed_fallback_reason = "dense cross-attention fallback"
     elif not selection_is_explicit:
@@ -206,7 +213,11 @@ def get_attn_backend(
 
     candidate_backends = [selected_backend]
     if allowed_fallback_reason is not None:
-        for candidate in (None, *be_tuple):
+        if selected_from_global_cli and default_attention_backend is not None:
+            fallback_candidates = (default_attention_backend, None, *be_tuple)
+        else:
+            fallback_candidates = (None, *be_tuple)
+        for candidate in fallback_candidates:
             if candidate not in candidate_backends:
                 candidate_backends.append(candidate)
 

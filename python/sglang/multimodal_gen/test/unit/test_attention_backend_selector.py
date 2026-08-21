@@ -89,6 +89,7 @@ class TestAttentionBackendFallback(unittest.TestCase):
         is_cross_attention: bool,
         supported: set[AttentionBackendEnum],
         attention_requirements: AttentionRequirements | None = None,
+        default_attention_backend: AttentionBackendEnum | None = None,
         server_args: object | None = None,
     ):
         if server_args is None:
@@ -111,6 +112,7 @@ class TestAttentionBackendFallback(unittest.TestCase):
                 torch.bfloat16,
                 supported_attention_backends=supported,
                 attention_requirements=attention_requirements,
+                default_attention_backend=default_attention_backend,
                 is_cross_attention=is_cross_attention,
             )
 
@@ -160,6 +162,20 @@ class TestAttentionBackendFallback(unittest.TestCase):
                 is_cross_attention=False,
                 supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
             )
+
+    def test_explicit_global_backend_uses_component_default(self):
+        backend = self._resolve(
+            AttentionBackendEnum.AITER,
+            explicit=True,
+            is_cross_attention=False,
+            supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+            default_attention_backend=AttentionBackendEnum.TORCH_SDPA,
+        )
+
+        self.assertIs(backend, _FakeSDPABackend)
+        self.assertEqual(
+            _FakePlatform.selected_backend, AttentionBackendEnum.TORCH_SDPA
+        )
 
     def test_sparse_backend_falls_back_for_cross_attention(self):
         backend = self._resolve(
