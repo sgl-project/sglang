@@ -619,7 +619,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         _assemble_condition_rows(ctx)
 
         emb = ctx.embeddings["positive"]
-        subblock_enabled = server_args.attention_backend == "subblock_sparse_attn"
+        subblock_enabled = server_args.pipeline_config.uses_subblock_attention(
+            server_args
+        )
         packed = _build_packed_layout(
             ctx,
             emb,

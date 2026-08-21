@@ -24,7 +24,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
-from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    get_attn_backend,
+    get_global_forced_attn_backend,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     LAYERWISE_OFFLOAD,
 )
@@ -94,6 +97,32 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     @staticmethod
     def _server_arg_value(value):
         return getattr(value, "value", value)
+
+    def resolve_transformer_attention_backend(
+        self, server_args
+    ) -> AttentionBackendEnum | None:
+        """Resolve the H3 DiT backend using the selector's precedence."""
+        selected_backend = get_global_forced_attn_backend()
+        if selected_backend is None:
+            selected_backend, _ = server_args.resolve_component_attention_backend(
+                "transformer"
+            )
+        if selected_backend is not None:
+            return selected_backend
+        attention_backend = server_args.attention_backend
+        if attention_backend is None or isinstance(
+            attention_backend, AttentionBackendEnum
+        ):
+            return attention_backend
+        attention_backend = self._server_arg_value(attention_backend)
+        return AttentionBackendEnum[str(attention_backend).strip().upper()]
+
+    def uses_subblock_attention(self, server_args) -> bool:
+        """Return whether H3 must build SubBlock-only request metadata."""
+        return (
+            self.resolve_transformer_attention_backend(server_args)
+            is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+        )
 
     def validate_quality_deployment(self, server_args) -> None:
         """Fail closed unless the resident server matches the deployment
@@ -212,20 +241,9 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                     "MiniMax-H3 MPS execution does not support torch.compile; "
                     "pass --enable-torch-compile false"
                 )
-        component_backends = server_args.component_attention_backends or {}
-        if "transformer" in component_backends:
-            raise ValueError(
-                "MiniMax-H3 resolves DiT attention lazily and does not support "
-                "a transformer component override; use --attention-backend instead"
-            )
-        attention_backend = self._server_arg_value(server_args.attention_backend)
-        if attention_backend is None:
+        selected_backend = self.resolve_transformer_attention_backend(server_args)
+        if selected_backend is None:
             return
-        selected_backend = (
-            attention_backend
-            if isinstance(attention_backend, AttentionBackendEnum)
-            else AttentionBackendEnum[str(attention_backend).strip().upper()]
-        )
         get_attn_backend(
             self.dit_config.arch_config.attention_head_dim,
             torch.bfloat16,

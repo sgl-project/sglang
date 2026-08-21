@@ -48,7 +48,11 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
-from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    get_attn_backend,
+    get_component_forced_attn_backend,
+    get_global_forced_attn_backend,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -1789,6 +1793,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             if self._adaln_precomputed
             else None
         )
+        # Component overrides disappear when the loader context exits. Preserve
+        # only that selection; process-wide overrides are resolved at first use.
+        self._component_attention_backend_override = get_component_forced_attn_backend()
         self._resolved_attention_backend: AttentionBackendEnum | None = None
         self._mark_missing_params_required()
 
@@ -1811,9 +1818,14 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     def _resolve_attention_backend_once(self) -> None:
         if self._resolved_attention_backend is not None:
             return
+        selected_backend = (
+            get_global_forced_attn_backend()
+            or self._component_attention_backend_override
+        )
         backend = get_attn_backend(
             self.arch.attention_head_dim,
             _BF16_DTYPE,
+            selected_attention_backend=selected_backend,
             attention_requirements=AttentionRequirements(packed_varlen=True),
         )
         for module in self.modules():

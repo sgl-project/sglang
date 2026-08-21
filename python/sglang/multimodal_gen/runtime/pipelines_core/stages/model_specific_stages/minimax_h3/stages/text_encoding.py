@@ -79,7 +79,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                     batch,
                     plan,
                     include_video_token_mask=(
-                        server_args.attention_backend == "subblock_sparse_attn"
+                        server_args.pipeline_config.uses_subblock_attention(server_args)
                     ),
                 )
                 self._publish_native_text_conditioning(batch)
