@@ -11,7 +11,12 @@ from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
-from sglang.srt.configs.model_config import AttentionArch, is_kimi_k3, is_qwen3_5
+from sglang.srt.configs.model_config import (
+    AttentionArch,
+    is_dspark_draft,
+    is_kimi_k3,
+    is_qwen3_5,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -81,6 +86,10 @@ def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv
         return False
     if use_mla:
         return is_kimi_k3(model_config.hf_config)
+    if is_dspark_draft(model_config.hf_config):
+        # Added for the K3 DSpark draft model, which is qwen3 type attention,
+        # and using bidirectional (non-causal) mode.
+        return use_verify_splitkv
     return (
         use_verify_splitkv
         and is_qwen3_5(model_config.hf_config)
