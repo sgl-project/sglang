@@ -151,6 +151,12 @@ class HiSparseCoordinator:
                 self.token_to_kv_pool_allocator.hisparse_kvcache,
                 HiSparseUnifiedC4DevicePool,
             )
+        # Byte layout of the host/device C4 buffers, as opposed to the pool
+        # structure that is_dsv4_hisparse selects: only the separate-KV path is
+        # page-padded, so it alone may take the dsv4 swap/copy kernels.
+        self.is_dsv4_paged_layout = (
+            self.is_dsv4_hisparse and not self.is_unified_hisparse
+        )
         if self.is_dsv4_hisparse:
             self.mem_pool_device = self.token_to_kv_pool_allocator.hisparse_kvcache
             page_size = self.mem_pool_device.page_size
@@ -976,7 +982,7 @@ class HiSparseCoordinator:
         num_reqs = req_pool_indices.size(0)
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
 
-        if self.is_dsv4_hisparse and not self.is_unified_hisparse:
+        if self.is_dsv4_paged_layout:
             # separate-KV: FP8 page-padded device + host C4 layout.
             swap_in_fn = load_cache_to_device_buffer_dsv4_mla
         else:
@@ -1026,7 +1032,7 @@ class HiSparseCoordinator:
             device_buffer=self.mem_pool_device.kv_buffer[skip_layer],
             item_size_bytes=self.item_size_bytes,
             num_blocks=self._prefetch_copy_blocks,
-            is_dsv4_layout=self.is_dsv4_hisparse,
+            is_dsv4_layout=self.is_dsv4_paged_layout,
             skip_io=self.skip_io,
         )
 
