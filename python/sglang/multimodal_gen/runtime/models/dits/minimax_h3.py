@@ -661,7 +661,7 @@ class MiniMaxH3Attention(nn.Module):
         weight = self.qkv_proj.weight
         # h3 checkpoints interleave each attention head's Q, K, and V rows
         # this parameter needs reordering before the native QKV projection
-        weight.mps_zero_copy_unsafe = True
+        weight.checkpoint_mapping_unsafe = True
         base_loader = weight.weight_loader
 
         def _reorder_checkpoint_weight(loaded_weight: torch.Tensor) -> torch.Tensor:
