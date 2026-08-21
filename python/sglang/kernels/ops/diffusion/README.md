@@ -63,6 +63,10 @@ looks harmless and is not: on ERNIE-Image it moved the 50-step trajectory to
 PSNR 18.83 dB at `quality=high`, which is what motivated the bit-exact
 rewrite.
 
+SANA-Video's quality-gated linear-attention site keeps BF16 inputs for the
+first GEMM while requesting FP32 accumulation/output, then runs the second
+GEMM in FP32. The default path still promotes Q/K/V before both GEMMs.
+
 ## Entry-point protocol
 
 Every public kernel is a **predicate + kernel** pair:
