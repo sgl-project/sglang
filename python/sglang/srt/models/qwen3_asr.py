@@ -21,6 +21,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.models.qwen3_omni_moe import (
     Qwen3OmniMoeAudioEncoder,
+    _pack_audio_features,
     pack_audio_features,
 )
 from sglang.srt.multimodal.modality import Modality
@@ -74,13 +75,20 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         has_mask = all(
             getattr(item, "feature_attention_mask", None) is not None for item in items
         )
+        if has_mask:
+            input_features, feature_lens = _pack_audio_features(
+                items,
+                device=device,
+                dtype=self.audio_tower.dtype,
+            )
+            audio_outputs = self.audio_tower(
+                input_features,
+                feature_lens=feature_lens,
+            )
+            return audio_outputs.last_hidden_state
         input_features, feature_lens, feature_lens_cpu = pack_audio_features(
             torch.cat([item.feature for item in items]),
-            (
-                torch.cat([item.feature_attention_mask for item in items], dim=0)
-                if has_mask
-                else None
-            ),
+            None,
             device,
             self.audio_tower.dtype,
         )
