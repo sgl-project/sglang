@@ -394,10 +394,12 @@ template <
     int32_t kPageBits,
     bool kUsePDL,
     bool kBf16Store = false,
-    bool kFp8TwoPool = false>
+    bool kFp8TwoPool = false,
+    bool kUniformFp8Store = false>
 FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormRopeStoreParams params) {
   using namespace device;
   using enum ForwardMode;
+  static_assert(!(kBf16Store && kUniformFp8Store));
 
   constexpr int64_t kHeadDim = 512;
   constexpr int64_t kRopeDim = 64;
@@ -409,10 +411,17 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   // [num_slots, head_dim] bf16 cache (page_size==1) at row out_loc
   // kFp8TwoPool: 512 B row holding the 448 fp8 nope + its UE8M0 scales, with rope
   // split off into a second [num_slots, kRopeDim] bf16 pool at the same row
+  // kUniformFp8Store: write the whole head_dim (rope tail included) as plain
+  // e4m3 at per-tensor scale 1.0 into the uniform 512-byte-per-token pool.
   static_assert(!(kBf16Store && kFp8TwoPool));
-  constexpr int64_t kRowBytes = kBf16Store ? (kHeadDim * 2ll) : (kFp8TwoPool ? kFp8TwoPoolRowBytes : 576ll);
-  constexpr int64_t kPageBytes =
-      (kBf16Store || kFp8TwoPool) ? (kRowBytes << kPageBits) : host::div_ceil(584ll << kPageBits, 576) * 576;
+  static_assert(!(kFp8TwoPool && kUniformFp8Store));
+  constexpr int64_t kRowBytes = kBf16Store        ? (kHeadDim * 2ll)
+                                : kUniformFp8Store ? kHeadDim
+                                : kFp8TwoPool      ? kFp8TwoPoolRowBytes
+                                                   : 576ll;
+  constexpr int64_t kPageBytes = (kBf16Store || kFp8TwoPool || kUniformFp8Store)
+                                     ? (kRowBytes << kPageBits)
+                                     : host::div_ceil(584ll << kPageBits, 576) * 576;
   static_assert(kHeadDim == kBlockSize * kVecSize);
   static_assert(kRopeDim == kWarpThreads * kVecSize);
   static_assert(kHeadDim - kRopeDim == kRopeWarp * kWarpThreads * kVecSize);
@@ -487,8 +496,9 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
 
   PDLTriggerSecondary<kUsePDL>();
 
-  // part 2: rope on the rope warp (BF16 store), or per-warp FP8 quant + store.
-  if constexpr (kBf16Store) {
+  // part 2: rope on the rope warp (BF16/uniform store), or per-warp FP8
+  // quant + store (packed layout).
+  if constexpr (kBf16Store || kUniformFp8Store) {
     Float2 d = data;
     if (warp_id == kRopeWarp) {
       const auto x_real = data[0];
@@ -498,7 +508,15 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
       d[0] = x_real * freq_real - x_imag * freq_imag;
       d[1] = x_real * freq_imag + x_imag * freq_real;
     }
-    reinterpret_cast<bf16x2_t*>(value_ptr)[tx] = cast<bf16x2_t>(fp32x2_t{d[0], d[1]});
+    if constexpr (kUniformFp8Store) {
+      // BF16 round-trip to match the unfused path (Triton norm+rope emits
+      // bf16, then the pool store casts bf16 -> e4m3 at scale 1.0).
+      const auto x = cast<float>(cast<bf16_t>(d[0]));
+      const auto y = cast<float>(cast<bf16_t>(d[1]));
+      reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx] = pack_fp8(x, y);
+    } else {
+      reinterpret_cast<bf16x2_t*>(value_ptr)[tx] = cast<bf16x2_t>(fp32x2_t{d[0], d[1]});
+    }
   } else if (warp_id == kRopeWarp) {
     // Each rope-warp lane owns exactly one (real, imag) pair within the rope
     // tail. Apply rotation, downcast to BF16, write to the slot's rope region.
@@ -548,15 +566,21 @@ template <
     uint32_t kPageSize,
     bool kUsePDL,
     int32_t kPreshuffleSize = 0,
-    bool kBf16Store = false>
+    bool kBf16Store = false,
+    bool kUniformFp8Store = false>
 struct FusedNormRopeKernel {
   static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
   static constexpr bool kIsIndexer = (kHeadDim == 128);
   static_assert(!(kIsIndexer && kBf16Store), "bf16 store only for flashmla head_dim=512");
+  static_assert(!(kIsIndexer && kUniformFp8Store), "uniform fp8 store only for flashmla head_dim=512");
+  static_assert(!(kBf16Store && kUniformFp8Store));
   static constexpr int64_t kIndexerBytes = 132 * kPageSize;
   static constexpr int64_t kFlashMLABytes = host::div_ceil(584 * kPageSize, 576) * 576;
   static constexpr int64_t kBf16Bytes = kHeadDim * 2 * kPageSize;  // plain bf16 cache
-  static constexpr int64_t kPageBytes = kBf16Store ? kBf16Bytes : (kIsIndexer ? kIndexerBytes : kFlashMLABytes);
+  static constexpr int64_t kUniformBytes = kHeadDim * kPageSize;  // uniform e4m3, 512 B/token
+  static constexpr int64_t kPageBytes = kBf16Store        ? kBf16Bytes
+                                        : kUniformFp8Store ? kUniformBytes
+                                                           : (kIsIndexer ? kIndexerBytes : kFlashMLABytes);
 
   /// TODO: Let's fix the config for now.
   static_assert(kRopeDim == 64 && (kHeadDim == 128 || kHeadDim == 512));
@@ -567,7 +591,7 @@ struct FusedNormRopeKernel {
     if constexpr (kIsIndexer) {
       return fused_norm_rope_indexer<DType, kMode, kLogPageSize, kUsePDL, kPreshuffleSize>;
     } else {
-      return fused_norm_rope_flashmla<DType, kMode, kLogPageSize, kUsePDL, kBf16Store>;
+      return fused_norm_rope_flashmla<DType, kMode, kLogPageSize, kUsePDL, kBf16Store, false, kUniformFp8Store>;
     }
   }
 
@@ -575,7 +599,8 @@ struct FusedNormRopeKernel {
   static constexpr auto select_fp8_2buff_kernel() {
     static_assert(!kIsIndexer, "fp8 two-pool store is only defined for the flashmla latent");
     static_assert(!kBf16Store, "fp8 two-pool store and bf16 store are separate layouts");
-    return fused_norm_rope_flashmla<DType, kMode, kLogPageSize, kUsePDL, false, true>;
+    static_assert(!kUniformFp8Store, "fp8 two-pool store and uniform fp8 store are separate layouts");
+    return fused_norm_rope_flashmla<DType, kMode, kLogPageSize, kUsePDL, false, true, false>;
   }
 
   template <ForwardMode kMode>
