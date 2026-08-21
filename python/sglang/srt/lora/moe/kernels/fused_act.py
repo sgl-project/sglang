@@ -29,7 +29,7 @@ from sglang.srt.lora.moe.kernels.activation_delta import (
 )
 from sglang.srt.lora.moe.route_view import RouteView
 
-MASKED_ACT_FAMILIES = ("b_activation",)
+B_ACT_FAMILIES = ("b_activation",)
 MASKED_ACT_TRITON = "triton"
 
 FUSED_B_ACT_DEFAULT_CONFIG: dict[str, int] = {
@@ -382,7 +382,7 @@ def _b_act_kernel(
         )
 
 
-def run_masked_fused_act(
+def fused_b_act_masked(
     family: str,
     *,
     activation: str,
@@ -498,7 +498,7 @@ def fused_b_act_contiguous(
     """Run the fused LoRA-B GEMM and the activation over the compact rows.
 
     The kernel, the grid and the per-pair arithmetic match
-    :func:`fused_act.run_masked_fused_act`. Only the shape check
+    :func:`fused_act.fused_b_act_masked`. Only the shape check
     differs, because the compact domain is one flat 2-D buffer. The kernel
     writes a zero into ``act_pairs`` once for each invalid pair.
 
@@ -506,8 +506,8 @@ def fused_b_act_contiguous(
     down GEMM still reads them, but it treats every row separately. No consumer
     reads the output of a padding row.
     """
-    if family not in MASKED_ACT_FAMILIES:
-        raise ValueError(f"family={family!r} is not one of {MASKED_ACT_FAMILIES}")
+    if family not in B_ACT_FAMILIES:
+        raise ValueError(f"family={family!r} is not one of {B_ACT_FAMILIES}")
     ActivationFn.parse(activation)
     pairs = routing.topk_ids.numel()
     if src2dst.dtype != torch.int32 or src2dst.numel() != pairs:

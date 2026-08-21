@@ -34,7 +34,7 @@ def apply_activation(x, ACTIVATION_TYPE: tl.constexpr):
 
 
 @triton.jit
-def _activation_delta_masked_kernel(
+def _act_delta_masked_kernel(
     gateup_ptr,  # [E_local * m_max, slices * inter] bf16
     delta_ptr,  # [num_tokens, top_k, slices * inter] [gate | up]
     act_out_ptr,  # [E_local * m_max, inter] bf16 (masked layout, flat)
@@ -144,7 +144,7 @@ def act_delta_masked(
     if activation_lora_input.shape != (*topk_ids.shape, inter):
         raise ValueError(f"activation_lora_input must be {(*topk_ids.shape, inter)}")
 
-    _activation_delta_masked_kernel[(num_pairs,)](
+    _act_delta_masked_kernel[(num_pairs,)](
         gateup_output.view(-1, num_slices * inter),
         gate_up_delta if gate_up_delta is not None else gateup_output,
         act_out.view(-1, inter),
@@ -215,7 +215,7 @@ def act_delta_contiguous(
         raise ValueError(f"activation_lora_input must be {(*topk_ids.shape, inter)}")
     if num_pairs == 0:
         return
-    _activation_delta_masked_kernel[(num_pairs,)](
+    _act_delta_masked_kernel[(num_pairs,)](
         gateup_output,
         gate_up_delta if gate_up_delta is not None else gateup_output,
         act_out,

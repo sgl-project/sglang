@@ -473,7 +473,7 @@ def test_contiguous_dispatch_metadata_contract(
     # entry: an expert id over each aligned segment, and -1 over the tail.
     # The test fills the buffer with garbage first to prove that.
     from sglang.srt.lora.moe.base_gemm_provider.contiguous_row_domain import (
-        contiguous_dispatch_fill,
+        dispatch_fill_contiguous,
     )
 
     dirty = {
@@ -493,7 +493,7 @@ def test_contiguous_dispatch_metadata_contract(
             (ws.m_pad_ceiling, _HIDDEN), dtype=torch.bfloat16, device=device
         ),
     }
-    contiguous_dispatch_fill(
+    dispatch_fill_contiguous(
         hidden_states, topk_ids, num_experts, top_k, alignment, **dirty
     )
     dirty_layout = dirty["grouped_layout_out"].cpu()
@@ -525,7 +525,7 @@ def test_fused_schedule_pack_matches_the_standalone_builder() -> None:
     after that are spare capacity, and nothing reads them.
     """
     from sglang.srt.lora.moe.base_gemm_provider.contiguous_row_domain import (
-        contiguous_dispatch_fill,
+        dispatch_fill_contiguous,
     )
     from sglang.srt.lora.moe.base_gemm_provider.cutedsl_masked.schedule_builder import (
         build_dual_stage_schedules_contiguous,
@@ -585,7 +585,7 @@ def test_fused_schedule_pack_matches_the_standalone_builder() -> None:
                 (m_pad_ceiling, _HIDDEN), dtype=torch.bfloat16, device=device
             ),
         }
-        contiguous_dispatch_fill(
+        dispatch_fill_contiguous(
             hidden_states,
             topk_ids,
             num_experts,

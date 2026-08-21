@@ -25,8 +25,8 @@ from sglang.srt.lora.moe.kernels.activation_delta import (
 )
 from sglang.srt.lora.moe.kernels.dispatch import (
     ContiguousSchedulePack,
-    contiguous_dispatch_fill,
     contiguous_m_pad_ceiling,
+    dispatch_fill_contiguous,
 )
 from sglang.srt.lora.moe.kernels.fused_act import (
     fused_b_act_contiguous,
@@ -163,7 +163,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
                 dtype=torch.bfloat16,
                 device=device,
             )
-        contiguous_dispatch_fill(
+        dispatch_fill_contiguous(
             hidden_states,
             topk_ids,
             num_experts,

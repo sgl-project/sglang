@@ -1,4 +1,4 @@
-"""fused_masked_preprocess must be a bf16 drop-in for moe_ep_deepgemm_preprocess;
+"""dispatch_fill_masked must be a bf16 drop-in for moe_ep_deepgemm_preprocess;
 slot order is nondeterministic in both, so checks are order-independent invariants."""
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from sglang.kernels.ops.moe.ep_moe_kernels import (  # noqa: E402
     moe_ep_deepgemm_preprocess,
 )
 from sglang.srt.lora.moe.kernels.dispatch import (  # noqa: E402
-    fused_masked_preprocess,
+    dispatch_fill_masked,
 )
 from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402
 
@@ -53,7 +53,7 @@ def _assert_matches_reference(
             output_dtype=torch.bfloat16,
         )
     )
-    masked, expected, src2dst, slab, scale = fused_masked_preprocess(
+    masked, expected, src2dst, slab, scale = dispatch_fill_masked(
         topk_ids,
         num_local_experts,
         hidden_states,
@@ -118,7 +118,7 @@ def test_sentinel_pairs_are_skipped() -> None:
     gateup_input_out = torch.empty(
         (num_experts, m_max, hidden), dtype=torch.bfloat16, device=device
     )
-    masked, _expected, src2dst, slab, _scale = fused_masked_preprocess(
+    masked, _expected, src2dst, slab, _scale = dispatch_fill_masked(
         topk_ids,
         num_experts,
         hidden_states,
@@ -145,7 +145,7 @@ def test_skewed_routing_fills_one_expert() -> None:
     hidden_states = _rand_hidden(num_tokens, hidden, seed=0xACE).to(device)
     _assert_matches_reference(topk_ids, hidden_states, num_experts, top_k)
 
-    masked, _expected, _src2dst, _slab, _scale = fused_masked_preprocess(
+    masked, _expected, _src2dst, _slab, _scale = dispatch_fill_masked(
         topk_ids, num_experts, hidden_states, top_k, None
     )
     counts = masked.cpu()
@@ -158,7 +158,7 @@ def test_empty_batch() -> None:
     num_experts, top_k, hidden = 4, 2, 64
     topk_ids = torch.empty((0, top_k), dtype=torch.int32, device=device)
     hidden_states = torch.empty((0, hidden), dtype=torch.bfloat16, device=device)
-    masked, expected, src2dst, slab, scale = fused_masked_preprocess(
+    masked, expected, src2dst, slab, scale = dispatch_fill_masked(
         topk_ids, num_experts, hidden_states, top_k, None
     )
     assert scale is None

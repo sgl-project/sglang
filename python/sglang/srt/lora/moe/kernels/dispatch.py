@@ -26,7 +26,7 @@ import triton.language as tl
 
 
 @triton.jit
-def fused_dispatch_fill_kernel(
+def _dispatch_fill_masked_kernel(
     input_ptr,  # [num_tokens, hidden] bf16 source rows
     gateup_input_ptr,  # [E_local, m_max, hidden] bf16 rows, viewed flat
     topk_ids_ptr,  # [num_tokens * topk]; < 0 = padding or EP-unrouted
@@ -53,7 +53,7 @@ def fused_dispatch_fill_kernel(
             tl.store(out + off + vec, tl.load(src + off + vec, mask=mask), mask=mask)
 
 
-def fused_masked_preprocess(
+def dispatch_fill_masked(
     topk_ids: torch.Tensor,
     num_local_experts: int,
     hidden_states: torch.Tensor,
@@ -137,7 +137,7 @@ def fused_masked_preprocess(
     # memset runs in stream order, and CUDA-graph capture accepts it.
     masked_m.zero_()
     if num_tokens > 0:
-        fused_dispatch_fill_kernel[(num_tokens, top_k)](
+        _dispatch_fill_masked_kernel[(num_tokens, top_k)](
             hidden_states,
             gateup_input,
             topk_ids.view(-1),
@@ -191,7 +191,7 @@ def contiguous_m_pad_ceiling(num_pairs: int, num_experts: int, alignment: int) -
 
 
 @triton.jit
-def _contig_count_slots_kernel(
+def _count_slots_contiguous_kernel(
     topk_ids_ptr,  # [num_pairs]; a value < 0 marks a pair with no expert
     slot_out_ptr,  # [num_pairs] int32 out: slot of the pair inside its expert
     seg_counts_ptr,  # [E_local] int32 count and cursor; the caller must zero it
@@ -211,7 +211,7 @@ def _contig_count_slots_kernel(
 
 
 @triton.jit
-def _contig_seg_layout_kernel(
+def _seg_layout_contiguous_kernel(
     seg_counts_ptr,  # [E_local] int32 per-expert routed-pair counts
     seg_offsets_ptr,  # [E_local + 1] int32 out: first row of each segment
     grouped_layout_ptr,  # [m_pad_ceiling] int32 out; the caller does not prefill it
@@ -313,7 +313,7 @@ def _contig_seg_layout_kernel(
 
 
 @triton.jit
-def _contig_fill_rows_kernel(
+def _fill_rows_contiguous_kernel(
     input_ptr,  # [num_tokens, hidden] bf16 source rows
     compact_ptr,  # [m_pad_ceiling, hidden] bf16, viewed flat
     topk_ids_ptr,  # [num_pairs]
@@ -358,14 +358,14 @@ def _contig_fill_rows_kernel(
 
 
 @triton.jit
-def _contig_finalize_src2dst_kernel(
+def _finalize_src2dst_contiguous_kernel(
     topk_ids_ptr,  # [num_pairs]; a value < 0 marks a pair with no expert
     src2dst_ptr,  # [num_pairs] int32: dense slots IN, compact rows OUT
     seg_offsets_ptr,  # [E_local + 1] int32 first row of each segment
     num_pairs,
     PAIRS_PER_PROGRAM: tl.constexpr,
 ):
-    # This stage needs its own launch. See the note on _contig_fill_rows_kernel.
+    # This stage needs its own launch. See the note on _fill_rows_contiguous_kernel.
     base = tl.program_id(0).to(tl.int64) * PAIRS_PER_PROGRAM
     for i in tl.static_range(PAIRS_PER_PROGRAM):
         pair = base + i
@@ -468,7 +468,7 @@ def _validate_schedule_pack(
         raise ValueError("schedule_pack tile counts must be one-element int32")
 
 
-def contiguous_dispatch_fill(
+def dispatch_fill_contiguous(
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,
     num_local_experts: int,
@@ -546,7 +546,7 @@ def contiguous_dispatch_fill(
     # prefill, because the seg-layout launch writes its -1 rows.
     seg_counts_out.zero_()
     if num_pairs > 0:
-        _contig_count_slots_kernel[
+        _count_slots_contiguous_kernel[
             (coarsened_pair_grid(num_pairs, pairs_per_program),)
         ](
             topk_ids.view(-1),
@@ -561,7 +561,7 @@ def contiguous_dispatch_fill(
     if schedule_pack is None:
         # The schedule arguments point at real tensors. The kernel reads and
         # writes none of them, because BUILD_SCHEDULES is a constexpr False.
-        _contig_seg_layout_kernel[(num_local_experts + 1,)](
+        _seg_layout_contiguous_kernel[(num_local_experts + 1,)](
             seg_counts_out,
             seg_offsets_out,
             grouped_layout_out,
@@ -583,7 +583,7 @@ def contiguous_dispatch_fill(
             OUTPUT_SHIFT=1,
         )
     else:
-        _contig_seg_layout_kernel[(num_local_experts + 1, 2)](
+        _seg_layout_contiguous_kernel[(num_local_experts + 1, 2)](
             seg_counts_out,
             seg_offsets_out,
             grouped_layout_out,
@@ -605,7 +605,7 @@ def contiguous_dispatch_fill(
             OUTPUT_SHIFT=schedule_pack.output_cluster_shift,
         )
     if num_pairs > 0:
-        _contig_finalize_src2dst_kernel[
+        _finalize_src2dst_contiguous_kernel[
             (coarsened_pair_grid(num_pairs, pairs_per_program),)
         ](
             topk_ids.view(-1),
@@ -614,7 +614,9 @@ def contiguous_dispatch_fill(
             num_pairs,
             PAIRS_PER_PROGRAM=pairs_per_program,
         )
-        _contig_fill_rows_kernel[(coarsened_pair_grid(num_pairs, pairs_per_program),)](
+        _fill_rows_contiguous_kernel[
+            (coarsened_pair_grid(num_pairs, pairs_per_program),)
+        ](
             hidden_states,
             hidden_compact_out,
             topk_ids.view(-1),

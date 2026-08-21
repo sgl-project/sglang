@@ -80,17 +80,17 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             act_delta_masked,
         )
         from sglang.srt.lora.moe.kernels.dispatch import (
-            fused_masked_preprocess,
+            dispatch_fill_masked,
         )
 
-        self._preprocess = fused_masked_preprocess
+        self._preprocess = dispatch_fill_masked
         self._act_kernel = act_delta_masked
 
         from sglang.srt.lora.moe.kernels.fused_act import (
-            run_masked_fused_act,
+            fused_b_act_masked,
         )
 
-        self._fused_act = run_masked_fused_act
+        self._fused_act = fused_b_act_masked
 
     def prepare(
         self,

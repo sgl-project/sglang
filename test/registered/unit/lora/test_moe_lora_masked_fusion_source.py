@@ -108,10 +108,10 @@ class TestMaskedFusionSource(unittest.TestCase):
         for source, kernel_name, launcher_name in (
             (
                 activation,
-                "_activation_delta_masked_kernel",
+                "_act_delta_masked_kernel",
                 "act_delta_masked",
             ),
-            (act, "_b_act_kernel", "run_masked_fused_act"),
+            (act, "_b_act_kernel", "fused_b_act_masked"),
         ):
             self.assertIn("gdc_wait", _function(source, kernel_name))
             self.assertIn('"launch_pdl": True', _function(source, launcher_name))
@@ -314,7 +314,7 @@ class TestMaskedFusionSource(unittest.TestCase):
             b_act.index("act_masked_ptr +"),
             b_act.index("if store_pair_act:"),
         )
-        launcher = _function(source, "run_masked_fused_act")
+        launcher = _function(source, "fused_b_act_masked")
         self.assertIn("store_pair_act=act_pairs is not None", launcher)
 
     def test_materialized_activation_keeps_the_two_axes_independent(self):
@@ -325,7 +325,7 @@ class TestMaskedFusionSource(unittest.TestCase):
         express a non-gated silu.
         """
         source = _source("activation_delta.py")
-        kernel = _function(source, "_activation_delta_masked_kernel")
+        kernel = _function(source, "_act_delta_masked_kernel")
         wrapper = _function(source, "act_delta_masked")
         self.assertIn("NUM_SLICES", kernel)
         self.assertIn("ACTIVATION_TYPE", kernel)
@@ -429,15 +429,15 @@ class TestMaskedFusionSource(unittest.TestCase):
         activation = types.ModuleType("sglang.srt.lora.moe.kernels.activation_delta")
         activation.act_delta_masked = lambda *_args, **_kwargs: None
         dispatch = types.ModuleType("sglang.srt.lora.moe.kernels.dispatch")
-        dispatch.fused_masked_preprocess = lambda *_args, **_kwargs: None
+        dispatch.dispatch_fill_masked = lambda *_args, **_kwargs: None
         finalize = types.ModuleType("sglang.srt.lora.moe.kernels.finalize")
         finalize.MASKED_FINALIZE_TRITON = "triton"
         finalize.invoke_shared_from_scratch_finalize = lambda **_kwargs: None
         finalize.invoke_shared_rank_reduce = lambda **_kwargs: None
         act = types.ModuleType("sglang.srt.lora.moe.kernels.fused_act")
-        act.MASKED_ACT_FAMILIES = ("b_activation",)
+        act.B_ACT_FAMILIES = ("b_activation",)
         act.MASKED_ACT_TRITON = "triton"
-        act.run_masked_fused_act = lambda *_args, **_kwargs: None
+        act.fused_b_act_masked = lambda *_args, **_kwargs: None
         into_base = types.ModuleType("sglang.srt.lora.moe.kernels.lora_b")
         into_base.invoke_down_b_into_base = lambda *_args, **_kwargs: None
 
@@ -472,7 +472,7 @@ class TestMaskedFusionSource(unittest.TestCase):
             )
 
         # One callable per fused stage, bound at construction.
-        self.assertIs(provider._fused_act, act.run_masked_fused_act)
+        self.assertIs(provider._fused_act, act.fused_b_act_masked)
 
         provider.contract = SimpleNamespace(lora_activation_dtype=torch.bfloat16)
         src2dst = torch.tensor([2, 0, -1, 3], dtype=torch.int32)
