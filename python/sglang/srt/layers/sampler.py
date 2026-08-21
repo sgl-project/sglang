@@ -272,8 +272,11 @@ class Sampler(nn.Module):
                     sampling_info.sampling_seed is None
                 ), "Sampling seed is not supported for flashinfer backend"
                 if sampling_info.need_min_p_sampling:
-                    probs = top_k_renorm_prob(probs, sampling_info.top_ks)
+                    # Each filter renormalizes its output, so apply top-p before
+                    # top-k to preserve the joint top-k/top-p support used by the
+                    # non-min-p FlashInfer and PyTorch paths.
                     probs = top_p_renorm_prob(probs, sampling_info.top_ps)
+                    probs = top_k_renorm_prob(probs, sampling_info.top_ks)
                     batch_next_token_ids = min_p_sampling_from_probs(
                         probs, sampling_info.min_ps
                     )
