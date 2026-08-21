@@ -29,9 +29,14 @@ class _FakeFlashInferComm:
     class AllReduceFusionPattern:
         kAllReduce = object()
         kARResidualRMSNorm = object()
+        kARResidualRMSNormOutFP4Quant = object()
+
+    class QuantizationSFLayout:
+        LINEAR = object()
 
     def __init__(self):
         self.calls = []
+        self.fusion_calls = []
 
     def create_allreduce_fusion_workspace(self, **kwargs):
         self.calls.append(kwargs)
@@ -51,8 +56,20 @@ class _FakeFlashInferComm:
         residual_in=None,
         rms_gamma=None,
         rms_eps=None,
-        **_kwargs,
+        quant_out=None,
+        scale_out=None,
+        **kwargs,
     ):
+        self.fusion_calls.append(
+            {
+                "input": input,
+                "workspace": workspace,
+                "pattern": pattern,
+                "quant_out": quant_out,
+                "scale_out": scale_out,
+                **kwargs,
+            }
+        )
         if pattern is self.AllReduceFusionPattern.kAllReduce:
             allreduced = input * workspace.world_size
             if output is None:
@@ -60,7 +77,10 @@ class _FakeFlashInferComm:
             output.copy_(allreduced)
             return output
 
-        if pattern is not self.AllReduceFusionPattern.kARResidualRMSNorm:
+        if pattern not in (
+            self.AllReduceFusionPattern.kARResidualRMSNorm,
+            self.AllReduceFusionPattern.kARResidualRMSNormOutFP4Quant,
+        ):
             raise ValueError(f"Unexpected pattern: {pattern}")
 
         allreduced = input * workspace.world_size
@@ -73,6 +93,9 @@ class _FakeFlashInferComm:
         ).to(input.dtype)
         residual_out.copy_(expected_residual)
         norm_out.copy_(expected_norm)
+        if pattern is self.AllReduceFusionPattern.kARResidualRMSNormOutFP4Quant:
+            quant_out.zero_()
+            scale_out.fill_(1)
 
 
 def _torch_allreduce_residual_rmsnorm_baseline(
@@ -256,6 +279,65 @@ class TestFlashInferCommFusion(CustomTestCase):
             else:
                 buffers[manager_key] = original_manager
             fusion._flashinfer_allreduce_unavailable = original_unavailable
+
+    def test_fp4_quant_wrapper_uses_linear_output_contract(self):
+        if not torch.cuda.is_available():
+            self.skipTest("FlashInfer allreduce custom op is CUDA-only")
+
+        from sglang.srt.runtime_context import get_resources
+
+        fake_comm = _FakeFlashInferComm()
+        manager_key = "flashinfer_fusion_attn_tp_workspace"
+        buffers = get_resources().buffers
+        original_manager = buffers.get(manager_key)
+        manager = fusion.FlashInferWorkspaceManager()
+        manager.workspace = _FakeWorkspace("mnnvl", world_size=4)
+        manager.initialized = True
+        buffers[manager_key] = manager
+
+        input_tensor = torch.randn(3, 32, dtype=torch.bfloat16, device="cuda")
+        residual = torch.randn_like(input_tensor)
+        weight = torch.randn(32, dtype=torch.bfloat16, device="cuda")
+        global_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+        eps = 1e-5
+
+        try:
+            with patch.object(fusion, "_flashinfer_comm", fake_comm):
+                norm_out, residual_out, quant_out, scale_out = (
+                    fusion.flashinfer_allreduce_residual_rmsnorm_fp4_quant(
+                        input_tensor,
+                        residual,
+                        weight,
+                        global_scale,
+                        eps,
+                    )
+                )
+        finally:
+            if original_manager is None:
+                buffers.pop(manager_key, None)
+            else:
+                buffers[manager_key] = original_manager
+
+        expected_norm, expected_residual = _torch_allreduce_residual_rmsnorm_baseline(
+            input_tensor, residual, weight, world_size=4, eps=eps
+        )
+        torch.testing.assert_close(norm_out, expected_norm)
+        torch.testing.assert_close(residual_out, expected_residual)
+        self.assertEqual(quant_out.dtype, torch.uint8)
+        self.assertEqual(quant_out.shape, (3, 16))
+        self.assertEqual(scale_out.dtype, torch.float8_e4m3fn)
+        self.assertEqual(scale_out.shape, (3, 2))
+
+        call = fake_comm.fusion_calls[-1]
+        self.assertIs(
+            call["pattern"],
+            fake_comm.AllReduceFusionPattern.kARResidualRMSNormOutFP4Quant,
+        )
+        self.assertIs(call["quant_out"], quant_out)
+        self.assertIs(call["scale_out"], scale_out)
+        self.assertIs(call["scale_factor"], global_scale)
+        self.assertIs(call["layout_code"], fake_comm.QuantizationSFLayout.LINEAR)
+        self.assertTrue(call["launch_with_pdl"])
 
 
 _GROUP_KEY = ("device_group", "cpu_group")

@@ -1480,10 +1480,10 @@ class FusedMoE(torch.nn.Module):
             and dispatch_output.format.is_standard()
             and dispatch_output.hidden_states_scale is None
         ):
-            # SGLANG_OPT_MOE_QUANT_ONCE: the standard dispatch was a pure
-            # passthrough, so the caller's pre-quantized (q, scale) pair still
-            # matches dispatch_output.hidden_states; attach it for the triton
-            # fused runner to skip its own activation quant.
+            # Standard dispatch was a pure passthrough, so the caller's
+            # pre-quantized (q, scale) pair still matches the dispatched hidden
+            # states. Attach it for the selected fused runner to skip its own
+            # activation quantization.
             dispatch_output = dispatch_output._replace(
                 hidden_states_pre_quant=pre_quant_input
             )

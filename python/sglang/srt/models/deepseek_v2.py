@@ -256,8 +256,10 @@ _enable_pcg_dsv2_dual_stream = (
     _is_cuda and envs.SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM.get()
 )
 
-# TODO(mattteochen) Cover more shapes
-_FLASHINFER_FUSED_SHARED_EXPERT_MAX_M = {4: 16, 8: 32}
+# FlashInfer currently supports the fused BF16 GEMM1+SwiGLU kernel for M <= 64.
+# Keep this keyed by TP size so the mapping also acts as the supported-layout
+# allowlist.
+_FLASHINFER_FUSED_SHARED_EXPERT_MAX_M = {4: 64, 8: 64}
 
 
 def _use_flashinfer_fused_shared_expert(

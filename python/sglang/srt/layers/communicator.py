@@ -774,6 +774,7 @@ class LayerCommunicator:
             and communicate_fn.func
             is CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual
             and self.layer_scatter_modes.layer_input_mode == ScatterMode.TP_ATTN_FULL
+            and not get_attn_tp_context().input_scattered
             and apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
         ):
             from sglang.srt.layers.flashinfer_comm_fusion import (
