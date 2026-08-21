@@ -136,7 +136,6 @@ _qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
 )
 _is_amx_available = cpu_has_amx_support()
-_CPU_FUSED_INPUT_PROJ_BLOCK_N = 32
 
 # Head-group ratios (num_v_heads // num_k_heads) served by the fused
 # split/reshape/cat Triton kernel. On AMD/aiter the ratio-8 layout is also
@@ -340,11 +339,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 and use_intel_amx_backend(self.in_proj_qkvz)
                 and use_intel_amx_backend(self.in_proj_ba)
                 and (
-                    self.in_proj_qkvz.weight.size(0) % _CPU_FUSED_INPUT_PROJ_BLOCK_N
-                    == 0
-                )
-                and (
-                    self.in_proj_ba.weight.size(0) % _CPU_FUSED_INPUT_PROJ_BLOCK_N == 0
+                    self.in_proj_qkvz.weight.size(0) % 32 == 0
+                    and self.in_proj_ba.weight.size(0) % 32 == 0
                 )
             )
         )
