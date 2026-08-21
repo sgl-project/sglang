@@ -34,14 +34,10 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     create_kt_config_from_server_args,
 )
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
-from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
-    AscendTPDispatcher,
-)
+from sglang.srt.layers.moe.token_dispatcher.ascend_tp import AscendTPDispatcher
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
-from sglang.srt.layers.moe.token_dispatcher.standard import (
-    StandardDispatcher,
-)
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
 from sglang.srt.layers.moe.topk import (
     BypassedTopKOutput,
     StandardTopKOutput,
@@ -166,6 +162,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             deepep_mode=get_deepep_mode(),
             async_finish=True,
             return_recv_hook=True,
+            layer_id=moe_runner_config.layer_id,
         )
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
