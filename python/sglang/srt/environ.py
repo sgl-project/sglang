@@ -980,7 +980,11 @@ class Envs:
     # -1 uses MoonEP's training-safe default B = E / EP.
     SGLANG_MOONEP_NUM_PREFETCH_SLOTS = EnvInt(-1)
     SGLANG_MOONEP_TOKEN_PADDING = EnvInt(128)
+    # Decode-phase token capacity; <= 0 derives it from max_running_requests.
+    SGLANG_MOONEP_DECODE_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(-1)
     SGLANG_MOONEP_NUM_SMS = EnvInt(32)
+    # MoonEP's static shapes should be capturable; off until that is shown.
+    SGLANG_ENABLE_MOONEP_CUDA_GRAPH = EnvBool(False)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
     # DeepSeek/GLM MoE (deepseek_v2.py): quantize the (dp-gathered) MoE input

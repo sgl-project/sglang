@@ -324,6 +324,52 @@ class Mxfp4Config(QuantizationConfig):
         return []
 
 
+def _maybe_alloc_moonep_expert_pool(
+    layer,
+    *,
+    intermediate_size: int,
+    hidden_size: int,
+    weight_dtype: torch.dtype,
+    mxfp4_block: int,
+) -> Optional[dict]:
+    """This layer's slice of MoonEP's symmetric expert pool, or None.
+
+    The scale entries describe DeepGEMM's *runtime* layout in storage order:
+    ``transform_sf_into_required_layout`` returns ``[E, MN, K/128]`` int32 with
+    stride ``(.., 1, MN)``, whose contiguous bytes are the transpose. Four
+    e8m0 exponents pack into one int32, so the byte count matches the
+    ``[E, MN, K/32]`` uint8 the checkpoint carries.
+    """
+    from sglang.srt.layers.moe.token_dispatcher import moonep_weights
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    if not get_moe_a2a_backend().is_moonep():
+        return None
+
+    scale_pack = 4 * mxfp4_block  # e8m0 bytes per int32 x elements per byte
+    return moonep_weights.alloc_expert_tensors(
+        layer,
+        {
+            moonep_weights.W13_WEIGHT: (
+                (2 * intermediate_size, hidden_size // 2),
+                weight_dtype,
+            ),
+            moonep_weights.W2_WEIGHT: (
+                (hidden_size, intermediate_size // 2),
+                weight_dtype,
+            ),
+            moonep_weights.W13_SCALE: (
+                (hidden_size // scale_pack, 2 * intermediate_size),
+                torch.int32,
+            ),
+            moonep_weights.W2_SCALE: (
+                (intermediate_size // scale_pack, hidden_size),
+                torch.int32,
+            ),
+        },
+    )
+
+
 class Mxfp4MoEMethod(FusedMoEMethodBase):
 
     def __init__(
@@ -334,6 +380,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         self.prefix = prefix
         self.topk_indices_dtype = None
+        self.moonep_pooled = None
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
@@ -464,13 +511,31 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.intermediate_size_per_partition = intermediate_size_per_partition_after_pad
 
         self.hidden_size = hidden_size
+
+        from sglang.srt.layers.moe.token_dispatcher import moonep_weights
+
+        # MoonEP needs every expert row readable by its peers, so the weights
+        # come from a symmetric VMM pool instead of a private allocation. The
+        # scales are pooled in their post-transform runtime layout, which
+        # process_weights_after_loading copies into rather than replacing.
+        self.moonep_pooled = _maybe_alloc_moonep_expert_pool(
+            layer,
+            intermediate_size=intermediate_size_per_partition_after_pad,
+            hidden_size=hidden_size,
+            weight_dtype=weight_dtype,
+            mxfp4_block=mxfp4_block,
+        )
+
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
-            torch.zeros(
-                layer.num_local_experts,
-                2 * intermediate_size_per_partition_after_pad,
-                hidden_size // 2,
-                dtype=weight_dtype,
+            self._expert_storage(
+                moonep_weights.W13_WEIGHT,
+                (
+                    layer.num_local_experts,
+                    2 * intermediate_size_per_partition_after_pad,
+                    hidden_size // 2,
+                ),
+                weight_dtype,
             ),
             requires_grad=False,
         )
@@ -508,11 +573,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         # down_proj (row parallel)
         w2_weight = torch.nn.Parameter(
-            torch.zeros(
-                layer.num_local_experts,
-                hidden_size,
-                intermediate_size_per_partition_after_pad // 2,
-                dtype=weight_dtype,
+            self._expert_storage(
+                moonep_weights.W2_WEIGHT,
+                (
+                    layer.num_local_experts,
+                    hidden_size,
+                    intermediate_size_per_partition_after_pad // 2,
+                ),
+                weight_dtype,
             ),
             requires_grad=False,
         )
@@ -542,6 +610,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter("w2_weight_bias", w2_weight_bias)
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
+
+    def _expert_storage(
+        self, kind: str, shape: tuple[int, ...], dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Zeroed storage for an expert tensor, from MoonEP's symmetric pool
+        when that backend is active and a private allocation otherwise."""
+        if self.moonep_pooled is None:
+            return torch.zeros(*shape, dtype=dtype)
+
+        pooled = self.moonep_pooled[kind]
+        assert tuple(pooled.shape) == shape and pooled.dtype == dtype, (
+            f"MoonEP pool gave {kind} as {tuple(pooled.shape)}/{pooled.dtype}, "
+            f"expected {shape}/{dtype}"
+        )
+        return pooled.zero_()
 
     def process_weights_after_loading(self, layer):
         if self.use_marlin:
@@ -575,21 +658,32 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self.use_deep_gemm:
             from deep_gemm import transform_sf_into_required_layout
 
+            from sglang.srt.layers.moe.token_dispatcher import moonep_weights
+
             # Packed fp4 (e2m1 x2 per byte) weights: DeepGEMM expects int8.
+            # A re-view keeps the storage, which is what lets MoonEP's pooled
+            # weights survive this step.
             layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
             layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
+            if self.moonep_pooled is not None:
+                moonep_weights.assert_resident(
+                    layer, moonep_weights.W13_WEIGHT, layer.w13_weight.data
+                )
+                moonep_weights.assert_resident(
+                    layer, moonep_weights.W2_WEIGHT, layer.w2_weight.data
+                )
             # Checkpoint scales are uint8 e8m0 (biased exponents). DeepGEMM
             # SM100 needs them in packed-UE8M0 TMA-aligned MN-major layout.
             # Round-trip through fp32 is exact (values are powers of two).
-            for scale_name, weight in (
-                ("w13_weight_scale", layer.w13_weight),
-                ("w2_weight_scale", layer.w2_weight),
+            for scale_name, weight, pool_kind in (
+                ("w13_weight_scale", layer.w13_weight, moonep_weights.W13_SCALE),
+                ("w2_weight_scale", layer.w2_weight, moonep_weights.W2_SCALE),
             ):
                 scale = getattr(layer, scale_name)
                 num_experts, n, _ = scale.data.shape
                 k = weight.shape[2] * 2
                 scale_f32 = scale.data.view(torch.float8_e8m0fnu).to(torch.float32)
-                scale.data = transform_sf_into_required_layout(
+                transformed = transform_sf_into_required_layout(
                     scale_f32,
                     mn=n,
                     k=k,
@@ -597,6 +691,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     num_groups=num_experts,
                     disable_ue8m0_cast=False,
                 )
+                if self.moonep_pooled is None:
+                    scale.data = transformed
+                    continue
+                # The checkpoint-layout buffer the loader filled is private
+                # memory; the runtime layout has to end up in the pool instead,
+                # so copy rather than rebind. The pooled range is stored
+                # transposed, matching the MN-major result's real byte order.
+                pooled = self.moonep_pooled[pool_kind].permute(0, 2, 1)
+                scale.data = pooled.copy_(transformed)
+                moonep_weights.assert_resident(layer, pool_kind, scale.data)
             if get_moe_a2a_backend().is_megamoe():
                 # MegaMoE consumes the same transformed sf, plus its own
                 # interleaved/UTCCP weight layout. K3 routes EVERY batch
