@@ -43,10 +43,24 @@ could in principle be fp8 but need no verdict:
 """
 
 import torch
+import triton
 
 from sglang.srt.utils import is_gfx95_supported
 
 _is_gfx95 = is_gfx95_supported()
+
+try:
+    _triton_version_parts = tuple(
+        int(part) for part in triton.__version__.split(".")[:2]
+    )
+except (AttributeError, ValueError):
+    _triton_version_parts = (0, 0)
+
+# triton-lang/triton#8278 landed in 3.6: from there on Triton rejects the scaled
+# intrinsic itself and falls back to the non-scaled fp8 MFMA, so the dots below
+# compile and stay in fp8. Only 3.4 and 3.5 let an explicit matrix_instr_nonkdim
+# skip that check, and a version string we cannot read keeps the guard on.
+_triton_rejects_narrow_fp8_mfma = _triton_version_parts >= (3, 6)
 
 # K reduced per V_MFMA_SCALE_F32_16X16X128_F8F6F4, the scaled instruction Triton
 # selects for an fp8 x fp8 dot once matrix_instr_nonkdim=16 pins the 16x16 tile.
@@ -65,12 +79,17 @@ _FP8_DTYPES = frozenset(
 def dot_in_kv_dtype(kv_dtype: torch.dtype, reduction_width: int) -> bool:
     """Whether a ``tl.dot`` reducing ``reduction_width`` elements may run in ``kv_dtype``.
 
-    ``True`` (keep today's cast-down) for every non-fp8 pool and every GPU
-    other than gfx950; on gfx950 an fp8 pool is only allowed the reduction
-    widths that tile the scaled MFMA instruction. Callers that get ``False``
-    must upcast the KV tile to the query dtype instead of casting the query
-    tile down.
+    ``True`` (keep today's cast-down) for every non-fp8 pool, every GPU other
+    than gfx950, and every Triton that carries #8278; only a gfx950 fp8 pool on
+    Triton 3.4/3.5 is restricted to the reduction widths that tile the scaled
+    MFMA instruction. Callers that get ``False`` must upcast the KV tile to the
+    query dtype instead of casting the query tile down.
+
+    The Triton term keeps this inert wherever the compiler already handles the
+    case -- notably the ROCm 7.2 image, which is the PR gate lane -- so the
+    workaround only alters codegen on the images that would otherwise abort, and
+    retires itself when the last of those is dropped.
     """
-    if not _is_gfx95 or kv_dtype not in _FP8_DTYPES:
+    if _triton_rejects_narrow_fp8_mfma or not _is_gfx95:
         return True
-    return reduction_width % _GFX950_SCALED_MFMA_K == 0
+    return kv_dtype not in _FP8_DTYPES or (reduction_width % _GFX950_SCALED_MFMA_K == 0)
