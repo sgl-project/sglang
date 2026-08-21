@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import (
     alloc_decode_kernel,
     alloc_extend_kernel,
+    page_representatives_from_segment,
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.unified_memory_pool import (
@@ -290,6 +291,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self.free_virtual_ids = None
         self.is_not_in_free_group = True
         self.free_group: List[torch.Tensor] = []
+        self.free_page_reps_group: List[torch.Tensor] = []
         self._inverse_history.clear()
         self._free_phys_pages = torch.empty(0, dtype=torch.int64, device=self.device)
         self._pending_reuse.clear()
@@ -710,7 +712,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             out.add_(offsets)
             out.clamp_(min=0)  # tombstoned page: -1*ps + offset in [-ps, -1]
             return out
-        phys_pages = self.virtual_to_physical[virt_pages]
+        # Keep the hot transfer-metadata path asynchronous. CUDA advanced
+        # indexing may perform a host-side bounds check; index_select does not
+        # force that scalar readback.
+        phys_pages = torch.index_select(self.virtual_to_physical, 0, virt_pages)
         result = phys_pages * self.page_size + offsets
         return torch.clamp_min(result, 0)
 
@@ -1009,6 +1014,53 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
             self._compact_pending(freed_p_pages)
 
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
+        """Free a dense request-row segment without data-dependent dedup.
+
+        A request's token slots are consecutive within every page, so fixed
+        stride slices provide one representative per touched virtual page.
+        This avoids ``torch.unique`` and its dynamic-output-length D2H readback
+        on the scheduler's critical enqueue path.
+        """
+        if free_index is None or free_index.numel() == 0:
+            return
+
+        pieces = page_representatives_from_segment(
+            free_index, start_pos=start_pos, page_size=self.page_size
+        )
+        if not self.is_not_in_free_group:
+            self.free_page_reps_group.extend(
+                self._copy_for_free_group(piece) for piece in pieces
+            )
+            return
+        self._free_page_ids(*(piece // self.page_size for piece in pieces))
+
+    def _free_page_ids(self, *page_ids: torch.Tensor) -> None:
+        """Release already-deduplicated virtual page ids."""
+        free_v_pages = page_ids[0] if len(page_ids) == 1 else torch.cat(page_ids)
+        if free_v_pages.numel() == 0:
+            return
+        free_v_pages = free_v_pages.detach().to(torch.int64)
+
+        if self.lazy_compaction:
+            self._free_lazy_pages(free_v_pages)
+            return
+
+        if self.forward_stream is not None:
+            with record_function("MultiEndedAlloc.free.wait_stream"):
+                torch.cuda.current_stream().wait_stream(self.forward_stream)
+        with record_function("MultiEndedAlloc.free.v2p_lookup"):
+            freed_p_pages = self.virtual_to_physical[free_v_pages]
+        with record_function("MultiEndedAlloc.free.sync_check"):
+            if bool((freed_p_pages < 0).any().item()):
+                self._raise_stale_slot_assertion(
+                    free_v=free_v_pages, freed_p=freed_p_pages
+                )
+        self.virtual_to_physical[free_v_pages] = -1
+        if self.is_id_owner:
+            self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
+        self._compact_pending(freed_p_pages)
+
     def _free_lazy(self, free_index: torch.Tensor) -> None:
         """Lazy free path: disjoint-element scatters + ONE `torch.cat` onto
         `_free_phys_pages`. No sort, no boundary absorb, no watermark mutation,
@@ -1019,7 +1071,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         Callers must not double-free: a tombstone (-1) here would be cat'd onto
         the free list.
         """
-        self._stats_n_free_lazy += 1
         with record_function("MultiEndedAlloc._free_lazy"):
             with record_function("MultiEndedAlloc._free_lazy.v2p_lookup"):
                 free_v_pages_raw = free_index.detach().to(torch.int64)
@@ -1027,7 +1078,13 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     free_v_pages = free_v_pages_raw
                 else:
                     free_v_pages = torch.unique(free_v_pages_raw // self.page_size)
-                freed_p_pages = self.virtual_to_physical[free_v_pages]
+            self._free_lazy_pages(free_v_pages)
+
+    def _free_lazy_pages(self, free_v_pages: torch.Tensor) -> None:
+        """Lazy-release virtual page ids that are already deduplicated."""
+        self._stats_n_free_lazy += 1
+        with record_function("MultiEndedAlloc._free_lazy_pages"):
+            freed_p_pages = self.virtual_to_physical[free_v_pages]
             # Disjoint-element scatters — no barrier (a freed v has no live reader;
             # per-element scatter writes are atomic).
             self.virtual_to_physical[free_v_pages] = -1
@@ -1719,6 +1776,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     def free_group_begin(self) -> None:
         self.is_not_in_free_group = False
         self.free_group = []
+        self.free_page_reps_group = []
 
     def free_group_end(self) -> None:
         self.is_not_in_free_group = True
@@ -1726,6 +1784,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             merged = torch.cat(self.free_group)
             self.free_group = []
             self.free(merged)
+        if self.free_page_reps_group:
+            page_ids = torch.cat(self.free_page_reps_group) // self.page_size
+            self.free_page_reps_group = []
+            self._free_page_ids(page_ids)
 
 
 class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -2144,6 +2206,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         self.is_not_in_free_group = True
         self.free_group: List[torch.Tensor] = []
+        self.request_free_segments_group = []
         # Empty (not None) for the leak checker.
         self.free_pages = torch.empty(0, dtype=torch.int64, device=device)
         self.release_pages = torch.empty(0, dtype=torch.int64, device=device)
@@ -2328,7 +2391,9 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         ps = self.swa_attn_allocator.page_size
         virt_pages = kv_indices // ps
         offsets = kv_indices % ps
-        swa_phys_pages = self.swa_attn_allocator.virtual_to_physical[virt_pages]
+        swa_phys_pages = torch.index_select(
+            self.swa_attn_allocator.virtual_to_physical, 0, virt_pages
+        )
         result = (swa_phys_pages * ps + offsets).to(torch.int32)
         result = torch.clamp_min(result, 0)
         if out is not None:
@@ -2489,6 +2554,61 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.swa_attn_allocator.free(live)
         self.swa_attn_allocator.clear_inverse_history()
 
+    def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
+        """Release a page-exact live SWA component without mapping discovery.
+
+        Unified-tree SWA component values are split at page-aligned eviction
+        frontiers, so this path contains no tombstoned virtual pages and can
+        delegate directly to the sub-allocator's fixed-stride segment release.
+        """
+        if free_index is None or free_index.numel() == 0:
+            return
+        self.swa_attn_allocator.free_segment(free_index, start_pos=start_pos)
+        self.swa_attn_allocator.clear_inverse_history()
+
+    def free_request_segments(self, segments, *, swa_evicted_seqlen: int) -> None:
+        """Release full KV and the still-live SWA suffix for one request.
+
+        The unified allocator uses the same virtual token IDs for both pools, so
+        it must not use the parent allocator's full-to-SWA mapping tensor.  The
+        CPU-maintained eviction frontier identifies the SWA-owned suffix without
+        any data-dependent GPU discovery.
+        """
+        request_segments = [
+            (indices, start_pos)
+            for indices, start_pos in segments
+            if indices.numel() > 0
+        ]
+        if not request_segments:
+            return
+        if not self.is_not_in_free_group:
+            self.request_free_segments_group.append(
+                (
+                    [
+                        (self._copy_for_free_group(indices), start_pos)
+                        for indices, start_pos in request_segments
+                    ],
+                    swa_evicted_seqlen,
+                )
+            )
+            return
+
+        self.full_attn_allocator.free_segments(request_segments)
+
+        live_swa_segments = []
+        for free_index, start_pos in request_segments:
+            end_pos = start_pos + free_index.numel()
+            live_start = max(start_pos, swa_evicted_seqlen)
+            if live_start < end_pos:
+                live_swa_segments.append(
+                    (free_index[live_start - start_pos :], live_start)
+                )
+        if live_swa_segments:
+            self.swa_attn_allocator.free_segments(live_swa_segments)
+
+        self.full_attn_allocator.clear_inverse_history()
+        self.swa_attn_allocator.clear_inverse_history()
+
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:
@@ -2507,6 +2627,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def free_group_begin(self) -> None:
         self.is_not_in_free_group = False
         self.free_group = []
+        self.request_free_segments_group = []
 
     def free_group_end(self) -> None:
         self.is_not_in_free_group = True
@@ -2514,12 +2635,20 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             merged = torch.cat(self.free_group)
             self.free_group = []
             self.free(merged)
+        if self.request_free_segments_group:
+            request_groups = self.request_free_segments_group
+            self.request_free_segments_group = []
+            for segments, swa_evicted_seqlen in request_groups:
+                self.free_request_segments(
+                    segments, swa_evicted_seqlen=swa_evicted_seqlen
+                )
 
     def clear(self) -> None:
         self.full_attn_allocator.clear()
         self.swa_attn_allocator.clear()
         self.is_not_in_free_group = True
         self.free_group = []
+        self.request_free_segments_group = []
 
     # -- Lazy compaction hooks --
 

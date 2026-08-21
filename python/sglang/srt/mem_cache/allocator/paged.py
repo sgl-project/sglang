@@ -42,6 +42,16 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 
+def page_representatives_from_segment(
+    free_index: torch.Tensor, *, start_pos: int, page_size: int
+) -> tuple[torch.Tensor, ...]:
+    """Return one token representative for every page touched by a segment."""
+    offset = start_pos % page_size
+    if offset == 0:
+        return (free_index[::page_size],)
+    return (free_index[:1], free_index[page_size - offset :: page_size])
+
+
 def alloc_extend_naive(
     prefix_lens,
     seq_lens,
@@ -279,11 +289,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         ps = self.page_size
-        offset = start_pos % ps
-        if offset == 0:
-            pieces = (free_index[::ps],)
-        else:
-            pieces = (free_index[:1], free_index[ps - offset :: ps])
+        pieces = page_representatives_from_segment(
+            free_index, start_pos=start_pos, page_size=ps
+        )
 
         if self.debug_mode:
             # reference unique on CPU: the NPU subclass deliberately avoids device unique

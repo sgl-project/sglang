@@ -71,6 +71,11 @@ class GenerationBatchResult:
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
 
+    # Pinned CPU page/state indices prepared on the result copy stream for
+    # disaggregated prefill.  They are consumed after copy_done fires, avoiding
+    # synchronous tiny D2H reads in send_kv_chunk().
+    disagg_transfer_indices: Optional[dict] = None
+
     # Grammar FSM advance memoization (spec-v2 overlap). advance_grammar_fsm sets
     # these once — eagerly via the scheduler's grammar barrier inside verify(), or
     # lazily in _resolve_spec_v2_tokens — and the latter consumes

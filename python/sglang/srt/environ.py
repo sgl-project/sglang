@@ -1048,6 +1048,11 @@ class Envs:
     # DeepGEMM Mega MoE
     # ===================================================================
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
+    # 0 derives the launch size from DeepGEMM's current device SM count.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_SMS = EnvInt(0)
+    # Blackwell MegaMoE uses a whole-grid software barrier. Keep a small even
+    # safety margin so every cluster can become resident beside other streams.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     # When set, the mega-MoE x slot is packed E2M1 (FP4) instead of FP8 E4M3.
     # Halves symm-buffer footprint and unlocks the MXF4 mainloop downstream.
     # Setting this also exports DG_USE_FP4_ACTS=1 so DeepGEMM's symm-buffer

@@ -391,6 +391,28 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             DeepseekV4AttnBackend.use_captured_forward_metadata_for_breakable_cuda_graph
         )
 
+    def test_prefill_snapshot_declares_pre_replay_boundary(self):
+        from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+            DSV4Metadata,
+        )
+
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.forward_metadata = DSV4Metadata(
+            self._make_core_metadata(0), indexer_metadata=None
+        )
+        self.assertIs(
+            backend.shared_read_ends(ForwardMode.EXTEND),
+            SharedReadEnds.UNKNOWN,
+        )
+
+        backend.forward_metadata.prefill_shared_reads_snapshotted = True
+        self.assertIs(
+            backend.shared_read_ends(ForwardMode.EXTEND),
+            SharedReadEnds.PRE_REPLAY,
+        )
+
     def test_refresh_replay_metadata_preserves_captured_tensor_storage(self):
         capture_metadata = self._make_core_metadata(0)
         replay_metadata = self._make_core_metadata(1000)
@@ -459,6 +481,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             self._make_core_metadata(0), indexer_metadata=None
         )
         capture_metadata.sparse_prefill_cache = object()
+        capture_metadata.prefill_shared_reads_snapshotted = True
         replay_metadata = DSV4Metadata(
             self._make_core_metadata(1000), indexer_metadata=None
         )
@@ -487,6 +510,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         self.assertTrue(calls[0][2])
         self.assertIs(backend.forward_metadata, capture_metadata)
         self.assertIsNone(capture_metadata.sparse_prefill_cache)
+        self.assertFalse(capture_metadata.prefill_shared_reads_snapshotted)
         self.assertTrue(
             torch.equal(
                 capture_metadata.core_attn_metadata.seq_lens_casual,

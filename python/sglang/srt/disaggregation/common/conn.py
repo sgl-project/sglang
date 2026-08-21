@@ -408,6 +408,31 @@ class CommonKVManager(BaseKVManager):
         worker ack, then a new chunk writes pages the decode already released."""
         self._deferred_ack_targets[room] = (decode_ip, decode_port)
 
+    def _is_dp_rank_registration_leader(self) -> bool:
+        return self.attn_tp_rank == 0 and self.attn_cp_rank == 0 and self.pp_rank == 0
+
+    def register_prefill_dp_rank(
+        self, bootstrap_server_url: str, bootstrap_room: int
+    ) -> None:
+        """Register fallback routing metadata before the room can be reused."""
+        if not self._is_dp_rank_registration_leader():
+            return
+        url = f"http://{bootstrap_server_url}/register_dp_rank"
+        payload = {
+            "bootstrap_room": bootstrap_room,
+            "dp_rank": self.attn_dp_rank,
+        }
+        try:
+            response = requests.post(url, json=payload, timeout=5)
+            if response.status_code != 200:
+                logger.error(
+                    "Failed to register prefill dp_rank: %s, %s",
+                    response.status_code,
+                    response.text,
+                )
+        except Exception as e:
+            logger.error("Failed to register prefill dp_rank: %s", e)
+
     def get_kv_replica_factor(self) -> int:
         if self._kv_replica_factor is None:
             logger.warning_once(
@@ -1189,19 +1214,9 @@ class CommonKVSender(BaseKVSender):
 
     def _register_prefill_dp_rank(self):
         """Register this request's prefill dp_rank to the bootstrap server."""
-        url = f"http://{self.bootstrap_server_url}/register_dp_rank"
-        payload = {
-            "bootstrap_room": self.bootstrap_room,
-            "dp_rank": self.kv_mgr.attn_dp_rank,
-        }
-        try:
-            response = requests.post(url, json=payload, timeout=5)
-            if response.status_code != 200:
-                logger.error(
-                    f"Failed to register prefill dp_rank: {response.status_code}, {response.text}"
-                )
-        except Exception as e:
-            logger.error(f"Failed to register prefill dp_rank: {e}")
+        self.kv_mgr.register_prefill_dp_rank(
+            self.bootstrap_server_url, self.bootstrap_room
+        )
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.num_kv_indices = num_kv_indices

@@ -7,7 +7,12 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
+from sglang.srt.managers import cache_controller as manager_cache_controller
+from sglang.srt.managers.cache_controller import (
+    CacheOperation,
+    HiCacheController,
+    LayerDoneCounter,
+)
 from sglang.srt.mem_cache import l2_transfer as transfer_module
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -29,6 +34,11 @@ from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.unified_cache import unified_tree_core
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+    UnifiedTreeCore,
+    UnifiedTreeNode,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -213,6 +223,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         op = CacheOperation(_indices(0, 4), _indices(4, 8), 7)
         op.pool_transfers = [transfer]
         controller = mock.Mock(spec=HybridCacheController)
+        controller.io_backend = "kernel"
         controller.load_queue = [op, op]
         controller.layer_done_counter = mock.MagicMock()
         controller.layer_done_counter.update_producer.return_value = 0
@@ -229,6 +240,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
         controller._l2_load_transfers.side_effect = lambda *args: (
             HybridCacheController._l2_load_transfers(controller, *args)
+        )
+        controller._start_loading_op.side_effect = lambda *args: (
+            HybridCacheController._start_loading_op(controller, *args)
         )
         controller._num_tokens_by_pool.return_value = {}
         controller._transfer_num_bytes.return_value = 0
@@ -263,6 +277,61 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
         controller._num_tokens_by_pool.assert_called_once_with(merged_op)
         self.assertEqual(controller.ack_load_queue[0].node_ids, [7, 7])
+
+    def test_consumer_waits_until_load_events_are_submitted(self):
+        counter = LayerDoneCounter.__new__(LayerDoneCounter)
+        counter.consumer_index = -1
+        event = mock.Mock()
+        counter.events = [event]
+
+        counter.set_consumer(0)
+
+        event.wait_until_submitted.assert_called_once_with()
+        self.assertEqual(counter.consumer_index, 0)
+
+    def test_direct_load_signals_only_after_cuda_submission(self):
+        op = CacheOperation(_indices(0, 4), _indices(4, 8), 7)
+        producer_event = mock.Mock()
+        order = []
+        producer_event.mark_submitted.side_effect = lambda **_: order.append("signal")
+
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.load_queue = [op]
+        controller.io_backend = "direct"
+        controller.layer_done_counter = mock.Mock()
+        controller.layer_done_counter.update_producer.return_value = 0
+        controller.layer_done_counter.events = [producer_event]
+        controller._enqueue_direct_dispatch = mock.Mock()
+        controller._start_loading_op = mock.Mock(
+            side_effect=lambda *_: order.append("submit")
+        )
+
+        self.assertEqual(controller.start_loading(), 0)
+        producer_event.mark_submitted.assert_not_called()
+        dispatch = controller._enqueue_direct_dispatch.call_args
+        self.assertIs(
+            dispatch.args[0].__func__,
+            controller._start_loading_op_and_signal_submission.__func__,
+        )
+
+        dispatch.args[0](*dispatch.args[1:])
+
+        self.assertEqual(order, ["submit", "signal"])
+
+    def test_direct_load_submission_error_unblocks_consumer(self):
+        producer_event = mock.Mock()
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.layer_done_counter = mock.Mock()
+        controller.layer_done_counter.events = [producer_event]
+        failure = RuntimeError("submit failed")
+        controller._start_loading_op = mock.Mock(side_effect=failure)
+
+        with self.assertRaisesRegex(RuntimeError, "submit failed"):
+            controller._start_loading_op_and_signal_submission(
+                CacheOperation(_indices(0, 1), _indices(1, 2), 3), 0
+            )
+
+        producer_event.mark_submitted.assert_called_once_with(error=failure)
 
     def test_l2_transfer_maps_global_layers(self):
         host_pool = mock.Mock()
@@ -379,6 +448,25 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
         self.assertIs(pool_transfers[0].host_indices, mock.sentinel.host_indices)
         self.assertIs(pool_transfers[0].device_indices, mock.sentinel.device_indices)
+
+    def test_background_thread_device_resolves_missing_cuda_index(self):
+        with mock.patch.object(
+            manager_cache_controller.device_module,
+            "current_device",
+            return_value=3,
+        ) as current_device:
+            resolved = manager_cache_controller._resolve_background_thread_device(
+                "cuda"
+            )
+
+        self.assertEqual(resolved, 3)
+        current_device.assert_called_once_with()
+
+    def test_background_thread_device_keeps_explicit_index(self):
+        resolved = manager_cache_controller._resolve_background_thread_device(
+            torch.device("cuda:2")
+        )
+        self.assertEqual(resolved, torch.device("cuda:2"))
 
     def _patched_transfers(self, src_registry=None, module=MEMORY_POOL_HOST_MODULE):
         staged_side_effect = None
@@ -1055,6 +1143,160 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
         controller.move_indices.assert_called_once()
         self.assertEqual(captured["host_indices"].device.type, "cpu")
+
+    def test_direct_cache_controller_defers_index_copy_to_dispatch_thread(self):
+        op = CacheOperation(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+        )
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.write_queue = [op]
+        controller.io_backend = "direct"
+        controller._enqueue_direct_dispatch = mock.Mock()
+        controller.move_indices = mock.Mock(
+            side_effect=AssertionError("scheduler must not copy direct indices")
+        )
+
+        controller.start_writing()
+
+        self.assertEqual(controller.write_queue, [])
+        controller._enqueue_direct_dispatch.assert_called_once_with(
+            controller._start_writing_op, op
+        )
+        controller.move_indices.assert_not_called()
+
+    def test_direct_hybrid_controller_defers_all_pool_index_copies(self):
+        ready_event = object()
+        op = CacheOperation(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+            pool_transfers=[
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    host_indices=_indices(0, 4),
+                    device_indices=_indices(4, 8),
+                )
+            ],
+            device_values_ready_event=ready_event,
+        )
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.write_queue = [op]
+        controller.io_backend = "direct"
+        controller._enqueue_direct_dispatch = mock.Mock()
+        controller.move_hybrid_indices = mock.Mock(
+            side_effect=AssertionError("scheduler must not copy direct indices")
+        )
+
+        controller.start_writing()
+
+        self.assertEqual(controller.write_queue, [])
+        controller._enqueue_direct_dispatch.assert_called_once_with(
+            controller._merge_and_start_writing_ops,
+            [op],
+            dependency=(ready_event,),
+        )
+        controller.move_hybrid_indices.assert_not_called()
+
+    def test_hybrid_merge_keeps_each_node_device_value_dependency(self):
+        first_event = object()
+        latest_event = object()
+        ops = [
+            CacheOperation(
+                _indices(0, 2),
+                _indices(2, 4),
+                node_id=1,
+                device_values_ready_event=first_event,
+            ),
+            CacheOperation(
+                _indices(4, 6),
+                _indices(6, 8),
+                node_id=2,
+                device_values_ready_event=latest_event,
+            ),
+        ]
+
+        merged = CacheOperation.merge_ops(ops)
+
+        self.assertEqual(merged.device_values_ready_event, (first_event, latest_event))
+
+    def test_direct_hybrid_normalizes_aux_indices_on_helper_path(self):
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.io_backend = "direct"
+        operation = CacheOperation(
+            _indices(0, 2),
+            _indices(2, 4),
+            node_id=1,
+            pool_transfers=[
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    host_indices=_indices(0, 2),
+                    device_indices=torch.arange(2, dtype=torch.int32),
+                )
+            ],
+        )
+        controller.move_indices = mock.Mock(
+            side_effect=lambda host, device: (host, device)
+        )
+
+        _, _, transfers = controller.move_hybrid_indices(operation)
+
+        self.assertEqual(transfers[0].device_indices.dtype, torch.int64)
+
+    def test_tree_readiness_events_are_owned_by_each_node(self):
+        tree = UnifiedTreeCore.__new__(UnifiedTreeCore)
+        tree.device = torch.device("cuda")
+        first_node = UnifiedTreeNode(())
+        second_node = UnifiedTreeNode(())
+        tree._node_arena = {
+            first_node.id: first_node,
+            second_node.id: second_node,
+        }
+        first_event = mock.Mock()
+        second_event = mock.Mock()
+        fake_device_module = mock.Mock()
+        fake_device_module.Event.side_effect = [first_event, second_event]
+
+        with mock.patch.object(unified_tree_core, "device_module", fake_device_module):
+            tree._record_device_values_ready(first_node)
+            tree._record_device_values_ready(second_node)
+
+        first_event.record.assert_called_once_with()
+        second_event.record.assert_called_once_with()
+        self.assertIs(tree.device_values_ready_event(first_node.id), first_event)
+        self.assertIs(tree.device_values_ready_event(second_node.id), second_event)
+
+    def test_cache_controller_can_defer_write_submission_for_batching(self):
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.mem_pool_host = mock.Mock()
+        controller.mem_pool_host.alloc.return_value = _indices(8, 12)
+        controller.write_queue = []
+        controller.start_writing = mock.Mock()
+        device_indices = _indices(0, 4)
+
+        host_indices = controller.write(device_indices, node_id=7, defer_start=True)
+
+        self.assertTrue(torch.equal(host_indices, _indices(8, 12)))
+        self.assertEqual(len(controller.write_queue), 1)
+        self.assertEqual(controller.write_queue[0].node_ids, [7])
+        controller.start_writing.assert_not_called()
+
+    def test_hybrid_controller_can_defer_write_submission_for_batching(self):
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mem_pool_host = mock.Mock()
+        controller.mem_pool_host.alloc.return_value = _indices(8, 12)
+        controller._resolve_pool_transfers_allocation = mock.Mock(return_value=[])
+        controller.write_queue = []
+        controller.start_writing = mock.Mock()
+        device_indices = _indices(0, 4)
+
+        host_indices = controller.write(device_indices, node_id=9, defer_start=True)
+
+        self.assertTrue(torch.equal(host_indices, _indices(8, 12)))
+        self.assertEqual(len(controller.write_queue), 1)
+        self.assertEqual(controller.write_queue[0].node_ids, [9])
+        controller.start_writing.assert_not_called()
 
 
 if __name__ == "__main__":

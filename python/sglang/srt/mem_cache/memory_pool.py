@@ -2235,6 +2235,8 @@ class MHATokenToKVPool(KVCache):
             "CPU KV offload indexes by slot (NHD); HND KV cache "
             "(SGLANG_USE_HND_KVCACHE) is not supported with CPU offload yet."
         )
+        if indices.numel() == 0:
+            return [[] for _ in range(self.layer_num)]
         current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -2257,6 +2259,8 @@ class MHATokenToKVPool(KVCache):
             "CPU KV offload indexes by slot (NHD); HND KV cache "
             "(SGLANG_USE_HND_KVCACHE) is not supported with CPU offload yet."
         )
+        if indices.numel() == 0:
+            return
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):

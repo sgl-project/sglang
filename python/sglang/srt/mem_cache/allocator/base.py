@@ -46,6 +46,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self.free_segments_group = []
+        self.swa_free_segments_group = []
 
     @property
     def size_full(self):
@@ -63,11 +65,18 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def free_group_begin(self):
         self.is_not_in_free_group = False
         self.free_group = []
+        self.free_segments_group = []
+        self.swa_free_segments_group = []
 
     def free_group_end(self):
         self.is_not_in_free_group = True
         if self.free_group:
             self.free(torch.cat(self.free_group))
+        if self.free_segments_group:
+            self.free_segments(self.free_segments_group)
+        if self.swa_free_segments_group:
+            for free_index, start_pos in self.swa_free_segments_group:
+                self.free_swa_segment(free_index, start_pos=start_pos)
 
     @staticmethod
     def _copy_for_free_group(free_index: torch.Tensor) -> torch.Tensor:
@@ -130,6 +139,14 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         data-dependent dedup. Default: plain free()."""
         self.free(free_index)
 
+    def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        """Free an SWA-only contiguous segment of one request's KV row.
+
+        SWA allocators may use ``start_pos`` to avoid data-dependent page
+        discovery. Other implementations retain the legacy free_swa path.
+        """
+        self.free_swa(free_index)
+
     def free_segments(self, segments):
         """Free disjoint ascending ``(free_index, start_pos)`` segments of one
         request's kv row; a boundary page shared by consecutive segments is
@@ -147,3 +164,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
                 start_pos = boundary
             prev_end = seg_end
             self.free_segment(free_index, start_pos=start_pos)
+
+    def free_request_segments(self, segments, *, swa_evicted_seqlen: int):
+        """Free request-row segments using CPU-known per-request state.
+
+        Non-SWA allocators have no auxiliary mapping frontier, so this is the
+        ordinary segment release. SWA allocators override it to avoid global
+        sparse-mapping discovery on the scheduler thread.
+        """
+        self.free_segments(segments)
