@@ -1074,6 +1074,10 @@ class MambaPool:
             tensors = value if isinstance(value, list) else [value]
             slice_axis = self.conv_slice_axis if field == "conv" else 0
             for state_tensor in tensors:
+                # A ShortConv layer has no temporal state, so that buffer is
+                # empty. Advertising it fails the whole batch registration.
+                if state_tensor.numel() == 0:
+                    continue
                 yield field, state_tensor, slice_axis
 
     def get_contiguous_buf_infos(self):
