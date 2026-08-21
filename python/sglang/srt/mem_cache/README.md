@@ -1,7 +1,7 @@
 # `mem_cache/`
 
 Everything that owns KV / SSM-state memory: who hands out slots, who holds the bytes on
-the device, who mirrors them to host and disk, and which prefix-cache tree decides what
+the device, who mirrors them to host and disk, and which radix cache decides what
 to keep. The layout is specified in
 [#25371](https://github.com/sgl-project/sglang/issues/25371).
 
@@ -33,13 +33,16 @@ to keep. The layout is specified in
 | `pool/` | physical KV / SSM state layout | `(layer_id, indices)` <-> tensor |
 | `pool_host/` | host mirror + H2D/D2H | `device_indices` <-> `host_indices` |
 | `storage/` | L3 backends (file, NIXL, HF3FS, Mooncake, ...) | hash -> bytes |
-| prefix-cache trees | what to keep and what to evict | token prefix -> node |
+| radix cache | what to keep and what to evict | token prefix -> node |
 
 Two groups sit outside that stack:
 
-- **Prefix-cache trees** are their own axis, one module each at the root
-  (`radix_cache.py`, `swa_radix_cache.py`, `mamba_radix_cache.py`, `hiradix_cache.py`,
-  `chunk_cache.py`, ...) plus the `unified_cache/` subpackage.
+- **Radix cache** is its own axis. The per-model variants (`radix_cache.py`,
+  `swa_radix_cache.py`, `mamba_radix_cache.py`, `hiradix_cache.py`, `chunk_cache.py`)
+  are converging onto the **Unified Radix Cache** (`unified_cache/`,
+  [#20415](https://github.com/sgl-project/sglang/issues/20415)), whose Full/SWA/Mamba
+  component model is documented in
+  [`unified_cache/components/README.md`](unified_cache/components/README.md).
 - **Construction** cuts across every layer rather than sitting in it:
   `kv_cache_configurator.py`, `kv_cache_builder.py`, `cache_init_params.py`,
   `allocation_sizing.py`, `kv_cache_dtype.py`, `kv_vmm_backing.py`, and
