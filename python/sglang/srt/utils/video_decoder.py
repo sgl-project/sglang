@@ -192,8 +192,12 @@ class VideoDecoderWrapper:
         return None
 
     def close(self):
-        """Explicitly clean up temporary files."""
-        if self._tmp_path is not None:
+        """Release decoder state, retained source bytes, and temporary files."""
+        self._decoder = None
+        self._source = None
+        self._source_bytes = None
+        self._source_path = None
+        if getattr(self, "_tmp_path", None) is not None:
             if os.path.exists(self._tmp_path):
                 os.unlink(self._tmp_path)
             self._tmp_path = None

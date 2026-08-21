@@ -112,6 +112,7 @@ from sglang.srt.models.glm_ocr import (
     GlmOcrVisionPatchEmbed,
     GlmOcrVisionPatchMerger,
 )
+from sglang.srt.multimodal.glm_visual import run_glm_visual_chunked
 from sglang.srt.multimodal.mm_utils import (
     run_dp_presharded_mrope_vision_model,
     run_dp_sharded_mrope_vision_model,
@@ -1228,45 +1229,63 @@ class Glm5NextForConditionalGeneration(nn.Module):
         vision_utils.update_vit_attn_dummy_heads_config(config)
         self.mm_config = config
         text_config = config.text_config
+        self.encoder_only = bool(getattr(config, "encoder_only", False))
+        self.language_only = bool(getattr(config, "language_only", False))
 
-        self.fuse_qkv_a_proj = getattr(text_config, "q_lora_rank", None) is not None
+        self.fuse_qkv_a_proj = (
+            not self.encoder_only
+            and getattr(text_config, "q_lora_rank", None) is not None
+        )
 
         self.pp_group = get_pp_group()
         self.config = text_config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
-        self.determine_num_fused_shared_experts()
         self.use_dsa = is_deepseek_dsa(text_config)
-        self.model = Glm5NextModel(
-            text_config, quant_config, prefix=add_prefix("model", prefix)
-        )
-        if self.pp_group.is_last_rank:
-            if self.pp_group.world_size == 1 and text_config.tie_word_embeddings:
-                self.lm_head = self.model.embed_tokens
+        self.num_fused_shared_experts = 0
+        self.model = None
+        self.lm_head = None
+        self.logits_processor = None
+        if not self.encoder_only:
+            self.determine_num_fused_shared_experts()
+            self.model = Glm5NextModel(
+                text_config, quant_config, prefix=add_prefix("model", prefix)
+            )
+            if self.pp_group.is_last_rank:
+                if self.pp_group.world_size == 1 and text_config.tie_word_embeddings:
+                    self.lm_head = self.model.embed_tokens
+                else:
+                    self.lm_head = ParallelLMHead(
+                        text_config.vocab_size,
+                        text_config.hidden_size,
+                        quant_config=quant_config,
+                        prefix=add_prefix("lm_head", prefix),
+                        use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                    )
             else:
-                self.lm_head = ParallelLMHead(
-                    text_config.vocab_size,
-                    text_config.hidden_size,
-                    quant_config=quant_config,
-                    prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
-                )
-        else:
-            self.lm_head = PPMissingLayer()
-        self.logits_processor = LogitsProcessor(text_config)
+                self.lm_head = PPMissingLayer()
+            self.logits_processor = LogitsProcessor(text_config)
 
         self._routed_experts_weights_of_layer = LazyValue(
-            lambda: {
-                layer_id: layer.mlp.get_moe_weights()
-                for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, Glm5NextMoE)
-            }
+            lambda: (
+                {
+                    layer_id: layer.mlp.get_moe_weights()
+                    for layer_id, layer in enumerate(self.model.layers)
+                    if isinstance(layer.mlp, Glm5NextMoE)
+                }
+                if self.model is not None
+                else {}
+            )
         )
         self.capture_aux_hidden_states = False
 
-        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        self.dsa_enable_prefill_cp = (
+            not self.encoder_only and is_dsa_enable_prefill_cp()
+        )
         self.mla_enable_prefill_cp = (
-            is_prefill_context_parallel_enabled() and not is_deepseek_dsa(text_config)
+            not self.encoder_only
+            and is_prefill_context_parallel_enabled()
+            and not is_deepseek_dsa(text_config)
         )
         if self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp:
             self.cp_rank = get_parallel().attn_cp_rank
@@ -1274,20 +1293,31 @@ class Glm5NextForConditionalGeneration(nn.Module):
         else:
             self.cp_rank = self.cp_size = None
 
-        get_attn_tp_context().init_context(
-            getattr(text_config, "q_lora_rank", None), self.use_dsa, text_config.mhc
-        )
+        if not self.encoder_only:
+            get_attn_tp_context().init_context(
+                getattr(text_config, "q_lora_rank", None),
+                self.use_dsa,
+                text_config.mhc,
+            )
 
         self.use_data_parallel = get_server_args().mm_enable_dp_encoder
-        self.visual = Glm5NextVisionModel(
-            config.vision_config,
-            quant_config=quant_config,
-            prefix=add_prefix("visual", prefix),
-            use_data_parallel=self.use_data_parallel,
+        self.visual = None
+        if not self.language_only:
+            self.visual = Glm5NextVisionModel(
+                config.vision_config,
+                quant_config=quant_config,
+                prefix=add_prefix("visual", prefix),
+                use_data_parallel=self.use_data_parallel,
+            )
+        self.is_mrope_enabled = not self.encoder_only and "mrope_section" in (
+            self.config.rope_scaling or {}
         )
-        self.is_mrope_enabled = "mrope_section" in (self.config.rope_scaling or {})
 
     def get_input_embeddings(self) -> nn.Embedding:
+        if self.model is None:
+            raise AttributeError(
+                "get_input_embeddings() is not available in encoder-only mode"
+            )
         return self.model.embed_tokens
 
     @property
@@ -1395,12 +1425,15 @@ class Glm5NextForConditionalGeneration(nn.Module):
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
-        if self.use_data_parallel:
-            return run_dp_sharded_mrope_vision_model(
-                self.visual, pixel_values, image_grid_thw.tolist(), rope_type="rope_3d"
-            )
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-        return image_embeds
+
+        def run_visual(px, grid):
+            if self.use_data_parallel:
+                return run_dp_sharded_mrope_vision_model(
+                    self.visual, px, grid.tolist(), rope_type="rope_3d"
+                )
+            return self.visual(px, grid_thw=grid)
+
+        return run_glm_visual_chunked(run_visual, pixel_values, image_grid_thw)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
@@ -1432,15 +1465,17 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 global_grid,
                 dp_meta["gpu_sample_counts"],
             )
-        if self.use_data_parallel:
-            return run_dp_sharded_mrope_vision_model(
-                self.visual,
-                pixel_values,
-                flattened_video_grid_thw.tolist(),
-                rope_type="rope_3d",
-            )
-        video_embeds = self.visual(pixel_values, grid_thw=flattened_video_grid_thw)
-        return video_embeds
+
+        def run_visual(px, grid):
+            if self.use_data_parallel:
+                return run_dp_sharded_mrope_vision_model(
+                    self.visual, px, grid.tolist(), rope_type="rope_3d"
+                )
+            return self.visual(px, grid_thw=grid)
+
+        return run_glm_visual_chunked(
+            run_visual, pixel_values, flattened_video_grid_thw
+        )
 
     def _prepare_context_parallel_metadata(
         self,
@@ -1575,6 +1610,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
         params_dict = dict(self.named_parameters())
         weight_names = []
         for name, loaded_weight in weights:
+            is_visual_weight = "visual" in name
+            if getattr(self, "encoder_only", False) and not is_visual_weight:
+                continue
+            if getattr(self, "language_only", False) and is_visual_weight:
+                continue
+
             if "language_model." in name:
                 name = name.replace("language_model.", "")
             if "model.visual." in name:
@@ -1731,7 +1772,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
 
-        if is_nextn:
+        if getattr(self, "encoder_only", False):
+            run_post = False
+        elif is_nextn:
             decoder_attn = getattr(self.model.decoder, "self_attn", None)
             run_post = decoder_attn is not None and hasattr(decoder_attn, "kv_b_proj")
         else:
@@ -1742,11 +1785,17 @@ class Glm5NextForConditionalGeneration(nn.Module):
             )
 
     def post_load_weights(self, is_nextn: bool = False, weight_names=None):
+        if self.encoder_only:
+            return
         DeepseekV2WeightLoaderMixin.post_load_weights(
             self, is_nextn=is_nextn, weight_names=weight_names
         )
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        if self.model is None:
+            raise AttributeError(
+                "load_kv_cache_scales() is not available in encoder-only mode"
+            )
         if callable(getattr(self.model, "load_kv_cache_scales", None)):
             self.model.load_kv_cache_scales(quantization_param_path)
         else:
@@ -1755,9 +1804,17 @@ class Glm5NextForConditionalGeneration(nn.Module):
             )
 
     def get_embed_and_head(self):
+        if self.model is None or self.lm_head is None:
+            raise AttributeError(
+                "get_embed_and_head() is not available in encoder-only mode"
+            )
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
+        if self.model is None or self.lm_head is None:
+            raise AttributeError(
+                "set_embed_and_head() is not available in encoder-only mode"
+            )
         del self.model.embed_tokens.weight
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed

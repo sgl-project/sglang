@@ -7848,10 +7848,11 @@ class ServerArgs:
             "KimiK25ForConditionalGeneration",
             "KimiK3ForConditionalGeneration",
             "MiMoV2ForCausalLM",
+            "Glm5NextForConditionalGeneration",
         ]:
             raise ValueError(
                 f"Model type {model_arch} is not supported for encoder disaggregation. "
-                f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, Qwen2Audio, Qwen2.5Omni, Kimi, MiMoV2."
+                f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, Qwen2Audio, Qwen2.5Omni, Kimi, MiMoV2, GLM5Next."
             )
 
     def _validate_ib_devices(self, device_str: Optional[str]) -> Optional[str]:

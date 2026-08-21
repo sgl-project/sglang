@@ -1,3 +1,4 @@
+import asyncio
 import json
 import math
 from typing import List, Union
@@ -15,6 +16,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
+from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 try:
     from sglang.srt.models.glm_ocr import GlmOcrForConditionalGeneration
@@ -26,12 +28,17 @@ try:
 except ImportError:
     Glm5NextForConditionalGeneration = None
 
-
 GLM_VIDEO_DEFAULT_FPS = 2.0
 GLM_VIDEO_DEFAULT_MAX_FRAMES = 2048
 GLM_VIDEO_PATCH_SIZE = 14
 GLM_VIDEO_MERGE_SIZE = 2
 GLM_VIDEO_PATCH_EXPAND_FACTOR = 4
+GLM_MEDIA_CONFIG_KEYS = (
+    "fps",
+    "max_frames",
+    "max_tokens_per_frame",
+    "max_image_tokens",
+)
 
 
 def _glm_video_metadata(total_num_frames, fps, duration, frames_indices):
@@ -44,29 +51,86 @@ def _glm_video_metadata(total_num_frames, fps, duration, frames_indices):
     }
 
 
+def _glm_item_config(item):
+    config = dict(getattr(item, "preprocess_kwargs", None) or {})
+    if isinstance(item, dict):
+        config.update(item.get("preprocess_kwargs") or {})
+        config.update(
+            {
+                key: item[key]
+                for key in GLM_MEDIA_CONFIG_KEYS
+                if item.get(key) is not None
+            }
+        )
+    return {
+        key: config[key] for key in GLM_MEDIA_CONFIG_KEYS if config.get(key) is not None
+    }
+
+
 def split_glm_video_items(mm_data):
-    """Extract per-video sampling overrides from URL dictionaries."""
+    """Extract per-video controls and return sources suitable for decoding."""
+    if mm_data is None:
+        return None, []
     items = mm_data if isinstance(mm_data, (list, tuple)) else [mm_data]
     urls, configs = [], []
     for item in items:
         if isinstance(item, dict) and "format" not in item and "url" in item:
             urls.append(item["url"])
-            configs.append(
-                {
-                    key: item[key]
-                    for key in (
-                        "fps",
-                        "max_frames",
-                        "max_tokens_per_frame",
-                        "max_image_tokens",
-                    )
-                    if item.get(key) is not None
-                }
-            )
+        elif hasattr(item, "url") and hasattr(item, "preprocess_kwargs"):
+            urls.append(item.url)
         else:
             urls.append(item)
-            configs.append({})
+        configs.append(_glm_item_config(item))
     return urls, configs
+
+
+def glm_budget_kwargs(processor, user_max_image_tokens=None, count=1, split=False):
+    """Resolve an optional per-item visual-token budget for a HF processor."""
+    if processor is None:
+        return None
+    default_max = getattr(processor, "max_image_tokens", None)
+    if not default_max:
+        return None
+
+    if user_max_image_tokens is not None:
+        budget = int(user_max_image_tokens)
+    elif split:
+        budget = int(default_max)
+    else:
+        return None
+
+    count = max(int(count or 1), 1)
+    effective = max(1, budget // count if split and count > 1 else budget)
+    if effective == default_max and user_max_image_tokens is None:
+        return None
+    return {"max_image_tokens": effective}
+
+
+def glm_max_image_tokens_from_configs(configs):
+    """Return the tightest max_image_tokens override across media items."""
+    values = [
+        int(config["max_image_tokens"])
+        for config in configs or []
+        if isinstance(config, dict) and config.get("max_image_tokens") is not None
+    ]
+    return min(values) if values else None
+
+
+def glm_processor_video_config(processor):
+    """Read GLM video defaults exposed by the model's HF processor."""
+    if processor is None:
+        return {}
+    return {
+        key: value
+        for key in GLM_MEDIA_CONFIG_KEYS
+        if (value := getattr(processor, key, None)) is not None
+    }
+
+
+def _merge_glm_video_configs(default_config, item_configs):
+    """Merge server defaults with per-request overrides."""
+    defaults = dict(default_config or {})
+    return [{**defaults, **dict(config or {})} for config in item_configs]
 
 
 def glm_sample_frame_indices(
@@ -297,17 +361,82 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
+        # Normalize inline media dictionaries before loading. In particular, a
+        # bare base64 video must go through SGLang's decoder rather than being
+        # forwarded to the HF video loader as a path-like string.
+        video_urls, video_configs = split_glm_video_items(request_obj.video_data)
+        video_processor = getattr(self._processor, "video_processor", None)
+        default_video_config = glm_processor_video_config(video_processor)
+        default_video_config.update(self.video_config)
+        video_configs = _merge_glm_video_configs(default_video_config, video_configs)
+
         base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
-            video_data=request_obj.video_data,
+            video_data=video_urls,
             multimodal_tokens=self.mm_tokens,
         )
 
-        if base_output.videos:
-            base_output.videos = request_obj.video_data
+        video_metadata = None
+        if base_output.videos and not isinstance(base_output.videos[0], dict):
+            loop = asyncio.get_running_loop()
+            decode_tasks = []
+            for index, video in enumerate(base_output.videos):
+                video_config = (
+                    video_configs[index] if index < len(video_configs) else {}
+                )
+                if isinstance(video, VideoDecoderWrapper):
+                    decode_tasks.append(
+                        loop.run_in_executor(
+                            self.io_executor,
+                            glm_sample_and_decode_sync,
+                            video,
+                            video_config,
+                        )
+                    )
+                elif isinstance(video, list) and (
+                    not video or isinstance(video[0], dict)
+                ):
+                    decode_tasks.append(
+                        loop.run_in_executor(
+                            self.io_executor, preprocess_video_frames_sync, video
+                        )
+                    )
+                else:
+                    decode_tasks.append(asyncio.sleep(0, result=(video, None)))
+
+            videos_processed = await asyncio.gather(*decode_tasks)
+            for video in base_output.videos:
+                close = getattr(video, "close", None)
+                if callable(close):
+                    close()
+            base_output.videos, metadata = map(list, zip(*videos_processed))
+            if metadata and all(item is not None for item in metadata):
+                video_metadata = metadata
+
+        combine_kwargs = {}
+        if video_metadata is not None:
+            # Frames were already sampled by SGLang. Preserve the original
+            # indices for timestamps and prevent a second HF sampling pass.
+            combine_kwargs["video_metadata"] = video_metadata
+            combine_kwargs["do_sample_frames"] = False
+            videos_kwargs = glm_budget_kwargs(
+                video_processor,
+                user_max_image_tokens=glm_max_image_tokens_from_configs(video_configs),
+                count=len(base_output.videos),
+                split=True,
+            )
+            processor_video_config = {
+                key: value
+                for key, value in self.video_config.items()
+                if key not in {"fps", "max_frames", "max_tokens_per_frame"}
+            }
+            if videos_kwargs is not None:
+                processor_video_config.update(videos_kwargs)
+            combine_kwargs["processor_video_config"] = processor_video_config
+
         mm_items, input_ids, ret = self.process_and_combine_mm_data(
-            base_output, self.mm_tokens
+            base_output, self.mm_tokens, **combine_kwargs
         )
 
         input_ids = input_ids.flatten()

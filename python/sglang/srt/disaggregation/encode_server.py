@@ -69,7 +69,10 @@ from sglang.srt.multimodal.encoder_preprocessing import (
     resolve_encoder_media_processor_config,
 )
 from sglang.srt.multimodal.processors.glm4v import (
+    glm_budget_kwargs,
     glm_decode_frames_at,
+    glm_max_image_tokens_from_configs,
+    glm_processor_video_config,
     glm_sample_and_decode_sync,
     glm_sample_frame_indices,
     preprocess_video_frames_sync,
@@ -880,6 +883,13 @@ class MMEncoder:
         }
         return [frames], video_processor_kwargs
 
+    @staticmethod
+    def _close_video_decoders(video_items) -> None:
+        for video in video_items or []:
+            close = getattr(video, "close", None)
+            if callable(close):
+                close()
+
     async def _flatten_and_load_videos(self, mm_items):
         if not isinstance(mm_items, (list, tuple)):
             mm_items = [mm_items]
@@ -887,6 +897,11 @@ class MMEncoder:
         video_configs = [{} for _ in mm_items]
         if "glm" in self.model_type:
             mm_items, video_configs = split_glm_video_items(mm_items)
+            defaults = glm_processor_video_config(self.video_processor)
+            defaults.update(self.vision_config.get("video", {}))
+            video_configs = [
+                {**defaults, **dict(config or {})} for config in video_configs
+            ]
 
         futures, _ = self.submit_data_loading_tasks(
             mm_items, [Modality.VIDEO] * len(mm_items)
@@ -908,7 +923,17 @@ class MMEncoder:
             if video_metadata:
                 video_processor_kwargs["video_metadata"] = video_metadata
             return videos, video_processor_kwargs
-        elif "glm" in self.model_type:
+
+        if "glm" in self.model_type:
+            budget_kwargs = glm_budget_kwargs(
+                self.video_processor,
+                user_max_image_tokens=glm_max_image_tokens_from_configs(video_configs),
+                count=len(video_items),
+                split=True,
+            )
+            if budget_kwargs is not None:
+                video_processor_kwargs.update(budget_kwargs)
+
             framed = any(isinstance(video, list) for video in video_items)
             if framed:
                 processed = await asyncio.gather(
@@ -940,7 +965,7 @@ class MMEncoder:
                     and sampled is not None
                     and len(sampled) >= max(32, tp_size * 2)
                 ):
-                    return await self._dp_sharded_decode_single_video(
+                    result = await self._dp_sharded_decode_single_video(
                         video_items[0],
                         video_configs[0],
                         tp_rank=get_attn_tensor_model_parallel_rank(),
@@ -948,6 +973,9 @@ class MMEncoder:
                         video_processor_kwargs=video_processor_kwargs,
                         precomputed_indices=sampled,
                     )
+                    self._close_video_decoders(video_items)
+                    return result
+
                 processed = await asyncio.gather(
                     *[
                         asyncio.get_running_loop().run_in_executor(
@@ -964,11 +992,13 @@ class MMEncoder:
             video_processor_kwargs["return_metadata"] = True
             if video_metadata:
                 video_processor_kwargs["video_metadata"] = video_metadata
+            self._close_video_decoders(video_items)
             return videos, video_processor_kwargs
-        else:
-            raise NotImplementedError(
-                f"Video processing is not supported for {self.model_type} model."
-            )
+
+        self._close_video_decoders(video_items)
+        raise NotImplementedError(
+            f"Video processing is not supported for {self.model_type} model."
+        )
 
     async def _flatten_and_load_data_by_modality(self, mm_items, modality):
         """
@@ -3694,8 +3724,7 @@ class DPDispatcher:
                     )
                     self._listener_failed = True
                     self._fail_all_pending(
-                        "encoder DP result listener stopped after repeated "
-                        "recv errors",
+                        "encoder DP result listener stopped after repeated recv errors",
                         "ResultListenerStopped",
                     )
                     return
@@ -4453,9 +4482,13 @@ async def handle_encode_request(request: dict):
             encoder_metrics_collector.inc_requests_received(modality=modality_str)
         if encoder_scheduler is not None and modality in _BATCHABLE_MODALITIES:
             try:
-                nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                    await encoder_scheduler.submit(request)
-                )
+                (
+                    nbytes,
+                    embedding_len,
+                    embedding_dim,
+                    error_msg,
+                    error_code,
+                ) = await encoder_scheduler.submit(request)
             except asyncio.TimeoutError:
                 time_stats.trace_ctx.abort(
                     abort_info={"reason": "encoder batch timed out"}
@@ -4476,9 +4509,13 @@ async def handle_encode_request(request: dict):
             async with encoder.encode_dispatch_lock:
                 for socket in send_sockets:
                     sock_send(socket, wrap_as_pickle(request))
-                nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                    await encoder.encode_request(request, modality)
-                )
+                (
+                    nbytes,
+                    embedding_len,
+                    embedding_dim,
+                    error_msg,
+                    error_code,
+                ) = await encoder.encode_request(request, modality)
 
         if error_msg:
             time_stats.trace_ctx.abort(abort_info={"reason": error_msg})

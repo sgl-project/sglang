@@ -1149,6 +1149,10 @@ class Envs:
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
+    # Bound GLM ViT activation peaks by splitting on visual-grid row boundaries.
+    # Set either value to 0 to disable that limit.
+    SGLANG_VLM_MAX_PATCHES_PER_VIT = EnvInt(8192)
+    SGLANG_VLM_MAX_IMAGES_PER_VIT = EnvInt(16)
     # Use the fully-vectorized ViT position-embedding interpolation (no per-image
     # Python loop / CPU<->GPU sync). Bit-exact with the legacy implementation;
     # set False to fall back to the per-image loop.
