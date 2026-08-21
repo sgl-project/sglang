@@ -214,10 +214,10 @@ def register_fsdp_entrypoints(model: torch.nn.Module) -> None:
     the shard conditions did not match stay in the catch-all root group, whose
     hook therefore never fires for a model driven through a custom method, and
     the first op mixing them with a plain tensor fails. Models declare those
-    entry points in ``_fsdp_forward_methods``. ``BaseDiT`` and ``TextEncoder``
-    default it to ``()``, while third-party encoder wrappers may omit it.
+    entry points in ``_fsdp_forward_methods``, which every model loaded through
+    FSDP must define; ``BaseDiT`` and ``TextEncoder`` default it to ``()``.
     """
-    for name in getattr(model, "_fsdp_forward_methods", ()):
+    for name in model._fsdp_forward_methods:
         register_fsdp_forward_method(model, name)
 
 

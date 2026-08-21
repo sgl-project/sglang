@@ -82,21 +82,6 @@ class _ComponentStage:
         ]
 
 
-def _executor_with_modules(**modules):
-    """Executor wired to a residency manager stub.
-
-    ``component_residency_manager`` stays ``None`` until
-    ``ComposedPipelineBase.forward`` assigns it, so stage-context tests provide
-    it themselves. The stub mirrors the real ``get_module``, which returns
-    ``None`` for any component that is not a loaded ``nn.Module``.
-    """
-    executor = _RecordingExecutor()
-    executor.component_residency_manager = SimpleNamespace(
-        get_module=lambda component_name: modules.get(component_name)
-    )
-    return executor
-
-
 def test_execute_with_profiling_uses_inference_tensor_platform(monkeypatch):
     monkeypatch.setattr(pipeline_executor, "current_platform", _InferenceTensorPlatform)
     executor = _RecordingExecutor()
@@ -168,7 +153,7 @@ def test_stage_context_preserves_version_counters_when_needed(
     stage = _ComponentStage(*component_names)
 
     with torch.inference_mode():
-        with _executor_with_modules()._stage_execution_context(stage, server_args):
+        with PipelineExecutor._stage_execution_context(stage, server_args):
             tensor = torch.ones(1)
 
             assert torch.is_inference_mode_enabled() is False
@@ -195,7 +180,7 @@ def test_stage_context_allows_layerwise_inference_tensor_mode(
     stage = _ComponentStage(*component_names)
 
     with torch.inference_mode():
-        with _executor_with_modules()._stage_execution_context(stage, server_args):
+        with PipelineExecutor._stage_execution_context(stage, server_args):
             assert torch.is_inference_mode_enabled() is True
 
     assert torch.is_inference_mode_enabled() is False
