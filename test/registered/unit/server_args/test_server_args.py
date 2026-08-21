@@ -1060,6 +1060,13 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
                 FlashinferA2ADispatchType.BF16,
             )
 
+    def test_runtime_getter_rejects_unresolved_auto(self):
+        with get_context().override_server_args(
+            flashinfer_a2a_dispatch_type="auto",
+        ):
+            with self.assertRaisesRegex(RuntimeError, "must resolve it"):
+                get_flashinfer_a2a_dispatch_type()
+
     def test_explicit_nvfp4_checks_hybrid_metadata_for_mxfp8_quantization(self):
         server_args = self._make_args(quantization="mxfp8", dispatch_type="nvfp4")
         server_args.get_model_config = MagicMock(

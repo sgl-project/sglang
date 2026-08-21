@@ -557,6 +557,17 @@ class TestResources(_IsolatedServerArgs):
         reset_context()
         self.assertIsNone(get_global_expert_location_metadata())
 
+    def test_flashinfer_megamoe_workspaces_follow_context_reset(self):
+        from sglang.srt.runtime_context import get_resources
+
+        reset_context()
+        resources = get_resources()
+        resources.flashinfer_megamoe_workspaces["shape"] = object()
+
+        reset_context()
+        self.assertIsNot(get_resources(), resources)
+        self.assertEqual(get_resources().flashinfer_megamoe_workspaces, {})
+
 
 class TestNamedStreams(_IsolatedServerArgs):
     """ctx.get_stream(name): keyed get-or-create (the persistent-buffer

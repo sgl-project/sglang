@@ -6780,23 +6780,6 @@ class ServerArgs:
 
         view = resolved_view(self)
 
-        if view.quantization == "mxfp8":
-            if view.moe_runner_backend == "auto":
-                view.moe_runner_backend = "flashinfer_trtllm"
-            elif view.moe_runner_backend not in [
-                "cutlass",
-                "flashinfer_megamoe",
-                "flashinfer_trtllm",
-                "flashinfer_trtllm_routed",
-            ]:
-                logger.warning(
-                    "mxfp8 quantization supports only cutlass, "
-                    "flashinfer_megamoe, flashinfer_trtllm, or "
-                    "flashinfer_trtllm_routed backends. "
-                    f"Overriding {view.moe_runner_backend!r}."
-                )
-                view.moe_runner_backend = "flashinfer_trtllm"
-
         if view.moe_runner_backend == "flashinfer_cutlass":
             assert view.quantization in [
                 "modelopt_fp4",
@@ -6955,10 +6938,7 @@ class ServerArgs:
                 "--flashinfer-a2a-dispatch-type."
             )
 
-        if nvfp4_dispatch_env_is_set:
-            dispatch_type = "nvfp4" if envs.SGLANG_MOE_NVFP4_DISPATCH.get() else "bf16"
-        else:
-            dispatch_type = cli_dispatch_type or "auto"
+        dispatch_type = cli_dispatch_type or "auto"
 
         supports_nvfp4_dispatch = (
             self.quantization == "modelopt_fp4"

@@ -12,6 +12,7 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.layers.dp_attention import set_dp_buffer_len
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
 from sglang.srt.layers.moe.utils import initialize_moe_config
+from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
@@ -70,7 +71,10 @@ class TestFlashinferDispatcher(CustomTestCase):
         )
 
     def set_dispatch_type(self, dispatch_type):
-        self.__class__.server_args.flashinfer_a2a_dispatch_type = dispatch_type
+        get_context().override(
+            "test_flashinfer_dispatcher",
+            flashinfer_a2a_dispatch_type=dispatch_type,
+        )
 
     def _zero_moe_a2a_dispatch_payloads(self):
         # Shared MoeAlltoAll workspaces keep stale recv payloads across tests.
@@ -424,6 +428,67 @@ class TestFlashinferDispatcher(CustomTestCase):
             (num_tokens * world_size, router_topk),
         )
         self.assertEqual(dispatch_output.topk_output.topk_ids.dtype, torch.int32)
+
+    def test_dispatch_with_mxfp8_quantization_and_empty_rank(self):
+        """All ranks must contribute the same payload dtypes, including empty ranks."""
+        self.set_dispatch_type("mxfp8")
+        num_tokens = 16
+        hidden_size = 128
+        router_topk = 1
+        world_size = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+        empty_rank = 1
+
+        global_num_tokens = [num_tokens] * world_size
+        global_num_tokens[empty_rank] = 0
+        set_dp_buffer_len(
+            global_dp_buffer_len=num_tokens * world_size,
+            local_dp_buffer_len=num_tokens,
+            dp_max_padding=False,
+            global_num_tokens=global_num_tokens,
+        )
+
+        local_tokens = 0 if rank == empty_rank else num_tokens
+        hidden_states = torch.randn(
+            (local_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
+        )
+        target_expert = (rank + 1) % world_size
+        topk_ids = torch.full(
+            (local_tokens, router_topk),
+            target_expert,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        topk_weights = torch.ones(
+            (local_tokens, router_topk), dtype=torch.float32, device="cuda"
+        )
+
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        dispatcher = self.create_dispatcher(
+            router_topk=router_topk,
+            num_experts=world_size,
+            num_local_experts=1,
+            hidden_size=hidden_size,
+        )
+        dispatcher.set_quant_config({"input_global_scale": None})
+        self._zero_moe_a2a_dispatch_payloads()
+        torch.distributed.barrier()
+        dispatch_output = dispatcher.dispatch(
+            hidden_states,
+            StandardTopKOutput(
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                router_logits=None,
+            ),
+        )
+
+        self.assertEqual(dispatch_output.hidden_states.dtype, torch.float8_e4m3fn)
+        self.assertEqual(dispatch_output.hidden_states_scale.dtype, torch.uint8)
+        self.assertEqual(
+            dispatch_output.hidden_states.shape,
+            (num_tokens * world_size, hidden_size),
+        )
 
 
 if __name__ == "__main__":

@@ -366,6 +366,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         get_moe_a2a_backend().is_deepep()
                         or get_moe_a2a_backend().is_mori()
                         or get_moe_a2a_backend().is_flashinfer()
+                        or get_moe_a2a_backend().is_flashinfer_megamoe()
                     )
                     else {}
                 ),

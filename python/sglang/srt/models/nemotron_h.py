@@ -235,6 +235,7 @@ class NemotronHMoE(nn.Module):
                     dict(tp_rank=0, tp_size=1)
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_flashinfer()
+                    or get_moe_a2a_backend().is_flashinfer_megamoe()
                     else {}
                 ),
                 prefix=f"{prefix}.shared_experts",
