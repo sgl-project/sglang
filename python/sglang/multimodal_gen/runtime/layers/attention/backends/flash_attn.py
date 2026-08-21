@@ -374,6 +374,10 @@ class FlashAttentionImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.attention_metadata = FlashAttentionMetadata()
+        # Per-head sink logits (an extra always-attended column in the softmax
+        # denominator) and a local attention window, both off by default.
+        self.sinks = extra_impl_args.get("sinks")
+        self.window_size = extra_impl_args.get("window_size", (-1, -1))
 
     def forward(
         self,
@@ -410,6 +414,8 @@ class FlashAttentionImpl(AttentionImpl):
                 max_seqlen_k=max_seqlen_k,
                 softmax_scale=self.softmax_scale,
                 causal=self.causal,
+                window_size=tuple(self.window_size),
+                sinks=self.sinks,
                 return_softmax_lse=return_softmax_lse,
                 ver=fa_ver,
             )
@@ -427,6 +433,8 @@ class FlashAttentionImpl(AttentionImpl):
                     max_seqlen_k=max_seqlen_k,
                     softmax_scale=self.softmax_scale,
                     causal=self.causal,
+                    window_size=list(self.window_size),
+                    sinks=self.sinks,
                     return_softmax_lse=True,
                     ver=fa_ver,
                 )
@@ -441,6 +449,8 @@ class FlashAttentionImpl(AttentionImpl):
                 max_seqlen_k=max_seqlen_k,
                 softmax_scale=self.softmax_scale,
                 causal=self.causal,
+                window_size=list(self.window_size),
+                sinks=self.sinks,
                 return_softmax_lse=False,
                 ver=fa_ver,
             )
@@ -469,6 +479,8 @@ class FlashAttentionImpl(AttentionImpl):
             max_seqlen_k=max_seqlen,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
+            window_size=tuple(self.window_size),
+            sinks=self.sinks,
             ver=fa_ver,
         )
         return output[0] if isinstance(output, tuple) else output
