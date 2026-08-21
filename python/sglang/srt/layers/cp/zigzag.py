@@ -33,7 +33,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass
 from itertools import accumulate
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -338,6 +338,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         return [
             CPAttentionBackendKind.FLASH_ATTENTION,
             CPAttentionBackendKind.TRTLLM_MHA,
+            CPAttentionBackendKind.FLASHINFER,
         ]
 
     def run_attention(
@@ -345,7 +346,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         q: Any,
         forward_batch,
         device: Any,
-        attn_fn,
+        attn_fn: Callable[..., Any],
         attention_backend: CPAttentionBackendKind = CPAttentionBackendKind.FLASH_ATTENTION,
     ) -> Any:
         assert (
@@ -353,8 +354,19 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         ), f"{self.name} CP does not support {attention_backend=}"
 
         meta = forward_batch.attn_cp_metadata
-        q_prev = q[: meta.total_q_prev_tokens]
         logical_tokens = meta.total_q_prev_tokens + meta.total_q_next_tokens
+
+        if attention_backend == CPAttentionBackendKind.FLASHINFER:
+            result = attn_fn(q[:logical_tokens])
+            pad_size = q.shape[0] - logical_tokens
+            assert pad_size >= 0
+            if pad_size > 0:
+                result = torch.cat(
+                    [result, result.new_zeros(pad_size, *result.shape[1:])], dim=0
+                )
+            return result
+
+        q_prev = q[: meta.total_q_prev_tokens]
         q_next = q[meta.total_q_prev_tokens : logical_tokens]
 
         prev_kwargs = {}
