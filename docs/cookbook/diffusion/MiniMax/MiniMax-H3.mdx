@@ -1251,8 +1251,7 @@ launcher, which holds no weights.
 ```bash 12 GB + 32 GB, lossless
 sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
   --performance-mode memory \
-  --layerwise-offload-components dit,text_encoder,vae \
-  --layerwise-resident-layers video_vae=36
+  --layerwise-offload-components dit,text_encoder,vae
 ```
 
 **Recipe B — host memory is free (the fast path)**
@@ -1270,9 +1269,14 @@ Recipe B pins 116.7 GB of host memory (DiT 61.56 GB, text encoder 46.18 GB, VAE
 
 **What not to change, and why**
 
-- Keep `video_vae=36`. `decode_temporal` re-runs the whole video decoder once per
-  temporal chunk, so streaming its blocks pays the weight transfer per chunk —
-  150 s of decode against 13 s when all 36 are held.
+- `video_vae=36` is a 16 GB flag, not a 12 GB one. Holding all 36 decoder
+  blocks turns the 150 s streamed decode into 13 s, because `decode_temporal`
+  re-runs the whole decoder once per temporal chunk — but the held blocks are
+  9 GB of VRAM that the decode's own activations then collide with: at a 12 GiB
+  allocator cap the denoise completes and the decode raises out-of-memory, so
+  no output is ever written. Recipe B keeps it; Recipe A must not, and its
+  streamed decode measured 209 s on a busy host. That decode is the slow part
+  of Recipe A's request, and it is the price of fitting 12 GB.
 - Leave `--enable-torch-compile` off, as elsewhere on this page. Layerwise offload
   rebinds `param.data` on every layer, so compiled graphs do not get the benefit
   they would on resident weights.
