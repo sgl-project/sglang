@@ -1528,7 +1528,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         mamba_pool = getattr(req_pool, "mamba_pool", None)
         use_replayssm_commit = (
             mamba_pool is not None
-            and getattr(mamba_pool, "replayssm_cache_base", None) is not None
+            and (
+                getattr(mamba_pool, "replayssm_spec_fold", False)
+                or getattr(mamba_pool, "replayssm_cache_base", None) is not None
+            )
             and not getattr(mamba_pool, "replayssm_is_kda", False)
         )
         if use_replayssm_commit:

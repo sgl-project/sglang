@@ -61,7 +61,7 @@ class TestCompactSeqLensHostBound(CustomTestCase):
 
 
 class TestDFlashMambaCommit(CustomTestCase):
-    def test_linear_accept_index_uses_common_mamba_commit_hook(self):
+    def test_fold_replayssm_uses_common_mamba_commit_hook(self):
         from sglang.srt.speculative import dflash_worker_v2
         from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
@@ -80,7 +80,7 @@ class TestDFlashMambaCommit(CustomTestCase):
                     model_runner=SimpleNamespace(
                         req_to_token_pool=SimpleNamespace(
                             mamba_pool=SimpleNamespace(
-                                replayssm_cache_base=object(),
+                                replayssm_spec_fold=True,
                                 replayssm_is_kda=False,
                             )
                         )
