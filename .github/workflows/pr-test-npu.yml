@@ -289,6 +289,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
+      test_timeout_minutes: '180'
 
   base-c-test-acc-4-npu-a3:
     name: base-c-test-acc-4-npu-a3
@@ -302,6 +303,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
+      test_timeout_minutes: '180'
 
   base-c-test-acc-8-npu-a3:
     name: base-c-test-acc-8-npu-a3
@@ -315,6 +317,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
+      test_timeout_minutes: '180'
 
   base-c-test-acc-16-npu-a3:
     name: base-c-test-acc-16-npu-a3
@@ -328,6 +331,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
+      test_timeout_minutes: '180'
 
   base-c-test-perf-2-npu-a3:
     name: base-c-test-perf-2-npu-a3
@@ -341,6 +345,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
+      test_timeout_minutes: '180'
 
   base-c-test-perf-4-npu-a3:
     name: base-c-test-perf-4-npu-a3
@@ -354,6 +359,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
+      test_timeout_minutes: '180'
 
   base-c-test-perf-8-npu-a3:
     name: base-c-test-perf-8-npu-a3
@@ -367,6 +373,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
+      test_timeout_minutes: '180'
 
   base-c-test-perf-16-npu-a3:
     name: base-c-test-perf-16-npu-a3
@@ -380,6 +387,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
+      test_timeout_minutes: '180'
 
 
   pr-test-npu-finish:
