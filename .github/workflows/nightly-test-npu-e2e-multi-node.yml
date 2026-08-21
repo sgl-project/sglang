@@ -64,6 +64,11 @@ on:
         type: string
         default: '{}'
         description: 'JSON run metadata {branch_label, workflow_name, create_time}, recorded once at workflow start'
+      test_timeout_minutes:
+        required: false
+        type: string
+        default: '300'
+        description: 'timeout-minutes for the Run test step'
 
 concurrency:
   group: ascend-nightly-multi-node-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_config_name }}
@@ -126,7 +131,7 @@ jobs:
           done
 
       - name: Run test
-        timeout-minutes: 300
+        timeout-minutes: ${{ fromJson(inputs.test_timeout_minutes) }}
         run: |
           # sglang_source_relative_path is shared-disk path
           sglang_source_relative_path=tests/sglang
