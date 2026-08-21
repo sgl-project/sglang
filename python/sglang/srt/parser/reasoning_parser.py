@@ -599,13 +599,19 @@ class KimiK3Detector(BaseReasoningFormatDetector):
 
     def finish(self) -> StreamingParseResult:
         if not self._force_nonempty_content:
-            return StreamingParseResult()
+            return super().finish()
         text, self._stream_text = self._stream_text, ""
-        # A skipped-think answer was streamed as reasoning (no channel decision
-        # is possible mid-stream); close evidence re-emits it as content, like
-        # the base class's finish() re-emit of its accumulated reasoning.
-        if self._is_skipped_think_answer(text):
+        if self._in_reasoning and self._is_skipped_think_answer(text):
+            # _in_reasoning means no channel decision happened mid-stream, so the
+            # answer went out as reasoning; without this gate the re-emit duplicates
+            # answers already streamed as content (RESPONSE_OPEN / force_reasoning=False).
+            self._buffer = ""
             return StreamingParseResult(normal_text=self._clean_content(text))
+        if self._in_reasoning and not self.stream_reasoning and self._buffer:
+            # super().finish() would emit this buffer as content under
+            # force_nonempty_content — the leak the flag exists to prevent.
+            buffer, self._buffer = self._buffer, ""
+            return StreamingParseResult(reasoning_text=buffer)
         return StreamingParseResult()
 
     def _drain_content(self) -> str:

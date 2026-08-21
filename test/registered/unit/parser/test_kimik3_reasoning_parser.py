@@ -158,10 +158,6 @@ def test_reasoning_parser_registration() -> None:
     assert isinstance(ReasoningParser("kimi_k3").detector, KimiK3Detector)
 
 
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
-
-
 def _stream_with_finish(detector: KimiK3Detector, chunks: list[str]) -> tuple[str, str]:
     reasoning, content = _stream(detector, chunks)
     result = detector.finish()
@@ -227,3 +223,49 @@ def test_fnc_streaming_long_think_streams_without_close(chunk_size: int) -> None
     result = detector.finish()
     assert result.reasoning_text == ""
     assert result.normal_text == ""
+
+
+def test_fnc_streaming_response_open_not_reemitted() -> None:
+    detector = KimiK3Detector(force_reasoning=True, force_nonempty_content=True)
+    text = f"{RESPONSE_OPEN}bare answer{RESPONSE_CLOSE}{MESSAGE_CLOSE}"
+    reasoning, content = _stream_with_finish(detector, _chunks(text, 5))
+    # The channel switch already streamed the answer as content; finish()
+    # must not re-emit it.
+    assert reasoning == ""
+    assert content == "bare answer"
+
+
+def test_fnc_streaming_force_reasoning_off_not_reemitted() -> None:
+    detector = KimiK3Detector(force_reasoning=False, force_nonempty_content=True)
+    text = f"bare answer{RESPONSE_CLOSE}{MESSAGE_CLOSE}"
+    reasoning, content = _stream_with_finish(detector, _chunks(text, 5))
+    assert reasoning == ""
+    assert content == "bare answer"
+
+
+@pytest.mark.parametrize("force_nonempty_content", [False, True])
+def test_stream_reasoning_off_truncation_flushes_reasoning(
+    force_nonempty_content: bool,
+) -> None:
+    detector = KimiK3Detector(
+        force_reasoning=True,
+        stream_reasoning=False,
+        force_nonempty_content=force_nonempty_content,
+    )
+    reasoning, content = _stream_with_finish(detector, _chunks("still going", 5))
+    assert reasoning == "still going"
+    assert content == ""
+
+
+def test_fnc_stream_reasoning_off_skipped_think_reemits_content() -> None:
+    detector = KimiK3Detector(
+        force_reasoning=True, stream_reasoning=False, force_nonempty_content=True
+    )
+    text = f"bare answer{RESPONSE_CLOSE}{MESSAGE_CLOSE}"
+    reasoning, content = _stream_with_finish(detector, _chunks(text, 5))
+    assert reasoning == ""
+    assert content == "bare answer"
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))
