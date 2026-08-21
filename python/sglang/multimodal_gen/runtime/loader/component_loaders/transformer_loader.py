@@ -139,6 +139,8 @@ def _server_args_for_transformer_component(
 class TransformerLoader(ComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
 
+    allow_global_attention_backend_fallback = False
+
     component_names = [
         "transformer",
         "unconditional_transformer",
