@@ -500,6 +500,31 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller.register_host_pool_entry(entry)
         self.sidecar_pool_specs.append(spec)
 
+    def register_hicache_draft_pools(
+        self, specs: list[SidecarPoolSpec], entries: list[PoolEntry]
+    ) -> None:
+        if self.cache_controller is None:
+            raise RuntimeError("HiCache controller is not attached.")
+        unified_draft_swa = (
+            not specs and len(entries) == 1 and entries[0].name == PoolName.SWA
+        )
+        if not unified_draft_swa and len(specs) != len(entries):
+            raise ValueError(
+                "HiCache draft sidecar specs and entries must be paired, except "
+                "for the unified draft SWA component."
+            )
+        for entry in entries:
+            self.cache_controller.register_host_pool_entry(entry)
+            if (
+                entry.name == PoolName.SWA
+                and self.supports_swa()
+                and self.components[ComponentType.SWA]._swa_kv_pool_host is None
+            ):
+                self.swa_kv_pool_host = entry.host_pool
+                self.components[ComponentType.SWA]._swa_kv_pool_host = entry.host_pool
+                self.tree_core.has_swa_host_pool = True
+        self.sidecar_pool_specs.extend(specs)
+
     def release_host_resources(self) -> None:
         if self.host_pool_group is not None:
             self.host_pool_group.destroy()

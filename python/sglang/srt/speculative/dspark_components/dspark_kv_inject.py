@@ -105,7 +105,9 @@ class TargetHiddenKvInjector:
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
     ) -> None:
-        if is_unified_kv_triton():
+        if is_unified_kv_triton() and not getattr(
+            pool, "unified_swa_is_sidecar", False
+        ):
             swa_loc = self._unified_inject_loc(
                 pool=pool,
                 positions=positions,
@@ -190,7 +192,9 @@ class TargetHiddenKvInjector:
         if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
             if hidden_strided.numel() == 0:
                 return
-            if is_unified_kv_triton():
+            if is_unified_kv_triton() and not getattr(
+                pool, "unified_swa_is_sidecar", False
+            ):
                 inject_layout = build_unified_commit_inject_layout(
                     req_pool_indices=batch.req_pool_indices,
                     prefix_lens=prefix_lens,

@@ -81,7 +81,9 @@ class DraftSWASidecarLayout:
                 physical_size=committed_size,
                 committed_pages=committed_pages,
             )
-        scratch_base = ceil_align(committed_size + 1, page_size)
+        # Keep the complete allocator guard page on the committed side. HiCache
+        # exposes exactly committed_pages, so scratch must begin after that view.
+        scratch_base = committed_pages * page_size
         return cls(
             committed_size=committed_size,
             scratch_width=scratch_width,
@@ -124,15 +126,9 @@ def use_dsv4_dspark_draft_swa_sidecar(server_args, spec_algorithm) -> bool:
     requested = getattr(
         server_args, "speculative_dspark_draft_swa_sidecar", None
     )
-    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-        is_unified_kv_triton,
-    )
-
     unsupported_reason = None
     if is_npu():
         unsupported_reason = "NPU uses a separate DSV4 cache implementation"
-    elif is_unified_kv_triton():
-        unsupported_reason = "unified_kv still uses a request-scoped SWA ring"
 
     if unsupported_reason is not None:
         if requested is True:
@@ -509,7 +505,7 @@ class DeepSeekV4UnifiedKVPool:
     """
     Layout:
     unified_kv[L]: ``[swa_pages + padded_compress_rows, head_dim]`` bf16
-    - rows ``[0, swa_pages)``   = SWA ring (``req_pool_indices * swa_window + pos % swa_window``)
+    - rows ``[0, swa_pages)``   = SWA ring or draft sidecar + scratch
     - rows ``[swa_pages, ...)`` = compressed (``swa_pages + page_index``)
     """
 
@@ -528,11 +524,16 @@ class DeepSeekV4UnifiedKVPool:
         memory_saver_adapter,
         custom_mem_pool,
         swa_ring_size: int,
+        swa_rows: Optional[int] = None,
     ):
         self.swa_ring_size = swa_ring_size
         self.head_dim = qk_nope_head_dim + qk_rope_head_dim
         self.num_slots = num_slots
-        self.swa_pages = num_slots * self.swa_ring_size
+        self.swa_pages = (
+            int(swa_rows)
+            if swa_rows is not None
+            else num_slots * self.swa_ring_size
+        )
         self.num_blocks = num_blocks
         self.page_size = page_size
         self.k_per_block = dict(self.K_PER_BLOCK)
@@ -699,10 +700,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
 
         self._unified_kv = is_unified_kv_triton()
-        if self._unified_kv and self.draft_swa_layout.has_scratch:
-            raise NotImplementedError(
-                "DSV4 DSpark draft SWA scratch is not supported by unified_kv yet."
-            )
+        self.unified_swa_is_sidecar = (
+            self._unified_kv and self.draft_swa_layout.has_scratch
+        )
 
         if self._unified_kv:
             self.swa_kv_pool = None
@@ -724,6 +724,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 memory_saver_adapter=self.memory_saver_adapter,
                 custom_mem_pool=self.custom_mem_pool,
                 swa_ring_size=self.sliding_window + spec_extra,
+                swa_rows=(
+                    physical_swa_size + 1 if self.unified_swa_is_sidecar else None
+                ),
             )
 
             self.unified_swa_window = self.sliding_window
@@ -806,6 +809,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     ) -> torch.Tensor:
         return self.draft_swa_layout.scratch_locs(req_pool_indices, block_size)
 
+    def get_draft_swa_scratch_locs_for_tokens(
+        self, req_pool_indices: torch.Tensor, step_offsets: torch.Tensor
+    ) -> torch.Tensor:
+        if not self.has_draft_swa_scratch:
+            raise RuntimeError("DSV4 draft SWA scratch is not enabled.")
+        return (
+            self.draft_swa_layout.scratch_base
+            + req_pool_indices.to(torch.int64) * self.draft_swa_layout.scratch_width
+            + step_offsets.to(torch.int64)
+        )
+
     def translate_draft_committed_loc(
         self, full_indices: torch.Tensor
     ) -> torch.Tensor:
@@ -815,9 +829,19 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_draft_swa_committed_buffers(self) -> List[torch.Tensor]:
         """Views exposed to cache/transfer layers; scratch pages are excluded."""
         if self._unified_kv:
-            raise NotImplementedError(
-                "Unified KV does not expose a content-scoped draft SWA sidecar."
-            )
+            if not self.unified_swa_is_sidecar:
+                raise NotImplementedError(
+                    "Request-scoped unified KV has no draft SWA sidecar."
+                )
+            pages = self.draft_swa_layout.committed_pages
+            page_size = self.draft_swa_layout.page_size
+            head_dim = self.unified_kv_pool.head_dim
+            return [
+                buf.narrow(0, 0, pages * page_size)
+                .reshape(pages, page_size * head_dim)
+                .view(torch.uint8)
+                for buf in self.unified_kv_pool.kv_buffer
+            ]
         if not self.has_draft_swa_scratch:
             return list(self.swa_kv_pool.kv_buffer)
         pages = self.draft_swa_layout.committed_pages
@@ -885,7 +909,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         data_ptrs: List[int] = []
         data_lens: List[int] = []
         item_lens: List[int] = []
-        if not self._unified_kv:
+        if not self._unified_kv or self.unified_swa_is_sidecar:
             return data_ptrs, data_lens, item_lens
         swa_pages = self.unified_kv_pool.swa_pages
         for buf in self.unified_kv_pool.kv_buffer:
@@ -938,7 +962,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         data_lens: List[int] = []
         item_lens: List[int] = []
 
-        if not self._unified_kv:
+        if self.unified_swa_is_sidecar:
+            for buf in self.get_draft_swa_committed_buffers():
+                data_ptrs.append(buf.data_ptr())
+                data_lens.append(buf.nbytes)
+                item_lens.append(buf[0].nbytes)
+        elif not self._unified_kv:
             for buf in self.swa_kv_pool.kv_buffer:
                 assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
                 data_ptrs.append(buf.data_ptr())

@@ -1,9 +1,12 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.runtime import (
+    build_dspark_sidecar_decode_stream,
+)
 from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     build_dspark_swa_page_indices,
 )
@@ -18,10 +21,15 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     resolve_pool_hit_boundary,
 )
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    build_swa_draft_pools,
+)
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.draft_swa_sidecar_component import (
     DraftSWASidecarComponent,
 )
 from sglang.srt.mem_cache.unified_cache.components.swa_component import SWAComponent
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -170,22 +178,16 @@ class TestDSV4DraftSWASidecar(unittest.TestCase):
                 )
             )
 
-    def test_explicit_enable_rejects_request_scoped_unified_kv(self):
+    def test_unified_kv_uses_draft_only_sidecar_extension(self):
         spec = SimpleNamespace(is_dspark=lambda: True)
-        with (
-            patch(
-                "sglang.srt.mem_cache.deepseek_v4_memory_pool.is_npu",
-                return_value=False,
-            ),
-            patch(
-                "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate."
-                "is_unified_kv_triton",
-                return_value=True,
-            ),
-            self.assertRaisesRegex(NotImplementedError, "request-scoped SWA ring"),
+        with patch(
+            "sglang.srt.mem_cache.deepseek_v4_memory_pool.is_npu",
+            return_value=False,
         ):
-            use_dsv4_dspark_draft_swa_sidecar(
-                SimpleNamespace(speculative_dspark_draft_swa_sidecar=True), spec
+            self.assertTrue(
+                use_dsv4_dspark_draft_swa_sidecar(
+                    SimpleNamespace(speculative_dspark_draft_swa_sidecar=True), spec
+                )
             )
 
     def test_scratch_rows_are_outside_committed_sidecar(self):
@@ -212,6 +214,72 @@ class TestDSV4DraftSWASidecar(unittest.TestCase):
             pool.get_draft_swa_scratch_locs(
                 torch.tensor([0], dtype=torch.int64), block_size=6
             )
+
+    def test_scratch_starts_after_unaligned_committed_guard_page(self):
+        layout = DraftSWASidecarLayout.build(
+            committed_size=1023,
+            scratch_width=5,
+            num_req_slots=1,
+            page_size=256,
+        )
+
+        self.assertEqual(layout.committed_pages, 5)
+        self.assertEqual(layout.scratch_base, 5 * 256)
+        self.assertGreaterEqual(
+            layout.scratch_base, layout.committed_pages * layout.page_size
+        )
+
+    def test_per_token_scratch_locations_support_ragged_verify(self):
+        pool = object.__new__(DeepSeekV4TokenToKVPool)
+        pool.draft_swa_layout = DraftSWASidecarLayout.build(
+            committed_size=1024,
+            scratch_width=5,
+            num_req_slots=4,
+            page_size=256,
+        )
+
+        locs = pool.get_draft_swa_scratch_locs_for_tokens(
+            torch.tensor([1, 1, 3], dtype=torch.int64),
+            torch.tensor([0, 2, 4], dtype=torch.int64),
+        )
+
+        self.assertEqual(locs.tolist(), [1285, 1287, 1299])
+
+    def test_unified_stream_combines_committed_prefix_and_step_scratch(self):
+        req_to_token = torch.tensor(
+            [[10, 11, 12, 13, 14, 15]], dtype=torch.int64
+        )
+        full_to_swa = torch.arange(64, dtype=torch.int64) + 100
+
+        indices, indptr = build_dspark_sidecar_decode_stream(
+            req_to_token=req_to_token,
+            full_to_swa_mapping=full_to_swa,
+            state_slot=torch.tensor([0, 0], dtype=torch.int64),
+            chunk_start=torch.tensor([3, 3], dtype=torch.int64),
+            final_pos=torch.tensor([5, 5], dtype=torch.int64),
+            win=5,
+            scratch_base=1000,
+            scratch_width=5,
+        )
+
+        self.assertEqual(indptr.tolist(), [0, 6, 12])
+        self.assertEqual(
+            indices[:12].tolist(),
+            [
+                110,
+                111,
+                112,
+                1000,
+                1001,
+                1002,
+                110,
+                111,
+                112,
+                1000,
+                1001,
+                1002,
+            ],
+        )
 
     def test_pd_buffer_range_excludes_scratch_pages(self):
         pool = object.__new__(DeepSeekV4TokenToKVPool)
@@ -252,6 +320,102 @@ class TestDSV4DraftSWASidecar(unittest.TestCase):
         self.assertEqual(committed[0].shape, (5, 8))
         self.assertEqual(committed[0].data_ptr(), backing.data_ptr())
         self.assertLess(committed[0].nbytes, backing.nbytes)
+
+    def test_unified_hicache_view_excludes_scratch_rows(self):
+        pool = object.__new__(DeepSeekV4TokenToKVPool)
+        pool._unified_kv = True
+        pool.unified_swa_is_sidecar = True
+        pool.draft_swa_layout = DraftSWASidecarLayout.build(
+            committed_size=1024,
+            scratch_width=5,
+            num_req_slots=4,
+            page_size=256,
+        )
+        backing = torch.empty((1300, 4), dtype=torch.bfloat16)
+        pool.unified_kv_pool = SimpleNamespace(
+            head_dim=4,
+            kv_buffer=[backing],
+        )
+        pool.compress_state_pools = []
+        pool.indexer_compress_state_pools = []
+
+        committed = pool.get_draft_swa_committed_buffers()
+        _, data_lens, item_lens = pool.get_state_buf_infos()
+
+        self.assertEqual(committed[0].shape, (5, 2048))
+        self.assertEqual(committed[0].data_ptr(), backing.data_ptr())
+        self.assertEqual(committed[0].nbytes, 5 * 256 * 4 * 2)
+        self.assertLess(committed[0].nbytes, backing.nbytes)
+        self.assertEqual(data_lens, [committed[0].nbytes])
+        self.assertEqual(item_lens, [committed[0][0].nbytes])
+
+    def test_unified_hicache_uses_logical_swa_component(self):
+        device_buffers = [torch.empty((5, 2048), dtype=torch.uint8)]
+        draft_pool = SimpleNamespace(
+            swa_kv_pool=None,
+            unified_swa_is_sidecar=True,
+            draft_swa_layout=SimpleNamespace(committed_pages=5),
+            get_draft_swa_committed_buffers=lambda: device_buffers,
+            swa_page_size=256,
+        )
+        swa_allocator = SimpleNamespace(alloc=MagicMock(), free=MagicMock())
+        tree_cache = SimpleNamespace(
+            cache_controller=SimpleNamespace(
+                mem_pool_host=SimpleNamespace(
+                    anchor_entry=SimpleNamespace(
+                        host_pool=SimpleNamespace(logical_size=2048, layout="layer_first")
+                    )
+                )
+            ),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                full_attn_allocator=SimpleNamespace(size=1024),
+                swa_attn_allocator=swa_allocator,
+            ),
+        )
+        fake_host_pool = SimpleNamespace(layer_num=1)
+
+        with patch(
+            "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
+            "DeepSeekV4PagedHostPool",
+            return_value=fake_host_pool,
+        ) as host_pool_cls:
+            specs, entries = build_swa_draft_pools(
+                draft_kv_pool=draft_pool,
+                tree_cache=tree_cache,
+                server_args=SimpleNamespace(hicache_storage_backend="default"),
+            )
+
+        self.assertEqual(specs, [])
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].name, PoolName.SWA)
+        self.assertIs(entries[0].device_pool, draft_pool)
+        host_pool_cls.assert_called_once_with(
+            pool_name=str(PoolName.SWA),
+            device_buffers=device_buffers,
+            item_bytes=device_buffers[0][0].nbytes,
+            num_host_pages=10,
+            slot_page_size=256,
+            layout="layer_first",
+            allocator_type="default",
+        )
+
+    def test_dynamic_unified_swa_host_pool_attaches_to_component(self):
+        cache = object.__new__(UnifiedRadixCache)
+        cache.cache_controller = MagicMock()
+        cache.sidecar_pool_specs = []
+        cache.supports_swa = lambda: True
+        swa_component = SimpleNamespace(_swa_kv_pool_host=None)
+        cache.components = {ComponentType.SWA: swa_component}
+        cache.tree_core = SimpleNamespace(has_swa_host_pool=False)
+        host_pool = object()
+        entry = SimpleNamespace(name=PoolName.SWA, host_pool=host_pool)
+
+        cache.register_hicache_draft_pools([], [entry])
+
+        cache.cache_controller.register_host_pool_entry.assert_called_once_with(entry)
+        self.assertIs(cache.swa_kv_pool_host, host_pool)
+        self.assertIs(swa_component._swa_kv_pool_host, host_pool)
+        self.assertTrue(cache.tree_core.has_swa_host_pool)
 
     def test_page_indices_read_direct_scratch_rows(self):
         req_to_token = torch.tensor([[10, 11, 12, 13]], dtype=torch.int64)
