@@ -193,6 +193,8 @@ if _is_cpu:
     _fused_sigmoid_mul_cpu = torch.ops.sgl_kernel.fused_sigmoid_mul_cpu
 
     def fused_sigmoid_mul(x, gate, inplace=True):
+        if not inplace:
+            x = x.clone()
         _fused_sigmoid_mul_cpu(x, gate)
         return x
 
