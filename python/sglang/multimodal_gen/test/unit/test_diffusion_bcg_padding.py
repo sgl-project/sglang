@@ -45,9 +45,20 @@ class MiniMaxH3DiTModel(torch.nn.Module):
     pass
 
 
+class LongCatImageTransformer2DModel(torch.nn.Module):
+    pass
+
+
 class ZImageTransformer2DModel(torch.nn.Module):
     def rotary_emb(self, pos_ids):
         return torch.zeros(pos_ids.shape[0], 8, device=pos_ids.device)
+
+
+def _fake_cache_dit_batch(*, is_warmup: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        is_warmup=is_warmup,
+        sampling_params=SimpleNamespace(enable_cache_dit=None, cache_dit_params=None),
+    )
 
 
 class TestDiffusionBCGPadding(unittest.TestCase):
@@ -55,6 +66,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.stage = DenoisingStage.__new__(DenoisingStage)
         self.qwen_model = QwenImageTransformer2DModel()
         self.ideogram_model = Ideogram4Transformer2DModel()
+        self.longcat_model = LongCatImageTransformer2DModel()
         self.minimax_h3_model = MiniMaxH3DiTModel()
         self.zimage_model = ZImageTransformer2DModel()
         self.other_model = OtherTransformer2DModel()
@@ -125,6 +137,26 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertEqual(_attn_mask_meta_local_pad(None), 0)
         self.assertEqual(_attn_mask_meta_local_pad({"local_pad": 7}), 7)
         self.assertEqual(_attn_mask_meta_local_pad(DynamicVarlenMaskMeta()), 0)
+
+    def test_longcat_keeps_its_fixed_512_token_prompt_shape(self):
+        kwargs = {
+            "hidden_states": torch.zeros(1, 4096, 64),
+            "timestep": torch.zeros(1),
+            "encoder_hidden_states": torch.zeros(1, 512, 3584),
+            "encoder_attention_mask": [torch.ones(1, 512, dtype=torch.long)],
+            "encoder_hidden_states_mask": [torch.ones(1, 512, dtype=torch.bool)],
+            "txt_ids": torch.zeros(512, 3),
+            "img_ids": torch.zeros(4096, 3),
+        }
+
+        with self._patch_buckets(64, 128, 256, 512, 1024):
+            out = self.stage._bcg_pad_prompt_kwargs(
+                kwargs, current_model=self.longcat_model
+            )
+
+        self.assertIs(out, kwargs)
+        self.assertEqual(out["encoder_hidden_states"].shape, (1, 512, 3584))
+        self.assertEqual(out["txt_ids"].shape, (512, 3))
 
     def test_qwen_default_bucket_preserves_mask(self):
         def kwargs(valid_len: int):
@@ -373,6 +405,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
 
     def test_image_generation_models_are_registered_as_bcg_supported(self):
         for model_id in (
+            "meituan-longcat/longcat-image",
             "qwen/qwen-image",
             "qwen/qwen-image-2512",
             "tongyi-mai/z-image",
@@ -383,6 +416,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
 
         for config_name in (
             "GlmImagePipelineConfig",
+            "LongCatImagePipelineConfig",
             "QwenImagePipelineConfig",
             "ZImagePipelineConfig",
         ):
@@ -443,7 +477,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
 
         self.assertIsNone(self.stage._maybe_get_bcg_runner(self.qwen_model))
         self.stage._maybe_torch_compile(self.qwen_model)
-        self.stage._maybe_enable_cache_dit(1, SimpleNamespace(is_warmup=True))
+        self.stage._maybe_enable_cache_dit(1, _fake_cache_dit_batch(is_warmup=True))
         self.assertEqual(self.stage._bcg_runners, {})
 
     def test_bcg_warns_when_cache_dit_is_requested(self):
@@ -455,8 +489,10 @@ class TestDiffusionBCGPadding(unittest.TestCase):
             patch.object(self.stage, "_cache_dit_requested", return_value=True),
             patch.object(denoising_module.logger, "warning") as warning,
         ):
-            self.stage._maybe_enable_cache_dit(1, SimpleNamespace(is_warmup=True))
-            self.stage._maybe_enable_cache_dit(1, SimpleNamespace(is_warmup=False))
+            self.stage._maybe_enable_cache_dit(1, _fake_cache_dit_batch(is_warmup=True))
+            self.stage._maybe_enable_cache_dit(
+                1, _fake_cache_dit_batch(is_warmup=False)
+            )
 
         warning.assert_called_once_with(
             "Cache-DiT was requested but is disabled because breakable CUDA "
@@ -474,7 +510,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
                 "logger.warning_once"
             ) as warning_once,
         ):
-            self.stage._maybe_enable_cache_dit(1, SimpleNamespace(is_warmup=True))
+            self.stage._maybe_enable_cache_dit(1, _fake_cache_dit_batch(is_warmup=True))
 
         warning_once.assert_not_called()
 

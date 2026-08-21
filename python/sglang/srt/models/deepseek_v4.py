@@ -143,6 +143,7 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
 from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     is_wint4afp8_or_wint4a16_config,
+    quant_blocks_shared_experts_fusion,
 )
 from sglang.srt.models.deepseek_v2 import (
     ParallelLMHead,
@@ -308,6 +309,89 @@ _is_gfx942_supported = is_gfx942_supported()
 if _use_aiter:
     if _is_gfx95_supported:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+
+
+def _wo_a_aiter_gemm_eligible(
+    flag: bool, use_aiter: bool, is_hip: bool, is_gfx95: bool
+) -> bool:
+    """Static eligibility for the aiter ``wo_a`` reroute.
+
+    Folds the opt-in flag, the global ``SGLANG_USE_AITER`` switch, and the
+    HIP/gfx95 platform gates into one predicate. Evaluated once at import (see
+    ``_wo_a_aiter_batched_gemm_enabled``) so none of it runs on the per-token
+    decode critical path.
+    """
+    return bool(flag and use_aiter and is_hip and is_gfx95)
+
+
+# Read the opt-in flag and import the aiter kernel ONCE at module import: the
+# decode ``wo_a`` matmul runs per layer/token on the critical path, so it must
+# not pay an ``EnvBool.get()`` plus a function-local import on every call. If the
+# path is eligible but the kernel import fails, disable it here and fall back to
+# the einsum for the process (logged once) instead of retrying every step.
+_wo_a_aiter_batched_gemm_enabled = _wo_a_aiter_gemm_eligible(
+    envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.get(),
+    _use_aiter,
+    _is_hip,
+    _is_gfx95_supported,
+)
+_wo_a_batched_gemm_bf16 = None
+if _wo_a_aiter_batched_gemm_enabled:
+    try:
+        from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import (
+            batched_gemm_bf16 as _wo_a_batched_gemm_bf16,
+        )
+    except Exception as err:  # pragma: no cover - env-dependent
+        _wo_a_aiter_batched_gemm_enabled = False
+        logger.warning(
+            "aiter wo_a batched_gemm_bf16 import failed; using einsum for wo_a "
+            "for the rest of this process: %s",
+            err,
+        )
+
+# Flipped once if the (already-imported) aiter kernel raises at runtime, so a
+# per-call kernel failure falls back to the einsum for the rest of the process
+# instead of re-raising (and re-logging) on every layer/token.
+_wo_a_aiter_batched_gemm_disabled = False
+
+
+def _apply_wo_a_bf16_matmul(
+    o: torch.Tensor, wo_a: torch.Tensor, is_decode: bool
+) -> torch.Tensor:
+    """wo_a (attn output -> o_proj low-rank) bf16 batched matmul.
+
+    ``o`` is ``[T, G, D]`` (tokens, groups, head_dim) and ``wo_a`` is
+    ``[G, R, D]`` (groups, o_lora_rank, head_dim); the result is ``[T, G, R]``.
+
+    Dispatch contract: on the decode path, when the reroute is enabled
+    (``_wo_a_aiter_batched_gemm_enabled``, computed once at import) and has not
+    been disabled by a prior runtime failure, call the pre-imported aiter
+    ``batched_gemm_bf16`` (``Y[i] = X[i] @ W[i]^T``). Otherwise -- prefill, any
+    gate off, or after a failure -- use the numerically-equivalent
+    ``torch.einsum("tgd,grd->tgr", ...)``. The first runtime kernel failure
+    disables the reroute for the process (logged once).
+    """
+    global _wo_a_aiter_batched_gemm_disabled
+    if (
+        is_decode
+        and _wo_a_aiter_batched_gemm_enabled
+        and not _wo_a_aiter_batched_gemm_disabled
+    ):
+        try:
+            # aiter batched_gemm_bf16: XQ[B,M,K] @ WQ[B,N,K]^T -> [B,M,N].
+            # Here batch = group G: XQ = o.transpose(0,1) [G,T,D], WQ = wo_a
+            # [G,R,D] -> [G,T,R] -> transpose back to [T,G,R].
+            xq = o.transpose(0, 1).contiguous()
+            y = _wo_a_batched_gemm_bf16(xq, wo_a, dtype=torch.bfloat16)
+            return y.transpose(0, 1).contiguous()
+        except Exception as err:
+            _wo_a_aiter_batched_gemm_disabled = True
+            logger.warning(
+                "aiter wo_a batched_gemm_bf16 failed; disabling the reroute and "
+                "falling back to einsum for the rest of this process: %s",
+                err,
+            )
+    return torch.einsum("tgd,grd->tgr", o, wo_a)
 
 
 def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):
@@ -1211,11 +1295,19 @@ class MQALayer(MqaAttentionBase):
 
         unified = is_unified_kv_triton()
         is_decode = forward_batch.forward_mode.is_decode_or_idle()
-        do_fused_store = (unified and is_decode) or (
+        # The kernel is token-indexed (q, kv and positions are all length M), so
+        # a verify batch carrying several draft tokens per request is a shape it
+        # already handles. Only the cache store differs between decode and
+        # verify, and that half is left off below.
+        fuse_verify = (
+            envs.SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY.get()
+            and forward_batch.forward_mode.is_target_verify()
+        )
+        do_fused_qk_norm_rope = (unified and (is_decode or fuse_verify)) or (
             not unified and self.use_fused_qk_norm_rope
         )
 
-        if do_fused_store:
+        if do_fused_qk_norm_rope:
             if _is_gfx95_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
@@ -1234,7 +1326,27 @@ class MQALayer(MqaAttentionBase):
             )
 
             token_to_kv_pool = get_token_to_kv_pool()
-            if unified:
+            if unified and fuse_verify:
+                # Target-verify runs through the unified_kv decode path. The
+                # backend writes the current chunk's KV into the ring *before*
+                # attention (save_kv_cache=True -> store_swa_into_unified ahead
+                # of runtime.decode), and per-token causal index streams -- built
+                # once per step in the backend metadata -- keep each draft query
+                # attending only to positions up to itself. Causal masking among
+                # the draft tokens comes from those index streams, not from store
+                # timing. So this path skips only the fused kernel's *own* store
+                # and returns kv, letting that existing causally-indexed backend
+                # store run unchanged; we fuse just the norm+RoPE. swa_loc is not
+                # computed -- it only addresses the kernel store this path drops.
+                #
+                # kv is a strided slice of qkv_a and the ring store requires a
+                # contiguous buffer, so materialise it before the kernel norms
+                # it in place. The unfused path pays the same copy inside
+                # _compute_kv_bf16.
+                kv = kv.contiguous()
+                swa_cache, swa_loc = None, None
+                swa_page_size, bf16_store = 1, True
+            elif unified:
                 swa_cache = token_to_kv_pool.get_unified_kv(self.layer_id)
                 # swa_loc is layer-independent; computed once per forward by the
                 # backend and cached on the metadata (read here by every layer).
@@ -1270,7 +1382,13 @@ class MQALayer(MqaAttentionBase):
                 dtype=x.dtype,
                 bf16_store=bf16_store,
             )
-            kv = None
+            # On the verify path the kernel normed + RoPE'd kv in place and wrote
+            # nothing, so hand it back: the caller feeds it to attention as the
+            # current chunk (attn_k = kv) and save_kv_cache = kv is not None lets
+            # the backend do its normal causally-indexed store into the ring
+            # before the decode kernel runs -- exactly as the unfused path did.
+            if not (unified and fuse_verify):
+                kv = None
 
             if not unified and use_cp:
                 # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
@@ -1479,10 +1597,13 @@ class MQALayer(MqaAttentionBase):
                 x_quant=x_quant,
             )
 
-        # The cache write is always fused / already done by _forward_prepare* --
-        # tell the backend to skip its own store_cache. When `kv is None`
-        # (no DSA-CP), pass `q` as a sentinel for the `k is v` assert; the
-        # attention path doesn't read it once `save_kv_cache=False`.
+        # save_kv_cache = kv is not None selects who writes the ring. When kv is
+        # None the store was already fused into _forward_prepare* (decode) or
+        # done inline, so the backend skips its own store_cache; pass `q` as a
+        # sentinel for the `k is v` assert (attention won't read it once
+        # save_kv_cache=False). When kv is not None (target-verify, or DSA-CP),
+        # _forward_prepare* deliberately left the store off and the backend does
+        # its normal causally-indexed store from attn_k = kv.
         attn_k = kv if kv is not None else q
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -1581,7 +1702,9 @@ class MQALayer(MqaAttentionBase):
             o = output
         else:
             wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-            o = torch.einsum("tgd,grd->tgr", o, wo_a)
+            o = _apply_wo_a_bf16_matmul(
+                o, wo_a, is_decode=forward_batch.forward_mode.is_decode()
+            )
 
         o, _ = self.wo_b(o.flatten(1))
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
@@ -3015,6 +3138,14 @@ class DeepseekV4ForCausalLM(nn.Module):
         """V4 only fuses when explicitly asked to, and then the checkpoint must
         carry exactly one shared expert. Asked by the loader before any layer is
         built."""
+        # Need to disable if quant precision mismatch, even if
+        # --enforce-shared-experts-fusion is specified
+        if quant_blocks_shared_experts_fusion(quant_config):
+            return (
+                "Quantization keeps shared experts at a higher precision than the "
+                "routed experts, so they cannot be fused into the quantized "
+                "routed-expert path."
+            )
         if not get_exec().moe.enforce_shared_experts_fusion:
             return "Config does not support fused shared expert(s)."
         if hf_config.n_shared_experts != 1:
