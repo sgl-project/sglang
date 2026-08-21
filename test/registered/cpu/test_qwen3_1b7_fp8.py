@@ -6,10 +6,9 @@ Registry: nightly-xeon-models suite"""
 
 import unittest
 
-from utils import CPU_BASE_ARGS, CPU_LAUNCH_TIMEOUT
-
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.cpu_test_utils import CPU_BASE_ARGS, CPU_LAUNCH_TIMEOUT
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
