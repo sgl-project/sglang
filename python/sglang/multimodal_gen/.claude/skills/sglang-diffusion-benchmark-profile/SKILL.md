@@ -62,6 +62,9 @@ Always rule out these existing families first:
 - LTX upsampler GroupNorm+SiLU
 - Z-Image bf16-native Triton RMSNorm scale/tanh-residual modulation
 - SANA packed self-attention Q/K/V and cross-attention K/V GEMMs
+- SANA-Video's packed projections and request-scoped BF16-input linear
+  attention at `quality=high`; keep the second attention GEMM in FP32 and
+  compare against `quality=lossless` before changing its precision further
 - SANA-Video reuse of SANA's bit-exact bias/activation, residual-gate, and
   LayerNorm-modulation fast paths before adding video-only kernels
 - MiniMax-H3 indexed modulation, fused QK norm + RoPE, packed Ulysses QKV,
