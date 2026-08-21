@@ -13,6 +13,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.managers.schedule_policy import SchedulePolicy
+from sglang.test.test_utils import CustomTestCase
 
 
 def make_req(
@@ -36,7 +37,7 @@ def make_req(
     )
 
 
-class TestSortByLongestPrefix(unittest.TestCase):
+class TestSortByLongestPrefix(CustomTestCase):
     def test_longer_prefix_scheduled_first(self):
         q = [
             make_req("a", prefix_len=3),
@@ -64,7 +65,7 @@ class TestSortByLongestPrefix(unittest.TestCase):
         self.assertEqual([r.rid for r in q], ["a", "b"])
 
 
-class TestSortByLongestOutput(unittest.TestCase):
+class TestSortByLongestOutput(CustomTestCase):
     def test_longer_output_first_without_priority(self):
         q = [
             make_req("a", max_new_tokens=5),
@@ -101,7 +102,7 @@ class TestSortByLongestOutput(unittest.TestCase):
         self.assertEqual([r.rid for r in q], ["b", "a"])
 
 
-class TestSortByPriorityAndFcfs(unittest.TestCase):
+class TestSortByPriorityAndFcfs(CustomTestCase):
     def test_higher_priority_value_first(self):
         # priority_sign=-1 (default) -> higher priority scheduled first.
         q = [
@@ -132,7 +133,7 @@ class TestSortByPriorityAndFcfs(unittest.TestCase):
         self.assertEqual([r.rid for r in q], ["b", "a"])
 
 
-class TestSortByRoutingKey(unittest.TestCase):
+class TestSortByRoutingKey(CustomTestCase):
     def _running_batch(self, keys):
         return SimpleNamespace(reqs=[SimpleNamespace(routing_key=k) for k in keys])
 
@@ -155,7 +156,7 @@ class TestSortByRoutingKey(unittest.TestCase):
         self.assertEqual([r.rid for r in q], ["a", "b"])
 
 
-class TestSortRandomly(unittest.TestCase):
+class TestSortRandomly(CustomTestCase):
     def test_shuffle_preserves_membership(self):
         q = [make_req("a"), make_req("b"), make_req("c")]
         SchedulePolicy._sort_randomly(q)
