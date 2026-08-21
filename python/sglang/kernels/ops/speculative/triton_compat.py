@@ -16,8 +16,10 @@ try:
     has_triton = True
 except ImportError:  # pragma: no cover - needs a triton-free environment
     triton = None
-    tl = None
     has_triton = False
+
+    class _MissingTritonLanguage:
+        constexpr = object
 
     class _MissingTritonKernel:
         """Import-time stand-in for a @triton.jit function; launch raises."""
@@ -37,6 +39,8 @@ except ImportError:  # pragma: no cover - needs a triton-free environment
 
     def jit(fn):
         return _MissingTritonKernel(fn.__name__)
+
+    tl = _MissingTritonLanguage()
 
 
 def next_power_of_2(n: int) -> int:

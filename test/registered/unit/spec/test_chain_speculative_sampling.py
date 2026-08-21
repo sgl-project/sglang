@@ -46,6 +46,10 @@ def _make_buffers(bs, num_slots, vocab, device="cpu"):
 
 
 def _run(fn, target_probs, draft_probs, candidates, coins, coin_final, device="cpu"):
+    if target_probs.ndim == 2:
+        target_probs = target_probs.unsqueeze(0)
+    if draft_probs.ndim == 2:
+        draft_probs = draft_probs.unsqueeze(0)
     (
         predicts,
         accept_index,
