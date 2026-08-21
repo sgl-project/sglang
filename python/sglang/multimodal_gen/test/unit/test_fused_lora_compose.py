@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     MergedColumnParallelLinearWithLoRA,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
+from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
     LoRAPipeline,
     _store_fused_lora_groups,
     stack_or_compose_fused_lora,
@@ -298,7 +298,7 @@ def _make_loader_pipeline() -> _TestLoRAPipeline:
 
 
 def _load_adapter(pipeline, state_dict, lora_alpha=None):
-    loader_mod = "sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline"
+    loader_mod = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline"
     with (
         patch(f"{loader_mod}.maybe_download_lora", return_value="/adapter"),
         patch(f"{loader_mod}.load_file", return_value=state_dict),
@@ -370,7 +370,7 @@ def test_apply_composed_adapter_end_to_end():
 
     strength = 2.0
     with patch(
-        "sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline.dist.get_rank",
+        "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline.dist.get_rank",
         return_value=0,
     ):
         applied = pipeline._apply_lora_to_layers(

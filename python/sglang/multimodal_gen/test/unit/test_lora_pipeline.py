@@ -6,10 +6,10 @@ from unittest.mock import patch
 import torch
 
 from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
-from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 
-_RANK_PATCH = "sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline.dist.get_rank"
+_RANK_PATCH = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline.dist.get_rank"
 
 
 class _TestLoRAPipeline(LoRAPipeline):

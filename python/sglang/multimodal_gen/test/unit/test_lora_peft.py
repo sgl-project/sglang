@@ -5,10 +5,10 @@ import math
 import pytest
 import torch
 
-from sglang.multimodal_gen.runtime.pipelines_core.lora_format_adapter import (
+from sglang.multimodal_gen.runtime.pipelines_core.lora.format_adapter import (
     normalize_lora_state_dict,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.lora_peft import (
+from sglang.multimodal_gen.runtime.pipelines_core.lora.peft import (
     get_peft_lora_alpha,
 )
 
