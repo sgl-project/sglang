@@ -668,40 +668,73 @@ class MooncakeKVManager(CommonKVManager):
                 return ret
         return 0
 
-    def _registered_src_ranges(self):
-        """Sorted (start, end) VA ranges of every fabric-registered buffer."""
-        cached = getattr(self, "_mf_src_ranges", None)
-        if cached is not None:
-            return cached
+    def _sync_engine_registration(self):
+        """Register kv_args regions the fabric engine has not seen yet.
+
+        kv_args state components (e.g. the DSV4 draft SWA pool) can be
+        appended after register_buffer_to_engine ran at startup; the engine
+        faults with an SDMA smmu-terminate on every transfer that touches
+        them. Register any missing region on first use instead of failing.
+        """
+        current = [
+            (p, p + l, l)
+            for p, l in zip(self._kv_args_ptr_list(), self._kv_args_len_list())
+            if l > 0
+        ]
+        engine = getattr(self, "_mf_engine_regions", None)
+        if engine is None:
+            self._mf_engine_regions = {p for p, _e, _l in current}
+            self._mf_engine_ranges = sorted(
+                (p, e) for p, e, _l in current
+            )
+            engine = self._mf_engine_regions
+        missing = [
+            (p, l) for p, _e, l in current if p not in engine
+        ]
+        if missing:
+            logger.error(
+                "[mf-trans] %d kv_args regions were never fabric-registered; "
+                "registering now: %s",
+                len(missing),
+                [(hex(p), l) for p, l in missing[:4]],
+            )
+            self.engine.batch_register([p for p, _l in missing], [l for _p, l in missing])
+            engine.update(p for p, _l in missing)
+            self._mf_engine_ranges = sorted(
+                (p, p + l) for p, l in current
+            )
+
+    def _kv_args_ptr_list(self):
         args = self.kv_args
         state_ptrs = [p for comp in (args.state_data_ptrs or []) for p in comp]
-        state_lens = [l for comp in (args.state_data_lens or []) for l in comp]
-        ranges = sorted(
-            (p, p + l)
-            for p, l in zip(
-                list(args.kv_data_ptrs)
-                + list(args.aux_data_ptrs or [])
-                + state_ptrs,
-                list(args.kv_data_lens)
-                + list(args.aux_data_lens or [])
-                + state_lens,
-            )
-            if l > 0
+        return (
+            list(args.kv_data_ptrs)
+            + list(args.aux_data_ptrs or [])
+            + state_ptrs
         )
-        self._mf_src_ranges = ranges
-        return ranges
+
+    def _kv_args_len_list(self):
+        args = self.kv_args
+        state_lens = [l for comp in (args.state_data_lens or []) for l in comp]
+        return (
+            list(args.kv_data_lens)
+            + list(args.aux_data_lens or [])
+            + state_lens
+        )
 
     def _drop_unregistered_src_blocks(self, batch):
         """Drop blocks whose source range escapes every registered buffer.
 
-        A garbage page id computes a source address ~TBs above the pool; the
-        fabric engine answers that with an SDMA smmu-terminate that kills the
-        whole session. Drop the offending blocks; the request's KV for those
-        pages is wrong either way.
+        A garbage page id computes a source address far outside the pools;
+        the fabric engine answers that with an SDMA smmu-terminate that
+        kills the whole session. First sync late kv_args regions into the
+        engine, then drop whatever still escapes and log it against the
+        nearest region.
         """
         import bisect
 
-        ranges = self._registered_src_ranges()
+        self._sync_engine_registration()
+        ranges = getattr(self, "_mf_engine_ranges", None) or []
         if not ranges:
             return batch
         starts = [r[0] for r in ranges]

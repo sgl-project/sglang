@@ -61,6 +61,13 @@ class AscendKVManager(MooncakeKVManager):
             lens.extend(component_lens)
         if ptrs:
             self.engine.batch_register(ptrs, lens)
+        # Anchor the engine-registered set to this startup batch so late
+        # kv_args appends (e.g. the draft SWA pool) are detectable and can be
+        # registered on first use; see MooncakeKVManager._sync_engine_registration.
+        self._mf_engine_regions = set(ptrs)
+        self._mf_engine_ranges = sorted(
+            (p, p + l) for p, l in zip(ptrs, lens) if l > 0
+        )
 
     def get_mla_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int], state_type=None
