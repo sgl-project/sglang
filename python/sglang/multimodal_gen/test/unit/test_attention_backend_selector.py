@@ -15,8 +15,16 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
+    GenericComponentLoader,
     PipelineComponentLoader,
 )
+from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
+    TextEncoderLoader,
+)
+from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
+    TransformerLoader,
+)
+from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import VAELoader
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
@@ -299,6 +307,12 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
 
         self.assertIsNotNone(context)
         self.assertFalse(context.allow_global_backend_fallback)
+
+    def test_builtin_loader_scopes(self):
+        self.assertFalse(TransformerLoader.allow_global_attention_backend_fallback)
+        self.assertFalse(GenericComponentLoader.allow_global_attention_backend_fallback)
+        self.assertTrue(TextEncoderLoader.allow_global_attention_backend_fallback)
+        self.assertTrue(VAELoader.allow_global_attention_backend_fallback)
 
 
 if __name__ == "__main__":
