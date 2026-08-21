@@ -11,7 +11,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_common.utils import _is_hip
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_sm100_or_sm110_supported, use_intel_amx_backend
 
 MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla"]
@@ -97,17 +97,9 @@ def _support_mha_one_shot(attn, forward_batch, backend_name):
         attn_supported
         and (
             backend_name != "flashinfer"
-            or _flashinfer_mha_one_shot_extend_aligned(forward_batch)
+            or not forward_batch.has_dp_padding_rows()
         )
         and sum_seq_lens <= forward_batch.get_max_chunk_capacity()
-    )
-
-
-def _flashinfer_mha_one_shot_extend_aligned(forward_batch):
-    extend_seq_lens = forward_batch.extend_seq_lens_cpu
-    return extend_seq_lens is not None and all(
-        extend_seq_len % get_parallel().attn_tp_size == 0
-        for extend_seq_len in extend_seq_lens
     )
 
 
@@ -142,7 +134,7 @@ def _handle_attention_backend(attn, forward_batch, backend_name):
     ):
         if (
             backend_name == "flashinfer"
-            and not _flashinfer_mha_one_shot_extend_aligned(forward_batch)
+            and forward_batch.has_dp_padding_rows()
         ):
             return _dispatch_mla_subtype(attn, forward_batch)
         if _support_mha_one_shot(attn, forward_batch, backend_name):

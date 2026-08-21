@@ -57,6 +57,22 @@ class ForwardBatchDeepSeekMHAMixin:
     def get_max_chunk_capacity(self):
         return envs.SGLANG_MAX_KV_CHUNK_CAPACITY.get()
 
+    def has_dp_padding_rows(self) -> bool:
+        """Whether DP-attention padding appended rows beyond the real extend tokens.
+
+        Under DP attention, every rank's input is padded to a common size: to the
+        attn_tp multiple (reduce-scatter alignment) or, when the prefill breakable
+        CUDA graph forces MAX_LEN mode, to the global max token count. The ragged
+        attention wrappers (flashinfer prefill / MLA ragged) build their qo_indptr
+        from per-request extend lengths, so they are only correct when every input
+        row is a real extend token — i.e. when ``sum(extend_seq_lens)`` equals the
+        padded input row count.
+        """
+        extend_seq_lens_cpu = self.extend_seq_lens_cpu
+        if extend_seq_lens_cpu is None or self.positions is None:
+            return False
+        return sum(extend_seq_lens_cpu) != self.positions.shape[0]
+
     def set_prefix_chunk_idx(self, idx: int):
         self.prefix_chunk_idx = idx
 
