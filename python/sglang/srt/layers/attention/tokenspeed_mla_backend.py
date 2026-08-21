@@ -114,8 +114,7 @@ def _get_tokenspeed_workspace(
 class TokenspeedMLABackend(TRTLLMMLABackend):
     """tokenspeed-mla CuTe DSL attention backend (Blackwell SM100, FP8 KV)."""
 
-    # This kernel does not support varlen queries. We also inherit
-    # backend == "trtllm-gen", so the opt-out has to be explicit.
+    # No varlen support; explicit opt-out since we inherit backend == "trtllm-gen".
     supports_varlen_absorbed_mla = False
 
     def __init__(
