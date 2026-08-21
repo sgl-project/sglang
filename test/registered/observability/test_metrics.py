@@ -18,13 +18,12 @@ from sglang.srt.observability.metrics_collector import (
     compute_routing_key_stats,
 )
 from sglang.srt.observability.startup_phase_registry import (
+    _phases,
+    _record,
     drain_post_startup_deltas,
     freeze_startup_phases,
-    get_startup_phases,
-    record_startup_phase,
     reset_startup_phases,
     startup_phase,
-    startup_phase_prefix,
 )
 from sglang.srt.observability.startup_time import (
     aggregate_scheduler_startup_times,
@@ -682,31 +681,32 @@ class TestStartupTimeDict(unittest.TestCase):
         reset_startup_phases()
 
     def test_build_merges_frozen_registry_phases(self):
-        record_startup_phase("distributed_init", 4.0)
-        record_startup_phase("deepgemm_jit", 30.0)
-        with startup_phase_prefix("draft_"):
-            record_startup_phase("deepgemm_jit", 7.0)
+        _record("distributed_init", 4.0)
+        _record("deepgemm_jit", 30.0)
+        _record("kv_cache_allocation", 2.0)
+        with startup_phase(draft=True):
+            _record("deepgemm_jit", 7.0)
 
         startup_time = build_scheduler_startup_time(
             target_load_weight=100.0,
             draft_load_weight=20.0,
-            kv_cache_allocation=2.0,
             scheduler_e2e=150.0,
             target_cuda_graph={"decode": 9.0},
             draft_cuda_graph=None,
-            phases=freeze_startup_phases(),
         )
 
         self.assertEqual(startup_time["load_weight"], 120.0)
         self.assertEqual(startup_time["scheduler_e2e"], 150.0)
+        self.assertEqual(startup_time["kv_cache_allocation"], 2.0)
         self.assertEqual(startup_time["distributed_init"], 4.0)
         self.assertEqual(startup_time["deepgemm_jit"], 30.0)
         self.assertEqual(startup_time["draft_deepgemm_jit"], 7.0)
         self.assertEqual(startup_time["cuda_graph"]["decode"], 9.0)
 
-        # Work recorded after the freeze must not reach the dict.
-        record_startup_phase("deepgemm_jit", 5.0)
+        # Building closed the snapshot: later work goes to the counter instead.
+        _record("deepgemm_jit", 5.0)
         self.assertEqual(freeze_startup_phases()["deepgemm_jit"], 30.0)
+        self.assertEqual(drain_post_startup_deltas(), {"deepgemm_jit": 5.0})
 
     def test_aggregate_maxes_arbitrary_phases(self):
         aggregated = aggregate_scheduler_startup_times(
@@ -732,7 +732,7 @@ class TestStartupTimeDict(unittest.TestCase):
         self.assertEqual(aggregated["scheduler_e2e"], 0.0)
 
     def test_post_startup_phases_counted_once(self):
-        record_startup_phase("distributed_init", 100.0)
+        _record("distributed_init", 100.0)
         freeze_startup_phases()
         collector = _make_in_memory_collector(_TEST_COLLECTOR_LABELS)
 
@@ -741,9 +741,9 @@ class TestStartupTimeDict(unittest.TestCase):
         collector.log_post_startup_phases()
         self.assertEqual(counter.calls, [])
 
-        record_startup_phase("deepgemm_jit", 3.0)
+        _record("deepgemm_jit", 3.0)
         collector.log_post_startup_phases()
-        record_startup_phase("deepgemm_jit", 2.0)
+        _record("deepgemm_jit", 2.0)
         collector.log_post_startup_phases()
         # A tick with no new work adds no increments.
         collector.log_post_startup_phases()
@@ -762,30 +762,52 @@ class TestStartupPhaseRegistry(unittest.TestCase):
         reset_startup_phases()
 
     def test_record_accumulates(self):
-        record_startup_phase("phase_a", 1.5)
-        record_startup_phase("phase_a", 2.5)
-        record_startup_phase("phase_b", 3.0)
-        self.assertEqual(get_startup_phases(), {"phase_a": 4.0, "phase_b": 3.0})
+        _record("phase_a", 1.5)
+        _record("phase_a", 2.5)
+        _record("phase_b", 3.0)
+        self.assertEqual(_phases, {"phase_a": 4.0, "phase_b": 3.0})
 
     def test_context_manager_records_elapsed(self):
         with startup_phase("phase_timed"):
             time.sleep(0.01)
-        self.assertGreaterEqual(get_startup_phases()["phase_timed"], 0.01)
+        self.assertGreaterEqual(_phases["phase_timed"], 0.01)
 
     def test_context_manager_records_on_exception(self):
         with self.assertRaises(RuntimeError):
             with startup_phase("phase_failed"):
                 raise RuntimeError("boom")
-        self.assertIn("phase_failed", get_startup_phases())
+        self.assertIn("phase_failed", _phases)
+
+    def test_decorator_form_returns_accumulates_and_attributes(self):
+        @startup_phase("weight_load")
+        def load() -> str:
+            time.sleep(0.01)
+            return "loaded"
+
+        with startup_phase(draft=True):
+            self.assertEqual(load(), "loaded")
+        self.assertEqual(load(), "loaded")
+        self.assertGreaterEqual(_phases["weight_load"], 0.01)
+        self.assertGreaterEqual(_phases["draft_weight_load"], 0.01)
+
+    def test_attribution_without_a_name_records_nothing_itself(self):
+        with startup_phase(draft=True):
+            _record("weight_load", 2.0)
+        self.assertEqual(_phases, {"draft_weight_load": 2.0})
+
+    def test_named_phase_keeps_its_own_key_in_the_callers_scope(self):
+        with startup_phase("worker_init", draft=True):
+            _record("deepgemm_jit", 3.0)
+        self.assertEqual(_phases.keys(), {"worker_init", "draft_deepgemm_jit"})
 
     def test_prefix_applies_to_nested_recordings(self):
-        with startup_phase_prefix("draft_"):
-            record_startup_phase("weight_load", 2.0)
+        with startup_phase(draft=True):
+            _record("weight_load", 2.0)
             with startup_phase("deepgemm_jit"):
                 pass
-        record_startup_phase("weight_load", 5.0)
+        _record("weight_load", 5.0)
 
-        phases = get_startup_phases()
+        phases = _phases
         self.assertEqual(phases["draft_weight_load"], 2.0)
         self.assertEqual(phases["weight_load"], 5.0)
         self.assertIn("draft_deepgemm_jit", phases)
@@ -793,52 +815,52 @@ class TestStartupPhaseRegistry(unittest.TestCase):
 
     def test_prefix_restored_on_exception(self):
         with self.assertRaises(RuntimeError):
-            with startup_phase_prefix("draft_"):
+            with startup_phase(draft=True):
                 raise RuntimeError("boom")
-        record_startup_phase("weight_load", 1.0)
-        self.assertEqual(get_startup_phases(), {"weight_load": 1.0})
+        _record("weight_load", 1.0)
+        self.assertEqual(_phases, {"weight_load": 1.0})
 
     def test_freeze_is_idempotent(self):
-        record_startup_phase("weight_load", 10.0)
+        _record("weight_load", 10.0)
         first = freeze_startup_phases()
-        record_startup_phase("deepgemm_jit", 3.0)
+        _record("deepgemm_jit", 3.0)
         second = freeze_startup_phases()
 
         self.assertEqual(first, {"weight_load": 10.0})
         # A later freeze call cannot fold post-ready work into the snapshot.
         self.assertEqual(second, first)
-        self.assertEqual(
-            get_startup_phases(), {"weight_load": 10.0, "deepgemm_jit": 3.0}
-        )
+        # Closing the snapshot took the pre-ready work with it, leaving only
+        # what arrived afterwards for the drain.
+        self.assertEqual(_phases, {"deepgemm_jit": 3.0})
 
     def test_drain_returns_post_freeze_deltas_exactly_once(self):
         # Before the freeze there is no cold-start boundary.
-        record_startup_phase("deepgemm_jit", 30.0)
+        _record("deepgemm_jit", 30.0)
         self.assertEqual(drain_post_startup_deltas(), {})
 
         freeze_startup_phases()
         self.assertEqual(drain_post_startup_deltas(), {})
 
-        record_startup_phase("deepgemm_jit", 12.0)
-        record_startup_phase("grammar_warmup", 1.5)  # phase first seen post-ready
+        _record("deepgemm_jit", 12.0)
+        _record("grammar_warmup", 1.5)  # phase first seen post-ready
         self.assertEqual(
             drain_post_startup_deltas(),
             {"deepgemm_jit": 12.0, "grammar_warmup": 1.5},
         )
 
         self.assertEqual(drain_post_startup_deltas(), {})
-        record_startup_phase("deepgemm_jit", 2.0)
+        _record("deepgemm_jit", 2.0)
         self.assertEqual(drain_post_startup_deltas(), {"deepgemm_jit": 2.0})
 
     def test_inner_empty_prefix_overrides_outer(self):
         # A target-runner scope entered during draft setup must attribute its
         # own work to the target, not inherit the draft prefix.
-        with startup_phase_prefix("draft_"):
-            with startup_phase_prefix(""):
-                record_startup_phase("cuda_graph_capture", 3.0)
-            record_startup_phase("cuda_graph_capture", 4.0)
+        with startup_phase(draft=True):
+            with startup_phase(draft=False):
+                _record("cuda_graph_capture", 3.0)
+            _record("cuda_graph_capture", 4.0)
         self.assertEqual(
-            get_startup_phases(),
+            _phases,
             {"cuda_graph_capture": 3.0, "draft_cuda_graph_capture": 4.0},
         )
 

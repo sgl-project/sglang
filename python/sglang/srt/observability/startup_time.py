@@ -6,28 +6,24 @@ from sglang.srt.model_executor.graph_memory_usage import (
     empty_graph_time_usage,
     merge_graph_time_usage,
 )
+from sglang.srt.observability.startup_phase_registry import freeze_startup_phases
 
 
 def build_scheduler_startup_time(
     *,
     target_load_weight: float,
     draft_load_weight: float,
-    kv_cache_allocation: float,
     scheduler_e2e: float,
     target_cuda_graph: Mapping[str, float] | None,
     draft_cuda_graph: Mapping[str, float] | None,
-    phases: Mapping[str, float],
 ) -> dict:
     """Build one scheduler rank's startup-time dict.
 
-    ``phases`` carries the frozen startup-phase registry (see
-    sglang.srt.observability.startup_phase_registry) as additional flat entries;
-    the explicitly plumbed durations take precedence on name collision.
+    Building it closes the registry's cold-start snapshot.
     """
     return {
-        **phases,
+        **freeze_startup_phases(),
         "load_weight": target_load_weight + draft_load_weight,
-        "kv_cache_allocation": kv_cache_allocation,
         "scheduler_e2e": scheduler_e2e,
         "cuda_graph": merge_graph_time_usage(
             target_cuda_graph,

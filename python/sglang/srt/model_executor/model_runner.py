@@ -167,10 +167,7 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
-from sglang.srt.observability.startup_phase_registry import (
-    startup_phase,
-    startup_phase_prefix,
-)
+from sglang.srt.observability.startup_phase_registry import startup_phase
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_context,
@@ -265,8 +262,7 @@ def _with_startup_phase_scope(method):
 
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
-        prefix = "draft_" if self.is_draft_worker else ""
-        with startup_phase_prefix(prefix):
+        with startup_phase(draft=self.is_draft_worker):
             return method(self, *args, **kwargs)
 
     return wrapper
