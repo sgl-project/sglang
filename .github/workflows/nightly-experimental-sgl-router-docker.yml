@@ -1,0 +1,95 @@
+name: Nightly Experimental sgl-router Docker Image
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_REPO: lmsysorg/sglang-staging
+  IMAGE_TAG: experimental-router-dev
+
+jobs:
+  # Build each arch natively (no QEMU emulation) and push the image by digest.
+  # The manifest job then stitches the per-arch digests into one multi-arch
+  # tag, so `docker pull` resolves the right arch automatically.
+  build:
+    if: github.repository == 'sgl-project/sglang'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push by digest
+        run: |
+          docker buildx build . -f docker/sgl-router.Dockerfile \
+            --platform ${{ matrix.platform }} \
+            --output "type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true" \
+            --metadata-file /tmp/metadata.json
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata.json'))['containerimage.digest'])")
+          echo "Pushed ${{ matrix.platform }} digest: ${DIGEST}"
+          mkdir -p /tmp/digests
+          echo "${DIGEST}" > "/tmp/digests/${{ matrix.arch }}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/${{ matrix.arch }}
+          retention-days: 1
+
+  create-manifest:
+    if: github.repository == 'sgl-project/sglang'
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest
+        run: |
+          AMD64_DIGEST=$(cat /tmp/digests/amd64)
+          ARM64_DIGEST=$(cat /tmp/digests/arm64)
+          docker buildx imagetools create \
+            -t "${IMAGE_REPO}:${IMAGE_TAG}" \
+            "${IMAGE_REPO}@${AMD64_DIGEST}" \
+            "${IMAGE_REPO}@${ARM64_DIGEST}"
+
+      - name: Inspect manifest
+        run: docker buildx imagetools inspect "${IMAGE_REPO}:${IMAGE_TAG}"

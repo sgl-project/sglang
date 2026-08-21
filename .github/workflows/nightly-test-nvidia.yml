@@ -1,0 +1,334 @@
+# Nightly CUDA tests. One job per runner_config, running that machine's
+# `nightly-test-{runner_config}` suite -- a test reaches a machine by declaring
+# `runner_config=` on register_cuda_ci, never by editing this file.
+#
+# Jobs go through the same _pr-test-stage.yml as the per-commit suites; what a
+# scheduled run needs on top is its `scheduled` input, so runner resolution,
+# rust-ext reuse and shard sizing are not reimplemented here.
+name: Nightly Test (Nvidia)
+
+on:
+  schedule:
+    - cron: '0 14 */2 * *'
+  workflow_dispatch:
+    inputs:
+      runner_filter:
+        description: 'Select which runner_config to run (leave empty or "all" to run all)'
+        required: false
+        type: choice
+        default: 'all'
+        options:
+          - 'all'
+          - '1-gpu-large'
+          - '2-gpu-large'
+          - '4-gpu-h100'
+          - '4-gpu-b200'
+          - '4-gpu-gb300'
+          - '8-gpu-h200'
+          - '8-gpu-b200'
+          - 'diffusion'
+      full_parallel:
+        description: 'Run all shards of a job at once (faster, but competes with per-commit CI for machines). Off by default: one shard at a time.'
+        required: false
+        type: boolean
+        default: false
+      force_baseline_update:
+        description: 'Refresh the precision rolling baseline instead of comparing. Dispatch once after an intentional forward-path precision change stales it; later runs compare against the new one.'
+        required: false
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
+      runner_filter:
+        description: 'Select which runner_config to run (leave empty or "all" to run all)'
+        required: false
+        type: string
+        default: 'all'
+      full_parallel:
+        description: 'Run all shards of a job at once (faster, but competes with per-commit CI for machines). Off by default: one shard at a time.'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: nightly-test-nvidia-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+permissions:
+  actions: write
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  # run_all_tests skips the paths-filter, so main_package is 'true' and
+  # sgl_kernel stays empty: every test runs, and no job waits on a wheel this
+  # workflow never builds. pr_test_yml points back here so shard sizing reads
+  # this file's own run_timeout_minutes.
+  check-changes:
+    uses: ./.github/workflows/_pr-test-check-changes.yml
+    with:
+      git_ref: ${{ inputs.ref || '' }}
+      pr_test_yml: '.github/workflows/nightly-test-nvidia.yml'
+      run_all_tests: true
+      force_continue_on_error: true
+    secrets: inherit
+
+  nightly-1-gpu-large:
+    needs: check-changes
+    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '1-gpu-large')
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: nightly-test-1-gpu-large
+      runner_config: 1-gpu-large
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '120'
+      job_timeout_minutes: '180'
+      scheduled: true
+    secrets: inherit
+
+  nightly-2-gpu-large:
+    needs: check-changes
+    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '2-gpu-large')
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: nightly-test-2-gpu-large
+      runner_config: 2-gpu-large
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '240'
+      job_timeout_minutes: '300'
+      scheduled: true
+    secrets: inherit
+
+  nightly-4-gpu-h100:
+    needs: check-changes
+    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '4-gpu-h100')
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: nightly-test-4-gpu-h100
+      runner_config: 4-gpu-h100
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '120'
+      job_timeout_minutes: '180'
+      scheduled: true
+    secrets: inherit
+
+  nightly-4-gpu-b200:
+    needs: check-changes
+    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '4-gpu-b200')
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: nightly-test-4-gpu-b200
+      runner_config: 4-gpu-b200
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '150'
+      job_timeout_minutes: '210'
+      scheduled: true
+    secrets: inherit
+
+  nightly-4-gpu-gb300:
+    needs: check-changes
+    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '4-gpu-gb300')
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: nightly-test-4-gpu-gb300
+      runner_config: 4-gpu-gb300
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '360'
+      job_timeout_minutes: '420'
+      scheduled: true
+      # aarch64: the rust-ext cache key is x86_64-only, same reason base-c skips it.
+      skip_prebuilt_rust_ext: true
+    secrets: inherit
+
+  nightly-8-gpu-h200:
+    needs: check-changes
+    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '8-gpu-h200')
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: nightly-test-8-gpu-h200
+      runner_config: 8-gpu-h200
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '300'
+      job_timeout_minutes: '360'
+      scheduled: true
+    secrets: inherit
+
+  nightly-8-gpu-b200:
+    needs: check-changes
+    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '8-gpu-b200')
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: nightly-test-8-gpu-b200
+      runner_config: 8-gpu-b200
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '360'
+      job_timeout_minutes: '420'
+      scheduled: true
+    secrets: inherit
+
+  # Hand-written because it is not a registry suite: it drives run_comparison.py
+  # and publishes a dashboard rather than running test files.
+  nightly-test-diffusion:
+    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == 'diffusion')
+    runs-on: 4-gpu-h100
+    timeout-minutes: 300
+    env:
+      SGLANG_IS_IN_CI: true
+      SGLANG_ENABLE_ASYNC_ASSERT: true
+      SGLANG_CUDA_COREDUMP: "1"
+      HF_HUB_DOWNLOAD_TIMEOUT: 300
+      HF_HUB_ETAG_TIMEOUT: 300
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run diffusion benchmark
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          PYTHONUNBUFFERED: "1"
+        timeout-minutes: 210
+        run: |
+          python3 -u scripts/ci/utils/diffusion/run_comparison.py \
+            --output comparison-results.json
+
+      - name: Generate dashboard
+        if: always()
+        env:
+          GH_PAT_FOR_NIGHTLY_CI_DATA: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/ci/utils/diffusion/generate_diffusion_dashboard.py \
+            --results comparison-results.json \
+            --output dashboard.md \
+            --charts-dir comparison-charts \
+            --fetch-history \
+            --step-summary
+
+      - name: Publish to sglang-ci-data
+        if: always()
+        env:
+          GH_PAT_FOR_NIGHTLY_CI_DATA: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: |
+          python3 scripts/ci/utils/diffusion/publish_comparison_results.py \
+            --results comparison-results.json \
+            --dashboard dashboard.md \
+            --charts-dir comparison-charts
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-benchmark-${{ github.run_id }}
+          path: |
+            comparison-results.json
+            dashboard.md
+            comparison-charts/
+            comparison-logs/
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
+
+  # Consolidate performance metrics from all jobs
+  consolidate-metrics:
+    if: github.repository == 'sgl-project/sglang' && always()
+    # Every scheduled stage uploads metrics now, so all of them must finish
+    # before the download step globs `*metrics-*`.
+    needs:
+      - nightly-1-gpu-large
+      - nightly-2-gpu-large
+      - nightly-4-gpu-h100
+      - nightly-4-gpu-b200
+      - nightly-4-gpu-gb300
+      - nightly-8-gpu-h200
+      - nightly-8-gpu-b200
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Download all partition metrics
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*metrics-*"
+          path: metrics/
+          merge-multiple: true
+
+      - name: List downloaded metrics
+        run: |
+          echo "Downloaded metrics files:"
+          find metrics/ -name "*.json" -type f 2>/dev/null || echo "No metrics files found"
+
+      - name: Merge metrics
+        run: |
+          python3 scripts/ci/utils/merge_metrics.py \
+            --input-dir metrics/ \
+            --output consolidated-metrics-${{ github.run_id }}.json \
+            --run-id ${{ github.run_id }} \
+            --commit-sha ${{ github.sha }} \
+            --branch ${{ github.ref_name }}
+
+      - name: Upload consolidated metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: consolidated-metrics-${{ github.run_id }}
+          path: consolidated-metrics-${{ github.run_id }}.json
+          retention-days: 90
+          if-no-files-found: warn
+
+  # Final check job
+  check-all-jobs:
+    if: github.repository == 'sgl-project/sglang' && always()
+    needs:
+      - nightly-1-gpu-large
+      - nightly-2-gpu-large
+      - nightly-4-gpu-h100
+      - nightly-4-gpu-b200
+      - nightly-4-gpu-gb300
+      - nightly-8-gpu-h200
+      - nightly-8-gpu-b200
+      - nightly-test-diffusion
+      - consolidate-metrics
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if any job failed
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "One or more nightly test jobs failed"
+            exit 1
+          fi
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more nightly test jobs were cancelled"
+            exit 1
+          fi
+          echo "All nightly test jobs passed"
