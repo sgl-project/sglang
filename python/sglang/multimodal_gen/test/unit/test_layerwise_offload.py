@@ -758,6 +758,12 @@ class _ResidentComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
         self.blocks = torch.nn.ModuleList([_DummyBlock() for _ in range(n)])
 
 
+class _ParkableResidentComponent(_ResidentComponent):
+    def __init__(self, n: int) -> None:
+        super().__init__(n)
+        self.non_layer = torch.nn.Parameter(torch.ones(2))
+
+
 class _AuxiliaryResidentComponent(_ResidentComponent):
     layerwise_offload_dit_group_enabled = False
 
@@ -1410,9 +1416,9 @@ def test_non_layer_parking_follows_memory_performance_mode(monkeypatch):
 
 def test_parking_leaves_streamed_layer_weights_alone(monkeypatch):
     """Only the parameters no manager streams are moved to the host."""
-    _patch_fake_device(monkeypatch)
-    comp = _ResidentComponent(4)
+    comp = _ParkableResidentComponent(4)
     comp.configure_layerwise_offload(_server_args(performance_mode="memory"))
+    _headroom(monkeypatch, 0)
     managed = comp._managed_layer_parameter_names()
     assert managed, "the managers should own the block parameters"
 
@@ -1429,8 +1435,7 @@ def test_parking_leaves_streamed_layer_weights_alone(monkeypatch):
 
 
 def test_parking_is_a_no_op_outside_memory_mode(monkeypatch):
-    _patch_fake_device(monkeypatch)
-    comp = _ResidentComponent(4)
+    comp = _ParkableResidentComponent(4)
     comp.configure_layerwise_offload(_server_args(performance_mode="speed"))
     comp.park_non_layer_weights()
     assert not comp._parked_non_layer_weights
@@ -1449,8 +1454,7 @@ def _headroom(monkeypatch, gib):
 
 def test_parking_is_skipped_when_the_card_has_room(monkeypatch):
     """A component holding a sliver of a large headroom is left alone."""
-    _patch_fake_device(monkeypatch)
-    comp = _ResidentComponent(4)
+    comp = _ParkableResidentComponent(4)
     comp.configure_layerwise_offload(_server_args(performance_mode="memory"))
     _headroom(monkeypatch, 400)
     comp.park_non_layer_weights()
@@ -1458,8 +1462,7 @@ def test_parking_is_skipped_when_the_card_has_room(monkeypatch):
 
 
 def test_parking_happens_when_the_headroom_is_small(monkeypatch):
-    _patch_fake_device(monkeypatch)
-    comp = _ResidentComponent(4)
+    comp = _ParkableResidentComponent(4)
     comp.configure_layerwise_offload(_server_args(performance_mode="memory"))
     _headroom(monkeypatch, 0)
     comp.park_non_layer_weights()
@@ -1468,8 +1471,7 @@ def test_parking_happens_when_the_headroom_is_small(monkeypatch):
 
 def test_host_copies_are_given_back_when_room_appears(monkeypatch):
     """Skipping must not leave host memory held for a park that will not happen."""
-    _patch_fake_device(monkeypatch)
-    comp = _ResidentComponent(4)
+    comp = _ParkableResidentComponent(4)
     comp.configure_layerwise_offload(_server_args(performance_mode="memory"))
     _headroom(monkeypatch, 0)
     comp.park_non_layer_weights()
@@ -1483,8 +1485,7 @@ def test_host_copies_are_given_back_when_room_appears(monkeypatch):
 
 def test_park_placeholders_are_shared(monkeypatch):
     """One stand-in per (device, dtype), not one allocation per parked weight."""
-    _patch_fake_device(monkeypatch)
-    comp = _ResidentComponent(4)
+    comp = _ParkableResidentComponent(4)
     comp.configure_layerwise_offload(_server_args(performance_mode="memory"))
     _headroom(monkeypatch, 0)
     comp.park_non_layer_weights()
