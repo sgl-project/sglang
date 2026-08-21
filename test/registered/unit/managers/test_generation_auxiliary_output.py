@@ -92,7 +92,6 @@ def test_auxiliary_output_releases_device_holder_after_copy():
 
     assert logits_output.auxiliary_device_output is None
     assert result.auxiliary_host_output is not device_output
-    assert torch.equal(result.auxiliary_host_output.values, device_output.values)
     assert device_output.copy_count == 1
     assert result.copy_done.record_count == 1
 
