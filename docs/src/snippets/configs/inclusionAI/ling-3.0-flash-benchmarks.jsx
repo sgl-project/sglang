@@ -78,6 +78,8 @@ export const benchmarks = [
     match: { hw: "b200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
     sglang_version: "PR #33561 @ c5071ded",
     accuracy: { gsm8k_pct: 96.44 },
+    notes:
+      "Same cell with the Playground DSPARK option (draft inclusionAI/Ling-3.0-flash-dspark + ReplaySSM, cache-len 32), PR #33561 head 0e5e40d8f on the dev-Ling-3.0-flash image: GSM8K 200q 98.0% (32 threads, 66s, 1243 tok/s output), average accept length 6.22, deterministic 20-request stop rate 100%.",
   },
   {
     match: { hw: "b200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },

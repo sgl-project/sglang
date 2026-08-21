@@ -101,10 +101,15 @@ sgl-eval run gsm8k \\
         {
           id: "dspark",
           label: "DSPARK (draft model)",
+          // --linear-replayssm-cache-len 32: the draft's block size 8 makes the
+          // verify window 9 tokens, and the KDA ReplaySSM ring must be a power
+          // of two >= 2x the window — the 16 default is too small and the
+          // server refuses to start.
           flags: [
             "--speculative-algorithm DSPARK",
             "--speculative-draft-model-path inclusionAI/Ling-3.0-flash-dspark",
             "--enable-linear-replayssm-spec",
+            "--linear-replayssm-cache-len 32",
           ],
         },
       ],
