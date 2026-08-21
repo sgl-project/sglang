@@ -62,6 +62,7 @@ class AscendLoRABackend(BaseLoRABackend):
         else:
             output_tensor = base_output
 
+        x = x.to(torch.float)
         torch.ops.npu.sgemmv_expand(
             x,
             weights,
