@@ -53,9 +53,7 @@ def _build_drift_prompt(model, image_token):
     token), followed by one image placeholder. drift_delta is how many extra
     tokens the non-canonical form carries vs. the canonical re-tokenization.
     """
-    tok = AutoProcessor.from_pretrained(
-        model, trust_remote_code=True, use_fast=True
-    ).tokenizer
+    tok = AutoProcessor.from_pretrained(model, trust_remote_code=True).tokenizer
 
     def enc(text):
         return tok.encode(text, add_special_tokens=False)

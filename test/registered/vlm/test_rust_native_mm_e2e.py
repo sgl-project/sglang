@@ -48,7 +48,7 @@ def solid_image_data_url(fmt):
 
 
 @unittest.skipIf(
-    importlib.util.find_spec("sglang.srt.server._core") is None,
+    importlib.util.find_spec("sglang.srt.rust_extensions._server") is None,
     "sglang-server rust extension not installed (e.g. AMD suite)",
 )
 class TestRustServerNativeMm(CustomTestCase):

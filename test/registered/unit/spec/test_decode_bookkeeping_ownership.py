@@ -41,6 +41,10 @@ _EVICT_METHOD = "maybe_evict_swa"
 # Any added/removed/recounted site fails until reviewed here.
 _SB = "managers/schedule_batch.py"
 _EAGLE_DECODE = ("speculative/eagle_utils.py", "eagle_prepare_for_decode")
+_DFLASH_DECODE = (
+    "speculative/dflash_info_v2.py",
+    "DFlashDraftInputV2.prepare_for_decode",
+)
 _RESOLVE = (
     "managers/scheduler_components/batch_result_processor.py",
     "SchedulerBatchResultProcessor._resolve_spec_v2_tokens",
@@ -62,6 +66,11 @@ _OWNER_SITES = {
     # inside the owned-kv alloc_for_spec_decode function (op42).
     (*_EAGLE_DECODE, "decode_batch_idx"): 1,
     (*_EAGLE_DECODE, "evict"): 1,
+    # DFlash uses its stateful scheduler-side preparation instead of
+    # eagle_prepare_for_decode. spec_prepare_for_decode dispatches to exactly
+    # one of these two owners for each speculative decode iteration.
+    (*_DFLASH_DECODE, "decode_batch_idx"): 1,
+    (*_DFLASH_DECODE, "evict"): 1,
     (
         "mem_cache/allocation.py",
         "alloc_for_spec_decode",
