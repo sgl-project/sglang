@@ -1878,7 +1878,9 @@ class OpenAIServingChat(OpenAIServingBase):
                         tokenizer=self.tokenizer_manager.tokenizer,
                         tool_call_parser_active=self._tool_call_parsing_active(request),
                     )
-                    reasoning_text, text = parser.parse_non_stream(text)
+                    reasoning_text, text = parser.parse_non_stream(
+                        text, finish_reason=finish_reason
+                    )
                 except Exception as e:
                     logger.error(f"Reasoning parsing error: {e}")
                     return self.create_error_response(
