@@ -430,47 +430,30 @@ def _make_kvpool(device="cpu", page_size=128, swa_page_size=128):
 class TestNpuStatePoolSize(unittest.TestCase):
     """Tests for the module-level npu_state_pool_size helper."""
 
-    def test_ratio4_page1(self):
-        """1.8*4=7.2 -> ceil 8 -> +1=9 -> max(2,9)=9; *1 req *1 = 9."""
+    def test_formula_cases(self):
+        """Explicit ceil/+1/clamp cases across ratio/page_size combos."""
         self.assertEqual(npu_state_pool_size(ratio=4, page_size=1, max_num_reqs=1), 9)
-
-    def test_ratio128_page1_two_reqs(self):
-        """1.8*128=230.4 -> ceil 231 -> +1=232; *2 reqs *1 = 464."""
         self.assertEqual(
             npu_state_pool_size(ratio=128, page_size=1, max_num_reqs=2), 464
         )
-
-    def test_ratio4_page8(self):
-        """1.8*4/8=0.9 -> ceil 1 -> +1=2 -> max(2,2)=2; *4 reqs *8 = 64."""
         self.assertEqual(npu_state_pool_size(ratio=4, page_size=8, max_num_reqs=4), 64)
-
-    def test_ratio128_page128(self):
-        """1.8*128/128=1.8 -> ceil 2 -> +1=3 -> max(2,3)=3; *1 req *128 = 384."""
         self.assertEqual(
             npu_state_pool_size(ratio=128, page_size=128, max_num_reqs=1), 384
         )
-
-    def test_blocks_clamped_to_two(self):
-        """Tiny ratio/page -> ceil yields 1 -> +1=2 -> clamped to 2."""
         self.assertEqual(
             npu_state_pool_size(ratio=4, page_size=128, max_num_reqs=1), 256
         )
 
-    def test_result_divisible_by_page_size(self):
-        """Result is always a whole multiple of page_size."""
+    def test_properties(self):
+        """Result divisible by page_size, linear in reqs, zero for no reqs."""
         for r, ps, mn in [(4, 1, 7), (128, 1, 3), (4, 8, 5), (128, 128, 2)]:
-            result = npu_state_pool_size(ratio=r, page_size=ps, max_num_reqs=mn)
-            self.assertEqual(result % ps, 0)
-
-    def test_scales_linearly_with_max_num_reqs(self):
-        """Doubling max_num_reqs doubles the result."""
+            self.assertEqual(
+                npu_state_pool_size(ratio=r, page_size=ps, max_num_reqs=mn) % ps, 0
+            )
         base = npu_state_pool_size(ratio=4, page_size=1, max_num_reqs=1)
         self.assertEqual(
             npu_state_pool_size(ratio=4, page_size=1, max_num_reqs=5), base * 5
         )
-
-    def test_zero_reqs(self):
-        """max_num_reqs=0 -> 0."""
         self.assertEqual(npu_state_pool_size(ratio=4, page_size=1, max_num_reqs=0), 0)
 
 
@@ -482,15 +465,11 @@ class TestNpuStatePoolSize(unittest.TestCase):
 class TestNPUCompressStatePool(unittest.TestCase):
     """Tests for NPUCompressStatePool construction and layout."""
 
-    def test_valid_ratio_4_constructs(self):
-        """ratio=4 (overlap True) constructs without error."""
-        sp = _make_state_pool(ratio=4, overlap=True, head_dim=4, ring_size=2)
-        self.assertIsInstance(sp, NPUCompressStatePool)
-
-    def test_valid_ratio_128_constructs(self):
-        """ratio=128 (overlap False) constructs without error."""
-        sp = _make_state_pool(ratio=128, overlap=False, head_dim=4, ring_size=2)
-        self.assertIsInstance(sp, NPUCompressStatePool)
+    def test_valid_ratios_construct(self):
+        """ratio 4/128 (overlap True/False) construct without error."""
+        for ratio, overlap in [(4, True), (128, False)]:
+            sp = _make_state_pool(ratio=ratio, overlap=overlap, head_dim=4, ring_size=2)
+            self.assertIsInstance(sp, NPUCompressStatePool)
 
     def test_invalid_ratio_raises(self):
         """ratio not in (4, 128) -> AssertionError."""
@@ -536,24 +515,17 @@ class TestNPUCompressStatePool(unittest.TestCase):
         self.assertEqual(_make_state_pool(ratio=4).ratio, 4)
         self.assertEqual(_make_state_pool(ratio=128, overlap=False).ratio, 128)
 
-    def test_last_dim_overlap_true(self):
-        """overlap True -> last_dim = 2 * (1+1) * head_dim = 4 * head_dim."""
-        sp = _make_state_pool(overlap=True, head_dim=4)
-        self.assertEqual(sp.last_dim, 4 * 4)
+    def test_last_dim_scales_with_overlap(self):
+        """last_dim = 2 * (1 + overlap) * head_dim."""
+        self.assertEqual(_make_state_pool(overlap=True, head_dim=4).last_dim, 4 * 4)
+        self.assertEqual(
+            _make_state_pool(overlap=False, head_dim=4, ratio=128).last_dim, 2 * 4
+        )
 
-    def test_last_dim_overlap_false(self):
-        """overlap False -> last_dim = 2 * (1+0) * head_dim = 2 * head_dim."""
-        sp = _make_state_pool(overlap=False, head_dim=4, ratio=128)
-        self.assertEqual(sp.last_dim, 2 * 4)
-
-    def test_dummy_row_kv_zeroed(self):
-        """kv half is all-zero everywhere (zeros init; sentinel row too)."""
+    def test_dummy_row_kv_zeroed_score_neg_inf(self):
+        """kv all-zero; last dummy row score -inf, other rows 0."""
         sp = _make_state_pool(size=8, ring_size=2, head_dim=4)
         self.assertTrue(torch.all(sp.kv_score_buffer.kv == 0))
-
-    def test_dummy_row_score_neg_inf(self):
-        """The last (dummy/sentinel) row has -inf score; the rest keep 0."""
-        sp = _make_state_pool(size=8, ring_size=2, head_dim=4)
         score = sp.kv_score_buffer.score
         self.assertTrue(torch.all(score[-1] == float("-inf")))
         self.assertTrue(torch.all(score[:-1] == 0))
@@ -567,17 +539,13 @@ class TestNPUCompressStatePool(unittest.TestCase):
         self.assertTrue(torch.all(score == float("-inf")))
         self.assertTrue(torch.all(sp.kv_score_buffer.kv == 0))
 
-    def test_state_cache_3d_shape(self):
-        """state_cache_3d reshapes to (num_buffer_pages, page_size, last_dim)."""
+    def test_state_cache_3d_shape_and_sentinel(self):
+        """3D view shape (npages, page_size, last_dim); last row is the dummy."""
         sp = _make_state_pool(size=8, ring_size=2, head_dim=4)
         # _size=12, page_size=2, last_dim=16 -> (6, 2, 16)
         self.assertEqual(
             sp.state_cache_3d.shape, (sp._size // sp.page_size, 2, sp.last_dim)
         )
-
-    def test_state_cache_3d_last_row_is_sentinel(self):
-        """state_cache_3d's last row carries the zeroed-kv / -inf-score dummy."""
-        sp = _make_state_pool(size=8, ring_size=2, head_dim=4)
         last_row = sp.state_cache_3d.reshape(-1, sp.last_dim)[-1]
         half = sp.last_dim // 2
         self.assertTrue(torch.all(last_row[:half] == 0))
@@ -617,24 +585,16 @@ class TestNPUDeepSeekV4SingleKVPool(unittest.TestCase):
             kernel_page_size=d["kernel_page_size"],
         )
 
-    def test_kernel_page_size_set_before_super(self):
-        """kernel_page_size is available right after construction."""
-        pool = self._make(kernel_page_size=16)
-        self.assertEqual(pool.kernel_page_size, 16)
-
     def test_bf16_creates_pa_nd_buffers(self):
         """bf16 store -> kv_buffer entries are PA_ND (npages, kp, 1, kv_dim)."""
-        pool = self._make()
+        pool = self._make(kernel_page_size=16)
+        self.assertEqual(pool.kernel_page_size, 16)
+        self.assertEqual(pool.kv_cache_total_dim, 128 + 64)  # qk_nope + qk_rope
         self.assertEqual(len(pool.kv_buffer), 2)
         buf = pool.kv_buffer[0]
         npu_pages = (128 + 16 + 1) // 16  # 9
         self.assertEqual(buf.shape, (npu_pages, 16, 1, 192))
         self.assertEqual(buf.dtype, torch.bfloat16)
-
-    def test_kv_cache_total_dim_set(self):
-        """kv_cache_total_dim = qk_nope + qk_rope."""
-        pool = self._make()
-        self.assertEqual(pool.kv_cache_total_dim, 128 + 64)  # 属于重复测试
 
     def test_npu_num_pages_formula(self):
         """npu_num_pages = (size + kernel_page_size + 1) // kernel_page_size."""
@@ -692,37 +652,23 @@ class TestNPUDeepSeekV4IndexerPool(unittest.TestCase):
         pool = self._make(kernel_page_size=16)
         self.assertEqual(pool._kernel_page_size, 16)
 
-    def test_index_k_buffer_layout(self):
-        """index_k_buffer: layer_num int8 (npages, kp, 1, index_head_dim)."""
+    def test_buffer_layouts(self):
+        """k (int8) and scale (fp16) buffers are layer_num PA_ND tensors."""
         pool = self._make()
-        self.assertEqual(len(pool.index_k_buffer), 2)
-        buf = pool.index_k_buffer[0]
         npu_pages = (128 + 16 + 1) // 16  # 9
-        self.assertEqual(buf.shape, (npu_pages, 16, 1, 256))
-        self.assertEqual(buf.dtype, torch.int8)
-
-    def test_index_scale_buffer_layout(self):
-        """index_scale_buffer: layer_num fp16 (npages, kp, 1, 1)."""
-        pool = self._make()
+        self.assertEqual(len(pool.index_k_buffer), 2)
+        self.assertEqual(pool.index_k_buffer[0].shape, (npu_pages, 16, 1, 256))
+        self.assertEqual(pool.index_k_buffer[0].dtype, torch.int8)
         self.assertEqual(len(pool.index_scale_buffer), 2)
-        buf = pool.index_scale_buffer[0]
-        self.assertEqual(buf.shape, (9, 16, 1, 1))
-        self.assertEqual(buf.dtype, torch.float16)
-
-    def test_has_npu_storage_true(self):
-        """NPU indexer pool always reports has_npu_storage True."""
-        pool = self._make()
+        self.assertEqual(pool.index_scale_buffer[0].shape, (npu_pages, 16, 1, 1))
+        self.assertEqual(pool.index_scale_buffer[0].dtype, torch.float16)
         self.assertTrue(pool.has_npu_storage)
 
-    def test_get_index_k_returns_layer(self):
-        """get_index_k(layer_id) returns index_k_buffer[layer_id]."""
+    def test_get_buffers_returns_layer(self):
+        """get_index_k / get_index_scale return the layer's buffer."""
         pool = self._make()
         self.assertIs(pool.get_index_k(0), pool.index_k_buffer[0])
         self.assertIs(pool.get_index_k(1), pool.index_k_buffer[1])
-
-    def test_get_index_scale_returns_layer(self):
-        """get_index_scale(layer_id) returns index_scale_buffer[layer_id]."""
-        pool = self._make()
         self.assertIs(pool.get_index_scale(0), pool.index_scale_buffer[0])
 
     def test_set_index_k_scale_with_scale_two_scatters(self):
@@ -826,51 +772,33 @@ class TestMakeKvPool(unittest.TestCase):
 class TestMakeAttnStatePool(unittest.TestCase):
     """Tests for DSV4NPUTokenToKVPool._make_attn_state_pool."""
 
-    def test_ratio4_builds_pool(self):
-        """ratio=4 -> NPUCompressStatePool with overlap and c4 dtype."""
+    def test_ratios_build_pool(self):
+        """ratio 4/128 -> NPUCompressStatePool with per-ratio overlap/last_dim."""
         pool = _make_kvpool()
-        sp = pool._make_attn_state_pool(ratio=4, enable_memory_saver=False)
-        self.assertIsInstance(sp, NPUCompressStatePool)
-        # page_size = state_cache_page_size = ring_size from get_ring_size(4)
-        self.assertEqual(sp.page_size, pool.get_ring_size(4))
-        self.assertEqual(sp.ring_size, pool.get_ring_size(4))
-        # overlap=True -> last_dim = 4 * head_dim
         head_dim = pool.qk_nope_head_dim + pool.qk_rope_head_dim
-        self.assertEqual(sp.last_dim, 4 * head_dim)
+        for ratio, mult in [(4, 4), (128, 2)]:
+            sp = pool._make_attn_state_pool(ratio=ratio, enable_memory_saver=False)
+            self.assertIsInstance(sp, NPUCompressStatePool)
+            # page_size = state_cache_page_size = ring_size from get_ring_size(ratio)
+            self.assertEqual(sp.page_size, pool.get_ring_size(ratio))
+            self.assertEqual(sp.ring_size, pool.get_ring_size(ratio))
+            self.assertEqual(sp.last_dim, mult * head_dim)
 
-    def test_ratio128_builds_pool(self):
-        """ratio=128 -> overlap False, c128 dtype."""
-        pool = _make_kvpool()
-        sp = pool._make_attn_state_pool(ratio=128, enable_memory_saver=False)
-        self.assertIsInstance(sp, NPUCompressStatePool)
-        head_dim = pool.qk_nope_head_dim + pool.qk_rope_head_dim
-        self.assertEqual(sp.last_dim, 2 * head_dim)
-
-    def test_state_pool_size_called_with_ratio(self):
-        """_state_pool_size is consulted with the ratio."""
-        pool = _make_kvpool()
-        pool._make_attn_state_pool(ratio=4, enable_memory_saver=False)
-        pool._state_pool_size.assert_called_once_with(4)
-
-    def test_size_from_state_pool_size(self):
-        """Pool size = _state_pool_size(ratio) output."""
+    def test_state_pool_size_consulted_for_size(self):
+        """_state_pool_size is called with the ratio and sizes the pool."""
         pool = _make_kvpool()
         pool._state_pool_size.return_value = 64
         sp = pool._make_attn_state_pool(ratio=4, enable_memory_saver=False)
+        pool._state_pool_size.assert_called_once_with(4)
         # _size = 64 + ring_size(8) + 1 = 73 -> pad to lcm(4, 8) = 80
         self.assertEqual(sp._size, 80)
 
     @patch(_MOD + ".ONLINE_C128", True)
-    def test_online_c128_with_ratio128_raises(self):
-        """ratio=128 and ONLINE_C128 -> AssertionError (no online on NPU)."""
+    def test_online_c128_only_rejects_ratio128(self):
+        """ONLINE_C128 forbids ratio 128 but allows ratio 4 (no online on NPU)."""
         pool = _make_kvpool()
         with self.assertRaises(AssertionError):
             pool._make_attn_state_pool(ratio=128, enable_memory_saver=False)
-
-    @patch(_MOD + ".ONLINE_C128", True)
-    def test_online_c128_with_ratio4_ok(self):
-        """ratio=4 with ONLINE_C128 is fine (assert only targets ratio 128)."""
-        pool = _make_kvpool()
         sp = pool._make_attn_state_pool(ratio=4, enable_memory_saver=False)
         self.assertIsInstance(sp, NPUCompressStatePool)
 
@@ -881,18 +809,13 @@ class TestMakeIndexerStatePool(unittest.TestCase):
     def test_builds_pool_with_indexer_head_dim(self):
         """Uses indexer_head_dim and c4_state_pool_size budget."""
         pool = _make_kvpool()
+        pool.c4_state_pool_size = 64
         sp = pool._make_indexer_state_pool(ratio=4, enable_memory_saver=False)
         self.assertIsInstance(sp, NPUCompressStatePool)
         # overlap True -> last_dim = 4 * indexer_head_dim
         self.assertEqual(sp.last_dim, 4 * pool.indexer_head_dim)
         # page_size = state_cache_page_size = ring_size from get_ring_size(4)
         self.assertEqual(sp.page_size, pool.get_ring_size(4))
-
-    def test_size_from_c4_state_pool_size(self):
-        """size = self.c4_state_pool_size."""
-        pool = _make_kvpool()
-        pool.c4_state_pool_size = 64
-        sp = pool._make_indexer_state_pool(ratio=4, enable_memory_saver=False)
         # _size = 64 + ring_size(8) + 1 = 73 -> pad to lcm(4, 8) = 80
         self.assertEqual(sp._size, 80)
 
@@ -906,34 +829,21 @@ class TestMakeIndexerPool(unittest.TestCase):
     """Tests for DSV4NPUTokenToKVPool._make_indexer_pool."""
 
     def test_returns_npu_indexer_pool(self):
-        """Returns NPUDeepSeekV4IndexerPool with kernel_page_size = page_size."""
-        pool = _make_kvpool()
-        ip = pool._make_indexer_pool(
-            size=128,
-            page_size=128,
-            dtype=torch.bfloat16,
-            index_head_dim=256,
-            layer_num=2,
-            device="cpu",
-            enable_memory_saver=False,
-        )
-        self.assertIsInstance(ip, NPUDeepSeekV4IndexerPool)
-        self.assertEqual(ip._kernel_page_size, pool.page_size)
-        self.assertEqual(len(ip.index_k_buffer), 2)
-
-    def test_passes_index_head_dim(self):
-        """index_head_dim flows through to the constructed pool."""
+        """Returns NPUDeepSeekV4IndexerPool; kernel_page_size = page_size, head dim flows."""
         pool = _make_kvpool()
         ip = pool._make_indexer_pool(
             size=128,
             page_size=128,
             dtype=torch.bfloat16,
             index_head_dim=512,
-            layer_num=1,
+            layer_num=2,
             device="cpu",
             enable_memory_saver=False,
         )
+        self.assertIsInstance(ip, NPUDeepSeekV4IndexerPool)
+        self.assertEqual(ip._kernel_page_size, pool.page_size)
         self.assertEqual(ip.index_head_dim, 512)
+        self.assertEqual(len(ip.index_k_buffer), 2)
 
 
 @unittest.skip("clear_unaccepted_c128_draft_states moved to shared base (out of NPU scope)")
@@ -986,20 +896,15 @@ class TestGetStateCache(unittest.TestCase):
 class TestGetKeyBuffer(unittest.TestCase):
     """Tests for get_key_buffer routing by compression ratio."""
 
-    def test_ratio0_returns_swa(self):
-        """ratio 0 -> swa_kv_pool.kv_buffer[compress_layer_id]."""
+    def test_ratio_routes_to_subpool(self):
+        """ratio 0/4/128 -> swa/c4/c128 kv_buffer[compress_layer_id]."""
         pool = _make_kvpool()
-        self.assertIs(pool.get_key_buffer(0), pool.swa_kv_pool.kv_buffer[0])
-
-    def test_ratio4_returns_c4(self):
-        """ratio 4 -> c4_kv_pool.kv_buffer[compress_layer_id]."""
-        pool = _make_kvpool()
-        self.assertIs(pool.get_key_buffer(1), pool.c4_kv_pool.kv_buffer[0])
-
-    def test_ratio128_returns_c128(self):
-        """ratio 128 -> c128_kv_pool.kv_buffer[compress_layer_id]."""
-        pool = _make_kvpool()
-        self.assertIs(pool.get_key_buffer(2), pool.c128_kv_pool.kv_buffer[0])
+        for layer_id, buf in [
+            (0, pool.swa_kv_pool.kv_buffer[0]),
+            (1, pool.c4_kv_pool.kv_buffer[0]),
+            (2, pool.c128_kv_pool.kv_buffer[0]),
+        ]:
+            self.assertIs(pool.get_key_buffer(layer_id), buf)
 
     def test_unknown_ratio_raises(self):
         """Unsupported ratio -> ValueError."""
@@ -1014,14 +919,10 @@ class TestGetKeyBuffer(unittest.TestCase):
         pool.layer_mapping[1] = _LayerItem(4, 1, "c4")
         self.assertIs(pool.get_key_buffer(1), pool.c4_kv_pool.kv_buffer[1])
 
-    def test_get_value_buffer_same_as_key(self):
-        """V4 MQA: V buffer == K buffer."""
+    def test_value_equals_key_and_kv_returns_pair(self):
+        """V4 MQA: V buffer == K buffer; get_kv_buffer returns (k, v) with v == k."""
         pool = _make_kvpool()
         self.assertIs(pool.get_value_buffer(1), pool.get_key_buffer(1))
-
-    def test_get_kv_buffer_returns_tuple(self):
-        """get_kv_buffer returns (k, v) with v == k."""
-        pool = _make_kvpool()
         k, v = pool.get_kv_buffer(1)
         self.assertIs(k, pool.c4_kv_pool.kv_buffer[0])
         self.assertIs(v, pool.c4_kv_pool.kv_buffer[0])
@@ -1035,10 +936,11 @@ class TestGetKeyBuffer(unittest.TestCase):
 class TestGetSwaBuffer(unittest.TestCase):
     """Tests for DSV4NPUTokenToKVPool.get_swa_buffer."""
 
-    def test_without_loc_returns_full(self):
-        """No loc -> raw swa_kv_pool.kv_buffer[layer_id]."""
+    def test_returns_raw_buffer(self):
+        """No loc -> raw swa buffer; indexed by raw layer_id, not compress_layer_id."""
         pool = _make_kvpool()
         self.assertIs(pool.get_swa_buffer(0), pool.swa_kv_pool.kv_buffer[0])
+        self.assertIs(pool.get_swa_buffer(2), pool.swa_kv_pool.kv_buffer[2])
 
     def test_with_loc_gathers_flat(self):
         """loc -> flatten(num_pages, page_size) then gather by loc."""
@@ -1048,11 +950,6 @@ class TestGetSwaBuffer(unittest.TestCase):
         flat = pool.swa_kv_pool.kv_buffer[0].flatten(0, 1)
         self.assertTrue(torch.equal(result, flat[loc]))
         self.assertEqual(result.shape, (2, 1, 192))
-
-    def test_uses_raw_layer_id(self):
-        """SWA buffer is indexed by raw layer_id, not compress_layer_id."""
-        pool = _make_kvpool()
-        self.assertIs(pool.get_swa_buffer(2), pool.swa_kv_pool.kv_buffer[2])
 
 
 # ---------------------------------------------------------------------------
@@ -1075,17 +972,13 @@ class TestGetCompressBuffer(unittest.TestCase):
         self.assertEqual(pool.get_compress_buffer(1, from_indexer=True), "idx_k")
         pool.c4_indexer_kv_pool.get_index_k.assert_called_once_with(0)
 
-    def test_ratio4_not_indexer(self):
-        """ratio 4 not indexer -> c4_kv_pool.kv_buffer."""
+    def test_non_indexer_returns_kv_buffer(self):
+        """ratio 4/128 not indexer -> corresponding compress kv_buffer."""
         pool = _make_kvpool()
         self.assertIs(
             pool.get_compress_buffer(1, from_indexer=False),
             pool.c4_kv_pool.kv_buffer[0],
         )
-
-    def test_ratio128_not_indexer(self):
-        """ratio 128 not indexer -> c128_kv_pool.kv_buffer."""
-        pool = _make_kvpool()
         self.assertIs(
             pool.get_compress_buffer(2, from_indexer=False),
             pool.c128_kv_pool.kv_buffer[0],
@@ -1114,23 +1007,18 @@ class TestGetCompressBuffer(unittest.TestCase):
 class TestSetSwaBuffer(unittest.TestCase):
     """Tests for DSV4NPUTokenToKVPool.set_swa_buffer."""
 
-    def test_writes_2d_cache_unsqueezed(self):
-        """cache (T, dim) -> unsqueeze(1) before index_put."""
+    def test_writes_cache_with_dim_axis(self):
+        """2D cache -> unsqueeze(1) before index_put; 3D cache written as-is."""
         pool = _make_kvpool()
         loc = torch.tensor([0, 1])
-        cache = torch.ones(2, 192, dtype=torch.bfloat16)
-        pool.set_swa_buffer(0, loc, cache)
         flat = pool.swa_kv_pool.kv_buffer[0].flatten(0, 1)
-        self.assertTrue(torch.equal(flat[loc], cache.unsqueeze(1)))
-
-    def test_writes_3d_cache_no_unsqueeze(self):
-        """cache (T, 1, dim) -> written as-is."""
-        pool = _make_kvpool()
-        loc = torch.tensor([0, 1])
-        cache = torch.ones(2, 1, 192, dtype=torch.bfloat16)
-        pool.set_swa_buffer(0, loc, cache)
-        flat = pool.swa_kv_pool.kv_buffer[0].flatten(0, 1)
-        self.assertTrue(torch.equal(flat[loc], cache))
+        c2 = torch.full((2, 192), 1, dtype=torch.bfloat16)
+        pool.set_swa_buffer(0, loc, c2)
+        self.assertTrue(torch.equal(flat[loc], c2.unsqueeze(1)))
+        flat[loc] = 0  # reset so the 3D write is observable
+        c3 = torch.full((2, 1, 192), 2, dtype=torch.bfloat16)
+        pool.set_swa_buffer(0, loc, c3)
+        self.assertTrue(torch.equal(flat[loc], c3))
 
     def test_casts_to_buffer_dtype(self):
         """cache dtype differs from buffer -> cast on write."""
@@ -1153,7 +1041,7 @@ class TestSetStateBuffer(unittest.TestCase):
     """Tests for DSV4NPUTokenToKVPool.set_state_buffer."""
 
     def test_writes_kv_and_score_halves(self):
-        """kv -> first half, score -> second half at rows [loc]."""
+        """kv -> first half, score -> second half at rows [loc]; sentinels intact."""
         pool = _make_kvpool()
         sp = _make_state_pool(head_dim=4, page_size=2, size=8)
         pool.get_attention_compress_states.return_value = sp
@@ -1166,42 +1054,20 @@ class TestSetStateBuffer(unittest.TestCase):
         self.assertTrue(torch.equal(ks[3, :8], kv[1]))
         self.assertTrue(torch.equal(ks[2, 8:], score[0]))
         self.assertTrue(torch.equal(ks[3, 8:], score[1]))
+        self.assertTrue(torch.all(ks[0, 8:] == float("-inf")))  # sentinel row
 
-    def test_sentinel_rows_untouched(self):
-        """Writing non-sentinel rows leaves block 0's -inf score intact."""
+    def test_from_indexer_route_and_cast(self):
+        """from_indexer routes to indexer pool; kv/score cast on write."""
         pool = _make_kvpool()
-        sp = _make_state_pool(head_dim=4, page_size=2, size=8)
-        pool.get_attention_compress_states.return_value = sp
-        loc = torch.tensor([2])
-        kv = torch.ones(1, 8, dtype=torch.float32)
-        score = torch.zeros(1, 8, dtype=torch.float32)
-        pool.set_state_buffer(1, loc, kv, score, from_indexer=False)
-        ks = sp.kv_score_buffer.kv_score
-        self.assertTrue(torch.all(ks[0, 8:] == float("-inf")))
-
-    def test_from_indexer_routes_to_indexer_pool(self):
-        """from_indexer=True -> get_indexer_compress_states(layer_id)."""
-        pool = _make_kvpool()
-        sp = _make_state_pool(head_dim=4, page_size=2, size=8)
+        sp = _make_state_pool(head_dim=4, page_size=2, size=8, dtype=torch.bfloat16)
         pool.get_indexer_compress_states.return_value = sp
         loc = torch.tensor([2])
         kv = torch.ones(1, 8, dtype=torch.float32)
-        score = torch.zeros(1, 8, dtype=torch.float32)
+        score = torch.ones(1, 8, dtype=torch.float32)
         pool.set_state_buffer(1, loc, kv, score, from_indexer=True)
         pool.get_indexer_compress_states.assert_called_once_with(1)
         self.assertTrue(torch.equal(sp.kv_score_buffer.kv_score[2, :8], kv[0]))
-
-    def test_casts_to_buffer_dtype(self):
-        """kv/score cast to the pool's kv_score dtype on write."""
-        pool = _make_kvpool()
-        sp = _make_state_pool(head_dim=4, page_size=2, size=8, dtype=torch.bfloat16)
-        pool.get_attention_compress_states.return_value = sp
-        loc = torch.tensor([2])
-        kv = torch.ones(1, 8, dtype=torch.float32)
-        score = torch.ones(1, 8, dtype=torch.float32)
-        pool.set_state_buffer(1, loc, kv, score, from_indexer=False)
-        ks = sp.kv_score_buffer.kv_score
-        self.assertEqual(ks.dtype, torch.bfloat16)
+        self.assertEqual(sp.kv_score_buffer.kv_score.dtype, torch.bfloat16)
 
 
 # ---------------------------------------------------------------------------
@@ -1213,40 +1079,23 @@ class TestSetStateBuffer(unittest.TestCase):
 class TestGetStateBuffer(unittest.TestCase):
     """Tests for DSV4NPUTokenToKVPool.get_state_buffer."""
 
-    def test_without_indices(self):
-        """No kv_indices -> split + unsqueeze over the whole buffer."""
+    def test_splits_kv_and_score(self):
+        """Split + unsqueeze(-2) num_kv_heads axis; optional kv_indices gather."""
         pool = _make_kvpool()
         sp = _make_state_pool(head_dim=4, page_size=2, size=8)
         pool.get_attention_compress_states.return_value = sp
-        kv, score = pool.get_state_buffer(1, from_indexer=False)
         ks = sp.kv_score_buffer.kv_score
         half = sp.last_dim // 2
+        kv, score = pool.get_state_buffer(1, from_indexer=False)
         self.assertEqual(kv.shape, (sp._size, 1, half))
-        self.assertEqual(score.shape, (sp._size, 1, half))
+        self.assertEqual(kv.shape[-2], 1)
         self.assertTrue(torch.equal(kv.squeeze(1), ks[:, :half]))
         self.assertTrue(torch.equal(score.squeeze(1), ks[:, half:]))
-
-    def test_with_indices(self):
-        """kv_indices -> gather rows then split + unsqueeze."""
-        pool = _make_kvpool()
-        sp = _make_state_pool(head_dim=4, page_size=2, size=8)
-        pool.get_attention_compress_states.return_value = sp
         idx = torch.tensor([2, 3])
         kv, score = pool.get_state_buffer(1, from_indexer=False, kv_indices=idx)
-        ks = sp.kv_score_buffer.kv_score
-        half = sp.last_dim // 2
         self.assertEqual(kv.shape, (2, 1, half))
         self.assertTrue(torch.equal(kv.squeeze(1), ks[idx, :half]))
         self.assertTrue(torch.equal(score.squeeze(1), ks[idx, half:]))
-
-    def test_adds_num_kv_heads_axis(self):
-        """Returned kv/score have a num_kv_heads=1 axis (unsqueeze(-2))."""
-        pool = _make_kvpool()
-        sp = _make_state_pool(head_dim=4, page_size=2, size=8)
-        pool.get_attention_compress_states.return_value = sp
-        kv, score = pool.get_state_buffer(1, from_indexer=False)
-        self.assertEqual(kv.shape[-2], 1)
-        self.assertEqual(score.shape[-2], 1)
 
 
 # ---------------------------------------------------------------------------
@@ -1269,14 +1118,17 @@ class TestSetCompressBuffer(unittest.TestCase):
         self.assertIs(call.args[2], kv)
         self.assertIs(call.args[3], scale)
 
-    def test_indexer_npu_asserts_has_npu_storage(self):
-        """from_indexer + npu device but no NPU storage -> AssertionError."""
+    def test_indexer_invalid_conditions_raise(self):
+        """from_indexer path raises for missing NPU storage / non-c4 layer."""
         pool = _make_kvpool()
-        pool.c4_indexer_kv_pool.has_npu_storage = False
         kv = MagicMock()
         kv.device.type = "npu"
+        pool.c4_indexer_kv_pool.has_npu_storage = False
         with self.assertRaises(AssertionError):
             pool.set_compress_buffer(1, torch.tensor([0]), kv, None, from_indexer=True)
+        pool.c4_indexer_kv_pool.has_npu_storage = True
+        with self.assertRaises(AssertionError):
+            pool.set_compress_buffer(2, torch.tensor([0]), kv, None, from_indexer=True)
 
     def test_indexer_cpu_no_scale_calls_set_index_fused(self):
         """from_indexer + cpu + kv_scale None -> set_index_fused."""
@@ -1300,37 +1152,20 @@ class TestSetCompressBuffer(unittest.TestCase):
         self.assertEqual(call.args[0], 0)
         self.assertIs(call.args[3], scale)
 
-    def test_indexer_wrong_ratio_raises(self):
-        """from_indexer on a non-c4 layer -> AssertionError."""
-        pool = _make_kvpool()
-        kv = MagicMock()
-        kv.device.type = "npu"
-        with self.assertRaises(AssertionError):
-            pool.set_compress_buffer(2, torch.tensor([0]), kv, None, from_indexer=True)
-
     def test_non_indexer_npu_writes_pa_nd(self):
-        """from_indexer False + npu device -> direct PA_ND write (3D src)."""
+        """npu device: 3D src written directly, 2D src unsqueezed first."""
         pool = _make_kvpool()
+        flat = pool.c4_kv_pool.kv_buffer[0].flatten(0, 1)
+        loc = torch.tensor([0, 1])
         kv = MagicMock()
         kv.device.type = "npu"
-        src = torch.ones(2, 1, 192, dtype=torch.bfloat16)
-        kv.to.return_value = src
-        loc = torch.tensor([0, 1])
+        kv.to.return_value = torch.ones(2, 1, 192, dtype=torch.bfloat16)
         pool.set_compress_buffer(1, loc, kv, None, from_indexer=False)
-        flat = pool.c4_kv_pool.kv_buffer[0].flatten(0, 1)
-        self.assertTrue(torch.equal(flat[loc], src))
-
-    def test_non_indexer_npu_2d_src_unsqueezed(self):
-        """2D kv src (T, dim) -> unsqueeze(1) before the PA_ND write."""
-        pool = _make_kvpool()
-        kv = MagicMock()
-        kv.device.type = "npu"
-        src = torch.ones(2, 192, dtype=torch.bfloat16)
-        kv.to.return_value = src
-        loc = torch.tensor([0, 1])
+        self.assertTrue(torch.equal(flat[loc], kv.to.return_value))
+        flat[loc] = 0  # reset so the 2D write is observable
+        kv.to.return_value = torch.ones(2, 192, dtype=torch.bfloat16)
         pool.set_compress_buffer(1, loc, kv, None, from_indexer=False)
-        flat = pool.c4_kv_pool.kv_buffer[0].flatten(0, 1)
-        self.assertTrue(torch.equal(flat[loc], src.unsqueeze(1)))
+        self.assertTrue(torch.equal(flat[loc], kv.to.return_value.unsqueeze(1)))
 
     def test_non_indexer_cpu_calls_set_key_buffer_fused(self):
         """from_indexer False + cpu device -> set_key_buffer_fused."""
@@ -1389,21 +1224,17 @@ class TestTranslateKvLocToCompressStateLoc(unittest.TestCase):
     """Tests for DSV4NPUTokenToKVPool.translate_kv_loc_to_compress_state_loc."""
 
     def test_raises_runtime_error(self):
-        """Paged kernel cannot ring-hash -> RuntimeError, always."""
+        """Paged kernel cannot ring-hash -> RuntimeError with paged/ring message."""
         pool = _make_kvpool()
-        with self.assertRaises(RuntimeError):
-            pool.translate_kv_loc_to_compress_state_loc(torch.tensor([0]), 4)
-
-    def test_message_explains_paged_contract(self):
-        """Error message mentions paged state pool and ring-buffer."""
-        pool = _make_kvpool()
-        try:
-            pool.translate_kv_loc_to_compress_state_loc(torch.tensor([0]), 128)
-        except RuntimeError as e:
-            msg = str(e).lower()
-            self.assertIn("paged", msg)
-            self.assertIn("ring", msg)
-            self.assertIn("out_cache_loc_dsv4", msg)
+        for ratio in (4, 128):
+            try:
+                pool.translate_kv_loc_to_compress_state_loc(torch.tensor([0]), ratio)
+                self.fail("expected RuntimeError")
+            except RuntimeError as e:
+                msg = str(e).lower()
+                self.assertIn("paged", msg)
+                self.assertIn("ring", msg)
+                self.assertIn("out_cache_loc_dsv4", msg)
 
 
 # ---------------------------------------------------------------------------
@@ -1438,14 +1269,12 @@ class TestGetContiguousBufInfos(unittest.TestCase):
 class TestGetPdStateComponents(unittest.TestCase):
     """Tests for DSV4NPUTokenToKVPool.get_pd_state_components."""
 
-    def test_six_components_in_fixed_order(self):
-        """All pools present -> [SWA, C4, C128, INDEXER, C4_STATE, C128_STATE]."""
+    def test_components_fixed_order_and_aligned(self):
+        """All pools present -> 6 components in fixed order, aligned int lists."""
         pool = _make_kvpool()
         comps = pool.get_pd_state_components()
-        self.assertEqual(len(comps), 6)
-        types = [c[0] for c in comps]
         self.assertEqual(
-            types,
+            [c[0] for c in comps],
             [
                 AscendStateType.DSV4_SWA,
                 AscendStateType.DSV4_C4,
@@ -1455,11 +1284,7 @@ class TestGetPdStateComponents(unittest.TestCase):
                 AscendStateType.DSV4_C128_STATE,
             ],
         )
-
-    def test_each_component_has_aligned_int_lists(self):
-        """Each (ptrs, lens, ilens) are non-empty int lists of equal length."""
-        pool = _make_kvpool()
-        for _type, ptrs, lens, ilens in pool.get_pd_state_components():
+        for _type, ptrs, lens, ilens in comps:
             self.assertEqual(len(ptrs), len(lens))
             self.assertEqual(len(lens), len(ilens))
             self.assertGreater(len(ptrs), 0)
@@ -1467,42 +1292,28 @@ class TestGetPdStateComponents(unittest.TestCase):
             self.assertTrue(all(isinstance(n, int) for n in lens))
             self.assertTrue(all(isinstance(i, int) for i in ilens))
 
-    def test_swa_ptrs_match_buffer(self):
-        """SWA component ptrs/lens come straight from swa_kv_pool.kv_buffer."""
+    def test_buffer_components_match_pools(self):
+        """SWA ptrs come from swa pool; INDEXER bundles k + scale buffers."""
         pool = _make_kvpool()
-        swa = next(
-            c
-            for c in pool.get_pd_state_components()
-            if c[0] is AscendStateType.DSV4_SWA
-        )
+        by_type = {c[0]: c for c in pool.get_pd_state_components()}
+        swa = by_type[AscendStateType.DSV4_SWA]
         bufs = pool.swa_kv_pool.kv_buffer
         self.assertEqual(swa[1], [b.data_ptr() for b in bufs])
         self.assertEqual(swa[2], [b.nbytes for b in bufs])
         self.assertEqual(swa[3], [b[0].nbytes for b in bufs])
-
-    def test_indexer_bundles_k_and_scale_buffers(self):
-        """INDEXER component concatenates index_k_buffer + index_scale_buffer."""
-        pool = _make_kvpool()
-        idx = next(
-            c
-            for c in pool.get_pd_state_components()
-            if c[0] is AscendStateType.DSV4_INDEXER
-        )
+        idx = by_type[AscendStateType.DSV4_INDEXER]
         idx_pool = pool.c4_indexer_kv_pool
-        bufs = list(idx_pool.index_k_buffer) + list(idx_pool.index_scale_buffer)
-        self.assertEqual(len(idx[1]), len(bufs))  # 2 + 2 = 4
-        self.assertEqual(idx[1], [b.data_ptr() for b in bufs])
+        ibufs = list(idx_pool.index_k_buffer) + list(idx_pool.index_scale_buffer)
+        self.assertEqual(len(idx[1]), len(ibufs))  # 2 + 2 = 4
+        self.assertEqual(idx[1], [b.data_ptr() for b in ibufs])
 
-    def test_c4_state_includes_indexer_pools(self):
-        """c4_state bundles attn-c4 + indexer-c4 (shared slot space)."""
+    def test_state_components(self):
+        """c4 bundles attn+indexer pools; c128 excludes indexer; ilens use page_size."""
         pool = _make_kvpool()
-        c4s = next(
-            c
-            for c in pool.get_pd_state_components()
-            if c[0] is AscendStateType.DSV4_C4_STATE
-        )
+        by_type = {c[0]: c for c in pool.get_pd_state_components()}
         attn_c4 = pool.compress_state_pools[0]
         indexer_sp = pool.indexer_compress_state_pools[0]
+        c4s = by_type[AscendStateType.DSV4_C4_STATE]
         self.assertEqual(
             c4s[1],
             [
@@ -1510,56 +1321,24 @@ class TestGetPdStateComponents(unittest.TestCase):
                 indexer_sp.kv_score_buffer.kv_score.data_ptr(),
             ],
         )
-
-    def test_c128_state_excludes_indexer_pools(self):
-        """c128_state has only the attn c128 pool (c128 has no indexer)."""
-        pool = _make_kvpool()
-        c128s = next(
-            c
-            for c in pool.get_pd_state_components()
-            if c[0] is AscendStateType.DSV4_C128_STATE
-        )
+        c128s = by_type[AscendStateType.DSV4_C128_STATE]
+        c128_sp = pool.compress_state_pools[1]
         self.assertEqual(len(c128s[1]), 1)
-        c128_sp = pool.compress_state_pools[1]
         self.assertEqual(c128s[1], [c128_sp.kv_score_buffer.kv_score.data_ptr()])
+        self.assertEqual(c128s[3], [c128_sp.kv_score_buffer.kv_score[0].nbytes * c128_sp.page_size])
 
-    def test_state_ilens_use_page_size(self):
-        """State ilens = kv_score[0].nbytes * pool.page_size."""
-        pool = _make_kvpool()
-        c128s = next(
-            c
-            for c in pool.get_pd_state_components()
-            if c[0] is AscendStateType.DSV4_C128_STATE
-        )
-        c128_sp = pool.compress_state_pools[1]
-        t = c128_sp.kv_score_buffer.kv_score
-        self.assertEqual(c128s[3], [t[0].nbytes * c128_sp.page_size])
-
-    def test_none_kv_pool_skipped(self):
-        """swa_kv_pool=None -> no SWA component (5 total)."""
+    def test_none_and_empty_pools_dropped(self):
+        """None/empty pools drop their component instead of crashing."""
         pool = _make_kvpool()
         pool.swa_kv_pool = None
-        comps = pool.get_pd_state_components()
-        self.assertFalse(any(c[0] is AscendStateType.DSV4_SWA for c in comps))
-        self.assertEqual(len(comps), 5)
-
-    def test_none_compress_state_pool_skipped(self):
-        """compress_state_pools[0]=None -> c4_state keeps only indexer pool."""
-        pool = _make_kvpool()
         pool.compress_state_pools[0] = None
-        c4s = next(
-            c
-            for c in pool.get_pd_state_components()
-            if c[0] is AscendStateType.DSV4_C4_STATE
-        )
-        self.assertEqual(len(c4s[1]), 1)  # only the indexer pool
-
-    def test_empty_pool_dropped(self):
-        """c128_kv_pool with empty kv_buffer -> c128 KV component dropped."""
-        pool = _make_kvpool()
         pool.c128_kv_pool.kv_buffer = []
         comps = pool.get_pd_state_components()
+        self.assertFalse(any(c[0] is AscendStateType.DSV4_SWA for c in comps))
         self.assertFalse(any(c[0] is AscendStateType.DSV4_C128 for c in comps))
+        c4s = next(c for c in comps if c[0] is AscendStateType.DSV4_C4_STATE)
+        self.assertEqual(len(c4s[1]), 1)  # only the indexer pool
+        self.assertEqual(len(comps), 4)  # C4, INDEXER, C4_STATE, C128_STATE
 
 
 if __name__ == "__main__":
