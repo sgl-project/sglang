@@ -143,7 +143,7 @@ def _split_dim_absorbed_extend_kernel(
     group = tl.arange(0, _GROUP_SIZE)
     tail = tl.arange(0, 64)
     col_offsets = tl.arange(0, BLOCK_N)
-    q_row = q_start + row
+    q_row = (q_start + row).to(tl.int64)
     q_base = q_row[:, None] * stride_qt + head * stride_qh
     q0 = tl.load(Q + q_base + group[None, :], mask=row_mask[:, None], other=0.0)
     q1 = tl.load(
@@ -276,7 +276,7 @@ def _split_dim_absorbed_extend_kernel(
     for start_n in range(0, extend_end, BLOCK_N):
         col = start_n + col_offsets
         col_mask = col < extend_end
-        token = q_start + col
+        token = (q_start + col).to(tl.int64) 
         k_base = token[None, :] * stride_kt
         k0 = tl.load(
             K_Extend + k_base + group[:, None],
