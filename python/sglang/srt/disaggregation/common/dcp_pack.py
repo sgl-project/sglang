@@ -1,13 +1,3 @@
-"""Prefill-side packing for DCP1 → DCP-N PD KV transfers.
-
-Cyclic DCP ownership (``pos % c == r``) makes source rows strided in the dense
-prefill pool. ``group_concurrent_contiguous`` then emits one RDMA per token.
-This module gathers owned rows into a registered contiguous buffer so the
-existing dest-contiguous grouping can emit page-sized (or larger) blocks.
-
-Decode is already packed (``pos // c``), so dest scatter is not required.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -49,11 +39,6 @@ def dcp_pack_buffer_bytes(kv_item_lens: Sequence[int], page_size: int) -> int:
 def plan_packed_dcp_blocks(
     dst_token_indices: npt.NDArray[np.integer],
 ) -> List[Tuple[int, int, int]]:
-    """Split packed src ``0..N-1`` on dest-contiguous runs.
-
-    Returns ``(src_start, dst_start, n_tokens)`` triples. Src is dense after
-    gather, so a consecutive dest page becomes one block.
-    """
     dst = np.asarray(dst_token_indices, dtype=np.int64)
     n = int(dst.size)
     if n == 0:
@@ -75,7 +60,6 @@ def gather_mla_owned_tokens(
     *,
     gpu_id: int,
 ) -> None:
-    """Copy owned MLA rows into ``pack`` in dest-token order, layer-major."""
     n = int(src_token_indices.size)
     if n == 0:
         return
@@ -112,7 +96,6 @@ def try_pack_dcp_src(
     token_item_lens: Sequence[int],
     gpu_id: int,
 ) -> Optional[Tuple[List[int], npt.NDArray[np.int64]]]:
-    """Gather owned rows. Returns packed layer ptrs and dense src indices, or None."""
     n = int(src_token_indices.size)
     if n == 0:
         empty = np.empty((0,), dtype=np.int64)
@@ -148,7 +131,6 @@ def init_dcp_pack_buffers(
     kv_args,
     count: int,
 ) -> List[StagingBuffer]:
-    """Allocate one registered pack buffer per transfer-queue shard."""
     from sglang.srt.disaggregation.common.staging_handler import (
         _get_custom_mem_pool,
     )

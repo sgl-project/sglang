@@ -1,5 +1,3 @@
-"""CPU unit tests for DCP1→DCP-N packed PD transfer planning and gather."""
-
 import unittest
 
 import numpy as np

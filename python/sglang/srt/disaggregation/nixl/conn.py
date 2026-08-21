@@ -1688,7 +1688,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         if pack_buffer is not None:
             from sglang.srt.disaggregation.common.dcp_pack import try_pack_dcp_src
 
-            src_tensors = self._mla_tensors_for_ptrs(src_kv_ptrs)
+            src_tensors = self._pack_src_tensors(src_kv_ptrs)
             packed = (
                 try_pack_dcp_src(
                     pack_buffer=pack_buffer,
@@ -1704,9 +1704,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 src_kv_ptrs, src_token_indices = packed
                 token_item_lens = token_item_lens[: len(src_kv_ptrs)]
 
-        # Prepared handles encode page-level offsets, while DCP relayout needs
-        # flat descriptors for the selected token rows. After a successful pack
-        # those rows are contiguous in the registered pack buffer.
         return self._send_kvcache_generic(
             peer_name=peer_name,
             src_data_ptrs=src_kv_ptrs,
