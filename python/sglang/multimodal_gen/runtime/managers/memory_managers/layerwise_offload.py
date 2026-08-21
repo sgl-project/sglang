@@ -468,7 +468,15 @@ class LayerwiseOffloadManager:
                         # Already a view into the checkpoint. Copying it would
                         # add a second copy of bytes the page cache holds
                         # anyway, and that copy is what does not fit.
-                        self._mapped_cpu_weights[layer_idx][name] = local_weight
+                        # `_to_local_tensor` hands back the parameter itself
+                        # for anything that is not a DTensor, so storing it
+                        # directly stores the parameter -- and `weight.data`
+                        # below swaps that same object's storage for a (1,)
+                        # placeholder, leaving the placeholder in the store.
+                        # Keep an independent tensor over the mapped storage.
+                        self._mapped_cpu_weights[layer_idx][
+                            name
+                        ] = local_weight.detach().view_as(local_weight)
                         self._weight_metadata[layer_idx][name] = {
                             "dtype": local_weight.dtype,
                             "shape": tuple(local_weight.shape),

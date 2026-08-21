@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import logging
 from enum import Enum
-from typing import Dict, Iterable, Mapping, Optional
+from typing import Any, Dict, Iterable, Mapping, Optional
 
 import torch
 from diffusers.loaders import lora_conversion_utils as lcu
+
+from sglang.multimodal_gen.runtime.pipelines_core.lora.peft_adapter import (
+    apply_peft_config,
+    normalize_peft_keys,
+)
 
 logger = logging.getLogger("LoRAFormatAdapter")
 
@@ -539,10 +544,13 @@ def convert_lora_state_dict_by_format(
 def normalize_lora_state_dict(
     state_dict: Mapping[str, torch.Tensor],
     logger: Optional[logging.Logger] = None,
+    *,
+    adapter_config: Mapping[str, Any] | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Normalize any supported LoRA format into a single canonical layout."""
     log = logger or globals()["logger"]
 
+    state_dict = normalize_peft_keys(state_dict)
     keys = list(state_dict.keys())
     log.info(
         "[LoRAFormatAdapter] normalize_lora_state_dict called, #keys=%d",
@@ -558,6 +566,7 @@ def normalize_lora_state_dict(
     log.info("[LoRAFormatAdapter] detected format: %s", fmt)
 
     normalized = convert_lora_state_dict_by_format(state_dict, fmt, log)
+    normalized = apply_peft_config(normalized, adapter_config or {})
 
     norm_keys = list(normalized.keys())
     if norm_keys:
