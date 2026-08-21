@@ -357,9 +357,17 @@ def main() -> int:
             + ", ".join(vendored)
         )
         if preload:
-            print(f'      export LD_PRELOAD="{preload}${{LD_PRELOAD:+:$LD_PRELOAD}}"')
-            print("      must be set before the process starts; LD_LIBRARY_PATH cannot")
-            print("      override the RPATH the wheel's libtorch_hip.so carries")
+            print(
+                "      to fix the image, overwrite those two files with the ROCm ones:"
+            )
+            for name, source in zip(RUNTIME_LIBS, preload.split(":")):
+                for destination in (lib for lib in vendored if name in lib):
+                    print(f"        cp -a {source} {destination}")
+            print(f'      to check this one run only: LD_PRELOAD="{preload}"')
+            print(
+                "      a preload leaves both copies mapped, which is fine here but has"
+            )
+            print("      been seen to break a full server run during graph capture")
 
     if not traced_everything(eager):
         print(
@@ -391,9 +399,8 @@ def main() -> int:
         )
         if vendored:
             print(
-                "The ROCm install is not what torch loaded, so preload its HIP and "
-                "roctracer as printed above and re-run before concluding the image is "
-                "unfixable."
+                "The ROCm install is not what torch loaded, so replace the wheel's copies "
+                "as printed above and re-run before concluding the image is unfixable."
             )
         else:
             print(
