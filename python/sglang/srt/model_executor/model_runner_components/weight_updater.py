@@ -410,11 +410,7 @@ class WeightUpdater:
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
     params_dict = dict(model.named_parameters())
     for name, tensor in named_tensors:
-        param = params_dict[name]
-        default_weight_loader(param, tensor)
-        post_write = getattr(param, "post_direct_write", None)
-        if post_write is not None:
-            post_write()
+        default_weight_loader(params_dict[name], tensor)
 
 
 def _unwrap_tensor(tensor, tp_rank, device):

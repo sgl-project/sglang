@@ -368,37 +368,16 @@ class Glm4MoeGate(nn.Module):
     ):
         super().__init__()
         self.weight = nn.Parameter(
-            torch.empty((config.n_routed_experts, config.hidden_size))
+            torch.empty(
+                (config.n_routed_experts, config.hidden_size), dtype=torch.float32
+            )
         )
-        self.weight.weight_loader = self.weight_loader
-        self.weight.post_direct_write = self.refresh_fp32_cache
         self.e_score_correction_bias = nn.Parameter(
             torch.empty((config.n_routed_experts), dtype=torch.float32)
         )
-        # GLM requires FP32 gate projection; cache to avoid per-forward cast.
-        # refresh_fp32_cache rewrites it in place on runtime weight updates:
-        # CUDA graphs capture this buffer's address.
-        self.register_buffer("_weight_fp32", None, persistent=False)
-
-    def refresh_fp32_cache(self) -> None:
-        if self._weight_fp32 is None:
-            self._weight_fp32 = self.weight.data.to(torch.float32)
-        else:
-            self._weight_fp32.copy_(self.weight.data)
-
-    def weight_loader(
-        self,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-    ) -> None:
-        default_weight_loader(param, loaded_weight)
-        self.refresh_fp32_cache()
 
     def forward(self, hidden_states):
-        # Lazy fallback for load paths that bypass weight_loader (e.g. dummy load).
-        if self._weight_fp32 is None:
-            self._weight_fp32 = self.weight.data.to(torch.float32)
-        logits = F.linear(hidden_states.to(torch.float32), self._weight_fp32, None)
+        logits = F.linear(hidden_states.to(torch.float32), self.weight, None)
         return logits
 
 
