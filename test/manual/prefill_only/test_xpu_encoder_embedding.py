@@ -1,9 +1,9 @@
 """
-XPU encoder-embedding accuracy test for the encoder models this PR adds
-(ModernBERT, NomicBERT). Compares SGLang (SRTRunner) embeddings against
-HuggingFace (HFRunner) via cosine similarity, mirroring
-test/manual/prefill_only/test_encoder_embedding_models.py but running on the
-Intel XPU attention backend.
+XPU encoder-embedding accuracy test for ModernBERT and NomicBERT. Compares
+SGLang (SRTRunner) embeddings against HuggingFace (HFRunner) via cosine
+similarity on the Intel XPU attention backend; the XPU counterpart of
+test_encoder_embedding_models.py. Manual test (needs an XPU host and downloads
+the models), so it is not registered for regular CI.
 
 Usage:
 python3 -m unittest test_xpu_encoder_embedding.TestXPUEncoderEmbeddingModels.test_prefill_logits
@@ -16,11 +16,8 @@ import unittest
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
-from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase, get_similarities, is_in_ci
-
-register_xpu_ci(est_time=600, suite="stage-b-test-1-gpu-xpu")
 
 # Models this PR enables on XPU. (model_path, tp_size, prefill_tolerance)
 MODELS = [
