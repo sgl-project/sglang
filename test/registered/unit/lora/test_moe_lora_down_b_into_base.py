@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pathlib
 from dataclasses import replace
 
 import pytest
@@ -246,17 +247,27 @@ class TestProviderIntoBaseSurface:
             intermediate_size=8,
             hidden_size=16,
         )
-        # One implementation on the base. Both row domains reach a row only
-        # through src2dst, so neither needs its own copy.
+        # The into-base epilogue is a LoRA kernel, so the runner calls it.
+        # No provider wraps it: the only provider state it needs is src2dst,
+        # which the runner already holds from the down-A mapping.
         from sglang.srt.lora.moe.base_gemm_provider.base import MoeBaseProvider
 
+        for cls in (
+            MaskedRowDomainProvider,
+            ContiguousRowDomainProvider,
+            MoeBaseProvider,
+        ):
+            assert not hasattr(cls, "run_down_b_into_base")
+        runner_src = (
+            pathlib.Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/lora/moe/moe_lora_runner.py"
+        ).read_text()
+        assert "invoke_down_b_into_base(" in runner_src
+        # The mapping is unconditional, so no other plan field can decide
+        # whether the runner holds src2dst.
+        assert "mapped_down_a = provider.mapped_down_lora_a_input(" in runner_src
         for cls in (MaskedRowDomainProvider, ContiguousRowDomainProvider):
-            assert "run_down_b_into_base" not in vars(cls)
-        assert "run_down_b_into_base" in vars(MoeBaseProvider)
-        assert MaskedRowDomainProvider(quant_info).run_down_b_into_base
-        assert ContiguousRowDomainProvider(
-            quant_info, m_alignment=128
-        ).run_down_b_into_base
+            assert MaskedRowDomainProvider(quant_info).mapped_down_lora_a_input
 
 
 cuda_only = pytest.mark.skipif(

@@ -231,7 +231,6 @@ class TestMaskedFusionSource(unittest.TestCase):
             "run_shared_rank_reduce",
             "finish_shared_rank_finalize",
             "mapped_down_lora_a_input",
-            "run_down_b_into_base",
             "finalize",
             "num_local_experts",
             "intermediate_size",

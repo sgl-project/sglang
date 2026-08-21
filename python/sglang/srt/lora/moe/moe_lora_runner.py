@@ -24,7 +24,6 @@ logger = logging.getLogger(__name__)
 
 from sglang.srt.lora.moe.activation import ActivationFn
 from sglang.srt.lora.moe.base_gemm_provider.base import (
-    MappedLoraAInput,
     MoeBaseProvider,
 )
 from sglang.srt.lora.moe.execution_plan import (
@@ -50,7 +49,7 @@ from sglang.srt.lora.moe.launch_config import (
     resolve_tiles,
 )
 from sglang.srt.lora.moe.lora_a import run_lora_a
-from sglang.srt.lora.moe.lora_b import run_lora_b
+from sglang.srt.lora.moe.lora_b import invoke_down_b_into_base, run_lora_b
 from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
 from sglang.srt.lora.moe.route_view import RouteView
 from sglang.srt.lora.moe.routing import MoeLoraRoutes, build_routes
@@ -352,7 +351,7 @@ class MoeLoraRunner:
             batch,
             num_tokens,
         )
-        act_out, down_a_input = self._run_act(
+        act_out, down_a_input, src2dst = self._run_act(
             plan,
             launch_config,
             provider,
@@ -380,6 +379,7 @@ class MoeLoraRunner:
             base_gemm_state,
             act_out,
             down_a_input,
+            src2dst,
             batch,
         )
         output = self._run_finalize(
@@ -597,15 +597,18 @@ class MoeLoraRunner:
             dtype=provider.contract.lora_activation_dtype,
             device=gateup_out.device,
         )
-        exposes_pair_activation = True
-        mapped_down_a: MappedLoraAInput | None = None
-        if (
+        # Always ask for the mapping. It is a view over ``act_out`` plus the
+        # route's ``src2dst``, so it allocates nothing, and the into-base
+        # epilogue needs ``src2dst`` whatever the down-A family turns out to
+        # be. Gating it on the down-A family would let one field silently
+        # decide whether another one works.
+        mapped_down_a = provider.mapped_down_lora_a_input(base_gemm_state, act_out)
+        # A grouped down-A reads the provider's own rows, so only the other
+        # families need the pair-major copy.
+        exposes_pair_activation = not (
             plan.act.family is ActFamily.B_ACTIVATION
             and plan.down_a.family is LoraAFamily.GROUPED
-        ):
-            mapped_down_a = provider.mapped_down_lora_a_input(base_gemm_state, act_out)
-            if mapped_down_a is not None:
-                exposes_pair_activation = False
+        )
         act_pairs = (
             self.workspace.tensor(
                 "act:pairs",
@@ -630,7 +633,7 @@ class MoeLoraRunner:
                 act_pairs,
                 activation=self.activation.value,
             )
-            return act_out, _DownAInput(act_pairs)
+            return act_out, _DownAInput(act_pairs), mapped_down_a.pair_to_row
 
         # The act stage runs the gate/up B GEMM. That GEMM always reads the
         # per-expert route.
@@ -652,14 +655,11 @@ class MoeLoraRunner:
                 else 1
             ),
         )
-        if mapped_down_a is not None:
-            down_a_input = _DownAInput(
-                mapped_down_a.rows,
-                mapped_down_a.pair_to_row,
-            )
-        else:
+        if exposes_pair_activation:
             down_a_input = _DownAInput(act_pairs)
-        return act_out, down_a_input
+        else:
+            down_a_input = _DownAInput(mapped_down_a.rows, mapped_down_a.pair_to_row)
+        return act_out, down_a_input, mapped_down_a.pair_to_row
 
     def _run_down(
         self,
@@ -670,6 +670,7 @@ class MoeLoraRunner:
         base_gemm_state,
         act_out: torch.Tensor,
         down_a_input: _DownAInput,
+        src2dst: torch.Tensor,
         batch: MoeLoraBatch,
     ) -> tuple[
         torch.Tensor,
@@ -707,9 +708,9 @@ class MoeLoraRunner:
             state.delta = delta
 
         def down_b_into_base(down_out: torch.Tensor) -> None:
-            provider.run_down_b_into_base(
-                base_gemm_state,
-                down_out=down_out,
+            invoke_down_b_into_base(
+                down_rows=down_out.view(-1, provider.hidden_size),
+                src2dst=src2dst,
                 bridge=state.rank,
                 b_down=batch.down_lora_b.flatten(0, 1),
                 # The into-base kernel runs in place of the family kernel, and

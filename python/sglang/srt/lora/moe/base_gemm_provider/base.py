@@ -215,35 +215,6 @@ class MoeBaseProvider:
             pair_to_row=row_state.src2dst,
         )
 
-    def run_down_b_into_base(
-        self,
-        row_state,
-        *,
-        down_out: torch.Tensor,
-        bridge: torch.Tensor,
-        b_down: torch.Tensor,
-        routing: RouteView,
-        config: Mapping[str, int],
-    ) -> None:
-        """Add each pair's unweighted down-B result into ``down_out``.
-
-        Call this after the base down GEMM. It reaches a row only through
-        ``src2dst``, so both row domains work. The later finalize must then
-        run with no pair delta. ``bridge`` is the pair-major down-A output.
-        ``b_down`` holds the down-B weights of every virtual expert.
-        """
-        # Imported here so this module keeps to msgspec and torch.
-        from sglang.srt.lora.moe.lora_b import invoke_down_b_into_base
-
-        invoke_down_b_into_base(
-            down_rows=down_out.view(-1, self.hidden_size),
-            src2dst=row_state.src2dst,
-            bridge=bridge,
-            b_down=b_down,
-            routing=routing,
-            config=config,
-        )
-
     def run_shared_rank_finalize(
         self,
         row_state,
