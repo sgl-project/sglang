@@ -1,4 +1,4 @@
-"""PEFT checkpoint semantics for native diffusion LoRA layers."""
+"""Adapt PEFT checkpoint semantics to native diffusion LoRA layers."""
 
 from __future__ import annotations
 

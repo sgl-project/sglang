@@ -8,7 +8,7 @@ import torch
 from sglang.multimodal_gen.runtime.pipelines_core.lora.format_adapter import (
     normalize_lora_state_dict,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.lora.peft import (
+from sglang.multimodal_gen.runtime.pipelines_core.lora.peft_adapter import (
     get_peft_lora_alpha,
 )
 

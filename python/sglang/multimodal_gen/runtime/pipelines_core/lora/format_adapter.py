@@ -7,7 +7,7 @@ from typing import Any, Dict, Iterable, Mapping, Optional
 import torch
 from diffusers.loaders import lora_conversion_utils as lcu
 
-from sglang.multimodal_gen.runtime.pipelines_core.lora.peft import (
+from sglang.multimodal_gen.runtime.pipelines_core.lora.peft_adapter import (
     apply_peft_config,
     normalize_peft_keys,
 )
