@@ -125,6 +125,10 @@ def is_kimi_k3(config) -> bool:
     return _hf_arch(config) == "KimiK3ForConditionalGeneration"
 
 
+def is_dspark_draft(config) -> bool:
+    return _hf_arch(config) == "DSparkDraftModel"
+
+
 def is_qwen3_5(config) -> bool:
     return _hf_arch(config) in (
         "Qwen3_5ForConditionalGeneration",
@@ -460,13 +464,17 @@ class ModelConfig:
         self.is_audio_model = enable_multimodal and is_audio_model(
             self.hf_config.architectures
         )
-        # TODO: requires further polishing
+        # Gated on `is_multimodal` because this flag is advertised via /model_info
+        # and drives the VLM warmup request, while the OpenAI serving layer rejects
+        # media input for models that are not `is_multimodal`. A text-only model
+        # with an auto-populated `vision_config` (see above) would otherwise warm up
+        # with an image request that its own serving layer answers with 400.
         # Key on the tower, not the attribute: several config classes default
         # vision_config to None, which presence alone would read as image-capable
         # (MuseGlimmerConfig's text-only layouts are one such case).
+        # TODO: requires further polishing
         self.is_image_understandable_model = (
-            enable_multimodal
-            and not self.is_lm_only
+            self.is_multimodal
             and getattr(self.hf_config, "vision_config", None) is not None
         )
 
