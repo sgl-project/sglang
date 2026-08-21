@@ -144,8 +144,8 @@ def _fused_attn_pooling_online_topk(
             q_end_idx = cu_seqlens_q[batch_idx + 1]
             k_end_idx = cu_seqlens_k[batch_idx + 1]
 
-            q_current_seqlen = q_end_idx - q_start_idx
-            k_current_seqlen = k_end_idx - k_start_idx
+            q_current_seqlen = T.alloc_var("int32", init=q_end_idx - q_start_idx)
+            k_current_seqlen = T.alloc_var("int32", init=k_end_idx - k_start_idx)
 
             # Chunk prefill: cache_len from tensor (0 for standard prefill, >0 for chunk prefill)
             cache_len = cache_lens[batch_idx]
