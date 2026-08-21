@@ -15,7 +15,6 @@ from sglang.test.run_eval import (
 from sglang.test.simple_eval_common import SingleEvalResult, aggregate_results
 from sglang.test.simple_eval_gpqa import GPQAEval
 
-
 register_cpu_ci(est_time=10, suite="base-b-test-cpu")
 
 
