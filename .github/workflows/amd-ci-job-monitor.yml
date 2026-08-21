@@ -146,15 +146,18 @@ jobs:
 
           # Parse the default ROCm 7.2 nightly (exclude utility jobs)
           # Excluded: check-all-jobs
-          # One nightly run covers every flavor, so ask for each by its full name.
-          # A stem-only prefix matches both and merges them into a single row,
-          # which hides a regression that only reproduces on one image.
+          # One nightly run covers every flavor, so ask for each by its full name:
+          # a stem-only prefix matches every flavor and merges them into a single
+          # row, hiding a regression that only reproduces on one image. Nightly
+          # names carry the runner too, so pair each job id with its runs-on.
           # Keep in sync with the rocm_version matrix in the nightly workflow.
           rocm_flavors="rocm724 rocm720"
-          nightly_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/nightly-test-amd-rocm720.yml | \
-            grep -v -E '^(check-all-jobs)$' | \
-            sed 's/-rocm720$//' | \
-            while read -r stem; do for f in $rocm_flavors; do echo "$stem ($f)"; done; done | \
+          nightly_jobs=$(yq -r '.jobs | to_entries | .[] | "\(.key) \(.value["runs-on"])"' .github/workflows/nightly-test-amd-rocm720.yml | \
+            grep -v -E '^check-all-jobs ' | \
+            while read -r id runner; do
+              stem=${id%-rocm720}
+              for f in $rocm_flavors; do echo "$stem ($f, $runner)"; done
+            done | \
             jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "nightly_jobs=$nightly_jobs" >> $GITHUB_OUTPUT
           echo "Nightly jobs: $nightly_jobs"
