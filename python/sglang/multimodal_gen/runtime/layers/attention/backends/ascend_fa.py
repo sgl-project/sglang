@@ -152,3 +152,28 @@ class AscendFAImpl(AttentionImpl):
             cu_seqlens_k_host=cu_seqlens_host,
             softmax_scale=self.softmax_scale,
         )
+
+    def forward_ring_kv_chunk(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one Ascend TND ring chunk and return LSE in ``[H, Tq]``."""
+        cu_seqlens_q = torch.tensor(
+            [0, query.shape[0]], dtype=torch.int32, device=query.device
+        )
+        cu_seqlens_k = torch.tensor(
+            [0, key.shape[0]], dtype=torch.int32, device=key.device
+        )
+        return ascend_fused_infer_attention_varlen(
+            query,
+            key,
+            value,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            cu_seqlens_q_host=(0, query.shape[0]),
+            cu_seqlens_k_host=(0, key.shape[0]),
+            softmax_scale=self.softmax_scale,
+            return_softmax_lse=True,
+        )

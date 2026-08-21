@@ -519,7 +519,7 @@ def _minimax_h3_attention_core_impl(
             q,
             k,
             v,
-            softmax_scale=attention.softmax_scale,
+            attn_impl=attention._attention_impl,
             real_seq_len=max_seqlen,
             ring_ws=ring_ws,
         )
