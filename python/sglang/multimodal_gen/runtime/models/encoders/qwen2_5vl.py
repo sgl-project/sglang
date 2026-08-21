@@ -315,14 +315,13 @@ class Qwen2_5_VLAttention(nn.Module):
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
-        # Diffusion text encoding is cache-free and historically uses the native
-        # causal kernel; its trailing padding is removed during postprocessing.
-        # Cached generation still needs the explicit mask for padded batches.
+        # Honor the prepared mask on the cache-free path too; it is None when
+        # there is nothing to mask, which keeps the native causal kernel.
         attn_output = self.attn(
             query_states,
             key_states,
             value_states,
-            attn_mask=attention_mask if use_cache else None,
+            attn_mask=attention_mask,
         )
 
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
@@ -423,6 +422,20 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         return hidden_states
+
+
+def _build_causal_padding_mask(
+    attention_mask: torch.Tensor, inputs_embeds: torch.Tensor
+) -> torch.Tensor:
+    """Build a causal+padding bool mask ``[batch, 1, q_len, kv_len]``; True attends."""
+    q_len = inputs_embeds.shape[1]
+    kv_len = attention_mask.shape[-1]
+    device = inputs_embeds.device
+    q_idx = torch.arange(kv_len - q_len, kv_len, device=device).unsqueeze(-1)
+    kv_idx = torch.arange(kv_len, device=device).unsqueeze(0)
+    causal = (kv_idx <= q_idx).unsqueeze(0)
+    padding = attention_mask.to(device=device, dtype=torch.bool).unsqueeze(1)
+    return (causal & padding).unsqueeze(1)
 
 
 class Qwen2_5_VLTextModel(nn.Module):
@@ -550,6 +563,20 @@ class Qwen2_5_VLTextModel(nn.Module):
             if self.has_sliding_layers:
                 causal_mask_mapping["sliding_attention"] = (
                     create_sliding_window_causal_mask(**mask_kwargs)
+                )
+
+            # `create_causal_mask` yields None for this config's
+            # `_attn_implementation`, letting padding attend to itself. Only rows
+            # from the first pad on differ, so callers that drop padded rows are
+            # unaffected; LongCat-Image-Edit feeds them to the DiT.
+            if (
+                causal_mask_mapping["full_attention"] is None
+                and isinstance(attention_mask, torch.Tensor)
+                and attention_mask.dim() == 2
+                and not bool(attention_mask.all())
+            ):
+                causal_mask_mapping["full_attention"] = _build_causal_padding_mask(
+                    attention_mask, inputs_embeds
                 )
 
         hidden_states = inputs_embeds

@@ -11,6 +11,9 @@ from torch import nn
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig
+from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
+    LongCatImageEditPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
 )
@@ -628,12 +631,9 @@ class TextEncoderLoader(ComponentLoader):
             with model_device, skip_init_modules():
                 architectures = getattr(model_config, "architectures", [])
                 model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
-                enable_image_understanding = (
-                    True
-                    if isinstance(
-                        server_args.pipeline_config, QwenImageEditPipelineConfig
-                    )
-                    else False
+                enable_image_understanding = isinstance(
+                    server_args.pipeline_config,
+                    (QwenImageEditPipelineConfig, LongCatImageEditPipelineConfig),
                 )
                 model_config.enable_image_understanding = enable_image_understanding
                 model = model_cls(model_config)

@@ -259,6 +259,7 @@ class ComposedPipelineBase(ABC):
                 "QwenImageEditPipeline": {"vae"},
                 "QwenImageEditPlusPipeline": {"vae"},
                 "QwenImageLayeredPipeline": {"vae", "transformer"},
+                "LongCatImageEditPipeline": {"vae"},
                 "GlmImagePipeline": {"vae", "transformer"},
                 "WanImageToVideoPipeline": {"vae"},
                 "WanImageToVideoDmdPipeline": {"vae"},

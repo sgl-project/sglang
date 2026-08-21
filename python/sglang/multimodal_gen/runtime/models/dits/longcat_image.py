@@ -298,6 +298,7 @@ class _LongCatSingleAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        num_replicated_prefix: int = 0,
     ) -> torch.Tensor:
         q, _ = self.to_q(hidden_states)
         k, _ = self.to_k(hidden_states)
@@ -314,7 +315,7 @@ class _LongCatSingleAttention(nn.Module):
             q = apply_rotary_emb(q, image_rotary_emb, sequence_dim=1)
             k = apply_rotary_emb(k, image_rotary_emb, sequence_dim=1)
 
-        x = self.attn(q, k, v)
+        x = self.attn(q, k, v, num_replicated_prefix=num_replicated_prefix)
         return x.flatten(2, 3).to(q.dtype)
 
 
@@ -412,6 +413,8 @@ class _SingleTransformerBlock(nn.Module):
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
             image_rotary_emb=image_rotary_emb,
+            # Text is replicated per SP rank; keep it out of the all-to-all.
+            num_replicated_prefix=text_seq_len,
         )
         hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
         gate = gate.unsqueeze(1)
