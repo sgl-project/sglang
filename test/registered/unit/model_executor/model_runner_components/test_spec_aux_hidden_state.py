@@ -43,7 +43,13 @@ def test_explicit_dspark_target_layers_define_draft_stage_count():
         speculative_draft_model_path="/model",
         speculative_draft_model_revision=None,
     )
-    model_config = SimpleNamespace(hf_text_config=SimpleNamespace(num_hidden_layers=43))
+    target_hf_config = SimpleNamespace(
+        num_hidden_layers=43, model_type="deepseek_v4"
+    )
+    model_config = SimpleNamespace(
+        hf_config=target_hf_config,
+        hf_text_config=target_hf_config,
+    )
     draft_model_config = SimpleNamespace(
         hf_config=SimpleNamespace(
             num_hidden_layers=43,

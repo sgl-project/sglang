@@ -240,6 +240,7 @@ def build_kv_cache(
 
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
     mtp_draft_device_pools = tp_worker.model_runner.mtp_draft_device_pools
+    target_kv_pool = token_to_kv_pool_allocator.get_kvcache()
 
     retraction_backup = resolve_decode_retraction_backup(tp_worker=tp_worker)
 
@@ -306,6 +307,9 @@ def build_kv_cache(
         enable_draft_swa_sidecar=(
             is_deepseek_v4(model_config.hf_config)
             and use_dsv4_dspark_draft_swa_sidecar(server_args, spec_algorithm)
+            # With unified_kv, the logical SWA component itself owns the draft
+            # committed sidecar. Paged target SWA needs the dependent tracker.
+            and not getattr(target_kv_pool, "_unified_kv", False)
         ),
         mtp_draft_device_pools=mtp_draft_device_pools,
     )

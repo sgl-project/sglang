@@ -1196,7 +1196,19 @@ def setup_state_kv_args(
                 "DSV4 target and draft pools must use the same unified-KV mode"
             )
 
-        if token_to_kv_pool._unified_kv:
+        if draft_token_to_kv_pool.unified_swa_is_sidecar:
+            if (
+                token_to_kv_pool.full_to_swa_index_mapping
+                is not draft_token_to_kv_pool.full_to_swa_index_mapping
+            ):
+                raise RuntimeError(
+                    "DSV4 target and draft pools must share the SWA index mapping"
+                )
+            draft_ptrs, draft_lens, draft_item_lens = (
+                draft_token_to_kv_pool.get_state_buf_infos()
+            )
+            draft_state_type = StateType.SWA
+        elif token_to_kv_pool._unified_kv:
             target_geometry = (
                 token_to_kv_pool.unified_swa_window,
                 token_to_kv_pool.unified_swa_ring_size,

@@ -1075,6 +1075,46 @@ def build_swa_draft_pools(
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Build a draft SWA sidecar whose indices follow target SWA."""
     draft_swa_pool = draft_kv_pool.swa_kv_pool
+    if getattr(draft_kv_pool, "unified_swa_is_sidecar", False):
+        controller = tree_cache.cache_controller
+        host_pool_group = controller.mem_pool_host
+        anchor = host_pool_group.anchor_entry
+        full_allocator = tree_cache.token_to_kv_pool_allocator.full_attn_allocator
+        committed_pages = draft_kv_pool.draft_swa_layout.committed_pages
+        num_host_pages = max(
+            1,
+            (
+                committed_pages * anchor.host_pool.logical_size
+                + full_allocator.size
+                - 1
+            )
+            // full_allocator.size,
+        )
+        device_buffers = draft_kv_pool.get_draft_swa_committed_buffers()
+        host_pool = DeepSeekV4PagedHostPool(
+            pool_name=str(PoolName.SWA),
+            device_buffers=device_buffers,
+            item_bytes=device_buffers[0][0].nbytes,
+            num_host_pages=num_host_pages,
+            slot_page_size=draft_kv_pool.swa_page_size,
+            layout=anchor.host_pool.layout,
+            allocator_type=_get_allocator_type(server_args),
+        )
+        swa_allocator = tree_cache.token_to_kv_pool_allocator.swa_attn_allocator
+        layer_mapping = {i: i for i in range(len(device_buffers))}
+        entry = build_pool_entry(
+            name=PoolName.SWA,
+            host_pool=host_pool,
+            device_pool=draft_kv_pool,
+            layer_mapping=layer_mapping,
+            transfer_layer_num=host_pool.layer_num,
+            device_alloc_fn=swa_allocator.alloc,
+            device_free_fn=swa_allocator.free,
+        )
+        # In unified mode the logical SWA component itself owns the draft
+        # committed sidecar; the target request ring remains backend-private.
+        return [], [entry]
+
     if draft_swa_pool is None:
         raise NotImplementedError(
             "HiCache draft SWA sidecar requires a non-unified draft SWA pool."

@@ -291,6 +291,115 @@ def build_decode_streams(
     return swa_i, swa_p, hca_i, hca_p, csa_i, csa_p
 
 
+@triton.jit
+def _build_dspark_sidecar_indices_kernel(
+    req_to_token_ptr,
+    full_to_swa_ptr,
+    state_slot_ptr,
+    chunk_start_ptr,
+    final_pos_ptr,
+    indptr_ptr,
+    indices_ptr,
+    req_to_token_stride,
+    scratch_base,
+    scratch_width,
+    N,
+    win: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if row >= N:
+        return
+
+    slot = tl.load(state_slot_ptr + row).to(tl.int64)
+    chunk_start = tl.load(chunk_start_ptr + row).to(tl.int64)
+    final_pos = tl.load(final_pos_ptr + row).to(tl.int64)
+    context_len = tl.minimum(chunk_start, win).to(tl.int32)
+    block_len = (final_pos - chunk_start + 1).to(tl.int32)
+    length = context_len + block_len
+    out_base = tl.load(indptr_ptr + row).to(tl.int64)
+
+    offsets = tl.arange(0, BLOCK)
+    valid = offsets < length
+    in_step = offsets >= context_len
+    absolute_pos = chunk_start - context_len + offsets
+
+    full_loc = tl.load(
+        req_to_token_ptr + slot * req_to_token_stride + absolute_pos,
+        mask=valid & ~in_step,
+        other=0,
+    ).to(tl.int64)
+    committed_loc = tl.load(
+        full_to_swa_ptr + full_loc,
+        mask=valid & ~in_step,
+        other=0,
+    ).to(tl.int32)
+    scratch_loc = (
+        scratch_base + slot * scratch_width + offsets - context_len
+    ).to(tl.int32)
+    loc = tl.where(in_step, scratch_loc, committed_loc)
+    tl.store(indices_ptr + out_base + offsets, loc, mask=valid)
+
+
+def build_dspark_sidecar_decode_stream(
+    *,
+    req_to_token: torch.Tensor,
+    full_to_swa_mapping: torch.Tensor,
+    state_slot: torch.Tensor,
+    chunk_start: torch.Tensor,
+    final_pos: torch.Tensor,
+    win: int,
+    scratch_base: int,
+    scratch_width: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build ``history window + full verify block`` for every DSpark query."""
+    N = state_slot.shape[0]
+    assert chunk_start.shape[0] >= N
+    assert final_pos.shape[0] >= N
+    context_len = torch.clamp(chunk_start[:N], max=win).to(torch.int32)
+    block_len = (final_pos[:N] - chunk_start[:N] + 1).to(torch.int32)
+    lengths = context_len + block_len
+    indptr = _lengths_to_indptr(lengths)
+    indices = torch.empty(
+        N * (win + scratch_width), dtype=torch.int32, device=state_slot.device
+    )
+    if state_slot.device.type == "cpu":
+        for row in range(N):
+            history = int(context_len[row])
+            verify = int(block_len[row])
+            length = history + verify
+            start = int(indptr[row])
+            slot = int(state_slot[row])
+            step_start = int(chunk_start[row])
+            for offset in range(length):
+                if offset >= history:
+                    loc = scratch_base + slot * scratch_width + offset - history
+                else:
+                    absolute_pos = step_start - history + offset
+                    full_loc = int(req_to_token[slot, absolute_pos])
+                    loc = int(full_to_swa_mapping[full_loc])
+                indices[start + offset] = loc
+        return indices, indptr
+    if N:
+        _build_dspark_sidecar_indices_kernel[(N,)](
+            req_to_token,
+            full_to_swa_mapping,
+            state_slot,
+            chunk_start,
+            final_pos,
+            indptr,
+            indices,
+            req_to_token.stride(0),
+            scratch_base,
+            scratch_width,
+            N,
+            win=win,
+            BLOCK=triton.next_power_of_2(win + scratch_width),
+            num_warps=4,
+        )
+    return indices, indptr
+
+
 # ---------------------------------------------------------------------------
 # Prefill index builder (ragged-packed: paged prefix + flat extend)
 # ---------------------------------------------------------------------------

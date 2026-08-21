@@ -2162,7 +2162,8 @@ class ServerArgs:
         Arg(
             help="DSPARK DSV4 only. Keep committed draft SWA in the content-scoped "
             "sidecar cache while routing optimistic proposal KV through step-scoped "
-            "scratch. Defaults to enabled on supported paged backends. Use "
+            "scratch. Defaults to enabled on supported paged and unified_kv "
+            "backends. Use "
             "--no-speculative-dspark-draft-swa-sidecar to restore the legacy path.",
             action=argparse.BooleanOptionalAction,
         ),

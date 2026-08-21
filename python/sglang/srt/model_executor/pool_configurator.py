@@ -732,6 +732,16 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             qk_nope_head_dim=self.qk_nope_head_dim,
             qk_rope_head_dim=self.qk_rope_head_dim,
         )
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        self.draft_swa_kv_bytes_per_token = (
+            (self.qk_nope_head_dim + self.qk_rope_head_dim)
+            * torch.bfloat16.itemsize
+            if is_unified_kv_triton()
+            else self.swa_kv_bytes_per_token
+        )
         self.context_len = kvc.model_config.context_len
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
         self.compression_ratios = cfg.compress_ratios[
@@ -839,7 +849,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 )
             # Only committed draft KV enters the persistent sidecar. Verify
             # candidates remain step-scoped until commit_lens gates the write.
-            return self.swa_ratio * self.swa_kv_bytes_per_token * draft_layers
+            return (
+                self.swa_ratio
+                * self.draft_swa_kv_bytes_per_token
+                * draft_layers
+            )
 
         # Preserve the existing single-average-layer reservation for other
         # speculative algorithms until their draft pool geometry is explicit.
@@ -971,9 +985,16 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         num_req_slots = self._get_num_req_slots(max_running_requests)
         scratch_rows = num_req_slots * self.draft_swa_scratch_width
         scratch_pages = ceil_div(scratch_rows, self.draft_swa_storage_page_size)
-        bytes_per_page = ceil_align(
-            self.draft_swa_storage_page_size * self.swa_kv_bytes_per_token, 576
-        )
+        if self.draft_swa_kv_bytes_per_token == self.swa_kv_bytes_per_token:
+            bytes_per_page = ceil_align(
+                self.draft_swa_storage_page_size * self.swa_kv_bytes_per_token,
+                576,
+            )
+        else:
+            bytes_per_page = (
+                self.draft_swa_storage_page_size
+                * self.draft_swa_kv_bytes_per_token
+            )
         return scratch_pages * bytes_per_page * self.draft_swa_num_layers
 
     def _get_draft_swa_scratch_fixed_bytes_for_token_capacity(

@@ -910,6 +910,54 @@ class TestDflashDraftKvBudget(CustomTestCase):
         expected_page_bytes = 260 * 576  # ceil(256 * 584 / 576) * 576
         self.assertEqual(scratch_bytes, expected_pages * expected_page_bytes * 3)
 
+    def test_dsv4_dspark_unified_budget_uses_bf16_row_stride(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        mr = _make_model_runner(
+            self,
+            num_layers=3,
+            is_hybrid_swa=True,
+            swa_full_tokens_ratio=0.8,
+            speculative_algorithm="DSPARK",
+            speculative_num_draft_tokens=6,
+            max_running_requests=8,
+            page_size=256,
+        )
+        mr.model_config.qk_nope_head_dim = 448
+        mr.model_config.qk_rope_head_dim = 64
+        mr.model_config.index_head_dim = 128
+        mr.model_config.window_size = 128
+        mr.model_config.compress_ratios = [0, 4, 128]
+        mr.spec_algorithm.is_dspark.return_value = True
+        mr.server_args.speculative_dspark_draft_swa_sidecar = True
+        mr.spec_aux_config = SimpleNamespace(
+            eagle_draft_num_layers=None,
+            dflash_draft_num_layers=3,
+            dflash_draft_cell_size_per_token=None,
+        )
+
+        with (
+            mock_cpu_env(),
+            patch(
+                "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate."
+                "is_unified_kv_triton",
+                return_value=True,
+            ),
+        ):
+            configurator = DSV4PoolConfigurator(mr)
+
+        self.assertEqual(configurator.draft_swa_kv_bytes_per_token, 1024)
+        self.assertEqual(
+            configurator.bytes_per_full_token,
+            configurator._get_bytes_per_full_token() + 0.8 * 1024 * 3,
+        )
+        expected_pages = 1
+        expected_page_bytes = 256 * 1024
+        self.assertEqual(
+            configurator._get_draft_swa_scratch_fixed_bytes(8),
+            expected_pages * expected_page_bytes * 3,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
