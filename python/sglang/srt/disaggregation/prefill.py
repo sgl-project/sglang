@@ -1319,8 +1319,8 @@ class SchedulerDisaggregationPrefillMixin:
             # not a complete physical DCP page. The regular final send covers
             # the full range; only skip this optional early-send optimization.
             return
-        staged_prefix: Optional[StagedCachedPrefixTransferIndices] = getattr(
-            req, "_staged_cached_prefix_transfer_indices", None
+        staged_prefix: Optional[StagedCachedPrefixTransferIndices] = (
+            req._staged_cached_prefix_transfer_indices
         )
         if (
             staged_prefix is not None
@@ -1385,11 +1385,11 @@ class SchedulerDisaggregationPrefillMixin:
             return
 
         state_indices: Optional[List] = None
-        staged: Optional[StagedPrefillTransferIndices] = getattr(
-            req, "_staged_prefill_transfer_indices", None
+        staged: Optional[StagedPrefillTransferIndices] = (
+            req._staged_prefill_transfer_indices
         )
-        staged_prefix: Optional[StagedCachedPrefixTransferIndices] = getattr(
-            req, "_staged_cached_prefix_transfer_indices", None
+        staged_prefix: Optional[StagedCachedPrefixTransferIndices] = (
+            req._staged_cached_prefix_transfer_indices
         )
         staged_prefix_ready = False
         if last_chunk:

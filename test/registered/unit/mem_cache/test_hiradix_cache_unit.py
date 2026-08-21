@@ -3,6 +3,8 @@
 import os
 import unittest
 from array import array
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -117,6 +119,34 @@ class TestHiRadixCacheKVEvents(CustomTestCase):
         self.assertEqual(list(stored_cpu[0].token_ids), [1, 2, 3, 4])
         self.assertIsNone(stored_cpu[0].parent_block_hash)
         self.assertEqual(len(stored_cpu[0].block_hashes), 2)
+
+    def test_write_back_waits_for_direct_dispatch_to_publish_ack(self):
+        cache = object.__new__(HiRadixCache)
+        cache.ongoing_write_through = {7: object()}
+        cache.cache_controller = mock.Mock()
+        cache.cache_controller.ack_write_queue = []
+        ack = SimpleNamespace(
+            finish_event=mock.Mock(),
+            node_ids=[7],
+        )
+
+        def publish_ack():
+            cache.cache_controller.ack_write_queue.append(ack)
+
+        cache.cache_controller.wait_direct_dispatch.side_effect = publish_ack
+        cache._finish_write_through_ack = mock.Mock(
+            side_effect=lambda ack_id, release_lock: cache.ongoing_write_through.pop(
+                ack_id
+            )
+        )
+        cache._log_write_ack_metrics = mock.Mock()
+
+        cache.writing_check(write_back=True)
+
+        cache.cache_controller.check_direct_dispatch_error.assert_called_once_with()
+        cache.cache_controller.wait_direct_dispatch.assert_called_once_with()
+        ack.finish_event.synchronize.assert_called_once_with()
+        cache._finish_write_through_ack.assert_called_once_with(7, release_lock=False)
 
 
 if __name__ == "__main__":

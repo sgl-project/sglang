@@ -1026,8 +1026,10 @@ class HiRadixCache(RadixCache):
         return count_values[0], count_values[1], tuple(count_values[2:])
 
     def writing_check(self, write_back=False, finish_count: Optional[int] = None):
+        self.cache_controller.check_direct_dispatch_error()
         if write_back:
             # blocking till all write back complete
+            self.cache_controller.wait_direct_dispatch()
             while len(self.ongoing_write_through) > 0:
                 for ack in self.cache_controller.ack_write_queue:
                     ack.finish_event.synchronize()
