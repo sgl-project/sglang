@@ -22,7 +22,10 @@ DSV4_DRAFT_ATTENTION_BACKEND = "dsv4"
 
 
 def draft_is_deepseek_v4(*, server_args: ServerArgs) -> bool:
-    from sglang.srt.configs.model_config import is_deepseek_v4
+    from sglang.srt.configs.model_config import (
+        draft_model_override_args_json,
+        is_deepseek_v4,
+    )
     from sglang.srt.utils.hf_transformers_utils import get_config
 
     draft_model_path = server_args.speculative_draft_model_path
@@ -32,7 +35,9 @@ def draft_is_deepseek_v4(*, server_args: ServerArgs) -> bool:
         draft_model_path,
         trust_remote_code=server_args.trust_remote_code,
         revision=server_args.speculative_draft_model_revision,
-        model_override_args=json.loads(server_args.json_model_override_args),
+        model_override_args=json.loads(
+            draft_model_override_args_json(server_args=server_args)
+        ),
         model_config_parser=server_args.model_config_parser,
     )
     return draft_hf_config is not None and is_deepseek_v4(draft_hf_config)
@@ -127,13 +132,16 @@ def resolve_runtime_config(
 def read_draft_checkpoint_gamma(*, server_args: ServerArgs) -> Optional[int]:
     """Load the draft checkpoint's hf config and read its DSpark gamma
     (block_size). Raises on config-load failure; callers pick the fallback."""
+    from sglang.srt.configs.model_config import draft_model_override_args_json
     from sglang.srt.utils.hf_transformers_utils import get_config
 
     draft_hf_config = get_config(
         server_args.speculative_draft_model_path,
         trust_remote_code=server_args.trust_remote_code,
         revision=server_args.speculative_draft_model_revision,
-        model_override_args=json.loads(server_args.json_model_override_args),
+        model_override_args=json.loads(
+            draft_model_override_args_json(server_args=server_args)
+        ),
     )
     return parse_dspark_draft_config(draft_hf_config=draft_hf_config).resolve_gamma(
         default=None

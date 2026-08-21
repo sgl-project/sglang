@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import pd_disaggregation_hook
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.configs.model_config import ModelConfig, draft_model_override_args_json
 from sglang.srt.entrypoints.sidecar import (
     SGLANG_GRPC_ENDPOINT_ENV,
     Sidecar,
@@ -118,6 +119,60 @@ class TestPrepareServerArgs(CustomTestCase):
         reconstructed._handle_missing_default_values()
 
         self.assertFalse(reconstructed._speculative_draft_quantization_explicitly_set)
+
+    def test_draft_model_override_args_default_to_the_target_override(self):
+        """An unset --speculative-draft-json-model-override-args must leave the draft
+        model reading --json-model-override-args, which is the whole backward-compat
+        contract: a default of "{}" instead of None would silently stop applying the
+        target's override to the draft."""
+        target = '{"num_hidden_layers": 4}'
+        draft = '{"num_hidden_layers": 1}'
+
+        inherited = ServerArgs(model_path="dummy", json_model_override_args=target)
+        self.assertIsNone(inherited.speculative_draft_json_model_override_args)
+        self.assertEqual(draft_model_override_args_json(server_args=inherited), target)
+
+        explicit = ServerArgs(
+            model_path="dummy",
+            json_model_override_args=target,
+            speculative_draft_json_model_override_args=draft,
+        )
+        self.assertEqual(draft_model_override_args_json(server_args=explicit), draft)
+        self.assertEqual(explicit.json_model_override_args, target)
+
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        base_args = ["--model-path", "dummy"]
+        self.assertIsNone(
+            parser.parse_args(base_args).speculative_draft_json_model_override_args
+        )
+        self.assertEqual(
+            parser.parse_args(
+                base_args + ["--speculative-draft-json-model-override-args", draft]
+            ).speculative_draft_json_model_override_args,
+            draft,
+        )
+
+    def test_model_config_routes_the_draft_override_to_the_draft_model_only(self):
+        """`ModelConfig.from_server_args` picks the override by `is_draft_model`, like
+        it already does for quantization and the decrypted config file."""
+        target = '{"num_hidden_layers": 4}'
+        draft = '{"num_hidden_layers": 1}'
+        server_args = ServerArgs(
+            model_path="dummy",
+            json_model_override_args=target,
+            speculative_draft_json_model_override_args=draft,
+        )
+
+        def override_for(is_draft_model: bool):
+            with patch.object(ModelConfig, "__init__", return_value=None) as init:
+                ModelConfig.from_server_args(
+                    server_args, model_path="dummy", is_draft_model=is_draft_model
+                )
+            return init.call_args.kwargs["model_override_args"]
+
+        self.assertEqual(override_for(is_draft_model=True), draft)
+        self.assertEqual(override_for(is_draft_model=False), target)
 
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:

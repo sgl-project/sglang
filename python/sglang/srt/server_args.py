@@ -2120,6 +2120,11 @@ class ServerArgs:
         ),
         NS("spec"),
     ] = None
+    speculative_draft_json_model_override_args: A[
+        Optional[str],
+        "A dictionary in JSON string format used to override the draft model's default configuration. If unset, the draft model reuses --json-model-override-args.",
+        NS("spec"),
+    ] = None
     speculative_num_steps: A[
         Optional[int],
         "The number of steps sampled from draft model in Speculative Decoding.",

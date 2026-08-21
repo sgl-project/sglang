@@ -258,6 +258,13 @@ def get_num_indexer_layers(config) -> int:
     return getattr(config, "num_indexer_layers", 0)
 
 
+def draft_model_override_args_json(*, server_args: ServerArgs) -> str:
+    """The draft model's config override, falling back to the target's when unset."""
+    if server_args.speculative_draft_json_model_override_args is not None:
+        return server_args.speculative_draft_json_model_override_args
+    return server_args.json_model_override_args
+
+
 class ModelConfig:
     def __init__(
         self,
@@ -586,6 +593,11 @@ class ModelConfig:
             if is_draft_model
             else server_args.decrypted_config_file
         )
+        model_override_args = (
+            draft_model_override_args_json(server_args=server_args)
+            if is_draft_model
+            else server_args.json_model_override_args
+        )
         return ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
@@ -595,7 +607,7 @@ class ModelConfig:
                 if context_length is not None
                 else server_args.context_length
             ),
-            model_override_args=server_args.json_model_override_args,
+            model_override_args=model_override_args,
             is_embedding=server_args.is_embedding,
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
