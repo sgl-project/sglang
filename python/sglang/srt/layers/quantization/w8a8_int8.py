@@ -169,6 +169,18 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 assert False, "W8A8Int8LinearMethod on CPU only works on AMX or Arm64"
         else:
             layer.weight = Parameter(layer.weight.t(), requires_grad=False)
+        ws = layer.weight_scale
+        # Guard the NaN check against meta-device tensors (model init / tracing
+        # paths), where a boolean reduction on a meta tensor raises (review note).
+        if ws.device.type != "meta" and torch.isnan(ws).any():
+            raise ValueError(
+                "W8A8Int8: weight_scale was not loaded from the checkpoint. "
+                "`--quantization w8a8_int8` requires a pre-quantized (e.g. "
+                "compressed-tensors INT8) checkpoint; the given model appears to be "
+                "unquantized (bf16/fp16). Loading bf16 weights into the int8 buffer "
+                "with an uninitialized scale silently produces garbage output. Use an "
+                "INT8 checkpoint, or `--quantization fp8` for on-the-fly quantization."
+            )
         layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
 
     def create_weights(
@@ -196,7 +208,12 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
 
         weight_scale = ChannelQuantScaleParameter(
-            data=torch.empty((sum(output_partition_sizes), 1), dtype=torch.float32),
+            # NaN sentinel: an unquantized checkpoint provides no weight_scale, so the
+            # NaN survives and is caught in process_weights_after_loading instead of
+            # being used as an uninitialized scale -> silently garbage output.
+            data=torch.full(
+                (sum(output_partition_sizes), 1), float("nan"), dtype=torch.float32
+            ),
             output_dim=0,
             weight_loader=weight_loader,
         )
