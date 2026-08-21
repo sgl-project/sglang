@@ -626,8 +626,6 @@ export const config = {
         ],
       },
       ep: {
-        // A3 keeps the recipe's own EP resolution (no --ep-size in the launch
-        // script), so the whole select hides there.
         showWhen: (b) => b.hw !== "a3",
         label: "EP",
         values: [
@@ -733,8 +731,7 @@ export const config = {
         //   EAGLE   --speculative-num-steps N           (chain; topk>1 is a tree)
         // Only DSPARK is selectable today, so only its form is emitted.
         id: "proposedDraftTokens", title: "Proposed Draft Tokens",
-        // The A3 recipe pins the shipped block size (7); nothing to tune, so
-        // the row hides there.
+        // The A3 recipe pins the shipped block size (7)
         showWhen: (b) => b.spec === "dspark" && b.hw !== "a3",
         control: "slider",
         stripPrefixes: [
@@ -759,7 +756,7 @@ export const config = {
         // prefill role) turns it on in the base, so this row derives to On and
         // exists mainly as the opt-out.
         // Needs the Triton linear-attn decode backend (the K3 default); the A3
-        // script never sets it (CUDA-only), so the row hides there.
+        // script never sets it.
         id: "replaySsm", title: "ReplaySSM (spec)",
         showWhen: (b) => b.spec === "dspark" && b.hw !== "a3",
         stripPrefixes: ["--enable-linear-replayssm-spec"],
@@ -781,8 +778,7 @@ export const config = {
         // without --speculative-dspark-sps-table-path (every step still
         // verifies full width); fails fast with ReplaySSM or DCP > 1.
         id: "raggedVerify", title: "Ragged Verify Mode (spec)",
-        // The A3 recipe pins static (in its env); nothing to tune, so the row
-        // hides there.
+        // The A3 recipe pins static.
         showWhen: (b) => b.spec === "dspark" && b.hw !== "a3",
         stripEnv: ["SGLANG_RAGGED_VERIFY_MODE"],
         options: [
