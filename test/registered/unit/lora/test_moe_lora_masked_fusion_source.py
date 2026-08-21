@@ -270,8 +270,12 @@ class TestMaskedFusionSource(unittest.TestCase):
         self.assertIn("del row_state", reduce_body)
         mapped = _function(base, "mapped_down_lora_a_input")
         # It hands back the flat row view paired with the route's src2dst.
-        self.assertIn("row_state.src2dst)", mapped)
-        self.assertIn("activation.view(-1, activation.shape[-1])", mapped)
+        # Assert the return itself: a punctuation-level match breaks whenever
+        # black rewraps the line.
+        self.assertIn(
+            "return activation.view(-1, activation.shape[-1]), row_state.src2dst",
+            " ".join(mapped.split()),
+        )
         for body in (shared, finish, reduce_body, mapped):
             self.assertNotIn("row_state.hidden_permuted", body)
             self.assertNotIn("row_state.masked_m", body)
