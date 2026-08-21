@@ -49,7 +49,13 @@ COMMON_ARGS = [
     "--mamba-radix-cache-strategy",
     "extra_buffer",
     "--mem-fraction-static",
-    "0.6",
+    "0.8",
+    # Write-through needs the host pool above the device pool and the default ratio
+    # puts it at 2x, so a bounded device pool is what keeps host memory in range for
+    # two roles on one node -- and it keeps the host tier actually exercised rather
+    # than everything staying resident on device.
+    "--max-total-tokens",
+    "65536",
     "--swa-full-tokens-ratio",
     "0.1",
     "--mamba-full-memory-ratio",
@@ -60,10 +66,9 @@ COMMON_ARGS = [
 
 
 class TestDisaggregationInklingMXFP8(PDDisaggregationServerBase, GSM8KMixin):
-    # Shot count and floor match the single-server Inkling case so the two numbers
-    # are comparable. This pair measured 0.845 to 0.865 across runs, closer to the
-    # floor than that case is; a dropped or misaligned state component collapses
-    # generation to near zero, which is what the floor is sized to catch.
+    # Shot count, TP and floor match the single-server Inkling case, so its 0.900
+    # is a peer number rather than a rough reference. A dropped or misaligned state
+    # component collapses generation to near zero, which is what the floor catches.
     gsm8k_num_shots = 10
     gsm8k_score_threshold = 0.80
 
@@ -71,7 +76,13 @@ class TestDisaggregationInklingMXFP8(PDDisaggregationServerBase, GSM8KMixin):
     def setUpClass(cls):
         super().setUpClass()
         cls.model = try_cached_model(MODEL)
-        cls.launch_all()
+        # Serialized rather than launch_all(): both roles load the same checkpoint,
+        # and doing it at once put the pair over the host memory a runner has.
+        cls.start_prefill()
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.start_decode()
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
+        cls.launch_lb()
 
     @classmethod
     def start_prefill(cls):
@@ -85,11 +96,6 @@ class TestDisaggregationInklingMXFP8(PDDisaggregationServerBase, GSM8KMixin):
             cls.bootstrap_port,
             *COMMON_ARGS,
             "--enable-hierarchical-cache",
-            # Absolute host size, not the default ratio: the ratio scales with the
-            # device pool, and two roles on one node then reserve more host memory
-            # than a runner has. This exercises the tiering, not its capacity.
-            "--hicache-size",
-            "8",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
