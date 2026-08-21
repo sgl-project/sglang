@@ -1,3 +1,4 @@
+import contextlib
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, List
@@ -975,8 +976,31 @@ def build_mla_attention_fixture(
     )
 
 
-def run_mla_fixture_eager(fixture: MLAAttentionFixture) -> torch.Tensor:
-    with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
+def run_mla_fixture_eager(
+    fixture: MLAAttentionFixture, *, piecewise: bool = False, breakable: bool = False
+) -> torch.Tensor:
+    """``piecewise=True``/``breakable=True`` set the corresponding process-global
+    capture-mode flag that backends branch on, without capturing a torch.compile
+    or segmented graph."""
+    assert not (
+        piecewise and breakable
+    ), "a captured prefill graph is either tc_piecewise or breakable, not both"
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        enable_breakable_cuda_graph,
+    )
+    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+        enable_tc_piecewise_cuda_graph,
+    )
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(torch.no_grad())
+        stack.enter_context(
+            forward_context(ForwardContext(attn_backend=fixture.backend))
+        )
+        if piecewise:
+            stack.enter_context(enable_tc_piecewise_cuda_graph())
+        if breakable:
+            stack.enter_context(enable_breakable_cuda_graph())
         fixture.backend.init_forward_metadata(fixture.forward_batch)
         return fixture.actual_module(fixture.input_hidden, fixture.forward_batch)
 
@@ -1196,6 +1220,8 @@ def run_mla_attention_case(
     atol: float = MLA_ATOL,
     rtol: float = MLA_RTOL,
     loc_layout: str = "shuffled_pages",
+    piecewise: bool = False,
+    breakable: bool = False,
 ):
     fixture = build_mla_attention_fixture(
         testcase,
@@ -1208,8 +1234,10 @@ def run_mla_attention_case(
         device=device,
         fp8_kv_cache=fp8_kv_cache,
         loc_layout=loc_layout,
+        disable_piecewise_cuda_graph=not piecewise,
     )
-    actual = run_mla_fixture_eager(fixture)
+    actual = run_mla_fixture_eager(fixture, piecewise=piecewise, breakable=breakable)
     expected = expected_mla_fixture_output(fixture)
 
     torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    return fixture
