@@ -9,8 +9,10 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
+from typing import Literal
 
 import torch
 
@@ -20,6 +22,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
+from sglang.srt.observability.metrics_collector import StorageMetrics
 from sglang.test.test_utils import CustomTestCase
 
 # Stress tests are opt-in: CI never sets this; set locally to exercise them.
@@ -164,6 +167,190 @@ class MockMemPoolHost:
         # Test tensors are too small to satisfy 4 KiB stride alignment; the
         # O_DIRECT path correctly falls back to copy mode in this case.
         return False
+
+
+class TestNixlStorageMetrics(CustomTestCase):
+    @staticmethod
+    def _make_backend(enabled: bool = True) -> HiCacheNixl:
+        backend = object.__new__(HiCacheNixl)
+        backend.enable_storage_metrics = enabled
+        if enabled:
+            backend._storage_metrics_lock = threading.Lock()
+            backend._prefetch_pgs: list[int] = []
+            backend._backup_pgs: list[int] = []
+            backend._prefetch_bandwidth: list[float] = []
+            backend._backup_bandwidth: list[float] = []
+        return backend
+
+    @staticmethod
+    def _record(
+        backend: HiCacheNixl,
+        direction: Literal["READ", "WRITE"],
+        pages: int,
+        buffer_sizes: list[int],
+        elapsed_ms: float,
+        successful: bool = True,
+    ) -> None:
+        backend._log_xfer_stats(
+            op_name="test_xfer",
+            direction=direction,
+            num_keys=pages,
+            host_indices=torch.arange(pages, dtype=torch.int64),
+            buffer_sizes=buffer_sizes,
+            elapsed_ms=elapsed_ms,
+            successful=successful,
+        )
+
+    def test_successful_read_write_metrics_drain_once(self) -> None:
+        backend = self._make_backend()
+        self._record(
+            backend=backend,
+            direction="READ",
+            pages=2,
+            buffer_sizes=[1 << 30],
+            elapsed_ms=1000.0,
+        )
+        self._record(
+            backend=backend,
+            direction="WRITE",
+            pages=3,
+            buffer_sizes=[1 << 29],
+            elapsed_ms=500.0,
+        )
+
+        stats = backend.get_stats()
+        assert stats is not None
+        self.assertEqual(stats.prefetch_pgs, [2])
+        self.assertEqual(stats.backup_pgs, [3])
+        self.assertEqual(stats.prefetch_bandwidth, [1.0])
+        self.assertEqual(stats.backup_bandwidth, [1.0])
+
+        drained = backend.get_stats()
+        assert drained is not None
+        self.assertEqual(drained.prefetch_pgs, [])
+        self.assertEqual(drained.backup_pgs, [])
+        self.assertEqual(drained.prefetch_bandwidth, [])
+        self.assertEqual(drained.backup_bandwidth, [])
+
+    def test_component_buffers_use_logical_page_count_and_total_bytes(self) -> None:
+        backend = self._make_backend()
+        self._record(
+            backend=backend,
+            direction="READ",
+            pages=2,
+            buffer_sizes=[1 << 28, 1 << 28, 1 << 29],
+            elapsed_ms=1000.0,
+        )
+
+        stats = backend.get_stats()
+        assert stats is not None
+        self.assertEqual(stats.prefetch_pgs, [2])
+        self.assertEqual(stats.prefetch_bandwidth, [1.0])
+
+    def test_failed_zero_duration_and_disabled_metrics(self) -> None:
+        backend = self._make_backend()
+        self._record(
+            backend=backend,
+            direction="READ",
+            pages=2,
+            buffer_sizes=[1 << 20],
+            elapsed_ms=10.0,
+            successful=False,
+        )
+        self._record(
+            backend=backend,
+            direction="READ",
+            pages=2,
+            buffer_sizes=[1 << 20],
+            elapsed_ms=0.0,
+        )
+
+        stats = backend.get_stats()
+        assert stats is not None
+        self.assertEqual(stats.prefetch_pgs, [2])
+        self.assertEqual(stats.prefetch_bandwidth, [])
+
+        disabled = self._make_backend(enabled=False)
+        self._record(
+            backend=disabled,
+            direction="WRITE",
+            pages=1,
+            buffer_sizes=[1 << 20],
+            elapsed_ms=1.0,
+        )
+        self.assertIsNone(disabled.get_stats())
+
+    def test_concurrent_update_and_drain_are_atomic(self) -> None:
+        backend = self._make_backend()
+        update_entered = threading.Event()
+        allow_update = threading.Event()
+        drain_attempted = threading.Event()
+        errors: list[BaseException] = []
+        snapshots: list[StorageMetrics] = []
+
+        class BlockingList(list[int]):
+            def append(self, value: int) -> None:
+                update_entered.set()
+                if not allow_update.wait(timeout=5):
+                    raise TimeoutError("Timed out waiting to finish metrics update")
+                super().append(value)
+
+        class ObservableLock:
+            def __init__(self) -> None:
+                self._lock = threading.Lock()
+                self._acquisitions: int = 0
+
+            def __enter__(self) -> "ObservableLock":
+                self._acquisitions += 1
+                if self._acquisitions == 2:
+                    drain_attempted.set()
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                self._lock.release()
+
+        backend._storage_metrics_lock = ObservableLock()
+        backend._prefetch_pgs = BlockingList()
+
+        def update() -> None:
+            try:
+                self._record(
+                    backend=backend,
+                    direction="READ",
+                    pages=1,
+                    buffer_sizes=[1 << 20],
+                    elapsed_ms=1.0,
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        def drain() -> None:
+            try:
+                stats = backend.get_stats()
+                assert stats is not None
+                snapshots.append(stats)
+            except BaseException as error:
+                errors.append(error)
+
+        update_thread = threading.Thread(target=update)
+        update_thread.start()
+        self.assertTrue(update_entered.wait(timeout=5))
+
+        drain_thread = threading.Thread(target=drain)
+        drain_thread.start()
+        self.assertTrue(drain_attempted.wait(timeout=5))
+
+        allow_update.set()
+        update_thread.join(timeout=5)
+        drain_thread.join(timeout=5)
+
+        self.assertFalse(update_thread.is_alive())
+        self.assertFalse(drain_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(snapshots[0].prefetch_pgs, [1])
+        self.assertEqual(len(snapshots[0].prefetch_bandwidth), 1)
 
 
 class MinioFixture:

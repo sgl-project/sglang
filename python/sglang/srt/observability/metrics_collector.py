@@ -2005,7 +2005,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         self.histogram_prefetch_bandwidth = Histogram(
             name="sglang:prefetch_bandwidth",
             documentation="Histogram of per-op L3 prefetch wire bandwidth in "
-            "GB/s: transferred bytes (compressed size when KV compression is "
+            "GiB/s: transferred bytes (compressed size when KV compression is "
             "on) over the op's IO wall time.",
             labelnames=labels.keys(),
             buckets=bucket_bandwidth,
@@ -2014,7 +2014,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         self.histogram_backup_bandwidth = Histogram(
             name="sglang:backup_bandwidth",
             documentation="Histogram of per-op L3 backup wire bandwidth in "
-            "GB/s: transferred bytes over the op's IO wall time, excluding "
+            "GiB/s: transferred bytes over the op's IO wall time, excluding "
             "pages the backend already held (the log line's "
             "processing_throughput includes them).",
             labelnames=labels.keys(),
