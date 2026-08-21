@@ -1045,11 +1045,19 @@ class HostPoolGroup:
     def get_ksize_per_token(self):
         return self.anchor_entry.host_pool.get_ksize_per_token()
 
+    def get_size_per_token(self):
+        return self.anchor_entry.host_pool.get_size_per_token()
+
     def get_pool(self, name: PoolName):
         return self.entry_map[name].host_pool
 
     def get_page_buffer_meta(self, indices):
         return self.anchor_entry.host_pool.get_page_buffer_meta(indices)
+
+    def get_split_heads_page_buffer_meta(self, indices, split_factor: int):
+        return self.anchor_entry.host_pool.get_split_heads_page_buffer_meta(
+            indices, split_factor
+        )
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
         return self.anchor_entry.host_pool.is_stride_page_aligned(page_size_bytes)
