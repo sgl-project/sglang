@@ -287,9 +287,7 @@ class LayerwiseOffloadManager:
         self._has_dtensor_weights = False
         # Store forward hooks for removal
         self._forward_hooks: List[Any] = []
-        # Skip-compute (e.g. Cache-DiT) can jump layers; track the last run
-        # index so prefetch does not assume i+1 or wrap into a skipped gap.
-        self._last_forwarded_layer: int | None = None
+        self._last_forwarded_layer: int | None = None  # skip-compute can jump
 
         if initialize:
             self._initialize()
@@ -544,9 +542,6 @@ class LayerwiseOffloadManager:
         Prepare for the next round of denoising loop with prefetching the necessary layers
         """
         self._last_forwarded_layer = None
-        # A prior Cache-DiT hit (or any skip-compute) may have speculatively
-        # prefetched layers that never ran, so they never hit a post-hook
-        # release. Drop those before priming this step's window.
         self._release_unneeded_streamed_layers(keep=set(self._head_of_stream()))
 
         # The resident set first: it has to be there for the whole step, and the
@@ -958,9 +953,6 @@ class LayerwiseOffloadManager:
                     self._last_forwarded_layer is not None
                     and i > self._last_forwarded_layer + 1
                 ):
-                    # Cache-DiT DBCache: Fn then jump to Bn. Drop the unused
-                    # prefetch window in the gap so skipped weights stay
-                    # released and the destination is loaded on demand.
                     self._release_skip_gap(
                         last_ran=self._last_forwarded_layer, next_ran=i
                     )
