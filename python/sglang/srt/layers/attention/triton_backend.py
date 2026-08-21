@@ -1370,11 +1370,12 @@ class TritonAttnBackend(AttentionBackend):
 
         # Normal mode: use original 2-stage kernel
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
-            diffusion_bidir = (
+            bidirectional_extend = (
                 layer.attn_type == AttentionType.DECODER_BIDIRECTIONAL
-                and forward_batch.dllm_is_encoder is False
             )
-            sliding_window_size = -1 if diffusion_bidir else layer.sliding_window_size
+            sliding_window_size = (
+                -1 if bidirectional_extend else layer.sliding_window_size
+            )
             kv_indptr = self.forward_metadata.window_kv_indptr
             kv_indices = self.forward_metadata.window_kv_indices
             window_kv_offsets = self.forward_metadata.window_kv_offsets
@@ -1611,11 +1612,12 @@ class TritonAttnBackend(AttentionBackend):
 
         # Determine sliding window settings
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
-            diffusion_bidir = (
+            bidirectional_extend = (
                 layer.attn_type == AttentionType.DECODER_BIDIRECTIONAL
-                and forward_batch.dllm_is_encoder is False
             )
-            sliding_window_size = -1 if diffusion_bidir else layer.sliding_window_size
+            sliding_window_size = (
+                -1 if bidirectional_extend else layer.sliding_window_size
+            )
             # Note: for unified kernel, we use full kv_indptr (not window)
             prefix_kv_indptr = self.forward_metadata.window_kv_indptr
             prefix_kv_indices = self.forward_metadata.window_kv_indices

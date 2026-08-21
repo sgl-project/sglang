@@ -1,10 +1,15 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.arg_groups.overrides import _dllm_attention_backend
+from sglang.srt.dllm.algorithm import get_algorithm
 from sglang.srt.dllm.algorithm.gemma4_renoise import Gemma4Renoise
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -18,7 +23,7 @@ def _config(*, block_size=3, fdfo=False, **algorithm_config):
         mask_id=-1,
         max_running_requests=8,
         first_done_first_out_mode=fdfo,
-        is_uniform=True,
+        requires_separate_context_encoding=True,
     )
 
 
@@ -34,8 +39,8 @@ def _batch(rids, block_size, *, sampling_seeds=None, encoder=False, empty=False)
         input_ids=torch.full((num_tokens,), -1, dtype=torch.long),
         rids=list(rids),
         sampling_info=sampling_info,
-        dllm_is_encoder=encoder,
-        dllm_self_conditioning_embeds=None,
+        forward_mode=(ForwardMode.EXTEND if encoder else ForwardMode.DLLM_EXTEND),
+        input_embeds=None,
     )
 
 
@@ -53,7 +58,11 @@ class _FakeRunner:
             vocab_size, hidden_size
         )
         self.embedding = _ScaledEmbedding(weight / 10, 1.5)
-        self.model = SimpleNamespace(get_input_embeddings=lambda: self.embedding)
+        self.prepared_signals = []
+        self.model = SimpleNamespace(
+            get_input_embeddings=lambda: self.embedding,
+            prepare_dllm_input_embeds=self.prepare_dllm_input_embeds,
+        )
         self.model_config = SimpleNamespace(
             hf_config=SimpleNamespace(
                 text_config=SimpleNamespace(vocab_size=vocab_size)
@@ -61,15 +70,19 @@ class _FakeRunner:
         )
         self.records = []
 
+    def prepare_dllm_input_embeds(self, input_ids, signal):
+        self.prepared_signals.append(None if signal is None else signal.clone())
+        input_embeds = self.embedding(input_ids)
+        if signal is not None:
+            input_embeds = input_embeds + signal
+        return input_embeds
+
     def forward(self, forward_batch, pp_proxy_tensors=None):
         self.records.append(
             {
                 "input_ids": forward_batch.input_ids.clone(),
-                "self_conditioning": (
-                    None
-                    if forward_batch.dllm_self_conditioning_embeds is None
-                    else forward_batch.dllm_self_conditioning_embeds.clone()
-                ),
+                "input_embeds": forward_batch.input_embeds.clone(),
+                "self_conditioning": self.prepared_signals[-1],
             }
         )
         vocab_size = self.model_config.hf_config.text_config.vocab_size
@@ -88,7 +101,10 @@ class TestGemma4Renoise(unittest.TestCase):
         algorithm.vocab_size = vocab_size
         algorithm.embed_tokens = _ScaledEmbedding(weight / 10, 1.5)
         states = algorithm.init_step_state(batch)
-        algorithm.prepare_inputs(batch, states)
+        runner = _FakeRunner(vocab_size=vocab_size, hidden_size=hidden_size)
+        runner.embedding = algorithm.embed_tokens
+        runner.model.get_input_embeddings = lambda: runner.embedding
+        algorithm.prepare_inputs(runner, batch, states)
         return states
 
     def test_defaults_and_validation(self):
@@ -119,11 +135,111 @@ class TestGemma4Renoise(unittest.TestCase):
                 {"stopping_config": {"confidence_threshold": 0}},
                 "stopping_config",
             ),
+            ({"sampler_config": "invalid"}, "sampler_config"),
+            ({"seed": "invalid"}, "seed"),
         ]
         for values, message in invalid:
             with self.subTest(values=values):
                 with self.assertRaisesRegex(ValueError, message):
                     Gemma4Renoise(_config(**values))
+
+        flat = Gemma4Renoise(
+            _config(
+                t_min=0.2,
+                t_max=0.6,
+                confidence_threshold=0.01,
+                stability_threshold=2,
+            )
+        )
+        self.assertEqual((flat.t_min, flat.t_max), (0.2, 0.6))
+        self.assertEqual(flat.confidence_threshold, 0.01)
+        self.assertEqual(flat.stability_threshold, 2)
+
+        with self.assertRaisesRegex(ValueError, "max_denoising_steps"):
+            get_algorithm(_config(max_denoising_steps=0))
+
+    def test_launch_constraints_are_owned_by_algorithm(self):
+        hf_config = SimpleNamespace(
+            tie_word_embeddings=True,
+            text_config=SimpleNamespace(tie_word_embeddings=True),
+        )
+        server_args = SimpleNamespace(
+            device="cuda",
+            get_model_config=lambda: SimpleNamespace(
+                hf_config=hf_config, quantization=None
+            ),
+            pp_size=1,
+            dcp_size=1,
+            attn_cp_size=1,
+            attention_backend="flashinfer",
+            prefill_attention_backend="fa3",
+            decode_attention_backend=None,
+            disable_radix_cache=False,
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(backend=Backend.FULL),
+                prefill=SimpleNamespace(backend=Backend.FULL),
+            ),
+            chunked_prefill_size=128,
+        )
+
+        Gemma4Renoise.configure_server_args(server_args)
+
+        self.assertEqual(server_args.attention_backend, "flashinfer")
+        self.assertEqual(server_args.prefill_attention_backend, "fa3")
+        self.assertIsNone(server_args.decode_attention_backend)
+        self.assertTrue(server_args.disable_radix_cache)
+        self.assertEqual(server_args.cuda_graph_config.decode.backend, Backend.DISABLED)
+        self.assertEqual(
+            server_args.cuda_graph_config.prefill.backend, Backend.DISABLED
+        )
+        self.assertEqual(server_args.chunked_prefill_size, -1)
+
+        with self.assertRaisesRegex(ValueError, "GPU execution"):
+            Gemma4Renoise.configure_server_args(SimpleNamespace(device="cpu"))
+
+    def test_required_attention_backend_uses_generic_override_pass(self):
+        view = SimpleNamespace(
+            dllm_algorithm="Gemma4Renoise",
+            attention_backend="flashinfer",
+            prefill_attention_backend="fa3",
+            decode_attention_backend=None,
+        )
+        self.assertEqual(
+            _dllm_attention_backend(view),
+            {
+                "attention_backend": "triton",
+                "prefill_attention_backend": "triton",
+                "decode_attention_backend": "triton",
+            },
+        )
+
+    def test_model_compatibility_populates_algorithm_capabilities(self):
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["DiffusionGemmaForBlockDiffusion"],
+                canvas_length=192,
+            )
+        )
+        server_args = SimpleNamespace(
+            dllm_algorithm="Gemma4Renoise",
+            model_path="model",
+            revision=None,
+            max_running_requests=None,
+            dllm_algorithm_config=None,
+            dllm_fdfo=True,
+        )
+
+        with patch(
+            "sglang.srt.dllm.config.ModelConfig.from_server_args",
+            return_value=model_config,
+        ):
+            config = DllmConfig.from_server_args(server_args)
+            self.assertEqual(config.block_size, 192)
+            self.assertTrue(config.requires_separate_context_encoding)
+
+            server_args.dllm_algorithm = "LowConfidence"
+            with self.assertRaisesRegex(ValueError, "requires the Gemma4Renoise"):
+                DllmConfig.from_server_args(server_args)
 
     def test_first_canvas_initialization_is_deterministic_and_written(self):
         algorithm = Gemma4Renoise(_config(block_size=4, seed=17))
@@ -140,9 +256,12 @@ class TestGemma4Renoise(unittest.TestCase):
             self.assertFalse(state["finished"])
 
         expected = torch.stack([state["current"] for state in states]).reshape(-1)
-        algorithm.prepare_inputs(batch, states)
+        runner = _FakeRunner(vocab_size=7)
+        algorithm.embed_tokens = runner.embedding
+        algorithm.prepare_inputs(runner, batch, states)
         torch.testing.assert_close(batch.input_ids, expected)
-        self.assertIsNone(batch.dllm_self_conditioning_embeds)
+        self.assertIsNotNone(batch.input_embeds)
+        self.assertIsNone(runner.prepared_signals[-1])
 
         repeat = algorithm.init_step_state(_batch(["other-a", "other-b"], 4))
         for first, second in zip(states, repeat):
@@ -168,13 +287,14 @@ class TestGemma4Renoise(unittest.TestCase):
         )
 
         processed = logits / algorithm._temperature(state["step"])
-        distribution = torch.distributions.Categorical(logits=processed)
+        log_probabilities = torch.log_softmax(processed, dim=-1)
+        probabilities = log_probabilities.exp()
         generator = torch.Generator(device="cpu")
         generator.set_state(state["rng_state"])
         sampled = torch.multinomial(
-            distribution.probs, num_samples=1, generator=generator
+            probabilities, num_samples=1, generator=generator
         ).squeeze(-1)
-        entropy = distribution.entropy()
+        entropy = -(probabilities * log_probabilities).sum(dim=-1)
         sorted_entropy, indices = torch.sort(entropy)
         cumulative = torch.cumsum(sorted_entropy, dim=-1)
         selected = cumulative - sorted_entropy <= algorithm.entropy_bound
@@ -195,10 +315,10 @@ class TestGemma4Renoise(unittest.TestCase):
         algorithm = Gemma4Renoise(_config())
         weight = torch.tensor([[1.0, 0.0], [0.0, 2.0], [3.0, -1.0]])
         algorithm.embed_tokens = _ScaledEmbedding(weight, 2.5)
-        logits = torch.tensor([[0.0, 1.0, -1.0], [2.0, -2.0, 0.5]])
+        probabilities = torch.tensor([[0.2, 0.7, 0.1], [0.6, 0.1, 0.3]])
 
-        actual = algorithm._soft_embeddings(logits)
-        expected = logits.softmax(dim=-1, dtype=torch.float32) @ weight * 2.5
+        actual = algorithm._soft_embeddings(probabilities)
+        expected = probabilities @ weight * 2.5
 
         self.assertEqual(actual.shape, (2, 2))
         self.assertEqual(actual.dtype, weight.dtype)

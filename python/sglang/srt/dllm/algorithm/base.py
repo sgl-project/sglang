@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import torch
 
@@ -11,6 +11,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_npu
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
 
 _is_npu = is_npu()
 
@@ -28,6 +31,10 @@ class DllmAlgorithm:
     synchronous and FDFO (``--dllm-fdfo``) execution loops in ``run``.
     """
 
+    supported_architectures: Tuple[str, ...] = ()
+    requires_separate_context_encoding = False
+    required_attention_backend: Optional[str] = None
+
     def __init__(self, config: DllmConfig):
         self.block_size = config.block_size
         self.mask_id = config.mask_id
@@ -41,7 +48,22 @@ class DllmAlgorithm:
     def init_step_state(self, forward_batch: ForwardBatch) -> List[Any]:
         return [None] * forward_batch.batch_size
 
-    def prepare_inputs(self, forward_batch: ForwardBatch, states: List[Any]) -> None:
+    @classmethod
+    def configure_server_args(cls, server_args: ServerArgs) -> None:
+        """Apply launch-time constraints owned by an algorithm."""
+
+    @classmethod
+    def validate_request(cls, req: Req) -> Optional[str]:
+        """Return an error for unsupported request features, if any."""
+        return None
+
+    def prepare_inputs(
+        self,
+        model_runner: ModelRunner,
+        forward_batch: ForwardBatch,
+        states: List[Any],
+    ) -> None:
+        """Prepare algorithm-specific inputs immediately before a model forward."""
         pass
 
     def max_steps(self, block_size: int) -> int:
@@ -53,9 +75,12 @@ class DllmAlgorithm:
         full_logits: torch.Tensor,
         states: List[Any],
     ) -> List[bool]:
-        """One denoise step, advancing ``forward_batch.input_ids``/``states`` in
-        place. Returns, per block, whether it was already complete *on entry* --
-        i.e. this forward persisted its final KV cache and it can be emitted.
+        """Advance one denoise step in place and report which blocks may emit.
+
+        Algorithms that retain generated-block KV must not report completion
+        until a forward has persisted their final tokens. Algorithms with a
+        separate context pass may emit immediately because that block KV is
+        discarded and encoded causally in the next round.
         """
         raise NotImplementedError
 
@@ -80,7 +105,7 @@ class DllmAlgorithm:
         batch_size = forward_batch.batch_size
         start_list = self._block_start_list(forward_batch)
         states = self.init_step_state(forward_batch)
-        self.prepare_inputs(forward_batch, states)
+        self.prepare_inputs(model_runner, forward_batch, states)
 
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         # No mask to denoise: return empty so process_batch_result_dllm skips the
@@ -97,6 +122,7 @@ class DllmAlgorithm:
             done = self.step(forward_batch, out.logits_output.full_logits, states)
             if all(done):
                 break
+            self.prepare_inputs(model_runner, forward_batch, states)
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
 
         next_token_ids = forward_batch.input_ids.view(batch_size, self.block_size)
@@ -125,7 +151,7 @@ class DllmAlgorithm:
             else:
                 states.append(carried)
 
-        self.prepare_inputs(forward_batch, states)
+        self.prepare_inputs(model_runner, forward_batch, states)
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         done = self.step(forward_batch, out.logits_output.full_logits, states)
 

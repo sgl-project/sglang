@@ -637,7 +637,7 @@ class PrefillAdder:
 
         self.rem_dllm_tokens = (
             self.rem_input_tokens
-            if dllm_config.is_uniform
+            if dllm_config.requires_separate_context_encoding
             else max_running_reqs * self.dllm_block_size
         )
 
@@ -905,19 +905,24 @@ class PrefillAdder:
     def _get_dllm_remain_tokens(self, req: Optional[Req] = None) -> int:
         _rem_tokens = min(self.rem_dllm_tokens, int(self.rem_total_tokens))
         if not (
-            self.dllm_config.is_uniform and req is not None and req.is_dllm_prefill()
+            self.dllm_config.requires_separate_context_encoding
+            and req is not None
+            and req.is_dllm_prefill()
         ):
             _rem_tokens = min(_rem_tokens, self.dllm_block_size)
         if _rem_tokens <= 0:
             _rem_tokens = self.rem_dllm_tokens
 
-        _rem_tokens = min(_rem_tokens, int(self.cur_rem_tokens) - self.page_size)
-        if self.is_hybrid_swa:
-            _rem_tokens = min(_rem_tokens, int(self.rem_swa_tokens) - self.page_size)
+        if self.dllm_config.requires_separate_context_encoding:
+            _rem_tokens = min(_rem_tokens, int(self.cur_rem_tokens) - self.page_size)
+            if self.is_hybrid_swa:
+                _rem_tokens = min(
+                    _rem_tokens, int(self.rem_swa_tokens) - self.page_size
+                )
         return _rem_tokens
 
     def _add_dllm_req(self, req: Req, prefix_len: int):
-        if self.dllm_config.is_uniform:
+        if self.dllm_config.requires_separate_context_encoding:
             remaining = (
                 req.dllm_block_offset - prefix_len
                 if req.is_dllm_prefill()
@@ -967,14 +972,20 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        if self.dllm_config.is_uniform and req.is_dllm_prefill():
+        if (
+            self.dllm_config.requires_separate_context_encoding
+            and req.is_dllm_prefill()
+        ):
             cand_extend_input_len = min(
                 cand_extend_input_len,
                 req.dllm_block_offset - len(req.prefix_indices),
             )
         if (
             req.dllm_incomplete_ids
-            or (self.dllm_config.is_uniform and not req.is_dllm_prefill())
+            or (
+                self.dllm_config.requires_separate_context_encoding
+                and not req.is_dllm_prefill()
+            )
         ) and cand_extend_input_len > _rem_tokens:
             return AddReqResult.NO_TOKEN
         truncated = cand_extend_input_len > _rem_tokens

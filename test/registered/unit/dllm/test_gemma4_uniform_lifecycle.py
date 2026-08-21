@@ -1,3 +1,5 @@
+"""Lifecycle tests for dLLMs with an explicit context-encoding phase."""
+
 import unittest
 from array import array
 from types import SimpleNamespace
@@ -5,10 +7,12 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.allocation import _alloc_extend_loc_with_kv_reuse
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -63,6 +67,11 @@ class _Req:
 class _Batch:
     def __init__(self, reqs):
         self.reqs = reqs
+        self.forward_mode = (
+            ForwardMode.EXTEND
+            if all(req.is_dllm_prefill() for req in reqs)
+            else ForwardMode.DLLM_EXTEND
+        )
         self.return_logprob = False
         self.prefill_stats = object()
         self.dp_cooperation_info = None
@@ -71,13 +80,16 @@ class _Batch:
         return len(self.reqs)
 
 
-class _Scheduler:
+class _Scheduler(SchedulerDllmMixin):
     def __init__(self, *, fdfo, block_size=4, context_len=128):
-        self.dllm_config = SimpleNamespace(
+        self.dllm_config = DllmConfig(
             algorithm="Gemma4Renoise",
-            first_done_first_out_mode=fdfo,
-            is_uniform=True,
+            algorithm_config={},
             block_size=block_size,
+            mask_id=-1,
+            max_running_requests=8,
+            first_done_first_out_mode=fdfo,
+            requires_separate_context_encoding=True,
         )
         self.metrics_reporter = SimpleNamespace(
             num_generated_tokens=0,
@@ -102,8 +114,37 @@ def _result(next_token_ids, *, accept_lengths=None, algo_states=None):
     )
 
 
-class TestGemma4UniformLifecycle(unittest.TestCase):
-    def test_encoder_result_skips_fdfo_token_processing(self):
+class TestGemma4ContextLifecycle(unittest.TestCase):
+    def test_scheduler_uses_standard_extend_for_context_only(self):
+        scheduler = SimpleNamespace(
+            dllm_config=SimpleNamespace(requires_separate_context_encoding=True),
+            dllm_manager=SimpleNamespace(
+                get_prefill_requests=Mock(return_value=[object()]),
+                get_decode_requests=Mock(return_value=[]),
+            ),
+            _process_batch_by_phase=Mock(),
+        )
+
+        mode = SchedulerDllmMixin._process_dllm_batches(
+            scheduler, Mock(), running_batch=Mock()
+        )
+        self.assertEqual(mode, ForwardMode.EXTEND)
+
+        scheduler.dllm_config.requires_separate_context_encoding = False
+        mode = SchedulerDllmMixin._process_dllm_batches(
+            scheduler, Mock(), running_batch=Mock()
+        )
+        self.assertEqual(mode, ForwardMode.DLLM_EXTEND)
+
+        scheduler.dllm_config.requires_separate_context_encoding = True
+        scheduler.dllm_manager.get_prefill_requests.return_value = []
+        scheduler.dllm_manager.get_decode_requests.return_value = [object()]
+        mode = SchedulerDllmMixin._process_dllm_batches(
+            scheduler, Mock(), running_batch=Mock()
+        )
+        self.assertEqual(mode, ForwardMode.DLLM_EXTEND)
+
+    def test_context_result_skips_fdfo_token_processing(self):
         scheduler = _Scheduler(fdfo=True)
         req = _Req(prefill=True)
         result = _result(None)
@@ -114,9 +155,9 @@ class TestGemma4UniformLifecycle(unittest.TestCase):
         scheduler.output_streamer.stream_output.assert_not_called()
         scheduler.metrics_reporter.report_prefill_stats.assert_called_once()
 
-    def test_uniform_encoder_is_not_capped_to_canvas_length(self):
+    def test_context_prefill_is_not_capped_to_canvas_length(self):
         adder = object.__new__(PrefillAdder)
-        adder.dllm_config = SimpleNamespace(is_uniform=True)
+        adder.dllm_config = SimpleNamespace(requires_separate_context_encoding=True)
         adder.dllm_block_size = 256
         adder.rem_dllm_tokens = 1024
         adder.can_run_list = []
@@ -132,9 +173,9 @@ class TestGemma4UniformLifecycle(unittest.TestCase):
         PrefillAdder._add_dllm_req(adder, req, 300)
         self.assertEqual((req.extend_range.start, req.extend_range.end), (300, 556))
 
-    def test_chunked_uniform_prefill_stops_at_context_boundary(self):
+    def test_chunked_context_prefill_stops_at_context_boundary(self):
         adder = object.__new__(PrefillAdder)
-        adder.dllm_config = SimpleNamespace(is_uniform=True)
+        adder.dllm_config = SimpleNamespace(requires_separate_context_encoding=True)
         adder.can_run_list = []
         adder._get_dllm_remain_tokens = lambda req=None: 64
         adder._mamba_gap_budget_for_req = lambda req: 0
@@ -163,7 +204,7 @@ class TestGemma4UniformLifecycle(unittest.TestCase):
         scheduler.token_to_kv_pool_allocator = allocator
         scheduler.stash_chunked_request = Mock()
 
-        SchedulerDllmMixin._stash_completed_uniform_canvas(scheduler, req)
+        SchedulerDllmMixin._stash_dllm_context(scheduler, req)
 
         expected = req_to_token[3, page_size : context_len + block_size]
         freed = allocator.free_segment.call_args.args[0]
@@ -221,7 +262,7 @@ class TestGemma4UniformLifecycle(unittest.TestCase):
             reused, req_to_token[slot, context_len : context_len + block_size]
         )
 
-    def test_finished_uniform_request_never_inserts_canvas_kv(self):
+    def test_finished_context_model_never_inserts_canvas_kv(self):
         scheduler = _Scheduler(fdfo=False)
         req = _Req()
         req.finish_on_update = True

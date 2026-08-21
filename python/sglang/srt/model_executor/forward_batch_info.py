@@ -183,6 +183,9 @@ class ForwardMode(IntEnum):
     def is_cpu_graph(self):
         return self == ForwardMode.DECODE
 
+    def is_dllm_extend(self):
+        return self == ForwardMode.DLLM_EXTEND
+
     def is_split_prefill(self):
         return self == ForwardMode.SPLIT_PREFILL
 
@@ -511,10 +514,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
-
-    # For uniform-state diffusion
-    dllm_is_encoder: Optional[bool] = None
-    dllm_self_conditioning_embeds: Optional[torch.Tensor] = None
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
@@ -886,23 +885,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 model_runner.lora_manager.reset_lora_batch()
             return ret
 
-        # Override the positions with diffusion LLM or spec_info
-        if batch.dllm_config is not None:
-            if batch.dllm_config.is_uniform:
-                ret.dllm_is_encoder = all(req.is_dllm_prefill() for req in batch.reqs)
-            if not ret.dllm_is_encoder:
-                block_size = batch.dllm_config.block_size
-                positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
-                ret.positions = torch.tensor(
-                    [
-                        i
-                        for block_offset in (
-                            req.dllm_block_offset for req in batch.reqs
-                        )
-                        for i in range(block_offset, block_offset + block_size)
-                    ],
-                    dtype=positions_dtype,
-                ).to(device, non_blocking=True)
+        # A dLLM denoise pass rewrites a fixed-size block in place. Context
+        # encoding uses the ordinary EXTEND position path below.
+        if batch.dllm_config is not None and ret.forward_mode.is_dllm_extend():
+            block_size = batch.dllm_config.block_size
+            positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
+            ret.positions = torch.tensor(
+                [
+                    i
+                    for block_offset in (req.dllm_block_offset for req in batch.reqs)
+                    for i in range(block_offset, block_offset + block_size)
+                ],
+                dtype=positions_dtype,
+            ).to(device, non_blocking=True)
         elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None
