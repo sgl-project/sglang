@@ -3021,7 +3021,6 @@ class SafeUnpickler(pickle.Unpickler):
         "peft.",
         "transformers.",
         "huggingface_hub.",
-        # --- NPU storage ---
         "torch_npu.",
     }
 
