@@ -13,24 +13,29 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tonic::Status;
 
 use crate::pb::{
-    ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ConfigureExpectedWorkersRequest,
-    ConfigureExpectedWorkersResponse, ExternalKvActionType, ExternalKvNodeMatch,
-    GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse, HitCountEntry,
-    InvalidateWorkerRequest, InvalidateWorkerResponse, MatchExternalKvPrefixRequest,
+    AbortExternalKvSnapshotRequest, AppendExternalKvSnapshotRequest,
+    AppendExternalKvSnapshotResponse, ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse,
+    BeginExternalKvSnapshotRequest, BeginExternalKvSnapshotResponse,
+    CommitExternalKvSnapshotRequest, CommitExternalKvSnapshotResponse,
+    ConfigureExpectedWorkersRequest, ConfigureExpectedWorkersResponse, ExternalKvActionType,
+    ExternalKvNodeMatch, ExternalKvPrefixMatch, ExternalKvSnapshotMetadata,
+    ExternalKvSnapshotPlacement, GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse,
+    HitCountEntry, InvalidateWorkerRequest, InvalidateWorkerResponse, MatchExternalKvPrefixRequest,
     MatchExternalKvPrefixResponse, MatchExternalKvRequest, MatchExternalKvResponse,
-    ReplaceExternalKvSnapshotRequest, ReplaceExternalKvSnapshotResponse, TierHashes,
-    WorkerCacheSpec,
+    ReplaceExternalKvSnapshotRequest, ReplaceExternalKvSnapshotResponse, StreamCoverage,
+    TierHashes, WorkerCacheSpec,
 };
-use crate::service::{assemble_prefix_response, prefix_limit, WorkerPrefixScanner};
-use crate::status::IndexerStatusHandle;
+use crate::service::{prefix_limit, WorkerPrefixScanner};
+use crate::status::{IndexerStatusHandle, IndexerStreamStatus};
+use crate::stream::StreamKey;
 use crate::{BlockComponents, KvIndexerBackend, WorkerPrefixInput};
 
 #[derive(Debug, Default)]
 struct BlockRecord {
     /// Shared block token count. A zero value means legacy/unspecified.
     token_count: u32,
-    /// Resident component snapshot for each `(worker, tier)`.
-    placements: HashMap<(String, i32), u32>,
+    /// Resident component snapshot for each `(stream, tier)`.
+    placements: HashMap<(StreamKey, i32), u32>,
 }
 
 #[derive(Debug, Default)]
@@ -40,6 +45,11 @@ struct WorkerRecord {
     ready: bool,
     epoch: Option<String>,
     last_seq: Option<u64>,
+    worker_generation: String,
+    model: String,
+    hash_schema_version: u32,
+    page_size: u32,
+    is_bigram: bool,
     /// Reverse index used by CLEAR_ALL_AT_TIER.
     holdings: HashMap<i32, HashSet<i64>>,
 }
@@ -47,12 +57,26 @@ struct WorkerRecord {
 #[derive(Debug, Default)]
 struct State {
     blocks: HashMap<i64, BlockRecord>,
-    workers: HashMap<String, WorkerRecord>,
+    workers: HashMap<StreamKey, WorkerRecord>,
     hit_counts: HashMap<i64, u64>,
+    snapshot_staging: HashMap<String, SnapshotStaging>,
+}
+
+#[derive(Debug)]
+struct SnapshotStaging {
+    stream: StreamKey,
+    worker_address: String,
+    worker_epoch: String,
+    applied_seq: u64,
+    cache_spec: Option<WorkerCacheSpec>,
+    metadata: ExternalKvSnapshotMetadata,
+    snapshot_id: String,
+    expected_placements: u64,
+    placements: Vec<ExternalKvSnapshotPlacement>,
 }
 
 struct WorkerView {
-    worker_id: String,
+    stream: StreamKey,
     address: String,
     spec: Option<WorkerCacheSpec>,
     hashes_by_tier: BTreeMap<i32, Vec<(i64, u32, u32)>>,
@@ -61,7 +85,7 @@ struct WorkerView {
 
 #[derive(Debug)]
 struct PrefixCandidate {
-    worker_id: String,
+    stream: StreamKey,
     address: String,
     scanner: WorkerPrefixScanner,
 }
@@ -99,9 +123,28 @@ impl InMemoryKvIndexerBackend {
 
     fn refresh_status(&self, state: &State) {
         if let Some(status) = &self.status {
-            let total = state.workers.len();
-            let ready = state.workers.values().filter(|worker| worker.ready).count();
-            status.set_coverage(ready, total);
+            let mut streams: Vec<_> = state
+                .workers
+                .iter()
+                .map(|(stream, worker)| IndexerStreamStatus {
+                    namespace: stream.namespace.clone(),
+                    worker_id: stream.worker_id.clone(),
+                    dp_rank: stream.dp_rank,
+                    worker_address: worker.address.clone(),
+                    ready: worker.ready,
+                    worker_epoch: worker.epoch.clone().unwrap_or_default(),
+                    watermark: worker.last_seq.unwrap_or_default(),
+                    worker_generation: worker.worker_generation.clone(),
+                })
+                .collect();
+            streams.sort_by(|left, right| {
+                (&left.namespace, &left.worker_id, left.dp_rank).cmp(&(
+                    &right.namespace,
+                    &right.worker_id,
+                    right.dp_rank,
+                ))
+            });
+            status.set_stream_coverage(streams);
         }
     }
 
@@ -130,17 +173,23 @@ impl InMemoryKvIndexerBackend {
             cache_spec,
             worker_epoch,
             enforce_sequence,
+            stream_id,
+            worker_generation,
         } = req;
+        let stream = StreamKey::from_wire(stream_id, &worker_id)?;
 
         if enforce_sequence {
-            let Some(worker) = state.workers.get(&worker_id) else {
+            let Some(worker) = state.workers.get(&stream) else {
                 return Err(Status::failed_precondition(
-                    "worker must be configured before recovery-aware apply",
+                    "stream must be configured before recovery-aware apply",
                 ));
             };
-            if !worker.ready || worker.epoch.as_deref() != Some(worker_epoch.as_str()) {
+            if !worker.ready
+                || worker.epoch.as_deref() != Some(worker_epoch.as_str())
+                || worker.worker_generation != worker_generation
+            {
                 return Err(Status::failed_precondition(
-                    "worker has no READY snapshot for this epoch",
+                    "stream has no READY snapshot for this generation and epoch",
                 ));
             }
             let last = worker.last_seq.unwrap_or_default();
@@ -151,8 +200,8 @@ impl InMemoryKvIndexerBackend {
                 });
             }
             if seq != last.saturating_add(1) {
-                clear_worker_holdings(&mut state, &worker_id);
-                if let Some(worker) = state.workers.get_mut(&worker_id) {
+                clear_worker_holdings(&mut state, &stream);
+                if let Some(worker) = state.workers.get_mut(&stream) {
                     worker.ready = false;
                     worker.epoch = None;
                     worker.last_seq = None;
@@ -168,9 +217,12 @@ impl InMemoryKvIndexerBackend {
         // Address and spec are snapshots carried on every batch. Empty address
         // makes the worker unroutable; absent spec returns it to legacy mode.
         {
-            let worker = state.workers.entry(worker_id.clone()).or_default();
+            let worker = state.workers.entry(stream.clone()).or_default();
             worker.address = worker_address;
             worker.spec = cache_spec;
+            if !worker_generation.is_empty() {
+                worker.worker_generation = worker_generation.clone();
+            }
         }
 
         for action in actions {
@@ -198,9 +250,7 @@ impl InMemoryKvIndexerBackend {
 
                     for (hash, (mask, token_count)) in last_by_hash {
                         let block = state.blocks.entry(hash).or_default();
-                        block
-                            .placements
-                            .insert((worker_id.clone(), action.tier), mask);
+                        block.placements.insert((stream.clone(), action.tier), mask);
                         // A legacy report carries no size, so 0 means
                         // "unknown" and must not erase a known count.
                         if token_count > 0 {
@@ -208,7 +258,7 @@ impl InMemoryKvIndexerBackend {
                         }
                         state
                             .workers
-                            .entry(worker_id.clone())
+                            .entry(stream.clone())
                             .or_default()
                             .holdings
                             .entry(action.tier)
@@ -218,18 +268,18 @@ impl InMemoryKvIndexerBackend {
                 }
                 Ok(ExternalKvActionType::ActionRevoke) => {
                     for hash in action.hashes {
-                        revoke_one(&mut state, &worker_id, &hash, action.tier);
+                        revoke_one(&mut state, &stream, &hash, action.tier);
                     }
                 }
                 Ok(ExternalKvActionType::ActionClearAllAtTier) => {
                     let hashes = state
                         .workers
-                        .get(&worker_id)
+                        .get(&stream)
                         .and_then(|worker| worker.holdings.get(&action.tier))
                         .cloned()
                         .unwrap_or_default();
                     for hash in hashes {
-                        revoke_one(&mut state, &worker_id, &hash, action.tier);
+                        revoke_one(&mut state, &stream, &hash, action.tier);
                     }
                 }
                 Ok(ExternalKvActionType::ActionUnknown) | Err(_) => {
@@ -238,7 +288,7 @@ impl InMemoryKvIndexerBackend {
             }
         }
 
-        if let Some(worker) = state.workers.get_mut(&worker_id) {
+        if let Some(worker) = state.workers.get_mut(&stream) {
             worker.ready = true;
             if enforce_sequence {
                 worker.epoch = Some(worker_epoch);
@@ -257,25 +307,37 @@ impl InMemoryKvIndexerBackend {
         req: ConfigureExpectedWorkersRequest,
     ) -> Result<ConfigureExpectedWorkersResponse, Status> {
         let mut state = self.write_state()?;
-        let expected: HashSet<String> = req
-            .workers
+        let mut configured = Vec::with_capacity(req.workers.len());
+        for worker in req.workers {
+            let stream = StreamKey::from_wire(worker.stream_id.clone(), &worker.worker_id)?;
+            configured.push((stream, worker));
+        }
+        let expected: HashSet<StreamKey> = configured
             .iter()
-            .map(|worker| worker.worker_id.clone())
+            .map(|(stream, _)| stream.clone())
             .collect();
-        let removed: Vec<String> = state
+        let removed: Vec<StreamKey> = state
             .workers
             .keys()
             .filter(|worker| !expected.contains(*worker))
             .cloned()
             .collect();
-        for worker in removed {
-            clear_worker_holdings(&mut state, &worker);
-            state.workers.remove(&worker);
+        for stream in removed {
+            clear_worker_holdings(&mut state, &stream);
+            state.workers.remove(&stream);
         }
-        for expected in req.workers {
-            let worker = state.workers.entry(expected.worker_id).or_default();
+        state
+            .snapshot_staging
+            .retain(|_, staging| expected.contains(&staging.stream));
+        for (stream, expected) in configured {
+            let worker = state.workers.entry(stream).or_default();
             worker.address = expected.worker_address;
             worker.spec = expected.cache_spec;
+            worker.worker_generation = expected.worker_generation;
+            worker.model = expected.model;
+            worker.hash_schema_version = expected.hash_schema_version;
+            worker.page_size = expected.page_size;
+            worker.is_bigram = expected.is_bigram;
         }
         self.refresh_status(&state);
         Ok(coverage_response(&state, &self.instance_epoch))
@@ -286,12 +348,13 @@ impl InMemoryKvIndexerBackend {
         req: ReplaceExternalKvSnapshotRequest,
     ) -> Result<ReplaceExternalKvSnapshotResponse, Status> {
         let mut state = self.write_state()?;
-        if !state.workers.contains_key(&req.worker_id) {
+        let stream = StreamKey::from_wire(req.stream_id.clone(), &req.worker_id)?;
+        if !state.workers.contains_key(&stream) {
             return Err(Status::failed_precondition(
-                "worker must be configured before snapshot replacement",
+                "stream must be configured before snapshot replacement",
             ));
         }
-        clear_worker_holdings(&mut state, &req.worker_id);
+        clear_worker_holdings(&mut state, &stream);
         for tier in req.hashes_by_tier {
             let has_masks = !tier.component_masks.is_empty();
             let has_sizes = !tier.block_sizes.is_empty();
@@ -307,16 +370,14 @@ impl InMemoryKvIndexerBackend {
                     0
                 };
                 let block = state.blocks.entry(hash).or_default();
-                block
-                    .placements
-                    .insert((req.worker_id.clone(), tier.tier), mask);
+                block.placements.insert((stream.clone(), tier.tier), mask);
                 if token_count > 0 {
                     block.token_count = token_count;
                 }
                 state
                     .workers
-                    .get_mut(&req.worker_id)
-                    .expect("configured worker exists")
+                    .get_mut(&stream)
+                    .expect("configured stream exists")
                     .holdings
                     .entry(tier.tier)
                     .or_default()
@@ -325,13 +386,16 @@ impl InMemoryKvIndexerBackend {
         }
         let worker = state
             .workers
-            .get_mut(&req.worker_id)
-            .expect("configured worker exists");
+            .get_mut(&stream)
+            .expect("configured stream exists");
         worker.address = req.worker_address;
         worker.spec = req.cache_spec;
         worker.ready = true;
         worker.epoch = Some(req.worker_epoch);
         worker.last_seq = Some(req.applied_seq);
+        if !req.worker_generation.is_empty() {
+            worker.worker_generation = req.worker_generation;
+        }
         self.refresh_status(&state);
         Ok(ReplaceExternalKvSnapshotResponse {
             applied_seq: req.applied_seq,
@@ -340,11 +404,15 @@ impl InMemoryKvIndexerBackend {
 
     fn invalidate(&self, req: InvalidateWorkerRequest) -> Result<InvalidateWorkerResponse, Status> {
         let mut state = self.write_state()?;
-        if !state.workers.contains_key(&req.worker_id) {
-            return Err(Status::not_found("worker is not configured"));
+        let stream = StreamKey::from_wire(req.stream_id, &req.worker_id)?;
+        if !state.workers.contains_key(&stream) {
+            return Err(Status::not_found("stream is not configured"));
         }
-        clear_worker_holdings(&mut state, &req.worker_id);
-        if let Some(worker) = state.workers.get_mut(&req.worker_id) {
+        clear_worker_holdings(&mut state, &stream);
+        state
+            .snapshot_staging
+            .retain(|_, staging| staging.stream != stream);
+        if let Some(worker) = state.workers.get_mut(&stream) {
             worker.ready = false;
             worker.epoch = None;
             worker.last_seq = None;
@@ -356,6 +424,150 @@ impl InMemoryKvIndexerBackend {
             ready_workers: coverage.ready_workers,
             indexer_epoch: coverage.indexer_epoch,
         })
+    }
+
+    fn begin_snapshot(
+        &self,
+        req: BeginExternalKvSnapshotRequest,
+    ) -> Result<BeginExternalKvSnapshotResponse, Status> {
+        let mut state = self.write_state()?;
+        let stream = StreamKey::from_wire(req.stream_id, "")?;
+        let metadata = req
+            .metadata
+            .ok_or_else(|| Status::invalid_argument("snapshot metadata is required"))?;
+        let worker = state
+            .workers
+            .get(&stream)
+            .ok_or_else(|| Status::failed_precondition("stream must be configured first"))?;
+        validate_snapshot_metadata(worker, &metadata)?;
+
+        // Only one transaction per stream is useful. Replacing an abandoned
+        // staging area is safe because staging is never query-visible.
+        state
+            .snapshot_staging
+            .retain(|_, staging| staging.stream != stream);
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+        state.snapshot_staging.insert(
+            transaction_id.clone(),
+            SnapshotStaging {
+                stream,
+                worker_address: req.worker_address,
+                worker_epoch: req.worker_epoch,
+                applied_seq: req.applied_seq,
+                cache_spec: req.cache_spec,
+                metadata,
+                snapshot_id: req.snapshot_id,
+                expected_placements: req.expected_placements,
+                placements: Vec::new(),
+            },
+        );
+        Ok(BeginExternalKvSnapshotResponse {
+            transaction_id,
+            indexer_epoch: self.instance_epoch.clone(),
+        })
+    }
+
+    fn append_snapshot(
+        &self,
+        req: AppendExternalKvSnapshotRequest,
+    ) -> Result<AppendExternalKvSnapshotResponse, Status> {
+        let mut state = self.write_state()?;
+        let staging = state
+            .snapshot_staging
+            .get_mut(&req.transaction_id)
+            .ok_or_else(|| Status::not_found("snapshot transaction not found"))?;
+        let next = staging
+            .placements
+            .len()
+            .checked_add(req.placements.len())
+            .ok_or_else(|| Status::resource_exhausted("snapshot placement count overflow"))?;
+        if next as u64 > staging.expected_placements {
+            return Err(Status::invalid_argument(
+                "snapshot append exceeds declared placement count",
+            ));
+        }
+        staging.placements.extend(req.placements);
+        Ok(AppendExternalKvSnapshotResponse {
+            staged_placements: next as u64,
+        })
+    }
+
+    fn commit_snapshot(
+        &self,
+        req: CommitExternalKvSnapshotRequest,
+    ) -> Result<CommitExternalKvSnapshotResponse, Status> {
+        let mut state = self.write_state()?;
+        let staging = state
+            .snapshot_staging
+            .remove(&req.transaction_id)
+            .ok_or_else(|| Status::not_found("snapshot transaction not found"))?;
+        if staging.placements.len() as u64 != staging.expected_placements {
+            return Err(Status::failed_precondition(format!(
+                "snapshot transaction {} expected {} placements but staged {}",
+                staging.snapshot_id,
+                staging.expected_placements,
+                staging.placements.len()
+            )));
+        }
+        if !state.workers.contains_key(&staging.stream) {
+            return Err(Status::failed_precondition(
+                "stream was removed before snapshot commit",
+            ));
+        }
+
+        let mut identities = HashSet::with_capacity(staging.placements.len());
+        for placement in &staging.placements {
+            if !identities.insert((placement.block_hash, placement.tier)) {
+                return Err(Status::invalid_argument(
+                    "snapshot contains duplicate (block_hash, tier) placement",
+                ));
+            }
+        }
+
+        clear_worker_holdings(&mut state, &staging.stream);
+        for placement in staging.placements {
+            let block = state.blocks.entry(placement.block_hash).or_default();
+            block.placements.insert(
+                (staging.stream.clone(), placement.tier),
+                placement.component_mask,
+            );
+            if placement.block_size > 0 {
+                block.token_count = placement.block_size;
+            }
+            state
+                .workers
+                .get_mut(&staging.stream)
+                .expect("configured stream exists")
+                .holdings
+                .entry(placement.tier)
+                .or_default()
+                .insert(placement.block_hash);
+        }
+
+        let worker = state
+            .workers
+            .get_mut(&staging.stream)
+            .expect("configured stream exists");
+        worker.address = staging.worker_address;
+        worker.spec = staging.cache_spec;
+        worker.ready = true;
+        worker.epoch = Some(staging.worker_epoch);
+        worker.last_seq = Some(staging.applied_seq);
+        worker.worker_generation = staging.metadata.worker_generation;
+        worker.model = staging.metadata.model;
+        worker.hash_schema_version = staging.metadata.hash_schema_version;
+        worker.page_size = staging.metadata.page_size;
+        worker.is_bigram = staging.metadata.is_bigram;
+        self.refresh_status(&state);
+        Ok(CommitExternalKvSnapshotResponse {
+            applied_seq: staging.applied_seq,
+        })
+    }
+
+    fn abort_snapshot(&self, req: AbortExternalKvSnapshotRequest) -> Result<(), Status> {
+        let mut state = self.write_state()?;
+        state.snapshot_staging.remove(&req.transaction_id);
+        Ok(())
     }
 
     fn do_match(&self, req: MatchExternalKvRequest) -> Result<MatchExternalKvResponse, Status> {
@@ -375,7 +587,7 @@ impl InMemoryKvIndexerBackend {
         let matches = workers
             .into_iter()
             .map(|worker| ExternalKvNodeMatch {
-                worker_id: worker.worker_id,
+                worker_id: worker.stream.worker_id,
                 address: worker.address,
                 hashes_by_tier: worker
                     .hashes_by_tier
@@ -403,8 +615,8 @@ impl InMemoryKvIndexerBackend {
     ) -> (Vec<WorkerView>, Vec<i64>) {
         // Keyed by a borrow of the stored worker id, so it is copied once per
         // worker in the result rather than once per scanned placement.
-        let mut worker_order: Vec<&str> = Vec::new();
-        let mut by_worker: HashMap<&str, WorkerView> = HashMap::new();
+        let mut worker_order: Vec<&StreamKey> = Vec::new();
+        let mut by_worker: HashMap<&StreamKey, WorkerView> = HashMap::new();
         let mut matched_hashes = Vec::new();
 
         for (index, hash) in hashes.iter().enumerate() {
@@ -415,12 +627,12 @@ impl InMemoryKvIndexerBackend {
                 continue;
             }
             matched_hashes.push(*hash);
-            for ((worker, tier), mask) in &block.placements {
-                let view = by_worker.entry(worker.as_str()).or_insert_with(|| {
-                    worker_order.push(worker.as_str());
-                    let metadata = state.workers.get(worker);
+            for ((stream, tier), mask) in &block.placements {
+                let view = by_worker.entry(stream).or_insert_with(|| {
+                    worker_order.push(stream);
+                    let metadata = state.workers.get(stream);
                     WorkerView {
-                        worker_id: worker.clone(),
+                        stream: stream.clone(),
                         address: metadata
                             .map(|worker| worker.address.clone())
                             .unwrap_or_default(),
@@ -461,7 +673,7 @@ impl InMemoryKvIndexerBackend {
             .0
             .into_iter()
             .map(|worker| WorkerPrefixInput {
-                worker_id: worker.worker_id,
+                worker_id: worker.stream.worker_id,
                 address: worker.address,
                 spec: worker.spec,
                 blocks: worker.blocks,
@@ -475,15 +687,24 @@ impl InMemoryKvIndexerBackend {
     ) -> Result<MatchExternalKvPrefixResponse, Status> {
         let limit = prefix_limit(req.hashes.len(), req.max_blocks);
         let hashes = &req.hashes[..limit];
+        let state = self.read_state()?;
+        let (coverage, eligible_streams, uncovered_worker_addresses, complete_coverage) =
+            select_coverage(&state, &req)?;
         if hashes.is_empty() {
-            return Ok(MatchExternalKvPrefixResponse::default());
+            return Ok(MatchExternalKvPrefixResponse {
+                matches: Vec::new(),
+                best_prefix_blocks: 0,
+                blocks_read: 0,
+                coverage,
+                complete_coverage,
+                uncovered_worker_addresses,
+            });
         }
 
         // Only workers holding block zero can own a non-empty prefix, so the
         // candidate set is fixed up front and each candidate reuses one scanner and
         // one block view. Allocation is O(first-block holders) whatever the request
         // length, which is why there is no scan cap: length costs time, not memory.
-        let state = self.read_state()?;
         let Some(first) = state
             .blocks
             .get(&hashes[0])
@@ -493,30 +714,33 @@ impl InMemoryKvIndexerBackend {
                 matches: Vec::new(),
                 best_prefix_blocks: 0,
                 blocks_read: 1,
+                coverage,
+                complete_coverage,
+                uncovered_worker_addresses,
             });
         };
         let mut seen = HashSet::new();
         let mut candidates: Vec<PrefixCandidate> = first
             .placements
             .keys()
-            .filter(|(worker, _)| seen.insert(worker.as_str()))
-            .map(|(worker, _)| {
-                let metadata = state.workers.get(worker);
-                PrefixCandidate {
-                    address: metadata
-                        .map(|worker| worker.address.clone())
-                        .unwrap_or_default(),
-                    scanner: WorkerPrefixScanner::new(
-                        metadata.and_then(|worker| worker.spec.as_ref()),
-                    ),
-                    worker_id: worker.clone(),
+            .filter(|(stream, _)| eligible_streams.contains(stream))
+            .filter(|(stream, _)| seen.insert((*stream).clone()))
+            .filter_map(|(stream, _)| {
+                let metadata = state.workers.get(stream)?;
+                if !metadata.ready {
+                    return None;
                 }
+                Some(PrefixCandidate {
+                    address: metadata.address.clone(),
+                    scanner: WorkerPrefixScanner::new(metadata.spec.as_ref()),
+                    stream: stream.clone(),
+                })
             })
             .collect();
-        let candidate_by_id: HashMap<String, usize> = candidates
+        let candidate_by_id: HashMap<StreamKey, usize> = candidates
             .iter()
             .enumerate()
-            .map(|(index, candidate)| (candidate.worker_id.clone(), index))
+            .map(|(index, candidate)| (candidate.stream.clone(), index))
             .collect();
         let mut present = vec![false; candidates.len()];
         let mut block_views: Vec<BlockComponents> = (0..candidates.len())
@@ -533,8 +757,8 @@ impl InMemoryKvIndexerBackend {
                 block.tier_masks.clear();
             }
             if let Some(block) = state.blocks.get(hash) {
-                for ((worker, tier), mask) in &block.placements {
-                    let Some(&index) = candidate_by_id.get(worker) else {
+                for ((stream, tier), mask) in &block.placements {
+                    let Some(&index) = candidate_by_id.get(stream) else {
                         continue;
                     };
                     present[index] = true;
@@ -549,18 +773,33 @@ impl InMemoryKvIndexerBackend {
             }
         }
 
-        let entries = candidates
+        let mut matches: Vec<ExternalKvPrefixMatch> = candidates
             .into_iter()
             .filter_map(|candidate| {
                 let prefix = candidate.scanner.prefix();
-                (!candidate.address.is_empty() && prefix > 0).then_some((
-                    candidate.worker_id,
-                    candidate.address,
-                    prefix,
-                ))
+                let metadata = state.workers.get(&candidate.stream)?;
+                (!candidate.address.is_empty() && prefix > 0).then_some(ExternalKvPrefixMatch {
+                    worker_address: candidate.address,
+                    matched_prefix_blocks: prefix,
+                    worker_id: candidate.stream.worker_id.clone(),
+                    stream_id: Some(candidate.stream.to_wire()),
+                    worker_generation: metadata.worker_generation.clone(),
+                })
             })
             .collect();
-        Ok(assemble_prefix_response(entries, limit as u32))
+        matches.sort_by_key(|entry| std::cmp::Reverse(entry.matched_prefix_blocks));
+        let best_prefix_blocks = matches
+            .first()
+            .map(|entry| entry.matched_prefix_blocks)
+            .unwrap_or(0);
+        Ok(MatchExternalKvPrefixResponse {
+            matches,
+            best_prefix_blocks,
+            blocks_read: limit as u32,
+            coverage,
+            complete_coverage,
+            uncovered_worker_addresses,
+        })
     }
 
     fn do_hit_counts(
@@ -593,27 +832,126 @@ fn coverage_response(state: &State, indexer_epoch: &str) -> ConfigureExpectedWor
     }
 }
 
-fn clear_worker_holdings(state: &mut State, worker_id: &str) {
+fn validate_snapshot_metadata(
+    worker: &WorkerRecord,
+    metadata: &ExternalKvSnapshotMetadata,
+) -> Result<(), Status> {
+    let mismatch = (!worker.worker_generation.is_empty()
+        && worker.worker_generation != metadata.worker_generation)
+        || (!worker.model.is_empty() && worker.model != metadata.model)
+        || (worker.hash_schema_version != 0
+            && worker.hash_schema_version != metadata.hash_schema_version)
+        || (worker.page_size != 0 && worker.page_size != metadata.page_size)
+        || (worker.hash_schema_version != 0 && worker.is_bigram != metadata.is_bigram);
+    if mismatch {
+        return Err(Status::failed_precondition(
+            "snapshot metadata does not match configured stream",
+        ));
+    }
+    Ok(())
+}
+
+fn select_coverage(
+    state: &State,
+    request: &MatchExternalKvPrefixRequest,
+) -> Result<(Vec<StreamCoverage>, HashSet<StreamKey>, Vec<String>, bool), Status> {
+    let mut selected = std::collections::BTreeSet::new();
+    let mut missing_streams = Vec::new();
+    let mut uncovered_worker_addresses = Vec::new();
+
+    if !request.eligible_streams.is_empty() {
+        for stream in &request.eligible_streams {
+            let key = StreamKey::from_wire(Some(stream.clone()), "")?;
+            if state.workers.contains_key(&key) {
+                selected.insert(key);
+            } else {
+                missing_streams.push(key);
+            }
+        }
+    } else if !request.eligible_worker_addresses.is_empty() {
+        for address in dedup_strings(&request.eligible_worker_addresses) {
+            let before = selected.len();
+            selected.extend(
+                state
+                    .workers
+                    .iter()
+                    .filter(|(_, worker)| worker.address == address)
+                    .map(|(stream, _)| stream.clone()),
+            );
+            if selected.len() == before {
+                uncovered_worker_addresses.push(address);
+            }
+        }
+    } else {
+        selected.extend(state.workers.keys().cloned());
+    }
+
+    let eligible_streams: HashSet<_> = selected.iter().cloned().collect();
+    let mut coverage = Vec::with_capacity(selected.len() + missing_streams.len());
+    for stream in selected {
+        let worker = state
+            .workers
+            .get(&stream)
+            .expect("selected stream is configured");
+        coverage.push(StreamCoverage {
+            stream_id: Some(stream.to_wire()),
+            worker_address: worker.address.clone(),
+            ready: worker.ready,
+            worker_epoch: worker.epoch.clone().unwrap_or_default(),
+            watermark: worker.last_seq.unwrap_or_default(),
+            worker_generation: worker.worker_generation.clone(),
+        });
+    }
+    coverage.extend(missing_streams.iter().map(|stream| StreamCoverage {
+        stream_id: Some(stream.to_wire()),
+        worker_address: String::new(),
+        ready: false,
+        worker_epoch: String::new(),
+        watermark: 0,
+        worker_generation: String::new(),
+    }));
+    let complete = !coverage.is_empty()
+        && missing_streams.is_empty()
+        && uncovered_worker_addresses.is_empty()
+        && coverage.iter().all(|entry| entry.ready);
+    Ok((
+        coverage,
+        eligible_streams,
+        uncovered_worker_addresses,
+        complete,
+    ))
+}
+
+fn dedup_strings(values: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    values
+        .iter()
+        .filter(|value| seen.insert(value.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn clear_worker_holdings(state: &mut State, stream: &StreamKey) {
     let holdings = state
         .workers
-        .get(worker_id)
+        .get(stream)
         .map(|worker| worker.holdings.clone())
         .unwrap_or_default();
     for (tier, hashes) in holdings {
         for hash in hashes {
-            revoke_one(state, worker_id, &hash, tier);
+            revoke_one(state, stream, &hash, tier);
         }
     }
 }
 
-fn revoke_one(state: &mut State, worker_id: &str, hash: &i64, tier: i32) {
+fn revoke_one(state: &mut State, stream: &StreamKey, hash: &i64, tier: i32) {
     let mut remove_block = false;
     if let Some(block) = state.blocks.get_mut(hash) {
-        block.placements.remove(&(worker_id.to_string(), tier));
+        block.placements.remove(&(stream.clone(), tier));
         remove_block = block.placements.is_empty();
     }
 
-    if let Some(worker) = state.workers.get_mut(worker_id) {
+    if let Some(worker) = state.workers.get_mut(stream) {
         if let Some(hashes) = worker.holdings.get_mut(&tier) {
             hashes.remove(hash);
             if hashes.is_empty() {
@@ -651,6 +989,34 @@ impl KvIndexerBackend for InMemoryKvIndexerBackend {
         request: ReplaceExternalKvSnapshotRequest,
     ) -> Result<ReplaceExternalKvSnapshotResponse, Status> {
         self.replace_snapshot(request)
+    }
+
+    async fn begin_external_kv_snapshot(
+        &self,
+        request: BeginExternalKvSnapshotRequest,
+    ) -> Result<BeginExternalKvSnapshotResponse, Status> {
+        self.begin_snapshot(request)
+    }
+
+    async fn append_external_kv_snapshot(
+        &self,
+        request: AppendExternalKvSnapshotRequest,
+    ) -> Result<AppendExternalKvSnapshotResponse, Status> {
+        self.append_snapshot(request)
+    }
+
+    async fn commit_external_kv_snapshot(
+        &self,
+        request: CommitExternalKvSnapshotRequest,
+    ) -> Result<CommitExternalKvSnapshotResponse, Status> {
+        self.commit_snapshot(request)
+    }
+
+    async fn abort_external_kv_snapshot(
+        &self,
+        request: AbortExternalKvSnapshotRequest,
+    ) -> Result<(), Status> {
+        self.abort_snapshot(request)
     }
 
     async fn invalidate_worker(
@@ -738,6 +1104,32 @@ mod tests {
             worker_id: id.into(),
             worker_address: address.into(),
             cache_spec: None,
+            ..Default::default()
+        }
+    }
+
+    fn expected_stream(id: &str, rank: u32, address: &str) -> crate::pb::ExpectedWorker {
+        crate::pb::ExpectedWorker {
+            worker_id: id.into(),
+            worker_address: address.into(),
+            cache_spec: Some(WorkerCacheSpec {
+                version: 1,
+                components: crate::service::COMPONENT_FULL,
+                swa_window_tokens: 0,
+                full_tier_mask: 1u32 << crate::pb::TierType::TierHbm as u32,
+                swa_tier_mask: 0,
+                mamba_tier_mask: 0,
+            }),
+            stream_id: Some(crate::pb::StreamId {
+                namespace: "ns".into(),
+                worker_id: id.into(),
+                dp_rank: rank,
+            }),
+            worker_generation: "generation-1".into(),
+            model: "model".into(),
+            hash_schema_version: 1,
+            page_size: 1,
+            is_bigram: false,
         }
     }
 
@@ -760,6 +1152,8 @@ mod tests {
                 block_sizes: Vec::new(),
             }],
             cache_spec: None,
+            stream_id: None,
+            worker_generation: String::new(),
         }
     }
 
@@ -792,6 +1186,8 @@ mod tests {
             .match_external_kv_prefix(MatchExternalKvPrefixRequest {
                 hashes: vec![1, 2],
                 max_blocks: 0,
+                eligible_worker_addresses: Vec::new(),
+                eligible_streams: Vec::new(),
             })
             .await
             .unwrap();
@@ -826,6 +1222,8 @@ mod tests {
             cache_spec: None,
             worker_epoch: "e".into(),
             enforce_sequence: true,
+            stream_id: None,
+            worker_generation: String::new(),
         };
         assert!(!backend.apply(request.clone()).unwrap().duplicate);
         assert!(backend.apply(request).unwrap().duplicate);
@@ -838,6 +1236,8 @@ mod tests {
             cache_spec: None,
             worker_epoch: "e".into(),
             enforce_sequence: true,
+            stream_id: None,
+            worker_generation: String::new(),
         };
         assert_eq!(
             backend.apply(gap).unwrap_err().code(),
@@ -871,8 +1271,12 @@ mod tests {
             .await
             .unwrap();
         let state = backend.read_state().unwrap();
-        assert!(state.workers.contains_key("w1"));
-        assert!(!state.workers.contains_key("w2"));
+        assert!(state
+            .workers
+            .contains_key(&StreamKey::new(String::new(), "w1".into(), 0).unwrap()));
+        assert!(!state
+            .workers
+            .contains_key(&StreamKey::new(String::new(), "w2".into(), 0).unwrap()));
         assert!(!state.blocks.contains_key(&2));
     }
 
@@ -893,5 +1297,178 @@ mod tests {
 
         assert!(!first.indexer_epoch.is_empty());
         assert_ne!(first.indexer_epoch, second.indexer_epoch);
+    }
+
+    #[tokio::test]
+    async fn staged_snapshot_larger_than_single_rpc_is_atomic() {
+        const COUNT: usize = crate::service::MAX_HASHES_PER_REQUEST + 1;
+        let backend = InMemoryKvIndexerBackend::new();
+        backend
+            .configure_expected_workers(ConfigureExpectedWorkersRequest {
+                workers: vec![expected_stream("worker", 0, "http://worker")],
+            })
+            .await
+            .unwrap();
+        let begin = backend
+            .begin_external_kv_snapshot(BeginExternalKvSnapshotRequest {
+                stream_id: Some(crate::pb::StreamId {
+                    namespace: "ns".into(),
+                    worker_id: "worker".into(),
+                    dp_rank: 0,
+                }),
+                worker_address: "http://worker".into(),
+                worker_epoch: "epoch-1".into(),
+                applied_seq: 7,
+                cache_spec: expected_stream("worker", 0, "http://worker").cache_spec,
+                metadata: Some(ExternalKvSnapshotMetadata {
+                    model: "model".into(),
+                    worker_generation: "generation-1".into(),
+                    hash_schema_version: 1,
+                    page_size: 1,
+                    is_bigram: false,
+                }),
+                snapshot_id: "snapshot-1".into(),
+                expected_placements: COUNT as u64,
+            })
+            .await
+            .unwrap();
+        let placements: Vec<_> = (0..COUNT)
+            .map(|hash| ExternalKvSnapshotPlacement {
+                block_hash: hash as i64,
+                parent_block_hash: hash.checked_sub(1).map(|parent| parent as i64),
+                tier: crate::pb::TierType::TierHbm as i32,
+                component_mask: crate::service::COMPONENT_FULL,
+                block_size: 1,
+            })
+            .collect();
+        for chunk in placements.chunks(crate::service::MAX_HASHES_PER_REQUEST) {
+            backend
+                .append_external_kv_snapshot(AppendExternalKvSnapshotRequest {
+                    transaction_id: begin.transaction_id.clone(),
+                    placements: chunk.to_vec(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let before = backend
+            .match_external_kv_prefix(MatchExternalKvPrefixRequest {
+                hashes: vec![0],
+                eligible_worker_addresses: vec!["http://worker".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!before.complete_coverage);
+        assert!(before.matches.is_empty());
+
+        backend
+            .commit_external_kv_snapshot(CommitExternalKvSnapshotRequest {
+                transaction_id: begin.transaction_id,
+            })
+            .await
+            .unwrap();
+        let after = backend
+            .match_external_kv_prefix(MatchExternalKvPrefixRequest {
+                hashes: (0..COUNT).map(|hash| hash as i64).collect(),
+                eligible_worker_addresses: vec!["http://worker".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(after.complete_coverage);
+        assert_eq!(after.best_prefix_blocks as usize, COUNT);
+        assert_eq!(after.coverage[0].watermark, 7);
+    }
+
+    #[tokio::test]
+    async fn coverage_distinguishes_partial_recovery_from_no_match() {
+        let backend = InMemoryKvIndexerBackend::new();
+        backend
+            .configure_expected_workers(ConfigureExpectedWorkersRequest {
+                workers: vec![
+                    expected_stream("w1", 0, "http://w1"),
+                    expected_stream("w2", 0, "http://w2"),
+                ],
+            })
+            .await
+            .unwrap();
+        let mut recovered = snapshot("w1", "http://w1", "e1", 1, &[1]);
+        recovered.stream_id = Some(crate::pb::StreamId {
+            namespace: "ns".into(),
+            worker_id: "w1".into(),
+            dp_rank: 0,
+        });
+        recovered.worker_generation = "generation-1".into();
+        backend
+            .replace_external_kv_snapshot(recovered)
+            .await
+            .unwrap();
+
+        let response = backend
+            .match_external_kv_prefix(MatchExternalKvPrefixRequest {
+                hashes: vec![999],
+                eligible_worker_addresses: vec!["http://w1".into(), "http://w2".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!response.complete_coverage);
+        assert!(response.matches.is_empty());
+        assert_eq!(
+            response.coverage.iter().filter(|entry| entry.ready).count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn same_worker_dp_streams_are_isolated() {
+        let backend = InMemoryKvIndexerBackend::new();
+        backend
+            .configure_expected_workers(ConfigureExpectedWorkersRequest {
+                workers: vec![
+                    expected_stream("worker", 0, "http://worker"),
+                    expected_stream("worker", 1, "http://worker"),
+                ],
+            })
+            .await
+            .unwrap();
+        for rank in 0..=1 {
+            let mut request = snapshot("worker", "http://worker", "epoch", 1, &[1]);
+            request.stream_id = Some(crate::pb::StreamId {
+                namespace: "ns".into(),
+                worker_id: "worker".into(),
+                dp_rank: rank,
+            });
+            request.worker_generation = "generation-1".into();
+            backend.replace_external_kv_snapshot(request).await.unwrap();
+        }
+        backend
+            .invalidate_worker(InvalidateWorkerRequest {
+                worker_id: "worker".into(),
+                stream_id: Some(crate::pb::StreamId {
+                    namespace: "ns".into(),
+                    worker_id: "worker".into(),
+                    dp_rank: 0,
+                }),
+            })
+            .await
+            .unwrap();
+
+        let response = backend
+            .match_external_kv_prefix(MatchExternalKvPrefixRequest {
+                hashes: vec![1],
+                eligible_streams: vec![crate::pb::StreamId {
+                    namespace: "ns".into(),
+                    worker_id: "worker".into(),
+                    dp_rank: 1,
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(response.complete_coverage);
+        assert_eq!(response.best_prefix_blocks, 1);
+        assert_eq!(response.matches[0].stream_id.as_ref().unwrap().dp_rank, 1);
     }
 }

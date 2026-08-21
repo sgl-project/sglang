@@ -23,9 +23,11 @@ from sglang.srt.disaggregation.kv_events import (
     SNAPSHOT_END,
     SNAPSHOT_HEADER,
     SNAPSHOT_REQUEST,
+    SNAPSHOT_REQUEST_V2,
     SNAPSHOT_SEND_TIMEOUT_MS,
     BlockRemoved,
     BlockStored,
+    BlockStoredWithComponents,
     BlockStoredMetadata,
     BlockStoredWithMetadata,
     EventPublisher,
@@ -33,6 +35,8 @@ from sglang.srt.disaggregation.kv_events import (
     KVEventBatch,
     KVSnapshotBlock,
     KVSnapshotHeader,
+    KVSnapshotHeaderV2,
+    KVSnapshotPlacementV2,
     NullEventPublisher,
     StorageMedium,
     ZmqEventPublisher,
@@ -298,6 +302,47 @@ class TestZmqEventPublisherReplay(CustomTestCase):
         finally:
             publisher.shutdown()
 
+    def test_replay_v2_is_epoch_fenced_and_range_bounded(self):
+        suffix = uuid.uuid4().hex
+        publisher = ZmqEventPublisher(
+            attn_dp_rank=0,
+            endpoint=f"inproc://replay-live-{suffix}",
+            replay_endpoint=f"inproc://replay-v2-{suffix}",
+            epoch="epoch-a",
+        )
+        dealer = zmq.Context.instance().socket(zmq.DEALER)
+        try:
+            for hash_value in (10, 11, 12):
+                publisher.publish(
+                    KVEventBatch(
+                        ts=1.0,
+                        events=[BlockRemoved(block_hashes=[hash_value])],
+                    )
+                )
+            publisher._event_queue.join()
+            dealer.connect(f"inproc://replay-v2-{suffix}")
+            dealer.send_multipart(
+                [
+                    b"",
+                    b"replay-v2",
+                    b"epoch-a",
+                    (1).to_bytes(8, "big"),
+                    (3).to_bytes(8, "big"),
+                ]
+            )
+            sequences = []
+            while True:
+                frames = dealer.recv_multipart()
+                self.assertEqual(frames[1], b"epoch-a")
+                sequence = int.from_bytes(frames[2], "big", signed=True)
+                if sequence == -1:
+                    break
+                sequences.append(sequence)
+            self.assertEqual(sequences, [1, 2])
+        finally:
+            dealer.close(linger=0)
+            publisher.shutdown()
+
 
 class TestKvPlacementSnapshotProtocol(CustomTestCase):
     def _fetch_header(self, endpoint: str) -> KVSnapshotHeader:
@@ -457,6 +502,84 @@ class TestKvPlacementSnapshotProtocol(CustomTestCase):
             self.assertEqual(barrier.events, [])
         finally:
             sub.close(linger=0)
+            dealer.close(linger=0)
+            publisher.shutdown()
+
+    def test_snapshot_v2_carries_identity_tier_components_and_block_size(self):
+        suffix = uuid.uuid4().hex
+        event_endpoint = f"inproc://kv-events-v2-{suffix}"
+        snapshot_endpoint = f"inproc://kv-snapshot-v2-{suffix}"
+        publisher = ZmqEventPublisher(
+            attn_dp_rank=2,
+            endpoint=event_endpoint,
+            snapshot_endpoint=snapshot_endpoint,
+            namespace="tenant-a",
+            model="model-a",
+            worker_id="worker-a",
+            worker_generation="generation-a",
+            hash_schema_version=3,
+            page_size=16,
+            is_bigram=True,
+            cache_components=["full", "swa"],
+            swa_window_tokens=4096,
+        )
+        endpoint = ZmqEventPublisher.offset_endpoint_port(snapshot_endpoint, 2)
+        dealer = zmq.Context.instance().socket(zmq.DEALER)
+        try:
+            publisher.publish(
+                KVEventBatch(
+                    ts=1.0,
+                    events=[
+                        BlockStoredWithComponents(
+                            block_hashes=[101],
+                            parent_block_hash=99,
+                            token_ids=[1, 2],
+                            block_size=2,
+                            lora_id=None,
+                            medium=StorageMedium.GPU,
+                            component_types=["full", "swa"],
+                        )
+                    ],
+                )
+            )
+            publisher._event_queue.join()
+            self.assertIn(("tenant-a", 101, 1), publisher._snapshot_placements)
+
+            dealer.connect(endpoint)
+            dealer.send_multipart([b"", SNAPSHOT_REQUEST_V2])
+            header_frames = dealer.recv_multipart()
+            header = msgspec.msgpack.decode(
+                header_frames[2], type=KVSnapshotHeaderV2
+            )
+            placements = []
+            while True:
+                frames = dealer.recv_multipart()
+                if frames[1] == SNAPSHOT_END:
+                    break
+                placements.extend(
+                    msgspec.msgpack.decode(
+                        frames[2], type=list[KVSnapshotPlacementV2]
+                    )
+                )
+
+            self.assertEqual(header.version, 2)
+            self.assertEqual(header.namespace, "tenant-a")
+            self.assertEqual(header.model, "model-a")
+            self.assertEqual(header.worker_id, "worker-a")
+            self.assertEqual(header.replica_rank, 2)
+            self.assertEqual(header.worker_generation, "generation-a")
+            self.assertEqual(header.hash_schema_version, 3)
+            self.assertEqual(header.page_size, 16)
+            self.assertTrue(header.is_bigram)
+            self.assertEqual(header.cache_spec.components, 3)
+            self.assertEqual(header.cache_spec.swa_window_tokens, 4096)
+            self.assertEqual(len(placements), 1)
+            self.assertEqual(placements[0].parent_block_hash, 99)
+            self.assertEqual(placements[0].block_hash, 101)
+            self.assertEqual(placements[0].tier, 1)
+            self.assertEqual(placements[0].component_mask, 3)
+            self.assertEqual(placements[0].block_size, 2)
+        finally:
             dealer.close(linger=0)
             publisher.shutdown()
 

@@ -10,6 +10,7 @@ pub mod client;
 pub mod recovery;
 pub mod snapshot;
 pub mod status;
+mod stream;
 
 pub mod pb {
     tonic::include_proto!("kv_indexer.v1");
@@ -17,6 +18,7 @@ pub mod pb {
 
 mod admission;
 mod memory_backend;
+mod replay;
 mod service;
 mod shutdown;
 

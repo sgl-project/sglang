@@ -443,6 +443,8 @@ pub(crate) fn build_apply_request(
         cache_spec: config.cache_spec,
         worker_epoch: String::new(),
         enforce_sequence: false,
+        stream_id: None,
+        worker_generation: String::new(),
     }
 }
 
@@ -589,9 +591,14 @@ fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeE
                 ));
             }
             let tier = medium_to_tier(expect_optional_str(&event[6], "BlockStored.medium")?)?;
-            // `component_types` is the trailing slot: a list of component labels
-            // folded into a bitmask, or nil/absent for a legacy whole-block store.
-            let mask = match event.get(7) {
+            // Unsalted component events carry the list at slot 7. Salted
+            // events keep their typed metadata map at slot 7 and append the
+            // component list at slot 8, preserving both legacy wire shapes.
+            let component_value = match event.get(7) {
+                Some(Value::Map(_)) => event.get(8),
+                value => value,
+            };
+            let mask = match component_value {
                 Some(value) => decode_component_mask(value)?,
                 None => None,
             };
@@ -1005,6 +1012,8 @@ mod tests {
             cache_spec: None,
             worker_epoch: String::new(),
             enforce_sequence: false,
+            stream_id: None,
+            worker_generation: String::new(),
         };
 
         let batches = split_apply_request(request);
@@ -1038,6 +1047,8 @@ mod tests {
             cache_spec: None,
             worker_epoch: String::new(),
             enforce_sequence: false,
+            stream_id: None,
+            worker_generation: String::new(),
         };
 
         let batches = split_apply_request(request);

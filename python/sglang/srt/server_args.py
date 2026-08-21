@@ -10698,7 +10698,7 @@ class ServerArgs:
                                                   # publishers
                 "snapshot_endpoint_host": "*",    # optional ROUTER endpoint
                 "snapshot_endpoint_port_base": 5757,
-                "snapshot_protocol_version": 1,
+                "snapshot_protocol_version": 2,
             }
 
         Returns None (i.e. "no publisher to describe") when any of:
@@ -10719,7 +10719,7 @@ class ServerArgs:
         # Lazy import so loading server_args doesn't pull in
         # disaggregation / msgspec / zmq at module top level.
         from sglang.srt.disaggregation.kv_events import (
-            SNAPSHOT_PROTOCOL_VERSION,
+            SNAPSHOT_PROTOCOL_VERSION_V2,
             EventPublisherFactory,
             ZmqEventPublisherConfig,
         )
@@ -10745,6 +10745,7 @@ class ServerArgs:
             return None
         host, port = endpoint
 
+        snapshot_model = resolved.served_model_name or resolved.model_path
         descriptor = {
             "publisher": publisher,
             "endpoint_host": host,
@@ -10752,6 +10753,12 @@ class ServerArgs:
             "topic": cfg.topic,
             "block_size": resolved.kv_event_block_size,
             "dp_size": resolved.dp_size,
+            "namespace": snapshot_model,
+            "model": snapshot_model,
+            "worker_id": f"{snapshot_model}@{resolved.host}:{resolved.port}",
+            "hash_schema_version": 1,
+            "is_bigram": str(resolved.speculative_algorithm or "").lower()
+            in {"eagle", "eagle3", "frozen_kv_mtp"},
         }
         # Snapshot support is additive. An invalid or non-TCP snapshot endpoint
         # does not hide an otherwise usable live publisher; older workers and
@@ -10763,7 +10770,17 @@ class ServerArgs:
                 {
                     "snapshot_endpoint_host": snapshot_host,
                     "snapshot_endpoint_port_base": snapshot_port,
-                    "snapshot_protocol_version": SNAPSHOT_PROTOCOL_VERSION,
+                    "snapshot_protocol_version": SNAPSHOT_PROTOCOL_VERSION_V2,
+                }
+            )
+        replay_endpoint = _parse_zmq_tcp_endpoint(cfg.replay_endpoint)
+        if replay_endpoint is not None:
+            replay_host, replay_port = replay_endpoint
+            descriptor.update(
+                {
+                    "replay_endpoint_host": replay_host,
+                    "replay_endpoint_port_base": replay_port,
+                    "replay_protocol_version": 2,
                 }
             )
         return descriptor

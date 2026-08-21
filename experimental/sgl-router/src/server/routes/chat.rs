@@ -184,7 +184,15 @@ pub async fn chat_completions(
             let outcome = if hashes.is_empty() {
                 sgl_kv_indexer::PrefixOutcome::Empty
             } else {
-                resolve_prefix_query(index.match_prefix(hashes).await, &model_str)?
+                resolve_prefix_query(
+                    index
+                        .match_prefix_for_workers(
+                            hashes,
+                            workers.iter().map(|worker| worker.url.clone()).collect(),
+                        )
+                        .await,
+                    &model_str,
+                )?
             };
             Some(ExternalPrefixSignal {
                 outcome,

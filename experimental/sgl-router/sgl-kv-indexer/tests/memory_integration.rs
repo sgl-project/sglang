@@ -552,6 +552,7 @@ fn prefix_req(hs: &[i64]) -> MatchExternalKvPrefixRequest {
     MatchExternalKvPrefixRequest {
         hashes: hs.to_vec(),
         max_blocks: 0,
+        ..Default::default()
     }
 }
 
@@ -652,6 +653,7 @@ async fn prefix_max_blocks_caps_the_scan() {
         .match_external_kv_prefix(MatchExternalKvPrefixRequest {
             hashes: vec![1, 2, 3, 4],
             max_blocks: 2,
+            ..Default::default()
         })
         .await
         .unwrap();

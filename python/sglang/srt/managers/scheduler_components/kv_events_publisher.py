@@ -15,6 +15,7 @@ import zmq
 from sglang.srt.disaggregation.kv_events import (
     EventPublisherFactory,
     KVEventBatch,
+    KVSnapshotRuntimeMetadata,
     select_kv_publisher_dp_rank,
 )
 from sglang.srt.managers.io_struct import hook_custom_types, sock_send
@@ -56,6 +57,13 @@ class SchedulerKvEventsPublisher:
     get_stats: Callable
     enable_kv_cache_events: bool = False
     kv_event_publisher: Any = None
+    snapshot_namespace: str = "default"
+    snapshot_model: str = "unknown"
+    snapshot_worker_id: str = ""
+    worker_generation: str = ""
+    page_size: int = 1
+    is_bigram: bool = False
+    swa_window_tokens: int = 0
 
     def __post_init__(self) -> None:
         self.init_kv_events(self.kv_events_config)
@@ -76,6 +84,24 @@ class SchedulerKvEventsPublisher:
                 kv_events_config,
                 select_kv_publisher_dp_rank(
                     self.ps.attn_dp_size, self.ps.attn_dp_rank, self.ps.dp_rank
+                ),
+                snapshot_metadata=KVSnapshotRuntimeMetadata(
+                    namespace=self.snapshot_namespace,
+                    model=self.snapshot_model,
+                    worker_id=self.snapshot_worker_id,
+                    worker_generation=self.worker_generation,
+                    page_size=self.page_size,
+                    is_bigram=self.is_bigram,
+                    cache_components=tuple(
+                        component.name.lower()
+                        for component in getattr(
+                            getattr(self.tree_cache, "tree_core", None),
+                            "component_types",
+                            (),
+                        )
+                    )
+                    or ("full",),
+                    swa_window_tokens=self.swa_window_tokens,
                 ),
             )
 

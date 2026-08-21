@@ -451,6 +451,7 @@ class MultiTokenizerRouter:
         port_args: PortArgs,
     ):
         self.server_args = server_args
+        self.instance_id = port_args.instance_id
         self.startup_time: Optional[Dict[str, Any]] = None
         context = zmq.asyncio.Context(3)
         self.recv_from_detokenizer = get_zmq_socket(

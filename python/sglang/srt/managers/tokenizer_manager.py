@@ -551,6 +551,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     def init_ipc_channels(self, port_args: PortArgs):
+        # The HTTP process must expose the same process identity that every
+        # Scheduler uses for KV Snapshot/Live and LoadSnapshot metadata.
+        self.instance_id = port_args.instance_id
         context = zmq.asyncio.Context(2)
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True

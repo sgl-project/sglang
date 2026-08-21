@@ -39,6 +39,7 @@ mod tests {
             normalized_load: 0.25,
             ready_workers: 2,
             total_workers: 2,
+            streams: Vec::new(),
         };
         let json = serde_json::to_string(&report).unwrap();
         assert_eq!(
