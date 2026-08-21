@@ -55,6 +55,11 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route("/readyz", get(crate::server::routes::health::readyz))
         .route("/metrics", get(crate::server::routes::metrics::metrics))
         .route(
+            "/v1/kv-indexer/status",
+            post(crate::server::routes::indexer_status::report)
+                .layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
             "/v1/models",
             get(crate::server::routes::models::list_models),
         )

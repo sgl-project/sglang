@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 
-use tokio::sync::Semaphore;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
@@ -15,6 +14,7 @@ use crate::pb::{
     GetExternalKvHitCountsResponse, MatchExternalKvPrefixRequest, MatchExternalKvPrefixResponse,
     MatchExternalKvRequest, MatchExternalKvResponse, TierType, WorkerCacheSpec,
 };
+use crate::status::IndexerStatusHandle;
 
 /// Protocol-level resource bounds, enforced before a backend sees the request so
 /// no caller can make it allocate work proportional to an unbounded field. The
@@ -147,7 +147,7 @@ impl KvIndexerBackend for std::sync::Arc<dyn KvIndexerBackend> {
 #[derive(Debug)]
 pub struct KvIndexerService<B> {
     backend: B,
-    prefix_query_semaphore: Semaphore,
+    status: std::sync::Arc<IndexerStatusHandle>,
 }
 
 impl<B> KvIndexerService<B>
@@ -159,14 +159,12 @@ where
     }
 
     pub fn with_prefix_query_max_inflight(backend: B, max_inflight: usize) -> Self {
-        assert!(
-            max_inflight > 0,
-            "prefix query max inflight must be greater than zero"
-        );
-        Self {
-            backend,
-            prefix_query_semaphore: Semaphore::new(max_inflight),
-        }
+        let status = std::sync::Arc::new(IndexerStatusHandle::new(max_inflight));
+        Self::with_status(backend, status)
+    }
+
+    pub fn with_status(backend: B, status: std::sync::Arc<IndexerStatusHandle>) -> Self {
+        Self { backend, status }
     }
 
     /// Wraps the service in its generated server with the decoding limit a
@@ -210,7 +208,7 @@ where
         reject_if_deadline_passed(&metadata, &extensions)?;
         validate_hashes(&request.hashes)?;
         // Caps concurrent prefix queries; excess is rejected, never queued.
-        let _permit = self.prefix_query_semaphore.try_acquire().map_err(|_| {
+        let _permit = self.status.try_acquire_query().map_err(|_| {
             if let Some(rejected_total) = OVERLOAD_LOG.record() {
                 tracing::warn!(
                     rejected_total,
@@ -657,6 +655,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    use tokio::sync::Semaphore;
     use tokio::time::Duration;
 
     #[derive(Clone)]
