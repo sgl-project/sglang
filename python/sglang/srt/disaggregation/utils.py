@@ -729,52 +729,6 @@ def _get_cp_rank_page_bounds(
     return local_start, local_start + n_pages
 
 
-def page_indices_to_cp_rank_page_indices(
-    page_indices: np.ndarray,
-    total_pages: int,
-    cp_rank: int,
-    cp_size: int,
-) -> np.ndarray:
-    """
-    Filter page_indices (which are *global* page ids in the KV pool) to those
-    belonging to the given CP rank for this request.
-
-    For a single request, its pages occupy a contiguous global range
-    [first_page, first_page + total_pages). We first compute the local
-    split [0, total_pages) across cp_size ranks, then shift that local
-    range by first_page back into the global page id space and take
-    the intersection with page_indices.
-
-    Returns:
-        Subset of page_indices that fall in this rank's global
-        [start_page, end_page) slice for the given CP rank.
-    """
-    if cp_size <= 1:
-        return page_indices
-
-    if page_indices.size == 0:
-        return np.asarray(page_indices)
-
-    first_page = int(page_indices.min())
-    base = total_pages // cp_size
-    rem = total_pages % cp_size
-
-    if rem == 0:
-        local_start = cp_rank * base
-        local_end = local_start + base
-    else:
-        local_start = cp_rank * base + min(cp_rank, rem)
-        n_pages = base + (1 if cp_rank < rem else 0)
-        local_end = local_start + n_pages
-
-    # Map back to global page ids.
-    start_page = first_page + local_start
-    end_page = first_page + local_end
-
-    mask = (page_indices >= start_page) & (page_indices < end_page)
-    return np.asarray(page_indices)[mask]
-
-
 def filter_kv_indices_for_cp_rank(
     kv_mgr: CommonKVManager,
     kv_indices: np.ndarray,
