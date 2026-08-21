@@ -75,6 +75,10 @@ if TYPE_CHECKING:
 def _radix_key_buffer(key: RadixKey) -> array:
     """The key's token ids honoring `limit`; view-independent since the
     binding derives its own atoms."""
+    if key.cache_salt is not None:
+        raise ValueError(
+            "cache_salt is not supported by the experimental Rust unified tree core"
+        )
     token_ids = key.raw_token_ids()
     assert (
         isinstance(token_ids, array) and token_ids.typecode == "q"
@@ -735,8 +739,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         return _transfer_from_binding(kv_xfer), _comp_xfers_from_binding(comp_xfers)
 
-    def prefetch_anchor_info(self, node_id: NodeId) -> Optional[str]:
-        return self._binding.prefetch_anchor_info(node_id)
+    def prefetch_anchor_info(
+        self, node_id: NodeId
+    ) -> tuple[Optional[str], Optional[str]]:
+        return self._binding.prefetch_anchor_info(node_id), None
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self._binding.node_backuped(node_id)
