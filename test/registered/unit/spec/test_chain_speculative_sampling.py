@@ -131,8 +131,8 @@ class TestChainSpeculativeSamplingTorch(CustomTestCase):
         target_probs[0, 3] = 1.0
         draft_probs[0, 3] = 1.0
         # Step 2 (row 1): p(c=4)=0 -> coin*q < 0 never holds -> rejected.
-        # Residual row: p = {4: .5, 5: .5}, q = {4: .5} -> point mass on 5.
-        target_probs[1, 4] = 0.5
+        # Residual row: p = {5: .5}, q = {4: .5} -> max(p - q, 0) = {5: .5}
+        # -> point mass on 5.
         target_probs[1, 5] = 0.5
         draft_probs[1, 4] = 0.5
         coins = torch.full((bs, num_slots - 1), 0.5)
@@ -213,8 +213,13 @@ class TestChainSpeculativeSamplingTorch(CustomTestCase):
         self.assertEqual(predicts[0].tolist(), [1, 2, 3])
         self.assertEqual(predicts[1].tolist(), [1, 4, 0])
         self.assertEqual(predicts[2].tolist(), [3, 0, 0])
+        # accept_index[:, 0] holds global token ids (row base + slot) as in
+        # the Triton kernel: retrive_index[:, 0] = arange(bs) * num_slots.
         self.assertTrue(
-            torch.equal(accept_index[:, 0], torch.arange(bs, dtype=torch.int32))
+            torch.equal(
+                accept_index[:, 0],
+                torch.arange(bs, dtype=torch.int32) * num_slots,
+            )
         )
 
     def test_first_token_distribution_matches_target(self):
