@@ -845,6 +845,12 @@ class DeepseekV4AscendAttnBackend(
             if pool is not None
         }
 
+    def supports_uniform_cuda_graph_bucket_padding(self) -> bool:
+        # DSpark cannot currently extend the global DP batch to a larger graph
+        # bucket without corrupting DSV4 cache/compressor metadata. Require an
+        # exact captured batch size; otherwise the runner falls back to eager.
+        return not self._is_dspark_algorithm
+
     def _is_dspark_draft_block(self, forward_batch: ForwardBatch) -> bool:
         spec_algorithm = forward_batch.spec_algorithm
         return (
@@ -1809,7 +1815,7 @@ class DeepseekV4AscendAttnBackend(
             attn_kwargs["ori_sparse_indices"] = ori_sparse_indices
         q_arg = attn_kwargs.pop("q")
         if self._is_dspark_draft_worker:
-            out, _ = torch.ops.npu.sparse_attn_sharedkv(q_arg, **attn_kwargs)
+            out, _ = torch.ops._C_ascend.npu_sparse_attn_sharedkv(q_arg, **attn_kwargs)
         else:
             out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(q_arg, **attn_kwargs)
         return out
