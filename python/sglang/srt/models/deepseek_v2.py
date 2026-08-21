@@ -81,7 +81,6 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.communicator_dsa_cp import (
     DSACPLayerCommunicator,
-    cp_requires_shared_expert_hoist,
     maybe_prefetch_next_full_attention_kv,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
@@ -894,10 +893,6 @@ class DeepseekV2MoE(nn.Module):
             )
 
         if not self._enable_a2a_moe:
-            # The flashinfer dual-stream-graph path has no way to skip the shared
-            # expert, so fall back to forward_normal when the caller hoisted it.
-            # Perf-only downgrade, in a configuration that would otherwise
-            # double-count the shared output.
             if self._can_dual_stream_graph(hidden_states) and not skip_shared_experts:
                 fwd = get_forward()
                 return dsv2_flashinfer_moe_dual_stream_graph(
@@ -955,10 +950,6 @@ class DeepseekV2MoE(nn.Module):
             else self._maybe_quant_moe_input_once(hidden_states)
         )
         self.alt_stream.wait_stream(current_stream)
-        # skip_shared_experts: the caller computed the shared expert on its LOCAL
-        # rows and will add it after its own combine. Must be honoured here too,
-        # not just in forward_normal -- otherwise the caller's add and the add
-        # below would both land and double-count it.
         has_shared_output = (
             hidden_states.shape[0] > 0
             and self.num_fused_shared_experts == 0
@@ -2501,17 +2492,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        # Under prefill CP, postprocess_layer reduce-scatters (SUMs) the MoE
-        # output across the CP group. A replicated (TP1) shared expert would be
-        # counted once per CP rank, so compute it here on this rank's own rows
-        # and add it back after the combine instead. prepare_mlp above has
-        # already applied the post-attention layernorm and gathered, so this
-        # rank's rows are the cp_rank-th chunk of the gathered buffer -- the
-        # shared expert is a per-token MLP, so slicing first is equivalent and
-        # costs 1/cp_size the rows.
         _cp_shared_local = None
         _cp_hoist_shared = (
-            cp_requires_shared_expert_hoist(self.mlp)
+            has_replicated_shared_expert(self.mlp)
             and self.layer_scatter_modes.mlp_mode == ScatterMode.FULL
             and (dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch))
         )
@@ -2522,13 +2505,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             if _cp_local_rows.shape[0] > 0:
                 _cp_shared_local = self.mlp._forward_shared_experts(_cp_local_rows)
 
-        # Fusing defers this layer's post-experts all-reduce to the NEXT layer's
-        # residual+layernorm. The MoE's own guard ("add the TP1 shared output
-        # after the all-reduce") then no longer protects anything: the shared
-        # output is already inside the returned tensor when the deferred
-        # all-reduce runs, so a replicated shared expert would be summed once
-        # per TP rank. Decline the fusion rather than emit wrong numbers -- a
-        # perf downgrade confined to configs that would otherwise be incorrect.
         fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
@@ -2585,7 +2561,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states, residual, forward_batch
             )
 
-        # Counted once here, rather than once per CP rank inside the combine.
         if _cp_shared_local is not None:
             hidden_states = hidden_states + _cp_shared_local[: hidden_states.shape[0]]
 

@@ -36,7 +36,6 @@ from sglang.srt.layers.dp_attention import (
     attn_cp_reduce_scatter_tensor,
     get_local_dp_buffer,
 )
-from sglang.srt.layers.moe.utils import has_replicated_shared_expert
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
@@ -91,33 +90,6 @@ def dsa_cp_reduce_scatter_hidden_states(hidden_states: torch.Tensor):
     hidden_states = hidden_states.tensor_split(cp_size)[cp_rank]
     attn_cp_reduce_scatter_tensor(hidden_states, input_hidden_states)
     return hidden_states
-
-
-def cp_requires_shared_expert_hoist(mlp) -> bool:
-    """Whether ``mlp``'s shared expert must be computed outside the CP combine.
-
-    ``dsa_cp_reduce_scatter_hidden_states`` SUMs the MoE output across the CP
-    group. That is correct for the routed experts, whose per-rank outputs are
-    genuine partial sums, but wrong for a replicated (TP1) shared expert: every
-    rank holds the identical full value, so summing scales it by ``cp_size`` --
-    once per layer.
-
-    ``DeepseekV2MoE`` already adds a TP1 shared expert *after* its internal
-    post-experts all-reduce for exactly this reason, but under CP that
-    all-reduce is skipped (``mlp_reduce_scatter=True``, see
-    ``should_skip_post_experts_all_reduce``) and the cross-rank sum happens
-    later in the CP combine instead -- outside the reach of that guard.
-
-    Callers must therefore compute the shared expert on their LOCAL rows before
-    the gather, pass ``skip_shared_experts=True`` into the MoE, and add the
-    result back after the reduce-scatter. Because this is a correctness
-    requirement it is deliberately independent of ``SGLANG_DP_SHARED_EXPERT_LOCAL``,
-    which only selects a perf variant of the same hoist on the DP path.
-
-    The CP combine is one of several reductions that can swallow a replicated
-    shared expert; ``has_replicated_shared_expert`` states the shared invariant.
-    """
-    return has_replicated_shared_expert(mlp)
 
 
 class DSACPLayerCommunicator(LayerCommunicator):

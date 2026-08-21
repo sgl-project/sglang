@@ -1,24 +1,9 @@
-"""A replicated shared expert must never sit inside a tensor a collective SUMs.
-
-A TP-sharded shared expert produces a genuine per-rank partial, so a
-post-experts reduction over it is correct. A replicated (``tp_size=1``) one
-holds the identical full value on every rank, so any group SUM scales it by the
-group size -- silently, once per layer.
-
-MoE modules encode this by adding the shared output *after* their own
-post-experts all-reduce. That guard only covers the reduction they perform
-themselves. ``should_skip_post_experts_all_reduce`` lets a caller defer,
-replace, or absorb that reduction, and every such caller inherits the
-invariant:
-
-  - ``fuse_mlp_allreduce`` -- the next layer's residual+layernorm performs the
-    all-reduce instead (covered here).
-  - the prefill-CP combine -- ``dsa_cp_reduce_scatter_hidden_states`` sums
-    across the CP group (covered in ``test/registered/cp/test_cp_strategy_unit.py``).
-"""
+"""Tests for replicated shared experts around deferred reductions."""
 
 import ast
+import importlib
 import inspect
+import textwrap
 import unittest
 from types import SimpleNamespace
 
@@ -33,20 +18,15 @@ register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 class TestHasReplicatedSharedExpert(CustomTestCase):
     def test_both_attribute_spellings(self):
-        # DeepseekV2MoE and everything reusing it say "shared_experts";
-        # LagunaMoE says "shared_expert".
         for attr in ("shared_experts", "shared_expert"):
             mlp = SimpleNamespace(**{attr: object()}, _shared_expert_tp1=True)
             self.assertTrue(has_replicated_shared_expert(mlp), attr)
 
     def test_tp_sharded_shared_expert_is_not_replicated(self):
-        # Per-rank partials: the downstream SUM is exactly what reassembles them.
         mlp = SimpleNamespace(shared_experts=object(), _shared_expert_tp1=False)
         self.assertFalse(has_replicated_shared_expert(mlp))
 
     def test_no_shared_expert(self):
-        # Fused into the routed kernel, or a dense (non-MoE) layer: the mlp has
-        # no shared-expert submodule at all.
         self.assertFalse(
             has_replicated_shared_expert(
                 SimpleNamespace(shared_experts=None, _shared_expert_tp1=True)
@@ -56,15 +36,8 @@ class TestHasReplicatedSharedExpert(CustomTestCase):
 
 
 class TestDeferredAllReduceDoubleCounts(CustomTestCase):
-    """Why declining the fusion is the fix, not a nicety."""
-
     @staticmethod
     def _layer(tp_size, shared_inside_allreduce):
-        """One layer's post-experts reduction; returns the reduced output.
-
-        ``routed`` are per-rank partials that legitimately sum to a total.
-        ``shared`` is replicated: identical on every rank.
-        """
         rows = 4
         shared = torch.full((rows, 1), 7.0)
         routed = [torch.full((rows, 1), float(r)) for r in range(tp_size)]
@@ -77,27 +50,14 @@ class TestDeferredAllReduceDoubleCounts(CustomTestCase):
         tp_size = 8
         correct = self._layer(tp_size, shared_inside_allreduce=False)
         wrong = self._layer(tp_size, shared_inside_allreduce=True)
-        # The whole error is (tp_size - 1) extra copies of the shared output.
         self.assertTrue(torch.allclose(wrong - correct, torch.full((4, 1), 49.0)))
         self.assertFalse(torch.allclose(wrong, correct))
 
 
 class TestFusionGatedOnReplicatedSharedExpert(CustomTestCase):
-    """Ratchet: a decoder that both publishes ``fuse_mlp_allreduce`` and can own
-    a replicated shared expert must gate the fusion on the invariant.
-
-    Source-level rather than behavioural because reaching the real path needs a
-    multi-GPU TP group; the failure mode this guards against is a new model (or
-    a refactor) reintroducing an ungated ``fuse_mlp_allreduce`` publication.
-    """
-
-    # Model modules that publish fuse_mlp_allreduce AND whose MoE can set
-    # _shared_expert_tp1. Keep in sync with `grep -l _shared_expert_tp1`.
     MODULES = ("sglang.srt.models.deepseek_v2", "sglang.srt.models.laguna")
 
     def test_publication_is_gated(self):
-        import importlib
-
         for name in self.MODULES:
             module = importlib.import_module(name)
             source = inspect.getsource(module)
@@ -117,57 +77,54 @@ class TestFusionGatedOnReplicatedSharedExpert(CustomTestCase):
                 self.assertIn(
                     "has_replicated_shared_expert",
                     ast.dump(node.value),
-                    f"{name}: fuse_mlp_allreduce is published without checking "
-                    "has_replicated_shared_expert(self.mlp). Fusing defers the "
-                    "post-experts all-reduce to the next layer, past the point "
-                    "where the MoE adds a replicated shared output -- which "
-                    "then gets summed once per TP rank.",
+                    f"{name}: fuse_mlp_allreduce lacks the shared-expert guard",
                 )
 
 
-class TestMandatoryHoistNotGatedOnPerfEnvVar(CustomTestCase):
-    """Ratchet: DSV4's shared-expert hoist must not depend only on
-    ``SGLANG_DP_SHARED_EXPERT_LOCAL``.
+class TestMandatorySharedExpertHoist(CustomTestCase):
+    def _assignment(self, source, name):
+        tree = ast.parse(textwrap.dedent(source))
+        values = [
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == name
+        ]
+        self.assertEqual(len(values), 1, name)
+        return ast.dump(values[0])
 
-    That variable is a perf PoC and defaults to FALSE (``get_bool_env_var``
-    default ``"false"``). But the hoist is also the only thing standing between
-    a replicated shared expert and a collective that SUMs it: under CP,
-    ``dsa_cp_reduce_scatter_hidden_states``; on the DP path, reduce_scatterv and
-    the equal-chunk reduce_scatter. Both replace the MoE-internal all-reduce
-    that the TP1 shared expert was supposed to be added after, so gating the
-    hoist on a perf switch makes the default configuration the corrupting one.
-
-    Source-level rather than behavioural because reaching the real path needs a
-    multi-GPU TP group.
-    """
-
-    def test_do_shared_local_includes_the_mandatory_terms(self):
-        import importlib
-
+    def test_eager_dp_collectives_require_the_hoist(self):
         module = importlib.import_module("sglang.srt.models.deepseek_v4")
-        source = inspect.getsource(module)
-        found = False
-        for node in ast.walk(ast.parse(source)):
-            if not (
-                isinstance(node, ast.Assign)
-                and len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)
-                and node.targets[0].id == "_do_shared_local"
-            ):
-                continue
-            found = True
-            dumped = ast.dump(node.value)
-            for term in ("_cp_must_hoist_shared", "_dp_must_hoist_shared"):
-                self.assertIn(
-                    term,
-                    dumped,
-                    "_do_shared_local must include "
-                    f"{term}: the hoist is mandatory for correctness whenever a "
-                    "downstream collective sums the MoE output, and must not be "
-                    "reachable only via _SHARED_EXPERT_LOCAL (a perf env var "
-                    "that defaults to false).",
-                )
-        self.assertTrue(found, "_do_shared_local assignment not found in deepseek_v4")
+        source = inspect.getsource(module.DeepseekV4DecoderLayer._run_moe_ffn_dp_sync)
+
+        mlp_reduce_scatter = self._assignment(source, "mlp_reduce_scatter")
+        dp_hoist = self._assignment(source, "_dp_must_hoist_shared")
+        do_shared_local = self._assignment(source, "_do_shared_local")
+
+        self.assertIn("_use_dynamic_reduce_scatterv", mlp_reduce_scatter)
+        self.assertIn("_use_dynamic_reduce_scatterv", dp_hoist)
+        self.assertIn("_cp_must_hoist_shared", do_shared_local)
+        self.assertIn("_dp_must_hoist_shared", do_shared_local)
+
+        tree = ast.parse(textwrap.dedent(source))
+        reduce_scatterv_conditions = [
+            ast.dump(node.test)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If)
+            and "_use_dynamic_reduce_scatterv" in ast.dump(node.test)
+            and "_use_reduce_scatterv" in ast.dump(node.test)
+        ]
+        self.assertTrue(reduce_scatterv_conditions)
+
+    def test_dp_tbo_hoist_is_not_perf_gated(self):
+        module = importlib.import_module("sglang.srt.models.deepseek_v4")
+        source = inspect.getsource(module.DeepseekV4DecoderLayer.op_gather_a)
+        do_shared_local = self._assignment(source, "do_shared_local")
+
+        self.assertIn("has_replicated_shared_expert", do_shared_local)
+        self.assertNotIn("_SHARED_EXPERT_LOCAL", do_shared_local)
 
 
 if __name__ == "__main__":

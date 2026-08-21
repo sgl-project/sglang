@@ -569,23 +569,7 @@ def should_use_dp_reduce_scatterv():
 
 
 def has_replicated_shared_expert(mlp) -> bool:
-    """Whether ``mlp`` holds a shared expert that is replicated, not TP-sharded.
-
-    A TP-sharded shared expert produces a genuine per-rank partial, so it is
-    safe to leave inside a tensor that a downstream collective SUMs. A
-    replicated (``tp_size=1``) one holds the identical full value on every
-    rank, so any such SUM scales it by the group size -- once per layer.
-
-    MoE modules therefore add a replicated shared output *after* their internal
-    post-experts all-reduce. That guard only covers the reduction they perform
-    themselves; when ``should_skip_post_experts_all_reduce`` defers or replaces
-    that reduction (fused next-layer all-reduce, reduce-scatter, CP combine),
-    the caller owns the invariant instead.
-
-    Note the two spellings of the attribute: ``DeepseekV2MoE`` (and everything
-    that subclasses or reuses it) names it ``shared_experts``, ``LagunaMoE``
-    names it ``shared_expert``. A dense (non-MoE) layer's mlp has neither.
-    """
+    """Return whether an MoE owns a replicated (TP1) shared expert."""
     if not getattr(mlp, "_shared_expert_tp1", False):
         return False
     return (

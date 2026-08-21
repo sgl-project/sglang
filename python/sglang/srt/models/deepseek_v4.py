@@ -55,7 +55,6 @@ from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.communicator_dsa_cp import (
-    cp_requires_shared_expert_hoist,
     dsa_cp_gather_hidden_states,
     dsa_cp_reduce_scatter_hidden_states,
 )
@@ -92,7 +91,10 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
+from sglang.srt.layers.moe.utils import (
+    has_replicated_shared_expert,
+    is_shared_experts_fusion_disabled,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     view_aiter_fused_rms_transposed_fp8_scale,
 )
@@ -2139,6 +2141,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             and forward_batch.dp_padding_mode is not None
             and not forward_batch.dp_padding_mode.is_max_len()
         )
+        _use_dynamic_reduce_scatterv = (
+            _use_tp_moe_gather and should_use_dp_reduce_scatterv()
+        )
         # SGLANG_DP_USE_REDUCE_SCATTER: in the MAX_LEN decode path (equal per-rank
         # padding, gatherv inactive, no EP), replace the MoE-internal post-experts
         # all_reduce + dp_scatter with an equal-chunk reduce_scatter. On ROCm this
@@ -2150,12 +2155,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
             and _use_tp_moe_gather
             and not _use_reduce_scatterv
-            and not should_use_dp_reduce_scatterv()
+            and not _use_dynamic_reduce_scatterv
             and forward_batch.dp_padding_mode is not None
             and forward_batch.dp_padding_mode.is_max_len()
             and get_parallel().tp_size == get_parallel().attn_dp_size
         )
-        mlp_reduce_scatter = _use_cp or _use_reduce_scatterv or _use_reduce_scatter
+        mlp_reduce_scatter = (
+            _use_cp
+            or _use_reduce_scatterv
+            or _use_dynamic_reduce_scatterv
+            or _use_reduce_scatter
+        )
         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): compute the replicated shared expert
         # on LOCAL hidden before the gather and add it back after the combine
         # (reduce_scatterv OR dp_scatter), instead of on the gathered global buffer.
@@ -2166,31 +2176,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         # expert this cancels the TP1 "full-dim" cost in decode (M_local * dim ==
         # M_global * dim/tp), so decode no longer pays the ~dp_size x penalty.
         _shared_local = None
-        _has_tp1_shared = cp_requires_shared_expert_hoist(self.mlp)
-        # On the CP path, hoisting the shared expert is REQUIRED for correctness,
-        # not a perf PoC. A TP1 shared expert is replicated across ranks, so it
-        # must never sit inside a tensor that a downstream collective SUMs.
-        # DeepseekV2MoE adds it after its internal all-reduce for exactly this
-        # reason, but under CP that all-reduce is skipped (mlp_reduce_scatter is
-        # True, see should_skip_post_experts_all_reduce) and the sum instead
-        # happens below in dsa_cp_reduce_scatter_hidden_states -- which would
-        # scale the shared expert by cp_size, once per layer. Deliberately NOT
-        # gated on _SHARED_EXPERT_LOCAL: correctness must not depend on a perf
-        # env var.
+        _has_tp1_shared = has_replicated_shared_expert(self.mlp)
         _cp_must_hoist_shared = (
             _use_cp and get_moe_a2a_backend().is_none() and _has_tp1_shared
         )
-        # Same requirement on the DP path, for the same reason: reduce_scatterv
-        # and the equal-chunk reduce_scatter both SUM across TP ranks, replacing
-        # the MoE-internal all-reduce that the TP1 shared expert was supposed to
-        # be added after. Until now the only thing preventing that was
-        # _SHARED_EXPERT_LOCAL -- a perf PoC env var that defaults to FALSE
-        # (get_bool_env_var default "false"), so the corrupting configuration was
-        # the default one. dp_scatter (the remaining branch) is not a sum and
-        # leaves mlp_reduce_scatter False, so the MoE's own guard still holds
-        # there.
         _dp_must_hoist_shared = (
-            _use_reduce_scatterv or _use_reduce_scatter
+            _use_reduce_scatterv or _use_dynamic_reduce_scatterv or _use_reduce_scatter
         ) and _has_tp1_shared
         _do_shared_local = (
             _cp_must_hoist_shared
@@ -2200,9 +2191,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         if _use_cp:
             moe_a2a_backend = get_moe_a2a_backend()
             if moe_a2a_backend.is_none():
-                # Compute on the LOCAL rows before the gather: the shared expert
-                # is a per-token MLP, so this is identical to computing it on the
-                # gathered buffer and keeping this rank's slice.
                 if _cp_must_hoist_shared and hidden_states.shape[0] > 0:
                     _shared_local = self.mlp._forward_shared_experts(hidden_states)
                 hidden_states = dsa_cp_gather_hidden_states(hidden_states)
@@ -2242,8 +2230,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
-            # Add the replicated shared expert back AFTER the reduce-scatter so
-            # it is counted once, not once per CP rank.
             if _shared_local is not None:
                 hidden_states = hidden_states + _shared_local[: hidden_states.shape[0]]
         elif _use_tp_moe_gather:
@@ -2251,7 +2237,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 get_local_dp_buffer(get_tp_group()),
                 hidden_states,
             )
-            if should_use_dp_reduce_scatterv() or _use_reduce_scatterv:
+            if _use_dynamic_reduce_scatterv or _use_reduce_scatterv:
                 # SUM the TP-sharded per-rank partial expert outputs AND scatter
                 # each rank its own token slice, in one op. Correct because the
                 # MoE-internal all_reduce was skipped (mlp_reduce_scatter above).
@@ -2411,14 +2397,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # replicate-gather on the shared comm stream; record an event.
         fb = state.forward_batch
         local = state.pop("hidden_states_mlp_input")  # LOCAL [M_local, hidden]
-        # Shared-expert-local: compute on LOCAL hidden before the gather; added
-        # back after the combine (same as the non-fused forward). Skipped in the
-        # global MoE via skip_shared_experts.
-        do_shared_local = (
-            _SHARED_EXPERT_LOCAL
-            and getattr(self.mlp, "shared_experts", None) is not None
-            and getattr(self.mlp, "_shared_expert_tp1", False)
-        )
+        do_shared_local = has_replicated_shared_expert(self.mlp)
         state.do_shared_local = do_shared_local
         state.shared_local = (
             self.mlp._forward_shared_experts(local)
@@ -2515,11 +2494,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
     def op_cp_gather_a(self, state):
         local = state.pop("hidden_states_mlp_input")
-        # Same correctness constraint as the non-TBO CP path: op_cp_combine_a
-        # reduce-scatters (SUMs) the MoE output across the CP group, so a
-        # replicated TP1 shared expert must be computed on LOCAL rows here and
-        # added back in op_cp_combine_b instead of riding through the sum.
-        state.cp_shared_hoisted = cp_requires_shared_expert_hoist(self.mlp)
+        state.cp_shared_hoisted = has_replicated_shared_expert(self.mlp)
         state.cp_shared_local = (
             self.mlp._forward_shared_experts(local)
             if (state.cp_shared_hoisted and local.shape[0] > 0)
@@ -2571,7 +2546,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         hidden = state.pop("local_out")
         shared_local = state.pop("cp_shared_local")
         state.pop("cp_shared_hoisted")
-        # Counted once here, rather than once per CP rank inside the sum.
         if shared_local is not None:
             hidden = hidden + shared_local[: hidden.shape[0]]
         state.hidden_states_mlp_output = hidden
