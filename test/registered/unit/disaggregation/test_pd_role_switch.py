@@ -469,12 +469,11 @@ class TestMooncakeTeardownNoThreadLeak(unittest.TestCase):
         m._socket_cache = {}
         m._monitor_cache = {}
         m.engine = MagicMock()
-        m.kv_args = SimpleNamespace(
-            kv_data_ptrs=[],
-            kv_data_lens=[],
-            aux_data_ptrs=[],
-            state_data_ptrs=[],
-        )
+        # Built from KVArgs' own annotations: teardown walks several ptr/len
+        # pairs, and hardcoding them here goes stale every time one is added.
+        from sglang.srt.disaggregation.base.conn import KVArgs
+
+        m.kv_args = SimpleNamespace(**{name: [] for name in KVArgs.__annotations__})
         for i, (q, ex) in enumerate(zip(m.transfer_queues, m.executors)):
             t = threading.Thread(
                 target=m.transfer_worker, args=(q, ex, None, i), daemon=True
