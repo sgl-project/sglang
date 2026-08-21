@@ -61,22 +61,44 @@ def loaded_tracing_libs() -> list[str]:
     return sorted({m.group(0) for m in TRACING_LIB_PATTERN.finditer(maps)})
 
 
-def vendored_runtime_libs(libs: list[str]) -> list[str]:
-    """Mapped HIP/tracing libraries for which the ROCm install is not in play.
+def vendored_runtime_libs(
+    libs: list[str], rocm_lib_dir: str = "/opt/rocm/lib"
+) -> list[str]:
+    """Mapped HIP/tracing libraries that are not the ROCm install's build.
 
     `libtorch_hip.so` carries `RPATH $ORIGIN` and needs `libamdhip64.so` /
     `libroctracer64.so`, so the loader takes the wheel's copies and
     LD_LIBRARY_PATH does not override them. The image's ROCm version then says
     nothing about what torch.profiler is actually using.
 
-    A preload maps both copies at once and the preloaded one interposes, so a
-    library counts as vendored only when no ROCm copy of it is mapped at all.
+    Neither the path nor the file name settles it, so both are checked against
+    the ROCm install: a preload maps its copy alongside the wheel's and
+    interposes, and an image can have the ROCm library copied over the wheel's
+    path, where only the size gives it away.
     """
+    rocm_sizes: dict[str, set[int]] = {}
+    for name in RUNTIME_LIBS:
+        sizes = set()
+        for path in glob.glob(os.path.join(rocm_lib_dir, f"{name}.so.*")):
+            if not os.path.islink(path):
+                try:
+                    sizes.add(os.path.getsize(path))
+                except OSError:
+                    pass
+        rocm_sizes[name] = sizes
+
     flagged = []
     for name in RUNTIME_LIBS:
         mapped = [lib for lib in libs if name in lib]
-        if mapped and not any(lib.startswith("/opt/rocm") for lib in mapped):
-            flagged.extend(mapped)
+        if not mapped or any(lib.startswith("/opt/rocm") for lib in mapped):
+            continue
+        for lib in mapped:
+            try:
+                is_rocm_build = os.path.getsize(lib) in rocm_sizes[name]
+            except OSError:
+                is_rocm_build = False
+            if not is_rocm_build:
+                flagged.append(lib)
     return flagged
 
 
