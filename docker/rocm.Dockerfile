@@ -321,7 +321,7 @@ RUN set -eux; \
         ;; \
       *rocm724*) \
         echo "ROCm 7.2.4 (GPU_ARCH=${GPU_ARCH}): installing libdrm-amdgpu from graphics/7.2.4 noble"; \
-        curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
+        curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors https://repo.radeon.com/rocm/rocm.gpg.key \
           | gpg --dearmor -o /etc/apt/keyrings/amdgpu-graphics.gpg \
         && echo 'deb [arch=amd64,i386 signed-by=/etc/apt/keyrings/amdgpu-graphics.gpg] https://repo.radeon.com/graphics/7.2.4/ubuntu noble main' \
           > /etc/apt/sources.list.d/amdgpu-graphics.list \
@@ -338,7 +338,7 @@ RUN set -eux; \
         ;; \
       *) \
         echo "ROCm 7.0 (GPU_ARCH=${GPU_ARCH}): installing libdrm-amdgpu packages"; \
-        curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
+        curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors https://repo.radeon.com/rocm/rocm.gpg.key \
           | gpg --dearmor -o /etc/apt/keyrings/amdgpu-graphics.gpg \
         && echo 'deb [arch=amd64,i386 signed-by=/etc/apt/keyrings/amdgpu-graphics.gpg] https://repo.radeon.com/graphics/7.0/ubuntu jammy main' \
           > /etc/apt/sources.list.d/amdgpu-graphics.list \
@@ -520,7 +520,7 @@ RUN pip install IPython \
 # (sglang.srt.rust_extensions._multimodal) during the sglang pip install below
 # and later by sgl-model-gateway. Must precede the sglang install.
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+RUN curl --proto '=https' --tlsv1.2 --retry 5 --retry-delay 3 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y \
     && rustc --version && cargo --version
 ENV CARGO_BUILD_JOBS=4
 
@@ -656,7 +656,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   done; \
   if [ -z "$LLVM_CONFIG_PATH" ]; then \
     echo "[TileLang] ROCm llvm-config not found; installing LLVM 18..."; \
-    curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /etc/apt/keyrings/llvm.gpg; \
+    curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /etc/apt/keyrings/llvm.gpg; \
     echo "deb [signed-by=/etc/apt/keyrings/llvm.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" > /etc/apt/sources.list.d/llvm.list; \
     apt-get update; \
     apt-get install -y --no-install-recommends llvm-18; \
@@ -740,7 +740,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
     none) \
       apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg apt-transport-https && \
       rm -rf /var/lib/apt/lists/* && mkdir -p /etc/apt/keyrings; \
-      curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > /etc/apt/keyrings/amdainic.gpg; \
+      curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > /etc/apt/keyrings/amdainic.gpg; \
       echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdainic.gpg] https://repo.radeon.com/amdainic/pensando/ubuntu/${AINIC_VERSION} ${UBUNTU_CODENAME} main" \
         > /etc/apt/sources.list.d/amdainic.list; \
       apt-get update && apt-get install -y --no-install-recommends \
@@ -749,7 +749,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
       ; \
       rm -rf /var/lib/apt/lists/*; \
       install -m 0755 -d /etc/apt/keyrings \
-      && curl -fsSL https://packages.broadcom.com/artifactory/api/security/keypair/PackagesKey/public -o /etc/apt/keyrings/broadcom-nic.asc \
+      && curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors https://packages.broadcom.com/artifactory/api/security/keypair/PackagesKey/public -o /etc/apt/keyrings/broadcom-nic.asc \
       && chmod a+r /etc/apt/keyrings/broadcom-nic.asc \
       && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/broadcom-nic.asc] https://packages.broadcom.com/artifactory/ethernet-nic-debian-public jammy main" > /etc/apt/sources.list.d/broadcom-nic.list \
       && apt-get update \
@@ -760,7 +760,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
     ainic) \
       apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg apt-transport-https && \
       rm -rf /var/lib/apt/lists/* && mkdir -p /etc/apt/keyrings; \
-      curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > /etc/apt/keyrings/amdainic.gpg; \
+      curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > /etc/apt/keyrings/amdainic.gpg; \
       echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdainic.gpg] https://repo.radeon.com/amdainic/pensando/ubuntu/${AINIC_VERSION} ${UBUNTU_CODENAME} main" \
         > /etc/apt/sources.list.d/amdainic.list; \
       apt-get update && apt-get install -y --no-install-recommends \
@@ -774,7 +774,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
        apt-get update \
        && apt-get install -y --no-install-recommends ca-certificates curl \
        && install -m 0755 -d /etc/apt/keyrings \
-       && curl -fsSL https://packages.broadcom.com/artifactory/api/security/keypair/PackagesKey/public -o /etc/apt/keyrings/broadcom-nic.asc \
+       && curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors https://packages.broadcom.com/artifactory/api/security/keypair/PackagesKey/public -o /etc/apt/keyrings/broadcom-nic.asc \
        && chmod a+r /etc/apt/keyrings/broadcom-nic.asc \
        && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/broadcom-nic.asc] https://packages.broadcom.com/artifactory/ethernet-nic-debian-public jammy main" > /etc/apt/sources.list.d/broadcom-nic.list \
        && apt-get update \

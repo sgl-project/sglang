@@ -5,9 +5,43 @@ metatags:
     description: "Serve MiniMax-H3 with SGLang Diffusion for text-to-video-and-audio, first/last-frame conditioning, video-to-video, and multimodal reference conditioning."
 ---
 
-## 1. Model introduction
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config } from "/src/snippets/configs/MiniMaxAI/minimax-h3.jsx";
 
-[MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) generates a video and a synchronized stereo audio track in one request. SGLang Diffusion provides a native pipeline for the three public task profiles, split across the released FL2VA (First-and-Last-Frame-to-Video-and-Audio) and Ref2VA (Reference-to-Video-and-Audio) checkpoint partitions:
+<DiffusionModelTags tags={["video + audio", "T2VA / FL2VA / Ref2VA", "multimodal references", "4–15 seconds", "768p"]} />
+
+## 1. Quick start
+
+Install with `uv pip install "sglang[diffusion]" --prerelease=allow`, then choose
+a verified recipe below. Setup changes the deployment; Server and Request expose
+orthogonal startup and sampling choices.
+
+<Deployment config={config} />
+
+<Note>
+The generated Server command already includes the recommended encoder policy.
+Change a Server option only for a deliberate trade-off; Request options do not
+reload the model.
+</Note>
+
+The Docker form installs the platform-specific diffusion extra from the source
+bundled in the image. For conditioned requests, set **Host media directory**
+under **Variables**; the builder mounts it read-only at `/data/minimax-h3`.
+AMD currently offers the Python form, while NVIDIA also offers Docker.
+
+To use ModelScope through the same normal `sglang serve` path, prefix the copied
+command with `SGLANG_USE_MODELSCOPE=true` and replace the model path with
+`MiniMax/MiniMax-H3`. Keep the selected variant and topology flags unchanged.
+
+For platform-specific installation details, see the
+[SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
+
+## 2. Model capabilities
+
+[MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) is a native joint video-and-audio model for text-to-video-and-audio, first/last-frame control, and multimodal reference conditioning. Its main strength is producing the picture and stereo soundtrack together, so speech, music, ambient sound, and visible events can stay aligned without a separate audio-generation pass.
+
+Choose H3 when synchronized audiovisual output or reference-driven generation matters more than a lightweight deployment. The released recipe targets a 768-pixel short edge at 24 fps for 4–15 seconds, and its capabilities are split across two checkpoint partitions; serving every mode therefore requires separate FL2VA and Ref2VA deployments.
 
 | Task | `task` value | Conditioning |
 | --- | --- | --- |
@@ -29,64 +63,12 @@ mapping; do not point `--model-path` at a manually downloaded subdirectory.
 Review the license and usage terms in the MiniMax-H3 model card before production or commercial use. SGLang support does not grant additional model usage rights.
 </Warning>
 
-## 2. Installation
+## 3. Deployment details
 
-Install SGLang with the diffusion dependencies:
-
-```bash Command
-uv pip install "sglang[diffusion]" --prerelease=allow
-```
-
-For platform-specific setup, see the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
-
-## 3. Serve MiniMax-H3
-
-Use the interactive selector to choose a hardware platform, deployment profile,
-one of the two checkpoint partitions, a request mode, and deployment features.
-It generates Python and, where available, Docker launch forms. AMD selections
-use the Python form until an H3-capable ROCm image is validated. The **$ cURL**
-button follows the selected request mode and switches the payload across
-text-only, all three first/last-frame signatures, and the image/audio/video
-reference combinations listed below.
-Set **Outputs per prompt** in the picker’s **Env** panel to generate more than
-one output without mixing request sampling controls into the deployment
-matrix.
-
-The Docker form does not assume the base SGLang image contains optional
-diffusion dependencies. It installs the platform-specific diffusion extra from
-the source bundled in the image before starting the server. Set **Host media
-directory** in the **Env** panel for FL2VA, V2V, or Ref2VA; the picker mounts
-that directory read-only at `/data/minimax-h3` inside the container.
-
-Every hardware/topology cell in this picker has completed a real request on
-that exact GPU model. Approximate load-time features such as online
-quantization are called out separately in the generated command. Sampling
-behavior such as Cache-DiT is documented separately below.
-
-**Deployment Profile** exposes resident and FSDP placement on B200, B300,
-H200, and H100. Resident is the latency-oriented default; FSDP reduces DiT
-weight residency at the cost of per-block parameter collectives. On H200 it
-also selects the verified 2-node cross-node topology. **Online
-Quantization** appears only on B200 and B300. AMD keeps its resident AITER
-recipe, while RTX 5090 uses its dedicated layerwise-offload profile. A
-single 24 GB card (RTX 4090) uses the same offload knobs plus online
-`kitchen_int8`; that recipe is documented below rather than in the picker.
-
-import { Deployment } from "/src/snippets/_deployment.jsx";
-import { config } from "/src/snippets/configs/MiniMaxAI/minimax-h3.jsx";
-
-<Deployment config={config} />
-
-<Note>
-The ready-to-run request template lives behind the **$ cURL** button in the
-picker above. It regenerates as you change the selection, so the payload it
-shows always matches the serve command next to it.
-</Note>
-
-The selector uses the verified Hugging Face ID. To use ModelScope through the
-same normal `sglang serve` path, prefix the copied command with
-`SGLANG_USE_MODELSCOPE=true` and replace the model path with
-`MiniMax/MiniMax-H3`; keep its selected variant and topology flags unchanged.
+The builder accepts legal custom GPU counts and topologies, marking them
+**Unverified** until the exact recipe has completed end-to-end validation.
+Static H3 head or partition violations disable Copy before they reach
+`sglang serve`.
 
 For a four-card H200 host, keep the full BF16/FP32 model resident by default.
 The model fits without FSDP, so this path avoids the per-block parameter
@@ -98,6 +80,7 @@ sglang serve \
   --model-variant fl2va \
   --num-gpus 4 \
   --ulysses-degree 4 \
+  --encoder-parallel auto \
   --performance-mode speed \
   --port 30010
 ```
@@ -121,6 +104,7 @@ sglang serve \
   --num-gpus 4 \
   --tp-size 2 \
   --ulysses-degree 2 \
+  --encoder-parallel auto \
   --performance-mode speed \
   --port 30010
 ```
@@ -136,6 +120,7 @@ sglang serve \
   --model-variant fl2va \
   --num-gpus 4 \
   --ulysses-degree 4 \
+  --encoder-parallel auto \
   --performance-mode speed \
   --use-fsdp-inference true \
   --port 30010
@@ -153,6 +138,7 @@ sglang serve \
   --num-gpus 2 \
   --tp-size 2 \
   --ulysses-degree 1 \
+  --encoder-parallel auto \
   --performance-mode memory \
   --layerwise-offload-components dit,text_encoder,vae \
   --dit-offload-prefetch-size 1 \
@@ -247,6 +233,59 @@ Face repository requires authentication, export a Hugging Face token in the
 server environment.
 
 For MiniMax-H3, `--performance-mode speed` deliberately keeps the DiT eager. The current `torch.compile` path changes the model's numerical output, so it is not enabled implicitly by any recommended lossless preset. An explicit `--enable-torch-compile true` remains available for controlled experiments, but it should not be used to generate consistency ground truth.
+
+### AdaLN-pruned safetensors transformers
+
+[Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/diffusion_models)
+publishes smaller DiT-only checkpoints that replace the original AdaLN branches
+with an interpolated curve table. Select one file explicitly; the base model
+still supplies the text encoder and VAEs.
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --transformer-weights-path \
+    Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors \
+  --num-gpus 4 \
+  --tp-size 2 \
+  --ulysses-degree 2 \
+  --performance-mode speed \
+  --port 30010
+```
+
+The pruned checkpoint is approximate and is therefore rejected by
+`quality="high"`, which remains limited to the audited official BF16 DiT.
+
+The Comfy `pruned_fp8_scaled` FL2VA and Ref2VA files are also supported. Their
+per-layer markers are detected automatically; do not add `--quantization`:
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --transformer-weights-path \
+    Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_fl2va_pruned_fp8_scaled.safetensors \
+  --num-gpus 4 \
+  --tp-size 2 \
+  --ulysses-degree 2 \
+  --performance-mode speed \
+  --port 30010
+```
+
+SGLang uses its native static-activation FP8 linear path for attention and
+`fc1`. The checkpoint marks `fc2` for full-precision matrix multiplication, so
+SGLang retains its FP8 storage but materializes and scales one compute-dtype
+`fc2` matrix for each call. This preserves the checkpoint's mixed execution
+contract and low resident weight memory, but that part is slower than a fully
+quantized FP8 GEMM. TP, Ulysses/Ring sequence parallelism, and
+component/layerwise offload are supported; FSDP inference is rejected.
+
+The `pruned_int8_convrot` files are detected but remain unsupported. They
+require online regular-Hadamard ConvRot, dynamic INT8 activation quantization,
+and a matching W8A8 GEMM. SGLang fails before loading them instead of silently
+treating their stored INT8 values as ordinary weights. A native ConvRot kernel
+path should be added and benchmarked separately before these files are accepted.
 
 ### Advanced: precomputed AdaLN cache
 
@@ -627,6 +666,7 @@ sglang serve \
   --sp-degree 4 \
   --ulysses-degree 4 \
   --ring-degree 1 \
+  --encoder-parallel auto \
   --performance-mode speed \
   --use-fsdp-inference false \
   --enable-torch-compile false \
@@ -711,6 +751,7 @@ sglang serve \
   --model-variant ref2va \
   --num-gpus 8 \
   --ulysses-degree 8 \
+  --encoder-parallel auto \
   --performance-mode speed \
   --port 30010
 ```
@@ -724,7 +765,11 @@ task profile. A real B200 request has completed, but the `quality: "high"`
 path above remains fail-closed to the audited 4×H200 workload.
 </Warning>
 
-## 7. Runtime feature recipes
+## 7. Feature contracts and advanced recipes
+
+The generated command already contains the recommended topology and encoder
+setting. Use the detailed reference below only when applying an optional
+override or checking its installation, topology limits, and validation evidence.
 
 <Tabs>
 
@@ -738,7 +783,6 @@ listed hardware and topology; it is not inherited by a similar GPU family.
 | --- | --- | --- |
 | Ulysses sequence parallelism | Verified: 8× B200, 4× H200, 4× H100, and Ulysses1/2/4/8 on MI300X and MI355X | Use `--ulysses-degree`. Combine with Ring for cross-node scaling; see the next row. |
 | Ring sequence parallelism (cross-node) | Verified: 2 nodes of 8× H200 each (Ulysses8 × Ring2) | Use `--ring-degree` together with `--nnodes`/`--node-rank`/`--dist-init-addr`. Ring shards the sequence across nodes while Ulysses shards heads within a node; H3's packed multi-segment attention only supports Ring across the node boundary, not within a single node's Ulysses group. Requires `--encoder-parallel replicate` — `auto`'s fold decision is not node-boundary aware. See the benchmark section below. |
-| SageAttention | Supported | Use `--attention-backend sage_attn` to select the native packed varlen path; install the SageAttention dependency first. |
 | Tensor parallelism | Verified: B200 TP2 + Ulysses4; H100 TP2 + Ulysses2 and TP4 + Ulysses1 | `--tp-size` may be combined with Ulysses when the TP-local head count remains divisible by the Ulysses degree. On 4×H100, TP2 + Ulysses2 is the measured speed default. |
 | FSDP inference | Verified: 4× B200 and 4× H100 + Ulysses4 | Preserves H3's mixed BF16/FP32 parameter policy. B200 completed the exact eager comparison; H100 completed consecutive real requests at about 57 GB peak memory per GPU. |
 | Resident components | Verified: B200, H200, 4×H100 with TP, and 1/2/4/8× MI300X and MI355X | This is the recommended single-request latency path when the complete workload fits. |
@@ -761,6 +805,7 @@ sglang serve \
   --model-variant ref2va \
   --num-gpus 8 \
   --ulysses-degree 8 \
+  --encoder-parallel auto \
   --performance-mode speed \
   --enable-breakable-cuda-graph true \
   --warmup-resolutions 1344x768 \
@@ -774,6 +819,29 @@ different task profile, reference set, resolution, or prompt template.
 
 </Tab>
 
+<Tab title="Attention backends">
+
+Leave `--attention-backend` unset for the platform default. Use
+`--attention-backend fa` only for an explicit FlashAttention comparison.
+
+SageAttention uses quantized attention math and is not a consistency mode. To
+select H3's native packed-varlen Sage path, install the dependency and add
+`--attention-backend sage_attn`. On Hopper, install the upstream SM90 binding
+fix rather than the PyPI 2.2.0 build:
+
+```bash Command
+pip install --force-reinstall \
+  git+https://github.com/thu-ml/SageAttention.git@d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4 \
+  --no-build-isolation
+```
+
+The backend is a server-wide default. Use
+`--component-attention-backends` only when a measured component needs a
+different kernel, and keep the platform default for every component not named
+in the override.
+
+</Tab>
+
 <Tab title="Online quantization">
 
 On the verified 8× B200 topology, quantize the BF16 transformer at server load:
@@ -784,6 +852,7 @@ sglang serve \
   --model-variant ref2va \
   --num-gpus 8 \
   --ulysses-degree 8 \
+  --encoder-parallel auto \
   --performance-mode speed \
   --quantization fp8 \
   --port 30010
@@ -799,6 +868,7 @@ sglang serve \
   --model-variant ref2va \
   --num-gpus 8 \
   --ulysses-degree 8 \
+  --encoder-parallel auto \
   --quantization fp8 \
   --quantization-ignored-layers blocks.0.attn token_refiner \
   --port 30010
@@ -808,8 +878,8 @@ sglang serve \
 Online FP8 is approximate and is not a consistency ground-truth mode. It can
 be combined with Cache-DiT, but the two approximations compound. Validate
 visual quality, audio quality, memory use, and latency on the target workload.
-The picker exposes this option only on the B200 and B300 topologies used for
-real H3 validation runs.
+This recipe is limited to the resident B200 and B300 topologies used for real
+H3 validation runs.
 </Warning>
 
 On a single 24 GB card, use `kitchen_int8` instead of FP8. It quantizes the
@@ -868,6 +938,33 @@ fails closed if the native encoder does not support that format. The language
 linear layers use FP8 while embeddings, normalization, and the vision tower
 remain BF16. This is an approximate serve-time choice and is incompatible with
 the strict `quality="high"` deployment contract.
+
+</Tab>
+
+<Tab title="Encoder scheduling">
+
+The picker explicitly writes `--encoder-parallel auto` in every single-node
+recipe. At the default request batch size of one, H100/H200/B200/B300 servers
+with peer-to-peer access fold the Qwen encoder across otherwise idle Ulysses
+ranks. A pure-TP recipe keeps the encoder inside its TP group, while a
+PCIe-only host can avoid an expensive world fold. Keep `auto` unless one of
+the cases below applies.
+
+Encoder DP is a throughput policy for compatible request batches. It requires
+TP1 and DiT DP1, replicates the encoder weights, and does not improve a batch
+of one:
+
+```bash Overlay
+--encoder-parallel dp \
+--batching-max-size 2
+```
+
+The cross-node picker recipe already uses replication because the automatic
+fold decision is not node-boundary aware:
+
+```bash Overlay
+--encoder-parallel replicate
+```
 
 </Tab>
 
@@ -942,7 +1039,7 @@ The swept axes are `--model-variant` (`fl2va` / `ref2va`), `--quantization`
 
 This is a single-request latency sweep (`batching_max_size: 1`), so encoder DP
 is intentionally excluded: it cannot distribute a batch of one. Use the
-picker’s **DP (batched throughput)** option for a multi-request throughput
+**DP for a request batch** setting above for a compatible multi-request
 deployment; the table below does not claim a measured H3 DP speedup.
 
 **Driver.**
