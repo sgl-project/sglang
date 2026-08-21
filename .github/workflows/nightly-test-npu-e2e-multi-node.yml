@@ -67,7 +67,7 @@ on:
       test_timeout_minutes:
         required: false
         type: string
-        default: '300'
+        default: '180'
         description: 'timeout-minutes for the Run test step'
 
 concurrency:
