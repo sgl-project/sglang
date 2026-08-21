@@ -11,7 +11,7 @@ class TestDiffusionImportIsolation(unittest.TestCase):
         """Diffusion modules must remain usable without the optional MLX path."""
         script = """
 import sys
-from sglang.kernels.ops.diffusion.triton.norm import norm_infer
+from sglang.kernels.ops.diffusion import norm_infer
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 assert norm_infer is not None and RMSNorm is not None
 assert not any(name == "mlx" or name.startswith("mlx.") for name in sys.modules)
