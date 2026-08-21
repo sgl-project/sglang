@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
+    FalconMambaConfig,
     GraniteMoeHybridConfig,
     InklingMMConfig,
     InklingModelConfig,
@@ -15,6 +16,8 @@ from sglang.srt.configs import (
     Lfm2Config,
     Lfm2MoeConfig,
     Lfm2VlConfig,
+    Mamba2Config,
+    MambaConfig,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Qwen3_5Config,
@@ -75,7 +78,10 @@ def mamba2_config(model_config: ModelConfig):
         | Lfm2Config
         | Lfm2MoeConfig
         | Lfm2VlConfig
-        | ZayaConfig,
+        | ZayaConfig
+        | Mamba2Config
+        | MambaConfig
+        | FalconMambaConfig,
     ):
         return config
     if isinstance(config, InklingModelConfig):
