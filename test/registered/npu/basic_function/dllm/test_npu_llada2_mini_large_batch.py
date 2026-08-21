@@ -9,11 +9,14 @@ batch, and (in the second case) prefill and decode rows scheduled into one
 round. Keep both files: they cover opposite ends of the deployment range.
 """
 
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
+from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline
 from sglang.test.ascend.test_ascend_utils import LLaDA2_0_MINI_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -48,6 +51,39 @@ def assert_mixed_rounds(test, expected: bool):
             )
         else:
             test.assertEqual(state["dllm_num_mixed_rounds"], 0)
+
+
+def run_staggered_pr_traffic(base_url, num_requests=32):
+    """Concurrent, staggered requests so a mixed round can actually form.
+
+    On PR pipelines the mixin's test_gsm8k short-circuits to a single smoke
+    request. One request is either prefilling or decoding, never both, so
+    ``_should_mix_dllm_batches`` (which needs num_prefill_reqs > 0 AND
+    num_decode_reqs > 0 in the same round) can never pass and
+    ``dllm_num_mixed_rounds`` stays 0. Staggered arrivals keep later requests
+    in prefill while earlier ones are still denoising their 128-token
+    completions (>= 4 decode blocks, many rounds), which is exactly the
+    overlap the gate waits for. Prompts differ per request so prefix caching
+    cannot collapse a prefill into a no-op.
+    """
+
+    def one_request(i):
+        time.sleep(0.05 * i)
+        response = requests.post(
+            f"{base_url}/generate",
+            json={
+                "text": f"Question {i}: compute {i} + {i} and explain. Answer:",
+                "sampling_params": {"temperature": 0, "max_new_tokens": 128},
+            },
+            timeout=300,
+        )
+        assert response.status_code == 200, response.text
+
+    # max_workers must cover every request: the stagger relies on all threads
+    # starting their sleeps together rather than queueing behind the pool.
+    with ThreadPoolExecutor(max_workers=num_requests) as pool:
+        # list() drains the iterator so a worker's exception re-raises here.
+        list(pool.map(one_request, range(num_requests)))
 
 
 _LARGE_BATCH_ARGS = [
@@ -105,6 +141,11 @@ class TestLLaDA2MiniMixedRound(GSM8KAscendMixin, CustomTestCase):
     def test_gsm8k(self):
         # See TestLLaDA2MiniLargeBatch.test_gsm8k.
         super().test_gsm8k()
+        if _is_pr_pipeline:
+            # The PR smoke path sends one request, which can never put a
+            # prefill row and a decode row in the same round; drive real
+            # overlapping traffic before asserting the counter moved.
+            run_staggered_pr_traffic(self.base_url)
         assert_mixed_rounds(self, True)
 
 
