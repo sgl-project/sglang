@@ -17,6 +17,38 @@
 #include "utils.h"  // WARP_SIZE
 #endif
 
+inline void* resolve_device_accessible_ptr(const at::Tensor& tensor) {
+  void* ptr = tensor.data_ptr();
+#if defined(USE_ROCM)
+  if (tensor.device().is_cpu()) {
+    void* device_ptr = nullptr;
+    C10_CUDA_CHECK(hipHostGetDevicePointer(&device_ptr, ptr, 0));
+    return device_ptr;
+  }
+#elif !defined(USE_MUSA)
+  if (tensor.device().is_cpu()) {
+    void* device_ptr = nullptr;
+    C10_CUDA_CHECK(cudaHostGetDevicePointer(&device_ptr, ptr, 0));
+    return device_ptr;
+  }
+#endif
+  return ptr;
+}
+
+#if !defined(USE_MUSA)
+int64_t get_device_accessible_ptr(const at::Tensor& tensor, int64_t device_index) {
+  TORCH_CHECK(device_index >= 0, "Target device index must be non-negative");
+  const c10::Device target_device(c10::DeviceType::CUDA, static_cast<c10::DeviceIndex>(device_index));
+  const at::cuda::OptionalCUDAGuard device_guard(target_device);
+  if (tensor.is_cuda()) {
+    TORCH_CHECK(tensor.device() == target_device, "GPU tensor must be on the target device");
+  } else {
+    TORCH_CHECK(tensor.device().is_cpu(), "Only CPU and target-device tensors are supported");
+  }
+  return reinterpret_cast<int64_t>(resolve_device_accessible_ptr(tensor));
+}
+#endif
+
 #if !defined(USE_ROCM) && !defined(USE_MUSA)
 __device__ __forceinline__ void
 transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes) {
@@ -335,6 +367,10 @@ void transfer_kv_launcher(
   TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "Source and destination indices must have the same length");
   TORCH_CHECK(item_size % 8 == 0, "Item byte size must be divisible by 8");
 
+#if !defined(USE_MUSA)
+  const at::cuda::OptionalCUDAGuard device_guard(src_indices.device());
+#endif
+
   auto div_up = [](int64_t x, int64_t y) { return (x + y - 1) / y; };
   const int64_t num_items = src_indices.numel();
   const int64_t items_per_warp = div_up(num_items, block_quota * num_warps_per_block);
@@ -342,10 +378,10 @@ void transfer_kv_launcher(
   dim3 grid_dim(num_blocks, 1, 1);
   const int32_t threads_per_block = num_warps_per_block * WARP_SIZE;
 
-  const void* src_k_ptr = src_k.defined() ? src_k.data_ptr() : nullptr;
-  void* dst_k_ptr = dst_k.defined() ? dst_k.data_ptr() : nullptr;
-  const void* src_v_ptr = IsMLA || !src_v.defined() ? nullptr : src_v.data_ptr();
-  void* dst_v_ptr = IsMLA || !dst_v.defined() ? nullptr : dst_v.data_ptr();
+  const void* src_k_ptr = src_k.defined() ? resolve_device_accessible_ptr(src_k) : nullptr;
+  void* dst_k_ptr = dst_k.defined() ? resolve_device_accessible_ptr(dst_k) : nullptr;
+  const void* src_v_ptr = IsMLA || !src_v.defined() ? nullptr : resolve_device_accessible_ptr(src_v);
+  void* dst_v_ptr = IsMLA || !dst_v.defined() ? nullptr : resolve_device_accessible_ptr(dst_v);
   const uintptr_t* src_k_tbl_ptr = src_k_layers.defined() ? src_k_layers.data_ptr<uintptr_t>() : nullptr;
   const uintptr_t* dst_k_tbl_ptr = dst_k_layers.defined() ? dst_k_layers.data_ptr<uintptr_t>() : nullptr;
   const uintptr_t* src_v_tbl_ptr = IsMLA || !src_v_layers.defined() ? nullptr : src_v_layers.data_ptr<uintptr_t>();
