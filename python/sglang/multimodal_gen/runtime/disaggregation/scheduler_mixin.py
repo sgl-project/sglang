@@ -736,6 +736,56 @@ class SchedulerDisaggMixin:
 
         return data
 
+    def _broadcast_recv_reqs(self: Scheduler, recv_reqs):
+        """Share the rank-0 ZMQ poll result with the other ranks.
+
+        Control messages still go through CPU ``broadcast_pyobj``. ``Req``
+        tensors go through NCCL via ``_broadcast_req_to_all_ranks`` so the
+        ComfyUI / SP path no longer pickles GPU latents onto the gloo group.
+        """
+        if not self._is_multi_rank():
+            return recv_reqs if recv_reqs is not None else []
+
+        is_rank0 = self.gpu_id == 0
+        if is_rank0:
+            envelope = []
+            for identity, payload in recv_reqs:
+                if isinstance(payload, Req):
+                    envelope.append((identity, "req", 1))
+                elif (
+                    isinstance(payload, list)
+                    and payload
+                    and all(isinstance(item, Req) for item in payload)
+                ):
+                    envelope.append((identity, "req_list", len(payload)))
+                else:
+                    envelope.append((identity, "other", 1))
+        else:
+            envelope = None
+
+        envelope = self._broadcast_to_all_ranks(envelope)
+        if not envelope:
+            return []
+
+        out = []
+        src_idx = 0
+        for identity, kind, count in envelope:
+            if kind == "req":
+                src = recv_reqs[src_idx][1] if is_rank0 else None
+                out.append((identity, self._broadcast_req_to_all_ranks(src)))
+            elif kind == "req_list":
+                src_list = recv_reqs[src_idx][1] if is_rank0 else [None] * count
+                synced = [
+                    self._broadcast_req_to_all_ranks(src_list[i] if is_rank0 else None)
+                    for i in range(count)
+                ]
+                out.append((identity, synced))
+            else:
+                other = recv_reqs[src_idx][1] if is_rank0 else None
+                out.append((identity, self._broadcast_to_all_ranks(other)))
+            src_idx += 1
+        return out
+
     def _is_multi_rank(self: Scheduler) -> bool:
         sa = self.server_args
         return sa.sp_degree != 1 or sa.tp_size > 1 or sa.enable_cfg_parallel
