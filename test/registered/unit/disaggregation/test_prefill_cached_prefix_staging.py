@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.prefill import (
     SchedulerDisaggregationPrefillMixin,
 )
@@ -31,6 +32,51 @@ class _Allocator:
     @staticmethod
     def translate_kv_indices_for_transfer(indices):
         return indices + 100
+
+    @staticmethod
+    def translate_loc_from_full_to_swa(indices):
+        return indices + 200
+
+
+def test_stage_final_swa_transfer_respects_decode_prefix():
+    req = SimpleNamespace(
+        pending_bootstrap=False,
+        extend_range=SimpleNamespace(end=20),
+        origin_input_ids=list(range(20)),
+        start_send_idx=0,
+        req_pool_idx=0,
+        rid="request-1",
+        disagg_decode_prefix_len=12,
+    )
+    scheduler = SimpleNamespace(
+        token_to_kv_pool_allocator=_Allocator(),
+        req_to_token_pool=SimpleNamespace(req_to_token=torch.arange(32).view(1, 32)),
+        disagg_prefill_bootstrap_queue=SimpleNamespace(
+            kv_manager=SimpleNamespace(
+                kv_args=SimpleNamespace(state_types=[StateType.SWA])
+            )
+        ),
+        sliding_window_size=16,
+        disagg_prefill_pending_chunk_rids=set(),
+    )
+    staged_full = torch.tensor([1])
+    staged_swa = torch.tensor([2])
+
+    with (
+        patch(
+            "sglang.srt.disaggregation.prefill._copy_page_indices_to_pinned_cpu",
+            side_effect=[staged_full, staged_swa],
+        ) as copy_page_ids,
+        patch("sglang.srt.disaggregation.prefill.is_aborted", return_value=False),
+    ):
+        staged = SchedulerDisaggregationPrefillMixin.stage_prefill_transfer_indices(
+            scheduler, SimpleNamespace(reqs=[req])
+        )
+
+    assert staged[req.rid].swa_page_indices is staged_swa
+    torch.testing.assert_close(
+        copy_page_ids.call_args_list[1].args[0], torch.arange(12, 20) + 200
+    )
 
 
 def test_stage_cached_prefix_transfer_indices_before_send():
