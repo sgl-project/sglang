@@ -543,16 +543,32 @@ class DeepseekMLARocmForwardMixin:
                 q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
         fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
-        if (
-            self.rotary_emb is not None
-            and (not fuse_rope_for_trtllm_mla)
-            and (not self._skip_rope_for_dsa_tilelang_fused())
-            and (not self._skip_rope_for_aiter_fused_mla())
+
+        # The fused rope+cache-write kernel writes at the virtual out_cache_loc,
+        # which is wrong under DCP, so force the standalone rope there.
+        force_rope_for_aiter_dcp_decode = (
+            get_parallel().dcp_enabled
             and (
-                not _use_aiter
-                or not _is_gfx95_supported
-                or self.use_dsa
-                or self.current_attention_backend == "triton"
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
+            and _use_aiter_gfx95
+            and self.current_attention_backend
+            not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
+        )
+        if self.rotary_emb is not None and (
+            force_rope_for_aiter_dcp_decode
+            or (
+                (not fuse_rope_for_trtllm_mla)
+                and (not self._skip_rope_for_dsa_tilelang_fused())
+                and (not self._skip_rope_for_aiter_fused_mla())
+                and (
+                    not _use_aiter
+                    or not _is_gfx95_supported
+                    or self.use_dsa
+                    or self.current_attention_backend == "triton"
+                )
             )
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
@@ -592,18 +608,23 @@ class DeepseekMLARocmForwardMixin:
                         q_pe=q_pe,
                     )
             elif forward_batch.forward_mode.is_extend():
-                # for extend, gather kv
-                all_gather_kv_cache_for_mla_extend(
-                    get_token_to_kv_pool(),
-                    self.attn_mqa,
-                    forward_batch.extend_prefix_lens_cpu,
-                    forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
-                    forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
-                    forward_batch.attn_dcp_metadata.dcp_kv_buffer,
-                    self.kv_lora_rank,
-                    k_nope,
-                    k_pe,
-                )
+                # Assemble the full sequence into dcp_kv_buffer, which the
+                # backend attends over instead of the sharded local cache.
+                if (
+                    forward_batch.attn_dcp_metadata is not None
+                    and forward_batch.attn_dcp_metadata.dcp_kv_buffer is not None
+                ):
+                    all_gather_kv_cache_for_mla_extend(
+                        get_token_to_kv_pool(),
+                        self.attn_mqa,
+                        forward_batch.extend_prefix_lens_cpu,
+                        forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
+                        forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
+                        forward_batch.attn_dcp_metadata.dcp_kv_buffer,
+                        self.kv_lora_rank,
+                        k_nope,
+                        k_pe,
+                    )
             else:
                 logger.warning(
                     f"not supported forward_mode {forward_batch.forward_mode}"
@@ -734,6 +755,45 @@ class DeepseekMLARocmForwardMixin:
                             else {}
                         ),
                     )
+        elif (
+            _use_aiter
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
+            and get_parallel().dcp_enabled
+        ):
+            # aiter DCP decode over this rank's KV shard, returning (out, lse)
+            # for the cross-rank merge below. Cannot use is_dcp_mla_decode_phase():
+            # that helper omits draft-extend-v2, which needs the same treatment.
+            q = torch.cat([q_nope_out, q_pe], dim=-1)
+            if llama_4_scaling is not None:
+                q *= llama_4_scaling
+            # set_mla_kv_buffer owner-filters and shards internally, so pass the
+            # RAW loc: pre-dividing here would double-apply the filter.
+            get_token_to_kv_pool().set_mla_kv_buffer(
+                self.attn_mqa,
+                forward_batch.out_cache_loc,
+                k_nope,
+                k_pe,
+            )
+            # Decode reads its KV back from the shard; target-verify cannot,
+            # since the window it must attend densely is split across ranks.
+            if forward_batch.forward_mode.is_target_verify():
+                k_window = torch.cat([k_nope, k_pe], dim=-1)
+                v_window = k_nope
+            else:
+                k_window = None
+                v_window = None
+            attn_output, lse = self.attn_mqa_for_dcp_decode(
+                q,
+                k_window,
+                v_window,
+                forward_batch,
+                save_kv_cache=False,
+                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+            )
         else:
             if self._skip_rope_for_aiter_fused_mla():
                 q, _, _, k = _fused_rope_cat_and_cache(
@@ -878,4 +938,8 @@ class DeepseekMLARocmForwardMixin:
         when running aiter-backend MLA on gfx95 (i.e., the `else` branch in
         forward_absorb_rocm_core that calls fused_qk_rope_cat_and_cache_mla).
         """
-        return _use_aiter_gfx95 and self.current_attention_backend == "aiter"
+        return (
+            _use_aiter_gfx95
+            and self.current_attention_backend == "aiter"
+            and self.rotary_emb is not None
+        )

@@ -462,6 +462,34 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["speculative_attention_mode"] = "decode"
 
         prefill_backend, decode_backend = attention_backends_of(server_args)
+        if decode_backend == "aiter":
+            # ag_rs merges the per-rank partials by default; --dcp-comm-backend
+            # a2a avoids its grouped self-P2P RCCL path (sgl-project/sglang#32831).
+            # Either prefill backend is KV-compatible: both write the same latent KV.
+            prefill_ab = "triton" if prefill_backend == "triton" else "aiter"
+            dcp_comm = (
+                server_args.dcp_comm_backend
+                if server_args.dcp_comm_backend in ("a2a", "fi_a2a")
+                else "ag_rs"
+            )
+            logger.info(
+                "Kimi-K3 DCP uses aiter MLA decode: "
+                f"prefill={prefill_backend!r} -> {prefill_ab!r}, "
+                f"decode={decode_backend!r} -> 'aiter' (dcp_comm_backend -> {dcp_comm!r})."
+            )
+            overrides.update(
+                prefill_attention_backend=prefill_ab,
+                decode_attention_backend="aiter",
+                dcp_comm_backend=dcp_comm,
+            )
+            # ag_rs needs the head-dim Q all-gather; a2a/fi_a2a project locally.
+            if server_args.dcp_replicate_q_proj is None:
+                overrides["dcp_replicate_q_proj"] = dcp_comm in ("a2a", "fi_a2a")
+            if server_args.page_size is None:
+                # The decode KV tile is the paged block size, and under DCP the
+                # allocator's page is page_size * dcp_size. 32 measured fastest.
+                overrides["page_size"] = 32
+            return overrides
         if decode_backend == "cutedsl_mla" or decode_backend is None:
             _require_kimi_k3_cutedsl_dcp_support()
             logger.info(
