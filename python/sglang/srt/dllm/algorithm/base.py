@@ -41,9 +41,12 @@ def argmax_and_softmax_prob(
     Three implementations of the same quantity, picked by what the caller has
     already paid for:
 
-    * a fused single-pass kernel when one is available for this device;
     * ``softmax(logits).gather(argmax)`` when the logits are already an fp32
-      ``[tokens, vocab]`` tensor;
+      ``[tokens, vocab]`` tensor. Callers that retain fp32 do so to keep the
+      pre-existing numerics and latency, so this path is taken even when a
+      fused kernel is installed;
+    * a fused single-pass kernel, when one is available for this device, for
+      logits kept in lm_head dtype;
     * otherwise a max reduction plus a vocab-chunked exp-sum, whose transients
       are only ``[tokens, vocab_chunk]``. This is the path that lets a caller
       keep the logits in lm_head dtype and never materialize the fp32
@@ -54,12 +57,9 @@ def argmax_and_softmax_prob(
     The argmax is identical across all three; the probability differs only by
     exp's precision in the input dtype.
     """
-    if _argmax_softmax_prob_fused is not None:
-        # Single-pass fused kernel: one read of the logits vs the 5-6 below.
-        return _argmax_softmax_prob_fused(full_logits_2d)
-
     if full_logits_2d.dtype == torch.float32:
-        # The fp32 copy already exists; chunking would save nothing.
+        # The fp32 copy already exists; chunking would save nothing, and the
+        # caller retained fp32 precisely to keep this exact path.
         argmax_ids = torch.argmax(full_logits_2d, dim=-1)
         prob = torch.gather(
             torch.softmax(full_logits_2d, dim=-1),
@@ -67,6 +67,10 @@ def argmax_and_softmax_prob(
             index=argmax_ids.unsqueeze(-1),
         ).squeeze(-1)
         return argmax_ids, prob
+
+    if _argmax_softmax_prob_fused is not None:
+        # Single-pass fused kernel: one read of the logits vs the 5-6 below.
+        return _argmax_softmax_prob_fused(full_logits_2d)
 
     row_max, argmax_ids = torch.max(full_logits_2d, dim=-1)
     row_max_col = row_max.unsqueeze(1)

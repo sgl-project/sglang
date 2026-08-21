@@ -16,7 +16,7 @@ implementations of that pair and picks between them by input dtype:
 """
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -56,6 +56,20 @@ class TestArgmaxAndSoftmaxProb(CustomTestCase):
         # every platform that hands the algorithms fp32 logits.
         logits = self._logits(12, 4099)
         ids, prob = argmax_and_softmax_prob(logits)
+        want_ids, want_prob = _reference(logits)
+        self.assertTrue(torch.equal(ids, want_ids))
+        self.assertTrue(torch.equal(prob, want_prob))
+
+    def test_fp32_input_bypasses_an_installed_fused_kernel(self):
+        # Callers that retain fp32 logits (below-threshold batches in
+        # logits_processor) do so to keep the pre-existing numeric and latency
+        # path. Installing the optional fused kernel must not reroute them: the
+        # fp32 branch has to win the dispatch.
+        logits = self._logits(12, 4099)
+        fused = MagicMock(side_effect=AssertionError("fused kernel called"))
+        with patch("sglang.srt.dllm.algorithm.base._argmax_softmax_prob_fused", fused):
+            ids, prob = argmax_and_softmax_prob(logits)
+        fused.assert_not_called()
         want_ids, want_prob = _reference(logits)
         self.assertTrue(torch.equal(ids, want_ids))
         self.assertTrue(torch.equal(prob, want_prob))
