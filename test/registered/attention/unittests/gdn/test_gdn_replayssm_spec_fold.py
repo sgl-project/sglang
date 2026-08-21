@@ -262,10 +262,9 @@ class TestGdnReplayssmSpecFold(CustomTestCase):
             page_size=16,
             prefix_lens=(4, 7, 5),
             extend_lens=(draft_token_num,) * 3,
+            enable_linear_replayssm_spec=True,
         )
-        fixture = build_gdn_attention_fixture(
-            self, case, enable_linear_replayssm_spec=True
-        )
+        fixture = build_gdn_attention_fixture(self, case)
         linear_backend = fixture.backend.linear_attn_backend
         spec_state = fixture.runner.req_to_token_pool.mamba_pool.mamba_cache
         layer_cache = fixture.runner.req_to_token_pool.mamba2_layer_cache(0)
