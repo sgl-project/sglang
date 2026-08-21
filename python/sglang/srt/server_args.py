@@ -359,6 +359,12 @@ DSA_CHOICES = [
 ]
 NSA_CHOICES = DSA_CHOICES  # deprecated alias
 
+DSV4_PREFILL_BACKEND_CHOICES = [
+    "auto",
+    "flashmla_sparse",
+    "flashmla_sparse_q8",
+]
+
 DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
 
 DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = ["auto", "deepgemm", "cutedsl", "aiter"]
@@ -1805,6 +1811,18 @@ class ServerArgs:
         ),
         NS("exec.kernel"),
     ] = None
+    dsv4_prefill_backend: A[
+        str,
+        Arg(
+            help=(
+                "DeepSeek-V4 sparse prefill backend. 'auto' and "
+                "'flashmla_sparse' use the existing BF16 sparse prefill path; "
+                "'flashmla_sparse_q8' enables the Q8KV8 sparse prefill path."
+            ),
+            choices=DSV4_PREFILL_BACKEND_CHOICES,
+        ),
+        NS("exec.kernel"),
+    ] = "auto"
     dsa_decode_backend: A[
         Optional[str],
         Arg(
@@ -2683,7 +2701,7 @@ class ServerArgs:
     ] = "cache"
     hicache_ratio: A[
         Optional[float],
-        "The ratio of the size of host KV cache memory pool to the size of device pool. Defaults to 2.0 in cache mode, 1.2 in buffer_only mode, or 1.0 for host-pool decode retraction.",
+        "The ratio of the size of host KV cache memory pool to the size of device pool. Defaults to 2.0 in cache mode, 1.2 in buffer_only mode, or 0.2 for backup-only host-pool decode retraction.",
         NS("memory"),
     ] = None
     hicache_size: A[
@@ -5638,17 +5656,11 @@ class ServerArgs:
             # enable_multi_layer_eagle for EAGLE moved to the override registry
             # (arg_groups/overrides.py: _mimo_v2_overrides).
 
-            if self.enable_hierarchical_cache:
-                if not envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
-                    raise ValueError(
-                        "Hierarchical cache for MiMoV2 requires the unified "
-                        "radix tree. Set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 "
-                        "to enable --enable-hierarchical-cache for this model."
-                    )
-
-                # MiMoV2 has head_dim != v_head_dim, so the host KV pool uses
-                # asymmetric K/V allocation. Both kernel/page_first and
-                # direct/page_first_direct have split K/V transfer paths.
+            # MiMoV2 hierarchical cache runs on the unified radix tree, which
+            # is the default tree cache now. MiMoV2 has head_dim != v_head_dim,
+            # so the host KV pool uses asymmetric K/V allocation. Both
+            # kernel/page_first and direct/page_first_direct have split K/V
+            # transfer paths.
         elif (
             "Step3p5ForCausalLM" in model_arch
             or "Step3p7ForConditionalGeneration" in model_arch
