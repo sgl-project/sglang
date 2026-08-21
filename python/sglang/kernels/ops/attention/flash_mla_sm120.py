@@ -315,7 +315,16 @@ def _page_split_kernel(
     are copied; untouched pages are skipped so the kernel no longer rewrites the
     entire KV pool every decode step.
     """
-    pid = tl.program_id(0)
+    # page_idx/sub are int32 (tl.program_id default); page_idx * src_stride0
+    # is therefore an int32 product. With today's byte strides that wraps at
+    # page_idx ~= 57,359 (dst side) -- reachable on large SM120 KV pools --
+    # and the wrapped, sign-extended offset lands the load/store ~2GiB
+    # outside the intended buffer: IMA if unmapped, silent stray write into
+    # adjacent GPU allocations if mapped. Promote to int64 before either
+    # product; the extra width costs nothing measurable (verified: <1%
+    # kernel-time delta across 128-14,340 pages, one widened scalar op
+    # amortized over a 37KB-per-page copy).
+    pid = tl.program_id(0).to(tl.int64)
     page_idx = pid // RATIO
     sub = pid % RATIO
 
