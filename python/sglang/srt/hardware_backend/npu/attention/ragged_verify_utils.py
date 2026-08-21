@@ -11,7 +11,6 @@ def get_npu_bucketed_ragged_verify_layout(
     spec_info,
     layout: RaggedVerifyLayout,
     padded_bs: int,
-    cap: int,
 ) -> RaggedVerifyLayout:
     """Memoize the NPU derivative of a live compact verify layout.
 
@@ -21,22 +20,19 @@ def get_npu_bucketed_ragged_verify_layout(
     interfaces remain unchanged.
     """
     padded_bs = int(padded_bs)
-    cap = int(cap)
     cached = getattr(spec_info, "_npu_ragged_verify_bucket_cache", None)
-    if (
-        cached is not None
-        and cached[0] is layout
-        and cached[1] == padded_bs
-        and cached[2] == cap
-    ):
-        return cached[3]
+    if cached is not None and cached[0] is layout and cached[1] == padded_bs:
+        return cached[2]
 
-    padded = layout.padded_to_bucket(padded_bs=padded_bs, cap=cap)
+    padded = layout.padded_to_bucket(
+        padded_bs=padded_bs,
+        cap=spec_info.draft_token_num,
+    )
     # Retaining layout prevents a later source from colliding through a
     # recycled Python object id. A new source or geometry replaces the cache.
     setattr(
         spec_info,
         "_npu_ragged_verify_bucket_cache",
-        (layout, padded_bs, cap, padded),
+        (layout, padded_bs, padded),
     )
     return padded

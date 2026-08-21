@@ -780,15 +780,6 @@ class AscendAttnBackend(AttentionBackend):
                         spec_info=spec_info,
                         layout=ragged_layout,
                         padded_bs=bs,
-                        cap=int(
-                            getattr(
-                                spec_info,
-                                "draft_token_num",
-                                self.speculative_num_draft_tokens,
-                            )
-                            or self.speculative_num_draft_tokens
-                            or 1
-                        ),
                     )
                 seq_lens = seq_lens + ragged_layout.verify_lens.to(seq_lens.dtype)
             else:

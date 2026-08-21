@@ -106,12 +106,13 @@ class CompressorAscendBackendMixin:
     @staticmethod
     def _ragged_verify_layout(forward_batch: ForwardBatch):
         layout = resolve_ragged_verify_layout(forward_batch)
-        if layout is not None and layout.bs != forward_batch.batch_size:
+        if layout is not None and (
+            layout.bs != forward_batch.batch_size or layout.cap is None
+        ):
             layout = get_npu_bucketed_ragged_verify_layout(
                 spec_info=forward_batch.spec_info,
                 layout=layout,
                 padded_bs=forward_batch.batch_size,
-                cap=forward_batch.spec_info.draft_token_num,
             )
         return layout
 
@@ -1139,17 +1140,6 @@ class DeepseekV4AscendAttnBackend(
         verify_lens = None
         verify_lens_cpu = None
         if ragged_layout is not None:
-            # Replay receives the live layout on spec_info, whereas capture
-            # used a graph-owned layout padded to the tier's request slots.
-            # Recreate the same geometry here, then copy it into the stable
-            # captured Q-indptr buffer below.
-            if ragged_layout.bs != bs or ragged_layout.cap is None:
-                ragged_layout = get_npu_bucketed_ragged_verify_layout(
-                    spec_info=forward_batch.spec_info,
-                    layout=ragged_layout,
-                    padded_bs=bs,
-                    cap=tokens_per_bs,
-                )
             verify_lens = ragged_layout.verify_lens.to(device=device, dtype=torch.int32)
             # Correctness-first host mirror for compressor position planning.
             # The graph-owned Q indptr remains device-side and is refreshed
