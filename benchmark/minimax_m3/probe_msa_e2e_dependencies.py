@@ -10,6 +10,7 @@ import importlib
 import inspect
 import json
 import os
+import re
 import subprocess
 from importlib import metadata
 from pathlib import Path
@@ -20,6 +21,14 @@ REQUIRED_GPQA_COLUMNS = {
     "Incorrect Answer 1",
     "Incorrect Answer 2",
     "Incorrect Answer 3",
+}
+REQUIRED_TP4_SM103_ROUTES = {
+    "topk_select.topk16": {"topk"},
+    "long_bf16_reverse_prefill.paged_gqa16_sm103": {
+        "long_prefill_paged_bf16_gqa16_sm103",
+        "long_prefill_reduce_paged_bf16_gqa16",
+    },
+    "direct_m16_decode.bf16_paged": {"decode_m16_bf16_paged"},
 }
 REQUIRED_SGLANG_KERNEL_VERSION = "0.4.6.post1"
 REQUIRED_TORCH_VERSION = "2.13.0"
@@ -189,6 +198,7 @@ def probe_flashinfer(source: Path, expected_head: str) -> dict:
         raise RuntimeError(
             f"installed flashinfer.msa_ops is missing callables: {missing}"
         )
+    route_manifest = probe_blackwell_msa_route_manifest(source)
     return {
         "source_path": str(source),
         "source_head": head,
@@ -196,6 +206,77 @@ def probe_flashinfer(source: Path, expected_head: str) -> dict:
         "version": getattr(flashinfer, "__version__", None),
         "prefill_signature": str(inspect.signature(msa_ops.msa_sparse_attention)),
         "decode_signature": str(inspect.signature(msa_ops.msa_sparse_decode_attention)),
+        "route_manifest": route_manifest,
+    }
+
+
+def probe_blackwell_msa_route_manifest(source: Path) -> dict:
+    """Verify the generated-source routes exercised by the GB300 TP4 gate."""
+
+    manifest_path = source / "csrc" / "blackwell_msa" / "route_manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError(f"FlashInfer MSA route manifest is missing: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text())
+    routes = manifest.get("reachable_specializations", [])
+    if manifest.get("operation") != "blackwell_msa":
+        raise RuntimeError("FlashInfer route manifest has the wrong operation")
+    if int(manifest.get("attention_topk", 0)) != 16:
+        raise RuntimeError(
+            "FlashInfer route manifest does not freeze attention top-k 16"
+        )
+    if int(manifest.get("reachable_specialization_count", -1)) != len(routes):
+        raise RuntimeError("FlashInfer route manifest specialization count is stale")
+
+    routes_by_id = {route.get("id"): route for route in routes}
+    missing_routes = sorted(set(REQUIRED_TP4_SM103_ROUTES) - set(routes_by_id))
+    if missing_routes:
+        raise RuntimeError(
+            f"FlashInfer route manifest is missing TP4 routes: {missing_routes}"
+        )
+
+    required_units: set[str] = set()
+    for route_id, source_units in REQUIRED_TP4_SM103_ROUTES.items():
+        route = routes_by_id[route_id]
+        if "sm103" not in route.get("architectures", []):
+            raise RuntimeError(f"FlashInfer route {route_id} does not support sm103")
+        observed_units = set(route.get("source_units", []))
+        if not source_units.issubset(observed_units):
+            missing_units = sorted(source_units - observed_units)
+            raise RuntimeError(
+                f"FlashInfer route {route_id} is missing source units: {missing_units}"
+            )
+        required_units.update(source_units)
+
+    inventory = manifest.get("source_inventory", {}).get("entries", [])
+    inventory_by_unit = {
+        entry.get("source_unit"): entry
+        for entry in inventory
+        if entry.get("target") == "sm103a"
+    }
+    missing_inventory = sorted(required_units - set(inventory_by_unit))
+    if missing_inventory:
+        raise RuntimeError(
+            "FlashInfer route inventory is missing sm103a source units: "
+            f"{missing_inventory}"
+        )
+    for source_unit in sorted(required_units):
+        entry = inventory_by_unit[source_unit]
+        for field in (
+            "generated_input_sha256",
+            "vendored_sha256",
+            "binding_sha256",
+            "arg_plan_sha256",
+        ):
+            value = entry.get(field, "")
+            if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise RuntimeError(
+                    f"FlashInfer {source_unit} has invalid {field}: {value!r}"
+                )
+    return {
+        "path": str(manifest_path.resolve()),
+        "sha256": sha256(manifest_path),
+        "required_routes": sorted(REQUIRED_TP4_SM103_ROUTES),
+        "required_sm103a_source_units": sorted(required_units),
     }
 
 

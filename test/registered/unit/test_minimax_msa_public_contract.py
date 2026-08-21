@@ -1,4 +1,5 @@
 import sys
+import types
 from unittest.mock import Mock
 
 import pytest
@@ -70,6 +71,52 @@ def test_explicit_provider_selection_disables_runtime_fallback(monkeypatch):
 
     monkeypatch.setenv("SGLANG_MINIMAX_MSA_BACKEND", "fmha_sm100")
     assert not msa.msa_runtime_fallback_allowed()
+
+
+def test_public_loader_rejects_missing_forwarded_abi_keywords(monkeypatch):
+    def prefill(
+        q,
+        k,
+        v,
+        q2k_indices,
+        cu_seqlens_q,
+        page_table,
+        seqused_k,
+        q_offset,
+        workspace,
+    ):
+        pass
+
+    def decode(
+        q,
+        k,
+        v,
+        q2k_indices,
+        *,
+        page_table,
+        seqused_k,
+        seqlen_q,
+        workspace,
+    ):
+        pass
+
+    fake_ops = types.SimpleNamespace(
+        msa_sparse_attention=prefill,
+        msa_sparse_decode_attention=decode,
+        msa_topk_select=lambda: None,
+        MSASparseAttentionWorkspace=lambda _device: None,
+    )
+    fake_flashinfer = types.ModuleType("flashinfer")
+    fake_flashinfer.msa_ops = fake_ops
+    monkeypatch.setitem(sys.modules, "flashinfer", fake_flashinfer)
+    msa._load_flashinfer_msa.cache_clear()
+    try:
+        with pytest.raises(
+            msa.MSAUnavailableError, match="causal.*softmax_scale"
+        ):
+            msa._load_flashinfer_msa()
+    finally:
+        msa._load_flashinfer_msa.cache_clear()
 
 
 def test_prefill_forwards_tp4_public_contract(monkeypatch):

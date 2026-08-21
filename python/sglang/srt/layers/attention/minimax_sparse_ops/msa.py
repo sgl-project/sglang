@@ -38,6 +38,8 @@ _FLASHINFER_PREFILL_PARAMS = frozenset(
         "v",
         "q2k_indices",
         "cu_seqlens_q",
+        "causal",
+        "softmax_scale",
         "page_table",
         "seqused_k",
         "q_offset",
@@ -53,6 +55,8 @@ _FLASHINFER_DECODE_PARAMS = frozenset(
         "page_table",
         "seqused_k",
         "seqlen_q",
+        "causal",
+        "softmax_scale",
         "workspace",
     }
 )

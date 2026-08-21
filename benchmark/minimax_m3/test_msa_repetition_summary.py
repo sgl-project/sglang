@@ -10,6 +10,10 @@ from pathlib import Path
 from unittest import mock
 
 from precompile_fmha_sm100 import runtime_variants
+from probe_msa_e2e_dependencies import (
+    REQUIRED_TP4_SM103_ROUTES,
+    probe_blackwell_msa_route_manifest,
+)
 from run_msa_ab_repetitions import (
     OFFLINE_THROUGHPUT_ARGS,
     OFFLINE_THROUGHPUT_DATASET,
@@ -26,6 +30,72 @@ from summarize_msa_repetitions import (
 
 
 class MSARepetitionSummaryTest(unittest.TestCase):
+    def make_route_manifest(self, root: Path) -> Path:
+        routes = [
+            {
+                "id": route_id,
+                "architectures": ["sm100", "sm103"],
+                "source_units": sorted(source_units),
+            }
+            for route_id, source_units in REQUIRED_TP4_SM103_ROUTES.items()
+        ]
+        units = sorted(
+            {
+                source_unit
+                for source_units in REQUIRED_TP4_SM103_ROUTES.values()
+                for source_unit in source_units
+            }
+        )
+        hashes = {
+            field: "a" * 64
+            for field in (
+                "generated_input_sha256",
+                "vendored_sha256",
+                "binding_sha256",
+                "arg_plan_sha256",
+            )
+        }
+        manifest = {
+            "operation": "blackwell_msa",
+            "attention_topk": 16,
+            "reachable_specialization_count": len(routes),
+            "reachable_specializations": routes,
+            "source_inventory": {
+                "entries": [
+                    {"target": "sm103a", "source_unit": unit, **hashes}
+                    for unit in units
+                ]
+            },
+        }
+        path = root / "csrc" / "blackwell_msa" / "route_manifest.json"
+        self.write_json(path, manifest)
+        return path
+
+    def test_route_manifest_covers_tp4_gb300_source_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = self.make_route_manifest(root)
+            result = probe_blackwell_msa_route_manifest(root)
+
+        self.assertEqual(result["path"], str(path.resolve()))
+        self.assertEqual(
+            result["required_routes"], sorted(REQUIRED_TP4_SM103_ROUTES)
+        )
+
+    def test_route_manifest_rejects_missing_decode_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = self.make_route_manifest(root)
+            manifest = json.loads(path.read_text())
+            manifest["source_inventory"]["entries"] = [
+                entry
+                for entry in manifest["source_inventory"]["entries"]
+                if entry["source_unit"] != "decode_m16_bf16_paged"
+            ]
+            self.write_json(path, manifest)
+            with self.assertRaisesRegex(RuntimeError, "decode_m16_bf16_paged"):
+                probe_blackwell_msa_route_manifest(root)
+
     def test_throughput_dataset_is_offline_and_deterministic(self) -> None:
         self.assertEqual(OFFLINE_THROUGHPUT_DATASET, "random-ids")
         self.assertEqual(
