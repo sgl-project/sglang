@@ -25,9 +25,9 @@ tick. Commits are tick-gated; BeamGroup.commit_pending documents why.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Sequence
 
+import msgspec
 import torch
 
 from sglang.srt.beam_search.beam_group import BeamGroup, BeamGroupState
@@ -79,8 +79,7 @@ def _rows_topk_logprobs(pieces: Sequence[torch.Tensor], num_candidates: int):
     return torch.cat(vals), torch.cat(toks)
 
 
-@dataclass(kw_only=True)
-class BeamCoordinator:
+class BeamCoordinator(msgspec.Struct, kw_only=True):
     server_args: ServerArgs
     model_config: ModelConfig
     spec_algorithm: SpeculativeAlgorithm

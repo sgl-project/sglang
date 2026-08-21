@@ -18,12 +18,12 @@ BeamSearchSequence is the per-sequence payload of the beam_results carrier
 since io_struct pulls it into every IPC participant.
 """
 
-from dataclasses import dataclass
 from typing import List, Optional
 
+import msgspec
 
-@dataclass
-class BeamSearchSequence:
+
+class BeamSearchSequence(msgspec.Struct, omit_defaults=True):
     """One beam candidate sequence; text is filled only when the sequence is
     about to be returned to the user."""
 

@@ -6,9 +6,9 @@ batch class carries only the beam_tail field and one-line hook calls.
 
 from __future__ import annotations
 
-import dataclasses
 from typing import TYPE_CHECKING, Any, List, NamedTuple
 
+import msgspec
 import torch
 
 if TYPE_CHECKING:
@@ -22,8 +22,7 @@ class BeamTailEntry(NamedTuple):
     end: int
 
 
-@dataclasses.dataclass
-class BeamTail:
+class BeamTail(msgspec.Struct):
     num_base_rows: int
     entries: List[BeamTailEntry]  # one per group, in batch order
 

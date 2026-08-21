@@ -11,9 +11,9 @@ split documented in coordinator.py.
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
+import msgspec
 import torch
 
 from sglang.srt.beam_search.fork import StagedOrphans
@@ -26,8 +26,7 @@ class BeamGroupState(enum.Enum):
     FINISHED = enum.auto()
 
 
-@dataclass
-class CompletedBeam:
+class CompletedBeam(msgspec.Struct):
     """A finished candidate: leaf node + score inputs + finish reason."""
 
     leaf: Optional[BeamNode]
@@ -36,8 +35,7 @@ class CompletedBeam:
     matched_token: Optional[int]  # stop token that ended it; None = length / cutoff
 
 
-@dataclass
-class BeamResult:
+class BeamResult(msgspec.Struct):
     """One output sequence of a finished group."""
 
     tokens: List[int]

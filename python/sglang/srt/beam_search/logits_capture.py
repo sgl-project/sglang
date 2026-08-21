@@ -7,8 +7,9 @@ raw logits it needs are preserved here, before sampling.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
+
+import msgspec
 
 if TYPE_CHECKING:
     import torch
@@ -18,8 +19,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-@dataclass
-class BeamLogitsCapture:
+class BeamLogitsCapture(msgspec.Struct):
     """The preserved raw logits, stashed on LogitsProcessorOutput.beam."""
 
     leader_logits: torch.Tensor  # pre-sample clone of the leader rows

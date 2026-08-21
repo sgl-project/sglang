@@ -8,12 +8,12 @@ materialized at group finish.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import List, Optional
 
+import msgspec
 
-@dataclass
-class BeamNode:
+
+class BeamNode(msgspec.Struct):
     """One generated token; the chain of parents is the sequence prefix."""
 
     token: int

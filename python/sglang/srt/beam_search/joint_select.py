@@ -13,13 +13,11 @@ while fewer than beam_width survivors precede it in score order.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
+import msgspec
 import torch
 
 
-@dataclass
-class SelectResult:
+class SelectResult(msgspec.Struct):
     """Fixed-shape outputs of one expansion step. Valid in [0, num_survivors)
     and [0, num_finished); past that, dump-slot zeros that must not be read."""
 
@@ -33,8 +31,7 @@ class SelectResult:
     num_finished: torch.Tensor  # [] int64
 
 
-@dataclass
-class FinalSelect:
+class FinalSelect(msgspec.Struct):
     """Top-beam_width candidates of a length-terminated step (all finished)."""
 
     tokens: torch.Tensor  # [beam_width] int64
