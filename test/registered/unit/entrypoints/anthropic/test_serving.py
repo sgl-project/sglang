@@ -14,6 +14,12 @@ from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
     AnthropicMessage,
     AnthropicMessagesRequest,
 )
+from sglang.srt.entrypoints.anthropic.request_conversion import (  # noqa: E402
+    convert_anthropic_to_openai_request,
+)
+from sglang.srt.entrypoints.anthropic.response_conversion import (  # noqa: E402
+    convert_openai_to_anthropic_response,
+)
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
 from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
@@ -770,6 +776,87 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(anthropic_response.content[1].type, "text")
         self.assertEqual(anthropic_response.content[1].text, "the answer is 4")
 
+    def test_request_converter_is_reusable_without_serving(self):
+        apply_reasoning_calls = []
+        request = self._anthropic_request(
+            stream=False,
+            system="system prompt",
+            thinking={"type": "disabled"},
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "prior reasoning"},
+                        {"type": "text", "text": "prior answer"},
+                    ],
+                },
+                {"role": "user", "content": "continue"},
+            ],
+        )
+
+        converted = convert_anthropic_to_openai_request(
+            request,
+            merge_inline_system=True,
+            wrap_reasoning_history=lambda text: f"<think>{text}</think>",
+            apply_reasoning_enabled=lambda _request, enabled: (
+                apply_reasoning_calls.append(enabled)
+            ),
+        )
+
+        self.assertIsInstance(converted, ChatCompletionRequest)
+        self.assertEqual(converted.messages[0].content, "system prompt")
+        self.assertEqual(
+            [part.text for part in converted.messages[1].content],
+            ["<think>prior reasoning</think>", "prior answer"],
+        )
+        self.assertEqual(apply_reasoning_calls, [False])
+
+    def test_response_converter_is_reusable_without_serving(self):
+        response = ChatCompletionResponse.model_validate(
+            {
+                "id": "chatcmpl-test",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "reasoning_content": "inspect the workspace",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": '{"path":"README.md"}',
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 4,
+                    "total_tokens": 14,
+                    "prompt_tokens_details": {"cached_tokens": 3},
+                },
+            }
+        )
+
+        converted = convert_openai_to_anthropic_response(response)
+
+        self.assertEqual(
+            [block.type for block in converted.content], ["thinking", "tool_use"]
+        )
+        self.assertEqual(converted.content[1].input, {"path": "README.md"})
+        self.assertEqual(converted.stop_reason, "tool_use")
+        self.assertEqual(converted.usage.input_tokens, 7)
+        self.assertEqual(converted.usage.cache_read_input_tokens, 3)
+        self.assertEqual(converted.usage.output_tokens, 4)
+
     def test_request_thinking_disabled_invokes_apply_reasoning_enabled(self):
         """``thinking={"type": "disabled"}`` must flip the reasoning toggle off."""
         serving = self._serving()
@@ -788,7 +875,8 @@ class TestAnthropicServing(unittest.TestCase):
             thinking={"type": "enabled", "budget_tokens": 2048}, stream=False
         )
         with self.assertLogs(
-            "sglang.srt.entrypoints.anthropic.serving", level=logging.WARNING
+            "sglang.srt.entrypoints.anthropic.request_conversion",
+            level=logging.WARNING,
         ) as log:
             serving._convert_to_chat_completion_request(request)
         self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
@@ -870,7 +958,8 @@ class TestAnthropicServing(unittest.TestCase):
             stream=False,
         )
         with self.assertLogs(
-            "sglang.srt.entrypoints.anthropic.serving", level=logging.WARNING
+            "sglang.srt.entrypoints.anthropic.request_conversion",
+            level=logging.WARNING,
         ) as log:
             serving._convert_to_chat_completion_request(request)
         self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
@@ -903,7 +992,8 @@ class TestAnthropicServing(unittest.TestCase):
             stream=False,
         )
         with self.assertLogs(
-            "sglang.srt.entrypoints.anthropic.serving", level=logging.INFO
+            "sglang.srt.entrypoints.anthropic.request_conversion",
+            level=logging.INFO,
         ) as log:
             chat_request = serving._convert_to_chat_completion_request(request)
         # max_tokens is untouched
@@ -917,7 +1007,8 @@ class TestAnthropicServing(unittest.TestCase):
         serving = self._serving()
         request = self._anthropic_request(betas=["thinking-2025-08-04"], stream=False)
         with self.assertLogs(
-            "sglang.srt.entrypoints.anthropic.serving", level=logging.INFO
+            "sglang.srt.entrypoints.anthropic.request_conversion",
+            level=logging.INFO,
         ) as log:
             serving._convert_to_chat_completion_request(request)
         self.assertTrue(any("thinking-2025-08-04" in r for r in log.output))
@@ -1522,7 +1613,8 @@ class TestAnthropicServing(unittest.TestCase):
         )
         serving = self._serving()
         with self.assertLogs(
-            "sglang.srt.entrypoints.anthropic.serving", level=logging.WARNING
+            "sglang.srt.entrypoints.anthropic.response_conversion",
+            level=logging.WARNING,
         ) as log:
             anthropic_response = serving._convert_response(response)
         self.assertEqual(anthropic_response.stop_reason, "end_turn")
