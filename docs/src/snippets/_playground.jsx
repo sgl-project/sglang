@@ -171,11 +171,19 @@ export const Playground = ({ config }) => {
     return null;
   };
 
-  // hw|variant|quant → variant|quant → "".
+  // hw|variant|quant → variant|quant → hw|quant → quant → "".
   const resolveModelName = (sel) => {
-    const triple = `${sel.hw}|${sel.variant}|${sel.quant}`;
-    const pair = `${sel.variant}|${sel.quant}`;
-    return config.modelNames[triple] ?? config.modelNames[pair] ?? "";
+    const keys = [
+      `${sel.hw}|${sel.variant}|${sel.quant}`,
+      `${sel.variant}|${sel.quant}`,
+      `${sel.hw}|${sel.quant}`,
+      sel.quant,
+    ];
+    for (const k of keys) {
+      const hit = config.modelNames[k];
+      if (hit) return hit;
+    }
+    return "";
   };
 
   const interpolate = (text, env, modelName) =>
@@ -901,10 +909,6 @@ export const Playground = ({ config }) => {
           "--disaggregation-mode", "--disaggregation-transfer-backend",
           "--disaggregation-ib-device", "--disaggregation-bootstrap-port",
         ]);
-        const specAlgorithm = (h.findFlagArg(flags, "--speculative-algorithm") || "").toUpperCase();
-        if ((fc.incompatibleSpeculativeAlgorithms || []).includes(specAlgorithm)) {
-          return { flags, env };
-        }
         const backends = fc.transferBackends || [];
         // A config that omits `modes` has the role on the Deploy panel instead;
         // this card then only tunes the transport for whatever role is selected.
@@ -913,6 +917,16 @@ export const Playground = ({ config }) => {
           : ((sel && sel.pdMode) || "off");
 
         if (mode === "prefill" || mode === "decode") {
+          // PD and some speculative algorithms cannot run together. Keep the
+          // PD card reachable for a speculative base recipe, then make the
+          // user's explicit PD-role selection win by removing the whole
+          // speculative flag family before composing the role command.
+          const specAlgorithm = (h.findFlagArg(
+            flags, "--speculative-algorithm") || "").toUpperCase();
+          if ((fc.incompatibleSpeculativeAlgorithms || []).includes(specAlgorithm)) {
+            flags = flags.filter((flag) =>
+              !flag.split(/[\s=]/)[0].startsWith("--speculative-"));
+          }
           const backend = value.transferBackend || (backends[0] || {}).id || "mooncake";
           const adds = [
             `--disaggregation-mode ${mode}`,

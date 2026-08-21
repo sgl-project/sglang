@@ -38,8 +38,12 @@
 //                      `verified` is the boolean badge baseline.
 //                      `verificationStatus` overrides it with a third state —
 //                      "verified" | "in-progress" | "unverified" — for a recipe
-//                      whose verification round is open rather than absent.
-//   modelNames         HF slug lookup, `hw|variant|quant` then `variant|quant`
+//                      whose verification round is open rather than absent. It
+//                      may also be a function of the selection, for a cell whose
+//                      verification depends on an overlay pick (e.g. one
+//                      speculative option still being validated).
+//   modelNames         HF slug lookup, `hw|variant|quant`, `variant|quant`,
+//                      `hw|quant`, `quant`, `hw`, then `default`
 //   placeholders       {{KEY}} → {target: 'command'|'curl', label, default?}
 //   curl               cURL template (uses {{MODEL_NAME}} + placeholders), or
 //                      `(selection, cell) => template` when the request payload
@@ -442,8 +446,14 @@ export const Deployment = ({ config, benchmarks }) => {
     typeof v === "string"
       ? (VERIFY_LABEL[v] ? v : "unverified")
       : (v ? "verified" : "unverified");
-  const cellVerifyStatus = (c) =>
-    c ? verifyStatusOf(c.verificationStatus ?? c.verified) : "unverified";
+  const cellVerifyStatus = (c, sel) => {
+    if (!c) return "unverified";
+    const v =
+      typeof c.verificationStatus === "function"
+        ? c.verificationStatus(sel)
+        : c.verificationStatus;
+    return verifyStatusOf(v ?? c.verified);
+  };
 
   // Two kinds of selector row:
   //   match dims    participate in cell lookup (cell.match[dim] === sel[dim])
@@ -643,10 +653,15 @@ export const Deployment = ({ config, benchmarks }) => {
 
   // Lookup walks most-specific to least so a config that drops the variant/quant
   // dims can key its HF slug on `hw` alone, or on the single "default" entry.
+  // The `hw|quant` and bare `quant` rungs cover a `matchDims` config that declares
+  // no variant dim at all — there `sel.variant` is undefined, so the two leading
+  // keys can never hit.
   const resolveModelName = (sel) => {
     const keys = [
       `${sel.hw}|${sel.variant}|${sel.quant}`,
       `${sel.variant}|${sel.quant}`,
+      `${sel.hw}|${sel.quant}`,
+      sel.quant,
       sel.hw,
       "default",
     ];
@@ -1234,7 +1249,7 @@ export const Deployment = ({ config, benchmarks }) => {
   // ==== 5. Derived values ====
   const s = makeStyles(isDark);
   const cell = findCell(config.cells, sel);
-  const verifyStatus = cellVerifyStatus(cell);
+  const verifyStatus = cellVerifyStatus(cell, sel);
   // Pin the calculator-computed ratio into the rendered command (before the
   // host/port tail); cells themselves stay ratio-free.
   const cellWithRatio = (() => {
