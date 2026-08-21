@@ -811,21 +811,6 @@ class MoeLoraRunner:
         num_tokens: int,
     ) -> torch.Tensor:
         if plan.finalize.family is FinalizeFamily.MATERIALIZED:
-            if plan.down_b_into_base:
-                # The down-B kernel adds the delta into the base down rows, so
-                # finalize gets no pair delta. The base row and the delta then
-                # round to BF16 together. The shipped path rounds the delta on
-                # its own.
-                provider.finalize(
-                    base_gemm_state,
-                    down_out,
-                    topk_output.topk_ids,
-                    topk_output.topk_weights,
-                    self.routed_scaling_factor,
-                    output,
-                    lora_delta=None,
-                )
-                return output
             provider.finalize(
                 base_gemm_state,
                 down_out,
@@ -833,18 +818,20 @@ class MoeLoraRunner:
                 topk_output.topk_weights,
                 self.routed_scaling_factor,
                 output,
-                lora_delta=down_delta.view(num_tokens, self.top_k, self.hidden_size),
+                lora_delta=(
+                    None
+                    if plan.down_b_into_base
+                    else down_delta.view(num_tokens, self.top_k, self.hidden_size)
+                ),
             )
             return output
 
-        route = routes.raw(plan.finalize.is_shared_outer)
-        b_down = batch.down_lora_b.flatten(0, 1)
         provider.run_shared_rank_finalize(
             base_gemm_state,
             down_masked=down_out,
             bridge=down_rank,
-            b_down=b_down,
-            routing=route,
+            b_down=batch.down_lora_b.flatten(0, 1),
+            routing=routes.raw(plan.finalize.is_shared_outer),
             topk_weights=topk_output.topk_weights,
             routed_scaling_factor=self.routed_scaling_factor,
             output=output,
