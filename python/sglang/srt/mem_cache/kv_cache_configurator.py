@@ -762,36 +762,32 @@ class KVCacheConfigurator:
         extra_max_context_len = get_req_to_token_extra_context_len()
 
         disagg = get_disagg()
-        is_decode = disagg.disaggregation_mode == "decode"
-        use_decode_pool = is_decode or disagg.enable_pd_role_switch
-        if use_decode_pool:
-            # Decode uses this pool normally; role-switch prefill avoids reallocating.
+        if disagg.disaggregation_mode == "decode":
             pre_alloc_size = disagg.disaggregation_decode_extra_slots
-            if not is_decode:
-                pre_alloc_size = pre_alloc_size or 0
-            if self.mambaish_config:
-                req_to_token_pool = self._build_hybrid_mamba_decode_req_pool(
-                    max_num_reqs=max_num_reqs,
-                    extra_max_context_len=extra_max_context_len,
-                    pre_alloc_size=pre_alloc_size,
-                )
-            else:
-                req_to_token_pool = self._build_decode_req_pool(
-                    max_num_reqs=max_num_reqs,
-                    extra_max_context_len=extra_max_context_len,
-                    pre_alloc_size=pre_alloc_size,
-                )
+        elif disagg.enable_pd_role_switch:
+            pre_alloc_size = disagg.disaggregation_decode_extra_slots or 0
         elif self.mambaish_config:
-            req_to_token_pool = self._build_hybrid_req_pool(
+            return self._build_hybrid_req_pool(
                 max_num_reqs=max_num_reqs,
                 extra_max_context_len=extra_max_context_len,
             )
         else:
-            req_to_token_pool = self._build_default_req_pool(
+            return self._build_default_req_pool(
                 max_num_reqs=max_num_reqs,
                 extra_max_context_len=extra_max_context_len,
             )
-        return req_to_token_pool
+
+        if self.mambaish_config:
+            return self._build_hybrid_mamba_decode_req_pool(
+                max_num_reqs=max_num_reqs,
+                extra_max_context_len=extra_max_context_len,
+                pre_alloc_size=pre_alloc_size,
+            )
+        return self._build_decode_req_pool(
+            max_num_reqs=max_num_reqs,
+            extra_max_context_len=extra_max_context_len,
+            pre_alloc_size=pre_alloc_size,
+        )
 
     def _build_hybrid_mamba_decode_req_pool(
         self,
