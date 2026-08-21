@@ -705,9 +705,8 @@ class TextEncoderLoader(ComponentLoader):
                     model = model.to("cpu")
                     mesh = init_device_mesh(
                         current_platform.device_type,
-                        mesh_shape=(dist.get_world_size(), 1),
-                        mesh_dim_names=("replicate", "shard"),
-                    )["shard"]
+                        mesh_shape=(dist.get_world_size(),),
+                    )
                     shard_model(
                         model,
                         cpu_offload=True,
