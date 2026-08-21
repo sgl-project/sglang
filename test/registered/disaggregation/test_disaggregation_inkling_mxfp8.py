@@ -49,7 +49,7 @@ COMMON_ARGS = [
     "--mamba-radix-cache-strategy",
     "extra_buffer",
     "--mem-fraction-static",
-    "0.8",
+    "0.6",
     "--swa-full-tokens-ratio",
     "0.1",
     "--mamba-full-memory-ratio",
@@ -85,6 +85,11 @@ class TestDisaggregationInklingMXFP8(PDDisaggregationServerBase, GSM8KMixin):
             cls.bootstrap_port,
             *COMMON_ARGS,
             "--enable-hierarchical-cache",
+            # Absolute host size, not the default ratio: the ratio scales with the
+            # device pool, and two roles on one node then reserve more host memory
+            # than a runner has. This exercises the tiering, not its capacity.
+            "--hicache-size",
+            "8",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
