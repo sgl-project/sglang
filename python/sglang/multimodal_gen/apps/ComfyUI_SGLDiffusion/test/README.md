@@ -4,10 +4,10 @@ This directory contains tests for each ComfyUI pipeline integration.
 
 ## Test Files
 
-- `test_zimage_pipeline.py` - Tests for ComfyUIZImagePipeline
-- `test_flux_pipeline.py` - Tests for ComfyUIFluxPipeline
-- `test_qwen_image_pipeline.py` - Tests for ComfyUIQwenImagePipeline
-- `test_qwen_image_edit_pipeline.py` - Tests for ComfyUIQwenImageEditPipeline (I2I/edit mode)
+- `test_zimage_pipeline.py` - Tests for ZImagePipeline
+- `test_flux_pipeline.py` - Tests for FluxPipeline
+- `test_qwen_image_pipeline.py` - Tests for QwenImagePipeline
+- `test_qwen_image_edit_pipeline.py` - Tests for QwenImageEditPlusPipeline (I2I/edit mode)
 
 ## Running Tests
 
