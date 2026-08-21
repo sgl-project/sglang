@@ -64,6 +64,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ResponsesRequest,
     ResponsesResponse,
     Tool,
+    ToolChoice,
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
@@ -416,6 +417,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                     else:
                         prompt_kwargs = {"input_ids": engine_prompt}
 
+                    # Extract routed_dp_rank from header (has higher priority than body)
+                    effective_routed_dp_rank = self.extract_routed_dp_rank_from_header(
+                        raw_request, request.routed_dp_rank
+                    )
+
                     logprob_kwargs = (
                         {
                             "return_logprob": True,
@@ -459,6 +465,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                         # background+stream streams on this connection, so don't detach.
                         background=request.background and not request.stream,
                         require_reasoning=require_reasoning,
+                        bootstrap_host=request.bootstrap_host,
+                        bootstrap_port=request.bootstrap_port,
+                        bootstrap_room=request.bootstrap_room,
+                        routed_dp_rank=effective_routed_dp_rank,
+                        disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
+                        priority=request.priority,
+                        routing_key=self.extract_routing_key(raw_request),
+                        custom_labels=self.extract_custom_labels(raw_request),
                     )
 
                     generator = self._generate_with_builtin_tools(
@@ -718,7 +732,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             total_tokens=num_prompt_tokens + num_generated_tokens,
             reasoning_tokens=num_reasoning_tokens,
         )
-        if self.enable_prompt_tokens_details and num_cached_tokens:
+        if self.enable_prompt_tokens_details:
             usage.prompt_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=num_cached_tokens
             )
@@ -852,11 +866,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                         type="reasoning_text", text=reasoning_content
                     ),
                 ],
-                status=None,
+                status="completed",
             )
             output_items.append(reasoning_item)
 
-        is_required = request.tool_choice == "required"
+        is_required = request.tool_choice == "required" or isinstance(
+            request.tool_choice, ToolChoice
+        )
         tool_call_items: list[ResponseFunctionToolCall] = []
         parsed_via_native = False
         detector_owns_format = False
@@ -973,6 +989,11 @@ class OpenAIServingResponses(OpenAIServingChat):
         chat_tools = []
         for tool in request.tools:
             if tool.type != "function":
+                continue
+            if not tool.name:
+                logger.warning(
+                    f"Skipping function tool without function name definition: {tool}"
+                )
                 continue
             chat_tools.append(
                 Tool(
@@ -1957,7 +1978,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
 
         chat_tools = self._response_tools_to_chat_tools(request)
-        is_required = request.tool_choice == "required"
+        is_required = request.tool_choice == "required" or isinstance(
+            request.tool_choice, ToolChoice
+        )
         tool_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
         if chat_tools and request.tool_choice != "none":
             native_supports_structural_tag = False
@@ -2497,7 +2520,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             total_tokens=total_tokens_meta or (prompt_tokens + completion_tokens),
             reasoning_tokens=reasoning_tokens_meta,
         )
-        if self.enable_prompt_tokens_details and cached_tokens:
+        if self.enable_prompt_tokens_details:
             usage.prompt_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=cached_tokens
             )
