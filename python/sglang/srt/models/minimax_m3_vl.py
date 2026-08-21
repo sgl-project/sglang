@@ -78,6 +78,9 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
 
+        self.encoder_only = config.encoder_only
+        self.language_only = config.language_only
+
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
         self.num_fused_shared_experts = 0
@@ -98,26 +101,34 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
 
         # Vision model skips quantization: CLIP dimensions (head_dim=80) are not
         # compatible with MXFP8 kernel alignment requirements (128).
-        self.vision_tower = MiniMaxVLVisionModel(
-            config=vision_config,
-            text_hidden_size=text_hidden_size,
-            projector_hidden_size=projector_hidden_size,
-            quant_config=None,
-            prefix=add_prefix("vision_tower", prefix),
-            multimodal_projector_bias=getattr(
-                config, "multimodal_projector_bias", True
-            ),
-            patch_merge_bias=getattr(config, "patch_merge_bias", True),
-        )
+        if self.language_only:
+            self.vision_tower = None
+        else:
+            self.vision_tower = MiniMaxVLVisionModel(
+                config=vision_config,
+                text_hidden_size=text_hidden_size,
+                projector_hidden_size=projector_hidden_size,
+                quant_config=None,
+                prefix=add_prefix("vision_tower", prefix),
+                multimodal_projector_bias=getattr(
+                    config, "multimodal_projector_bias", True
+                ),
+                patch_merge_bias=getattr(config, "patch_merge_bias", True),
+            )
 
         text_config = config.text_config
-        self.model = MiniMaxM3Model(
-            config=text_config,
-            quant_config=quant_config,
-            prefix=add_prefix("language_model.model", prefix),
-        )
+        if not self.encoder_only:
+            self.model = MiniMaxM3Model(
+                config=text_config,
+                quant_config=quant_config,
+                prefix=add_prefix("language_model.model", prefix),
+            )
+        else:
+            self.model = None
 
-        if self.pp_group.is_last_rank:
+        if self.encoder_only:
+            self.lm_head = None
+        elif self.pp_group.is_last_rank:
             self.lm_head = ParallelLMHead(
                 text_config.vocab_size,
                 text_config.hidden_size,
@@ -133,7 +144,9 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             text_rope_scaling is not None and "mrope_section" in text_rope_scaling
         )
 
-        self.logits_processor = LogitsProcessor(text_config)
+        self.logits_processor = (
+            None if self.encoder_only else LogitsProcessor(text_config)
+        )
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
@@ -191,17 +204,35 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             input_ids, mm_inputs
         )
 
+    def _require_vision_tower(self) -> None:
+        if self.vision_tower is None:
+            raise RuntimeError(
+                "vision tower is not loaded in language_only mode; multimodal "
+                "inputs must arrive as precomputed embeddings from the encoder "
+                "server."
+            )
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        self._require_vision_tower()
         return get_image_feature(self.vision_tower, items, self.use_data_parallel)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        self._require_vision_tower()
         return get_video_feature(self.vision_tower, items, self.use_data_parallel)
 
     def get_input_embeddings(self):
+        if self.model is None:
+            raise AttributeError(
+                "get_input_embeddings() is not available in encoder-only mode"
+            )
         return self.model.embed_tokens
 
     def get_embed_and_head(self):
         # EAGLE3 target interface: share the text embed + lm_head with the draft.
+        if self.model is None:
+            raise AttributeError(
+                "get_embed_and_head() is not available in encoder-only mode"
+            )
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
@@ -319,6 +350,8 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
                 continue
 
             if name.startswith("language_model."):
+                if self.encoder_only:
+                    continue
                 self._load_llm_weight(
                     name[len("language_model.") :],
                     loaded_weight,
@@ -334,7 +367,8 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
 
         merge_vit_qkv_weights(vit_qkv_weights, vit_qkv_biases, params_dict)
 
-        build_minimax_fused_qkv_index(self)
+        if not self.encoder_only:
+            build_minimax_fused_qkv_index(self)
 
     def _load_llm_weight(
         self,
