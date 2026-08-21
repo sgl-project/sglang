@@ -115,8 +115,7 @@ impl Rid {
         }
     }
 
-    /// Shard index for `n` detokenizer shards. Pure function of the id so the
-    /// ingress and egress sides agree without any shared map.
+    /// Shard index for `n` detokenizer shards.
     #[inline]
     pub fn shard(&self, n: usize) -> usize {
         debug_assert!(n > 0);
@@ -126,16 +125,9 @@ impl Rid {
 
 impl From<String> for Rid {
     fn from(id: String) -> Self {
-        // ONE seed per process, not one per conversion. Ingress and egress each
+        // ONE seed per process, not one per conversion. To-scheduler and from-scheduler each
         // build a `Rid` from the same string and must agree on the shard without a
-        // shared map — a fresh `RandomState` here would hash the same rid two
-        // different ways, so chunks would arrive at a shard that never registered
-        // the request and be dropped.
-        //
-        // The seed is random rather than fixed because rids are client-supplied:
-        // with public keys, colliding rids are an offline ~2^32 search. Collisions
-        // are only a shard co-location now (identity is the string), but a keyed
-        // hash also stops an attacker from stacking every request onto one shard.
+        // shared map.
         static SEED: OnceLock<RandomState> = OnceLock::new();
         let hash = SEED.get_or_init(RandomState::new).hash_one(&id);
         Rid { id, hash }
