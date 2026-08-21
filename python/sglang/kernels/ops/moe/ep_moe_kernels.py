@@ -1943,10 +1943,10 @@ def _fp8_per_token_quant_to_per_tensor_quant_kernel(
     m,
     k,
     K_SCALE_BLOCK_SIZE: tl.constexpr,
-    K_BLOCK_SIZE: tl.constexpr,
-    HAS_K_TAIL: tl.constexpr,
+    G_BLOCK_SIZE: tl.constexpr,
+    HAS_G_TAIL: tl.constexpr,
 ):
-    pid_k, pid_m, pid_e = (
+    pid_g, pid_m, pid_e = (
         tl.program_id(axis=0),
         tl.program_id(axis=1),
         tl.program_id(axis=2),
@@ -1959,35 +1959,90 @@ def _fp8_per_token_quant_to_per_tensor_quant_kernel(
     if token_id >= last_effective_id:
         return
     output_scale_val_inv = 1.0 / tl.load(output_scale_ptr).to(tl.float32)
-    k_offsets = pid_k * K_BLOCK_SIZE + tl.arange(0, K_BLOCK_SIZE)
-    # k only has to be a multiple of the 128-wide scale group (e.g. 3584), so the
-    # last k block can be partial.  Specialize on it: hidden sizes that fill
-    # every block keep the unmasked loads, and their codegen is unchanged.
-    if HAS_K_TAIL:
-        k_mask = k_offsets < k
-    scale_offsets = (k_offsets // K_SCALE_BLOCK_SIZE) * x_scale_stride2
+
+    # The payload is a whole number of scale groups, so tile it as
+    # [G_BLOCK_SIZE, K_SCALE_BLOCK_SIZE]: one scalar scale load per group rather
+    # than a 128-way gather of m-strided addresses (the dispatcher's scales are
+    # column-major in the last two dims), and a partial k masks whole groups.
+    g_offsets = pid_g * G_BLOCK_SIZE + tl.arange(0, G_BLOCK_SIZE)
+    k_offsets = (
+        g_offsets[:, None] * K_SCALE_BLOCK_SIZE
+        + tl.arange(0, K_SCALE_BLOCK_SIZE)[None, :]
+    )
+    if HAS_G_TAIL:
+        g_mask = g_offsets < k // K_SCALE_BLOCK_SIZE
 
     x_ptrs = x_ptr + pid_e * m * k + k_offsets
     output_ptrs = output_ptr + pid_e * m * k + k_offsets
-    x_scale_ptrs = x_scale_ptr + pid_e * x_scale_stride0 + scale_offsets
+    x_scale_ptrs = x_scale_ptr + pid_e * x_scale_stride0 + g_offsets * x_scale_stride2
 
     for tok_idx in tl.range(token_id, last_effective_id, pid_m_dim):
-        if HAS_K_TAIL:
-            hidden = tl.load(x_ptrs + tok_idx * k, mask=k_mask, other=0.0)
-            x_scale = tl.load(
-                x_scale_ptrs + tok_idx * x_scale_stride1, mask=k_mask, other=0.0
+        if HAS_G_TAIL:
+            hidden = tl.load(x_ptrs + tok_idx * k, mask=g_mask[:, None], other=0.0)
+            group_scale = tl.load(
+                x_scale_ptrs + tok_idx * x_scale_stride1, mask=g_mask, other=0.0
             )
         else:
             hidden = tl.load(x_ptrs + tok_idx * k)
-            x_scale = tl.load(x_scale_ptrs + tok_idx * x_scale_stride1)
-        hidden = hidden.to(tl.float32)
-        scale_fp32 = x_scale.to(tl.float32)
-        hidden = hidden * scale_fp32 * output_scale_val_inv
-        quantized = hidden.to(output_ptr.dtype.element_ty)
-        if HAS_K_TAIL:
-            tl.store(output_ptrs + tok_idx * k, quantized, mask=k_mask)
+            group_scale = tl.load(x_scale_ptrs + tok_idx * x_scale_stride1)
+        scaled = hidden.to(tl.float32) * group_scale.to(tl.float32)[:, None]
+        scaled = scaled * output_scale_val_inv
+        quantized = scaled.to(output_ptr.dtype.element_ty)
+        if HAS_G_TAIL:
+            tl.store(output_ptrs + tok_idx * k, quantized, mask=g_mask[:, None])
         else:
             tl.store(output_ptrs + tok_idx * k, quantized)
+
+
+# Groups per program, i.e. G_BLOCK_SIZE * 128 hidden elements.  16 groups (2048
+# elements) pays off once there are enough experts to fill the machine on the
+# expert axis alone; below that the smaller tile keeps more programs resident.
+_REQUANT_G_BLOCK = 8
+_REQUANT_G_BLOCK_MANY_EXPERTS = 16
+_REQUANT_MANY_EXPERTS = 32
+# 4 warps put 8 B/thread in flight for a 1024-element tile, which is where Triton
+# starts emitting vector accesses; 8 warps (the historical value) drop to 4
+# B/thread and scalar b32 loads.
+_REQUANT_NUM_WARPS = 4
+_REQUANT_M_GRID_MAX = 32
+_REQUANT_M_GRID_MIN = 4
+# Programs to aim for on the (m-grid x expert) plane while each expert holds
+# fewer rows than the grid would serve.  Hundreds of local experts saturate the
+# grid on the expert axis alone, where 32 programs per expert is oversubscription
+# (measured 15-30% at >= 64 experts on H200 and B200); past this many rows the
+# extra programs carry real work again and the cap costs a few percent.
+_REQUANT_TARGET_PROGRAMS = 1024
+_REQUANT_ROWS_SATURATED = 64
+
+
+def requant_launch_geometry(
+    num_groups: int, num_experts: int, expected_rows: Optional[int] = None
+) -> Tuple[int, int]:
+    """Pick (groups per program, m-grid) for the per-token -> per-tensor requant.
+
+    Only a launch hint: the m-grid decides how many programs share an expert's
+    rows, so any value is correct and skew just means more rows per program.
+    One program per expected row, never above the historical 32 and additionally
+    capped by the expert count while rows are scarce, was the measured optimum
+    across hidden sizes and expert counts -- so this only ever shrinks the grid.
+    The row count is rounded down to a power of two because the dispatcher's
+    estimate already rounds up (it adds the expert count before dividing), so an
+    exact average of 8 rows arrives as 9 and must not launch 16 programs.
+    """
+    g_block = (
+        _REQUANT_G_BLOCK_MANY_EXPERTS
+        if num_experts >= _REQUANT_MANY_EXPERTS
+        else _REQUANT_G_BLOCK
+    )
+    # Round down, so the tile never covers groups the payload does not have.
+    g_block = min(g_block, 1 << (max(1, num_groups).bit_length() - 1))
+    if expected_rows is None:
+        return g_block, _REQUANT_M_GRID_MAX
+    m_grid = min(_REQUANT_M_GRID_MAX, 1 << (max(1, expected_rows).bit_length() - 1))
+    if expected_rows < _REQUANT_ROWS_SATURATED:
+        cap = _REQUANT_TARGET_PROGRAMS // max(1, num_experts)
+        m_grid = min(m_grid, 1 << (max(1, cap).bit_length() - 1))
+    return g_block, max(_REQUANT_M_GRID_MIN, m_grid)
 
 
 def fp8_per_token_to_per_tensor_quant_triton(
@@ -1996,6 +2051,7 @@ def fp8_per_token_to_per_tensor_quant_triton(
     masked_m: torch.Tensor,
     output_scale: torch.Tensor,
     output: torch.Tensor,
+    expected_rows: Optional[int] = None,
 ):
     K_SCALE_BLOCK_SIZE = 128
     assert len(x.shape) == 3 and x.size(2) % K_SCALE_BLOCK_SIZE == 0
@@ -2003,8 +2059,9 @@ def fp8_per_token_to_per_tensor_quant_triton(
     assert x_scale.size(2) == x.size(2) // K_SCALE_BLOCK_SIZE
     assert output_scale.numel() == 1
 
-    K_BLOCK_SIZE = 1024
-    grid = (triton.cdiv(x.size(2), K_BLOCK_SIZE), 32, x.size(0))
+    num_groups = x.size(2) // K_SCALE_BLOCK_SIZE
+    g_block, m_grid = requant_launch_geometry(num_groups, x.size(0), expected_rows)
+    grid = (triton.cdiv(num_groups, g_block), m_grid, x.size(0))
     _fp8_per_token_quant_to_per_tensor_quant_kernel[grid](
         x,
         x_scale,
@@ -2015,9 +2072,9 @@ def fp8_per_token_to_per_tensor_quant_triton(
         x.size(1),
         x.size(2),
         K_SCALE_BLOCK_SIZE=K_SCALE_BLOCK_SIZE,
-        K_BLOCK_SIZE=K_BLOCK_SIZE,
-        HAS_K_TAIL=x.size(2) % K_BLOCK_SIZE != 0,
-        num_warps=8,
+        G_BLOCK_SIZE=g_block,
+        HAS_G_TAIL=(num_groups % g_block != 0),
+        num_warps=_REQUANT_NUM_WARPS,
     )
 
 
