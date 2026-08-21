@@ -5,6 +5,7 @@ import subprocess
 from functools import lru_cache
 
 from huggingface_hub import HfApi
+from huggingface_hub.errors import GatedRepoError
 
 from sglang.srt.environ import envs
 from sglang.utils import (
@@ -61,7 +62,7 @@ def get_is_diffusion_model(model_path: str) -> bool:
     For registered models, consults the diffusion registry first.
     For other local directories, checks the filesystem directly.
     For other HF/ModelScope model IDs, attempts to fetch only model_index.json.
-    For gated repos where file download fails, falls back to HF model card
+    For gated HF repos where file download fails, falls back to HF model card
     metadata (library_name == "diffusers").
     Returns False on any failure (network error, 404, offline mode, etc.)
     so that the caller falls through to the standard LLM server path.
@@ -78,8 +79,10 @@ def get_is_diffusion_model(model_path: str) -> bool:
     if os.path.isdir(model_path):
         return _is_diffusers_model_dir(model_path)
 
+    use_modelscope = envs.SGLANG_USE_MODELSCOPE.get()
+
     try:
-        if envs.SGLANG_USE_MODELSCOPE.get():
+        if use_modelscope:
             from modelscope import model_file_download
 
             file_path = model_file_download(
@@ -93,6 +96,8 @@ def get_is_diffusion_model(model_path: str) -> bool:
         return _is_diffusers_model_dir(os.path.dirname(file_path))
     except Exception as e:
         logger.debug("Failed to auto-detect diffusion model for %s: %s", model_path, e)
+        if not use_modelscope and isinstance(e, GatedRepoError):
+            return _is_gated_diffusion_repo(model_path)
         return False
 
 
