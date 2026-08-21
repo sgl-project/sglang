@@ -994,7 +994,7 @@ def build_dflash_verify_target_probs(
         elif max_top_k > vocab_size:
             max_top_k = vocab_size
 
-        # Sparse exact path for top-k/top-p (top-k-first semantics), then scatter to dense.
+        # Sparse exact path for joint top-k/top-p filtering, then scatter to dense.
         if 0 < max_top_k < vocab_size:
             topk_logits, topk_indices = torch.topk(scaled_logits, k=max_top_k, dim=-1)
             if uniform_top_k_value is None or int(uniform_top_k_value) != max_top_k:
@@ -1009,7 +1009,17 @@ def build_dflash_verify_target_probs(
                 repeated_top_ps = torch.repeat_interleave(
                     sampling_info.top_ps, draft_token_num, dim=0
                 )
-                topk_probs = _dflash_top_p_renorm_prob(topk_probs, repeated_top_ps)
+                # topk_probs has already been renormalized over the top-k
+                # support. Scale top-p by that support's original probability
+                # mass so the cutoff still refers to the full distribution.
+                topk_mass = torch.exp(
+                    torch.logsumexp(topk_logits, dim=-1)
+                    - torch.logsumexp(scaled_logits, dim=-1)
+                )
+                adjusted_top_ps = torch.clamp(repeated_top_ps / topk_mass, max=1.0)
+                topk_probs = _dflash_top_p_renorm_prob(
+                    topk_probs, adjusted_top_ps
+                )
 
             target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
             target_probs.scatter_(1, topk_indices, topk_probs)
@@ -1017,15 +1027,15 @@ def build_dflash_verify_target_probs(
 
     if not sparse_topk_applied:
         target_probs = F.softmax(scaled_logits, dim=-1)
-        if need_top_k:
-            target_probs = _dflash_top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
-            )
         if need_top_p:
             target_probs = _dflash_top_p_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
+            )
+        if need_top_k:
+            target_probs = _dflash_top_k_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
             )
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
