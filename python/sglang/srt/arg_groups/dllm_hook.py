@@ -24,33 +24,9 @@ def handle_dllm_inference(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.dllm_algorithm is None:
         return
-    if cfg.dllm_algorithm == "Gemma4Renoise":
-        from sglang.srt.arg_groups.model_override_base import model_config_of
+    from sglang.srt.dllm.algorithm import get_algorithm_cls
 
-        model_config = model_config_of(server_args)
-        hf_config = model_config.hf_config
-        if cfg.pp_size > 1:
-            raise ValueError("DiffusionGemma does not support pipeline parallelism")
-        if cfg.dcp_size > 1 or cfg.attn_cp_size > 1:
-            raise ValueError("DiffusionGemma does not support context parallelism")
-        if model_config.quantization is not None:
-            raise ValueError("DiffusionGemma does not support quantized loading")
-        if not (
-            getattr(hf_config, "tie_word_embeddings", False)
-            and getattr(hf_config.text_config, "tie_word_embeddings", False)
-        ):
-            raise ValueError("DiffusionGemma requires tied word embeddings")
-        declare_resolution(
-            server_args,
-            "_handle_dllm_inference",
-            disable_radix_cache=True,
-            chunked_prefill_size=-1,
-            cuda_graph_config=with_phase(
-                with_phase(cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED),
-                Phase.PREFILL,
-                backend=Backend.DISABLED,
-            ),
-        )
+    get_algorithm_cls(cfg.dllm_algorithm).configure_server_args(server_args)
 
     # On AMD/HIP, disable cuda graph for DLLM (the attention_backend
     # resolution moved to the pipeline: arg_groups/overrides.py

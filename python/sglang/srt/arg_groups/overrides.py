@@ -1726,16 +1726,23 @@ def _gguf_quantization(view: Any) -> dict:
 def _dllm_attention_backend(view: Any) -> dict:
     if view.dllm_algorithm is None:
         return {}
-    if view.dllm_algorithm == "Gemma4Renoise":
-        backend = (
-            "torch_native"
-            if view.device == "cpu"
-            else ("ascend" if get_platform().is_npu else "triton")
+    from sglang.srt.dllm.algorithm import get_algorithm_cls
+
+    algorithm_cls = get_algorithm_cls(view.dllm_algorithm)
+    if backend := algorithm_cls.required_attention_backend:
+        fields = (
+            "attention_backend",
+            "prefill_attention_backend",
+            "decode_attention_backend",
         )
-        if view.attention_backend != backend:
-            logger.warning("DiffusionGemma requires the %s attention backend", backend)
-            return {"attention_backend": backend}
-        return {}
+        overrides = {
+            field: backend for field in fields if getattr(view, field, None) != backend
+        }
+        if overrides:
+            logger.warning(
+                "%s requires the %s attention backend", view.dllm_algorithm, backend
+            )
+        return overrides
     if get_platform().is_hip:
         if view.attention_backend not in ["triton", "aiter"]:
             logger.warning(

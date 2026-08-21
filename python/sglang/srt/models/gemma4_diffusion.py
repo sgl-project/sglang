@@ -175,7 +175,11 @@ class DiffusionGemmaAttention(nn.Module):
 
         q, k = self.rotary_emb(positions, q, k)
 
-        attn = self.attn if forward_batch.dllm_is_encoder else self.attn_bidir
+        attn = (
+            self.attn
+            if not forward_batch.forward_mode.is_dllm_extend()
+            else self.attn_bidir
+        )
         attn_output = attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
@@ -304,7 +308,7 @@ class DiffusionGemmaDecoderLayer(nn.Module):
 
         scalar = (
             self.encoder_layer_scalar
-            if forward_batch.dllm_is_encoder
+            if not forward_batch.forward_mode.is_dllm_extend()
             else self.layer_scalar
         )
         return hidden_states * scalar
@@ -353,12 +357,6 @@ class DiffusionGemmaModel(nn.Module):
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
-
-        if not forward_batch.dllm_is_encoder:
-            signal = forward_batch.dllm_self_conditioning_embeds
-            if signal is None:
-                signal = torch.zeros_like(hidden_states)
-            hidden_states = self.self_conditioning(hidden_states, signal)
 
         for i in range(self.start_layer, self.end_layer):
             hidden_states = self.layers[i](positions, hidden_states, forward_batch)
@@ -435,6 +433,14 @@ class DiffusionGemmaForBlockDiffusion(PreTrainedModel):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
+    def prepare_dllm_input_embeds(
+        self, input_ids: torch.Tensor, self_conditioning: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        inputs_embeds = self.model.embed_tokens(input_ids)
+        if self_conditioning is None:
+            self_conditioning = torch.zeros_like(inputs_embeds)
+        return self.model.self_conditioning(inputs_embeds, self_conditioning)
+
     def get_attention_sliding_window_size(self):
         # Inclusive (HF) -> exclusive (sglang).
         return self.text_config.sliding_window - 1
@@ -448,7 +454,8 @@ class DiffusionGemmaForBlockDiffusion(PreTrainedModel):
         input_embeds: torch.Tensor = None,
         **kwargs,
     ):
-        if forward_batch.dllm_is_encoder and forward_batch.contains_image_inputs():
+        is_context_encoding = not forward_batch.forward_mode.is_dllm_extend()
+        if is_context_encoding and forward_batch.contains_image_inputs():
             Gemma4ForConditionalGeneration.prepare_attn_masks(
                 self, forward_batch, input_ids, torch.bool
             )
@@ -457,7 +464,7 @@ class DiffusionGemmaForBlockDiffusion(PreTrainedModel):
         if (
             input_embeds is None
             and self.vision_tower is not None
-            and forward_batch.dllm_is_encoder
+            and is_context_encoding
             and forward_batch.contains_image_inputs()
         ):
             hidden_states = general_mm_embed_routine(
@@ -471,8 +478,8 @@ class DiffusionGemmaForBlockDiffusion(PreTrainedModel):
             hidden_states = self.model(
                 input_ids, positions, forward_batch, input_embeds
             )
-        if forward_batch.dllm_is_encoder:
-            # Encoder passes only write the context KV and their logits are unused.
+        if is_context_encoding:
+            # Context passes only write KV; their logits are unused.
             return None
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch

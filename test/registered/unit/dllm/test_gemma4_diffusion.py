@@ -43,6 +43,9 @@ class _LanguageModelStub(torch.nn.Module):
             return input_embeds
         return self.embed_tokens(input_ids)
 
+    def self_conditioning(self, input_embeds, signal):
+        return input_embeds + signal
+
 
 class _LogitsProcessorStub(torch.nn.Module):
     def __init__(self):
@@ -66,7 +69,7 @@ def _diffusion_model_stub():
 
 def _dispatch_batch(*, encoder):
     return SimpleNamespace(
-        dllm_is_encoder=encoder,
+        forward_mode=(ForwardMode.EXTEND if encoder else ForwardMode.DLLM_EXTEND),
         contains_image_inputs=lambda: True,
     )
 
@@ -80,7 +83,7 @@ class TestGemma4DiffusionImageMasks(unittest.TestCase):
         ]
         forward_batch = SimpleNamespace(
             batch_size=1,
-            forward_mode=ForwardMode.DLLM_EXTEND,
+            forward_mode=ForwardMode.EXTEND,
             extend_seq_lens=[6],
             extend_prefix_lens=[2],
             mm_inputs=[SimpleNamespace(mm_items=image_items)],
@@ -156,6 +159,18 @@ class TestGemma4DiffusionImageMasks(unittest.TestCase):
 
         prepare_attn_masks.assert_not_called()
         self.assertIs(output, model.logits_processor.output)
+
+    def test_denoise_inputs_use_generic_input_embeds(self):
+        model = _diffusion_model_stub()
+        input_ids = torch.tensor([1, 2])
+        signal = torch.full((2, 4), 0.25)
+
+        actual = model.prepare_dllm_input_embeds(input_ids, signal)
+        expected = model.model.embed_tokens(input_ids) + signal
+        torch.testing.assert_close(actual, expected)
+
+        without_signal = model.prepare_dllm_input_embeds(input_ids, None)
+        torch.testing.assert_close(without_signal, model.model.embed_tokens(input_ids))
 
 
 class TestGemma4DiffusionWeightLoading(unittest.TestCase):

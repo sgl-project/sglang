@@ -31,9 +31,9 @@ def _gemma4_overrides(server_args: Any, hf_config: Any) -> dict:
         and hf_config.architectures[0] == "DiffusionGemmaForBlockDiffusion"
     )
     default_attention_backend = (
-        "torch_native"
-        if is_diffusion and cfg.device == "cpu"
-        else ("triton" if is_diffusion else ("trtllm_mha" if get_platform().is_sm100 else "triton"))
+        "triton"
+        if is_diffusion
+        else ("trtllm_mha" if get_platform().is_sm100 else "triton")
     )
     if is_attention_backend_not_set(cfg):
         logger.info(

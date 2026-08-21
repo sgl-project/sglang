@@ -26,7 +26,7 @@ class ReqDllmMixin:
         self.dllm_config = dllm_config
 
         if self.dllm_config is not None:
-            if self.dllm_config.is_uniform:
+            if self.dllm_config.requires_separate_context_encoding:
                 self.dllm_phase = DllmReqPhase.INCOMING_PREFILL
             elif len(self.origin_input_ids) < self.dllm_config.block_size:
                 self.dllm_phase = DllmReqPhase.INCOMING_DECODE
@@ -48,7 +48,7 @@ class ReqDllmMixin:
             return
 
         prefix_length = len(self.prefix_indices)
-        if self.dllm_config.is_uniform:
+        if self.dllm_config.requires_separate_context_encoding:
             self.dllm_phase = (
                 DllmReqPhase.STAGING_PREFILL
                 if prefix_length < self.dllm_block_offset
@@ -79,7 +79,7 @@ class ReqDllmMixin:
             # non-incomplete path which also defers it to the adder.
             return
 
-        if self.dllm_config.is_uniform:
+        if self.dllm_config.requires_separate_context_encoding:
             self._refresh_fill_ids()
             self.dllm_block_offset = self.seqlen
             if self.dllm_initialized:
@@ -102,7 +102,7 @@ class ReqDllmMixin:
 
     def _update_block_offset_for_dllm(self):
         prefix_len = len(self.prefix_indices)
-        if self.dllm_config.is_uniform:
+        if self.dllm_config.requires_separate_context_encoding:
             assert prefix_len <= self.dllm_block_offset
         else:
             assert (
