@@ -212,6 +212,7 @@ def _mix_fused(
     nvb: int,
     score_proj: ReplicatedLinear,
     score_norm: RMSNorm,
+    out_norm: Optional[RMSNorm] = None,
 ) -> torch.Tensor:
     """Triton score + combine pair: returns the pre-norm mixture."""
     T, H = prefix_sum.shape
@@ -227,7 +228,12 @@ def _mix_fused(
             nvb,
             cw,
             score_norm.variance_epsilon,
+            out_norm_weight=out_norm.weight if out_norm is not None else None,
+            out_norm_epsilon=(
+                out_norm.variance_epsilon if out_norm is not None else 0.0
+            ),
         )
+    assert out_norm is None
     n_h_blocks = H // _BLOCK_H
 
     # Step 1: score each row (2D grid, full row-parallelism)
@@ -277,6 +283,10 @@ def _aggregate_fused(
     out_norm: RMSNorm,
 ) -> torch.Tensor:
     # Step 3: standard RMSNorm (sglang's optimized kernel)
+    if is_npu():
+        return _mix_fused(
+            prefix_sum, bank, nvb, score_proj, score_norm, out_norm=out_norm
+        )
     return out_norm(_mix_fused(prefix_sum, bank, nvb, score_proj, score_norm))
 
 
