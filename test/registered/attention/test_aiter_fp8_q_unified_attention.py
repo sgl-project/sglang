@@ -126,6 +126,97 @@ class TestAiterFP8QUnifiedAttention(CustomTestCase):
         )
         return backend, layer, forward_batch, q
 
+    def test_verify_true_gqa_matches_stride_zero_expanded_layout(self):
+        batch, q_len = 4, 4
+        num_q_heads, num_kv_heads = 16, 1
+        seq_len, head_dim, page_size = 512, 256, 16
+        # PyTorch's ROCm build uses the "cuda" device namespace.
+        device = "cuda"
+        torch.manual_seed(0)
+
+        q = torch.randn(
+            batch * q_len,
+            num_q_heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        k_bf16 = torch.randn(
+            batch,
+            seq_len,
+            num_kv_heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        v_bf16 = torch.randn_like(k_bf16)
+        pages_per_seq = seq_len // page_size
+        block_table = torch.arange(
+            batch * pages_per_seq, dtype=torch.int32, device=device
+        ).view(batch, pages_per_seq)
+        cu_seqlens_q = torch.arange(
+            0,
+            (batch + 1) * q_len,
+            q_len,
+            dtype=torch.int32,
+            device=device,
+        )
+        seqused_k = torch.full((batch,), seq_len, dtype=torch.int32, device=device)
+
+        for kv_dtype in (torch.bfloat16, fp8_dtype):
+            with self.subTest(kv_dtype=kv_dtype):
+                if kv_dtype == fp8_dtype:
+                    fp8_max = torch.finfo(fp8_dtype).max
+                    k_descale = (
+                        (k_bf16.abs().float().amax() / fp8_max).clamp(min=1e-9).view(1)
+                    )
+                    v_descale = (
+                        (v_bf16.abs().float().amax() / fp8_max).clamp(min=1e-9).view(1)
+                    )
+                    k, _ = scaled_fp8_quant(k_bf16.reshape(-1, head_dim), k_descale)
+                    v, _ = scaled_fp8_quant(v_bf16.reshape(-1, head_dim), v_descale)
+                else:
+                    k, v = k_bf16, v_bf16
+                    k_descale = v_descale = None
+
+                k = k.view(-1, page_size, num_kv_heads, head_dim)
+                v = v.view(-1, page_size, num_kv_heads, head_dim)
+
+                def run(k_cache, v_cache):
+                    output = torch.empty_like(q)
+                    unified_attention(
+                        q=q,
+                        k=k_cache,
+                        v=v_cache,
+                        out=output,
+                        cu_seqlens_q=cu_seqlens_q,
+                        seqused_k=seqused_k,
+                        max_seqlen_q=q_len,
+                        max_seqlen_k=seq_len,
+                        softmax_scale=1 / math.sqrt(head_dim),
+                        causal=True,
+                        window_size=(-1, -1),
+                        block_table=block_table,
+                        softcap=0,
+                        q_descale=None,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        sinks=None,
+                    )
+                    return output
+
+                true_gqa = run(k, v)
+                expanded_mha = run(
+                    k.expand(-1, -1, num_q_heads, -1),
+                    v.expand(-1, -1, num_q_heads, -1),
+                )
+                torch.testing.assert_close(
+                    true_gqa,
+                    expanded_mha,
+                    rtol=2e-2,
+                    atol=2e-2,
+                )
+
     def test_q_quantization_is_isolated_to_unified_attention(self):
         for branch in ("mla", "vectorized", "unified", "legacy"):
             with self.subTest(branch=branch):

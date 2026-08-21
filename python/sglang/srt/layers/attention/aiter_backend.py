@@ -69,7 +69,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     scaled_fp8_quant,
 )
-from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.configs.model_config import AttentionArch, is_qwen3_5
 from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
@@ -267,6 +267,11 @@ class AiterAttnBackend(AttentionBackend):
             and not self.use_mla
             and self.topk == 1
             and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
+        )
+        self._use_verify_gqa_packing = (
+            self._use_unified_verify
+            and is_gfx95_supported()
+            and is_qwen3_5(model_runner.model_config.hf_config)
         )
 
         # aiter kernel related initialization
@@ -2278,8 +2283,6 @@ class AiterAttnBackend(AttentionBackend):
                         if self.forward_metadata.swa_page_table is not None:
                             page_table = self.forward_metadata.swa_page_table
 
-                    # True KV-head count, same layout as forward_decode.
-                    # unified_attention derives nqpkv from this axis.
                     q_unified = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
                     k_unified = k_cache.view(
                         -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
@@ -2287,6 +2290,14 @@ class AiterAttnBackend(AttentionBackend):
                     v_unified = v_cache.view(
                         -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                     )
+                    if (
+                        not self._use_verify_gqa_packing
+                        and layer.tp_k_head_num == 1
+                        and layer.tp_q_head_num > 1
+                    ):
+                        # Keep the legacy MHA layout outside the validated path.
+                        k_unified = k_unified.expand(-1, -1, layer.tp_q_head_num, -1)
+                        v_unified = v_unified.expand(-1, -1, layer.tp_q_head_num, -1)
 
                     # The seq_lens + draft_num add has to run INSIDE the graph
                     # region; a host-side pre-add would allocate a new tensor
