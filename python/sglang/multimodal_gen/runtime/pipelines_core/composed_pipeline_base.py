@@ -33,6 +33,14 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentResidencyStrategy,
     get_global_component_residency_manager,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.comfyui_profile import (
+    COMFYUI_REQUIRED_MODULES,
+    create_comfyui_pipeline_stages,
+    initialize_comfyui_pipeline,
+    is_comfyui_mode,
+    is_comfyui_single_file,
+    load_comfyui_transformer,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
 )
@@ -120,6 +128,9 @@ class ComposedPipelineBase(ABC):
         )
         if base_required_config_modules is None:
             raise NotImplementedError("Subclass must set _required_config_modules")
+        if is_comfyui_mode(server_args):
+            # ComfyUI owns text encoding, VAE decode, and the sampler loop.
+            base_required_config_modules = COMFYUI_REQUIRED_MODULES
         self._required_config_modules = list(base_required_config_modules)
         self._extra_config_module_map = dict(self._extra_config_module_map)
 
@@ -161,6 +172,12 @@ class ComposedPipelineBase(ABC):
 
     def __post_init__(self) -> None:
         assert self.server_args is not None, "server_args must be set"
+        if is_comfyui_mode(self.server_args):
+            initialize_comfyui_pipeline(self, self.server_args)
+            logger.info("Creating ComfyUI pipeline stages...")
+            create_comfyui_pipeline_stages(self, self.server_args)
+            return
+
         self.initialize_pipeline(self.server_args)
 
         logger.info("Creating pipeline stages...")
@@ -370,6 +387,8 @@ class ComposedPipelineBase(ABC):
         loaded_modules: Optional[Dict[str, torch.nn.Module]] = None,
         If provided, loaded_modules will be used instead of loading from config/pretrained weights.
         """
+        if is_comfyui_mode(server_args) and is_comfyui_single_file(self.model_path):
+            return load_comfyui_transformer(self, server_args, loaded_modules)
 
         model_index = self._load_config()
         logger.info("Loading pipeline modules from config: %s", model_index)
