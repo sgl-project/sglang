@@ -413,7 +413,7 @@ uninstall_stale_flashinfer() {
 
 install_pytorch_stack() {
     PYTORCH_SPECS=()
-    for package in torch torchaudio torchvision torchao torchcodec; do
+    for package in torch torchaudio torchvision torchcodec; do
         spec=$(grep -Po -m1 "\"${package}([<>=!~ ;][^\"]*)?\"" python/pyproject.toml | tr -d '"' || true)
         if [ -n "$spec" ]; then
             PYTORCH_SPECS+=("$spec")
@@ -460,7 +460,7 @@ require_prebuilt_rust_exts() {
         return
     fi
 
-    # Exact EXT_SUFFIX rather than a _core*.so glob: no crate sets abi3, so a module
+    # Exact EXT_SUFFIX rather than an _*.so glob: no crate sets abi3, so a module
     # built for another minor version satisfies the glob while the import system
     # ignores it, leaving is_rust_server_built() false and the Rust-server tests
     # silently skipped. Stages have no setup-python, so the interpreter is whatever
@@ -469,13 +469,13 @@ require_prebuilt_rust_exts() {
     local suffix
     suffix=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
     local missing=()
-    local pkg
-    for pkg in server grpc multimodal; do
-        [ -f "python/sglang/srt/${pkg}/_core${suffix}" ] || missing+=("${pkg}")
+    local module
+    for module in server grpc multimodal; do
+        [ -f "python/sglang/srt/rust_extensions/_${module}${suffix}" ] || missing+=("${module}")
     done
     if [ ${#missing[@]} -gt 0 ]; then
-        echo "::warning::no prebuilt _core${suffix} for: ${missing[*]}; building from source"
-        ls -l python/sglang/srt/*/_core*.so 2>/dev/null || echo "(no extension modules at all)"
+        echo "::warning::no prebuilt Rust extension ${suffix} for: ${missing[*]}; building from source"
+        ls -l python/sglang/srt/rust_extensions/_*.so 2>/dev/null || echo "(no extension modules at all)"
         export SGLANG_BUILD_RUST_EXTS=
         mark_step_done "${FUNCNAME[0]}"
         return
@@ -501,6 +501,17 @@ install_sglang() {
        && pip show nvidia-cusparselt-cu13 >/dev/null 2>&1; then
         echo "WARNING: nvidia-cusparselt-cu13 metadata present but libcusparseLt.so.0 missing — reinstalling"
         $PIP_CMD install --reinstall nvidia-cusparselt-cu13 $PIP_INSTALL_SUFFIX
+    fi
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+install_nccl() {
+    if [ "$CU_MAJOR" = "13" ]; then
+        $PIP_CMD install "nvidia-nccl-cu13==2.30.7" \
+            --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+    else
+        echo "CUDA ${CU_MAJOR} does not require the NCCL Gin wheel"
     fi
 
     mark_step_done "${FUNCNAME[0]}"
@@ -812,7 +823,7 @@ print(f"sglang resolves to {spec.origin}")
 # so a .so that cannot load passes find_spec and only fails inside some suite.
 import importlib
 for mod in ("server", "grpc", "multimodal"):
-    name = f"sglang.srt.{mod}._core"
+    name = f"sglang.srt.rust_extensions._{mod}"
     try:
         importlib.import_module(name)
     except Exception as exc:
@@ -843,6 +854,7 @@ main() {
     install_pytorch_stack
     install_cuda12_deepep_wheel
     install_sglang
+    install_nccl
     # Diffusion B200 CI imports torch inside install_sglang_kernel after removing
     # stale CUDA 12 NVIDIA wheels, so opt into one early LD_LIBRARY_PATH refresh.
     if [ "${SGLANG_CI_EARLY_LD_LIBRARY_PATH:-0}" = "1" ]; then
