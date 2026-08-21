@@ -100,12 +100,15 @@ class SamplingMaskOutput:
     lengths: torch.Tensor
     selected_logprobs: torch.Tensor
     statuses: torch.Tensor
+    output_lens: Optional[torch.Tensor] = None
 
     def map_device_tensors(self, fn) -> None:
         self.token_ids = fn(self.token_ids)
         self.lengths = fn(self.lengths)
         self.selected_logprobs = fn(self.selected_logprobs)
         self.statuses = fn(self.statuses)
+        if self.output_lens is not None:
+            self.output_lens = fn(self.output_lens)
 
 
 def _trace_e2e_logits(stage: str, **fields) -> None:
@@ -224,8 +227,12 @@ class LogitsProcessorOutput:
     # Post-filter support IDs, bounded by server capacity, and selected-token
     # logprob over the full realized support.
     sampling_mask_output: Optional[SamplingMaskOutput] = None
-    next_token_sampling_mask_idx: Optional[List[Optional[List[int]]]] = None
-    next_token_sampling_logprobs: Optional[List[Optional[float]]] = None
+    next_token_sampling_mask_idx: Optional[
+        List[Optional[Union[List[int], List[List[int]]]]]
+    ] = None
+    next_token_sampling_logprobs: Optional[
+        List[Optional[Union[float, List[float]]]]
+    ] = None
     next_token_sampling_mask_status: Optional[List[Optional[int]]] = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
