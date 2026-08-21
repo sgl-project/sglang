@@ -38,6 +38,24 @@ def _normalize_page_table_rows(
     )
 
 
+def _normalize_cache_seqlens_rows(
+    cache_seqlens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    batch_size: int,
+) -> torch.Tensor:
+    """Preserve planned rows and fill only newly DP-padded dummy rows."""
+    planned_bs = cache_seqlens.shape[0]
+    if planned_bs >= batch_size:
+        return cache_seqlens[:batch_size]
+
+    dummy_seqlens = seq_lens[planned_bs:batch_size].to(
+        device=cache_seqlens.device,
+        dtype=cache_seqlens.dtype,
+        non_blocking=True,
+    )
+    return torch.cat([cache_seqlens, dummy_seqlens], dim=0)
+
+
 def _metadata_mismatches_dp_padded_batch(metadata, forward_batch) -> bool:
     """True when pre-planned attention metadata no longer matches the live batch.
 
@@ -354,9 +372,11 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
             raise RuntimeError("Dots SWA latent decode requires an SWA page table.")
         bs = forward_batch.batch_size
         block_table = _normalize_page_table_rows(block_table, bs)
-        cache_seqlens = metadata.cache_seqlens_int32
-        if cache_seqlens.shape[0] != bs:
-            cache_seqlens = forward_batch.seq_lens[:bs].to(torch.int32)
+        cache_seqlens = _normalize_cache_seqlens_rows(
+            metadata.cache_seqlens_int32,
+            forward_batch.seq_lens,
+            bs,
+        )
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         output = forward_dense_kvlora_swa_torch_fallback(

@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.dots_hybrid_backend import (
     DotsHybridAttnBackend,
     DotsSWAMLAAttnBackend,
     _metadata_mismatches_dp_padded_batch,
+    _normalize_cache_seqlens_rows,
 )
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionMetadata
 from sglang.srt.layers.attention.swa_mla_fallback.ops import (
@@ -80,6 +81,24 @@ def test_hybrid_rebuilds_when_dp_padding_changes_batch_size():
         _batch(bs=2, num_tokens=2, original_bs=1)
     )
     hybrid.init_forward_metadata.assert_called_once()
+
+
+def test_normalize_cache_seqlens_preserves_planned_rows_and_pads_dummy_rows():
+    cache_seqlens = torch.tensor([17, 23], dtype=torch.int32)
+    seq_lens = torch.tensor([100, 200, 300, 400], dtype=torch.int64)
+
+    normalized = _normalize_cache_seqlens_rows(cache_seqlens, seq_lens, 4)
+
+    assert torch.equal(normalized, torch.tensor([17, 23, 300, 400], dtype=torch.int32))
+
+
+def test_normalize_cache_seqlens_truncates_extra_rows():
+    cache_seqlens = torch.tensor([17, 23, 29], dtype=torch.int32)
+    seq_lens = torch.tensor([100, 200], dtype=torch.int64)
+
+    normalized = _normalize_cache_seqlens_rows(cache_seqlens, seq_lens, 2)
+
+    assert torch.equal(normalized, torch.tensor([17, 23], dtype=torch.int32))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

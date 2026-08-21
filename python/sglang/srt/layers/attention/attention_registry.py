@@ -310,12 +310,15 @@ def attn_backend_wrapper_for_draft_extend(
 
 
 def attn_backend_wrapper_for_draft_decode(runner: "ModelRunner", backend):
-    """Apply an optional model-owned wrapper to per-step draft backends."""
-    hf_text_config = getattr(
-        getattr(runner, "model_config", None), "hf_text_config", None
-    )
-    wrapper = getattr(hf_text_config, "wrap_draft_decode_attention_backend", None)
-    return wrapper(backend) if wrapper is not None else backend
+    """Apply the Dots model wrapper to per-step draft backends."""
+    from sglang.srt.configs.dots3 import Dots3Config
+
+    if not hasattr(runner, "model_config"):
+        return backend
+    hf_text_config = runner.model_config.hf_text_config
+    if isinstance(hf_text_config, Dots3Config):
+        return hf_text_config.wrap_draft_decode_attention_backend(backend)
+    return backend
 
 
 def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBackend"):
