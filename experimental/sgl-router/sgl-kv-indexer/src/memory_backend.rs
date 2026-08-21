@@ -431,6 +431,11 @@ impl InMemoryKvIndexerBackend {
             worker.ready = false;
             worker.epoch = None;
             worker.last_seq = None;
+            // A Worker process restart legitimately changes generation. The
+            // next Snapshot v2 establishes the new value; an operator-pinned
+            // expected generation is reapplied by ConfigureExpectedWorkers
+            // before Begin and still fences mismatches.
+            worker.worker_generation.clear();
         }
         self.refresh_status(&state);
         let coverage = coverage_response(&state, &self.instance_epoch);
@@ -1497,5 +1502,61 @@ mod tests {
         assert!(response.complete_coverage);
         assert_eq!(response.best_prefix_blocks, 1);
         assert_eq!(response.matches[0].stream_id.as_ref().unwrap().dp_rank, 1);
+    }
+
+    #[tokio::test]
+    async fn invalidation_allows_snapshot_to_establish_new_worker_generation() {
+        let backend = InMemoryKvIndexerBackend::new();
+        let mut configured = expected_stream("worker", 0, "http://worker");
+        configured.worker_generation.clear();
+        backend
+            .configure_expected_workers(ConfigureExpectedWorkersRequest {
+                workers: vec![configured],
+            })
+            .await
+            .unwrap();
+        let mut first = snapshot("worker", "http://worker", "epoch-1", 1, &[1]);
+        first.stream_id = Some(crate::pb::StreamId {
+            namespace: "ns".into(),
+            worker_id: "worker".into(),
+            dp_rank: 0,
+        });
+        first.worker_generation = "generation-1".into();
+        backend.replace_external_kv_snapshot(first).await.unwrap();
+        backend
+            .invalidate_worker(InvalidateWorkerRequest {
+                worker_id: "worker".into(),
+                stream_id: Some(crate::pb::StreamId {
+                    namespace: "ns".into(),
+                    worker_id: "worker".into(),
+                    dp_rank: 0,
+                }),
+            })
+            .await
+            .unwrap();
+
+        backend
+            .begin_external_kv_snapshot(BeginExternalKvSnapshotRequest {
+                stream_id: Some(crate::pb::StreamId {
+                    namespace: "ns".into(),
+                    worker_id: "worker".into(),
+                    dp_rank: 0,
+                }),
+                worker_address: "http://worker".into(),
+                worker_epoch: "epoch-2".into(),
+                applied_seq: 2,
+                cache_spec: expected_stream("worker", 0, "http://worker").cache_spec,
+                metadata: Some(ExternalKvSnapshotMetadata {
+                    model: "model".into(),
+                    worker_generation: "generation-2".into(),
+                    hash_schema_version: 1,
+                    page_size: 1,
+                    is_bigram: false,
+                }),
+                snapshot_id: "snapshot-2".into(),
+                expected_placements: 0,
+            })
+            .await
+            .expect("new Worker generation should be accepted after invalidation");
     }
 }
