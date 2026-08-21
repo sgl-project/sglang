@@ -104,11 +104,17 @@ class MSARepetitionSummaryTest(unittest.TestCase):
                     provider_dir / "fixed_parity.json",
                     {
                         "records": [
-                            {"name": name, "response_sha256": digest}
-                            for name, digest in (
-                                ("short", "c" * 64),
-                                ("long_32768", "d" * 64),
-                                ("long_65536", "e" * 64),
+                            {
+                                "name": name,
+                                "expected": answer,
+                                "exact_expected": True,
+                                "content": answer,
+                                "response_sha256": digest,
+                            }
+                            for name, answer, digest in (
+                                ("short", "MSA-SHORT-4B19", "c" * 64),
+                                ("long_32768", "MSA-32768-C7F29A", "d" * 64),
+                                ("long_65536", "MSA-65536-C7F29A", "e" * 64),
                             )
                         ]
                     },
@@ -144,6 +150,30 @@ class MSARepetitionSummaryTest(unittest.TestCase):
                 {"order": ["baseline", "candidate"]},
             )
             with self.assertRaisesRegex(ValueError, "order"):
+                build_summary(root)
+
+    def test_reasoning_hash_drift_does_not_change_exact_fixed_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_fixture(root)
+            parity_path = root / "rep02" / "candidate" / "fixed_parity.json"
+            parity = json.loads(parity_path.read_text())
+            parity["records"][0]["response_sha256"] = "f" * 64
+            self.write_json(parity_path, parity)
+
+            build_summary(root)
+
+    def test_rejects_fixed_answer_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_fixture(root)
+            parity_path = root / "rep02" / "candidate" / "fixed_parity.json"
+            parity = json.loads(parity_path.read_text())
+            parity["records"][0]["content"] = "WRONG"
+            parity["records"][0]["exact_expected"] = False
+            self.write_json(parity_path, parity)
+
+            with self.assertRaisesRegex(ValueError, "failed its expected answer"):
                 build_summary(root)
 
     def test_accuracy_margins_are_metric_specific(self) -> None:

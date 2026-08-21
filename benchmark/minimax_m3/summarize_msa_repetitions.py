@@ -80,19 +80,23 @@ def build_summary(root: Path, repetitions: int = 3) -> dict:
     if len(longbench_hashes) != 1:
         raise ValueError("LongBench-v2 SHA-256 is not identical across all six runs")
 
-    fixed_hashes: dict[str, set[str]] = {}
+    fixed_answers: dict[str, set[str]] = {}
     for provider_dir in provider_dirs:
         for record in load(provider_dir / "fixed_parity.json")["records"]:
-            fixed_hashes.setdefault(record["name"], set()).add(
-                record["response_sha256"]
-            )
+            if not record.get("exact_expected", False):
+                raise ValueError(
+                    f"fixed probe failed its expected answer: {record['name']}"
+                )
+            fixed_answers.setdefault(record["name"], set()).add(record["content"])
     expected_fixed = {"short", "long_32768", "long_65536"}
-    if set(fixed_hashes) != expected_fixed:
-        raise ValueError(f"fixed probes are incomplete: {sorted(fixed_hashes)}")
-    unstable = sorted(name for name, hashes in fixed_hashes.items() if len(hashes) != 1)
+    if set(fixed_answers) != expected_fixed:
+        raise ValueError(f"fixed probes are incomplete: {sorted(fixed_answers)}")
+    unstable = sorted(
+        name for name, answers in fixed_answers.items() if len(answers) != 1
+    )
     if unstable:
         raise ValueError(
-            "temperature-zero fixed responses changed across repetitions: "
+            "temperature-zero fixed answers changed across repetitions: "
             + ", ".join(unstable)
         )
 

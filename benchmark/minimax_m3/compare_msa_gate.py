@@ -78,11 +78,8 @@ def main() -> None:
             failures.append(f"baseline fixed probe failed its expected answer: {name}")
         if candidate is not None and not candidate.get("exact_expected", False):
             failures.append(f"candidate fixed probe failed its expected answer: {name}")
-        if (
-            candidate is None
-            or candidate["response_sha256"] != baseline["response_sha256"]
-        ):
-            failures.append(f"fixed output mismatch: {name}")
+        if candidate is None or candidate.get("content") != baseline.get("content"):
+            failures.append(f"fixed answer mismatch: {name}")
         if name.startswith("long_"):
             minimum_tokens = int(name.removeprefix("long_"))
             if int(baseline.get("prompt_tokens", 0)) < minimum_tokens:

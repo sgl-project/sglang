@@ -162,9 +162,11 @@ repetition is never overwritten.
 Each repetition is compared independently. `summary.json` then reports the
 three raw values, backend median, gain computed from backend medians, and median
 paired gain for every concurrency and metric. It also rejects provider-order
-drift, dataset-hash drift, and any temperature-zero fixed response that changes
-across the six server runs. By default, candidate median output throughput may
-not regress at any concurrency.
+drift, dataset-hash drift, and any visible temperature-zero fixed answer that
+changes across the six server runs. Hidden reasoning text and its response hash
+remain in the evidence for auditing, but are not an equality gate: equivalent
+exact answers can legitimately use different reasoning traces. By default,
+candidate median output throughput may not regress at any concurrency.
 
 For a single diagnostic run, start one server manually and run:
 
