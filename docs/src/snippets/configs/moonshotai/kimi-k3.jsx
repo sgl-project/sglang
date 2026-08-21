@@ -731,7 +731,7 @@ export const config = {
         //   EAGLE   --speculative-num-steps N           (chain; topk>1 is a tree)
         // Only DSPARK is selectable today, so only its form is emitted.
         id: "proposedDraftTokens", title: "Proposed Draft Tokens",
-        // The A3 recipe pins the shipped block size (7)
+        // The A3 recipe pins the shipped block size (7).
         showWhen: (b) => b.spec === "dspark" && b.hw !== "a3",
         control: "slider",
         stripPrefixes: [
