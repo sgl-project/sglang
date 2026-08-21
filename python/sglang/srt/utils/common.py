@@ -4051,6 +4051,7 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "o_proj",
     "q_a_proj",
     "kv_a_proj_with_mqa",
+    "fused_qkv_a_proj_with_mqa",
     "q_b_proj",
     "kv_b_proj",
     "wq_b",
@@ -4066,9 +4067,15 @@ SUPPORTED_LORA_TARGET_MODULES = [
     # Inkling attention projections (merged q/k/v/r and its row-parallel output).
     "qkvr",
     "wo_ud",
-    # GDN linear attention (Qwen3-Next / Qwen3.5) serves the fused in_proj as two slices.
+    # GDN linear attention (Qwen3-Next / Qwen3.5) serves the fused in_proj as two
+    # slices, and also carries an unfused in_proj and a row-parallel out_proj.
     "in_proj_qkvz",
     "in_proj_ba",
+    "in_proj",
+    "out_proj",
+    # Latent MLP projections.
+    "fc1_latent_proj",
+    "fc2_latent_proj",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"
