@@ -1197,6 +1197,11 @@ class LayerwiseOffloadableModuleMixin:
     # under layerwise offload. See _host_resident_tables for what qualifies.
     host_resident_table_names: List[str] = []
     layerwise_offload_managers: list[LayerwiseOffloadManager] = []
+    # Captured by _capture_mps_cpu_non_layer_weights after the managers
+    # initialize on MPS. None until then, so a residency strategy that runs a
+    # use interval before capture restores nothing instead of raising.
+    _mps_cpu_non_layer_parameters: Dict[str, torch.Tensor] | None = None
+    _mps_cpu_buffers: Dict[str, torch.Tensor] | None = None
 
     def _capture_mps_cpu_non_layer_weights(self) -> None:
         managed_names = {
@@ -1240,6 +1245,8 @@ class LayerwiseOffloadableModuleMixin:
     def materialize_mps_non_layer_weights(self, *prefixes: str) -> None:
         if not current_platform.is_mps() or not self.mps_stream_non_layer_weights:
             return
+        if self._mps_cpu_non_layer_parameters is None:
+            return
         selected_prefixes = tuple(prefixes)
         with torch.inference_mode(False), torch.no_grad():
             parameters = dict(self.named_parameters())
@@ -1257,6 +1264,8 @@ class LayerwiseOffloadableModuleMixin:
 
     def release_mps_non_layer_weights(self, *prefixes: str) -> None:
         if not current_platform.is_mps() or not self.mps_stream_non_layer_weights:
+            return
+        if self._mps_cpu_non_layer_parameters is None:
             return
         selected_prefixes = tuple(prefixes)
         with torch.inference_mode(False), torch.no_grad():
@@ -1281,6 +1290,8 @@ class LayerwiseOffloadableModuleMixin:
 
     def restore_mps_cpu_non_layer_weights(self) -> None:
         if not current_platform.is_mps():
+            return
+        if self._mps_cpu_non_layer_parameters is None:
             return
         with torch.inference_mode(False), torch.no_grad():
             parameters = dict(self.named_parameters())
