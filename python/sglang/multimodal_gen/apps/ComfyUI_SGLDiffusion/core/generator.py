@@ -31,6 +31,13 @@ from ..executors import (
 )
 from .model_patcher import SGLDModelPatcher
 
+_EXECUTOR_CLASSES = (
+    FluxExecutor,
+    ZImageExecutor,
+    QwenImageExecutor,
+    QwenImageEditExecutor,
+)
+
 
 class SGLDiffusionGenerator:
     """Generator for SGLang Diffusion models in ComfyUI."""
@@ -41,18 +48,15 @@ class SGLDiffusionGenerator:
         self.executor = None
         self.last_options = None
 
-        self.pipeline_class_dict = {
-            "flux": "ComfyUIFluxPipeline",
-            "lumina2": "ComfyUIZImagePipeline",  # zimage
-            "qwen_image": "ComfyUIQwenImagePipeline",
-            "qwen_image_edit": "ComfyUIQwenImageEditPipeline",
-        }
-        self.executor_class_dict = {
-            "flux": FluxExecutor,
-            "lumina2": ZImageExecutor,
-            "qwen_image": QwenImageExecutor,
-            "qwen_image_edit": QwenImageEditExecutor,
-        }
+        # Native pipelines, run under comfyui_mode as a DiT-only forward service.
+        self.pipeline_class_dict = {}
+        self.executor_class_dict = {}
+        for executor_cls in _EXECUTOR_CLASSES:
+            for model_type in executor_cls.adapter_cls.model_types:
+                self.executor_class_dict[model_type] = executor_cls
+                self.pipeline_class_dict[model_type] = (
+                    executor_cls.adapter_cls.pipeline_class_name
+                )
 
     def __del__(self):
         self.close_generator()
@@ -66,13 +70,36 @@ class SGLDiffusionGenerator:
         if kwargs is None:
             kwargs = {}
         # Set comfyui_mode for ComfyUI integration
+        kwargs = dict(kwargs)
         kwargs["comfyui_mode"] = True
+        # ComfyUI already keeps CLIP/VAE in the parent process. Auto image
+        # policy otherwise sets dit_cpu_offload=True and every sampler step
+        # reloads the DiT from CPU.
+        kwargs.setdefault("dit_cpu_offload", False)
+        kwargs = self._server_args_kwargs(kwargs)
         self.generator = DiffGenerator.from_pretrained(
             model_path=model_path,
             pipeline_class_name=pipeline_class_name,
             **kwargs,
         )
         return self.generator
+
+    @staticmethod
+    def _server_args_kwargs(kwargs: dict) -> dict:
+        """Drop plugin-only / stale flags that ServerArgs no longer accepts."""
+        import dataclasses
+
+        from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+        valid = {f.name for f in dataclasses.fields(ServerArgs)}
+        aliases = {"dp_degree": "dp_size", "cache_strategy": None, "model_type": None}
+        cleaned = {}
+        for key, value in kwargs.items():
+            dest = aliases.get(key, key)
+            if dest is None or dest not in valid:
+                continue
+            cleaned[dest] = value
+        return cleaned
 
     def kill_generator(self):
         """Kill worker processes manually because generator shutdown cannot terminate them."""
