@@ -63,6 +63,10 @@ looks harmless and is not: on ERNIE-Image it moved the 50-step trajectory to
 PSNR 18.83 dB at `quality=high`, which is what motivated the bit-exact
 rewrite.
 
+SANA-Video's quality-gated linear-attention site keeps BF16 inputs for the
+first GEMM while requesting FP32 accumulation/output, then runs the second
+GEMM in FP32. The default path still promotes Q/K/V before both GEMMs.
+
 ## Entry-point protocol
 
 Every public kernel is a **predicate + kernel** pair:
@@ -114,6 +118,7 @@ Several norms look interchangeable and are not. Start here.
 | `fused_qknorm_rope_pack_kv` | JIT CUDA | as above, also packs prefix K/V |
 | `fused_rope_rotate_half_bitexact` | Triton | bit-exact (elementwise only) |
 | `ltx2_qknorm_split_rope_cuda` | JIT CUDA | close; **validated on B200** |
+| `fused_ltx25_decoder_rope` | JIT CUDA | bit-exact paired 3D RoPE from cached compact axis tables |
 | `apply_rotary_embedding` | Triton (+fallbacks) | close; the generic entry point |
 | `hunyuan_qkv_rope_pack` | Triton | bit-exact; packs QKV and applies RoPE in one pass |
 
