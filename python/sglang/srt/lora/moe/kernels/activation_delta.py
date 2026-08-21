@@ -163,3 +163,74 @@ def act_delta_masked(
         BLOCK_SIZE=512,
         **({"launch_pdl": True} if consume_base_pdl else {}),
     )
+
+
+def act_delta_contiguous(
+    gateup_output: torch.Tensor,  # [m_pad_ceiling, slices * inter] bf16
+    gate_up_delta: torch.Tensor | None,  # [num_tokens, top_k, slices * inter]
+    act_out: torch.Tensor,  # [m_pad_ceiling, inter] bf16
+    activation_lora_input: torch.Tensor,  # [num_tokens, top_k, inter] bf16
+    src2dst: torch.Tensor,  # [num_tokens * top_k] int32 COMPACT rows
+    topk_ids: torch.Tensor,  # [num_tokens, top_k]
+    num_local_experts: int,
+    gate_first: bool = True,
+    interleaved: bool = False,
+    activation: str = "silu",
+    consume_base_pdl: bool = False,
+) -> None:
+    """Run the masked activation kernel over the compact rows.
+
+    The launch, the grid and the per-pair arithmetic match
+    :func:`activation_delta.act_delta_masked`. Only the physical row behind
+    each ``src2dst`` entry differs. The kernel writes a zero into
+    ``activation_lora_input`` once for each invalid pair.
+
+    ``num_local_experts`` is a parameter here because the compact buffer is 2-D
+    and has no expert dimension to read it from.
+    """
+    ActivationFn.parse(activation)  # reject an unknown activation name
+    num_pairs = topk_ids.numel()
+    inter = act_out.shape[-1]
+    if gateup_output.ndim != 2:
+        raise ValueError(
+            f"base gate/up must be compact 2-D, got {tuple(gateup_output.shape)}"
+        )
+    # The slice count comes from the weight shape, not from the activation.
+    num_slices = gateup_output.shape[-1] // inter
+    if num_slices not in (1, 2) or num_slices * inter != gateup_output.shape[-1]:
+        raise ValueError(
+            f"gate/up width {gateup_output.shape[-1]} is not 1x or 2x "
+            f"intermediate {inter}"
+        )
+    if act_out.ndim != 2 or act_out.shape[0] != gateup_output.shape[0]:
+        raise ValueError("gate/up and activation compact buffers must share rows")
+    if gate_up_delta is not None and gate_up_delta.shape != (
+        *topk_ids.shape,
+        num_slices * inter,
+    ):
+        raise ValueError(
+            f"gate_up_delta must be {(*topk_ids.shape, num_slices * inter)}"
+        )
+    if activation_lora_input.shape != (*topk_ids.shape, inter):
+        raise ValueError(f"activation_lora_input must be {(*topk_ids.shape, inter)}")
+    if num_pairs == 0:
+        return
+    _activation_delta_masked_kernel[(num_pairs,)](
+        gateup_output,
+        gate_up_delta if gate_up_delta is not None else gateup_output,
+        act_out,
+        activation_lora_input,
+        src2dst,
+        topk_ids,
+        topk_ids.shape[1],
+        num_local_experts,
+        inter,
+        HAS_DELTA=gate_up_delta is not None,
+        NUM_SLICES=num_slices,
+        ACTIVATION_TYPE=activation,
+        GATE_FIRST=gate_first,
+        INTERLEAVED=interleaved,
+        CONSUME_BASE_PDL=consume_base_pdl,
+        BLOCK_SIZE=512,
+        **({"launch_pdl": True} if consume_base_pdl else {}),
+    )

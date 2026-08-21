@@ -12,15 +12,15 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.moe.base_gemm_provider.contiguous_row_domain import (
-    ContiguousSchedulePack,
-)
 from sglang.srt.lora.moe.base_gemm_provider.cutedsl_masked.schedule_abi import (
     MAX_EXPERTS,
     MAX_OUTPUT_CLUSTERS,
     MAX_TOKEN_CLUSTERS,
     OUTPUT_CLUSTER_SHIFT,
     TOKEN_CLUSTER_SHIFT,
+)
+from sglang.srt.lora.moe.kernels.dispatch import (
+    ContiguousSchedulePack,
 )
 
 

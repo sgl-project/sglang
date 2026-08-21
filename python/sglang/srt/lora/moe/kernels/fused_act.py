@@ -475,3 +475,147 @@ def run_masked_fused_act(
         num_stages=num_stages,
         **({"launch_pdl": True} if consume_base_pdl else {}),
     )
+
+
+def fused_b_act_contiguous(
+    family: str,
+    *,
+    activation: str,
+    base_gateup: torch.Tensor,  # [m_pad_ceiling, slices * inter] bf16
+    act_compact: torch.Tensor,  # [m_pad_ceiling, inter] bf16
+    act_pairs: torch.Tensor | None,  # [num_tokens, top_k, inter] or None
+    src2dst: torch.Tensor,  # [num_tokens * top_k] int32 COMPACT rows
+    routing: RouteView,
+    num_local_experts: int,
+    gate_first: bool,
+    interleaved: bool,
+    config: Mapping[str, int],
+    bridge_gateup: torch.Tensor | None = None,
+    b_gate_up: torch.Tensor | None = None,
+    bridge_top_k: int = 1,
+    consume_base_pdl: bool = False,
+) -> None:
+    """Run the fused LoRA-B GEMM and the activation over the compact rows.
+
+    The kernel, the grid and the per-pair arithmetic match
+    :func:`fused_act.run_masked_fused_act`. Only the shape check
+    differs, because the compact domain is one flat 2-D buffer. The kernel
+    writes a zero into ``act_pairs`` once for each invalid pair.
+
+    The kernel skips the segment padding rows, so they keep stale values. The
+    down GEMM still reads them, but it treats every row separately. No consumer
+    reads the output of a padding row.
+    """
+    if family not in MASKED_ACT_FAMILIES:
+        raise ValueError(f"family={family!r} is not one of {MASKED_ACT_FAMILIES}")
+    ActivationFn.parse(activation)
+    pairs = routing.topk_ids.numel()
+    if src2dst.dtype != torch.int32 or src2dst.numel() != pairs:
+        raise ValueError(f"src2dst must be int32 with {pairs} entries")
+    if act_compact.ndim != 2 or act_compact.shape[1] < 1:
+        raise ValueError("act_compact must be compact [m_pad_ceiling, intermediate]")
+    width = act_compact.shape[1]
+    # The slice count comes from the weight shape, not from the activation.
+    slices = base_gateup.shape[-1] // width
+    if slices not in (1, 2) or slices * width != base_gateup.shape[-1]:
+        raise ValueError(
+            f"base gate/up width {base_gateup.shape[-1]} is not 1x or 2x "
+            f"activation width {width}"
+        )
+    if base_gateup.shape != (act_compact.shape[0], slices * width):
+        raise ValueError(
+            "base_gateup must share the compact rows and carry "
+            f"{slices * width} columns, got {tuple(base_gateup.shape)}"
+        )
+    if act_pairs is not None:
+        if act_pairs.shape != (*routing.topk_ids.shape, width):
+            raise ValueError(
+                f"act_pairs must be {(*routing.topk_ids.shape, width)}, got "
+                f"{tuple(act_pairs.shape)}"
+            )
+        if act_compact.dtype != act_pairs.dtype:
+            raise TypeError(
+                f"dual activation stores need one dtype, got "
+                f"{act_compact.dtype} and {act_pairs.dtype}"
+            )
+    if base_gateup.dtype != torch.bfloat16 or act_compact.dtype != torch.bfloat16:
+        raise TypeError("contiguous BF16 middle requires BF16 base and activation rows")
+    tensors = (
+        base_gateup,
+        act_compact,
+        src2dst,
+        routing.topk_ids,
+        routing.sorted_pair_ids,
+        routing.block_virtual_expert_ids,
+        routing.num_pairs_post_padded,
+    )
+    if act_pairs is not None:
+        tensors += (act_pairs,)
+    devices = {item.device for item in tensors}
+    if len(devices) != 1:
+        raise ValueError(f"contiguous-middle tensors span devices {devices}")
+    if bridge_gateup is None or b_gate_up is None:
+        raise ValueError(f"family {family!r} requires bridge_gateup and b_gate_up")
+    gate_rank = _validate_b_inputs(
+        bridge_gateup,
+        b_gate_up,
+        routing,
+        pairs=pairs,
+        slices=slices,
+        width=width,
+        bridge_top_k=bridge_top_k,
+    )
+
+    if pairs == 0:
+        return
+    block_w, block_k, group_m, num_warps, num_stages = _require_config(config)
+    if routing.block_size < 16 or not _is_power_of_two(routing.block_size):
+        raise ValueError(
+            "aligned fused-act route block size must be a power of two >= 16"
+        )
+    num_m_blocks = triton.cdiv(routing.sorted_pair_ids.numel(), routing.block_size)
+    pair_target = act_pairs.view(-1, width) if act_pairs is not None else act_compact
+    num_w_tiles = triton.cdiv(width, block_w)
+    _b_act_kernel[(num_m_blocks * num_w_tiles,)](
+        bridge_gateup,
+        b_gate_up,
+        base_gateup,
+        act_compact,
+        pair_target,
+        src2dst,
+        routing.topk_ids,
+        routing.sorted_pair_ids,
+        routing.block_virtual_expert_ids,
+        routing.num_pairs_post_padded,
+        pairs,
+        bridge_gateup.stride(0),
+        bridge_gateup.stride(1),
+        b_gate_up.stride(0),
+        b_gate_up.stride(1),
+        b_gate_up.stride(2),
+        base_gateup.stride(0),
+        base_gateup.stride(1),
+        act_compact.stride(0),
+        act_compact.stride(1),
+        pair_target.stride(0),
+        pair_target.stride(1),
+        num_local_experts=num_local_experts,
+        top_k=routing.topk_ids.shape[1],
+        width=width,
+        rank=gate_rank,
+        num_slices=slices,
+        activation_type=activation,
+        gate_first=gate_first,
+        interleaved=interleaved,
+        bridge_token_major=bridge_top_k != 1,
+        num_m_blocks=num_m_blocks,
+        block_m=routing.block_size,
+        block_w=block_w,
+        block_k=block_k,
+        group_m=group_m,
+        store_pair_act=act_pairs is not None,
+        consume_base_pdl=consume_base_pdl,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        **({"launch_pdl": True} if consume_base_pdl else {}),
+    )

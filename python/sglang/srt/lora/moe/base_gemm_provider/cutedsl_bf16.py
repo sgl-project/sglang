@@ -9,11 +9,13 @@ from sglang.srt.lora.moe.base_gemm_provider.base import MoeBaseProviderContract
 from sglang.srt.lora.moe.base_gemm_provider.contiguous_row_domain import (
     ContiguousRowDomainProvider,
     ContiguousRowState,
-    contiguous_m_pad_ceiling,
 )
 from sglang.srt.lora.moe.base_gemm_provider.masked_row_domain import (
     MaskedRowDomainProvider,
     MaskedRowState,
+)
+from sglang.srt.lora.moe.kernels.dispatch import (
+    contiguous_m_pad_ceiling,
 )
 from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
 
