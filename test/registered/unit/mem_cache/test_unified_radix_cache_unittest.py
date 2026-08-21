@@ -3728,15 +3728,12 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(_node_children(cache, cache.root_node_handle())), 0)
         cache.sanity_check()
 
-    def test_hicache_evict_keeps_node_on_device_when_backup_fails(self):
-        """evict(): a failed write-back backup skips the demote, leaving the node
-        device-resident and recoverable."""
+    def test_hicache_evict_drops_unlocked_node_when_backup_fails(self):
+        """A failed write-back backup drops an unlocked subtree."""
         if self._skip_unsupported_hicache_test():
             return
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         self._init_hicache(cache, write_policy="write_back")
-        ct = ComponentType.FULL
-
         seq = self._make_seq(1, 2)
         self._insert(cache, allocator, req_to_token_pool, seq)
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
@@ -3745,13 +3742,13 @@ class UnifiedRadixCacheSuite:
         self.assertFalse(cache.tree_core.is_backuped(node))
         self.assertFalse(cache.tree_core.is_full_device_evicted(node))
 
-        # Backup IO fails (returns 0): evict() must skip the demote.
+        # Backup failure falls back to dropping the unlocked subtree.
         with mock.patch.object(cache, "_execute_and_commit_kv_backup", return_value=0):
-            cache.evict(EvictParams(num_tokens=len(seq)))
+            result = cache.evict(EvictParams(num_tokens=len(seq)))
 
-        self.assertFalse(cache.tree_core.is_full_device_evicted(node))
-        self.assertIsNotNone(_device_value(cache, node, ct))
-        self.assertIsNone(_host_value(cache, node, ct))
+        self.assertGreaterEqual(result.num_tokens_evicted, len(seq))
+        self.assertFalse(cache.tree_core.contains_node(node))
+        self.assertEqual(len(_node_children(cache, cache.root_node_handle())), 0)
         cache.sanity_check()
 
     def test_hicache_load_back_restores_data(self):
