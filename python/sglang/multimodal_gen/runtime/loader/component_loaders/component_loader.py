@@ -445,11 +445,11 @@ class ComponentLoader(ABC):
         return GenericComponentLoader(transformers_or_diffusers, component_architecture)
 
 
-class UnquantizedComponentLoader(ComponentLoader):
-    """Base for native component loaders that materialize plain state dicts."""
+class PlainStateDictComponentLoader(ComponentLoader):
+    """Base for native loaders whose current materializer expects plain weights."""
 
     @staticmethod
-    def ensure_unquantized_checkpoint(config: object, component_name: str) -> None:
+    def ensure_plain_state_dict_checkpoint(config: object, component_name: str) -> None:
         try:
             quant_spec = resolve_checkpoint_quant_spec(config)
         except (TypeError, ValueError) as error:
@@ -463,15 +463,15 @@ class UnquantizedComponentLoader(ComponentLoader):
         method = quant_spec.declared_method or "unspecified"
         raise ComponentCheckpointUnsupportedError(
             f"{component_name!r} checkpoint declares quantization metadata in "
-            f"{quant_spec.source} (quant_method={method!r}), but its native SGLang "
-            "loader only supports unquantized checkpoints."
+            f"{quant_spec.source} (quant_method={method!r}), which its current "
+            "plain state-dict materializer cannot restore."
         )
 
     def load_component_config(
         self, component_model_path: str, component_name: str
     ) -> dict[str, Any]:
         config = get_diffusers_component_config(component_path=component_model_path)
-        self.ensure_unquantized_checkpoint(config, component_name)
+        self.ensure_plain_state_dict_checkpoint(config, component_name)
         return config
 
 

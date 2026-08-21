@@ -8,7 +8,7 @@ import torch
 from safetensors.torch import load_file as safetensors_load_file
 
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
-    UnquantizedComponentLoader,
+    PlainStateDictComponentLoader,
 )
 from sglang.multimodal_gen.runtime.models.upsampler.latent_upsampler import (
     LatentUpsampler,
@@ -194,7 +194,7 @@ def _load_explicit_config(
     return None
 
 
-class UpsamplerLoader(UnquantizedComponentLoader):
+class UpsamplerLoader(PlainStateDictComponentLoader):
     component_names = ["spatial_upsampler"]
     expected_library = "diffusers"
 
@@ -207,7 +207,7 @@ class UpsamplerLoader(UnquantizedComponentLoader):
         safetensors_path = _find_safetensors_file(component_model_path)
         raw_config = _load_explicit_config(safetensors_path, component_model_path)
         if raw_config is not None:
-            self.ensure_unquantized_checkpoint(raw_config, component_name)
+            self.ensure_plain_state_dict_checkpoint(raw_config, component_name)
 
         state_dict = safetensors_load_file(safetensors_path)
         if raw_config is None:

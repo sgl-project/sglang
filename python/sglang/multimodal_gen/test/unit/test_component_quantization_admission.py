@@ -12,7 +12,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.bridge_loader import
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
-    UnquantizedComponentLoader,
+    PlainStateDictComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.diffusion_decoder_loader import (
     DiffusionDecoderLoader,
@@ -28,7 +28,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.vocoder_loader impor
 )
 
 
-class _TestLoader(UnquantizedComponentLoader):
+class _TestLoader(PlainStateDictComponentLoader):
     pass
 
 
@@ -63,16 +63,16 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
                 self.subTest(source=source),
                 self.assertRaisesRegex(
                     ComponentCheckpointUnsupportedError,
-                    rf"{re.escape(source)}.*quant_method=.*only supports unquantized",
+                    rf"{re.escape(source)}.*quant_method=.*cannot restore",
                 ),
             ):
-                _TestLoader.ensure_unquantized_checkpoint(config, "test_component")
+                _TestLoader.ensure_plain_state_dict_checkpoint(config, "test_component")
 
         with self.assertRaisesRegex(
             ComponentCheckpointUnsupportedError,
             "Cannot parse checkpoint quantization metadata",
         ):
-            _TestLoader.ensure_unquantized_checkpoint(
+            _TestLoader.ensure_plain_state_dict_checkpoint(
                 {"quantization_config": "invalid"}, "test_component"
             )
 
@@ -88,7 +88,7 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
 
         for loader_class in loader_classes:
             with self.subTest(loader=loader_class.__name__):
-                self.assertTrue(issubclass(loader_class, UnquantizedComponentLoader))
+                self.assertTrue(issubclass(loader_class, PlainStateDictComponentLoader))
 
     def test_adapter_rejects_quantization_before_model_construction(self):
         config = {

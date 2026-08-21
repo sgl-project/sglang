@@ -7,7 +7,7 @@ from sglang.multimodal_gen.configs.models.adapter.ltx_2_duration_head import (
     LTX2DurationHeadConfig,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
-    UnquantizedComponentLoader,
+    PlainStateDictComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     load_safetensors_state_dict,
@@ -19,7 +19,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 
 
-class AdapterLoader(UnquantizedComponentLoader):
+class AdapterLoader(PlainStateDictComponentLoader):
     """Loader for small adapter-style modules (e.g., LTX-2 connectors).
 
     This loader intentionally avoids FSDP sharding and just:

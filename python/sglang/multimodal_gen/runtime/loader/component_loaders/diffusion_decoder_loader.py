@@ -4,7 +4,7 @@ from sglang.multimodal_gen.configs.models.decoders.ltx_2_5_diffusion_decoder imp
     LTX25DiffusionDecoderConfig,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
-    UnquantizedComponentLoader,
+    PlainStateDictComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     load_safetensors_state_dict,
@@ -16,7 +16,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 
 
-class DiffusionDecoderLoader(UnquantizedComponentLoader):
+class DiffusionDecoderLoader(PlainStateDictComponentLoader):
     """Loader for the standalone, replicated LTX-2.5 diffusion decoder."""
 
     component_names = ["diffusion_decoder"]

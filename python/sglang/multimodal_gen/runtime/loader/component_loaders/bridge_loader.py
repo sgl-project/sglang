@@ -4,7 +4,7 @@ import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
-    UnquantizedComponentLoader,
+    PlainStateDictComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
@@ -20,7 +20,7 @@ from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 logger = init_logger(__name__)
 
 
-class BridgeLoader(UnquantizedComponentLoader):
+class BridgeLoader(PlainStateDictComponentLoader):
     """Loader for MOVA dual tower bridge with FSDP support."""
 
     pipeline_bridge_config_attr: str = "bridge_config"
