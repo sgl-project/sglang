@@ -102,11 +102,32 @@ deepseek:
     - any-glob-to-any-file:
       - '**/*deepseek*'
 
+# Mem-Cache
+mem-cache:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'python/sglang/srt/mem_cache/**/*'
+      - 'python/sglang/srt/managers/cache_controller.py'
+      - 'test/registered/mem_cache/**/*'
+      - 'test/registered/radix_cache/**/*'
+      - 'test/registered/hicache/**/*'
+
 # HiCache
 hicache:
   - changed-files:
     - any-glob-to-any-file:
       - '**/*hicache*'
+      - '**/HiCache/**/*'
+      - 'benchmark/hicache/**/*'
+      - 'test/registered/hicache/**/*'
+      - 'python/sglang/srt/managers/cache_controller.py'
+      - 'python/sglang/srt/mem_cache/hiradix_cache.py'
+      - 'python/sglang/srt/mem_cache/memory_pool_host.py'
+      - 'python/sglang/srt/mem_cache/buffer_mode/**/*'
+      - 'python/sglang/srt/mem_cache/hybrid_cache/**/*'
+      - 'python/sglang/srt/mem_cache/pool_host/**/*'
+      - 'python/sglang/srt/mem_cache/storage/**/*'
+      - 'python/sglang/srt/mem_cache/unified_cache/storage_attachment.py'
 
 # Deterministic
 deterministic:
