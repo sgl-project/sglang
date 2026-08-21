@@ -15,8 +15,8 @@ use zeromq::{Socket, SocketRecv, SubSocket};
 use crate::bridge::{build_apply_request, decode_event_batch, BridgeConfig, BridgeError};
 use crate::pb::kv_indexer_client::KvIndexerClient;
 use crate::pb::{
-    ConfigureExpectedWorkersRequest, ExpectedWorker, ReplaceExternalKvSnapshotRequest, TierHashes,
-    TierType,
+    ConfigureExpectedWorkersRequest, ExpectedWorker, InvalidateWorkerRequest,
+    ReplaceExternalKvSnapshotRequest, TierHashes, TierType,
 };
 use crate::service::{MAX_ACTIONS_PER_BATCH, MAX_HASHES_PER_REQUEST};
 use crate::snapshot::fetch_snapshot;
@@ -24,6 +24,8 @@ use crate::snapshot::fetch_snapshot;
 const RECONNECT_BASE: Duration = Duration::from_millis(100);
 const RECONNECT_CAP: Duration = Duration::from_secs(2);
 const SUBSCRIPTION_SETTLE: Duration = Duration::from_millis(50);
+const BARRIER_TIMEOUT: Duration = Duration::from_secs(5);
+const INDEXER_EPOCH_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const EPOCH_MARKER: &[u8] = b"\x00sgl-kv-epoch=";
 const BARRIER_MARKER: &[u8] = b"\x00sgl-kv-snapshot=";
 
@@ -118,7 +120,9 @@ where
 }
 
 async fn configure_workers(config: &BridgeFleetConfig) -> Result<(), BridgeError> {
-    configure_worker_list(&config.indexer_endpoint, &config.workers).await
+    configure_worker_list(&config.indexer_endpoint, &config.workers)
+        .await
+        .map(|_| ())
 }
 
 async fn supervise_worker(
@@ -129,16 +133,36 @@ async fn supervise_worker(
     let mut delay = RECONNECT_BASE;
     loop {
         // Re-establish the complete desired Worker set after an Indexer restart.
-        if let Err(error) = configure_worker_list(&indexer_endpoint, &expected_workers).await {
+        let indexer_epoch = match configure_worker_list(&indexer_endpoint, &expected_workers).await
+        {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                if error.is_permanent() {
+                    return Err(error);
+                }
+                warn!(worker_id = %worker.worker_id, %error, retry_in = ?delay, "failed to configure restarted Indexer");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(RECONNECT_CAP);
+                continue;
+            }
+        };
+        if let Err(error) = invalidate_worker(&indexer_endpoint, &worker.worker_id).await {
             if error.is_permanent() {
                 return Err(error);
             }
-            warn!(worker_id = %worker.worker_id, %error, retry_in = ?delay, "failed to configure restarted Indexer");
+            warn!(worker_id = %worker.worker_id, %error, retry_in = ?delay, "failed to invalidate Worker before recovery");
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(RECONNECT_CAP);
             continue;
         }
-        match recover_and_stream(&indexer_endpoint, &worker).await {
+        match recover_and_stream(
+            &indexer_endpoint,
+            &worker,
+            &expected_workers,
+            &indexer_epoch,
+        )
+        .await
+        {
             Ok(()) => return Ok(()),
             Err(error) if error.is_permanent() => return Err(error),
             Err(error) => {
@@ -150,12 +174,23 @@ async fn supervise_worker(
     }
 }
 
+async fn invalidate_worker(indexer_endpoint: &str, worker_id: &str) -> Result<(), BridgeError> {
+    let mut client = connect_indexer(indexer_endpoint).await?;
+    client
+        .invalidate_worker(InvalidateWorkerRequest {
+            worker_id: worker_id.to_owned(),
+        })
+        .await
+        .map_err(super::bridge::classify_rpc)?;
+    Ok(())
+}
+
 async fn configure_worker_list(
     indexer_endpoint: &str,
     workers: &[BridgeWorkerConfig],
-) -> Result<(), BridgeError> {
+) -> Result<String, BridgeError> {
     let mut client = connect_indexer(indexer_endpoint).await?;
-    client
+    let response = client
         .configure_expected_workers(ConfigureExpectedWorkersRequest {
             workers: workers
                 .iter()
@@ -168,12 +203,14 @@ async fn configure_worker_list(
         })
         .await
         .map_err(super::bridge::classify_rpc)?;
-    Ok(())
+    Ok(response.into_inner().indexer_epoch)
 }
 
 async fn recover_and_stream(
     indexer_endpoint: &str,
     worker: &BridgeWorkerConfig,
+    expected_workers: &[BridgeWorkerConfig],
+    indexer_epoch: &str,
 ) -> Result<(), BridgeError> {
     let mut client = connect_indexer(indexer_endpoint).await?;
     let mut subscriber = SubSocket::new();
@@ -192,21 +229,26 @@ async fn recover_and_stream(
 
     // Ignore pre-cut live data and wait until the exact snapshot barrier is
     // observed on the already-connected SUB stream.
-    loop {
-        let message = subscriber.recv().await?;
-        let frame = parse_live_message(&message.into_vec())?;
-        if frame.epoch.as_deref() != Some(epoch.as_str()) {
-            continue;
+    tokio::time::timeout(BARRIER_TIMEOUT, async {
+        loop {
+            let message = subscriber.recv().await?;
+            let frame = parse_live_message(&message.into_vec())?;
+            if frame.epoch.as_deref() != Some(epoch.as_str()) {
+                continue;
+            }
+            if frame.seq == barrier_seq && frame.barrier_id.as_deref() == Some(barrier_id.as_str())
+            {
+                return Ok::<(), BridgeError>(());
+            }
+            if frame.seq > barrier_seq {
+                return Err(BridgeError::Decode(
+                    "snapshot barrier was missed on the live stream".into(),
+                ));
+            }
         }
-        if frame.seq == barrier_seq && frame.barrier_id.as_deref() == Some(barrier_id.as_str()) {
-            break;
-        }
-        if frame.seq > barrier_seq {
-            return Err(BridgeError::Decode(
-                "snapshot barrier was missed on the live stream".into(),
-            ));
-        }
-    }
+    })
+    .await
+    .map_err(|_| BridgeError::Decode("timed out waiting for snapshot barrier".into()))??;
 
     let mut hashes = Vec::with_capacity(snapshot.blocks.len());
     for block in snapshot.blocks {
@@ -250,8 +292,20 @@ async fn recover_and_stream(
         cache_spec: None,
     };
     let mut expected = barrier_seq.saturating_add(1);
+    let mut epoch_check = tokio::time::interval(INDEXER_EPOCH_CHECK_INTERVAL);
+    epoch_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    epoch_check.tick().await;
     loop {
-        let message = subscriber.recv().await?;
+        let message = tokio::select! {
+            message = subscriber.recv() => message?,
+            _ = epoch_check.tick() => {
+                let current = configure_worker_list(indexer_endpoint, expected_workers).await?;
+                if current != indexer_epoch {
+                    return Err(BridgeError::Decode("paired Indexer process restarted".into()));
+                }
+                continue;
+            }
+        };
         let frame = parse_live_message(&message.into_vec())?;
         if frame.epoch.as_deref() != Some(epoch.as_str()) {
             return Err(BridgeError::Decode("worker epoch changed".into()));
@@ -398,6 +452,46 @@ mod tests {
         router.send(reply).await.unwrap();
     }
 
+    fn start_indexer_server(addr: std::net::SocketAddr) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let backend: Arc<dyn KvIndexerBackend> = Arc::new(InMemoryKvIndexerBackend::new());
+            server_builder()
+                .add_service(KvIndexerService::new(backend).into_server())
+                .serve(addr)
+                .await
+                .unwrap();
+        })
+    }
+
+    async fn connect_indexer_client(addr: std::net::SocketAddr) -> KvIndexerClient<Channel> {
+        let endpoint = format!("http://{addr}");
+        for _ in 0..100 {
+            if let Ok(client) = KvIndexerClient::connect(endpoint.clone()).await {
+                return client;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("failed to connect to Indexer at {endpoint}");
+    }
+
+    async fn wait_for_prefix(client: &mut KvIndexerClient<Channel>, hashes: Vec<i64>) {
+        for _ in 0..150 {
+            let response = client
+                .match_external_kv_prefix(MatchExternalKvPrefixRequest {
+                    hashes: hashes.clone(),
+                    max_blocks: 0,
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            if response.best_prefix_blocks as usize == hashes.len() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("snapshot plus live events did not restore the expected prefix");
+    }
+
     #[tokio::test]
     async fn snapshot_then_live_event_restores_indexer_state() {
         let mut publisher = PubSocket::new();
@@ -417,14 +511,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let indexer_addr = listener.local_addr().unwrap();
         drop(listener);
-        let backend: Arc<dyn KvIndexerBackend> = Arc::new(InMemoryKvIndexerBackend::new());
-        let indexer_server = tokio::spawn(async move {
-            server_builder()
-                .add_service(KvIndexerService::new(backend).into_server())
-                .serve(indexer_addr)
-                .await
-                .unwrap();
-        });
+        let indexer_server = start_indexer_server(indexer_addr);
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         let worker = tokio::spawn(async move {
@@ -470,33 +557,123 @@ mod tests {
             },
         ));
 
-        let mut client = KvIndexerClient::connect(format!("http://{indexer_addr}"))
-            .await
-            .unwrap();
-        let mut restored = false;
-        for _ in 0..100 {
-            let response = client
-                .match_external_kv_prefix(MatchExternalKvPrefixRequest {
-                    hashes: vec![1, 2],
-                    max_blocks: 0,
-                })
-                .await
-                .unwrap()
-                .into_inner();
-            if response.best_prefix_blocks == 2 {
-                restored = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(
-            restored,
-            "snapshot plus live event did not become queryable"
-        );
+        let mut client = connect_indexer_client(indexer_addr).await;
+        wait_for_prefix(&mut client, vec![1, 2]).await;
 
         let _ = stop_tx.send(());
         fleet.await.unwrap().unwrap();
         worker.await.unwrap();
+        indexer_server.abort();
+    }
+
+    #[tokio::test]
+    async fn idle_indexer_restart_is_detected_and_restored_from_a_new_snapshot() {
+        let mut publisher = PubSocket::new();
+        let pub_endpoint = publisher.bind("tcp://127.0.0.1:0").await.unwrap();
+        let pub_port = match pub_endpoint {
+            Endpoint::Tcp(_, port) => port,
+            other => panic!("unexpected endpoint: {other:?}"),
+        };
+
+        let mut snapshot_router = RouterSocket::new();
+        let snapshot_endpoint = snapshot_router.bind("tcp://127.0.0.1:0").await.unwrap();
+        let snapshot_port = match snapshot_endpoint {
+            Endpoint::Tcp(_, port) => port,
+            other => panic!("unexpected endpoint: {other:?}"),
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let indexer_addr = listener.local_addr().unwrap();
+        drop(listener);
+        let mut indexer_server = start_indexer_server(indexer_addr);
+        let mut client = connect_indexer_client(indexer_addr).await;
+
+        let worker = tokio::spawn(async move {
+            for cycle in 0..2 {
+                let request = snapshot_router.recv().await.unwrap();
+                let identity = request.get(0).unwrap().clone();
+                let barrier_seq = if cycle == 0 { 0_i64 } else { 2_i64 };
+                let blocks = if cycle == 0 {
+                    vec![(Option::<i64>::None, vec![1_i64])]
+                } else {
+                    vec![
+                        (Option::<i64>::None, vec![1_i64]),
+                        (Some(1_i64), vec![2_i64]),
+                    ]
+                };
+                let barrier_id = format!("b{cycle}");
+                send_snapshot_reply(
+                    &mut snapshot_router,
+                    identity.clone(),
+                    b"header",
+                    rmp_serde::to_vec(&(
+                        1_u32,
+                        "e1",
+                        0_u32,
+                        barrier_seq + 1,
+                        barrier_seq,
+                        barrier_id.as_str(),
+                        blocks.len(),
+                    ))
+                    .unwrap(),
+                )
+                .await;
+                send_snapshot_reply(
+                    &mut snapshot_router,
+                    identity.clone(),
+                    b"chunk",
+                    rmp_serde::to_vec(&blocks).unwrap(),
+                )
+                .await;
+                send_snapshot_reply(&mut snapshot_router, identity, b"end", Vec::new()).await;
+
+                let barrier_topic = format!("kv\0sgl-kv-epoch=e1\0sgl-kv-snapshot={barrier_id}");
+                send_pub(
+                    &mut publisher,
+                    barrier_topic.as_bytes(),
+                    barrier_seq as u64,
+                    Vec::new(),
+                )
+                .await;
+                if cycle == 0 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    send_pub(&mut publisher, b"kv\0sgl-kv-epoch=e1", 1, stored_batch(2)).await;
+                }
+            }
+        });
+
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let fleet = tokio::spawn(run_recoverable_bridge_fleet_until(
+            BridgeFleetConfig {
+                indexer_endpoint: format!("http://{indexer_addr}"),
+                workers: vec![BridgeWorkerConfig {
+                    worker_id: "w1".into(),
+                    worker_address: "http://w1".into(),
+                    event_endpoint: format!("tcp://127.0.0.1:{pub_port}"),
+                    snapshot_endpoint: format!("tcp://127.0.0.1:{snapshot_port}"),
+                    event_topic: "kv".into(),
+                    dp_rank: 0,
+                }],
+            },
+            async {
+                let _ = stop_rx.await;
+            },
+        ));
+
+        wait_for_prefix(&mut client, vec![1, 2]).await;
+        indexer_server.abort();
+        let _ = indexer_server.await;
+
+        indexer_server = start_indexer_server(indexer_addr);
+        client = connect_indexer_client(indexer_addr).await;
+        wait_for_prefix(&mut client, vec![1, 2]).await;
+
+        let _ = stop_tx.send(());
+        fleet.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("Bridge should request a second snapshot")
+            .unwrap();
         indexer_server.abort();
     }
 }

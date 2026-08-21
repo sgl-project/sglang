@@ -160,6 +160,7 @@ pub struct ModelConfig {
 /// External KV Indexer client settings.
 #[derive(Debug, Clone)]
 pub struct KvIndexerEndpointConfig {
+    /// One endpoint or a comma-separated bootstrap list.
     pub url: String,
     pub query_timeout_ms: u64,
     pub query_max_inflight: usize,

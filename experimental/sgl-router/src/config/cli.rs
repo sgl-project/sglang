@@ -73,8 +73,10 @@ pub struct Cli {
     /// Multiplicative load spread gating the absolute balance check.
     #[arg(long)]
     pub balance_rel_threshold: Option<f32>,
-    /// External KV indexer gRPC endpoint used as the authoritative cache signal.
-    /// Needs an explicit scheme, e.g. `http://10.0.0.1:50051`.
+    /// Bootstrap KV Indexer gRPC endpoint(s) used as the cache signal. Multiple
+    /// endpoints are comma-separated. Dynamic 100 ms reports replace this
+    /// fallback once the first Indexer reports to `/v1/kv-indexer/status`.
+    /// Every endpoint needs an explicit scheme, e.g. `http://10.0.0.1:50051`.
     #[arg(long)]
     pub kv_indexer_endpoint: Option<String>,
     /// KV Indexer query timeout in milliseconds. Requires

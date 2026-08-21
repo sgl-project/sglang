@@ -16,9 +16,10 @@ use crate::pb::{
     ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ConfigureExpectedWorkersRequest,
     ConfigureExpectedWorkersResponse, ExternalKvActionType, ExternalKvNodeMatch,
     GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse, HitCountEntry,
-    MatchExternalKvPrefixRequest, MatchExternalKvPrefixResponse, MatchExternalKvRequest,
-    MatchExternalKvResponse, ReplaceExternalKvSnapshotRequest, ReplaceExternalKvSnapshotResponse,
-    TierHashes, WorkerCacheSpec,
+    InvalidateWorkerRequest, InvalidateWorkerResponse, MatchExternalKvPrefixRequest,
+    MatchExternalKvPrefixResponse, MatchExternalKvRequest, MatchExternalKvResponse,
+    ReplaceExternalKvSnapshotRequest, ReplaceExternalKvSnapshotResponse, TierHashes,
+    WorkerCacheSpec,
 };
 use crate::service::{assemble_prefix_response, prefix_limit, WorkerPrefixScanner};
 use crate::status::IndexerStatusHandle;
@@ -70,6 +71,7 @@ struct PrefixCandidate {
 pub struct InMemoryKvIndexerBackend {
     state: RwLock<State>,
     status: Option<Arc<IndexerStatusHandle>>,
+    instance_epoch: String,
 }
 
 impl Default for InMemoryKvIndexerBackend {
@@ -77,6 +79,7 @@ impl Default for InMemoryKvIndexerBackend {
         Self {
             state: RwLock::new(State::default()),
             status: None,
+            instance_epoch: uuid::Uuid::new_v4().to_string(),
         }
     }
 }
@@ -90,6 +93,7 @@ impl InMemoryKvIndexerBackend {
         Self {
             state: RwLock::new(State::default()),
             status: Some(status),
+            instance_epoch: uuid::Uuid::new_v4().to_string(),
         }
     }
 
@@ -274,7 +278,7 @@ impl InMemoryKvIndexerBackend {
             worker.spec = expected.cache_spec;
         }
         self.refresh_status(&state);
-        Ok(coverage_response(&state))
+        Ok(coverage_response(&state, &self.instance_epoch))
     }
 
     fn replace_snapshot(
@@ -331,6 +335,26 @@ impl InMemoryKvIndexerBackend {
         self.refresh_status(&state);
         Ok(ReplaceExternalKvSnapshotResponse {
             applied_seq: req.applied_seq,
+        })
+    }
+
+    fn invalidate(&self, req: InvalidateWorkerRequest) -> Result<InvalidateWorkerResponse, Status> {
+        let mut state = self.write_state()?;
+        if !state.workers.contains_key(&req.worker_id) {
+            return Err(Status::not_found("worker is not configured"));
+        }
+        clear_worker_holdings(&mut state, &req.worker_id);
+        if let Some(worker) = state.workers.get_mut(&req.worker_id) {
+            worker.ready = false;
+            worker.epoch = None;
+            worker.last_seq = None;
+        }
+        self.refresh_status(&state);
+        let coverage = coverage_response(&state, &self.instance_epoch);
+        Ok(InvalidateWorkerResponse {
+            total_workers: coverage.total_workers,
+            ready_workers: coverage.ready_workers,
+            indexer_epoch: coverage.indexer_epoch,
         })
     }
 
@@ -561,10 +585,11 @@ impl InMemoryKvIndexerBackend {
     }
 }
 
-fn coverage_response(state: &State) -> ConfigureExpectedWorkersResponse {
+fn coverage_response(state: &State, indexer_epoch: &str) -> ConfigureExpectedWorkersResponse {
     ConfigureExpectedWorkersResponse {
         total_workers: state.workers.len() as u32,
         ready_workers: state.workers.values().filter(|worker| worker.ready).count() as u32,
+        indexer_epoch: indexer_epoch.to_owned(),
     }
 }
 
@@ -626,6 +651,13 @@ impl KvIndexerBackend for InMemoryKvIndexerBackend {
         request: ReplaceExternalKvSnapshotRequest,
     ) -> Result<ReplaceExternalKvSnapshotResponse, Status> {
         self.replace_snapshot(request)
+    }
+
+    async fn invalidate_worker(
+        &self,
+        request: InvalidateWorkerRequest,
+    ) -> Result<InvalidateWorkerResponse, Status> {
+        self.invalidate(request)
     }
 
     async fn apply_external_kv_batch(
@@ -842,5 +874,24 @@ mod tests {
         assert!(state.workers.contains_key("w1"));
         assert!(!state.workers.contains_key("w2"));
         assert!(!state.blocks.contains_key(&2));
+    }
+
+    #[tokio::test]
+    async fn indexer_epoch_changes_between_process_instances() {
+        let first = InMemoryKvIndexerBackend::new()
+            .configure_expected_workers(ConfigureExpectedWorkersRequest {
+                workers: vec![expected("w", "http://w")],
+            })
+            .await
+            .unwrap();
+        let second = InMemoryKvIndexerBackend::new()
+            .configure_expected_workers(ConfigureExpectedWorkersRequest {
+                workers: vec![expected("w", "http://w")],
+            })
+            .await
+            .unwrap();
+
+        assert!(!first.indexer_epoch.is_empty());
+        assert_ne!(first.indexer_epoch, second.indexer_epoch);
     }
 }

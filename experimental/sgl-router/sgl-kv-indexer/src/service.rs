@@ -12,9 +12,9 @@ use crate::pb::{
     ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ConfigureExpectedWorkersRequest,
     ConfigureExpectedWorkersResponse, ExternalKvAction, ExternalKvActionType,
     ExternalKvPrefixMatch, GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse,
-    MatchExternalKvPrefixRequest, MatchExternalKvPrefixResponse, MatchExternalKvRequest,
-    MatchExternalKvResponse, ReplaceExternalKvSnapshotRequest, ReplaceExternalKvSnapshotResponse,
-    TierType, WorkerCacheSpec,
+    InvalidateWorkerRequest, InvalidateWorkerResponse, MatchExternalKvPrefixRequest,
+    MatchExternalKvPrefixResponse, MatchExternalKvRequest, MatchExternalKvResponse,
+    ReplaceExternalKvSnapshotRequest, ReplaceExternalKvSnapshotResponse, TierType, WorkerCacheSpec,
 };
 use crate::status::IndexerStatusHandle;
 
@@ -60,6 +60,15 @@ pub trait KvIndexerBackend: Send + Sync + 'static {
     ) -> Result<ReplaceExternalKvSnapshotResponse, Status> {
         Err(Status::unimplemented(
             "backend does not support atomic worker snapshots",
+        ))
+    }
+
+    async fn invalidate_worker(
+        &self,
+        _request: InvalidateWorkerRequest,
+    ) -> Result<InvalidateWorkerResponse, Status> {
+        Err(Status::unimplemented(
+            "backend does not support worker invalidation",
         ))
     }
 
@@ -140,6 +149,13 @@ impl KvIndexerBackend for std::sync::Arc<dyn KvIndexerBackend> {
         request: ReplaceExternalKvSnapshotRequest,
     ) -> Result<ReplaceExternalKvSnapshotResponse, Status> {
         (**self).replace_external_kv_snapshot(request).await
+    }
+
+    async fn invalidate_worker(
+        &self,
+        request: InvalidateWorkerRequest,
+    ) -> Result<InvalidateWorkerResponse, Status> {
+        (**self).invalidate_worker(request).await
     }
 
     async fn apply_external_kv_batch(
@@ -260,6 +276,17 @@ where
         }
         Ok(Response::new(
             self.backend.replace_external_kv_snapshot(request).await?,
+        ))
+    }
+
+    async fn invalidate_worker(
+        &self,
+        request: Request<InvalidateWorkerRequest>,
+    ) -> Result<Response<InvalidateWorkerResponse>, Status> {
+        let request = request.into_inner();
+        validate_worker_id(&request.worker_id)?;
+        Ok(Response::new(
+            self.backend.invalidate_worker(request).await?,
         ))
     }
 
