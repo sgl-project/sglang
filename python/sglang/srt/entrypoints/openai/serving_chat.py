@@ -1916,7 +1916,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Build sglext at response level (from first ret_item, as these are per-request)
         first_ret = ret[0]
-        routed_experts = process_routed_experts_from_ret(first_ret, request)
+        routed_experts = (
+            None
+            if request.return_meta_info
+            else process_routed_experts_from_ret(first_ret, request)
+        )
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
@@ -2378,6 +2382,13 @@ class OpenAIServingChat(OpenAIServingBase):
             request.skip_special_tokens = False
         elif self.reasoning_parser == "muse":
             request.skip_special_tokens = False
+
+    def supports_native_reasoning_history(self) -> bool:
+        """Whether the chat encoder takes history as ``reasoning_content`` rather
+        than via :meth:`wrap_reasoning_history`; see
+        :func:`chat_encoding.spec_owns_reasoning_history` for why.
+        """
+        return chat_encoding.spec_owns_reasoning_history(self.chat_encoding_spec)
 
     def wrap_reasoning_history(self, reasoning_text: str) -> str:
         """Wrap prior-turn reasoning in the detector's own start/end tokens.

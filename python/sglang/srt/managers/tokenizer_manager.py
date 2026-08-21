@@ -47,7 +47,7 @@ from fastapi import BackgroundTasks
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
-from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
+from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
@@ -671,7 +671,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Encoder Disaggregation
         self.encoder_bootstrap_server = None
         if self.server_args.language_only:
-            from sglang.srt.disaggregation.encode_receiver import (
+            from sglang.srt.disaggregation.encoder.receiver import (
                 EncoderBootstrapServer,
             )
 
@@ -833,13 +833,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
     ) -> InputFormat:
-        """Detect the format of input texts for proper tokenization handling.
-
-        Returns:
-            - InputFormat.SINGLE_STRING: Regular single text like "Hello world"
-            - InputFormat.BATCH_STRINGS: Regular batch like ["Hello", "World"]
-            - InputFormat.CROSS_ENCODER_PAIRS: Cross-encoder pairs like [["query", "document"]]
-        """
         if isinstance(texts, str):
             return InputFormat.SINGLE_STRING
 
@@ -894,38 +887,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         Tuple[List[int], Optional[List[int]]],
         Tuple[List[List[int]], Optional[List[List[int]]]],
     ]:
-        """
-        Tokenize text(s) using the appropriate tokenizer strategy.
-
-        This method handles multiple input formats and chooses between async dynamic
-        batch tokenizer (for single texts only) and regular tokenizer.
-
-        Args:
-            texts: Text input in various formats:
-
-                   Regular cases:
-                   - Single string: "How are you?"
-                   - Batch of strings: ["Hello", "World", "How are you?"]
-
-                   Cross-encoder cases (sentence pairs for similarity/ranking):
-                   - Single pair: [["query text", "document text"]]
-                   - Multiple pairs: [["q1", "d1"], ["q2", "d2"], ["q3", "d3"]]
-
-            is_cross_encoder: Whether to return token_type_ids for cross-encoder models.
-                             Enables proper handling of sentence pairs with segment IDs.
-
-        Returns:
-            Single input cases:
-                Tuple[List[int], Optional[List[int]]]: (input_ids, token_type_ids)
-                Example: ([101, 2129, 102], [0, 0, 0]) for single text
-                Example: ([101, 2129, 102, 4068, 102], [0, 0, 0, 1, 1]) for cross-encoder pair
-
-            Batch input cases:
-                Tuple[List[List[int]], Optional[List[List[int]]]]: (batch_input_ids, batch_token_type_ids)
-                Example: ([[101, 2129, 102], [101, 4068, 102]], None) for regular batch
-
-            Note: token_type_ids is None unless is_cross_encoder=True.
-        """
         if not texts or self.tokenizer is None:
             raise ValueError("texts cannot be empty and tokenizer must be initialized")
 
@@ -1448,7 +1409,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
-                mm_data_mooncake=obj.mm_data_mooncake,
                 encoder_urls=obj.encoder_urls,
             )
         elif isinstance(obj, EmbeddingReqInput):
@@ -1490,11 +1450,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         token_id: int,
         embeds: List[torch.Tensor],
     ) -> PositionalEmbeds:
-        """Resolve placeholder positions in input_ids and create PositionalEmbeds.
-
-        Scans input_ids for occurrences of token_id and pairs them with the
-        provided embedding tensors.
-        """
         positions = [idx for idx, tok in enumerate(input_ids) if tok == token_id]
         if len(positions) != len(embeds):
             raise ValueError(
@@ -1692,11 +1647,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state: ReqState,
         is_stream: bool,
     ) -> Optional[dict]:
-        """Handle abort/error finish reasons from the scheduler.
-
-        Returns the output dict if it should be yielded (stream abort), or None
-        for normal flow. Raises ValueError or HTTPException for non-stream aborts.
-        """
+        """Returns the output dict to yield (stream abort), None for normal flow;
+        raises ValueError/HTTPException for non-stream aborts."""
         finish_reason = out["meta_info"]["finish_reason"]
 
         if (
@@ -3435,17 +3387,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ) -> bool:
-        """Check if the request should be dispatched to encoder for processing.
-
-        Returns True if the request should be dispatched to encoder (multiple multimodal items),
-        False if it should be processed locally (single multimodal item or no multimodal items).
-
-        Args:
-            obj: The request input object
-
-        Returns:
-            bool: True if should dispatch to encoder, False otherwise
-        """
         if obj.batch_size > 1:
             logger.warning(
                 "Batch request (batch_size=%d) is not supported in EPD disaggregation mode; skipping encoder dispatch.",

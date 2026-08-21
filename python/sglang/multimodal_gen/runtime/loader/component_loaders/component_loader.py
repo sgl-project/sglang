@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
 from sglang.multimodal_gen.runtime.loader.utils import (
     _normalize_component_type,
     component_name_to_loader_cls,
+    format_component_residency,
     get_memory_usage_of_component,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
@@ -80,6 +81,11 @@ class ComponentLoader(ABC):
     # diffusers or transformers
     expected_library: str = ""
 
+    # --attention-backend primarily selects the DiT backend. Auxiliary
+    # components may fall back when that global choice is incompatible; an
+    # explicit --component-attention-backends entry remains strict.
+    allow_global_attention_backend_fallback = True
+
     _loaders_registered = False
 
     def __init_subclass__(cls, **kwargs):
@@ -124,9 +130,12 @@ class ComponentLoader(ABC):
         component_name: str,
         attn_backend: Any,
         component_attn_name: str | None,
+        allow_global_backend_fallback: bool,
     ) -> AutoModel:
         with component_attn_backend_context_manager(
-            attn_backend, component_name=component_attn_name
+            attn_backend,
+            component_name=component_attn_name,
+            allow_global_backend_fallback=allow_global_backend_fallback,
         ):
             load_kwargs = self.customized_load_kwargs_for_component(
                 server_args, component_name
@@ -143,9 +152,12 @@ class ComponentLoader(ABC):
         transformers_or_diffusers: str,
         attn_backend: Any,
         component_attn_name: str | None,
+        allow_global_backend_fallback: bool,
     ) -> AutoModel:
         with component_attn_backend_context_manager(
-            attn_backend, component_name=component_attn_name
+            attn_backend,
+            component_name=component_attn_name,
+            allow_global_backend_fallback=allow_global_backend_fallback,
         ):
             component = self.load_native(
                 component_model_path,
@@ -197,6 +209,7 @@ class ComponentLoader(ABC):
                 component_name,
                 attn_backend,
                 component_attn_name,
+                self.allow_global_attention_backend_fallback,
             )
             source = "sgl-diffusion"
         except (ComponentCheckpointUnsupportedError, ComponentResidencyError):
@@ -230,6 +243,7 @@ class ComponentLoader(ABC):
                 transformers_or_diffusers,
                 attn_backend,
                 component_attn_name,
+                self.allow_global_attention_backend_fallback,
             )
             source = "native"
             logger.warning(
@@ -254,11 +268,11 @@ class ComponentLoader(ABC):
             model_size = get_memory_usage_of_component(component) or "NA"
             consumed = gpu_mem_before_loading - current_gpu_mem
             logger.info(
-                f"Loaded %s: %s ({source} version). model size: %s GB, consumed GPU mem: %.2f GB, avail GPU mem: %.2f GB",
+                f"Loaded %s: %s ({source} version). model size: %s GB, %s. avail GPU mem: %.2f GB",
                 component_name,
                 component.__class__.__name__,
                 model_size,
-                consumed,
+                format_component_residency(component),
                 current_gpu_mem,
             )
         return component, consumed
@@ -500,6 +514,10 @@ class TokenizerLoader(ComponentLoader):
 class GenericComponentLoader(ComponentLoader):
     """Generic loader for components that don't have a specific loader."""
 
+    # An unknown out-of-tree component may itself be the primary transformer.
+    # Require it to opt into fallback through a registered component loader.
+    allow_global_attention_backend_fallback = False
+
     def __init__(
         self, library="transformers", component_architecture: str | None = None
     ) -> None:
@@ -520,6 +538,8 @@ class PipelineComponentLoader:
         transformers_or_diffusers: str,
         server_args: ServerArgs,
         component_architecture: str | None = None,
+        component_attn_backend: Any = None,
+        component_attn_name: str | None = None,
     ):
         """
         Load a pipeline component.
@@ -537,15 +557,21 @@ class PipelineComponentLoader:
         )
 
         try:
-            # Load the component
-            return loader.load(
-                component_model_path,
-                server_args,
-                component_name,
-                transformers_or_diffusers,
-            )
-        except Exception as e:
+            with component_attn_backend_context_manager(
+                component_attn_backend,
+                component_name=component_attn_name,
+                allow_global_backend_fallback=(
+                    loader.allow_global_attention_backend_fallback
+                ),
+            ):
+                return loader.load(
+                    component_model_path,
+                    server_args,
+                    component_name,
+                    transformers_or_diffusers,
+                )
+        except Exception:
             logger.error(
                 f"Error while loading component: {component_name}, {component_model_path=}"
             )
-            raise e
+            raise

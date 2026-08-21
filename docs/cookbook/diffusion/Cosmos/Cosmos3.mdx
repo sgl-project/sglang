@@ -6,11 +6,13 @@ metatags:
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
-<DiffusionModelTags tags={["image", "video", "sound/action", "world model", "policy"]} />
+<DiffusionModelTags tags={["omnimodal", "image + video", "sound + action", "world model", "robot policy"]} />
 
 ## 1. Model Introduction
 
-[NVIDIA Cosmos3](https://huggingface.co/collections/nvidia/cosmos3) is an omnimodal world-model family for image, video, sound, and action generation. SGLang Diffusion serves the public checkpoints with its native Cosmos3 pipeline.
+[NVIDIA Cosmos3](https://huggingface.co/collections/nvidia/cosmos3) is an omnimodal world-model family spanning text/image/video generation, optional synchronized sound, and robot action prediction. Its main advantage is breadth: the same native SGLang pipeline can serve media-generation checkpoints and the DROID policy checkpoint without routing through an LLM sampler.
+
+Choose Nano for the broadest modality coverage and lower deployment cost, Super for the larger 64B image/video model, and a specialized checkpoint when only T2I or I2V is needed. Sound and action are checkpoint-specific heads, so they are not available from every Cosmos3 repository.
 
 | Model | Status | Notes |
 | --- | --- | --- |

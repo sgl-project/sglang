@@ -1301,7 +1301,7 @@ class SWARadixCache(BasePrefixCache):
         allocator = self.token_to_kv_pool_allocator
         swa_value = allocator.translate_loc_from_full_to_swa(incoming_full)
         allocator.set_full_to_swa_mapping(node.value, swa_value)
-        allocator.full_to_swa_index_mapping[incoming_full.to(torch.int64)] = 0
+        allocator.clear_full_to_swa_mapping(incoming_full)
         allocator.full_attn_allocator.free(incoming_full)
 
         node.swa_tombstone = False
