@@ -890,7 +890,15 @@ class ModelConfig:
             self.swa_v_head_dim = self.swa_head_dim
             setattr(self.hf_text_config, "swa_v_head_dim", self.swa_v_head_dim)
         # FIXME: temporary special judge for MLA architecture
-        if (
+        if "KimiK3DSparkMLADraftModel" in self.hf_config.architectures:
+            self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
+            self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
+            self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+            self.v_head_dim = self.hf_text_config.v_head_dim
+            self.kv_lora_rank = self.hf_text_config.kv_lora_rank
+            self.attention_arch = AttentionArch.MLA
+            self._init_mla_scaling(getattr(self.hf_text_config, "rope_scaling", None))
+        elif (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
