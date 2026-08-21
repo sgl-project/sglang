@@ -15,14 +15,18 @@ import zmq.asyncio
 from fastapi import HTTPException
 from PIL import Image
 
-from sglang.srt.disaggregation.encode_receiver import (
+from sglang.srt.disaggregation.encoder.preprocessor import (
+    EncoderPreprocessor,
+    EncoderPreprocessResult,
+)
+from sglang.srt.disaggregation.encoder.receiver import (
     EmbeddingData,
     MMReceiverHTTP,
     MultiModalEmbeddingData,
     _encoder_media_item,
     _select_mm_processor_prompt,
 )
-from sglang.srt.disaggregation.encode_server import MMEncoder, _get_mm_grid_dim
+from sglang.srt.disaggregation.encoder.server import MMEncoder
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.managers.tokenizer_manager import (
     _reject_missing_dispatched_encoder_embedding,
@@ -220,16 +224,19 @@ def test_epd_allows_local_processing_when_request_was_not_dispatched():
 def _encoder(model_type="kimi_k3"):
     encoder = MMEncoder.__new__(MMEncoder)
     encoder.model_type = model_type
-    encoder.model_config = SimpleNamespace(
+    preprocessor = EncoderPreprocessor.__new__(EncoderPreprocessor)
+    preprocessor.model_type = model_type
+    preprocessor.model_config = SimpleNamespace(
         hf_config=SimpleNamespace(
             vision_config=SimpleNamespace(merge_kernel_size=(2, 2))
         )
     )
-    encoder.encoder_media_processor_config = (
+    preprocessor.encoder_media_processor_config = (
         KimiK3ForConditionalGeneration.encoder_media_processor_config
         if model_type == "kimi_k3"
         else EncoderMediaProcessorConfig()
     )
+    encoder.preprocessor = preprocessor
     return encoder
 
 
@@ -237,11 +244,11 @@ def test_kimi_k3_encoder_normalizes_pillow_images_to_media_dicts():
     image = Image.new("RGB", (2, 2))
     encoder = _encoder()
 
-    assert encoder._grid_count_per_leaf(
+    assert encoder.preprocessor._grid_count_per_leaf(
         [image, {"type": "image", "image": [image, image]}], Modality.IMAGE
     ) == [1, 2]
 
-    normalized = encoder._normalize_kimi_encoder_images(
+    normalized = encoder.preprocessor._normalize_kimi_encoder_images(
         [image, {"type": "image", "image": [image, image]}]
     )
     assert len(normalized) == 3
@@ -258,14 +265,15 @@ def test_kimi_k3_encoder_passes_media_dicts_to_image_processor():
         return {"pixel_values": torch.ones(1, 3), "grid_thws": [[1, 1, 1]]}
 
     encoder = _encoder()
-    encoder.image_processor = image_processor
-    encoder.vision_config = {"image": {"return_tensors": "pt"}}
-    encoder._flatten_and_load_images = AsyncMock(return_value=[image])
-    encoder.preproc_executor = ThreadPoolExecutor(max_workers=1)
+    preprocessor = encoder.preprocessor
+    preprocessor.image_processor = image_processor
+    preprocessor.vision_config = {"image": {"return_tensors": "pt"}}
+    preprocessor._flatten_and_load_images = AsyncMock(return_value=[image])
+    preprocessor.preproc_executor = ThreadPoolExecutor(max_workers=1)
     try:
-        output = asyncio.run(encoder._process_image_items([image], None))
+        output = asyncio.run(preprocessor._process_image_items([image], None))
     finally:
-        encoder.preproc_executor.shutdown()
+        preprocessor.preproc_executor.shutdown()
 
     assert "pixel_values" in output
     assert output["original_image_sizes"] == [[3, 2]]
@@ -354,27 +362,28 @@ def test_kimi_k3_epd_model_preprocessor_receives_image_processor():
         return prepare_kimi_k3_encoder_inputs(mm_data, image_processor)
 
     encoder = _encoder()
-    encoder.image_processor = image_processor
-    encoder.use_image_processor_gpu = False
-    encoder.vision_config = {"image": {"return_tensors": "pt"}}
-    encoder._flatten_and_load_images = AsyncMock(return_value=[image])
-    encoder.preproc_executor = ThreadPoolExecutor(max_workers=1)
+    preprocessor = encoder.preprocessor
+    preprocessor.image_processor = image_processor
+    preprocessor.use_image_processor_gpu = False
+    preprocessor.vision_config = {"image": {"return_tensors": "pt"}}
+    preprocessor._flatten_and_load_images = AsyncMock(return_value=[image])
+    preprocessor.preproc_executor = ThreadPoolExecutor(max_workers=1)
     try:
         with patch(
-            "sglang.srt.disaggregation.encode_server.get_parallel",
+            "sglang.srt.disaggregation.encoder.preprocessor.get_parallel",
             return_value=SimpleNamespace(attn_tp_rank=0, attn_tp_size=1),
         ):
             output = asyncio.run(
-                encoder._process_image_items([image], model_preprocessor)
+                preprocessor._process_image_items([image], model_preprocessor)
             )
     finally:
-        encoder.preproc_executor.shutdown()
+        preprocessor.preproc_executor.shutdown()
 
     assert len(calls) == 1
     assert calls[0][0][0] == {"type": "image", "image": image}
     assert calls[0][1:] == (
         Modality.IMAGE,
-        encoder.vision_config,
+        preprocessor.vision_config,
         image_processor,
         False,
     )
@@ -481,13 +490,13 @@ def test_kimi_k3_epd_selects_matching_jpeg_decode_mode(
 ):
     expected = torch.zeros((3, 2, 3), dtype=torch.uint8)
     encoder = _encoder()
-    encoder.use_image_processor_gpu = use_image_processor_gpu
+    encoder.preprocessor.use_image_processor_gpu = use_image_processor_gpu
 
     with patch(
-        "sglang.srt.disaggregation.encode_server.load_image",
+        "sglang.srt.disaggregation.encoder.preprocessor.load_image",
         return_value=(expected, None),
     ) as load:
-        output = encoder._load_single_item(b"jpeg", Modality.IMAGE)
+        output = encoder.preprocessor._load_single_item(b"jpeg", Modality.IMAGE)
 
     assert output is expected
     load.assert_called_once_with(b"jpeg", expected_decode_mode)
@@ -498,13 +507,13 @@ def test_kimi_k3_epd_verifies_content_hash_before_decode():
     digest = snapshot_media(payload).content_digest
     expected = torch.zeros((3, 2, 3), dtype=torch.uint8)
     encoder = _encoder()
-    encoder.use_image_processor_gpu = False
+    encoder.preprocessor.use_image_processor_gpu = False
 
     with patch(
-        "sglang.srt.disaggregation.encode_server.load_image",
+        "sglang.srt.disaggregation.encoder.preprocessor.load_image",
         return_value=(expected, None),
     ) as load:
-        output = encoder._load_single_item(
+        output = encoder.preprocessor._load_single_item(
             {"url": payload, "content_hash": digest}, Modality.IMAGE
         )
 
@@ -589,8 +598,9 @@ def test_kimi_k3_encoder_prefers_grid_thws_and_uses_temporal_pool_length():
     stale_grid = torch.tensor([[1, 2, 2]])
     mm_inputs = {"grid_thws": grid_thws, "image_grid_thw": stale_grid}
 
-    assert _get_mm_grid_dim(mm_inputs, Modality.IMAGE, "kimi_k3") is grid_thws
-    assert _encoder().get_num_tokens(grid_thws[0], Modality.IMAGE) == 24
+    preprocessor = _encoder().preprocessor
+    assert preprocessor._get_mm_grid_dim(mm_inputs, Modality.IMAGE) is grid_thws
+    assert preprocessor.get_num_tokens(grid_thws[0], Modality.IMAGE) == 24
 
 
 def test_kimi_k3_encoder_splits_cross_request_batch_into_single_grid_items():
@@ -606,12 +616,14 @@ def test_kimi_k3_encoder_splits_cross_request_batch_into_single_grid_items():
 
     output = encoder._encode_missing(
         feature,
-        {"pixel_values": feature, "grid_thws": grid_thws},
+        EncoderPreprocessResult(
+            mm_inputs={"pixel_values": feature, "grid_thws": grid_thws},
+            grid_thw=grid_thws,
+            token_counts=[1, 2, 2],
+        ),
         indices=[2, 0, 1],
         modality=Modality.IMAGE,
         get_feature_fn=get_feature_fn,
-        grid_thw=grid_thws,
-        keep_on_gpu=True,
     )
 
     items = captured["items"]
@@ -643,7 +655,7 @@ def test_encoder_preprocessed_items_follow_dp_owner_selection_order():
         {"pixel_values": [item.feature for item in items], "grid_thws": grid_thws},
         mm_items=items,
     )
-    embeddings = torch.arange(4, dtype=torch.float32).reshape(4, 1)
+    embeddings = torch.arange(3, dtype=torch.float32).reshape(3, 1)
     captured = {}
 
     def get_feature_fn(selected_items):
@@ -652,17 +664,19 @@ def test_encoder_preprocessed_items_follow_dp_owner_selection_order():
 
     output = encoder._encode_missing(
         mm_inputs["pixel_values"],
-        mm_inputs,
+        EncoderPreprocessResult(
+            mm_inputs=mm_inputs,
+            grid_thw=grid_thws,
+            token_counts=[1, 2, 2],
+        ),
         indices=[2, 0],
         modality=Modality.IMAGE,
         get_feature_fn=get_feature_fn,
-        grid_thw=grid_thws,
-        keep_on_gpu=True,
     )
 
     assert captured["items"] == [items[2], items[0]]
     assert [part.shape[0] for part in output] == [2, 1]
-    torch.testing.assert_close(torch.cat(output), embeddings[:3])
+    torch.testing.assert_close(torch.cat(output), embeddings)
 
 
 def test_encoder_preprocessed_items_hash_individually():
@@ -767,6 +781,8 @@ def test_epd_encoder_reuses_scheduler_zmq_peer():
         )
         with config_override as server_args:
             encoder.server_args = server_args
+            encoder.transfer_backend = "zmq_to_scheduler"
+            encoder.use_mooncake = False
             encoder.send_timeout = 3
             encoder.context = context
             encoder.scheduler_send_sockets = {}
@@ -841,6 +857,8 @@ def test_epd_encoder_pipelines_zero_copy_sends_per_peer():
         )
         with config_override as server_args:
             encoder.server_args = server_args
+            encoder.transfer_backend = "zmq_to_scheduler"
+            encoder.use_mooncake = False
             encoder.send_timeout = 1
             encoder.context = FakeContext(socket)
             encoder.scheduler_send_sockets = {}
