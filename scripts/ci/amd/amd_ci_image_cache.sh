@@ -16,11 +16,18 @@
 # Environment:
 #   AMD_CI_IMAGE_CACHE_RESERVE_GB    free space to leave untouched (default 100)
 #   AMD_CI_IMAGE_CACHE_MAX_AGE_DAYS  prune tarballs older than this (default 1)
+#   AMD_CI_IMAGE_CACHE_LOAD_TIMEOUT  seconds before abandoning a load (default 1200)
+#   AMD_CI_IMAGE_CACHE_SAVE_TIMEOUT  seconds before abandoning a seed (default 1800)
 
 IMAGE_CACHE_DIR=""
 IMAGE_CACHE_EXT=""
 IMAGE_CACHE_RESERVE_GB="${AMD_CI_IMAGE_CACHE_RESERVE_GB:-100}"
 IMAGE_CACHE_MAX_AGE_DAYS="${AMD_CI_IMAGE_CACHE_MAX_AGE_DAYS:-1}"
+# The cache exists to be faster than pulling, so it must never be able to be
+# slower. Observed hits land at 334-738s, so 1200s means a load that is going
+# badly is abandoned for a pull rather than blocking the job indefinitely.
+IMAGE_CACHE_LOAD_TIMEOUT="${AMD_CI_IMAGE_CACHE_LOAD_TIMEOUT:-1200}"
+IMAGE_CACHE_SAVE_TIMEOUT="${AMD_CI_IMAGE_CACHE_SAVE_TIMEOUT:-1800}"
 
 # image_cache_init <cache_host_dir>
 # Leaves IMAGE_CACHE_DIR empty when caching is unavailable or switched off.
@@ -81,9 +88,9 @@ image_cache_load() {
   [[ -f "${path}" ]] || return 1
   echo "Loading image from tarball cache: ${path}"
   case "${IMAGE_CACHE_EXT}" in
-    .zst) zstd -dc "${path}" 2>/dev/null | docker load >/dev/null 2>&1 || true ;;
-    .gz)  pigz -dc "${path}" 2>/dev/null | docker load >/dev/null 2>&1 || true ;;
-    *)    docker load -i "${path}" >/dev/null 2>&1 || true ;;
+    .zst) timeout "${IMAGE_CACHE_LOAD_TIMEOUT}" bash -c 'zstd -dc "$1" | docker load' _ "${path}" >/dev/null 2>&1 || true ;;
+    .gz)  timeout "${IMAGE_CACHE_LOAD_TIMEOUT}" bash -c 'pigz -dc "$1" | docker load' _ "${path}" >/dev/null 2>&1 || true ;;
+    *)    timeout "${IMAGE_CACHE_LOAD_TIMEOUT}" docker load -i "${path}" >/dev/null 2>&1 || true ;;
   esac
   if [[ -n "$(docker images -q "${image}" 2>/dev/null)" ]]; then
     # Retention is by mtime, so refresh it on use: find_latest_image walks back
@@ -92,7 +99,7 @@ image_cache_load() {
     touch "${path}" 2>/dev/null || true
     return 0
   fi
-  echo "Warning: tarball cache did not yield ${image}; falling back to a pull" >&2
+  echo "Warning: tarball cache did not yield ${image} within ${IMAGE_CACHE_LOAD_TIMEOUT}s; falling back to a pull" >&2
   return 1
 }
 
@@ -153,9 +160,9 @@ image_cache_save() {
   echo "Seeding image tarball cache: ${path}"
   local ok=1
   case "${IMAGE_CACHE_EXT}" in
-    .zst) docker save "${image}" 2>/dev/null | zstd -T0 -3 -q > "${tmp}" 2>/dev/null || ok=0 ;;
-    .gz)  docker save "${image}" 2>/dev/null | pigz -1 > "${tmp}" 2>/dev/null || ok=0 ;;
-    *)    docker save "${image}" > "${tmp}" 2>/dev/null || ok=0 ;;
+    .zst) timeout "${IMAGE_CACHE_SAVE_TIMEOUT}" bash -c 'docker save "$1" | zstd -T0 -3 -q > "$2"' _ "${image}" "${tmp}" 2>/dev/null || ok=0 ;;
+    .gz)  timeout "${IMAGE_CACHE_SAVE_TIMEOUT}" bash -c 'docker save "$1" | pigz -1 > "$2"' _ "${image}" "${tmp}" 2>/dev/null || ok=0 ;;
+    *)    timeout "${IMAGE_CACHE_SAVE_TIMEOUT}" bash -c 'docker save "$1" > "$2"' _ "${image}" "${tmp}" 2>/dev/null || ok=0 ;;
   esac
   if (( ok )) && [[ -s "${tmp}" ]] && mv -f "${tmp}" "${path}" 2>/dev/null; then
     echo "Seeded $(du -h "${path}" 2>/dev/null | cut -f1) tarball for ${image}"
