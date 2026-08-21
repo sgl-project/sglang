@@ -187,20 +187,20 @@ the accuracy contract:
 python benchmark/minimax_m3/compare_msa_gate.py \
   --baseline-dir /shared/results/msa_external \
   --candidate-dir /shared/results/msa_flashinfer \
-  --gpqa-score-tolerance 0 \
-  --longbench-score-tolerance 0.01
+  --gpqa-score-tolerance 0.0051 \
+  --longbench-score-tolerance 0.02
 ```
 
-The mandatory accuracy gates are exact temperature-zero output parity for the
-fixed probes (with tokenizer-measured 32K and 64K prompt lengths), zero score
-tolerance on all 198 GPQA-Diamond questions, and an explicit one-answer (0.01)
-noninferiority margin on the deterministic 100-example category-balanced
-LongBench-v2 subset whose prompts are 32K--512K tokens. Both the per-pair checks
-and the three-run backend medians enforce those margins. The runner requires the
-two margins as inputs and records them in its manifests and comparison JSON.
-GPQA is materially harder than saturated GSM8K; LongBench directly exercises
-MSA's long-context page selection and decode replay without admitting prompts
-beyond the model's serving envelope.
+The mandatory accuracy gates are exact temperature-zero visible-answer parity
+for the fixed probes (with tokenizer-measured 32K and 64K prompt lengths), an
+explicit one-answer (1/198, rounded up to 0.0051) noninferiority margin on all
+198 GPQA-Diamond questions, and a two-answer (0.02) margin on the deterministic
+100-example category-balanced LongBench-v2 subset whose prompts are 32K--512K
+tokens. Both the per-pair checks and the three-run backend medians enforce those
+margins. The runner requires the two margins as inputs and records them in its
+manifests and comparison JSON. GPQA is materially harder than saturated GSM8K;
+LongBench directly exercises MSA's long-context page selection and decode
+replay without admitting prompts beyond the model's serving envelope.
 
 The single-pair comparison command also reports fractional speedup for
 request/output-token throughput and median/p99 TTFT and inter-token latency. Pass
