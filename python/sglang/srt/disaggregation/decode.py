@@ -394,6 +394,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
 
+    def _copy_state_index_to_host(self, index: torch.Tensor) -> np.ndarray:
+        copy_stream = getattr(self, "_state_index_copy_stream", None)
+        if copy_stream is None:
+            copy_stream = torch.cuda.Stream(device=index.device)
+            self._state_index_copy_stream = copy_stream
+        host_index = torch.empty_like(index, device="cpu", pin_memory=True)
+        with torch.cuda.stream(copy_stream):
+            host_index.copy_(index, non_blocking=True)
+        copy_stream.synchronize()
+        return host_index.numpy()
+
     def _swa_tail_len(self, seq_len: int) -> int:
         if not self._uses_swa_tail_prealloc() or seq_len <= 0:
             return max(seq_len, 0)
@@ -1269,11 +1280,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             def _mamba_payload():
                 return [
-                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                        decode_req.req.req_pool_idx
-                    ]
-                    .cpu()
-                    .numpy()
+                    self._copy_state_index_to_host(
+                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                            decode_req.req.req_pool_idx
+                        ]
+                    )
                 ]
 
             def _swa_payload():

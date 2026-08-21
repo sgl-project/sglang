@@ -126,6 +126,12 @@
     "change": "Keep single-request Mamba resets and request mappings on device, and construct one-element decode preallocation tensors without pageable host-to-device copies.",
     "targeted_validation": "CMH job 3187136: 16 requests bitwise; CPU admission wall 20.408094 to 0.304404 ms and post-graph GPU-visible gap 0.447396 to 0.040410 ms. Production pair 3187323/3187324: generation +1.1467%, Output TPS/User +1.5226%, all alignment gates pass."
   },
+  "decode_preallocation_state_index_private_copy": {
+    "parent_commit": "294de5772ecd86bb8aa58676d9a62c4cfedb8a45",
+    "file": "python/sglang/srt/disaggregation/decode.py",
+    "change": "Materialize the scalar Mamba state index through pinned host memory on a private CUDA stream so it does not wait behind the in-flight decode graph on the scheduler stream.",
+    "targeted_validation": "CMH job 3197311: exact scalar value; fetch p50 17.0350515 to 0.0757285 ms, concurrent graph +0.063215 ms within the 0.216509 ms gate. Production 3P2D A/B pending."
+  },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
     "tree": "b0161fbca98775c0f79999f4970de1f14a4426fb"
