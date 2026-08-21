@@ -71,7 +71,10 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import (
+    BaseTokenToKVPoolAllocator,
+    PagedTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
@@ -407,6 +410,42 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             host_index.copy_(device_index, non_blocking=True)
         copy_stream.synchronize()
         return host_index.numpy()
+
+    def _prestage_page_indices(
+        self, *, fill_len: int, total_prefix_len: int
+    ) -> Optional[np.ndarray]:
+        allocator = self.token_to_kv_pool_allocator
+        if (
+            self.scheduler.enable_hisparse
+            or self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+            or total_prefix_len != 0
+            or not isinstance(allocator, PagedTokenToKVPoolAllocator)
+            or not allocator.need_sort
+        ):
+            return None
+
+        page_size = allocator.page_size
+        num_pages = (fill_len + page_size - 1) // page_size
+        # Match alloc_extend's merge condition.  When a merge is needed, keep
+        # the existing post-allocation materialization path because free_pages
+        # is about to be replaced by the merged tensor.
+        if num_pages + 2 > len(allocator.free_pages):
+            return None
+
+        copy_stream = getattr(self, "_page_index_copy_stream", None)
+        if copy_stream is None:
+            copy_stream = torch.cuda.Stream(device=allocator.device)
+            self._page_index_copy_stream = copy_stream
+        selected_pages = allocator.free_pages[:num_pages]
+        host_pages = torch.empty(
+            num_pages, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        selected_pages.record_stream(copy_stream)
+        with torch.cuda.stream(copy_stream):
+            device_pages = selected_pages.to(dtype=torch.int32)
+            host_pages.copy_(device_pages, non_blocking=True)
+        copy_stream.synchronize()
+        return host_pages.numpy()
 
     def _swa_tail_len(self, seq_len: int) -> int:
         if not self._uses_swa_tail_prealloc() or seq_len <= 0:
@@ -1235,6 +1274,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     "for PD + chunked prefill."
                 )
 
+            staged_page_indices = self._prestage_page_indices(
+                fill_len=self._pre_alloc_fill_len(decode_req.req),
+                total_prefix_len=total_prefix_len,
+            )
             with scheduler_nvtx_range("scheduler.pd.prealloc.allocate"):
                 dst_kv_indices = self._pre_alloc(
                     decode_req.req,
@@ -1383,9 +1426,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             assert decode_req.metadata_buffer_index is not None
             # int32 for ZMQ serialization -- from_zmq reads np.int32.
             with scheduler_nvtx_range("scheduler.pd.prealloc.page_indices"):
-                page_indices = kv_to_page_indices(
-                    kv_indices, kv_transfer_page_size
-                ).astype(np.int32)
+                page_indices = (
+                    staged_page_indices
+                    if staged_page_indices is not None
+                    else kv_to_page_indices(
+                        kv_indices, kv_transfer_page_size
+                    ).astype(np.int32)
+                )
             device_page_indices = None
             if (
                 self.scheduler.enable_hisparse

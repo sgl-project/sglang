@@ -130,7 +130,13 @@
     "parent_commit": "294de5772ecd86bb8aa58676d9a62c4cfedb8a45",
     "file": "python/sglang/srt/disaggregation/decode.py",
     "change": "Materialize the allocator-owned scalar Mamba slot through pinned host memory on a private CUDA stream, instead of reading the request mapping that was just written on the scheduler stream.",
-    "targeted_validation": "CMH job 3197763 rejected a private-stream read of the just-written mapping (1/32 exact). Job 3197839 passed allocator-source ordering (32/32 exact); job 3197883 passed timing with fetch p50 16.719712 to 0.088609 ms and concurrent graph +0.120192 ms within the 0.216628 ms gate. Production 3P2D validation is pending."
+    "targeted_validation": "CMH job 3197763 rejected a private-stream read of the just-written mapping (1/32 exact). Job 3197839 passed allocator-source ordering (32/32 exact); job 3197883 passed timing with fetch p50 16.719712 to 0.088609 ms and concurrent graph +0.120192 ms within the 0.216628 ms gate. Production pair 3197529/3198133 showed no service gain; profile 3198616 proved the wait moved to page-index materialization."
+  },
+  "decode_preallocation_page_metadata_prestage": {
+    "parent_commit": "4cc13a84fb3bc6316ffc6d9752dd573a67cf1b44",
+    "file": "python/sglang/srt/disaggregation/decode.py",
+    "change": "For decode-cache-off paged PD allocation, stage the already-selected free-page IDs to pinned host memory before alloc_extend, while preserving allocation, request mapping, release-page, and merge ordering. Merge and unsupported paths retain the existing materialization.",
+    "targeted_validation": "CMH job 3199523: 4096-token/page64 repeated alloc/free/merge page IDs, request mapping, and free-list exact; 93.75% fast-path coverage; stage 0.071624 ms/admission; concurrent graph -0.000071 ms; trace-reweighted mechanism saving estimate 0.651473 ms/step. Production validation is pending."
   },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
