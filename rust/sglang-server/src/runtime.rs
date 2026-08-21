@@ -9,7 +9,7 @@
 //!   * TM ingress   — 1 thread driving the ingress FSM
 //!   * TM egress    — 1 thread draining the egress ring → detok shards
 //!   * MM workers   — K unpinned OS threads, spawned late via
-//!     [`Runtime::spawn_mm_pool`] (multimodal models only)
+//!     [`Runtime::start_mm_workers`] (multimodal models only)
 //!
 //! Keeping CPU-bound tokenize/detokenize off the async executor avoids stalling
 //! axum's worker threads.
@@ -40,18 +40,11 @@ pub use runnable::Runnable;
 pub struct Runtime {
     pub ingress: IngressConsumer,
     pub egress: EgressProducer,
-    /// Requests parked in `Encoding`, drained by the MM worker pool
-    /// (`Server.start_mm_workers`). Stays empty for non-multimodal models —
-    /// ingress never routes to it.
-    pub mm: flume::Receiver<crate::message::MmRequest>,
-    /// Back-channel for the MM workers' `MmEncoded` / `MmFailed` into tm-ingress.
-    pub tm: flume::Sender<TmEvent>,
-    /// The loaded tokenizer, shared with the MM worker path (`None` under
-    /// `skip_tokenizer_init`).
-    pub tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>>,
     /// MM results parked between a worker's `MmEncoded` and the scheduler drain
     /// (`Server.take_mm`).
-    pub mm_sidecar: crate::mm::Sidecar,
+    pub mm_results: crate::mm::MmResultStore,
+    /// Wiring for the late-spawned MM pool ([`Runtime::start_mm_workers`]).
+    mm_wiring: crate::mm::MmWiring,
     /// Worker join handles, joined by `request_shutdown` / `Drop`.
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// The single shutdown sender.
@@ -63,19 +56,30 @@ pub struct Runtime {
 const SHUTDOWN_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Runtime {
-    /// Spawn `workers` `mm-worker-{i}` threads into the shutdown join set —
-    /// late, once Python has built the mm spec (`Server::start_mm_workers`).
+    /// Build the family context from `spec_json` and spawn `workers`
+    /// `mm-worker-{i}` threads into the shutdown join set — late, once Python
+    /// has built the mm spec (`Server.start_mm_workers`).
     ///
     /// Deliberately unpinned: the threads inherit the launch thread's affinity,
     /// already narrowed by `RustServer.launch` to the server cores, so bursty
     /// MM preprocessing floats over that whole set (rather than owning cores
     /// that idle between bursts) and never preempts the scheduler's reserved
     /// cores.
-    pub fn spawn_mm_pool(&self, workers: usize, ctx: Arc<crate::mm::Context>) {
+    pub fn start_mm_workers(&self, spec_json: &str, workers: usize) -> Result<(), String> {
+        let ctx = Arc::new(crate::mm::MmContext::new(
+            spec_json,
+            self.mm_wiring.tokenizer.clone(),
+            self.mm_results.clone(),
+        )?);
         let mut threads = self.threads.lock().unwrap();
         spawn_pool("mm-worker", None, workers.max(1), &mut threads, |_| {
-            crate::mm::MmWorker::new(self.mm.clone(), self.tm.clone(), ctx.clone())
+            crate::mm::MmWorker::new(
+                self.mm_wiring.mm_rx.clone(),
+                self.mm_wiring.tm_tx.clone(),
+                ctx.clone(),
+            )
         });
+        Ok(())
     }
 
     /// Stop the runtime and join every worker thread (with a bounded wait).
@@ -180,7 +184,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         .map(|t| Arc::new(tokenizer::DynamoTokenizer::new(t.clone())) as _);
 
     // Shared: MM workers park, the Python drain pops, tm-ingress purges.
-    let mm_sidecar: crate::mm::Sidecar = Default::default();
+    let mm_results: crate::mm::MmResultStore = Default::default();
 
     // --- Detokenizer shards (pinned, CPU bound) ---
     {
@@ -260,10 +264,10 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             .map(|c| vec![c]);
         let limits = tokenizer_manager::Limits::try_from(&*cfg.server_args)
             .map_err(|e| format!("ingress limits: {e}"))?;
-        let mm = tokenizer_manager::Mm {
+        let mm = tokenizer_manager::MmDispatch {
             enabled: cfg.server_args.model_is_multimodal(),
             tx: mm_tx,
-            sidecar: mm_sidecar.clone(),
+            results: mm_results.clone(),
         };
         let mut parts = Some((tm_rx, ingress_tx)); // moved into the single worker
         let shutdown_rx = shutdown_rx.clone();
@@ -328,10 +332,12 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     Ok(Runtime {
         ingress: ingress_rx,
         egress: egress_tx,
-        mm: mm_rx,
-        tm: tm_tx,
-        tokenizer: text_tokenizer,
-        mm_sidecar,
+        mm_results,
+        mm_wiring: crate::mm::MmWiring {
+            mm_rx,
+            tm_tx,
+            tokenizer: text_tokenizer,
+        },
         threads: Mutex::new(threads),
         shutdown_tx: Mutex::new(Some(shutdown_tx)),
     })

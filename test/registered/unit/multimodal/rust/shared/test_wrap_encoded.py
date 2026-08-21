@@ -1,7 +1,7 @@
-"""``NativeMmHost.build_native_mm`` (managers/rust_server.py): the drain-time
-wrapping contracts — tensors are zero-copy views over the Rust-owned buffers, and
-pad values come from worker-precomputed hashes, since the scheduler loop must
-never hash features. Synthetic buffers, so this needs no Rust extension."""
+"""``MmSpec.wrap_encoded`` (managers/rust_server.py): the drain-time wrapping
+contracts — tensors are zero-copy views over the Rust-owned buffers, and pad
+values come from worker-precomputed hashes, since the scheduler loop must never
+hash features. Synthetic buffers, so this needs no Rust extension."""
 
 import os
 import unittest
@@ -15,15 +15,15 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.rust_server import NativeMmHost, NativeMmSpec  # noqa: E402
+from sglang.srt.managers.rust_server import MmSpec  # noqa: E402
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-class TestBuildNativeMm(CustomTestCase):
+class TestWrapEncoded(CustomTestCase):
     def setUp(self):
         # feature_dim == 3 * temporal_patch_size * patch_size**2 == 6.
-        self.spec = NativeMmSpec(
+        self.spec = MmSpec(
             family="qwen_vl",
             feature_shm=False,
             image_token_id=10,
@@ -50,9 +50,8 @@ class TestBuildNativeMm(CustomTestCase):
 
     def build(self):
         features = np.arange(30, dtype=np.float32)
-        output = NativeMmHost.build_native_mm(
-            self.spec,
-            SimpleNamespace(  # the shape of Rust's MmHandoff
+        output = self.spec.wrap_encoded(
+            SimpleNamespace(  # the shape of Rust's MmEncodedResult
                 grids=self.GRIDS,
                 hashes=self.HASHES,
                 offsets=self.OFFSETS,
@@ -99,7 +98,7 @@ class TestBuildNativeMm(CustomTestCase):
         )
 
 
-class TestBuildNativeMmShm(TestBuildNativeMm):
+class TestWrapEncodedShm(TestWrapEncoded):
     """The shm entry shape (TP>1): features arrive as named POSIX segments, and
     each item becomes a ``ShmPointerMMData`` stub whose ``materialize()`` yields
     that item's slice — and unlinks, taking the cleanup duty exactly once."""
