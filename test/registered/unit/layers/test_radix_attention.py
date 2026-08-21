@@ -73,6 +73,7 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
             out_cache_loc=torch.arange(num_tokens, dtype=torch.int64),
             positions=torch.arange(num_tokens, dtype=torch.int64),
             _attn_output=None,
+            mha_return_lse=False,
         )
         return SimpleNamespace(
             forward_batch=forward_batch,
@@ -220,6 +221,34 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
                     self.assertTrue(torch.all(lse[:2] == 7))
                     self.assertTrue(torch.all(lse[2:] == 0))
                     self.assertIs(forward_batch.out_cache_loc, original_out_cache_loc)
+
+    def test_extra_kwargs_path_returns_bucket_shaped_lse(self):
+        attention_layer = SimpleNamespace()
+        context = self._new_impl_context([attention_layer])
+        backend = _RecordingAttentionBackend()
+        query = torch.zeros((4, 2, 3))
+
+        with (
+            patch.object(
+                radix_attention_module,
+                "get_tc_piecewise_forward_context",
+                return_value=context,
+            ),
+            patch.object(
+                radix_attention_module, "get_attn_backend", return_value=backend
+            ),
+        ):
+            lse = radix_attention_module.attention_with_output_extra_kwargs(
+                query,
+                query,
+                query,
+                torch.empty_like(query),
+                False,
+                0,
+                {"return_lse": True},
+            )
+
+        self.assertEqual(lse.tolist(), [[7, 7], [7, 7], [0, 0], [0, 0]])
 
     def test_impl_uses_independent_query_and_key_value_extents(self):
         attention_layer = SimpleNamespace()
