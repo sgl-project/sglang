@@ -102,10 +102,11 @@ def init_npu_backend():
 
     import torch_npu
 
-    # These imports lead to unpredictable behavior in diffusion models 
+    # These imports lead to unpredictable behavior in diffusion models
     # and a significant reduction in performance.
     if "sglang.multimodal_gen" not in sys.modules:
         from torch_npu.contrib import transfer_to_npu  # noqa: F401
+
         torch_npu.npu.config.allow_internal_format = True
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
