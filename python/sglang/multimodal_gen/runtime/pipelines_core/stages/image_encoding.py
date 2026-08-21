@@ -322,6 +322,7 @@ class ImageEncodingStage(PipelineStage):
                             pixel_values=image_inputs.pixel_values,
                             image_grid_thw=image_inputs.image_grid_thw,
                             output_hidden_states=True,
+                            use_cache=False,
                         )
                         if batch.do_classifier_free_guidance:
                             neg_outputs = self.text_encoder(
@@ -330,6 +331,7 @@ class ImageEncodingStage(PipelineStage):
                                 pixel_values=neg_image_inputs.pixel_values,
                                 image_grid_thw=neg_image_inputs.image_grid_thw,
                                 output_hidden_states=True,
+                                use_cache=False,
                             )
 
                 prompt_embeds, prompt_embeds_mask, prompt_seq_lens = (
@@ -528,12 +530,31 @@ class LTX2ImageEncodingStage(PipelineStage):
             configure_layerwise_offload_modules(
                 modules,
                 server_args,
-                component_names=server_args.layerwise_offload_components,
+                component_names=(
+                    None
+                    if server_args.component_residency is not None
+                    else server_args.layerwise_offload_components
+                ),
                 warn_missing=False,
             )
         return True
 
     # -- image preprocessing ---------------------------------------------
+
+    # Conditioning images are re-compressed to match training: CRF 33 for
+    # LTX-2 / 2.3, 18 for LTX-2.5. Like upstream, keyed off the text-encoder
+    # generation -- the only signal that separates them.
+    _DEFAULT_IMAGE_CRF = 33
+    _LTX_2_5_IMAGE_CRF = 18
+    _GEMMA_4_MODEL_TYPES = ("gemma4_unified", "gemma4")
+
+    @classmethod
+    def _resolve_image_conditioning_crf(cls, server_args: ServerArgs) -> int:
+        text_encoder_configs = server_args.pipeline_config.text_encoder_configs
+        for encoder_config in text_encoder_configs:
+            if encoder_config.prefix in ("gemma_4_unified", "gemma_4"):
+                return cls._LTX_2_5_IMAGE_CRF
+        return cls._DEFAULT_IMAGE_CRF
 
     @staticmethod
     def _apply_video_codec_compression(
@@ -704,11 +725,12 @@ class LTX2ImageEncodingStage(PipelineStage):
         from sglang.multimodal_gen.runtime.utils.vision import load_image
 
         # 1. Load images, apply codec compression, resize for condition_image
+        crf = self._resolve_image_conditioning_crf(server_args)
         conditioned_imgs = []
         for image_path in image_paths:
             img = load_image(image_path)
             arr = np.array(img).astype(np.uint8)[..., :3]
-            arr = self._apply_video_codec_compression(arr, crf=33)
+            arr = self._apply_video_codec_compression(arr, crf=crf)
             conditioned_img = PIL.Image.fromarray(arr)
             conditioned_imgs.append(conditioned_img)
         batch.condition_image = [

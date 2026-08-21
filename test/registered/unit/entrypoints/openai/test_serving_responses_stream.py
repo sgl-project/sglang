@@ -167,6 +167,7 @@ class NonHarmonyStreamTestCase(CustomTestCase):
             parser_cls.return_value.parse_stream_chunk.side_effect = (
                 fake_parse_stream_chunk
             )
+            parser_cls.return_value.parse_stream_end.return_value = ("", [])
             fixture = StreamFixture(serving, request)
             events = fixture.run(chunks)
 
@@ -177,6 +178,35 @@ class NonHarmonyStreamTestCase(CustomTestCase):
         self.assertEqual(output[0]["content"][0]["text"], "I'll check.")
         self.assertEqual(output[1]["name"], "get_weather")
         self.assertEqual(output[2]["content"][0]["text"], "It's sunny.")
+
+    def test_reasoning_parser_flushed_at_stream_end(self):
+        """Bug regression: the stream loop never drained text the reasoning
+        parser held back as a possible marker prefix, so a response whose text
+        genuinely ends with e.g. "<|e" lost that tail on /v1/responses (chat
+        flushes via parse_stream_end; responses did not)."""
+        serving = make_serving()
+        serving.reasoning_parser = "muse"
+        serving.tool_call_parser = None
+
+        request = ResponsesRequest(model="x", input="hi", stream=True, store=False)
+        text = (
+            " to=self<|message|>think<|eom|>"
+            "<|start|>assistant to=user<|message|>Answer<|e"
+        )
+        fixture = StreamFixture(serving, request)
+        events = fixture.run(
+            [
+                engine_chunk(text[:30], 4),
+                engine_chunk(text, 9, finish=True),
+            ]
+        )
+
+        streamed = "".join(
+            p["delta"]
+            for ev, p in zip(event_types(events), event_payloads(events))
+            if ev == "response.output_text.delta"
+        )
+        self.assertEqual(streamed, "Answer<|e")
 
 
 class MultiToolCallStreamingOrderTestCase(CustomTestCase):

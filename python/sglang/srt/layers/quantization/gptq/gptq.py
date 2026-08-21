@@ -28,6 +28,7 @@ from .schemes import (
     GPTQMarlinLinearScheme,
     GPTQMarlinMoEScheme,
     GPTQMoEAscendScheme,
+    GPTQXPULinearScheme,
 )
 
 if TYPE_CHECKING:
@@ -261,6 +262,35 @@ class CPUGPTQConfig(GPTQConfig):
         return GPTQIntelAMXMoEScheme(self)
 
 
+class GPTQXPUConfig(GPTQConfig):
+    """Config class for GPTQ on Intel XPU.
+
+    Dense int4 GPTQ lowers to torch's native
+    ``_weight_int4pack_mm_with_scales_and_zeros`` op (no Marlin on XPU). MoE is
+    out of scope for the dense phase.
+    """
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
+        return [torch.half, torch.bfloat16]
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional[LinearMethodBase]:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        if isinstance(layer, FusedMoE):
+            raise NotImplementedError(
+                "GPTQ MoE is not yet supported on XPU (dense-only phase)."
+            )
+        return get_linear_quant_method(
+            self, layer, prefix=prefix, linear_method_cls=GPTQLinearMethod
+        )
+
+    def get_linear_scheme(self, layer: torch.nn.Module):
+        return GPTQXPULinearScheme(self)
+
+
 class GPTQMarlinConfig(QuantizationConfig):
     """Config class for GPTQ Marlin"""
 
@@ -471,7 +501,7 @@ class GPTQLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        if not hasattr(layer, "scheme"):
+        if layer.scheme is None:
             layer.scheme = self.quant_config.get_linear_scheme(layer)
         weight_loader = extra_weight_attrs.get("weight_loader")
         layer.scheme.create_weights(
@@ -511,7 +541,7 @@ class GPTQMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        if not hasattr(layer, "scheme"):
+        if layer.scheme is None:
             layer.scheme = self.quant_config.get_moe_scheme(layer)
         layer.scheme.create_weights(
             layer=layer,
@@ -563,7 +593,7 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        if not hasattr(layer, "scheme"):
+        if layer.scheme is None:
             layer.scheme = self.quant_config.get_linear_scheme(layer)
         weight_loader = extra_weight_attrs.get("weight_loader")
         layer.scheme.create_weights(
@@ -603,7 +633,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        if not hasattr(layer, "scheme"):
+        if layer.scheme is None:
             layer.scheme = self.quant_config.get_moe_scheme(layer)
         layer.scheme.create_weights(
             layer=layer,

@@ -95,6 +95,7 @@ class QwenImageLayeredPipeline(QwenImageEditPipeline):
     pipeline_name = "QwenImageLayeredPipeline"
 
     _required_config_modules = [
+        "text_encoder",
         "vae",
         "tokenizer",
         "processor",
@@ -104,19 +105,19 @@ class QwenImageLayeredPipeline(QwenImageEditPipeline):
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         def create_before_denoising_stage():
-            return QwenImageLayeredBeforeDenoisingStage(
+            stage = QwenImageLayeredBeforeDenoisingStage(
                 vae=self.get_module("vae"),
-                text_encoder=None,
+                text_encoder=self.get_module("text_encoder"),
                 tokenizer=self.get_module("tokenizer"),
                 processor=self.get_module("processor"),
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
-                model_path=self.model_path,
                 vae_dtype=PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision],
                 text_encoder_dtype=PRECISION_TO_TYPE[
                     server_args.pipeline_config.text_encoder_precisions[0]
                 ],
             )
+            return stage
 
         self.add_stage_factory(
             RoleType.ENCODER,
