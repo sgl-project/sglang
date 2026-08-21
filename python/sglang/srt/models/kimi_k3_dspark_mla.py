@@ -28,8 +28,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDecoderLayer, DFlashDraftModel
 from sglang.srt.models.dspark import (
-    DSparkDraftMixin,
     _DSPARK_SKIPPED_WEIGHT_PREFIXES,
+    DSparkDraftMixin,
 )
 from sglang.srt.models.kimi_k3 import KimiK3MLAAttention
 from sglang.srt.runtime_context import get_device, get_parallel
