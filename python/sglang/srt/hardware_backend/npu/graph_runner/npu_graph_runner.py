@@ -239,13 +239,22 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
-            if forward_batch.forward_mode.is_target_verify():
-                seq_lens_cpu = forward_batch.seq_lens.cpu() + self.captured_req_width
-                seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
+            seq_lens_cpu = forward_batch.seq_lens_cpu
+            has_host_seq_lens = seq_lens_cpu is not None
+            if has_host_seq_lens:
+                seq_lens_cpu = seq_lens_cpu[: self.raw_bs]
             else:
-                seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
-                    self.bs - self.raw_bs
-                )
+                seq_lens_cpu = forward_batch.seq_lens[: self.raw_bs].cpu()
+
+            if forward_batch.forward_mode.is_target_verify() and not (
+                self.model_runner.spec_algorithm.is_dspark() and has_host_seq_lens
+            ):
+                seq_lens_cpu = seq_lens_cpu + self.captured_req_width
+
+            # DSpark's verifier has already added the verify width to its CPU
+            # mirror. Reusing that value avoids both a blocking D2H copy and
+            # the double increment that would corrupt graph replay metadata.
+            seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
             output = self.backend.replay_with_input_update(
                 graph_key,
                 seq_lens=seq_lens,
