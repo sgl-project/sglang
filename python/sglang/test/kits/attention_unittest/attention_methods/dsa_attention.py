@@ -293,6 +293,11 @@ class DSAMockModelRunner(ModelRunner):
         # `set_mla_kv_buffer` does the quantize on the way in.
         self.kv_cache_dtype = torch.float8_e4m3fn if fp8_kv_cache else dtype
         self.kv_cache_dtype_str = "auto"
+        # This runner's own resolved backends (production stamps these in
+        # ModelRunner.initialize); a draft runner would carry its own.
+        self.prefill_attention_backend_str = case.backend
+        self.decode_attention_backend_str = case.backend
+        self.draft_attention_backend = None
         # For TARGET_VERIFY / DRAFT_EXTEND, the DSA backend uses
         # `self.speculative_num_draft_tokens` to size `seqlens_expanded`
         # (`dsa_backend.py:482-486,510-515`). When zero, deep_gemm's

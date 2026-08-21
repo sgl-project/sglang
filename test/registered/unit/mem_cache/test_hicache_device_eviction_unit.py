@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -23,7 +24,7 @@ class _FakeAllocator:
         self.free = mock.Mock()
 
 
-class TestHiRadixSyncFreeDeviceRelease(unittest.TestCase):
+class TestHiRadixSyncFreeDeviceRelease(CustomTestCase):
     def _make_cache(self, *, page_size=4, need_sort=True):
         cache = HiRadixCache.__new__(HiRadixCache)
         cache.page_size = page_size
@@ -124,7 +125,7 @@ class TestHiRadixSyncFreeDeviceRelease(unittest.TestCase):
         self.assertEqual(allocator.release_pages.numel(), 0)
 
 
-class TestHiRadixPendingWriteThroughEviction(unittest.TestCase):
+class TestHiRadixPendingWriteThroughEviction(CustomTestCase):
     def _make_cache(self):
         cache = HiRadixCache.__new__(HiRadixCache)
         cache.page_size = 4
@@ -170,12 +171,12 @@ class TestHiRadixPendingWriteThroughEviction(unittest.TestCase):
         allocator.free.assert_not_called()
 
 
-class TestHiRadixRegularEvictionPendingGuard(unittest.TestCase):
+class TestHiRadixRegularEvictionPendingGuard(CustomTestCase):
     def _make_cache(self):
         cache = HiRadixCache.__new__(HiRadixCache)
         cache.page_size = 4
         cache.ongoing_write_through = {}
-        cache._record_remove_event = mock.Mock()
+        cache.kv_events = SimpleNamespace(record_remove=mock.Mock())
         cache._delete_leaf = mock.Mock()
         cache.cache_controller = SimpleNamespace(
             mem_pool_device_allocator=_FakeAllocator(need_sort=True)
@@ -196,7 +197,7 @@ class TestHiRadixRegularEvictionPendingGuard(unittest.TestCase):
 
         allocator = cache.cache_controller.mem_pool_device_allocator
         self.assertEqual(evicted, 0)
-        cache._record_remove_event.assert_not_called()
+        cache.kv_events.record_remove.assert_not_called()
         cache._delete_leaf.assert_not_called()
         allocator.free.assert_not_called()
         self.assertEqual(allocator.release_pages.numel(), 0)
@@ -215,7 +216,7 @@ class TestHiRadixRegularEvictionPendingGuard(unittest.TestCase):
 
         allocator = cache.cache_controller.mem_pool_device_allocator
         self.assertEqual(evicted, 8)
-        cache._record_remove_event.assert_called_once_with(node)
+        cache.kv_events.record_remove.assert_called_once_with(node)
         cache._delete_leaf.assert_called_once_with(node)
         self.assertTrue(torch.equal(allocator.release_pages, torch.tensor([2, 5])))
         allocator.free.assert_not_called()

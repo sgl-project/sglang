@@ -2137,7 +2137,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             return None
 
         try:
-            from sglang.kernels.ops.diffusion.triton.sana_wm_gdn import (
+            from sglang.kernels.ops.diffusion import (
                 fused_bigdn_func,
                 fused_qk_inv_rms,
                 prepare_rope_tables,
@@ -2269,9 +2269,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             return None
 
         try:
-            from sglang.kernels.ops.diffusion.triton.sana_wm_gdn_chunkwise import (
-                cam_scan_bidi_chunkwise,
-            )
+            from sglang.kernels.ops.diffusion import cam_scan_bidi_chunkwise
 
             B, heads, _, _ = q.shape
             T, H_sp, W_sp = HW
