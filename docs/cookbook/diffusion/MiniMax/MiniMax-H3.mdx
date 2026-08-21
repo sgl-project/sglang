@@ -1197,6 +1197,89 @@ peak per GPU.
 | prefetch 2, resident 20 | 43.37 s | 78.06 s | 27.5 GiB | No measurable gain |
 | Ulysses2, prefetch 2, resident 10 | Did not reach warmup | — | — | Rejected |
 
+### 12 GB VRAM inside a 32 GB host
+
+On consumer hardware the binding question is not which card you have but how much
+host RAM sits behind it. H3's weights are about 108 GB — 61.73 GB of DiT and
+46.18 GB of text encoder — so no consumer configuration holds them all, and where
+the shortfall lands decides the throughput.
+
+**Two budgets, and what each one buys**
+
+| | 12 GB VRAM + 32 GB host | VRAM budget only, host free |
+| --- | ---: | ---: |
+| Peak VRAM | ≤ 12 GiB | ≤ 12 GiB |
+| Host anonymous (must fit) | 24.5 GiB | 116.7 GB pinned |
+| Denoise, 864×480 / 124 frames / 20 NFE | 17.38 s/it | **6.10 s/it** |
+| Runs at all | yes | yes |
+
+Read the host row carefully, because the two numbers are not the same kind of
+memory. *Anonymous* host memory — pinned buffers and pageable copies — has to fit,
+and the kernel cannot reclaim it. Page cache backing a file mapping is
+*droppable*, so it does not count against the budget even though it shows up in
+`VmRSS`; use `RssAnon` from `/proc/<pid>/status` when checking. Likewise measure
+VRAM with `torch.cuda.set_per_process_memory_fraction` and let the allocator fail,
+rather than reading `nvidia-smi`, which reports the caching allocator's reserved
+pool and overstates the requirement.
+
+Inside 32 GB the weights cannot be held, so roughly 49 GiB per denoise step is
+re-read from the checkpoint mapping at about 3.4 GB/s. That is arithmetic, not a
+tuning gap: no lossless setting removes it, and an NVMe is a requirement rather
+than a recommendation. Giving the host room to pin the weights instead is what
+takes the step from 17.38 s to 6.10 s.
+
+**Recipe A — fits 12 GB VRAM + 32 GB host**
+
+```bash 12 GB + 32 GB, lossless
+sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
+  --performance-mode memory \
+  --layerwise-offload-components dit,text_encoder,vae \
+  --layerwise-resident-layers video_vae=36
+```
+
+**Recipe B — host memory is free (the fast path)**
+
+```bash unconstrained host, lossless
+sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
+  --performance-mode memory \
+  --layerwise-offload-components dit,text_encoder,vae \
+  --dit-layerwise-resident-layers 4 \
+  --layerwise-resident-layers video_vae=36
+```
+
+Recipe B pins 116.7 GB of host memory (DiT 61.56 GB, text encoder 46.18 GB, VAE
+9.00 GB). Do not reach for it on a 32 GB machine.
+
+**What not to change, and why**
+
+- Keep `video_vae=36`. `decode_temporal` re-runs the whole video decoder once per
+  temporal chunk, so streaming its blocks pays the weight transfer per chunk —
+  150 s of decode against 13 s when all 36 are held.
+- Leave `--enable-torch-compile` off, as elsewhere on this page. Layerwise offload
+  rebinds `param.data` on every layer, so compiled graphs do not get the benefit
+  they would on resident weights.
+- Recipe A's flags are what the automatic policy should choose on its own. Until
+  the model declares its own placement, `--performance-mode memory` plus the
+  explicit component list is what makes it happen; pass them.
+
+**Against ComfyUI, on the same weights**
+
+Same unpruned bf16 checkpoints, same card, same sampler settings (cfg 1.0,
+euler_ancestral, sigma shift 12.0/3.0, seed 1101), 864×480 / 124 frames / 20 NFE:
+
+| | denoise | host memory | peak VRAM |
+| --- | ---: | ---: | ---: |
+| sglang, Recipe B | **6.10 s/it** | 116.7 GB pinned | ≤ 12 GiB |
+| ComfyUI KSampler | 6.58–6.59 s/it | 116.5 GiB | 13048 MiB |
+
+Both need about 116 GB of host memory to reach those numbers, and neither fits
+Recipe A's budget there. Inside 12 GB + 32 GB, ComfyUI cannot run these weights at
+all; the path it ships for 12 GB cards uses
+`minimax_h3_fl2va_pruned_int8_convrot` and `qwen3vl_32b_minimax_h3_nvfp4_awq`,
+i.e. an int8 DiT and an NVFP4 text encoder, and its pruned bf16 file is 40.2 GB
+against the unpruned 66.3 GB. Those are different weights, so it is not a
+like-for-like comparison with the recipes above.
+
 ### RTX 4090 24 GB single-GPU run
 
 One RTX 4090 D 24 GB completed the 1344×768, 107-frame, 20-NFE T2VA
