@@ -19,8 +19,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     IncLockRefResult,
 )
-from sglang.srt.mem_cache.unified_cache.components.mamba_component import MambaComponent
-from sglang.srt.mem_cache.unified_cache.components.tree_component import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
 from sglang.test.ci.ci_register import register_cpu_ci

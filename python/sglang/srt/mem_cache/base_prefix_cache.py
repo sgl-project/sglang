@@ -34,7 +34,7 @@ if TYPE_CHECKING:
         CacheAction,
         ComponentAction,
     )
-    from sglang.srt.mem_cache.unified_cache.components.tree_component import (
+    from sglang.srt.mem_cache.unified_cache.components.base import (
         ComponentType,
     )
 
