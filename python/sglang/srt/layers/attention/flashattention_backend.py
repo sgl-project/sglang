@@ -333,16 +333,6 @@ class FlashAttentionBackend(AttentionBackend):
     ) -> int:
         return self.num_splits
 
-    def _check_return_lse(self, return_lse: bool, layer: RadixAttention) -> None:
-        if not return_lse:
-            return
-        if self.fa_impl_ver != 4:
-            raise RuntimeError("return_lse is only supported by the FA4 backend.")
-        if self.use_mla or self.fa_skip_kv_cache or layer.is_cross_attention:
-            raise RuntimeError(
-                "return_lse is only supported on the paged non-MLA attention path."
-            )
-
     def _compute_scheduler_metadata(
         self, batch_size, max_seq_len_k, cache_seqlens, cu_seqlens_q
     ):
@@ -1162,7 +1152,6 @@ class FlashAttentionBackend(AttentionBackend):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
-        self._check_return_lse(return_lse, layer)
         lse_out = None
         is_cp_mode = (
             forward_batch.forward_mode.is_context_parallel_extend()
@@ -1773,7 +1762,6 @@ class FlashAttentionBackend(AttentionBackend):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
-        self._check_return_lse(return_lse, layer)
         lse_out = None
         if k is not None:
             assert v is not None

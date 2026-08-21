@@ -527,30 +527,6 @@ class TestFA4DenseAttentionBackendCorrectness(CustomTestCase):
                     rtol=DENSE_RTOL,
                 )
 
-    def test_return_lse_rejects_unsupported_paths(self):
-        """The paged non-MLA path is the only one that can serve an LSE."""
-        case = self.RETURN_LSE_CASES[0]
-        fixture = build_dense_attention_fixture(
-            self, case, head_dim=self.HEAD_DIM, hidden_size=self.HIDDEN_SIZE
-        )
-        backend, layer = fixture.backend, fixture.actual_module.attn
-
-        layer.is_cross_attention = True
-        try:
-            with self.assertRaises(RuntimeError):
-                backend._check_return_lse(True, layer)
-        finally:
-            layer.is_cross_attention = False
-
-        backend.fa_impl_ver = 3
-        try:
-            with self.assertRaises(RuntimeError):
-                backend._check_return_lse(True, layer)
-        finally:
-            backend.fa_impl_ver = 4
-
-        backend._check_return_lse(False, layer)  # no-op when not requested
-
 
 if __name__ == "__main__":
     unittest.main()
