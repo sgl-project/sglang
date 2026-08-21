@@ -46,7 +46,13 @@ register_amd_ci(
 
 INVALID = -9999999
 
-QWEN35_MXFP4_HF_MODEL_ID = "amd/Qwen3.5-397B-A17B-MXFP4"
+# Overridable so a runner with the checkpoint already on disk (or a local repro) can
+# skip the ~200GB download; the default is the HF id. Same variable name as the
+# stage-c fusion test, so one setting covers both.
+QWEN35_MXFP4_MODEL_PATH = os.environ.get(
+    "QWEN35_MXFP4_MODEL_PATH",
+    "amd/Qwen3.5-397B-A17B-MXFP4",
+)
 SERVER_LAUNCH_TIMEOUT = 3600
 # TP=4 matches the AMD model-card reproduction recipe and keeps model-load + full
 # GSM8K inside the 3600s per-file budget on this 8-GPU MI35x runner. Avoid TP=8 here:
@@ -145,7 +151,7 @@ def run_gsm8k_benchmark(
 class TestQwen35MXFP4DenseFp8MI35x(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = QWEN35_MXFP4_HF_MODEL_ID
+        cls.model = QWEN35_MXFP4_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
 

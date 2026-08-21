@@ -7,15 +7,16 @@ the baseline. Default-off, so untested by a plain CI run; nightly single-server 
 is in accuracy/mi35x/test_qwen35_dense_fp8_mi35x.py.
 """
 
+import ast
 import os
 import re
-import subprocess
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
+import numpy as np
 import requests
 
 from sglang.srt.utils import kill_process_tree
@@ -27,9 +28,11 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_github_step_summary,
 )
-from sglang.utils import download_and_cache_file
+from sglang.utils import download_and_cache_file, read_jsonl
 
 register_amd_ci(est_time=4800, suite="stage-c-test-large-8-gpu-amd-mi35x")
+
+INVALID = -9999999
 
 # Promotion only reaches layers the checkpoint excludes: this one leaves
 # shared_expert.down_proj bf16, while AttnFP8-V2 quantizes it (nothing to promote).
@@ -39,12 +42,25 @@ QWEN35_MXFP4_MODEL_PATH = os.environ.get(
 )
 SERVER_LAUNCH_TIMEOUT = 4800
 GSM8K_NUM_QUESTIONS = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
-# down_proj->FP8 is accuracy-neutral (~0.94-0.97 here), so 0.92 gates regressions.
+GSM8K_NUM_SHOTS = 5
+# Submit the whole set at once and let the scheduler batch it. Measured on MI355X
+# TP4 over 1319 questions: 112s here vs 192s when capped at 128 in flight, for the
+# same accuracy -- throttling the client just starves the GPU.
+GSM8K_PARALLEL = int(os.environ.get("GSM8K_PARALLEL", str(GSM8K_NUM_QUESTIONS)))
+# Qwen3.5 is a reasoning model: it emits a long <think> block before the final
+# answer, so the generation cap must be large enough to reach the answer line. The
+# 512-token default of benchmark/gsm8k/bench_sglang.py truncates valid answers
+# mid-reasoning and costs ~5 points here, which is why this file runs its own
+# harness instead (matching accuracy/mi35x/test_qwen35_dense_fp8_mi35x.py).
+GSM8K_MAX_NEW_TOKENS = int(os.environ.get("GSM8K_MAX_NEW_TOKENS", "8192"))
+# Measured on MI355X TP4 with the harness below: 0.973 bf16 baseline, so 0.92 leaves
+# ~5 points of headroom while still catching a real break.
 ACCURACY_THRESHOLD = 0.92
+# The actual claim under test is that promoting down_proj to FP8 is accuracy-neutral,
+# so also gate fused against baseline. GSM8K stderr at 1319 questions is ~0.006; 0.02
+# is wide enough not to flake and tight enough to catch a genuine regression.
+ACCURACY_DELTA_TOLERANCE = 0.02
 
-# bench_sglang.py is at the repo root (this file is 5 levels below).
-REPO_ROOT = Path(__file__).resolve().parents[5]
-GSM8K_BENCH_SCRIPT = REPO_ROOT / "benchmark" / "gsm8k" / "bench_sglang.py"
 GSM8K_DATA_URL = (
     "https://raw.githubusercontent.com/openai/grade-school-math/"
     "master/grade_school_math/data/test.jsonl"
@@ -72,6 +88,9 @@ COMMON_ENV = {
     "SGLANG_USE_AITER_FP8_PER_TOKEN": "1",
 }
 
+FUSED_VARIANT = "dense-fp8-fused"
+BASELINE_VARIANT = "bf16-baseline"
+
 
 @dataclass
 class DenseFp8Variant:
@@ -91,13 +110,13 @@ def _base_url_with_port_offset(offset: int) -> str:
 def get_dense_fp8_variants() -> List[DenseFp8Variant]:
     return [
         DenseFp8Variant(
-            variant="dense-fp8-fused",
+            variant=FUSED_VARIANT,
             hip_visible_devices="0,1,2,3",
             port_offset=0,
             extra_args=["--enable-dense-fp8"],
         ),
         DenseFp8Variant(
-            variant="bf16-baseline",
+            variant=BASELINE_VARIANT,
             hip_visible_devices="4,5,6,7",
             port_offset=1,
             extra_args=[],
@@ -105,19 +124,77 @@ def get_dense_fp8_variants() -> List[DenseFp8Variant]:
     ]
 
 
-def _parse_gsm8k_metrics(stdout: str) -> Dict[str, float]:
-    metrics = {}
-    for key, pattern in {
-        "accuracy": r"Accuracy:\s*([0-9.]+)",
-        "invalid": r"Invalid:\s*([0-9.]+)",
-        "latency": r"Latency:\s*([0-9.]+)\s*s",
-        "output_throughput": r"Output throughput:\s*([0-9.]+)\s*token/s",
-    }.items():
-        match = re.search(pattern, stdout)
-        if match is None:
-            raise AssertionError(f"Could not parse {key} from GSM8K output:\n{stdout}")
-        metrics[key] = float(match.group(1))
-    return metrics
+def get_one_example(lines, i, include_answer):
+    ret = "Question: " + lines[i]["question"] + "\nAnswer:"
+    if include_answer:
+        ret += " " + lines[i]["answer"]
+    return ret
+
+
+def get_few_shot_examples(lines, k):
+    ret = ""
+    for i in range(k):
+        ret += get_one_example(lines, i, True) + "\n\n"
+    return ret
+
+
+def get_answer_value(answer_str):
+    answer_str = answer_str.replace(",", "")
+    numbers = re.findall(r"\d+", answer_str)
+    if len(numbers) < 1:
+        return INVALID
+    try:
+        return ast.literal_eval(numbers[-1])
+    except SyntaxError:
+        return INVALID
+
+
+def run_gsm8k_benchmark(
+    base_url: str,
+    data_path: str,
+    num_questions: int,
+) -> Tuple[float, float, float]:
+    import sglang as sgl
+    from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+
+    lines = list(read_jsonl(data_path))
+    few_shot_examples = get_few_shot_examples(lines, GSM8K_NUM_SHOTS)
+
+    questions = []
+    labels = []
+    for i in range(len(lines[:num_questions])):
+        questions.append(get_one_example(lines, i, False))
+        labels.append(get_answer_value(lines[i]["answer"]))
+    assert all(l != INVALID for l in labels)
+
+    @sgl.function
+    def few_shot_gsm8k(s, question):
+        s += few_shot_examples + question
+        # Stop only at the next few-shot boundary ("\n\nQuestion"), not the bare
+        # word "Question", which appears inside reasoning text and would truncate
+        # valid answers early (fix from PR #29264).
+        s += sgl.gen(
+            "answer",
+            max_tokens=GSM8K_MAX_NEW_TOKENS,
+            stop=["\n\nQuestion", "Assistant:", "<|im_end|>"],
+        )
+
+    # Both variants are evaluated concurrently from this process, so the backend is
+    # passed per call rather than through the global set_default_backend().
+    tic = time.perf_counter()
+    states = few_shot_gsm8k.run_batch(
+        [{"question": q} for q in questions],
+        temperature=0,
+        num_threads=GSM8K_PARALLEL,
+        backend=RuntimeEndpoint(base_url),
+    )
+    latency = time.perf_counter() - tic
+
+    preds = [get_answer_value(states[i]["answer"]) for i in range(len(states))]
+    acc = np.mean(np.array(preds) == np.array(labels))
+    invalid = np.mean(np.array(preds) == INVALID)
+
+    return float(acc), float(invalid), float(latency)
 
 
 class TestQwen35DenseFp8MI35x(CustomTestCase):
@@ -127,34 +204,8 @@ class TestQwen35DenseFp8MI35x(CustomTestCase):
     def setUpClass(cls):
         cls.model = QWEN35_MXFP4_MODEL_PATH
         cls.variants = get_dense_fp8_variants()
-        # Pre-fetch once so the two parallel subprocesses don't race the cache write.
+        # Pre-fetch once so the two parallel eval threads don't race the cache write.
         cls.gsm8k_data_path = download_and_cache_file(GSM8K_DATA_URL)
-
-    def _run_gsm8k(self, base_url: str) -> Dict[str, float]:
-        port = int(base_url.rsplit(":", 1)[-1])
-        command = [
-            "python3",
-            str(GSM8K_BENCH_SCRIPT),
-            "--num-questions",
-            str(GSM8K_NUM_QUESTIONS),
-            "--parallel",
-            str(GSM8K_NUM_QUESTIONS),
-            "--num-shots",
-            "5",
-            "--data-path",
-            str(self.gsm8k_data_path),
-            "--port",
-            str(port),
-        ]
-        result = subprocess.run(command, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise AssertionError(
-                "GSM8K benchmark failed:\n"
-                f"stdout:\n{result.stdout}\n"
-                f"stderr:\n{result.stderr}"
-            )
-        print(result.stdout)
-        return _parse_gsm8k_metrics(result.stdout)
 
     def _run_variant(self, variant: DenseFp8Variant) -> Dict[str, float]:
         env = os.environ.copy()
@@ -171,21 +222,21 @@ class TestQwen35DenseFp8MI35x(CustomTestCase):
         )
         try:
             requests.get(base_url + "/flush_cache", timeout=10)
-            metrics = self._run_gsm8k(base_url)
+            accuracy, invalid, latency = run_gsm8k_benchmark(
+                base_url, self.gsm8k_data_path, GSM8K_NUM_QUESTIONS
+            )
+            metrics = {
+                "accuracy": accuracy,
+                "invalid": invalid,
+                "latency": latency,
+            }
             print(f"[{variant.variant}] {metrics=}")
             return metrics
         finally:
             kill_process_tree(process.pid)
 
     def test_qwen35_dense_fp8_accuracy(self):
-        summary = "### Qwen3.5 MXFP4 --enable-dense-fp8 GSM8K (MI35x, parallel TP4)\n\n"
-        summary += (
-            "| Variant | GPUs | Accuracy | Invalid | Latency (s) | Output tok/s | "
-            "Threshold | Status |\n"
-        )
-        summary += "| ------- | ---- | -------- | ------- | ----------- | ------------ | --------- | ------ |\n"
-
-        failures = []
+        results: Dict[str, Dict[str, float]] = {}
         with ThreadPoolExecutor(max_workers=len(self.variants)) as executor:
             future_to_variant = {
                 executor.submit(self._run_variant, variant): variant
@@ -193,29 +244,56 @@ class TestQwen35DenseFp8MI35x(CustomTestCase):
             }
             for future in as_completed(future_to_variant):
                 variant = future_to_variant[future]
-                with self.subTest(variant=variant.variant):
-                    metrics = future.result()
-                    accuracy = metrics["accuracy"]
-                    passed = accuracy >= ACCURACY_THRESHOLD
-                    status = "PASS" if passed else "FAIL"
-                    summary += (
-                        f"| {variant.variant} | {variant.hip_visible_devices} | "
-                        f"{accuracy:.3f} | {metrics['invalid']:.3f} | "
-                        f"{metrics['latency']:.2f} | "
-                        f"{metrics['output_throughput']:.2f} | "
-                        f"{ACCURACY_THRESHOLD} | {status} |\n"
-                    )
-                    if not passed:
-                        failures.append((variant.variant, accuracy))
+                results[variant.variant] = future.result()
+
+        summary = "### Qwen3.5 MXFP4 --enable-dense-fp8 GSM8K (MI35x, parallel TP4)\n\n"
+        summary += (
+            "| Variant | GPUs | Accuracy | Invalid | Latency (s) | Threshold | "
+            "Status |\n"
+        )
+        summary += (
+            "| ------- | ---- | -------- | ------- | ----------- | --------- | "
+            "------ |\n"
+        )
+        for variant in self.variants:
+            metrics = results[variant.variant]
+            passed = metrics["accuracy"] >= ACCURACY_THRESHOLD
+            summary += (
+                f"| {variant.variant} | {variant.hip_visible_devices} | "
+                f"{metrics['accuracy']:.3f} | {metrics['invalid']:.3f} | "
+                f"{metrics['latency']:.2f} | {ACCURACY_THRESHOLD} | "
+                f"{'PASS' if passed else 'FAIL'} |\n"
+            )
+
+        fused_accuracy = results[FUSED_VARIANT]["accuracy"]
+        baseline_accuracy = results[BASELINE_VARIANT]["accuracy"]
+        delta = fused_accuracy - baseline_accuracy
+        summary += (
+            f"\nfused - baseline = {delta:+.4f} "
+            f"(tolerance -{ACCURACY_DELTA_TOLERANCE})\n"
+        )
 
         if is_in_ci():
             write_github_step_summary(summary)
         print(summary)
 
+        below_threshold = [
+            (name, metrics["accuracy"])
+            for name, metrics in sorted(results.items())
+            if metrics["accuracy"] < ACCURACY_THRESHOLD
+        ]
         self.assertEqual(
-            failures,
+            below_threshold,
             [],
-            f"Qwen3.5 dense-FP8 accuracy below {ACCURACY_THRESHOLD}: {failures}",
+            f"Qwen3.5 GSM8K accuracy below {ACCURACY_THRESHOLD}: {below_threshold}",
+        )
+
+        self.assertGreaterEqual(
+            delta,
+            -ACCURACY_DELTA_TOLERANCE,
+            f"dense-FP8 regressed vs bf16 baseline: {fused_accuracy:.4f} vs "
+            f"{baseline_accuracy:.4f} (delta {delta:+.4f}, tolerance "
+            f"-{ACCURACY_DELTA_TOLERANCE})",
         )
 
 
