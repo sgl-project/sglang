@@ -61,10 +61,12 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_skip_post_experts_all_reduce,
 )
+from sglang.srt.batch_overlap.single_batch_overlap import compute_overlap_args
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputChecker
 from sglang.srt.layers.moe.utils import (
+    is_sbo_enabled,
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
     is_deepep_class_backend,
@@ -464,6 +466,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             and forward_batch.forward_mode.is_cuda_graph()
         )
+        # CUDA: overlap the separate shared-expert MLP with deepep dispatch/experts/
+        # combine on alt_stream; join only before the final add. Safe because the
+        # experts path is non-inplace when the separate shared expert exists.
+        cuda_shared_overlap = (
+            not enable_dual_stream
+            and self.alt_stream is not None
+            and self.shared_expert is not None
+            and hidden_states.shape[0] > 0
+            and envs.SGLANG_QWEN_DEEPEP_SHARED_OVERLAP.get()
+        )
         shared_output = None
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
@@ -472,6 +484,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 shared_output = shared_expert_on_independent_stream(
                     hidden_states.clone(), self._forward_shared_experts
                 )
+            elif cuda_shared_overlap:
+                _cur = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(_cur)
+                with torch.cuda.stream(self.alt_stream):
+                    shared_output = self._forward_shared_experts(hidden_states)
+                    shared_output.record_stream(self.alt_stream)
             else:
                 shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
@@ -488,12 +506,46 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+        # SBO combine<->down-GEMM overlap (flavor-gated inside compute_overlap_args;
+        # on Blackwell requires the cutedsl moe runner). Hooks are one-shot per forward.
+        if is_sbo_enabled() and self.alt_stream is not None and not self.is_nextn:
+
+            def _post_dispatch_hook(dispatcher, dispatch_output):
+                combine_args, down_gemm_args, meta_args = compute_overlap_args(
+                    dispatch_output, self.alt_stream
+                )
+                if combine_args is not None:
+                    dispatcher.set_overlap_args(
+                        combine_overlap_args=combine_args,
+                        meta_overlap_args=meta_args,
+                    )
+                    self.experts.set_overlap_args(
+                        down_gemm_overlap_args=down_gemm_args,
+                        meta_overlap_args=meta_args,
+                    )
+                _post_dispatch_handle.remove()
+
+            def _post_combine_hook(dispatcher, _hidden):
+                dispatcher.clear_overlap_args()
+                self.experts.clear_overlap_args()
+                _post_combine_handle.remove()
+
+            _post_dispatch_handle = self.experts.dispatcher.register_post_dispatch_hook(
+                _post_dispatch_hook
+            )
+            _post_combine_handle = self.experts.dispatcher.register_post_combine_hook(
+                _post_combine_hook
+            )
+
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
         if enable_dual_stream:
             wait_share_stream()
+        elif cuda_shared_overlap and shared_output is not None:
+            torch.cuda.current_stream().wait_stream(self.alt_stream)
 
         if shared_output is not None:
             final_hidden_states.add_(shared_output)

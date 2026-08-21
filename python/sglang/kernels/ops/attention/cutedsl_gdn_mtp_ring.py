@@ -1680,7 +1680,7 @@ def gdn_wide_vec_kernel(
                 _loop_limit = T_decode_const  # constexpr int — propagates as constexpr
             for i_t_offset in cutlass.range(
                 _loop_limit,
-                unroll=1,
+                unroll=2,
                 unroll_full=(T_decode_const <= 1) and not per_request_accepted_steps,
             ):
                 if cutlass.const_expr(per_request_fused):

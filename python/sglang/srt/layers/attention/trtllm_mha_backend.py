@@ -91,6 +91,13 @@ class TRTLLMMHAMetadata:
     encoder_cache_seqlens: torch.Tensor = None
     encoder_page_table: torch.Tensor = None
     encoder_row_map: torch.Tensor = None
+    # Decode/verify request order and read-only metadata shared by every
+    # attention layer in one forward. Preparing these once avoids repeating
+    # the same sort and page-table gathers in each layer.
+    decode_seq_len_order: torch.Tensor = None
+    decode_sorted_seq_lens: torch.Tensor = None
+    decode_sorted_page_table: torch.Tensor = None
+    decode_sorted_swa_page_table: torch.Tensor = None
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -261,6 +268,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             "trtllm_mha_default_kv_scale",
             lambda: torch.ones(1, dtype=torch.float32, device=self.device),
         )
+        self.decode_seq_len_splits = envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS.get()
+        if self.decode_seq_len_splits < 1:
+            raise ValueError(
+                "SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS must be at least 1, "
+                f"got {self.decode_seq_len_splits}"
+            )
 
     def _check_decode_kv_access(self) -> None:
         supported_kinds = {
@@ -381,6 +394,99 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 return swa_pt
         return self.forward_metadata.page_table
 
+    def _get_sorted_layer_page_table(
+        self, layer: RadixAttention
+    ) -> Optional[torch.Tensor]:
+        """Return the pre-sorted page table for the given layer, if prepared."""
+        metadata = self.forward_metadata
+        if metadata.swa_page_table is not None:
+            _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
+            if is_swa:
+                return metadata.decode_sorted_swa_page_table
+        return metadata.decode_sorted_page_table
+
+    def _prepare_decode_seq_len_splits(
+        self, metadata: TRTLLMMHAMetadata
+    ) -> None:
+        """Build request ordering and sorted read metadata once per forward."""
+        if (
+            self.decode_seq_len_splits == 1
+            or metadata.is_ragged_verify
+            or metadata.cache_seqlens_int32 is None
+            or metadata.page_table is None
+        ):
+            return
+        if metadata.decode_seq_len_order is None:
+            sorted_seq_lens, order = torch.sort(metadata.cache_seqlens_int32)
+            metadata.decode_seq_len_order = order
+            metadata.decode_sorted_seq_lens = sorted_seq_lens
+            metadata.decode_sorted_page_table = metadata.page_table.index_select(
+                0, order
+            )
+        else:
+            torch.sort(
+                metadata.cache_seqlens_int32,
+                out=(
+                    metadata.decode_sorted_seq_lens,
+                    metadata.decode_seq_len_order,
+                ),
+            )
+            torch.index_select(
+                metadata.page_table,
+                0,
+                metadata.decode_seq_len_order,
+                out=metadata.decode_sorted_page_table,
+            )
+        if metadata.swa_page_table is not None:
+            if metadata.decode_sorted_swa_page_table is None:
+                metadata.decode_sorted_swa_page_table = (
+                    metadata.swa_page_table.index_select(
+                        0, metadata.decode_seq_len_order
+                    )
+                )
+            else:
+                torch.index_select(
+                    metadata.swa_page_table,
+                    0,
+                    metadata.decode_seq_len_order,
+                    out=metadata.decode_sorted_swa_page_table,
+                )
+
+    def _add_decode_split_graph_buffers(
+        self, source: dict, max_bs: int, max_num_pages: int
+    ) -> None:
+        if self.decode_seq_len_splits == 1:
+            return
+        source["decode_seq_len_order"] = torch.empty(
+            max_bs, dtype=torch.int64, device=self.device
+        )
+        source["decode_sorted_seq_lens"] = torch.empty(
+            max_bs, dtype=torch.int32, device=self.device
+        )
+        source["decode_sorted_page_table"] = torch.empty(
+            max_bs, max_num_pages, dtype=torch.int32, device=self.device
+        )
+        if self.use_sliding_window_kv_pool:
+            source["decode_sorted_swa_page_table"] = torch.empty(
+                max_bs, max_num_pages, dtype=torch.int32, device=self.device
+            )
+
+    @staticmethod
+    def _bind_decode_split_graph_buffers(
+        metadata: TRTLLMMHAMetadata, source: dict, bs: int
+    ) -> None:
+        order = source.get("decode_seq_len_order")
+        if order is None:
+            return
+        metadata.decode_seq_len_order = order[:bs]
+        metadata.decode_sorted_seq_lens = source["decode_sorted_seq_lens"][:bs]
+        metadata.decode_sorted_page_table = source[
+            "decode_sorted_page_table"
+        ][:bs, :]
+        sorted_swa = source.get("decode_sorted_swa_page_table")
+        if sorted_swa is not None:
+            metadata.decode_sorted_swa_page_table = sorted_swa[:bs, :]
+
     def _maybe_build_cp_zigzag_page_tables(
         self,
         metadata: TRTLLMMHAMetadata,
@@ -457,6 +563,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ),
             "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
         }
+        self._add_decode_split_graph_buffers(
+            self.decode_cuda_graph_metadata, max_bs, max_num_pages
+        )
 
         # SWA write-target buffer; bound as a [:num_tokens] view in
         # _build_cuda_graph_metadata and refilled by the fused metadata kernel.
@@ -512,6 +621,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ),
                 "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
             }
+            self._add_decode_split_graph_buffers(
+                self.target_verify_metadata, max_bs, max_num_pages
+            )
             if self.expand_encoder_only_verify:
                 max_verify_rows = max_bs * self.speculative_num_draft_tokens
                 self.target_verify_metadata["encoder_cache_seqlens"] = torch.zeros(
@@ -577,6 +689,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     "swa_page_table_draft_decode",
                     bs,
                 )
+                self._bind_decode_split_graph_buffers(
+                    metadata, self.decode_cuda_graph_metadata, bs
+                )
                 self.decode_cuda_graph_metadata[bs] = metadata
             else:
                 # Normal Decode
@@ -597,6 +712,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     self.decode_cuda_graph_metadata,
                     "swa_page_table",
                     bs,
+                )
+                self._bind_decode_split_graph_buffers(
+                    metadata, self.decode_cuda_graph_metadata, bs
                 )
                 self.decode_cuda_graph_metadata[bs] = metadata
         elif forward_mode.is_target_verify():
@@ -624,6 +742,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 self.target_verify_metadata,
                 "swa_page_table",
                 bs,
+            )
+            self._bind_decode_split_graph_buffers(
+                metadata, self.target_verify_metadata, bs
             )
             if self._needs_encoder_only_expand(forward_mode, metadata):
                 verify_rows = bs * metadata.max_seq_len_q
@@ -925,6 +1046,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
         )
+        if forward_batch.forward_mode.is_decode_or_idle() or (
+            forward_batch.forward_mode.is_target_verify()
+            and not self.forward_metadata.is_ragged_verify
+        ):
+            self._prepare_decode_seq_len_splits(self.forward_metadata)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
@@ -1032,6 +1158,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
         self._maybe_build_cp_zigzag_page_tables(metadata, forward_batch)
 
+        if forward_batch.forward_mode.is_decode_or_idle() or (
+            forward_batch.forward_mode.is_target_verify()
+            and not metadata.is_ragged_verify
+        ):
+            self._prepare_decode_seq_len_splits(metadata)
+
         if self._needs_encoder_only_expand(forward_batch.forward_mode, metadata):
             row_map = (
                 torch.arange(batch_size * metadata.max_seq_len_q, device=device)
@@ -1073,6 +1205,89 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     def _get_nvfp4_bmm_scales(self, layer: RadixAttention) -> tuple[float, float]:
         assert self.is_nvfp4_kvcache
         return self.kv_cache_quant_method.get_bmm_scales(layer.layer_id)
+
+    def _run_fixed_q_len_decode(
+        self,
+        query: torch.Tensor,
+        kv_cache,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        bmm1_scale,
+        bmm2_scale,
+        window_left: int,
+        sinks: Optional[torch.Tensor],
+        q_len_per_req: int = 1,
+        kv_cache_sf=None,
+        request_order: Optional[torch.Tensor] = None,
+        sorted_block_tables: Optional[torch.Tensor] = None,
+        sorted_seq_lens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run decode, optionally sorting and splitting requests by KV length."""
+
+        def run_group(group_query, group_block_tables, group_seq_lens):
+            kwargs = {}
+            if q_len_per_req != 1:
+                kwargs["q_len_per_req"] = q_len_per_req
+            return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                query=group_query,
+                kv_cache=kv_cache,
+                workspace_buffer=self.workspace_buffer,
+                block_tables=group_block_tables,
+                seq_lens=group_seq_lens,
+                max_seq_len=self.max_context_len,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                window_left=window_left,
+                sinks=sinks,
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                out_dtype=self.q_data_type,
+                kv_cache_sf=kv_cache_sf,
+                multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+                **kwargs,
+            )
+
+        num_requests = seq_lens.shape[0]
+        num_splits = min(self.decode_seq_len_splits, num_requests)
+        if num_splits == 1:
+            return run_group(query, block_tables, seq_lens)
+
+        order = request_order
+        if order is None:
+            order = torch.argsort(seq_lens)
+            sorted_block_tables = block_tables.index_select(0, order)
+            sorted_seq_lens = seq_lens.index_select(0, order)
+        else:
+            assert sorted_block_tables is not None
+            assert sorted_seq_lens is not None
+        query_by_request = query.view(
+            num_requests, q_len_per_req, query.shape[-2], query.shape[-1]
+        )
+        query_by_request = query_by_request.index_select(0, order)
+        output_by_request = torch.empty(
+            query_by_request.shape,
+            dtype=self.q_data_type,
+            device=query.device,
+        )
+        base_size, remainder = divmod(num_requests, num_splits)
+        start = 0
+        for split_index in range(num_splits):
+            end = start + base_size + (split_index < remainder)
+            indices = order[start:end]
+            group_output = run_group(
+                query_by_request[start:end].reshape(
+                    -1, query.shape[-2], query.shape[-1]
+                ),
+                sorted_block_tables[start:end],
+                sorted_seq_lens[start:end],
+            )
+            output_by_request.index_copy_(
+                0,
+                indices,
+                group_output.view(-1, q_len_per_req, query.shape[-2], query.shape[-1]),
+            )
+            start = end
+        return output_by_request.view(-1, query.shape[-2], query.shape[-1])
 
     def _get_nvfp4_decode_kv_cache(self, layer: RadixAttention) -> tuple[
         tuple[torch.Tensor, torch.Tensor],
@@ -1159,22 +1374,21 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         attention_sink = kwargs.get("sinks", None)
 
         page_table = self._get_layer_page_table(layer, forward_batch)
+        sorted_page_table = self._get_sorted_layer_page_table(layer)
 
-        o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-            query=q,
-            kv_cache=kv_cache,
-            workspace_buffer=self.workspace_buffer,
-            block_tables=page_table,
-            seq_lens=self.forward_metadata.cache_seqlens_int32,
-            max_seq_len=self.max_context_len,
+        o = self._run_fixed_q_len_decode(
+            q,
+            kv_cache,
+            page_table,
+            self.forward_metadata.cache_seqlens_int32,
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
             window_left=layer.sliding_window_size,
             sinks=attention_sink,
-            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-            out_dtype=self.q_data_type,  # model_runner.dtype
             kv_cache_sf=kv_cache_block_scales,
-            multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+            request_order=self.forward_metadata.decode_seq_len_order,
+            sorted_block_tables=sorted_page_table,
+            sorted_seq_lens=self.forward_metadata.decode_sorted_seq_lens,
         )
         if self.is_nvfp4_kvcache and o.dtype != self.q_data_type:
             o = o.to(self.q_data_type)
@@ -1326,21 +1540,20 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 )
             else:
-                o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-                    query=q,
-                    kv_cache=kv_cache,
-                    workspace_buffer=self.workspace_buffer,
-                    block_tables=page_table,
-                    seq_lens=self.forward_metadata.cache_seqlens_int32,
-                    max_seq_len=self.max_context_len,
+                sorted_page_table = self._get_sorted_layer_page_table(layer)
+                o = self._run_fixed_q_len_decode(
+                    q,
+                    kv_cache,
+                    page_table,
+                    self.forward_metadata.cache_seqlens_int32,
                     bmm1_scale=bmm1_scale,
                     bmm2_scale=bmm2_scale,
                     window_left=layer.sliding_window_size,
                     sinks=attention_sink,
-                    skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-                    out_dtype=self.q_data_type,
                     q_len_per_req=self.forward_metadata.max_seq_len_q,
-                    multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+                    request_order=self.forward_metadata.decode_seq_len_order,
+                    sorted_block_tables=sorted_page_table,
+                    sorted_seq_lens=self.forward_metadata.decode_sorted_seq_lens,
                 )
         else:
 

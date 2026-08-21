@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
-  "status": "pd_prefill_spec_verify_sizing_experiment",
-  "frozen_at": "2026-08-12T01:25:00-07:00",
+  "status": "agentx_decode_gap_v2_split_metadata_hoist",
+  "frozen_at": "2026-08-15T12:37:43-07:00",
   "model": {
     "repo": "nvidia/Qwen3.5-397B-A17B-NVFP4",
     "revision": "1dcf92e1a474ef147273a2a2d15ad5daec44edc5"
@@ -13,16 +13,66 @@
     "aga_sqsh_sha256": "87c34529c0e854e85b6075619a0f62cece4843de8bb4698f7aeaf30e0ae04c5a"
   },
   "sglang": {
-    "base_commit": "a39f7f4c291915633d3889491c5b90fa64bf6beb",
-    "experiment_commit": "0505c37ee9d1b2a9afbe17767fbd41a4afc1b249",
-    "experiment_tree": "a1b7cc3d104df9ab2a6d3390a56ab6d603a63329",
-    "patch_sha256": "ec12e52facb661d7b9bd94bcf672587d1ccf0a95db3427ad073cd577e0219ddb",
-    "change": "Do not reserve speculative TARGET_VERIFY intermediate SSM memory on a disaggregated Prefill worker because its actual HybridReqToTokenPool passes speculative_num_draft_tokens=None.",
+    "runtime_base_identity": "5be8757c0d99f83bde9f5254b1fee30b97dcf66f",
+    "change_commit": "8aa2c4360c17cfba569e0fdc156d7527e4748fb6",
+    "upstream_change_commit": "78fa0f5e8031da1f778feeec26f3a06d400bc592",
+    "patch_sha256": "a2e00dee946f16cb40e69d78c562d7493ee16b0778e3b3c70fb96f3af84ef265",
+    "change": "Prepare TRTLLM-MHA request order, sorted sequence lengths, and sorted page tables once per forward and reuse them across attention layers.",
     "targeted_validation": {
+      "clean_apply_to_runtime_copy": "pass",
       "py_compile": "pass",
-      "diff_check": "pass",
-      "cpu_unit_test": "pass: AGA CPU job 430009 targeted predicate; full module collection blocked by pre-existing source/container import mismatch",
-      "real_agentx_canary": "pending"
+      "callsite_audit": "pass: graph and eager metadata initialization are mutually exclusive and each invokes the preparation once per forward"
+    }
+  },
+  "candidate_overlay": {
+    "parent_change_commit": "8aa2c4360c17cfba569e0fdc156d7527e4748fb6",
+    "local_commit": "9bff6da59b65ae2efaee825a58da73bd2a7b19ff",
+    "file": "python/sglang/kernels/ops/attention/fla/gdn_replayssm_spec_fold.py",
+    "baseline_sha256": "fb79ad9e12ec1e485cc65e12d6394debee69fb21a14c50e1bb84a809f6a46e28",
+    "candidate_sha256": "4edb7dcc60d8bd22a4840dd2509626f47fdb9541b84cecd02c17b6c4b62dad09",
+    "change": "Reduce the raw ReplaySSM GDN fold value tile from 32 to 16; recurrence, ABI, warps and pipeline stages are unchanged.",
+    "targeted_validation": {
+      "gb300_micro_job": "3071746: pass, 3.781210 to 2.883568 ms at B53/T6/AL4.792/45 layers",
+      "correctness_job": "3071785: pass, 6 tests"
+    }
+  },
+  "verify_unroll_overlay": {
+    "parent_runtime_job": "3074223",
+    "parent_local_commit": "19932c2e9a114166beca3cb7091cd09d4bced0e5",
+    "file": "python/sglang/kernels/ops/attention/cutedsl_gdn_mtp_ring.py",
+    "baseline_sha256": "f5e8eb4af1a67288103e4b9af3c9a34c0483838baa9b559a0c55de0f71ca5ebf",
+    "candidate_sha256": "62f57ab2039d3805ca92ce507b3b6cb34b1948ffbf0de22f458bb3a15141bf14",
+    "change": "Set the production constexpr GDN verify token loop unroll factor from 1 to 2; ABI, per-token operation order, raw ring layout and raw-fold tile are unchanged.",
+    "source_evidence": {
+      "task_status_commit": "a3acbeb89b1359d6da5ff4cd5f5634ad5a811c64",
+      "gb300_micro_job": "3074240: pass, 7.003 to 5.347 ms/step at B64/T6/45 layers",
+      "bitwise_gate": "pass at B44 and B64 for output plus rawv/rawk/g/beta"
+    }
+  },
+  "prebuilt_dead_transfer_overlay": {
+    "parent_local_commit": "7db6656f0b52f1bdd693b51ac67e94b5c16d1e03",
+    "local_commit": "696e6523f15bb1a8ab37ba1d66f1cac5b20ad5f6",
+    "file": "python/sglang/srt/disaggregation/decode_schedule_batch_mixin.py",
+    "baseline_sha256": "c9bce6e98d54c415794eee6c75eeda96e168c64a8bc526c06e2f3960c01bb40a",
+    "candidate_sha256": "fd0d4e749ff1ceb60c132177120139aa3cacc77deee2c1aa064553753515611a",
+    "change": "Avoid materializing and copying the unused full-prompt input_ids tensor for PREBUILT batches; retain extend_num_tokens from the authoritative extend ranges and rebuild the first decode input from the existing relay.",
+    "targeted_validation": {
+      "gb300_micro_job": "3077282: pass, 1.688780 ms/target-step GPU-visible saving and 1.688699 ms/target-step CPU-wall saving over the 44-shape trace replay",
+      "unit_tests": "3077282: pass, 5 tests",
+      "production_pair": "3077318/3077319: pass, exact-shape TPS/User +17.976145%, strict TPS/GPU +12.735476%"
+    }
+  },
+  "query_prefill_dp_rank_overlap": {
+    "parent_local_commit": "696e6523f15bb1a8ab37ba1d66f1cac5b20ad5f6",
+    "local_commit": "a31c1e52e947bcbdd0d551c5e2323e96a9bf303b",
+    "file": "python/sglang/srt/disaggregation/decode.py",
+    "baseline_sha256": "62512bd3bed2af7027ea9428cfa0188d4c97a2cddfda6e5bc17c7b56143db0f4",
+    "candidate_sha256": "4176c594803ad5858b13ade616aa05428d27ad754836937d28711bdff93ea117",
+    "change": "Start the authoritative bootstrap room-to-DP-rank HTTP query early, then consume it at the original same-step receiver-init boundary while retaining rank, FIFO, retry, error and cleanup semantics.",
+    "targeted_validation": {
+      "gb300_replay_job": "3077510: pass, 2.704767 ms/step critical-path saving over 57 trace-derived query gaps",
+      "fake_server_cpu_tests": "3077510: pass, 6 tests",
+      "admission_feed": "57/57 same-step, 57/57 query-complete-before-init, 114/114 HTTP payloads"
     }
   },
   "srt_slurm": {
