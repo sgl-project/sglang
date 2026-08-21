@@ -110,7 +110,7 @@ def _swa_alloc(allocator, need_size):
     full_indices = allocator.full_attn_allocator.alloc(need_size)
     swa_indices = allocator.swa_attn_allocator.alloc(need_size)
     assert full_indices is not None and swa_indices is not None
-    allocator.full_to_swa_index_mapping[full_indices] = swa_indices
+    allocator.set_full_to_swa_mapping(full_indices, swa_indices)
     return full_indices
 
 
@@ -223,6 +223,53 @@ class TestSWA(unittest.TestCase):
 
         allocator.free_swa(full_indices[1:2])
         self.assertEqual(allocator.swa_available_size(), 16)
+
+    def test_swa_free_deduplicates_shared_slots(self):
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            page_size=1,
+            kv_size=16,
+            kv_size_swa=16,
+        )
+        swa_index = allocator.swa_attn_allocator.alloc(1)
+        self.assertIsNotNone(swa_index)
+        mapping_indices = torch.tensor(
+            [1, 1, 2], dtype=torch.int64, device=get_device()
+        )
+        allocator.set_full_to_swa_mapping(
+            mapping_indices, swa_index.expand_as(mapping_indices)
+        )
+
+        allocator.free_swa(mapping_indices)
+
+        self.assertEqual(allocator.swa_available_size(), allocator.size_swa)
+
+    def test_swa_free_keeps_cross_call_shared_slot_live(self):
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            page_size=1,
+            kv_size=16,
+            kv_size_swa=16,
+        )
+        swa_index = allocator.swa_attn_allocator.alloc(1)
+        self.assertIsNotNone(swa_index)
+        full_indices = torch.tensor([1, 2], dtype=torch.int64, device=get_device())
+        allocator.set_full_to_swa_mapping(
+            full_indices, swa_index.expand_as(full_indices)
+        )
+
+        allocator.free_swa(full_indices[:1])
+        self.assertEqual(allocator.swa_available_size(), allocator.size_swa - 1)
+
+        other_swa_index = allocator.swa_attn_allocator.alloc(1)
+        self.assertIsNotNone(other_swa_index)
+        self.assertNotEqual(other_swa_index[0].item(), swa_index[0].item())
+
+        allocator.free_swa(full_indices[1:])
+        self.assertEqual(allocator.swa_available_size(), allocator.size_swa - 1)
+
+        allocator.swa_attn_allocator.free(other_swa_index)
+        self.assertEqual(allocator.swa_available_size(), allocator.size_swa)
 
     def test_swa_radix_cache_1(self):
         # args
