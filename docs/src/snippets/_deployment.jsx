@@ -1652,14 +1652,23 @@ export const Deployment = ({ config, benchmarks }) => {
     );
   };
 
-  const renderFlatSection = (title, options, dim, selectedId) => (
-    <div style={s.card}>
-      <div style={s.title}>{title}</div>
-      <div style={s.itemsGrid(options.length)}>
-        {options.map((item) => renderButton(item, dim, selectedId))}
+  const renderFlatSection = (title, options, dim, selectedId) => {
+    const selected = options.find((o) => o.id === selectedId);
+    return (
+      <div style={s.card}>
+        <div style={s.title}>{title}</div>
+        <div style={s.itemsGrid(options.length)}>
+          {options.map((item) => renderButton(item, dim, selectedId))}
+        </div>
+        {selected?.href && (
+          <a href={selected.href} target="_blank" rel="noreferrer"
+             style={{ display: "inline-block", marginTop: 6, fontSize: 13 }}>
+            Model card ↗
+          </a>
+        )}
       </div>
-    </div>
-  );
+    );
+  };
 
   const maxHwCols = Math.max(...hwGroups.map((x) => x.items.length));
 

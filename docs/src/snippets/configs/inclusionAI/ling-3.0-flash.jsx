@@ -162,7 +162,11 @@ sgl-eval run gsm8k \\
       title: "Spec Decode",
       options: [
         { id: "nextn", label: "NEXTN (built-in MTP)" },
-        { id: "dspark", label: "DSPARK (draft model)" },
+        {
+          id: "dspark",
+          label: "DSPARK (draft model)",
+          href: "https://huggingface.co/inclusionAI/Ling-3.0-flash-dspark",
+        },
         { id: "off", label: "Off (greedy)" },
       ],
     },
