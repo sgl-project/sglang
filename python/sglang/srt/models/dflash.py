@@ -12,7 +12,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.speculative.dflash import selector_walk_triton
+from sglang.kernels.ops.speculative.dflash import (
+    selector_beam_walk_triton,
+    selector_walk_triton,
+)
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.activation import SiluAndMul
@@ -802,6 +805,96 @@ def _follow_maps(maps, initial_indices, edges: int):
     return torch.stack(path, dim=1)
 
 
+def _first_max_index(values: torch.Tensor) -> torch.Tensor:
+    """Index of the first maximum along the last axis.
+
+    `torch.argmax` does not promise the first occurrence and the triton walk
+    deliberately does (`tl.min(tl.where(scores == best, offsets, limit))`). Beam
+    selection compares across a flattened axis where exact ties are constructible,
+    so the reference has to spell out the same rule.
+    """
+    limit = values.shape[-1]
+    best = values.max(dim=-1, keepdim=True).values
+    offsets = torch.arange(limit, device=values.device)
+    return torch.where(values == best, offsets, limit).min(dim=-1).values
+
+
+def _beam_walk_torch(
+    *,
+    candidate_ids: torch.Tensor,
+    scores: torch.Tensor,
+    anchor_token_ids: torch.Tensor,
+    beam_width: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Device-agnostic reference for the fixed-width draft tree; see `beam_walk`.
+
+    Mirrors the triton kernel step for step -- beam_width-1 rounds of masked argmax
+    rather than `torch.topk`, and the same `flat = m * top_k + c` flattening -- so
+    the two resolve ties identically and can be compared elementwise.
+    """
+    bs, slots, top_k = candidate_ids.shape
+    width = int(beam_width)
+    device = candidate_ids.device
+    node_tokens = torch.empty((bs, 1 + slots * width), dtype=torch.int64, device=device)
+    node_parents = torch.empty_like(node_tokens)
+    node_tokens[:, 0] = anchor_token_ids
+    node_parents[:, 0] = -1
+
+    # Per-row over the successor axis: a row is the conditional distribution given
+    # its predecessor, and only that normalization makes the depth-wise sums
+    # comparable across rows. Rows are independent, so normalizing all top_k of them
+    # here and gathering width of them below matches the kernel's gather-then-
+    # normalize order elementwise.
+    log_probs = torch.log_softmax(scores.float(), dim=-1)
+
+    rows = torch.arange(bs, device=device)
+    # cum = -inf everywhere but beam 0 folds the first depth into the same loop
+    # body: only beam 0 can score, so the top-width is taken over that one row's
+    # top_k candidates and every parent is the root.
+    state = torch.zeros((bs, width), dtype=torch.int64, device=device)
+    cum = torch.full((bs, width), float("-inf"), dtype=torch.float32, device=device)
+    cum[:, 0] = 0.0
+    node = torch.zeros((bs, width), dtype=torch.int64, device=device)
+
+    for slot in range(slots):
+        base = 1 + slot * width
+        transitions = log_probs[:, slot].gather(
+            1, state[:, :, None].expand(bs, width, top_k)
+        )
+        flat = (cum[:, :, None] + transitions).reshape(bs, width * top_k)
+
+        beam_index = torch.zeros((bs, width), dtype=torch.int64, device=device)
+        candidate_index = torch.empty((bs, width), dtype=torch.int64, device=device)
+        # The spine: beam 0's own best child, parent pinned to beam 0. Reads the row
+        # rather than `flat` so it stays independent of the accumulated score, which
+        # is what keeps the spine chain equal to `sample_path`'s greedy walk.
+        candidate_index[:, 0] = _first_max_index(transitions[:, 0, :])
+
+        remaining = flat.clone()
+        # Struck from the pool, so the width picks are distinct (beam, candidate)
+        # pairs -- which is what makes same-parent sibling tokens distinct.
+        remaining[rows, candidate_index[:, 0]] = float("-inf")
+        for beam in range(1, width):
+            picked = _first_max_index(remaining)
+            beam_index[:, beam] = torch.div(picked, top_k, rounding_mode="floor")
+            candidate_index[:, beam] = picked % top_k
+            remaining[rows, picked] = float("-inf")
+
+        node_tokens[:, base : base + width] = candidate_ids[:, slot].gather(
+            1, candidate_index
+        )
+        # Parents come from the previous depth, so they are always < base: the BFS
+        # order every downstream ancestor-closure scan relies on.
+        node_parents[:, base : base + width] = node.gather(1, beam_index)
+
+        # Read `flat`, not `remaining`, whose picks have been overwritten with -inf.
+        cum = flat.gather(1, beam_index * top_k + candidate_index)
+        state = candidate_index
+        node = torch.arange(base, base + width, device=device).expand(bs, width)
+
+    return node_tokens, node_parents
+
+
 class CandidateSelector(nn.Module):
     """Scores the K x K transitions between adjacent proposal slots, then walks them.
 
@@ -922,6 +1015,47 @@ class CandidateSelector(nn.Module):
             greedy_mask[:, None, None], F.one_hot(path_indices, top_k).float(), q_rows
         )
         return tokens, q_rows
+
+    def beam_walk(
+        self,
+        *,
+        candidate_ids: torch.Tensor,
+        scores: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+        beam_width: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Expand the lattice into a fixed-width tree: [bs, 1 + slots * beam_width]
+        BFS-ordered `(node_tokens, node_parents)`, root inclusive at index 0.
+
+        Greedy only -- no `q`, so it cannot feed a rejection-sampling accept. Each
+        depth keeps `beam_width` nodes: index 0 is the spine (the previous depth's
+        spine child with the best transition, which makes the spine chain equal to
+        `sample_path`'s greedy walk and the tree a superset of it), the rest are the
+        top of the flattened `beam_width * top_k` pool with the spine struck out.
+
+        `beam_width == 1` reproduces `sample_path`'s greedy output, but the worker
+        keeps calling `sample_path` there -- this path is the tree's regression gate,
+        not its chain implementation.
+        """
+        if beam_width > self.top_k:
+            raise ValueError(
+                f"DFlash2 beam width {beam_width} exceeds the checkpoint's "
+                f"selector_top_k {self.top_k}: the first depth only has "
+                "selector_top_k candidates, so a wider beam cannot be filled."
+            )
+        if scores.is_cuda:
+            return selector_beam_walk_triton(
+                candidate_ids=candidate_ids,
+                scores=scores,
+                anchor_token_ids=anchor_token_ids,
+                beam_width=beam_width,
+            )
+        return _beam_walk_torch(
+            candidate_ids=candidate_ids,
+            scores=scores,
+            anchor_token_ids=anchor_token_ids,
+            beam_width=beam_width,
+        )
 
 
 class DFlash2DraftModel(DFlashDraftModel):
