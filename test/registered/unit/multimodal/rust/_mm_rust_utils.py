@@ -21,13 +21,13 @@ register_cpu_ci(
 
 
 def load_core():
-    """The Rust ``_core`` extension, or ``None`` (→ skip) when not built
+    """The Rust ``_multimodal`` extension, or ``None`` (→ skip) when not built
     locally. In CI a missing extension is a hard failure, never a silent
     skip — the CPU suite builds it from source."""
     try:
-        from sglang.srt.multimodal import _core
+        from sglang.srt.rust_extensions import _multimodal
 
-        return _core
+        return _multimodal
     except ImportError:
         if is_in_ci():
             raise
@@ -88,5 +88,12 @@ def image_bytes(width, height, seed=0):
     return buffer.getvalue()
 
 
-def spec_json(config, image_token_id=IMAGE_TOKEN_ID):
-    return json.dumps({"family": "qwen_vl", "image_token_id": image_token_id, **config})
+def spec_json(config, image_token_id=IMAGE_TOKEN_ID, resample="aten_u8"):
+    return json.dumps(
+        {
+            "family": "qwen_vl",
+            "image_token_id": image_token_id,
+            "resample": resample,
+            **config,
+        }
+    )

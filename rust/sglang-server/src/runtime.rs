@@ -8,6 +8,8 @@
 //!   * Detokenizer  — M pinned OS threads / shards (CPU bound), core set C
 //!   * TM ingress   — 1 thread driving the ingress FSM
 //!   * TM egress    — 1 thread draining the egress ring → detok shards
+//!   * MM workers   — K unpinned OS threads, spawned late via
+//!     [`Runtime::spawn_mm_pool`] (multimodal models only)
 //!
 //! Keeping CPU-bound tokenize/detokenize off the async executor avoids stalling
 //! axum's worker threads.
@@ -38,6 +40,18 @@ pub use runnable::Runnable;
 pub struct Runtime {
     pub ingress: IngressConsumer,
     pub egress: EgressProducer,
+    /// Requests parked in `Encoding`, drained by the MM worker pool
+    /// (`Server.start_mm_workers`). Stays empty for non-multimodal models —
+    /// ingress never routes to it.
+    pub mm: flume::Receiver<crate::message::MmRequest>,
+    /// Back-channel for the MM workers' `MmEncoded` / `MmFailed` into tm-ingress.
+    pub tm: flume::Sender<TmEvent>,
+    /// The loaded tokenizer, shared with the MM worker path (`None` under
+    /// `skip_tokenizer_init`).
+    pub tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>>,
+    /// MM results parked between a worker's `MmEncoded` and the scheduler drain
+    /// (`Server.take_mm`).
+    pub mm_sidecar: crate::mm::Sidecar,
     /// Worker join handles, joined by `request_shutdown` / `Drop`.
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// The single shutdown sender.
@@ -49,6 +63,21 @@ pub struct Runtime {
 const SHUTDOWN_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Runtime {
+    /// Spawn `workers` `mm-worker-{i}` threads into the shutdown join set —
+    /// late, once Python has built the mm spec (`Server::start_mm_workers`).
+    ///
+    /// Deliberately unpinned: the threads inherit the launch thread's affinity,
+    /// already narrowed by `RustServer.launch` to the server cores, so bursty
+    /// MM preprocessing floats over that whole set (rather than owning cores
+    /// that idle between bursts) and never preempts the scheduler's reserved
+    /// cores.
+    pub fn spawn_mm_pool(&self, workers: usize, ctx: Arc<crate::mm::Context>) {
+        let mut threads = self.threads.lock().unwrap();
+        spawn_pool("mm-worker", None, workers.max(1), &mut threads, |_| {
+            crate::mm::MmWorker::new(self.mm.clone(), self.tm.clone(), ctx.clone())
+        });
+    }
+
     /// Stop the runtime and join every worker thread (with a bounded wait).
     ///
     /// Dropping `shutdown_tx` wakes the tm-ingress/tm-egress selectors (which
@@ -107,6 +136,10 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     let (tm_tx, tm_rx) = flume::bounded::<TmEvent>(cfg.rust_server_args.channel_cap);
     let (tok_tx, tok_rx) =
         flume::bounded::<crate::message::Request>(cfg.rust_server_args.channel_cap);
+    // Encoding → MM worker pool. Bounded like the other stage edges so a slow
+    // pool back-pressures instead of buffering unboundedly.
+    let (mm_tx, mm_rx) =
+        flume::bounded::<crate::message::MmRequest>(cfg.rust_server_args.channel_cap);
     let detokenizer_worker_num = cfg.server_args.detokenizer_worker_num;
     let mut detok_tx = Vec::with_capacity(detokenizer_worker_num);
     let mut detok_rx = Vec::with_capacity(detokenizer_worker_num);
@@ -140,6 +173,14 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         cfg.server_args.revision.as_deref(),
         skip_tokenizer_init,
     )?;
+    // The `TextTokenizer` view of it, shared by the tokenizer pool and the MM
+    // worker path (which encodes the placeholder-expanded prompt itself).
+    let text_tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>> = dyn_tokenizer
+        .as_ref()
+        .map(|t| Arc::new(tokenizer::DynamoTokenizer::new(t.clone())) as _);
+
+    // Shared: MM workers park, the Python drain pops, tm-ingress purges.
+    let mm_sidecar: crate::mm::Sidecar = Default::default();
 
     // --- Detokenizer shards (pinned, CPU bound) ---
     {
@@ -168,10 +209,9 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // --- Tokenizer pool (pinned, CPU bound) ---
     // Only spawned when a real tokenizer is loaded; under `skip_tokenizer_init`
     // there is none and ingress never routes to the pool, so we skip it.
-    if let Some(t) = &dyn_tokenizer {
+    if let Some(tokenizer) = &text_tokenizer {
         // Reuse the single loaded tokenizer (shared with the detok shards).
-        let tokenizer: Arc<dyn tokenizer::TextTokenizer> =
-            Arc::new(tokenizer::DynamoTokenizer::new(t.clone()));
+        let tokenizer = tokenizer.clone();
         let tok_cores = plan.as_ref().map(|p| p.tok.clone());
         // Workers share the MPMC inbox (`tok_rx`) and the read-only backend, so
         // each gets a cheap clone of both.
@@ -220,6 +260,11 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             .map(|c| vec![c]);
         let limits = tokenizer_manager::Limits::try_from(&*cfg.server_args)
             .map_err(|e| format!("ingress limits: {e}"))?;
+        let mm = tokenizer_manager::Mm {
+            enabled: cfg.server_args.model_is_multimodal(),
+            tx: mm_tx,
+            sidecar: mm_sidecar.clone(),
+        };
         let mut parts = Some((tm_rx, ingress_tx)); // moved into the single worker
         let shutdown_rx = shutdown_rx.clone();
         spawn_pool("tm-ingress", cores, 1, &mut threads, |_| {
@@ -230,6 +275,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 senders.clone(),
                 ingress_tx,
                 limits.clone(),
+                mm.clone(),
                 shutdown_rx.clone(),
             )
         });
@@ -282,6 +328,10 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     Ok(Runtime {
         ingress: ingress_rx,
         egress: egress_tx,
+        mm: mm_rx,
+        tm: tm_tx,
+        tokenizer: text_tokenizer,
+        mm_sidecar,
         threads: Mutex::new(threads),
         shutdown_tx: Mutex::new(Some(shutdown_tx)),
     })

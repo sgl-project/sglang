@@ -159,12 +159,6 @@ fn hidden_states_rows(vals: &[f32], lens: &[u32]) -> serde_json::Value {
     serde_json::Value::Array(rows)
 }
 
-/// The `{ "error": { message, code } }` object every error path emits (an SSE
-/// event's data, a unary body, or one entry of a batch array).
-pub(super) fn error_value(code: u16, message: &str) -> serde_json::Value {
-    serde_json::json!({ "error": { "message": message, "code": code } })
-}
-
 /// Format a decoded [`ChunkEvent`] as one SGLang `/generate` frame's JSON. `rid`
 /// (response `meta_info.id`) is passed as a string; the event's numeric `rid` is
 /// just the shard routing key.

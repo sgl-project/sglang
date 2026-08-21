@@ -399,6 +399,6 @@ class RocmPlatform(Platform):
         return patched
 
     @classmethod
-    def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:
-        """ROCm performs better without DIT layerwise offload on Wan."""
+    def enable_dit_layerwise_offload_by_default(cls) -> bool:
+        """Whether automatic DiT layerwise offload is enabled on this platform."""
         return False

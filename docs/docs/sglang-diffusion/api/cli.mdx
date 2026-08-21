@@ -75,17 +75,24 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 ### Model and runtime
 
 - `--model-path {MODEL}`: model path or Hugging Face model ID
+- `--served-model-name {NAME}`: stable model name exposed by serving APIs. Defaults to `--model-id` when set, otherwise `--model-path`.
 - `--model-variant {NAME}`: semantic checkpoint variant to load when one model repository contains multiple weight partitions. The pipeline maps this stable name to the repository layout before loading; for example, MiniMax-H3 accepts `fl2va` and `ref2va`. This is a server/load-time choice, unlike a request's `task`.
+- `--minimax-h3-adaln-cache-path {FILE}`: advanced MiniMax-H3-only inference cache. It replaces the checkpoint's AdaLN projection weights with precomputed outputs and only accepts requests whose exact FP32 timestep plan is included in the cache. It requires unquantized weights and the matching model variant.
 - `--model-subfolder {PATH}`: advanced direct override for a component subfolder inside the model repository. Prefer `--model-variant` when the pipeline exposes semantic routing. If both are supplied, they must resolve to the same weight partition.
 - `--lora-path {PATH}` and `--lora-nickname {NAME}`: load a LoRA adapter
+- `--lora-weight-name {FILE}`: select one adapter file from a repository that contains multiple LoRA revisions. The Hub download is filtered to that file plus JSON metadata, so unused weights are not downloaded.
+- `--lora-alpha {N}`: supply the training alpha when a single-file adapter omits both per-layer alpha tensors and `adapter_config.json`. Do not set it when the adapter already records alpha metadata.
 - `--lora-merge-mode {auto|merge|dynamic}`: choose how LoRA is applied. `auto` statically merges regular weights and uses dynamic LoRA for FSDP-sharded weights to avoid full-gather peaks.
 - `--num-gpus {N}`: number of GPUs to use
-- `--performance-mode {manual|auto|speed|memory}` / `--mode`: preset for latency/throughput and memory defaults. `auto` is the default and keeps safe offload defaults, using FSDP only for validated DiT-offload replacement paths; `speed` also enables `--enable-torch-compile` unless the model-specific deployment config opts out or you explicitly disable it. Use `manual` to keep performance-related server args under explicit user control. Explicit offload, FSDP, and parallelism flags take precedence in all modes.
-- `--tp-size {N}`: tensor parallelism size, mainly for encoders
+- `--performance-mode {manual|auto|speed|memory}` / `--mode`: preset for latency/throughput and memory defaults. `auto` is the default and dispatches residency from selected-GPU headroom and workload type: image DiTs stay resident above the 45 GiB threshold, while video DiT placement remains model-specific. It uses FSDP only for validated DiT-offload replacement paths. `speed` keeps `torch.compile` disabled unless a model-specific deployment config opts in after validation; pass `--enable-torch-compile true` to enable it explicitly. Use `manual` to keep performance-related server args under explicit user control. Explicit offload, FSDP, and parallelism flags take precedence in all modes.
+- `--direct-gpu-weight-loading {true|false}`: opt into direct GPU loading for an unquantized, GPU-resident, TP=1 DiT by materializing its complete checkpoint state dict on GPU. Startup impact is model-dependent, so benchmark the target model before deployment. Disabled by default because checkpoint and model weights coexist temporarily, substantially increasing peak GPU memory. It is incompatible with DiT CPU/layerwise offload and FSDP.
+- `--tp-size {N}`: tensor parallelism size. Depending on the pipeline, it can shard the DiT, one or more encoders, or both.
 - `--sp-degree {N}`: sequence parallelism size
+- `--dp-size {N}` (alias `--data-parallel-size`): number of data-parallel replicas. Each replica is a full copy of the engine on `num_gpus / N` GPUs with its own ingress; generation requests round-robin across replicas, realtime sessions stick to the replica holding their state, and control operations (weights, LoRA, memory occupation, shutdown) apply to every replica. Combines with the other parallelism axes (`num_gpus = dp × cfg × tp × sp`); monolithic serving only.
 - `--ulysses-degree {N}` and `--ring-degree {N}`: USP parallelism controls
+- `--kv-gather-degree {N}`: sequence-parallel degree that splits rows inside attention and exchanges with one K/V all-gather (queries stay local) instead of Ulysses all-to-all. Non-causal attention only; does not compose with `--ulysses-degree`/`--ring-degree` yet. When no SP degree is set explicitly, `sp_degree=2` defaults to `kv_gather_degree=2` (its measured-win zone) and higher degrees default to Ulysses; under that auto assignment, attention calls the gather path cannot take fall back to the Ulysses exchange, while an explicit degree fails instead of degrading.
 - `--enable-cfg-parallel {true|false}`: enable or explicitly disable CFG parallelism
-- `--encoder-parallel {auto|fold|dp|replicate}`: how the text/image encoders use the GPUs the DiT replica leaves idle during encoding. `auto` (the default for both `generate` and `serve`) TP-folds an encoder wide enough to pay for the per-layer all-reduce, selects DP for a server batch when it can engage, and otherwise replicates; `fold` forces the shard whenever the dims allow it; `dp` splits a batched encode across ranks and needs `--batching-max-size > 1` to engage; `replicate` encodes redundantly on every rank. `fold` and `replicate` are bitwise-identical to single-GPU encoding. See [Encoder Parallelism](/docs/sglang-diffusion/encoder_parallel).
+- `--encoder-parallel {auto|fold|dp|replicate}`: how text/image encoders use the GPUs in each DiT replica. `auto` TP-folds an encoder wide enough to benefit, selects batch DP when it can engage, and otherwise keeps the existing encoder TP layout; `fold` shards across the full replica whenever dimensions allow; `dp` splits a batched encode across encoder copies and composes with encoder TP; `replicate` disables folding and batch DP. Encoder collectives never cross `--dp-size` replicas. See [Encoder Parallelism](/docs/sglang-diffusion/encoder_parallel).
 - `--warmup-mode {off|request|server}`: control startup warmup for `sglang serve`; `off` skips warmup, `request` primes the request path, and `server` runs a full synthetic server warmup before serving traffic
 - `--enable-torch-compile {true|false}`: compile native diffusion hot paths. When no warmup mode is configured, this also enables server warmup so first real requests do not pay compile latency.
 - `--offload-during-compile {true|false}`: when compile warmup is active, temporarily layerwise-offload DiT weights and move resident non-DiT components off-device so `max-autotune` fits on tighter-memory GPUs; the configured serving residency is restored before real traffic. Skipped under existing layerwise offload, Cache-DiT, or FSDP.
@@ -97,6 +104,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--srt-encoder-url {HTTPADDRESS}`: address of SGLang srt server with AR model for GLM-Image like models. See [Models with AR Stage](../models_with_ar).
 - `--srt-encoder-timeout {SECONDS}`: Timeout in seconds for HTTP requests to the SGLang encoder server
 - `--srt-encoder-connection-timeout {SECONDS}`: TCP connection timeout in seconds for SGLang encoder server
+- `--scheduler-rpc-timeout {SECONDS}`: optional end-to-end deadline for an internal scheduler RPC, including scheduler queue time. It is unset by default so valid long-running and queued video jobs are not failed by the transport layer. Set it only when the deployment requires a bounded request deadline; caller cancellation and server shutdown remain effective without it.
 - `--pe-server-url {HTTPADDRESS}`: url of SGLang server hosting the PE model (e.g., for ERNIE-Image). See [Models with Prompt Enhancement](../models_with_pe).
 
 ### Sampling and output
@@ -111,17 +119,30 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 
 For frame interpolation and upscaling, see [Post-Processing](./post_processing).
 
-### Quantized transformers
+### Quantization
 
 For quantized transformer checkpoints, prefer:
 
 - `--model-path` for the base pipeline
 - `--transformer-path` for a quantized `transformers` transformer component folder
-- `--transformer-weights-path` for a quantized safetensors file, directory, or repo
+- `--transformer-weights-path` for a quantized safetensors file, directory,
+  repo, or a supported GGUF transformer file
 - `--quantization` for online quantization (apply quantization to unquantized models at load time, activations are quantized dynamically)
 - `--quantization-ignored-layers` layer name patterns to keep unquantized (e.g. `attention.to_`)
 
-See [Quantization](../quantization) for supported quantization families and examples.
+Component checkpoint paths are selected separately, so changing DiT precision
+never silently changes prompt embeddings. For a native text encoder:
+
+- `--component-paths.text_encoder {MODEL}` replaces the text-encoder checkpoint; `--text-encoder-path {MODEL}` is its shorter alias
+- Quantization metadata is auto-detected from that checkpoint. Each native encoder must explicitly support the serialized format; this is not blanket quantization support for every component, and unsupported combinations fail before weight loading.
+
+For supported realtime causal video models, `--kv-cache-quant {off|int4|int2}`
+compresses completed KV-cache chunks independently of transformer weight
+quantization. It is lossy and disabled by default.
+
+See [Realtime and Causal Video Models](../realtime_models) for the runtime and
+model scope, and [Quantization](../quantization) for supported quantization
+families and examples.
 
 ### Request logging
 
@@ -182,24 +203,64 @@ sglang generate \
 HTTP server-only arguments are ignored by `sglang generate`.
 </Note>
 
-For supported pipelines, Cache-DiT can be enabled with `SGLANG_CACHE_DIT_ENABLED=true` or `--cache-dit-config`. See [Cache-DiT](../cache_dit).
+For supported native pipelines, set `SGLANG_CACHE_DIT_ENABLED=true` to enable Cache-DiT. For the diffusers backend, use `--backend diffusers --cache-dit-config ...`. See [Cache-DiT](../cache_dit).
 
 For supported image pipelines, breakable CUDA graph can be enabled with `--enable-breakable-cuda-graph`, but you must declare every served resolution in `--warmup-resolutions` so warmup captures matching graph signatures.
 
-### Layerwise Offload
+### Component Residency
 
-Use layerwise offload when a large component does not fit comfortably in GPU memory. By default, `--dit-layerwise-offload` only applies to legacy DiT components. Use `--layerwise-offload-components` to select pipeline component names explicitly (`--layerwise-offload-modules` is accepted as an alias):
+Use `--component-residency COMPONENT=MODE` to assign one runtime residency mode to each native pipeline component:
+
+```bash Command
+sglang generate \
+  --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+  --component-residency all=resident text_encoder=layerwise-offload vae=component-offload \
+  --prompt "A quiet city street after rain"
+```
+
+The available modes are:
+
+- `resident`: keep the complete component on the accelerator.
+- `component-offload`: keep the complete component on CPU between uses, moving it to the accelerator before each declared use and back to CPU afterward.
+- `layerwise-offload`: keep component weights on CPU and stream its declared layers during execution.
+
+Selectors match exact loaded component keys from `model_index.json`, including names such as `transformer_2`, `audio_vae`, and `connectors`. The group selectors `dit`, `text_encoder`, `image_encoder`, and `vae` are also available, together with `all`. An exact key overrides a matching group, and a group overrides `all`. Components without a matching canonical selector retain their explicit legacy setting or automatic/model default.
+
+The existing `--dit-cpu-offload`, `--text-encoder-cpu-offload`, `--image-encoder-cpu-offload`, `--vae-cpu-offload`, and `--cpu-offload-components` options remain supported. New and legacy options may be mixed: `--component-residency` wins only for components it matches, while unmatched legacy settings remain effective. Legacy layerwise selectors take precedence over legacy component-offload selectors for the same component. Explicit `--dit-layerwise-offload false` makes the DiT resident unless another explicit DiT selector, such as `--dit-cpu-offload true` or `--component-residency dit=component-offload`, selects a different mode.
+
+Layerwise selection is strict. A native weighted component selected for `layerwise-offload` must declare its layer structure; otherwise startup fails with the unsupported component name instead of silently changing modes. FSDP applies only to resident components. The Diffusers backend supports only pipeline-wide `all=resident` and `all=component-offload`.
+
+### Layerwise Offload Tuning
+
+Use layerwise offload when a component does not fit comfortably in GPU memory. The compatibility options `--dit-layerwise-offload` and `--layerwise-offload-components` remain available (`--layerwise-offload-modules` is an alias), while new deployments can select the mode directly:
 
 ```bash Command
 sglang generate \
   --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-  --dit-layerwise-offload \
-  --layerwise-offload-components transformer text_encoder \
+  --component-residency transformer=layerwise-offload text_encoder=layerwise-offload \
   --dit-offload-prefetch-size 0 \
   --prompt "A quiet city street after rain"
 ```
 
-The values must match keys in the selected pipeline's `pipeline.modules`, such as `transformer`, `text_encoder`, `image_encoder`, `vae`, `condition_image_encoder`, `spatial_upsampler`, or `vocoder`. Use `all` to select every layerwise-offloadable component. Prefer the smallest component set that solves the memory issue because layerwise offload can increase latency.
+Values passed to the compatibility option `--layerwise-offload-components` must match loaded component keys, such as `transformer`, `text_encoder`, `image_encoder`, `vae`, `condition_image_encoder`, `spatial_upsampler`, or `vocoder`. Its `default` group selects text encoders, image encoders, and VAEs. Use `all` to select every layerwise-offloadable component.
+
+Layerwise tuning options such as `--dit-offload-prefetch-size`, `--dit-layerwise-resident-layers`, and `--dit-layerwise-residency-policy` continue to control the streamed layer working set. Prefer the smallest component set that solves the memory issue because layerwise offload can increase latency.
+
+Those three set the default for every streamed component. To give one component its own values, use the `component=value` forms, which also accept JSON:
+
+```bash
+sglang serve --model-path <MODEL> \
+  --layerwise-offload-components dit,text_encoder \
+  --layerwise-prefetch-size text_encoder=2 \
+  --layerwise-resident-layers text_encoder=4 \
+  --layerwise-residency-policy text_encoder=strided
+```
+
+- `--layerwise-prefetch-size`: how many layers to fetch ahead. Fractional values are a share of the stack, `>= 1` an absolute count. Deeper prefetch overlaps more of the transfer with compute, at the cost of staging buffers.
+- `--layerwise-resident-layers`: how many layers stay on the GPU instead of being streamed. Resident layers are transferred once at startup, so they are removed from every pass. Fractional values are a share of the stack.
+- `--layerwise-residency-policy`: `leading` keeps the first layers, `strided` spreads them across the stack so the transfers do not arrive as one burst.
+
+A component without an entry keeps the group default, so adding these options changes nothing until one is set. Both knobs trade VRAM for transfer, and the return differs by component: a DiT earns it back once per denoising step, a text encoder or VAE once per request. Measure before raising either.
 
 ## Serve
 
@@ -215,6 +276,24 @@ sglang serve \
   --ring-degree 2 \
   --port 30010
 ```
+
+### Health endpoints
+
+SGLang Diffusion separates process liveness from inference readiness:
+
+| Endpoint | Success condition | Recommended use |
+| --- | --- | --- |
+| `GET /liveness` | The HTTP server is accepting requests. It remains `200` during server warmup. | Kubernetes liveness probe |
+| `GET /health` | The server is ready for normal inference traffic. It returns `503` while server-based synthetic warmup is running and `200` after it completes. | Startup and readiness probes |
+| `GET /health_generate` | Compatibility alias for `/health`. It does not currently issue a generation request in SGLang Diffusion. | Existing integrations only |
+
+`/health` gates only server-based warmup. With `--warmup-mode off` or
+`--warmup-mode request`, it returns `200` once the HTTP server starts; those modes
+do not promise that compilation or other first-request work has completed. If
+server-based warmup fails, the server terminates instead of reporting ready.
+
+Do not use `/health` as a liveness probe: a long server warmup can legitimately
+keep it at `503` for several minutes.
 
 ### Cloud Storage
 

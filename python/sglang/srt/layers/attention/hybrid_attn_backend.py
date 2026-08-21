@@ -4,7 +4,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    SharedReadEnds,
+)
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -44,6 +47,10 @@ class HybridAttnBackend(AttentionBackend):
             self.spec_attn_is_prefill and prefill_backend.needs_cpu_seq_lens
         )
         self.max_context_len = model_runner.model_config.context_len
+        # _select_backend routes EXTEND to prefill_backend unconditionally.
+        self.extend_dummy_seqs_capped_by_req_pool = getattr(
+            prefill_backend, "extend_dummy_seqs_capped_by_req_pool", False
+        )
 
     @property
     def supports_ragged_verify_graph(self) -> bool:
@@ -78,6 +85,9 @@ class HybridAttnBackend(AttentionBackend):
             )
         else:
             return self.prefill_backend
+
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        return self._select_backend(fm).shared_read_ends(fm)
 
     @property
     def supports_full_cuda_graph_chunked_prefix(self) -> bool:

@@ -10,29 +10,57 @@ framework-specific optimization workflow.
 - `python/sglang/multimodal_gen/runtime/layers/elementwise.py`
 - `python/sglang/multimodal_gen/runtime/layers/fused_scale_shift_gate.py`
 - `python/sglang/multimodal_gen/runtime/layers/rotary_embedding/utils.py`
-- `python/sglang/kernels/ops/diffusion/triton/scale_shift.py`
-- `python/sglang/kernels/ops/diffusion/group_norm_silu.py`
-- `python/sglang/kernels/ops/diffusion/triton/group_norm_silu.py`
-- `python/sglang/kernels/ops/diffusion/triton/norm.py`
-- `python/sglang/kernels/ops/diffusion/triton/rmsnorm_onepass.py`
-- `python/sglang/kernels/ops/diffusion/triton/zimage_native_norm.py`
-- `python/sglang/kernels/ops/diffusion/triton/rotary.py`
-- `python/sglang/kernels/ops/diffusion/triton/ltx2_rotary.py`
-- `python/sglang/kernels/ops/diffusion/triton/indexed_modulation.py`
-- `python/sglang/kernels/ops/diffusion/triton/ulysses_qkv.py`
-- `python/sglang/kernels/ops/diffusion/usp_relayout.py`
+- `python/sglang/kernels/ops/diffusion/modulate/scale_shift_triton.py`
+- `python/sglang/kernels/ops/diffusion/modulate/modulate_scale_shift_jit.py`
+- `python/sglang/kernels/ops/diffusion/sites/fused_ln_modulate_site.py`
+- `python/sglang/kernels/ops/diffusion/sites/quality_gate.py`
+- `python/sglang/kernels/ops/diffusion/sites/bitexact_gate.py`
+- `python/sglang/kernels/ops/diffusion/norm/group_norm_silu.py`
+- `python/sglang/kernels/ops/diffusion/norm/group_norm_silu_triton.py`
+- `python/sglang/kernels/ops/diffusion/norm/group_norm_silu_twopass_triton.py`
+- `python/sglang/kernels/ops/diffusion/norm/norm_triton.py`
+- `python/sglang/kernels/ops/diffusion/norm/rmsnorm_onepass_triton.py`
+- `python/sglang/kernels/ops/diffusion/norm/layernorm_modulate_triton.py`
+- `python/sglang/kernels/ops/diffusion/norm/native_bf16_rmsnorm_triton.py`
+- `python/sglang/kernels/ops/diffusion/norm/zimage_qk_rmsnorm_triton.py`
+- `python/sglang/kernels/ops/diffusion/rope/rotary_triton.py`
+- `python/sglang/kernels/ops/diffusion/rope/ltx2_rotary_triton.py`
+- `python/sglang/kernels/ops/diffusion/rope/ltx2_qknorm_split_rope_jit.py`
+- `python/sglang/kernels/ops/diffusion/sites/ltx2_rmsnorm_modulate_site.py`
+- `python/sglang/kernels/ops/diffusion/modulate/indexed_modulation_triton.py`
+- `python/sglang/kernels/ops/diffusion/layout/ulysses_qkv_triton.py`
+- `python/sglang/kernels/ops/diffusion/layout/usp_relayout_jit.py`
 - `python/sglang/multimodal_gen/runtime/layers/usp.py`
 - `python/sglang/multimodal_gen/runtime/models/dits/minimax_h3.py`
-- `python/sglang/kernels/ops/diffusion/residual_gate_add.py`
+- `python/sglang/multimodal_gen/runtime/models/dits/longcat_image.py`
+- `python/sglang/multimodal_gen/runtime/models/dits/sana_video.py`
+- `python/sglang/multimodal_gen/runtime/models/dits/lingbot_video_moe.py`
+- `python/sglang/multimodal_gen/runtime/models/decoders/ltx_2_5_diffusion_decoder.py`
+- `python/sglang/multimodal_gen/runtime/layers/moe.py`
+- `python/sglang/srt/layers/moe/topk.py`
+- `python/sglang/kernels/ops/diffusion/modulate/residual_gate_add_jit.py`
 - `python/sglang/kernels/jit/csrc/diffusion/residual_gate_add.cuh`
-- `python/sglang/kernels/ops/diffusion/triton/varlen_pack_pad.py`
-- `python/sglang/kernels/ops/diffusion/cutedsl/scale_residual_norm_scale_shift.py`
+- `python/sglang/kernels/ops/diffusion/layout/varlen_pack_pad_triton.py`
+- `python/sglang/kernels/ops/diffusion/layout/wan_causal_cache_triton.py`
+- `python/sglang/kernels/ops/diffusion/norm/scale_residual_norm_cutedsl.py`
+- `python/sglang/multimodal_gen/runtime/models/vaes/fast_path_gate.py`
+- `python/sglang/multimodal_gen/runtime/models/vaes/flux2_vae_cuda_opt.py`
+- `python/sglang/multimodal_gen/runtime/models/vaes/wan_vae_cuda_opt.py`
+- `python/sglang/multimodal_gen/runtime/breakable_cuda_graph/runner.py`
 - `test/registered/kernels/ops/diffusion/test_qwen_image_modulation.py`
 - `test/registered/kernels/ops/diffusion/test_group_norm_silu.py`
 - `test/registered/kernels/ops/diffusion/test_residual_gate_add.py`
 - `test/registered/kernels/ops/diffusion/test_varlen_pack_pad.py`
 - `test/registered/kernels/ops/diffusion/test_varlen_uspattn_equivalence.py`
-- `test/registered/kernels/ops/diffusion/test_zimage_native_norm.py`
+- `test/registered/kernels/ops/diffusion/test_native_bf16_rmsnorm.py`
+- `test/registered/kernels/ops/diffusion/test_flux_ln_modulate.py`
+- `test/registered/kernels/ops/diffusion/test_glm_image_ln_modulate.py`
+- `test/registered/kernels/ops/diffusion/test_sana_ln_modulate.py`
+- `test/registered/kernels/ops/diffusion/test_quality_gate.py`
+- `test/registered/kernels/ops/diffusion/test_ltx2_rms_norm_modulate.py`
+- `test/registered/kernels/ops/diffusion/test_bitexact_gate.py`
+- `test/registered/kernels/ops/diffusion/test_wan_causal_cache.py`
+- `test/registered/kernels/ops/diffusion/test_stage_profiler_sync.py`
 - `test/registered/kernels/benchmark/diffusion/bench_qwen_image_modulation.py`
 - `test/registered/kernels/benchmark/diffusion/bench_group_norm_silu.py`
 - `test/registered/kernels/benchmark/diffusion/bench_residual_gate_add.py`
@@ -60,33 +88,72 @@ framework-specific optimization workflow.
 - Constraints: `D % 256 == 0` and `D <= 8192`. `x/residual/gate/scale/shift` must pass shape and stride validation. Dtypes limited to fp16/bf16/fp32.
 - Behavior: CuTe DSL compilation cached by `(dtype, ndim, D, norm_type)`. `None` tensors replaced by scalar placeholders. If constraints fail, `layernorm.py` warns and falls back to native PyTorch.
 
-3. Z-Image bf16-native RMSNorm modulation (Triton)
-- Kernels: `zimage_rmsnorm_scale`, `zimage_rmsnorm_tanh_residual`
-- Locations: `triton/zimage_native_norm.py`, `zimage.py`
+3. Bit-exact adaLN modulation and LayerNorm + modulation
+- Kernels: `modulate_scale_shift`, `fused_layernorm_modulate`, and
+  `fused_qk_head_layernorm`.
+- Locations: `modulate_scale_shift.py`, `triton/layernorm_modulate.py`,
+  `runtime/models/dits/flux.py`, `glm_image.py`, and `sana.py`.
+- Use cases:
+  - `x * (1 + scale[:, None]) + shift[:, None]` as one JIT CUDA launch.
+  - BF16 `LayerNorm(x) * (1 + scale) + shift` as one Triton launch that
+    reproduces the active aten BF16 reduction and rounding order.
+  - GLM-Image per-head Q/K LayerNorm with the same aten-compatible reduction.
+- Constraints: the JIT modulation path requires aligned contiguous CUDA
+  fp16/bf16 BLC inputs with `[B, D]` scale/shift. The Triton LayerNorm path is
+  BF16-specific and only claims bit-exactness for its guarded aten dispatch;
+  FLUX/GLM/SANA run a live eager equality check and fail closed on mismatch.
+- Validation: `test_flux_ln_modulate.py`, `test_glm_image_ln_modulate.py`,
+  `test_sana_ln_modulate.py`, `test_modulate_scale_shift.py`, and
+  `test_fused_ln_modulate.py`.
+- Workflow rule: if these models show separate norm and modulation kernels,
+  check dtype, alignment, shape, BCG/compile context, and the one-time equality
+  self-test before proposing another fusion.
+
+4. Request-scoped `quality=high` fusion gates
+- Locations: `quality_gate.py`, `fused_ln_modulate.py`, `denoising.py`,
+  `decoding.py`, `fast_path_gate.py`, `flux2_vae_cuda_opt.py`, and
+  `wan_vae_cuda_opt.py`.
+- Behavior: `quality="lossless"` is the default exact reference path.
+  `quality="high"` may mount model-owned, validated but non-bit-exact DiT
+  fusions and decode-scoped VAE rewrites. Mounting is all-or-nothing per
+  transformer/fusion family; VAE gates reset after every decode.
+- Current families include FLUX affine-folded LN+modulate / fused GELU sites,
+  GLM-Image fused GELU sites, generic KL VAE decoder rewrites used by
+  FLUX.1/FLUX.2/Z-Image/SD3, and Wan VAE RMSNorm+SiLU.
+- Do not confuse request `--quality` with `--output-quality`, which controls
+  output-file compression rather than model math.
+- Validation: `test_quality_gate.py`, `test_fused_ln_modulate.py`,
+  `test_flux2_vae_fastpath.py`, `test_wan_vae_fastpath.py`, and
+  `test_vae_fast_path_gate.py`.
+
+5. Z-Image bf16-native RMSNorm modulation (Triton)
+- Kernels: `rmsnorm_scale`, `rmsnorm_tanh_residual`
+- Locations: `triton/native_bf16_rmsnorm.py`, with wrappers in `zimage.py` and
+  `fused_gate_rmsnorm.py`. Note: `triton/zimage_native_norm.py` is QK-only.
 - Use cases:
   - `y = rmsnorm(x) * scale`
   - `y = residual + tanh(gate) * rmsnorm(x)`
 - Constraints: CUDA bf16 tensors, contiguous weights, flattenable row strides,
   compatible modulation row counts, and `D <= 8192`.
-- Validation: `test/registered/kernels/ops/diffusion/test_zimage_native_norm.py`
+- Validation: `test/registered/kernels/ops/diffusion/test_native_bf16_rmsnorm.py`
 - Behavior: the kernels preserve Z-Image's native bf16 arithmetic. They return
   `None` when an eligibility guard fails, and the runtime wrapper executes the
   native PyTorch formula.
 
-4. Triton LayerNorm/RMSNorm fusion
+6. Triton LayerNorm/RMSNorm fusion
 - Kernels: `rms_norm_fn`, `layer_norm_fn`, `norm_infer`
 - Locations: `triton/norm.py`, `layernorm.py`
 - Use cases: fp32 RMSNorm with residual/dropout/rowscale/x1 branches, and inference-friendly `norm_infer`.
 - Constraints: last dim must be contiguous, and `N * element_size < 64KB`.
 - Validation: `test/registered/kernels/ops/layernorm/test_rmsnorm.py`.
 
-5. Triton one-pass RMSNorm (small hidden size fast path)
+7. Triton one-pass RMSNorm (small hidden size fast path)
 - Kernel: `triton_one_pass_rms_norm`
 - Locations: `triton/rmsnorm_onepass.py`, `layernorm.py`
 - Use case: `hidden_size <= 128` in `RMSNorm.forward_cuda`.
 - `torch.compile` note: keep this path behind the custom-op wrapper in `rmsnorm_onepass.py`; direct `wrap_triton` can recompile on dynamic row counts.
 
-6. Triton RoPE fusion
+8. Triton RoPE fusion
 - Kernel: `apply_rotary_embedding`
 - Locations: `triton/rotary.py`, `rotary_embedding/utils.py`
 - Use case: GPT-J style RoPE when not Neox.
@@ -94,24 +161,24 @@ framework-specific optimization workflow.
 - NPU fallback: `npu_fallback.apply_rotary_embedding_native`.
 - Validation: `test/registered/kernels/ops/attention/test_rope.py`.
 
-7. LTX2 split RoPE fusion
+9. LTX2 split RoPE fusion
 - Kernel: `apply_ltx2_split_rotary_emb`
 - Locations: `triton/ltx2_rotary.py`, `runtime/models/dits/ltx_2.py`
 - Use case: LTX-2 split rotary embedding over `[B, S, num_heads * head_dim]` with separate `cos` and `sin` tensors.
 - Constraints: `cos` and `sin` shapes must match `[B, H, S, head_dim / 2]`, and `inner_dim == H * head_dim`.
 - Workflow rule: if LTX-2 traces show a large split-RoPE PyTorch chain, check whether the LTX2-specific Triton path was disabled by shape or dtype before proposing a new RoPE kernel.
 
-8. LTX2 residual-gate add fusion
+10. LTX2 residual-gate add fusion
 - Kernel: `diffusion_residual_gate_add`
 - Locations: `diffusion/residual_gate_add.py`, `csrc/diffusion/residual_gate_add.cuh`, `runtime/models/dits/ltx_2.py`
 - Use case: `residual + update * gate` in LTX2 self-attention, prompt cross-attention, audio/video cross-attention, and feed-forward residual updates.
 - Constraints: `residual`, `update`, and `gate` must be CUDA tensors on the same device, contiguous, same dtype (`fp16`, `bf16`, or `fp32`), with `update.shape == residual.shape`; `gate` can match `residual` or be row-broadcast with the last dimension matching.
-- Behavior: `_ltx2_residual_gate_add(...)` uses the CUDA custom op while guards pass. On a runtime exception outside `torch.compile`, it logs once, disables the fast path for the process, and falls back to `residual + update * gate`.
+- Behavior: LTX2 calls `residual_gate_add(...)` from the kernels package directly. The CUDA custom op is used while guards pass. On a runtime exception outside `torch.compile`, it logs once, disables the fast path for the process, and falls back to `residual + update * gate`.
 - Validation: `test/registered/kernels/ops/diffusion/test_residual_gate_add.py`.
 - Microbench: `test/registered/kernels/benchmark/diffusion/bench_residual_gate_add.py`.
 - Workflow rule: if LTX2 traces show repeated elementwise `mul` + `add` ladders around attention or MLP residuals, check whether this existing CUDA path was disabled by shape, dtype, contiguity, or a prior runtime failure before proposing another elementwise fusion.
 
-9. MiniMax-H3 indexed AdaLN modulation and gated residual fusion
+11. MiniMax-H3 indexed AdaLN modulation and gated residual fusion
 - Kernels: `indexed_scale_shift_bf16_`, `indexed_gate_bf16_`
 - Locations: `triton/indexed_modulation.py`, `runtime/models/dits/minimax_h3.py`
 - Use cases: H3's packed video/audio/text rows select per-token modulation with `combined_indices`; the Triton paths replace `index_select` plus scale/shift or gated residual chains in place.
@@ -119,7 +186,7 @@ framework-specific optimization workflow.
 - Numerical contract: the kernels explicitly reproduce H3's eager BF16 rounding boundaries. Do not replace them with a mathematically equivalent contraction without the H3 consistency check.
 - Workflow rule: if H3 traces show `index_select` plus elementwise ladders around every block, check dtype, contiguity, and input-reuse eligibility before designing another modulation kernel.
 
-10. MiniMax-H3 packed Ulysses QKV and output relayout
+12. MiniMax-H3 packed Ulysses QKV and output relayout
 - Kernels: `pack_qkv_destination_major`, `usp_merge_heads`
 - Locations: `triton/ulysses_qkv.py`, `usp_relayout.py`, `runtime/layers/usp.py`, `runtime/models/dits/minimax_h3.py`
 - Use cases: one destination-major QKV pack plus one collective replaces three separately prepared Ulysses input exchanges; the output JIT kernel replaces `permute(...).contiguous()` when merging gathered heads.
@@ -127,7 +194,7 @@ framework-specific optimization workflow.
 - Related transport: 2-rank, peer-accessible CUDA groups can use the existing IPC A2A transport; larger or unsupported groups fall back to the normal collective path.
 - Workflow rule: if an H3 Ulysses trace has three Q/K/V preparation ladders or a large output `permute + contiguous`, first prove why these existing guards missed.
 
-11. HunyuanVideo / LTX upsampler GroupNorm + SiLU fusion
+13. HunyuanVideo / LTX upsampler GroupNorm + SiLU fusion
 - Kernel: `triton_group_norm_silu`
 - Locations: `diffusion/group_norm_silu.py`, `triton/group_norm_silu.py`, `runtime/models/vaes/hunyuanvae.py`, `runtime/models/upsampler/latent_upsampler.py`
 - Use case: `activation(group_norm(x))` when the activation is non-inplace `nn.SiLU` and the GroupNorm is affine.
@@ -135,6 +202,18 @@ framework-specific optimization workflow.
 - Constraints: CUDA inference path only; no grad, `x.requires_grad == False`, `nn.GroupNorm`, `nn.SiLU(inplace=False)`, affine norm with weight and bias. Unsupported cases fall back to native `activation(norm(x))`.
 - Validation: `test/registered/kernels/ops/diffusion/test_group_norm_silu.py`.
 - Microbench: `test/registered/kernels/benchmark/diffusion/bench_group_norm_silu.py`.
+
+14. Wan causal-VAE data-movement fusion
+- Kernels: `cat_pad_channels_last_3d` and `dup_up3d_add`.
+- Locations: `triton/wan_causal_cache.py` and
+  `runtime/models/vaes/wanvae.py`.
+- Use cases: build causal Conv3d input plus the next compact feature cache in
+  one channels-last-3D pass, and fuse `main + DupUp3D(src)` without
+  materializing `repeat_interleave + permute().contiguous()` intermediates.
+- Numerical contract: these are bit-exact data-movement / same-order-add
+  replacements and run independently of the `quality=high` Wan RMSNorm+SiLU
+  path. Unsupported layouts or padding fall back to the aten chain.
+- Validation: `test/registered/kernels/ops/diffusion/test_wan_causal_cache.py`.
 
 **Faster CUDA Kernel Usage Points**
 
@@ -176,7 +255,7 @@ framework-specific optimization workflow.
 **QK Norm + RoPE Optimization**
 
 - Entry point: `apply_qk_norm_rope` in `layernorm.py`.
-- Fast path: JIT fused inplace QK norm + RoPE from `python/sglang/kernels/ops/diffusion/qknorm_rope.py` via `fused_inplace_qknorm_rope`.
+- Fast path: JIT fused inplace QK norm + RoPE from `python/sglang/kernels/ops/diffusion/rope/qknorm_rope_jit.py` via `fused_inplace_qknorm_rope`.
 - Toggle: `SGLANG_ENABLE_FUSED_QKNORM_ROPE=1` keeps the fused path enabled by default.
 - Preconditions for fused path:
   - CUDA only.
@@ -216,19 +295,58 @@ framework-specific optimization workflow.
 - Scope: this is a mainline SANA model fast path. Query projection in cross-attention remains separate because it uses denoising hidden states, while K/V share step-invariant encoder hidden states.
 - Workflow rule: if a SANA trace shows separate self-attention `to_q`, `to_k`, `to_v` GEMMs, or separate cross-attention `to_k` and `to_v` GEMMs, treat that as a regressed existing packed-projection path before proposing a new GEMM fusion.
 
+**Recent Model Audit Boundaries**
+
+- LongCat-Image currently has split image/text QKV projections and performs
+  joint-stream `cat`/split inside each single block. Do not misclassify those
+  as a missed existing packed path; they are model-local structural
+  opportunities that need their own weight-loader and parity coverage.
+- SANA-Video already packs self QKV and cross KV. Its conv/modulation formulas
+  mirror SANA, but it does not yet call SANA's bit-exact bias-SiLU, bias-GLU,
+  residual-gate, LayerNorm-modulation, or one-time contiguous-layout helpers.
+  Reuse or extract those helpers before authoring a video-only kernel.
+- LingBot Video MoE's router implements sigmoid+bias grouped top-k in
+  `multimodal_gen/runtime/layers/moe.py`. Check parameter and output-order
+  compatibility with `srt/layers/moe/topk.py::biased_grouped_topk` before
+  writing a new router kernel.
+- LTX-2.5 reuses the mature LTX-2 DiT paths. Treat the optional diffusion
+  decoder separately: confirm NATTEN `na3d` is active, then inspect its
+  per-block 3D RoPE construction and split QKV/SwiGLU projections.
+- Cosmos3 Edge inherits the existing Cosmos3 attention-prep fusions. Profile
+  the dense squared-ReLU MLP before proposing another Cosmos kernel, and do not
+  repeat the closed experimental Cosmos BCG direction without solving its
+  model-state lifecycle problem.
+
 **Common Entry Points in Diffusion Models**
 - AdaLN modulation: `LayerNormScaleShift`, `RMSNormScaleShift`, `ScaleResidual*` in `layernorm.py`.
+- Bit-exact adaLN modulation / LayerNorm folding: `modulate_scale_shift` and
+  `fused_layernorm_modulate` through `flux.py`, `glm_image.py`, and `sana.py`.
+- Request-scoped high-quality acceleration: `QualityGatedFusion` in
+  `quality_gate.py`, `_maybe_toggle_quality_fusions` in `denoising.py`, and
+  `use_vae_fast_path` in `decoding.py`.
+- Bit-exact first-sight verify/disable: `BitExactFusionGate` in
+  `bitexact_gate.py`, used by FLUX / GLM / Sana / Ernie fused norm sites.
 - Qwen-Image gating: `fuse_layernorm_scale_shift_gate_select01_kernel` and `fuse_residual_layernorm_scale_shift_gate_select01_kernel` through `fused_scale_shift_gate.py` and `qwen_image.py`.
-- Z-Image native norm modulation: `zimage_rmsnorm_scale` and
-  `zimage_rmsnorm_tanh_mul_add` in `zimage.py`, backed by
-  `triton/zimage_native_norm.py`.
+- Z-Image native norm modulation: `rmsnorm_scale` and `rmsnorm_tanh_residual`
+  in `triton/native_bf16_rmsnorm.py`, with wrappers in `zimage.py` /
+  `fused_gate_rmsnorm.py`. `zimage_native_norm.py` is QK-only.
 - HunyuanVideo VAE and LTX upsampler GroupNorm+SiLU: `apply_group_norm_silu` in `hunyuanvae.py` and `latent_upsampler.py`; default-eligible when wrapper guards pass.
 - MiniMax-H3 indexed modulation: `_modulate_scale_shift` and `_modulate_gate` in `minimax_h3.py`, backed by `triton/indexed_modulation.py`.
 - MiniMax-H3 Ulysses relayout: `_usp_input_all_to_all_packed_qkv` and `usp_merge_heads` through `runtime/layers/usp.py`.
 - QK norm: `apply_qk_norm` used in `flux.py`, `flux_2.py`, `qwen_image.py`, `zimage.py`, `wanvideo.py`, `ltx_2.py`, `hunyuanvideo.py`.
 - QK norm + RoPE: `apply_qk_norm_rope` in `layernorm.py`; use this path when the model wants fused attention prep instead of separate QK norm and RoPE calls.
 - LTX2 split RoPE: `apply_ltx2_split_rotary_emb` in `ltx_2.py`.
-- LTX2 residual-gate add: `_ltx2_residual_gate_add` in `ltx_2.py` wraps the CUDA `diffusion_residual_gate_add` custom op for attention, cross-attention, and MLP residual updates.
+- LTX2 RMSNorm+modulate and FFN GELU epilogue under `quality="high"`:
+  `mark_ltx2_rms_norm_modulate_site` / `fused_ltx2_rms_norm_modulate` in
+  `kernels/ops/diffusion/sites/ltx2_rmsnorm_modulate_site.py` (mount-based
+  `QualityGatedFusion`, not a first-sight `BitExactFusionGate` — the fused
+  kernel is <=1 ULP off aten, so it is request-gated instead of verified),
+  wired at the six `LTX2TransformerBlock` adaLN sites in `ltx_2.py`.
+- LTX2 residual-gate add: `ltx_2.py` calls `residual_gate_add` from
+  `kernels/ops/diffusion/modulate/residual_gate_add_jit.py` directly for attention,
+  cross-attention, and MLP residual updates.
+- Wan causal VAE: `cat_pad_channels_last_3d` and `dup_up3d_add` in
+  `wanvae.py`, backed by `triton/wan_causal_cache.py`.
 - Varlen USP attention: `fused_pack_qkv` and `fused_scatter_to_padded` in `attention/layer.py`.
 - SANA packed projections: `to_qkv` and `to_kv` in `sana.py`.
 - Nunchaku fused GELU MLP: `_fused_gelu_mlp` in `flux.py` for quantized FLUX-family checkpoints.
@@ -238,10 +356,21 @@ framework-specific optimization workflow.
 **Existing Overlap / Communication Families**
 
 - Ulysses / USP attention: treat `all_to_all`, `ring_attn`, and head / sequence reshards as an existing distributed attention family, not a new overlap idea.
+- Cross-node SP: current server args support `--nnodes`, `--node-rank`, and
+  `--dist-init-addr`. Prefer node-local Ulysses multiplied by cross-node Ring;
+  keep encoders replicated and verify each model's Ring admission before
+  treating cross-node transport as a new framework gap.
 - MiniMax-H3 TP AdaLN: the DiT stacks every block's TP-local AdaLN projection and performs one batched all-gather before the block loop when `_can_batch_block_adaln()` passes. One all-gather per block indicates that this existing batching path missed.
 - MiniMax-H3 final projections: H3 removes dead text/padding rows before the final TP column gathers and combines video/audio for the SP row gather. Preserve that ordering when optimizing output communication.
 - Turbo-layer async all-to-all: `all_to_all_single(..., async_op=True)` plus staged waits already form an existing overlap family in `turbo_layer.py`.
 - TorchInductor compute / communication reorder: `torch._inductor.config.reorder_for_compute_comm_overlap = True` can already partially overlap compiled denoise traces.
+- Breakable CUDA graph: `runtime/breakable_cuda_graph/runner.py` captures
+  fixed-resolution DiT segments around eager attention/collectives for
+  supported pipelines. It is mutually exclusive with `torch.compile` and
+  Cache-DiT. The model's default resolution is captured automatically; put
+  every additional served resolution in `--warmup-resolutions`, and use
+  `--bcg-text-buckets` for prompt signatures. Check this path before proposing
+  a second graph-capture mechanism for launch-bound traces.
 - Dual-stream diffusion models: `use_dual_stream = True` in models such as `hunyuan3d.py` is an existing overlap family.
 - Workflow rule: if a hotspot is communication-heavy, rule out these in-repo overlap families before proposing a brand new overlap design.
 
@@ -261,6 +390,9 @@ relying on any file path, flag, or claim about whether the work has merged.
   - #20429 Qwen-Image layernorm and `fuse_scale_shift_gate_select01` work.
   - #20530 MOVA fused RMSNorm + interleaved RoPE.
   - #29361 LTX2 residual-gate CUDA fast path for `residual + update * gate`.
+  - #34172 LTX2 quality-high fusion; #34305/#34314 Ideogram eager fusions.
+  - #34584 Wan TI2V modulation/RoPE; #34616 FLUX2; #34617 Hunyuan;
+    #34619 GLM; #34620 ERNIE; #34928 SANA; #34932 Cosmos3.
 - VAE and decode-side acceleration:
   - #22531 LTX2 parallel VAE support and #20927 batched tiled VAE decode (draft).
 - Attention, communication, and runtime scheduling:
@@ -275,9 +407,15 @@ relying on any file path, flag, or claim about whether the work has merged.
   - #20447 TeaCache support for GLM-Image, Qwen-Image, and related models.
   - #19516 Qwen-Image CUDA Graph.
   - #21912 Z-Image Turbo FP8 full quantization and CUDA Graph.
+  - #34174 automatic default-resolution BCG warmup; #34210 Z-Image BCG
+    correctness; #34929 LTX2.3 BCG. #34618 is a closed Cosmos BCG experiment,
+    not a reusable mainline fast path.
 
 **Constraints and Fallbacks**
 - `scale_shift` Triton requires CUDA + contiguous `x`. NPU swaps to native.
+- Bit-exact BF16 LayerNorm+modulate requires the guarded aten-compatible shape
+  and a successful live equality check; `quality=high` affine folding is a
+  separate non-bit-exact path.
 - CuTe DSL fused norms require `D % 256 == 0` and `D <= 8192`.
 - Triton norm kernels error on feature size >= 64KB.
 - FlashAttention requires fp16/bf16 and SM80+; otherwise SDPA.

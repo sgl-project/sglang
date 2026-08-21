@@ -37,6 +37,9 @@ python3 "$ENV_PY" check-write-access >/dev/null
 
 export HF_TOKEN=<your_hf_token>  # required for gated repos such as black-forest-labs/FLUX.*
 export FLASHINFER_DISABLE_VERSION_CHECK=1
+# Required for correctly attributed stage-level denoise/decode timings. The
+# checked-in benchmark helper sets this by default unless you explicitly set 0.
+export SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1
 # Leave CUDA_VISIBLE_DEVICES unset to let the preset helper select the number
 # of idle GPUs it requires. For manual runs, set --count to that command's
 # exact --num-gpus value.
@@ -83,6 +86,8 @@ Environment notes:
 - all commands below assume you are inside the configured diffusion container shell
 - export `HF_TOKEN` before any gated Hugging Face model run
 - export `FLASHINFER_DISABLE_VERSION_CHECK=1` before any benchmark or profiler run
+- keep `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1` for stage-level comparisons;
+  without it, asynchronous GPU work can be charged to a later stage
 - re-run `print-idle-gpus` before each perf command if GPU availability may have changed
 - keep benchmark commands within 4 GPUs or fewer
 
@@ -130,15 +135,31 @@ PYTHONPATH=python python3 "$BENCH_PY" \
   --output-dir "${BENCH_DIR}"
 ```
 
-Keep `torch.compile` off when the task requires it:
+The helper defaults to eager. Add `--torch-compile` only for a labeled compile
+control. `--no-torch-compile` remains accepted for compatibility but is no
+longer required.
+
+The helper sets `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1` for accurate stage
+attribution. Set it to `0` explicitly only when collecting an e2e-only run and
+do not compare its per-stage values with synchronized results.
+
+For downloaded checkpoints, isolate and clean the model cache after the preset
+finishes. Cleanup also runs after an error or interruption, and appends a JSONL
+record with pre/post byte and weight-file counts:
 
 ```bash
+MODEL_CACHE_ROOT=/path/to/task-owned/model-caches
 PYTHONPATH=python python3 "$BENCH_PY" \
-  --model flux \
+  --model longcat-image \
   --label baseline \
   --output-dir "${BENCH_DIR}" \
-  --no-torch-compile
+  --model-cache-root "${MODEL_CACHE_ROOT}" \
+  --cleanup-model-cache
 ```
+
+The helper refuses to reuse an existing per-run cache directory and never
+redirects `SGLANG_CACHE_DIR`, so compiled kernel caches remain separate. Never
+point this option at a shared Hugging Face or ModelScope cache.
 
 Run the `LTX-2.3` one-stage skill preset:
 
@@ -168,7 +189,7 @@ PYTHONPATH=python python3 "$BENCH_PY" \
 ```
 
 Run the current-source MiniMax-H3 T2VA preset. The helper forces eager mode
-for this model even when its global compile default is enabled:
+for this model even when `--torch-compile` is requested:
 
 ```bash
 export CUDA_VISIBLE_DEVICES=$(python3 "$ENV_PY" print-idle-gpus --count 4)
@@ -206,8 +227,8 @@ Use the preset categories this way:
 
 | Preset | Model | Nightly | Notes |
 | --- | --- | --- | --- |
-| `flux` | `black-forest-labs/FLUX.1-dev` | Yes: `flux1_dev_t2i_1024` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2, `--dit-layerwise-offload false`; no explicit steps/guidance override |
-| `flux2` | `black-forest-labs/FLUX.2-dev` | Yes: `flux2_dev_t2i_1024` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2, `--dit-layerwise-offload false`; no explicit steps/guidance override |
+| `flux` | `black-forest-labs/FLUX.1-dev` | Yes: `flux1_dev_t2i_1024` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2, resident DiT; no explicit steps/guidance override |
+| `flux2` | `black-forest-labs/FLUX.2-dev` | Yes: `flux2_dev_t2i_1024` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2, resident DiT; no explicit steps/guidance override |
 | `qwen` | `Qwen/Qwen-Image-2512` | Yes: `qwen_image_2512_t2i_1024` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2; no explicit steps/guidance override |
 | `qwen-edit` | `Qwen/Qwen-Image-Edit-2511` | Yes: `qwen_image_edit_2511` | Uses the nightly cat image and edit prompt, 2 GPUs, TP size 2 |
 | `zimage` | `Tongyi-MAI/Z-Image-Turbo` | Yes: `zimage_turbo_t2i_1024` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2; no explicit steps/guidance override |
@@ -217,7 +238,14 @@ Use the preset categories this way:
 | `ideogram4-fp8` | `ideogram-ai/ideogram-4-fp8` | Yes: `ideogram4_fp8_t2i_2gpu` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2, FlashAttention backend; sampling preset owns steps/guidance |
 | `cosmos3-super-t2v` | `nvidia/Cosmos3-Super` | Yes: `cosmos3_super_t2v_2gpu` | Prompt, 1280x720, 81 frames, seed 42, 2 GPUs, TP size 2, guardrails disabled for benchmark isolation |
 | `wan-i2v` | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Yes: `wan22_i2v_a14b_720p` | Nightly cat image and motion prompt, 1280x720, 81 frames, 4 GPUs, CFG parallel, Ulysses degree 2, text encoder CPU offload and pinned CPU memory |
-| `minimax-h3-t2va` | `MiniMaxAI/MiniMax-H3` | No | Current-source H3 FL2VA-partition T2VA baseline: 1344x768 resolved canvas, 5 seconds / 124 frames at 24 fps, 50 joint video-audio steps, 4 GPUs, TP2 + Ulysses2, eager BF16/FP32. The helper writes H3's `task`, `conditions`, `target`, and audio/video flow shifts to a generated config. |
+| `minimax-h3-t2va` | `MiniMaxAI/MiniMax-H3` | Yes: `minimax_h3_t2va_5s` | H3 FL2VA-partition T2VA baseline: 1344x768 resolved canvas, 5 seconds / 124 frames at 24 fps, 50 joint video-audio steps, 4 GPUs, TP2 + Ulysses2, eager BF16/FP32. The helper writes H3's request contract to a generated config. |
+| `longcat-image` | `meituan-longcat/LongCat-Image` | No | Eager DiT baseline at 1024x1024, 50 steps, guidance 4.5; prompt rewrite is disabled so Qwen2.5-VL does not contaminate the DiT A/B. |
+| `sana-video` | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` | No | CI-sized eager T2V baseline: 832x480, 17 frames, 8 steps, guidance 6.0. |
+| `lingbot-video-moe` | `robbyant/lingbot-video-moe-30b-a3b` | No | One-GPU eager baseline using the CI structured-JSON caption, 384x640, 17 frames, 12 steps, and text-encoder CPU offload. |
+| `cosmos3-edge-t2i` | `nvidia/Cosmos3-Edge` | No | One-GPU eager T2I baseline at Edge's native 640x640 shape, 35 steps, guidance 7.0. |
+| `cosmos3-super-t2i-distilled` | `nvidia/Cosmos3-Super-Text2Image-4Step` | No | Four-GPU eager distilled T2I baseline. The checkpoint owns its fixed sigma schedule; the preset does not override the step count. |
+| `ltx25` | `Lightricks/LTX-2.5-Diffusers` | No | One-stage distilled eager baseline at 960x544, 121 frames, 8 steps, guidance 1.0. |
+| `ltx25-diffusion-decoder` | `Lightricks/LTX-2.5-Diffusers` | No | Same fixed DiT workload with `--use-diffusion-decoder`; attribute decoder time separately and confirm NATTEN `na3d` is active. |
 | `ltx2` | `Lightricks/LTX-2` | No | Current-source two-stage LTX-2 preset with 2 GPUs, CFG parallel, 768x512, 121 frames |
 | `qwen-image` | `Qwen/Qwen-Image` | No | Current-source extra covering the base Qwen-Image native path, separate from the nightly `Qwen-Image-2512` case |
 | `qwen-edit-2509` | `Qwen/Qwen-Image-Edit-2509` | No | Current-source extra for the pre-2511 edit-plus path; uses the cat image, 1024x1024 |
@@ -292,7 +320,7 @@ sglang generate \
   --prompt="At night, while their owner sleeps in a bedroom, three cats march in loudly playing tiny brass instruments, then abruptly file out." \
   --seed=1101 --num-gpus=4 --tp-size=2 --ulysses-degree=2 \
   --performance-mode=speed --enable-torch-compile=false \
-  --save-output --warmup \
+  --save-output --warmup-mode request \
   --perf-dump-path="${BENCH_DIR}/minimax-h3-t2va-baseline.json"
 ```
 
@@ -344,7 +372,7 @@ sglang generate \
   --width=768 --height=512 \
   --num-frames=121 \
   --seed=42 --num-gpus=2 --enable-cfg-parallel \
-  --save-output --enable-torch-compile --warmup
+  --save-output --enable-torch-compile --warmup-mode request
 ```
 
 `LTX2TwoStagePipeline` is a native path. The spatial upsampler and distilled
@@ -361,7 +389,7 @@ sglang generate \
   --width=768 --height=512 \
   --num-frames=121 \
   --seed=42 --num-gpus=2 --cfg-parallel-size=2 \
-  --save-output --enable-torch-compile --warmup
+  --save-output --enable-torch-compile --warmup-mode request
 ```
 
 This matches the nightly comparison case `ltx2.3_twostage_ti2v_2gpus`.
@@ -377,7 +405,7 @@ sglang generate \
   --num-frames=121 --fps=24 \
   --num-inference-steps=30 --guidance-scale=3.0 \
   --seed=1234 --num-gpus=2 \
-  --save-output --enable-torch-compile --warmup
+  --save-output --enable-torch-compile --warmup-mode request
 ```
 
 Use this when you want the native `LTX2Pipeline` baseline for `LTX-2.3` at the
@@ -395,7 +423,7 @@ sglang generate \
   --num-frames=121 --fps=24 \
   --num-inference-steps=30 --guidance-scale=3.0 \
   --seed=1234 --num-gpus=2 \
-  --save-output --enable-torch-compile --warmup
+  --save-output --enable-torch-compile --warmup-mode request
 ```
 
 This matches the skill-only `ltx23-two-stage` preset. Use it as a
@@ -413,7 +441,7 @@ sglang generate \
   --num-inference-steps=40 --guidance-scale=4.0 \
   --num-gpus=2 --enable-cfg-parallel --ulysses-degree=1 \
   --dit-layerwise-offload false --dit-cpu-offload false \
-  --save-output --enable-torch-compile --warmup
+  --save-output --enable-torch-compile --warmup-mode request
 ```
 
 ### Manual command example: FireRed Image Edit
@@ -428,7 +456,7 @@ sglang generate \
   --num-inference-steps=40 --guidance-scale=4.0 \
   --num-gpus=2 --enable-cfg-parallel --ulysses-degree=1 \
   --dit-layerwise-offload false --dit-cpu-offload false \
-  --save-output --enable-torch-compile --warmup
+  --save-output --enable-torch-compile --warmup-mode request
 ```
 
 Use `FireRedTeam/FireRed-Image-Edit-1.0` in the same command when comparing the
@@ -453,7 +481,7 @@ sglang generate \
   --config="${CONFIG_DIR}/hunyuan3d-shape.json" \
   --num-inference-steps=50 --guidance-scale=5.0 \
   --dit-layerwise-offload false --dit-cpu-offload false \
-  --save-output --enable-torch-compile --warmup
+  --save-output --enable-torch-compile --warmup-mode request
 ```
 
 For Hunyuan3D, compare the denoise stage separately from mesh export and paint
@@ -473,7 +501,7 @@ sglang generate \
   --seed=42 --save-output \
   --num-gpus=4 --enable-cfg-parallel --ulysses-degree=2 \
   --text-encoder-cpu-offload --pin-cpu-memory \
-  --warmup --enable-torch-compile
+  --warmup-mode request --enable-torch-compile
 ```
 
 `Wan2.2-I2V-A14B` uses the 720p max-area config by default, and explicit
@@ -485,7 +513,7 @@ reference-image aspect ratio.
 For every benchmark run, write a perf dump JSON:
 
 ```bash
-sglang generate ... --warmup --perf-dump-path "${BENCH_DIR}/<result>.json"
+sglang generate ... --warmup-mode request --perf-dump-path "${BENCH_DIR}/<result>.json"
 ```
 
 Before/after comparison:
@@ -500,9 +528,16 @@ Always keep:
 - denoise latency
 - end-to-end latency
 - peak GPU memory
-- exact command line, model shape, dtype, and GPU topology
+- exact command line, model shape, dtype, request `quality`, GPU topology, and
+  whether synchronized stage profiling was enabled
 
 Never keep a perf dump produced after a diffusers-backend fallback.
+
+Stage durations are host wall times around asynchronous GPU launches unless
+`SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1`. Without the sync, queued denoise
+work can leak into the next blocking stage and inflate `DecodingStage` by 2-3x.
+Use synchronized dumps for denoise/decode attribution and keep the setting
+identical in every before/after pair.
 
 ## `torch.profiler` Workflow
 
@@ -542,7 +577,7 @@ sglang generate \
   --model-path=black-forest-labs/FLUX.1-dev \
   --prompt="A futuristic cyberpunk city at night" \
   --width=1024 --height=1024 --num-inference-steps=50 \
-  --seed=42 --enable-torch-compile --warmup \
+  --seed=42 --enable-torch-compile --warmup-mode request \
   --profile
 ```
 
@@ -603,10 +638,14 @@ the known mainline families.
 | --- | --- |
 | `fused_inplace_qknorm_rope` missing, but separate qk norm plus rope show up | Check whether the fused diffusion `QK norm + RoPE` path should have engaged |
 | `to_q -> to_k -> to_v` on NVFP4 or Nunchaku FLUX-family checkpoints | Treat as a packed-QKV fast-path miss or checkpoint-format mismatch |
-| `zimage_rmsnorm_scale` or `zimage_rmsnorm_tanh_residual` missing on Z-Image | Check the bf16-native Triton eligibility guards before proposing a new fusion |
+| `rmsnorm_scale` or `rmsnorm_tanh_residual` missing on Z-Image | Check the bf16-native Triton eligibility guards before proposing a new fusion |
+| FLUX.1, GLM-Image, or SANA shows separate LayerNorm plus adaLN elementwise kernels | Check the bit-exact `modulate_scale_shift` and `fused_layernorm_modulate` guards/self-test before proposing another norm fusion |
+| `quality=high` shows the same FLUX/GLM DiT or FLUX-family/Wan VAE chain as `lossless` | Check whether the request-scoped quality gate mounted and whether every site passed its all-or-nothing compatibility checks |
 | LTX-2 split RoPE appears as a long PyTorch elementwise chain | Check the `apply_ltx2_split_rotary_emb` Triton path and its shape guards |
+| Wan decode is dominated by causal `cat + pad + contiguous`, feature-cache copies, or `repeat_interleave + permute + add` | Check the bit-exact Wan causal-cache and DupUp3D data-movement kernels before writing a new decoder kernel |
 | masked attention spends time packing/unpacking Q/K/V | Check whether fused varlen USP pack/scatter should have engaged |
 | `all_to_all`, ring attention, or async A2A dominate | Classify against Ulysses, USP, or turbo-layer overlap first |
+| Fixed-resolution image/video traces show many small launch gaps | Check supported breakable CUDA graph capture, declared warmup resolutions, and text buckets before adding a new graph mechanism |
 | H3 shows separate indexed gather + scale/shift, QK norm + RoPE, or three Q/K/V Ulysses relayouts | Check H3's indexed-modulation, fused QK-norm+RoPE, packed Ulysses-QKV, and USP relayout guards before writing a new kernel |
 | H3 TP traces show one AdaLN collective per block | Check the batched TP AdaLN projection/all-gather path in `minimax_h3.py` before attempting communication overlap |
 | split `fc1 -> gelu -> quant -> fc2.lora_down` on Nunchaku FLUX | Treat as a missing fused GELU MLP path |
@@ -633,8 +672,10 @@ This skill intentionally stops here. It tells you whether you are looking at:
 
 - [ ] fixed-shape baseline perf dump saved
 - [ ] fixed-shape new perf dump saved
+- [ ] request `quality` and `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING` match
 - [ ] `compare_perf.py` table generated
 - [ ] one representative `torch.profiler` trace saved
 - [ ] hotspot classified against `existing-fast-paths.md`
 - [ ] reference image or video checked for correctness
+- [ ] task-owned checkpoint cache cleaned and ledger shows zero residual weight files
 - [ ] any remaining kernel work handed off with perf/profile evidence attached

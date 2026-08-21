@@ -18,7 +18,7 @@ use axum::response::Response;
 use serde_json::json;
 use tower::util::ServiceExt;
 
-use super::routes;
+use super::{openai_error, routes};
 use crate::ids::Rid;
 use crate::message::{ChunkEvent, EgressItem};
 use crate::runtime::ServerArgs;
@@ -157,13 +157,13 @@ pub(super) async fn body_json(response: Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
-/// The common StatusCode→error helper follows `pre_submit_error`'s shape:
+/// The common StatusCode→error helper follows `error_response`'s shape:
 /// unary requests get the JSON error with its status; a committed stream gets
 /// 200 + one SSE error frame + `[DONE]`, and the frame carries the OpenAI
 /// error fields (`type`, `param`, `code`) that the SDKs dispatch on.
 #[tokio::test]
 async fn openai_error_response_covers_unary_and_sse() {
-    let unary = super::openai_error_response(StatusCode::BAD_REQUEST, "bad input", false);
+    let unary = openai_error(StatusCode::BAD_REQUEST, "bad input", false);
     assert_eq!(unary.status(), StatusCode::BAD_REQUEST);
     let value = body_json(unary).await;
     assert_eq!(value["error"]["message"], "bad input");
@@ -171,7 +171,7 @@ async fn openai_error_response_covers_unary_and_sse() {
     assert_eq!(value["error"]["code"], 400);
     assert!(value["error"]["param"].is_null());
 
-    let streamed = super::openai_error_response(StatusCode::BAD_REQUEST, "bad input", true);
+    let streamed = openai_error(StatusCode::BAD_REQUEST, "bad input", true);
     assert_eq!(streamed.status(), StatusCode::OK);
     let bytes = axum::body::to_bytes(streamed.into_body(), 64 * 1024)
         .await
@@ -290,7 +290,7 @@ async fn basic_openai_router_excludes_responses_api() {
 
 /// A closed tm inbox with a *streaming* request must answer inside the
 /// committed stream: 200 + one OpenAI-shaped SSE error frame + `[DONE]` (the
-/// same rule `pre_submit_error` applies to the native API), not a unary 503.
+/// same `error_response` rule the native API applies), not a unary 503.
 #[tokio::test]
 async fn streaming_submit_failure_answers_inside_the_stream() {
     let app = routes().with_state(app_state(senders_closed()));
