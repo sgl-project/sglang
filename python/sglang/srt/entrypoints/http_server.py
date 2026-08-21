@@ -671,10 +671,9 @@ async def health_generate(request: Request) -> Response:
     # Diagnostic only: allow an external E2E driver to establish a balanced
     # DP16 batch instead of letting the router's singleton health request
     # create the [1, 0, ..., 0] idle-rank case first.
-    if (
-        os.getenv("SGLANG_DIAG_BYPASS_HEALTH_GENERATE", "0") == "1"
-        and request.url.path in ("/health", "/health_generate")
-    ):
+    if os.getenv(
+        "SGLANG_DIAG_BYPASS_HEALTH_GENERATE", "0"
+    ) == "1" and request.url.path in ("/health", "/health_generate"):
         return Response(status_code=200)
 
     if (

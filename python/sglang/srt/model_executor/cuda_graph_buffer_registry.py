@@ -959,9 +959,10 @@ def build_prefill_registry(
                 reg.register_slot(
                     GraphSlot(
                         name=f"pp_proxy_tensors.{_key}",
-                        shape_fn=lambda _bs, mt, _tail=tuple(
-                            _backing.shape[1:]
-                        ): (mt, *_tail),
+                        shape_fn=lambda _bs, mt, _tail=tuple(_backing.shape[1:]): (
+                            mt,
+                            *_tail,
+                        ),
                         dtype=_backing.dtype,
                         axis="tokens",
                         padding_policy=PaddingPolicy.ZERO,

@@ -318,10 +318,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_dtype = running_state["hidden_states_dtype"]
         hidden_states_shape = running_state["hidden_states_shape"]
         m_indices = runner_input.m_indices
-        trace_deepep_v2_contig = (
-            os.environ.get("SGLANG_DEEPEP_V2_TRACE_CONTIG") == "1"
-            and running_state.get("deepep_v2_expanded", False)
-        )
+        trace_deepep_v2_contig = os.environ.get(
+            "SGLANG_DEEPEP_V2_TRACE_CONTIG"
+        ) == "1" and running_state.get("deepep_v2_expanded", False)
 
         N = quant_info.w13_weight.size(1)
         K = hidden_states_shape[1]
@@ -356,9 +355,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 "DeepEP v2 expanded contig runner enter: hidden=%s scale=%s "
                 "m_indices=%s",
                 tuple(hidden_states.shape),
-                None
-                if hidden_states_scale is None
-                else tuple(hidden_states_scale.shape),
+                (
+                    None
+                    if hidden_states_scale is None
+                    else tuple(hidden_states_scale.shape)
+                ),
                 m_indices.detach().cpu().tolist(),
             )
             torch.cuda.synchronize()
@@ -617,18 +618,18 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         w2_scale = quant_info.w2_scale
 
         hidden_states_device = running_state["hidden_states_device"]
-        trace_deepep_v2_masked = (
-            os.environ.get("SGLANG_DEEPEP_V2_TRACE_MASKED") == "1"
-        )
+        trace_deepep_v2_masked = os.environ.get("SGLANG_DEEPEP_V2_TRACE_MASKED") == "1"
         if trace_deepep_v2_masked:
             logger.warning(
                 "DeepEP v2 masked runner enter: hidden=%s hidden_stride=%s "
                 "scale=%s scale_stride=%s masked_m=%s expected_m=%s",
                 tuple(hidden_states.shape),
                 hidden_states.stride(),
-                None
-                if hidden_states_scale is None
-                else tuple(hidden_states_scale.shape),
+                (
+                    None
+                    if hidden_states_scale is None
+                    else tuple(hidden_states_scale.shape)
+                ),
                 None if hidden_states_scale is None else hidden_states_scale.stride(),
                 masked_m.detach().cpu().tolist(),
                 expected_m,
@@ -1643,12 +1644,16 @@ def pre_permute_deepep_v2_to_deep_gemm(
                     "scale=%s scale_stride=%s psum=%s max_m=%s align=%s",
                     tuple(hidden_states.shape),
                     hidden_states.stride(),
-                    None
-                    if hidden_states_scale is None
-                    else tuple(hidden_states_scale.shape),
-                    None
-                    if hidden_states_scale is None
-                    else hidden_states_scale.stride(),
+                    (
+                        None
+                        if hidden_states_scale is None
+                        else tuple(hidden_states_scale.shape)
+                    ),
+                    (
+                        None
+                        if hidden_states_scale is None
+                        else hidden_states_scale.stride()
+                    ),
                     psum_num_recv_tokens_per_expert.detach().cpu().tolist(),
                     deepep_v2_masked_max_m,
                     deepep_v2_expert_alignment,
@@ -1806,10 +1811,9 @@ def post_permute_deep_gemm_to_deepep_v2(
     if running_state.get("deepep_v2_expanded", False):
         hidden_states = runner_output.hidden_states
         topk_weights = running_state["topk_weights"]
-        trace_deepep_v2_contig = (
-            os.environ.get("SGLANG_DEEPEP_V2_TRACE_CONTIG") == "1"
-            and not running_state.get("deepep_v2_masked", False)
-        )
+        trace_deepep_v2_contig = os.environ.get(
+            "SGLANG_DEEPEP_V2_TRACE_CONTIG"
+        ) == "1" and not running_state.get("deepep_v2_masked", False)
         if trace_deepep_v2_contig:
             torch.cuda.synchronize()
             logger.warning(

@@ -390,9 +390,7 @@ def _fused_qkvzba_causal_conv1d_update_contiguous_kernel(
     # exactly PAD_SLOT_ID, but this extra bound prevents malformed/stale graph
     # metadata from turning an indexed state update into an OOB access.
     valid_slot = (
-        (state_slot != PAD_SLOT_ID)
-        & (state_slot >= 0)
-        & (state_slot < NUM_STATE_SLOTS)
+        (state_slot != PAD_SLOT_ID) & (state_slot >= 0) & (state_slot < NUM_STATE_SLOTS)
     )
     state_base = (
         conv_state + state_slot * stride_state_batch + dim_idx * stride_state_dim

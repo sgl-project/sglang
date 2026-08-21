@@ -86,10 +86,7 @@ def _trace_e2e_logits(stage: str, **fields) -> None:
         return
     try:
         parallel = get_parallel()
-        rank = (
-            f"dp={parallel.attn_dp_rank} "
-            f"tp={parallel.tp_rank}"
-        )
+        rank = f"dp={parallel.attn_dp_rank} " f"tp={parallel.tp_rank}"
     except Exception:
         rank = "rank=unknown"
     details = " ".join(f"{key}={value}" for key, value in fields.items())
@@ -778,7 +775,9 @@ class LogitsProcessor(nn.Module):
 
         used_tp_lm_head_all_to_all = False
         if self.do_tensor_parallel_all_gather:
-            _trace_e2e_logits("tp_logits_gather_enter", logits_shape=tuple(logits.shape))
+            _trace_e2e_logits(
+                "tp_logits_gather_enter", logits_shape=tuple(logits.shape)
+            )
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
             elif self._can_use_tp_lm_head_all_to_all(
@@ -788,7 +787,9 @@ class LogitsProcessor(nn.Module):
                 used_tp_lm_head_all_to_all = True
             else:
                 logits = self._logits_gatherer(logits)
-            _trace_e2e_logits("tp_logits_gather_returned", logits_shape=tuple(logits.shape))
+            _trace_e2e_logits(
+                "tp_logits_gather_returned", logits_shape=tuple(logits.shape)
+            )
 
         if not used_tp_lm_head_all_to_all:
             _trace_e2e_logits(

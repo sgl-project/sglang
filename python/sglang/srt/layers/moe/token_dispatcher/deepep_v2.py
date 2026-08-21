@@ -338,9 +338,7 @@ class _DeepEPv2Impl:
         # prefill/extend -> non-expanded contiguous layout. This decouples the
         # masked-GEMM + CUDA-graph decode fast path from the comm mode, so it is
         # available under multi-node `hybrid` too.
-        force_expand_prefill = (
-            os.environ.get("SGLANG_DEEPEP_V2_EXPAND_PREFILL") == "1"
-        )
+        force_expand_prefill = os.environ.get("SGLANG_DEEPEP_V2_EXPAND_PREFILL") == "1"
         use_expand_layout = self.capability.use_expanded_layout and (
             force_expand_prefill or not get_is_extend_in_batch()
         )
@@ -353,8 +351,7 @@ class _DeepEPv2Impl:
         use_masked = use_expand_layout and not get_is_extend_in_batch()
         if (
             use_masked
-            and hidden_states.shape[0]
-            > self.masked_num_max_dispatch_tokens_per_rank
+            and hidden_states.shape[0] > self.masked_num_max_dispatch_tokens_per_rank
         ):
             raise ValueError(
                 "DeepEP v2 masked decode input exceeds the per-rank slab "
@@ -392,17 +389,13 @@ class _DeepEPv2Impl:
         # the non-expanded exact-count path.  Keying this off `not use_masked`
         # incorrectly pads expanded-prefill ranks and routes every dummy to
         # global experts 0..topk-1, creating a large artificial hotspot on EP0.
-        self._pad_empty_combine = (
-            not use_expand_layout and hidden_states.shape[0] == 0
-        )
+        self._pad_empty_combine = not use_expand_layout and hidden_states.shape[0] == 0
         if self._pad_empty_combine:
             empty_pad_tokens = int(
                 os.environ.get("SGLANG_DEEPEP_V2_EMPTY_PAD_TOKENS", "1")
             )
             if empty_pad_tokens < 1:
-                raise ValueError(
-                    "SGLANG_DEEPEP_V2_EMPTY_PAD_TOKENS must be at least 1"
-                )
+                raise ValueError("SGLANG_DEEPEP_V2_EMPTY_PAD_TOKENS must be at least 1")
             hidden_states = hidden_states.new_zeros(
                 (empty_pad_tokens, hidden_states.shape[-1])
             )
@@ -410,9 +403,14 @@ class _DeepEPv2Impl:
             # all-zero -> expert 0 repeated) fault the dispatch kernel. Route the
             # dummy to experts [0, 1, ..., topk-1] with zero weights so it
             # contributes nothing even before combine_b slices it off.
-            topk_ids = torch.arange(
-                topk_ids.shape[-1], dtype=topk_ids.dtype, device=topk_ids.device
-            ).unsqueeze(0).expand(empty_pad_tokens, -1).contiguous()
+            topk_ids = (
+                torch.arange(
+                    topk_ids.shape[-1], dtype=topk_ids.dtype, device=topk_ids.device
+                )
+                .unsqueeze(0)
+                .expand(empty_pad_tokens, -1)
+                .contiguous()
+            )
             topk_weights = topk_weights.new_zeros(
                 (empty_pad_tokens, topk_weights.shape[-1])
             )
@@ -431,9 +429,7 @@ class _DeepEPv2Impl:
         # subset nondeterministic, so this diagnostic can reproduce the same
         # payload shape on a fixed suffix of ranks while keeping all collective
         # arguments and tensor shapes identical.
-        dummy_rank_from = int(
-            os.environ.get("SGLANG_DEEPEP_V2_DUMMY_RANK_FROM", "-1")
-        )
+        dummy_rank_from = int(os.environ.get("SGLANG_DEEPEP_V2_DUMMY_RANK_FROM", "-1"))
         if (
             self._dispatch_seq == 1
             and dummy_rank_from >= 0
@@ -480,9 +476,7 @@ class _DeepEPv2Impl:
                 + token_offsets * self.router_topk
                 + expert_offsets
             ) % self.num_experts
-            topk_weights = torch.full_like(
-                topk_weights, 1.0 / self.router_topk
-            )
+            topk_weights = torch.full_like(topk_weights, 1.0 / self.router_topk)
             if trace_dispatch:
                 logger.warning(
                     "DeepEP v2 synthesized real route: ep_rank=%s seq=%s tokens=%s",
@@ -541,8 +535,7 @@ class _DeepEPv2Impl:
                         "row_in_row_out",
                     }:
                         raise ValueError(
-                            "Invalid SGLANG_DEEPEP_V2_FP8_LAYOUT_AB="
-                            f"{layout_ab}"
+                            "Invalid SGLANG_DEEPEP_V2_FP8_LAYOUT_AB=" f"{layout_ab}"
                         )
                     if layout_ab.startswith("row_in_"):
                         dispatch_x = (dispatch_x[0], dispatch_x[1].contiguous())
@@ -700,9 +693,7 @@ class _DeepEPv2Impl:
             # (MAX_LEN / SUM_LEN / skewed). Using the local batch for the slab
             # would be unsafe: under skewed SUM_LEN decode another rank's larger
             # batch could overflow this rank's slab.
-            masked_max_m = (
-                self.masked_num_max_dispatch_tokens_per_rank * ep_group_size
-            )
+            masked_max_m = self.masked_num_max_dispatch_tokens_per_rank * ep_group_size
             total_expanded = recv_hidden_states.shape[0]
 
         return DeepEPv2DispatchOutput(

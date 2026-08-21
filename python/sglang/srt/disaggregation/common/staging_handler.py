@@ -9,8 +9,8 @@ protocol code is at the bottom.
 from __future__ import annotations
 
 import dataclasses
-import struct
 import logging
+import struct
 import threading
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple

@@ -1243,9 +1243,7 @@ class TestBuildPrefillRegistry(unittest.TestCase):
             tuple(buffers.pp_proxy_tensors["hidden_states"].shape), (16, 8)
         )
         self.assertEqual(tuple(buffers.pp_proxy_tensors["residual"].shape), (16, 8))
-        self.assertEqual(
-            tuple(buffers.pp_proxy_tensors["topk_indices"].shape), (16, 3)
-        )
+        self.assertEqual(tuple(buffers.pp_proxy_tensors["topk_indices"].shape), (16, 3))
 
     def test_source_none_owns_allocated_buffers(self):
         # source=None -> the registry allocates (owns) every slot.

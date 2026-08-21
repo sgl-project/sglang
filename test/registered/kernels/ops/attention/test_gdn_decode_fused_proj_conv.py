@@ -7,6 +7,7 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_causal_conv1d_update_contiguous,
     fused_qkvzba_split_reshape_cat_contiguous,
 )
+
 # This is also the update implementation imported directly by GDNBackend on
 # CUDA; the presence of the optional sgl_kernel AOT extension does not reroute
 # GDN decode through srt.layers.attention.mamba.causal_conv1d.
@@ -319,12 +320,8 @@ class TestGDNDecodeFusedProjectionConv1D(unittest.TestCase):
         torch.manual_seed(29)
         batch = 4
         qkv_dim, v_dim, num_v_heads, head_v_dim = 128, 64, 2, 32
-        qkvz = torch.randn(
-            batch, qkv_dim + v_dim, device="cuda", dtype=torch.bfloat16
-        )
-        ba = torch.randn(
-            batch, 2 * num_v_heads, device="cuda", dtype=torch.bfloat16
-        )
+        qkvz = torch.randn(batch, qkv_dim + v_dim, device="cuda", dtype=torch.bfloat16)
+        ba = torch.randn(batch, 2 * num_v_heads, device="cuda", dtype=torch.bfloat16)
         weight = torch.randn(qkv_dim, 4, device="cuda", dtype=torch.bfloat16)
         state = torch.randn(3, qkv_dim, 3, device="cuda", dtype=torch.bfloat16)
         # -1 is the expected padding sentinel; -2 and len(state) exercise the

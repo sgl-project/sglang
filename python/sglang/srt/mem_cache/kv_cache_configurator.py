@@ -185,6 +185,7 @@ def _pp_local_per_request_bytes(
     )
     return total_bytes // len(layer_ids) * local_layer_count
 
+
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.mem_cache.unified_memory_pool import (

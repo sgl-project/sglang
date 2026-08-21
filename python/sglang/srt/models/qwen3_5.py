@@ -1682,9 +1682,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         # model's own GemmaRMSNorm gamma. Preserve the sam/dev native-final-norm
         # diagnostic path for the ordinary (non-deferred) case.
         trace_final_norm = os.getenv("SGLANG_TRACE_QWEN35_FINAL_NORM", "0") == "1"
-        use_native_final_norm = (
-            os.getenv("SGLANG_QWEN35_NATIVE_FINAL_NORM", "0") == "1"
-        )
+        use_native_final_norm = os.getenv("SGLANG_QWEN35_NATIVE_FINAL_NORM", "0") == "1"
         is_deferred_finalize = False
         if self.flashinfer_mnnvl_cutedsl_fusion is not None:
             from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
