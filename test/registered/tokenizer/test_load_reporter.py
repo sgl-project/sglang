@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import socket
 import subprocess
 import threading
@@ -409,6 +410,18 @@ class TestLoadReporterStandaloneGrpc(CustomTestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        try:
+            from smg_grpc_servicer.sglang.server import serve_grpc
+        except ImportError as exc:
+            raise unittest.SkipTest(
+                f"compatible optional smg-grpc-servicer is unavailable: {exc}"
+            ) from exc
+
+        if "on_request_manager_ready" not in inspect.signature(serve_grpc).parameters:
+            raise unittest.SkipTest(
+                "smg-grpc-servicer lacks on_request_manager_ready support"
+            )
+
         cls.host = "127.0.0.1"
         cls.smg_port = get_free_port()
         cls.sidecar_port = get_free_port()
