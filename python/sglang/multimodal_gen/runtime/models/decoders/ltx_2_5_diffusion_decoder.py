@@ -17,6 +17,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    can_use_ltx25_decoder_rope,
+    fused_ltx25_decoder_rope,
+    tensors_equal,
+)
 from sglang.multimodal_gen.configs.models.decoders.ltx_2_5_diffusion_decoder import (
     LTX25DiffusionDecoderConfig,
 )
@@ -152,6 +158,12 @@ def _unpatchify(x: torch.Tensor, patch_size: int) -> torch.Tensor:
 _BLOCK_MASK_CACHE: dict = {}
 _BLOCK_MASK_CACHE_MAX = 16
 
+# These tables are tiny and shared by every attention block at the same decoder
+# grid. Without this cache, each Q and K rotation rebuilds them independently.
+_ROPE_TABLE_CACHE: dict[tuple, tuple[tuple[torch.Tensor, torch.Tensor], ...]] = {}
+_ROPE_TABLE_CACHE_MAX = 16
+_LTX25_DECODER_ROPE = BitExactFusionGate("LTX-2.5 decoder fused RoPE")
+
 
 def _neighborhood_block_mask(
     num_frames: int,
@@ -232,15 +244,47 @@ class LTX2VideoVaeRotaryPosEmbed3D(nn.Module):
         self.rope_dim_split = (dim_t, dim_hw, dim_hw)
         self.base = base
 
-    def _inv_freqs(self, dim: int, device: torch.device) -> torch.Tensor:
+    def _axis_tables(
+        self, length: int, dim: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         exponents = torch.arange(0, dim, 2, dtype=torch.float64, device=device) / dim
-        return (1.0 / self.base**exponents).to(torch.float32)
+        inv_freqs = (1.0 / self.base**exponents).to(torch.float32)
+        positions = torch.arange(length, dtype=torch.float32, device=device)
+        angles = positions[:, None] * inv_freqs[None, :]
+        return angles.cos(), angles.sin()
+
+    def _tables(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        num_frames, height, width = hidden_states.shape[1:4]
+        cache_key = (
+            num_frames,
+            height,
+            width,
+            self.rope_dim_split,
+            self.base,
+            hidden_states.device,
+        )
+        cached = _ROPE_TABLE_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        tables = tuple(
+            self._axis_tables(length, dim, hidden_states.device)
+            for length, dim in zip(
+                (num_frames, height, width), self.rope_dim_split, strict=True
+            )
+        )
+        if len(_ROPE_TABLE_CACHE) >= _ROPE_TABLE_CACHE_MAX:
+            _ROPE_TABLE_CACHE.pop(next(iter(_ROPE_TABLE_CACHE)))
+        _ROPE_TABLE_CACHE[cache_key] = tables
+        return tables
 
     def _rotate_axis(
         self,
         x: torch.Tensor,
-        positions: torch.Tensor,
-        inv_freqs: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
         axis: int,
     ) -> torch.Tensor:
         out_dtype = x.dtype
@@ -248,35 +292,71 @@ class LTX2VideoVaeRotaryPosEmbed3D(nn.Module):
         even = pairs[..., 0].float()
         odd = pairs[..., 1].float()
         # Broadcast over (B, T, H, W, heads, dim // 2), varying only along `axis`.
-        shape = [1, 1, 1, 1, 1, inv_freqs.shape[0]]
-        shape[axis] = positions.shape[0]
-        angles = (positions[:, None] * inv_freqs[None, :]).reshape(shape)
-        cos, sin = angles.cos(), angles.sin()
+        shape = [1, 1, 1, 1, 1, cos.shape[1]]
+        shape[axis] = cos.shape[0]
+        cos = cos.reshape(shape)
+        sin = sin.reshape(shape)
         rotated = torch.stack([even * cos - odd * sin, even * sin + odd * cos], dim=-1)
         return rotated.reshape(x.shape).to(out_dtype)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """`hidden_states`: `(B, T, H, W, heads, head_dim)`."""
+    def _apply_rope(
+        self,
+        hidden_states: torch.Tensor,
+        tables: tuple[tuple[torch.Tensor, torch.Tensor], ...],
+    ) -> torch.Tensor:
         dim_t, dim_h, _ = self.rope_dim_split
-        num_frames, height, width = hidden_states.shape[1:4]
-        device = hidden_states.device
-        inv_t, inv_h, inv_w = (
-            self._inv_freqs(dim, device) for dim in self.rope_dim_split
-        )
-
-        positions_t = torch.arange(num_frames, dtype=torch.float32, device=device)
-        positions_h = torch.arange(height, dtype=torch.float32, device=device)
-        positions_w = torch.arange(width, dtype=torch.float32, device=device)
-        rotated_t = self._rotate_axis(
-            hidden_states[..., :dim_t], positions_t, inv_t, axis=1
-        )
+        rotated_t = self._rotate_axis(hidden_states[..., :dim_t], *tables[0], axis=1)
         rotated_h = self._rotate_axis(
-            hidden_states[..., dim_t : dim_t + dim_h], positions_h, inv_h, axis=2
+            hidden_states[..., dim_t : dim_t + dim_h], *tables[1], axis=2
         )
         rotated_w = self._rotate_axis(
-            hidden_states[..., dim_t + dim_h :], positions_w, inv_w, axis=3
+            hidden_states[..., dim_t + dim_h :], *tables[2], axis=3
         )
         return torch.cat([rotated_t, rotated_h, rotated_w], dim=-1)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """`hidden_states`: `(B, T, H, W, heads, head_dim)`."""
+        return self._apply_rope(hidden_states, self._tables(hidden_states))
+
+    def forward_pair(
+        self, query: torch.Tensor, key: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rotate Q/K together, with a bit-exact eager fallback."""
+        tables = self._tables(query)
+        verified = _LTX25_DECODER_ROPE.verified
+        if (
+            not _LTX25_DECODER_ROPE.disabled
+            and can_use_ltx25_decoder_rope(query, key, tables, self.rope_dim_split)
+            and (verified or _LTX25_DECODER_ROPE.can_attempt_once())
+        ):
+            dim_t, dim_h, _ = self.rope_dim_split
+            try:
+                fused = fused_ltx25_decoder_rope(
+                    query,
+                    key,
+                    *tables[0],
+                    *tables[1],
+                    *tables[2],
+                    dim_t,
+                    dim_h,
+                )
+            except Exception as exc:
+                _LTX25_DECODER_ROPE.on_exception(exc, logger=logger)
+            else:
+                if verified:
+                    return fused
+                eager = self._apply_rope(query, tables), self._apply_rope(key, tables)
+                return _LTX25_DECODER_ROPE.accept_or_fallback(
+                    fused,
+                    eager,
+                    equal=tensors_equal,
+                    logger=logger,
+                    mismatch_msg=(
+                        "LTX-2.5 decoder fused RoPE is not bit-exact on this "
+                        "platform; falling back to eager"
+                    ),
+                )
+        return self._apply_rope(query, tables), self._apply_rope(key, tables)
 
 
 class LTX2VideoVaeNeighborhoodAttention(nn.Module):
@@ -322,7 +402,8 @@ class LTX2VideoVaeNeighborhoodAttention(nn.Module):
         query = self.norm_q(query)
         key = self.norm_k(key)
         query = query * self.scale
-        return self.rope(query), self.rope(key), value
+        query, key = self.rope.forward_pair(query, key)
+        return query, key, value
 
     def build_block_mask(self, hidden_states: torch.Tensor):
         """The window mask for this grid, or `None` when NATTEN handles it.
