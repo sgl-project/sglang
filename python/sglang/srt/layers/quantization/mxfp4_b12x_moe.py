@@ -183,8 +183,32 @@ def _prepare_weights(*, w13, s13, w2, s2, ones, num_experts, hidden_size, interm
 
 
 def _plan_scratch(*, experts, top_k, device, swiglu_limit, counts):
-    """Frozen scratch plan. Returns (plan, scratch)."""
+    """One frozen scratch plan + arena shared by every expert layer.
+
+    Every expert layer presents identical caps, so one plan and one arena
+    serve them all (per-layer arenas once wasted ~12 GB here; bind is a pure
+    view mapping over the arena, so sharing is allocation- and state-free).
+    The weight-plan identity check in bind passes across layers because
+    MoEWeightPreparationPlan is a tensor-free frozen dataclass with value
+    equality.
+    """
     from b12x.moe import fused_moe
+
+    from sglang.srt.runtime_context import get_resources
+
+    fingerprint = (
+        int(top_k),
+        tuple(counts),
+        None if swiglu_limit is None else float(swiglu_limit),
+        int(experts.num_experts),
+        int(experts.hidden_size),
+        int(experts.intermediate_size),
+    )
+    buffers = get_resources().buffers
+    key = f"b12x:moe_plan:{device}"
+    cached = buffers.get(key)
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1], cached[2]
 
     caps = fused_moe.Caps(
         max_tokens=max(counts),
@@ -204,6 +228,7 @@ def _plan_scratch(*, experts, top_k, device, swiglu_limit, counts):
     if len(specs) != 1 or specs[0].dtype != torch.uint8:
         raise RuntimeError(f"unexpected b12x scratch specs: {specs}")
     scratch = torch.empty(int(specs[0].shape[0]), dtype=torch.uint8, device=device)
+    buffers[key] = (fingerprint, plan, scratch)
     return plan, scratch
 
 
