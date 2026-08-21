@@ -4,7 +4,9 @@ python3 -m sglang.test.run_eval --port 30000 --eval-name mmlu --num-examples 10
 """
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import statistics
 import subprocess
@@ -20,6 +22,98 @@ from sglang.test.simple_eval_common import (
     make_report,
     set_ulimit,
 )
+
+
+def validate_per_example_evidence_args(args) -> None:
+    output = getattr(args, "per_example_output", None)
+    private_responses = getattr(args, "per_example_private_responses", None)
+    if private_responses and not output:
+        raise ValueError(
+            "--per-example-private-responses requires --per-example-output"
+        )
+    if not output:
+        return
+    if args.eval_name != "gpqa":
+        raise ValueError("per-example evidence is currently supported only for GPQA")
+    if getattr(args, "repeat", 1) != 1:
+        raise ValueError("per-example evidence requires --repeat 1")
+    for value in (output, private_responses):
+        if value and Path(value).exists():
+            raise FileExistsError(
+                f"refusing to overwrite per-example evidence: {value}"
+            )
+
+
+def write_per_example_evidence(
+    *,
+    result,
+    metrics: dict,
+    eval_name: str,
+    model: str,
+    output_path: str,
+    private_responses_path: str | None = None,
+) -> None:
+    if not result.examples:
+        raise ValueError(f"{eval_name} did not produce per-example evidence")
+    if len(result.examples) != len(result.convos):
+        raise ValueError("per-example evidence and conversations are misaligned")
+    question_ids = [example["question_id"] for example in result.examples]
+    if len(question_ids) != len(set(question_ids)):
+        raise ValueError("per-example evidence contains duplicate question IDs")
+    example_score = sum(bool(example["correct"]) for example in result.examples) / len(
+        result.examples
+    )
+    if "score" not in metrics or not math.isclose(
+        example_score, float(metrics["score"]), abs_tol=1e-12
+    ):
+        raise ValueError(
+            f"summary score {metrics.get('score')} does not match examples {example_score}"
+        )
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "eval_name": eval_name,
+        "model": model,
+        "summary": metrics,
+        "examples": result.examples,
+    }
+    with output.open("x") as destination:
+        json.dump(payload, destination, indent=2, sort_keys=True)
+        destination.write("\n")
+    output.chmod(0o444)
+    print(f"Writing per-example evidence to {output}")
+
+    if private_responses_path is None:
+        return
+    private_output = Path(private_responses_path)
+    private_output.parent.mkdir(parents=True, exist_ok=True)
+    private_fd = os.open(
+        private_output,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+    with os.fdopen(private_fd, "w") as destination:
+        for example, convo in zip(result.examples, result.convos, strict=True):
+            response = convo[-1].get("content") or ""
+            response_sha256 = hashlib.sha256(response.encode()).hexdigest()
+            if response_sha256 != example["response_sha256"]:
+                raise ValueError(f"response hash mismatch for {example['question_id']}")
+            destination.write(
+                json.dumps(
+                    {
+                        "question_id": example["question_id"],
+                        "response": response,
+                        "response_sha256": response_sha256,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+    private_output.chmod(0o600)
+    print(f"Writing private per-example responses to {private_output}")
 
 
 def get_thinking_kwargs(args):
@@ -239,6 +333,7 @@ def run_eval(args):
     # Lazy import to avoid circular dependency with test_utils
     from sglang.test.test_utils import dump_metric
 
+    validate_per_example_evidence_args(args)
     set_ulimit()
 
     if "OPENAI_API_KEY" not in os.environ:
@@ -437,6 +532,17 @@ def run_eval(args):
         f.write(json.dumps(metrics, indent=2))
     print(f"Writing results to {result_filename}")
 
+    per_example_output = getattr(args, "per_example_output", None)
+    if per_example_output:
+        write_per_example_evidence(
+            result=result,
+            metrics=metrics,
+            eval_name=args.eval_name,
+            model=sampler.model,
+            output_path=per_example_output,
+            private_responses_path=getattr(args, "per_example_private_responses", None),
+        )
+
     if getattr(args, "return_latency", False):
         return metrics, latency
     return metrics
@@ -494,6 +600,16 @@ if __name__ == "__main__":
         help="JSON object string for chat_template_kwargs, e.g. '{\"enable_thinking\": true}'",
     )
     parser.add_argument("--reasoning-effort", type=str)
+    parser.add_argument(
+        "--per-example-output",
+        type=str,
+        help="Write GPQA hashes, parsed answers, and correctness without raw responses",
+    )
+    parser.add_argument(
+        "--per-example-private-responses",
+        type=str,
+        help="Explicitly write raw GPQA responses to a mode-0600 JSONL file",
+    )
     parser.add_argument(
         "--thinking-mode",
         default=None,

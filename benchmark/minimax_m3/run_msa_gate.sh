@@ -43,6 +43,7 @@ python -m sglang.test.run_eval \
   --model "${MODEL}" \
   --eval-name gpqa \
   --gpqa-data-path "${GPQA_DATASET}" \
+  --per-example-output "${OUTPUT_DIR}/gpqa_per_example.json" \
   --num-examples 198 \
   --num-threads "${NUM_THREADS}" \
   --max-tokens 8192 \
