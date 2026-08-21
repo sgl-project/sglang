@@ -60,6 +60,11 @@ class TestAsyncDynamicbatchTokenizer:
 
             return MockBatchEncoding(result)
 
+        # Stand in for a fast HF tokenizer (batched __call__ returning a
+        # BatchEncoding). is_fast=True keeps it on the __call__ path; the slow
+        # encode() routing is covered by the registered unit test instead.
+        mock_encode.is_fast = True
+
         # Return the function directly - the AsyncDynamicbatchTokenizer will call it
         return mock_encode
 
@@ -193,6 +198,8 @@ class TestAsyncDynamicbatchTokenizer:
         # Create a new async tokenizer with a failing tokenizer
         def failing_tokenizer(*args, **kwargs):
             raise ValueError("Tokenizer error")
+
+        failing_tokenizer.is_fast = True  # exercise the __call__ path, not encode()
 
         async_tokenizer = AsyncDynamicbatchTokenizer(
             tokenizer=failing_tokenizer, max_batch_size=4, batch_wait_timeout_s=0.01
