@@ -34,12 +34,26 @@ class DFlashVerifyInput(SpecInput):
     draft_token: torch.Tensor
     positions: torch.Tensor
     draft_token_num: int
-    # Kept for compatibility with attention backends that gate tree metadata by `topk > 1`.
-    # DFLASH verify is linear (non-tree), so this is always 1.
-    topk: int = 1
+    # Beam width kept per draft depth: 1 = linear chain, > 1 = tree verify. Required (no
+    # default) so every construction site states which shape it is building -- attention
+    # backends gate tree metadata on `topk > 1` and a forgotten site would silently verify a
+    # tree as a chain. DSPARK reuses this class and always passes 1.
+    topk: int
+    # Longest root-to-leaf chain, i.e. the DFLASH draft block width. Bounds `accept_index`,
+    # whose outer accept loop silently truncates the accepted path if it is too narrow.
+    # Defaults to `draft_token_num`, which is exact for any chain (topk == 1); tree callers
+    # must pass it, since there the verify width 1 + (block_size - 1) * topk is wider.
+    block_size: Optional[int] = None
     # Custom attention "allow mask" for TARGET_VERIFY in backends that require it.
     # Semantics follow SGLang speculative conventions: True means the (q, k) pair is allowed.
     custom_mask: torch.Tensor | None = None
+    # Left-child / right-sibling encoding of the draft tree, plus the flat node index, in the
+    # layout `reconstruct_indices_from_tree_mask` writes and `verify_tree_greedy` walks. None
+    # for chain verify. Declared here rather than alongside their producer because the GDN
+    # backend reads `spec_info.retrieve_next_token` as a bare attribute as soon as topk > 1.
+    retrieve_index: Optional[torch.Tensor] = None
+    retrieve_next_token: Optional[torch.Tensor] = None
+    retrieve_next_sibling: Optional[torch.Tensor] = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     # Shape info for padding (e.g., DP attention / CUDA graph).
@@ -55,6 +69,28 @@ class DFlashVerifyInput(SpecInput):
         if self.num_tokens_per_req == -1:
             self.num_tokens_per_req = int(self.draft_token_num)
         self.num_tokens_for_logprob_per_req = int(self.draft_token_num)
+        if self.block_size is None:
+            if self.topk > 1:
+                raise ValueError(
+                    "DFlashVerifyInput with topk > 1 must pass block_size: the verify width "
+                    "1 + (block_size - 1) * topk no longer equals the longest root-to-leaf "
+                    f"chain, so accept_index cannot be sized from draft_token_num. Got "
+                    f"topk={self.topk}, draft_token_num={self.draft_token_num}."
+                )
+            self.block_size = int(self.draft_token_num)
+
+    @property
+    def max_tree_depth(self) -> int:
+        # Longest root-to-leaf chain, NOT the node count: a fixed-width beam over the
+        # selector lattice keeps W nodes per depth but every path is still block_size long.
+        return int(self.block_size)
+
+    @property
+    def tree_topk(self) -> int:
+        # Per-parent fanout. The beam picks its W nodes per depth globally across parents, so
+        # a parent can end up with anywhere from 0 to W children: irregular, hence -1. topk
+        # == 1 keeps reporting 1 so the chain path's callers see today's value.
+        return -1 if self.topk > 1 else int(self.topk)
 
     def prepare_for_verify(
         self,

@@ -71,7 +71,11 @@ class Spec:
     ] = None
     speculative_dflash_block_size: A[
         Optional[int],
-        "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
+        "DFLASH only. Draft block width. Alias of --speculative-num-draft-tokens when --speculative-dflash-tree-width is 1. Omit to infer it from the draft checkpoint block_size.",
+    ] = None
+    speculative_dflash_tree_width: A[
+        Optional[int],
+        "DFLASH only. Beam width kept at every draft depth (1 = single-path chain). The verify window is 1 + (block_size - 1) * tree_width. Must not exceed the draft checkpoint selector_top_k. Use this instead of --speculative-eagle-topk, which is EAGLE-only.",
     ] = None
     speculative_dspark_block_size: A[
         Optional[int],
