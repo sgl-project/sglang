@@ -50,9 +50,9 @@ from sglang.srt.utils import (
     is_npu,
 )
 
-is_npu = is_npu()
+_is_npu = is_npu()
 
-if is_npu:
+if _is_npu:
     import torch_npu
     from torch_npu.profiler import ProfilerActivity, profile
 
