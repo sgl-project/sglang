@@ -46,7 +46,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="667d576b41effd9639e9b75050c82847ab8a3cde"
+ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -56,7 +56,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="667d576b41effd9639e9b75050c82847ab8a3cde"
+ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 
 # ===============================
 # Base image 942 with rocm724 and args (Python 3.12 + torch 2.11)
@@ -90,7 +90,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="667d576b41effd9639e9b75050c82847ab8a3cde"
+ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -100,7 +100,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="667d576b41effd9639e9b75050c82847ab8a3cde"
+ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 
 # ===============================
 # Base image 950 with rocm724 and args (Python 3.12 + torch 2.11)
