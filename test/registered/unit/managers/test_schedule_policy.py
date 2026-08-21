@@ -26,7 +26,9 @@ def make_req(
     """Build a lightweight Req-like object with only the fields touched by sorting."""
     return SimpleNamespace(
         rid=rid,
-        prefix_indices=list(range(prefix_len)),
+        # Total prefix tokens matched against the radix cache; this is what
+        # _sort_by_longest_prefix reads (not len(prefix_indices)).
+        num_matched_prefix_tokens=prefix_len,
         sampling_params=SimpleNamespace(max_new_tokens=max_new_tokens),
         priority=priority,
         time_stats=SimpleNamespace(wait_queue_entry_time=entry_time),
