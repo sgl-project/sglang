@@ -67,5 +67,17 @@ class GlmImagePipeline(LoRAPipeline, ComposedPipelineBase):
             device=torch.device("cpu"),
         )
 
+    def can_prepare_async_ar_prefetch(
+        self, batches: list[Req], server_args: ServerArgs
+    ) -> bool:
+        stage = self._stage_name_mapping.get("glm_image_ar")
+        if not isinstance(stage, GlmImageAR):
+            return False
+        return stage.can_prepare_external_ar_group(
+            batches,
+            server_args,
+            require_single_output=True,
+        )
+
 
 EntryClass = [GlmImagePipeline]

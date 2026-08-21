@@ -385,26 +385,43 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """Yield grouped results after each request finishes its terminal stage."""
         assert self.pipeline is not None
         results = self.pipeline.forward_batch_sequentially(batch, self.server_args)
+        yield from self._execute_sequential_results(
+            batch,
+            results,
+            error_context_prefix="grouped request",
+            collect_output=lambda results, req: self._collect_sequential_outputs(
+                results,
+                (
+                    max(1, int(req.num_outputs_per_prompt or 1))
+                    if self.server_args.pipeline_config.supports_sequential_multi_output_inference()
+                    else 1
+                ),
+            ),
+        )
+
+    def _execute_sequential_results(
+        self,
+        batch: list[Req],
+        results: Iterator[OutputBatch | Req],
+        *,
+        error_context_prefix: str,
+        collect_output: Callable[[Iterator[OutputBatch | Req], Req], OutputBatch | Req],
+    ) -> Iterator[OutputBatch]:
         group_start_time = time.monotonic()
 
         try:
             for req in batch:
-                output_count = (
-                    max(1, int(req.num_outputs_per_prompt or 1))
-                    if self.server_args.pipeline_config.supports_sequential_multi_output_inference()
-                    else 1
-                )
                 output_batch = self._execute_forward_common(
                     req,
-                    forward_fn=lambda results=results, output_count=output_count: (
-                        self._collect_sequential_outputs(results, output_count)
+                    forward_fn=lambda results=results, req=req: (
+                        collect_output(results, req)
                     ),
                     log_reqs=[req],
                     return_req=False,
                     save_output_paths=lambda output_batch, req=req: self._save_output_paths(
                         req, output_batch
                     ),
-                    error_context=f"grouped request {req.request_id}",
+                    error_context=f"{error_context_prefix} {req.request_id}",
                     execution_start_time=group_start_time,
                     propagate_forward_errors=True,
                 )
@@ -434,6 +451,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         assert self.pipeline is not None
         return self.pipeline.prepare_async_ar_prefetch(batch, self.server_args)
 
+    def can_prepare_forward_sequential_group(self, batch: list[Req]) -> bool:
+        """Return whether a grouped request can use async AR prefetch."""
+        assert self.pipeline is not None
+        return self.pipeline.can_prepare_async_ar_prefetch(batch, self.server_args)
+
     def execute_prepared_forward_sequentially(
         self, batch: list[Req]
     ) -> Iterator[OutputBatch]:
@@ -442,22 +464,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         results = self.pipeline.forward_prepared_batch_sequentially(
             batch, self.server_args
         )
-        group_start_time = time.monotonic()
-
-        for req in batch:
-            output_batch = self._execute_forward_common(
-                req,
-                forward_fn=lambda results=results: next(results),
-                log_reqs=[req],
-                return_req=False,
-                save_output_paths=lambda output_batch, req=req: self._save_output_paths(
-                    req, output_batch
-                ),
-                error_context=f"prefetched grouped request {req.request_id}",
-                execution_start_time=group_start_time,
-            )
-            assert isinstance(output_batch, OutputBatch)
-            yield output_batch
+        yield from self._execute_sequential_results(
+            batch,
+            results,
+            error_context_prefix="prefetched grouped request",
+            collect_output=lambda results, _req: next(results),
+        )
 
     def _execute_forward_batch(self, batch: list[Req]) -> OutputBatch | Req:
         """Execute expanded multi-output requests as one grouped forward."""

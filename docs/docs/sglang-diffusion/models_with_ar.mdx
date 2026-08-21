@@ -32,6 +32,16 @@ sglang serve --model-path /path/to/zai-org/GLM-Image/ \
   --srt-encoder-url "http://${HOST}:${AR_PORT}" \
   --port ${PORT}
 ```
+For compatible single-rank GLM-Image T2I serving with dynamic batching, you can
+enable AR/DiT overlap on the Diffusion server:
+```bash
+sglang serve --model-path /path/to/zai-org/GLM-Image/ \
+  --srt-encoder-url "http://${HOST}:${AR_PORT}" \
+  --batching-mode dynamic \
+  --batching-max-size 4 \
+  --enable-ar-dit-overlap \
+  --port ${PORT}
+```
 ```bash
 # Terminal 3 : launch client
 curl http://${HOST}:${PORT}/v1/images/generations \

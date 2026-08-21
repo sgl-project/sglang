@@ -1100,6 +1100,14 @@ class ComposedPipelineBase(ABC):
             f"{self.pipeline_name} does not support async AR prefetch"
         )
 
+    def can_prepare_async_ar_prefetch(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+    ) -> bool:
+        """Return whether a request group can use async AR prefetch."""
+        return False
+
     @torch.no_grad()
     def forward_prepared_batch_sequentially(
         self,

@@ -129,20 +129,21 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         )
         self.assertEqual(args.model_path, "/data/my-model")
 
-    def test_ar_dit_overlap_mode_defaults_to_off(self):
-        args = self._from_dict_without_model_resolution({"model_path": "/data/model"})
+    def test_enable_ar_dit_overlap_defaults_to_false(self):
+        args = self._from_dict_without_model_resolution(
+            {"model_path": "~/fake/local/model"}
+        )
 
-        self.assertEqual(args.ar_dit_overlap_mode, "off")
+        self.assertFalse(args.enable_ar_dit_overlap)
 
-    def test_ar_dit_overlap_mode_cli_arg_is_parsed(self):
+    def test_enable_ar_dit_overlap_cli_arg_is_parsed(self):
         parser = FlexibleArgumentParser()
         ServerArgs.add_cli_args(parser)
         args, unknown_args = parser.parse_known_args(
             [
                 "--model-path",
-                "/data/model",
-                "--ar-dit-overlap-mode",
-                "on",
+                "~/fake/local/model",
+                "--enable-ar-dit-overlap",
             ]
         )
 
@@ -154,12 +155,15 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         ):
             server_args = ServerArgs.from_cli_args(args, unknown_args)
 
-        self.assertEqual(server_args.ar_dit_overlap_mode, "on")
+        self.assertTrue(server_args.enable_ar_dit_overlap)
 
-    def test_invalid_ar_dit_overlap_mode_raises(self):
+    def test_invalid_enable_ar_dit_overlap_raises(self):
         with self.assertRaises(ValueError):
             self._from_dict_without_model_resolution(
-                {"model_path": "/data/model", "ar_dit_overlap_mode": "bad"}
+                {
+                    "model_path": "~/fake/local/model",
+                    "enable_ar_dit_overlap": "bad",
+                }
             )
 
     def test_component_paths_are_expanded_before_pipeline_resolution(self):

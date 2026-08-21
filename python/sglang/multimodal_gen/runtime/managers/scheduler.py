@@ -9,7 +9,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from copy import deepcopy
 from enum import Enum
-from typing import Any, Iterator, List
+from typing import Any, Callable, Iterator, List
 
 import zmq
 
@@ -413,8 +413,18 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             )
 
     def _sequential_prefetch_enabled(self) -> bool:
-        overlap_mode = getattr(self.server_args, "ar_dit_overlap_mode", "off")
-        if overlap_mode != "on":
+        if not getattr(self.server_args, "enable_ar_dit_overlap", False):
+            return False
+
+        gpus_per_replica = max(
+            1, self.server_args.num_gpus // max(1, self.server_args.dp_size)
+        )
+        if (
+            gpus_per_replica > 1
+            or (self.server_args.tp_size or 1) > 1
+            or (self.server_args.sp_degree or 1) > 1
+            or bool(self.server_args.enable_cfg_parallel)
+        ):
             return False
 
         pipeline_config = self.server_args.pipeline_config
@@ -433,8 +443,27 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         if not self.waiting_queue or not self._sequential_prefetch_enabled():
             return None
 
-        identity, req, enqueue_time = self.waiting_queue[0]
+        return self._select_compatible_request_batch(
+            group_is_dispatchable=self.worker.can_prepare_forward_sequential_group,
+            incompatible_group_reason="async_ar_prefetch_incompatible",
+            ready_stop_reason="sequential_prefetch",
+        )
+
+    def _select_compatible_request_batch(
+        self,
+        *,
+        group_is_dispatchable: Callable[[list[Req]], bool] | None = None,
+        incompatible_group_reason: str | None = None,
+        ready_stop_reason: str = "ready",
+    ) -> list[tuple[bytes | None, Req]] | None:
+        """Pop a dynamic batch of compatible requests from the waiting queue."""
+        if not self.waiting_queue:
+            return None
+
+        _identity, req, enqueue_time = self.waiting_queue[0]
         if not isinstance(req, Req) or not self._can_dynamic_batch(req, req):
+            return None
+        if group_is_dispatchable is not None and not group_is_dispatchable([req]):
             return None
 
         compatible_indices: list[int] = [0]
@@ -454,17 +483,36 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 admission_reject = self._batch_admission.reject_reason_for_candidate(
                     compatible_reqs, candidate_req
                 )
-                if admission_reject is None:
+                candidate_group = [*compatible_reqs, candidate_req]
+                group_reject = (
+                    group_is_dispatchable is not None
+                    and not group_is_dispatchable(candidate_group)
+                )
+                if admission_reject is None and not group_reject:
                     compatible_indices.append(idx)
                     compatible_reqs.append(candidate_req)
                 elif self._batch_metrics_enabled:
-                    reject_reasons.append(admission_reject)
+                    reject_reasons.append(
+                        admission_reject
+                        or incompatible_group_reason
+                        or "dynamic_batch_incompatible"
+                    )
             elif self._batch_metrics_enabled and isinstance(candidate_req, Req):
                 reason = self._get_dynamic_batch_reject_reason(req, candidate_req)
                 if reason is not None:
                     reject_reasons.append(reason)
 
         batch_len = len(compatible_indices)
+
+        oldest_wait_s = time.monotonic() - enqueue_time
+        should_wait_for_more = (
+            batch_len < self._batching_max_size
+            and not self._batch_admission.batch_is_full(compatible_reqs)
+            and oldest_wait_s < self._batching_delay_s
+        )
+        if should_wait_for_more:
+            return None
+
         batch_items: list[tuple[bytes | None, Req]] = [None] * batch_len
         for pos, idx in enumerate(reversed(compatible_indices)):
             item_identity, item_req, _ = self.waiting_queue[idx]
@@ -473,17 +521,20 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         stop_reason = self._batch_admission.limit_reason_for_batch(compatible_reqs)
         if stop_reason is None:
-            stop_reason = (
-                "max_size"
-                if batch_len >= self._batching_max_size
-                else "sequential_prefetch"
-            )
+            if batch_len >= self._batching_max_size:
+                stop_reason = "max_size"
+            elif reject_reasons:
+                stop_reason = reject_reasons[0]
+            elif oldest_wait_s >= self._batching_delay_s:
+                stop_reason = "delay"
+            else:
+                stop_reason = ready_stop_reason
         self._record_batch_dispatch_metrics(
             request_count=batch_len,
             output_count=sum(
                 max(1, int(req.num_outputs_per_prompt or 1)) for req in compatible_reqs
             ),
-            queue_wait_ms=(time.monotonic() - enqueue_time) * 1000.0,
+            queue_wait_ms=oldest_wait_s * 1000.0,
             effective_max_output_count=self._batch_admission.max_admissible_batch_size(
                 compatible_reqs[0]
             ),
@@ -492,22 +543,24 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         )
         return batch_items
 
+    def _receive_and_enqueue_requests(self) -> int:
+        new_reqs = self.recv_reqs()
+        new_reqs = self.process_received_reqs_with_req_based_warmup(new_reqs)
+        if not new_reqs:
+            return 0
+        now = time.monotonic()
+        self.waiting_queue.extend((identity, req, now) for identity, req in new_reqs)
+        return len(new_reqs)
+
     def _receive_prefetchable_requests(self) -> None:
         try:
-            new_reqs = self.recv_reqs()
-            new_reqs = self.process_received_reqs_with_req_based_warmup(new_reqs)
+            self._receive_and_enqueue_requests()
         except Exception as e:
             logger.warning(
                 "Failed to receive requests during sequential AR prefetch: %s",
                 e,
                 exc_info=True,
             )
-            return
-
-        if not new_reqs:
-            return
-        now = time.monotonic()
-        self.waiting_queue.extend((identity, req, now) for identity, req in new_reqs)
 
     def _maybe_start_sequential_prefetch(self) -> None:
         if not self._sequential_prefetch_enabled():
@@ -1160,7 +1213,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 )
             return [(identity, req)]
 
-        identity, req, enqueue_time = self.waiting_queue[0]
+        identity, req, _enqueue_time = self.waiting_queue[0]
         if not isinstance(req, Req):
             identity, req, _ = self.waiting_queue.popleft()
             return [(identity, req)]
@@ -1185,73 +1238,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             )
             return [(identity, req)]
 
-        compatible_indices: list[int] = [0]
-        compatible_reqs: list[Req] = [req]
-        reject_reasons: list[str] = []
-        for idx in range(1, len(self.waiting_queue)):
-            if len(
-                compatible_indices
-            ) >= self._batching_max_size or self._batch_admission.batch_is_full(
-                compatible_reqs
-            ):
-                break
-            _identity, candidate_req, _enqueue_time = self.waiting_queue[idx]
-            if isinstance(candidate_req, Req) and self._can_dynamic_batch(
-                req, candidate_req
-            ):
-                admission_reject = self._batch_admission.reject_reason_for_candidate(
-                    compatible_reqs, candidate_req
-                )
-                if admission_reject is None:
-                    compatible_indices.append(idx)
-                    compatible_reqs.append(candidate_req)
-                elif self._batch_metrics_enabled:
-                    reject_reasons.append(admission_reject)
-            elif self._batch_metrics_enabled and isinstance(candidate_req, Req):
-                reason = self._get_dynamic_batch_reject_reason(req, candidate_req)
-                if reason is not None:
-                    reject_reasons.append(reason)
-
-        batch_len = len(compatible_indices)
-
-        oldest_wait_s = time.monotonic() - enqueue_time
-
-        should_wait_for_more = (
-            batch_len < self._batching_max_size
-            and not self._batch_admission.batch_is_full(compatible_reqs)
-            and oldest_wait_s < self._batching_delay_s
-        )
-        if should_wait_for_more:
-            return None
-
-        batch_items: list[tuple[bytes | None, Any]] = [None] * batch_len
-        for pos, idx in enumerate(reversed(compatible_indices)):
-            item_identity, item_req, _ = self.waiting_queue[idx]
-            batch_items[batch_len - 1 - pos] = (item_identity, item_req)
-            del self.waiting_queue[idx]
-        stop_reason = self._batch_admission.limit_reason_for_batch(compatible_reqs)
-        if stop_reason is None:
-            if batch_len >= self._batching_max_size:
-                stop_reason = "max_size"
-            elif reject_reasons:
-                stop_reason = reject_reasons[0]
-            elif oldest_wait_s >= self._batching_delay_s:
-                stop_reason = "delay"
-            else:
-                stop_reason = "ready"
-        self._record_batch_dispatch_metrics(
-            request_count=batch_len,
-            output_count=sum(
-                max(1, int(req.num_outputs_per_prompt or 1)) for req in compatible_reqs
-            ),
-            queue_wait_ms=oldest_wait_s * 1000.0,
-            effective_max_output_count=self._batch_admission.max_admissible_batch_size(
-                compatible_reqs[0]
-            ),
-            reject_reasons=reject_reasons,
-            stop_reason=stop_reason,
-        )
-        return batch_items
+        return self._select_compatible_request_batch()
 
     @staticmethod
     def _normalize_received_payload(
@@ -1350,12 +1337,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
             # 1: receive requests
             try:
-                new_reqs = self.recv_reqs()
-                new_reqs = self.process_received_reqs_with_req_based_warmup(new_reqs)
-                now = time.monotonic()
-                self.waiting_queue.extend(
-                    [(identity, req, now) for identity, req in new_reqs]
-                )
+                self._receive_and_enqueue_requests()
                 # Reset error count on success
                 self._consecutive_error_count = 0
             except Exception as e:

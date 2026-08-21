@@ -42,9 +42,6 @@ class _FakeResponse:
     def raise_for_status(self):
         return None
 
-    def raise_for_status(self):
-        pass
-
     def json(self):
         data = {"output_ids": self._output_ids}
         if self._meta_info is not None:
@@ -58,9 +55,6 @@ class _FakeBatchResponse:
 
     def raise_for_status(self):
         return None
-
-    def raise_for_status(self):
-        pass
 
     def json(self):
         return self._outputs
