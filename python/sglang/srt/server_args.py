@@ -450,6 +450,47 @@ def add_linear_attn_kernel_backend_choices(choices):
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
 
 
+def resolve_model_subfolder(
+    path: str, subfolder: Optional[str], revision: Optional[str] = None
+) -> str:
+    """Return the local directory holding the model inside `subfolder` of `path`.
+
+    `path` is a local directory or a Hugging Face repo ID. Collapsing both to
+    one real directory here means every later consumer -- config loading,
+    ModelConfig, the weight loader -- is handed a single plain path, so the
+    config and the weights cannot be read from different places.
+
+    The Hub has no single-string form for this: a repo ID may contain at most
+    one "/", so "org/repo/subdir" is not a valid ID and the sub-path has to be
+    carried separately.
+    """
+    if not subfolder:
+        return path
+    subfolder = subfolder.strip("/")
+    if not subfolder:
+        return path
+
+    if os.path.isdir(path):
+        resolved = os.path.join(path, subfolder)
+    else:
+        # Hub repo: fetch only the subtree, not the whole (often huge) repo.
+        from huggingface_hub import snapshot_download
+
+        local_root = snapshot_download(
+            path,
+            allow_patterns=[f"{subfolder}/*"],
+            revision=revision,
+        )
+        resolved = os.path.join(local_root, subfolder)
+
+    if not os.path.isdir(resolved):
+        raise ValueError(
+            f"Subfolder {subfolder!r} was not found in {path!r} "
+            f"(expected a directory at {resolved})."
+        )
+    return resolved
+
+
 @dataclasses.dataclass
 class ServerArgs:
     """Server-wide configuration for SGLang.
@@ -2110,6 +2151,11 @@ class ServerArgs:
     speculative_draft_model_revision: A[
         Optional[str],
         "The specific draft model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version.",
+        NS("spec"),
+    ] = None
+    speculative_draft_model_subfolder: A[
+        Optional[str],
+        "The subfolder of --speculative-draft-model-path that holds the draft weights and config. Use this to serve a draft bundled inside its target model's repository or directory instead of published as its own repo, e.g. --speculative-draft-model-path org/target --speculative-draft-model-subfolder DFlash.",
         NS("spec"),
     ] = None
     speculative_draft_load_format: A[
@@ -3989,7 +4035,7 @@ class ServerArgs:
             )
 
     def _handle_model_source_paths(self):
-        """Prepare metadata for model paths backed by remote object stores."""
+        """Resolve model paths: remote object stores, GGUF, then draft subfolders."""
         self._resolve_hf_gguf_model_path()
 
         seen_paths = set()
@@ -4005,6 +4051,16 @@ class ServerArgs:
             ):
                 ObjectStorageModel.download_and_get_path(model_path)
                 seen_paths.add(model_path)
+
+        # Fold a draft-model subfolder into the draft path itself. This runs in
+        # the path-resolution phase, before the speculative hook reads the
+        # draft config, so every consumer downstream sees the same directory.
+        if self.speculative_draft_model_subfolder and self.speculative_draft_model_path:
+            self.speculative_draft_model_path = resolve_model_subfolder(
+                self.speculative_draft_model_path,
+                self.speculative_draft_model_subfolder,
+                self.speculative_draft_model_revision,
+            )
 
     def _handle_pd_disaggregation(self):
         from sglang.srt.arg_groups.pd_disaggregation_hook import (
