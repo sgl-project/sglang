@@ -284,18 +284,19 @@ checkpoint's calibration scales automatically.
   RTX PRO 6000 BF16/FP8 cells boot and serve; on H200, DGX Spark and GB300
   those cells carry the **Final Verification In Progress**
   badge. The
-  RTX PRO 6000 recipe needs no changes. On the 32GB RTX 5090 the pins differ per
-  state dtype, and the panel applies them automatically. bfloat16 serves at
-  `--mem-fraction-static 0.88` on the balanced ratio (0.90, DSpark's pin, OOMs
-  on the first request). float32 reaches only the High-Throughput tier, at
-  `--mem-fraction-static 0.895` with `--mamba-full-memory-ratio 10` overriding
-  the balanced value — these cells pin `--max-running-requests 1`, so the
-  balanced ratio provisions KV for concurrency the recipe never uses and
-  starves the state pool of the slots fp32 needs. The Low-Latency tier is
-  greyed out for float32: it needs five fp32 slots plus a full request's KV,
-  and no mem-fraction holds both — buying the fifth slot cuts KV to 7,752
-  tokens against the 9,216 one 8192/1024 request needs, while every
-  mem-fraction with a large enough pool dies in prefill graph capture.
+  RTX PRO 6000 recipe needs no changes. On the 32GB RTX 5090 every pin is
+  re-measured against that commit, and the panel applies them automatically:
+  DFlash2 at `--mem-fraction-static 0.91` with `--chunked-prefill-size 1024` —
+  the only cell on this page needing a smaller prefill chunk, because at 0.91
+  the pools fit but a 2048-token chunk's activations do not — DSpark at 0.88,
+  EAGLE at 0.93 (bfloat16) and 0.94 (float32), and no-speculation at 0.90.
+  float32 is greyed out for both draft-model picks on that card: an fp32 state
+  slot costs 154 MB against bfloat16's 78 MB, so below ~0.92 the state pool
+  never reaches the tier's slot count, while at or above it prefill graph
+  capture or the first request runs out of memory. That was verified across
+  0.86–0.96 at both chunk sizes and with balanced-ratio overrides up to 20.
+  bfloat16 is also the faster choice: DFlash2 posts 4.92 ms median TPOT at an
+  accept length of 4.29, the best result on this card.
 - **Hardware fit**: FP8 weights ~28.5GB (not serviceable beyond bs≤2 on
   32GB cards); NVFP4 weights ~16.5GB (recommended for RTX 5090-class GPUs).
 - `--mamba-radix-cache-strategy extra_buffer_lazy` lowers the state cost per

@@ -83,12 +83,14 @@ export const config = {
             ...(["rtx5090", "rtx6000", "dgx-spark"].includes(sel.hw)
               ? ["--enable-linear-replayssm-spec"]
               : []),
-            // Measured on the 5090: bf16 state serves at 0.92, fp32 needs
-            // 0.94 (an fp32 slot is 146.81 MiB vs bf16's 74.81).
+            // Measured on the 5090 at commit 1cf2b8c: fp32 serves at 0.94,
+            // bf16 at 0.93. bf16 moved UP from 0.92 with the dense-lm_head
+            // checkpoint -- the heavier weights need a larger static budget
+            // before the state pool fits.
             ...(sel.hw === "rtx5090"
               ? [sel.ssmDtype === "float32"
                   ? "--mem-fraction-static 0.94"
-                  : "--mem-fraction-static 0.92"]
+                  : "--mem-fraction-static 0.93"]
               : []),
           ],
         },
@@ -107,19 +109,13 @@ export const config = {
             "--speculative-algorithm DSPARK",
             "--speculative-draft-model-path RadixArk/Qwen3.8-27B-DSpark",
             "--speculative-draft-attention-backend flashinfer",
-            // Measured on the 5090 at commit 1cf2b8c, the build the Install
-            // accordion pins for this card: fp32 serves at 0.89, bf16 at 0.88.
-            // Both are lower than the pins this recipe carried when it was
-            // measured on an older build, because a draft model plus the
-            // automatic prefill CUDA-graph capture no longer fit at 0.90+ —
-            // the same reason DFLASH2 sits at 0.88/0.895. EAGLE and no-spec are
-            // unaffected: replayssm keeps EAGLE's state pool tiny and no-spec
-            // loads no draft weights, so both still serve at their old pins.
-            ...(sel.hw === "rtx5090"
-              ? [sel.ssmDtype === "float32"
-                  ? "--mem-fraction-static 0.89"
-                  : "--mem-fraction-static 0.88"]
-              : []),
+            // Measured on the 5090 at commit 1cf2b8c: bf16 serves at 0.88,
+            // below the 0.90 this recipe carried when it was measured on an
+            // older build, because a draft model plus the automatic prefill
+            // CUDA-graph capture no longer fit there. fp32 is greyed out by the
+            // SSM dtype row. EAGLE and no-speculation are unaffected: replayssm
+            // keeps EAGLE's state pool tiny and no-spec loads no draft weights.
+            ...(sel.hw === "rtx5090" ? ["--mem-fraction-static 0.88"] : []),
           ],
         },
         {
@@ -134,31 +130,21 @@ export const config = {
           disabled: (sel) => sel.hw === "rtx5090" && sel.quant !== "nvfp4",
           disableReason:
             "On the 32GB RTX 5090 the DFlash2 draft model only fits on top of the NVFP4 weights",
-          // fp32 is the one case that needs the balanced ratio overridden, so
-          // that family is stripped too and re-emitted below.
           stripPrefixes: (sel) =>
-            sel.hw === "rtx5090"
-              ? sel.ssmDtype === "float32"
-                ? ["--mem-fraction-static", "--mamba-full-memory-ratio"]
-                : ["--mem-fraction-static"]
-              : [],
+            sel.hw === "rtx5090" ? ["--mem-fraction-static"] : [],
           flags: (sel) => [
             "--speculative-algorithm DFLASH",
             "--speculative-draft-model-path incoai/Qwen3.8-27B-DFlash2",
             "--speculative-num-draft-tokens 8",
             // Measured on the 5090 at commit 1cf2b8c, the build the Install
-            // accordion pins for this pick. bf16 serves at 0.88 on the balanced
-            // ratio (0.90, DSPARK's pin, OOMs on the first request). fp32 needs
-            // 0.895 AND the balanced ratio overridden to 10: these cells pin
-            // --max-running-requests 1, so the balanced value provisions KV for
-            // concurrency this recipe never uses, starving the state pool of the
-            // slots fp32 needs. Only High-Throughput reaches fp32 (S=4); the SSM
-            // dtype row greys fp32 out for Low-Latency (S=5).
+            // accordion pins. This is the only cell on the page that also needs
+            // a prefill chunk smaller than the engine default: at 0.91 the pools
+            // fit but a 2048-token chunk's activations do not. The pair together
+            // is the fastest recipe on this card (4.92ms median TPOT, 4.29
+            // accept length). fp32 is greyed out by the SSM dtype row.
             ...(sel.hw === "rtx5090"
-              ? sel.ssmDtype === "float32"
-                ? ["--mem-fraction-static 0.895",
-                   "--mamba-full-memory-ratio 10"]
-                : ["--mem-fraction-static 0.88"]
+              ? ["--mem-fraction-static 0.91",
+                 "--chunked-prefill-size 1024"]
               : []),
           ],
         },
@@ -204,21 +190,22 @@ export const config = {
         // serves, and is the faster cell there anyway.
         {
           id: "float32", label: "float32",
-          // Only the Low-Latency tier is out of reach: it needs S=5 fp32 slots
-          // (735MB) plus >=9216 KV tokens for one request, and no mem-fraction
-          // holds both -- at 0.8975/r14 the pool buys the 5th slot but KV falls
-          // to 7752 tokens and generation stops after one token, while every
-          // mem-fraction with a big enough pool (>=0.90) dies in graph capture.
-          // High-Throughput needs one slot fewer and does fit; see the DFLASH2
-          // option's pins.
+          // On the 32GB RTX 5090 a draft model plus an fp32 state pool no longer
+          // fit together: the checkpoint's dense lm_head adds ~3.2GB of weights,
+          // which pushes the pools up into the mem-fraction range where prefill
+          // CUDA-graph capture no longer fits. Measured across 0.86-0.96 at both
+          // prefill chunk sizes, plus balanced-ratio overrides up to 20: below
+          // ~0.92 the state pool never reaches the tier's slot count, and at or
+          // above it capture or the first request OOMs. An fp32 slot is 154MB
+          // against bfloat16's 78MB, which is why only fp32 is caught. EAGLE and
+          // no-speculation are unaffected -- replayssm keeps EAGLE's pool tiny
+          // and no-spec loads no draft weights at all.
           disabled: (sel) =>
             sel.hw === "rtx5090" &&
-            sel.spec === "dflash" &&
-            sel.tier === "low-latency",
+            (sel.spec === "dflash" || sel.spec === "dspark"),
           disableReason:
-            "On the 32GB RTX 5090 the Low-Latency tier cannot hold five fp32 state " +
-            "slots and a full request's KV at once — use bfloat16, or the " +
-            "High-Throughput tier which fits fp32",
+            "On the 32GB RTX 5090 an fp32 GDN state pool and a speculative draft model " +
+            "do not fit together — use bfloat16",
           flags: ["--mamba-ssm-dtype float32"],
         },
         {
