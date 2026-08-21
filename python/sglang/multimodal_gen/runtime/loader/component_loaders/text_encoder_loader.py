@@ -39,6 +39,10 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
     pt_weights_iterator,
     safetensors_weights_iterator,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    host_copies_would_not_fit,
+    host_memory_available_bytes,
+)
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     EncoderTensorParallelMixin,
     TextEncoder,
@@ -203,6 +207,34 @@ def _process_quantized_encoder_weights(
             "model did not construct any quantized linear layers"
         )
     return processed_layers
+
+
+def _checkpoint_bytes(model_path: str) -> int:
+    """On-disk size of a checkpoint, readable before any weight of it is."""
+    total = 0
+    for path in glob.glob(
+        os.path.join(str(model_path), "**", "*.safetensors"), recursive=True
+    ):
+        try:
+            total += os.path.getsize(path)
+        except OSError:
+            continue
+    return total
+
+
+def _keep_this_checkpoint_mapped(model_path: str) -> bool:
+    """Whether this encoder's weights should stay on their file mapping."""
+    checkpoint_bytes = _checkpoint_bytes(model_path)
+    if not host_copies_would_not_fit(checkpoint_bytes):
+        return False
+    logger.info(
+        "Text encoder checkpoint is %.2f GiB against %.2f GiB of host memory, "
+        "so its compatible weights stay on the checkpoint mapping instead of "
+        "being copied in.",
+        checkpoint_bytes / 1024**3,
+        host_memory_available_bytes() / 1024**3,
+    )
+    return True
 
 
 class TextEncoderLoader(ComponentLoader):
@@ -613,11 +645,17 @@ class TextEncoderLoader(ComponentLoader):
                 )
             model.bind_encoder_tp_group(encoder_tp_group)
 
-            if current_platform.is_mps() and component_starts_on_cpu:
-                # the h3 encoder is layered immediately after this loader returns
-                # compatible CPU safetensors stay mapped instead of copying the
-                # full Qwen checkpoint into unified memory
-                model._mps_zero_copy_weight_loading = True
+            if component_starts_on_cpu and (
+                current_platform.is_mps() or _keep_this_checkpoint_mapped(model_path)
+            ):
+                # The encoder is layered immediately after this loader returns,
+                # so compatible CPU safetensors can stay mapped instead of being
+                # copied. On MPS that is always the right call -- the memory is
+                # unified. On any host it becomes the only call once the
+                # checkpoint is larger than host memory, because the copy is
+                # what does not fit: H3's encoder is 62.13 GiB against a 32 GiB
+                # target.
+                model._keep_checkpoint_mapping = True
 
             weights_to_load = {name for name, _ in model.named_parameters()}
             loaded_weights = model.load_weights(
