@@ -485,6 +485,50 @@ class ModelOptFp8Config(ModelOptQuantConfig):
         )
 
 
+def _maybe_convert_fp8_proj_to_nvfp4(layer: torch.nn.Module) -> None:
+    """Opt-in: requantize an FP8 column-parallel projection to NVFP4 at load time
+    so apply() serves it W4A4 through the FP4 GEMM path instead of the FP8 one.
+
+    On SM120 these GEMMs stream their weights at the DRAM wall, so halving the
+    weight bytes is the speed lever kernel choice cannot provide. Only
+    column-parallel projections qualify: their inputs come out of layernorm and
+    tolerate the extra quantization error, while converting row-parallel output
+    projections (which read heavy-tailed attention outputs) collapses generation
+    quality. Enable with SGLANG_ENABLE_MODELOPT_FP8_PROJ_NVFP4 and gate the
+    deployment on an accuracy eval; quality is checkpoint-dependent.
+    """
+    layer.fp8_proj_nvfp4 = None
+    if not envs.SGLANG_ENABLE_MODELOPT_FP8_PROJ_NVFP4.get():
+        return
+    if not (is_cuda() and is_sm120_supported() and enable_flashinfer_fp4_gemm):
+        return
+    from sglang.srt.layers.linear import ColumnParallelLinear
+
+    if not isinstance(layer, ColumnParallelLinear):
+        return
+    if layer.input_scale is None or layer.input_scale.numel() != 1:
+        return
+    # layer.weight is the [K, N] transposed view of an [N, K]-contiguous buffer.
+    w_t = layer.weight.t()
+    n, k = w_t.shape
+    # FlashInfer CUTLASS FP4 alignment: scale rows pad to 128, K/16 groups to 4.
+    if n % 128 != 0 or k % 64 != 0 or (k // 16) % 4 != 0:
+        return
+    scale = layer.weight_scale.float()
+    w = w_t.float() * (scale.view(-1, 1) if scale.numel() > 1 else scale)
+    w = w.to(torch.bfloat16)
+    weight_scale_2 = (w.abs().amax().float() / (448.0 * 6.0)).reshape(1)
+    wq, wsf = fp4_quantize(w, (1.0 / weight_scale_2).to(torch.float32))
+    input_scale_2 = (layer.input_scale.float() / 6.0).reshape(1)
+    layer.fp8_proj_nvfp4 = (
+        wq.T,
+        wsf.view(torch.float8_e4m3fn).T,
+        (input_scale_2 * weight_scale_2).to(torch.float32).reshape(1),
+        (1.0 / input_scale_2).to(torch.float32).reshape(1),
+        n,
+    )
+
+
 class ModelOptFp8LinearMethod(LinearMethodBase):
     """Linear method for ModelOpt static FP8 quantization.
 
@@ -597,6 +641,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 .reshape(1)
                 .contiguous()
             )
+        _maybe_convert_fp8_proj_to_nvfp4(layer)
         if self.use_marlin:
             prepare_fp8_layer_for_marlin(layer)
             # Marlin uses FP8 weights with unquantized activations.
@@ -618,6 +663,12 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 size_n=layer.output_size_per_partition,
                 size_k=layer.input_size_per_partition,
                 bias=bias,
+            )
+        if layer.fp8_proj_nvfp4 is not None and bias is None and x.dim() == 2:
+            wq_t, wsf_t, alpha, input_scale_inv, out_features = layer.fp8_proj_nvfp4
+            x_fp4, x_scale_interleaved = fp4_quantize(x, input_scale_inv)
+            return fp4_gemm(
+                x_fp4, wq_t, x_scale_interleaved, wsf_t, alpha, x.dtype, out_features
             )
         if (
             self.use_sm120_gemv

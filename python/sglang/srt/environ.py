@@ -872,6 +872,9 @@ class Envs:
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
+    # Opt-in: requantize ModelOpt FP8 column-parallel projections to NVFP4 at
+    # load time and serve them W4A4 through the FP4 GEMM path (SM120 only).
+    SGLANG_ENABLE_MODELOPT_FP8_PROJ_NVFP4 = EnvBool(False)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
