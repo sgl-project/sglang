@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Transformer building blocks for the MiniMax H3 visual VAE ViT decoder.
 import math
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
@@ -171,7 +172,10 @@ class RotaryEmbeddingND(nn.Module):
         if D != self.n_dim:
             raise ValueError(f"Expected {self.n_dim} dimensions, got {D}")
 
-        with torch.autocast("cuda", enabled=False):
+        autocast_context = (
+            torch.autocast("cuda", enabled=False) if img_ids.is_cuda else nullcontext()
+        )
+        with autocast_context:
             angles = (
                 self.angle_scale
                 * img_ids[:, :, :, None]
