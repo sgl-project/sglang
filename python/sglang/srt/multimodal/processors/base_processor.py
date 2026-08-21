@@ -593,7 +593,10 @@ class BaseMultimodalProcessor(ABC):
                 audio_idx += 1
             else:
                 raise ValueError(f"Invalid modality: {modality}")
-            assert cur_idx <= mm_start_idx
+            # cur_idx == mm_start_idx + 1 happens with back-to-back mm
+            # placeholders: the previous span consumed up to and including
+            # this item's "start" position, so the copy below is empty.
+            assert cur_idx <= mm_start_idx + 1
 
             input_ids.extend(prompt[cur_idx : mm_start_idx + 1])
             mm_offset_start = len(input_ids)
