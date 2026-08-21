@@ -2814,13 +2814,12 @@ class ServerArgs(DisaggServerArgsMixin):
         return component_attention_backends, remaining
 
     @classmethod
-    def collect_cli_args(
+    def from_cli_args(
         cls,
         args: argparse.Namespace,
         unknown_args: list[str] | None = None,
         default_args: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Merge CLI, config-file, and dynamic component arguments."""
+    ) -> "ServerArgs":
         if unknown_args is None:
             unknown_args = []
 
@@ -2860,18 +2859,7 @@ class ServerArgs(DisaggServerArgsMixin):
             explicit_arg_names.add("component_attention_backends")
 
         provided_args["_explicit_arg_names"] = explicit_arg_names
-        return provided_args
-
-    @classmethod
-    def from_cli_args(
-        cls,
-        args: argparse.Namespace,
-        unknown_args: list[str] | None = None,
-        default_args: dict[str, Any] | None = None,
-    ) -> "ServerArgs":
-        return cls.from_dict(
-            cls.collect_cli_args(args, unknown_args, default_args=default_args)
-        )
+        return cls.from_dict(provided_args)
 
     @classmethod
     def from_dict(cls, kwargs: dict[str, Any]) -> "ServerArgs":

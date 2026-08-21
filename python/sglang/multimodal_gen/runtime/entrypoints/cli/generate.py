@@ -14,10 +14,6 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
 )
-from sglang.multimodal_gen.runtime.entrypoints.cli.checkpoint_inspection import (
-    add_checkpoint_inspection_args,
-    run_checkpoint_inspection,
-)
 from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcommand
 from sglang.multimodal_gen.runtime.entrypoints.cli.utils import (
     RaiseNotImplementedAction,
@@ -86,7 +82,6 @@ def add_multimodal_gen_generate_args(parser: argparse.ArgumentParser):
     )
 
     parser = ServerArgs.add_cli_args(parser)
-    parser = add_checkpoint_inspection_args(parser)
     parser = SamplingParams.add_cli_args(parser)
 
     parser.add_argument(
@@ -160,10 +155,7 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
     """The entry point for the generate command."""
     args.request_id = "mocked_fake_id_for_offline_generate"
 
-    launch_args = ServerArgs.collect_cli_args(args, unknown_args)
-    if run_checkpoint_inspection(launch_args):
-        return
-    server_args = ServerArgs.from_dict(launch_args)
+    server_args = ServerArgs.from_cli_args(args, unknown_args)
     sampling_params_cls = _resolve_cli_sampling_params_cls(server_args)
 
     sampling_params_kwargs = {}

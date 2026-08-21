@@ -79,7 +79,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--model-variant {NAME}`: semantic checkpoint variant to load when one model repository contains multiple weight partitions. The pipeline maps this stable name to the repository layout before loading; for example, MiniMax-H3 accepts `fl2va` and `ref2va`. This is a server/load-time choice, unlike a request's `task`.
 - `--minimax-h3-adaln-cache-path {FILE}`: advanced MiniMax-H3-only inference cache. It replaces the checkpoint's AdaLN projection weights with precomputed outputs and only accepts requests whose exact FP32 timestep plan is included in the cache. It requires unquantized weights and the matching model variant.
 - `--model-subfolder {PATH}`: advanced direct override for a component subfolder inside the model repository. Prefer `--model-variant` when the pipeline exposes semantic routing. If both are supplied, they must resolve to the same weight partition.
-- `--lora-path {PATH}` and `--lora-nickname {NAME}`: load a LoRA adapter
+- `--lora-path {PATH}` and `--lora-nickname {NAME}`: load a LoRA adapter from a local path, Hugging Face repo/subfolder, or exact Hub file URL
 - `--lora-weight-name {FILE}`: select one adapter file from a repository that contains multiple LoRA revisions. The Hub download is filtered to that file plus JSON metadata, so unused weights are not downloaded.
 - `--lora-alpha {N}`: supply the training alpha when a single-file adapter omits both per-layer alpha tensors and `adapter_config.json`. Do not set it when the adapter already records alpha metadata.
 - `--lora-merge-mode {auto|merge|dynamic}`: choose how LoRA is applied. `auto` statically merges regular weights and uses dynamic LoRA for FSDP-sharded weights to avoid full-gather peaks.
@@ -135,23 +135,6 @@ never silently changes prompt embeddings. For a native text encoder:
 
 - `--component-paths.text_encoder {MODEL}` replaces the text-encoder checkpoint; `--text-encoder-path {MODEL}` is its shorter alias
 - Quantization metadata is auto-detected from that checkpoint. Each native encoder must explicitly support the serialized format; this is not blanket quantization support for every component, and unsupported combinations fail before weight loading.
-
-### Checkpoint inspection
-
-Use the normal `generate` or `serve` command to inspect the configured model,
-component overrides, transformer weights override, and startup LoRA before
-allocating a GPU:
-
-```bash Command
-sglang serve \
-  --model-path MiniMaxAI/MiniMax-H3 \
-  --lora-path owner/adapter \
-  --inspect-checkpoints
-```
-
-Inspection reads Hub inventory, configs, and safetensors headers without
-downloading tensor payloads, then exits before model construction. Add
-`--checkpoint-report-format json` for a machine-readable CI or support report.
 
 For supported realtime causal video models, `--kv-cache-quant {off|int4|int2}`
 compresses completed KV-cache chunks independently of transformer weight

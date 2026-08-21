@@ -7,10 +7,6 @@ import os
 from typing import cast
 
 from sglang.multimodal_gen.apps.webui import run_sgl_diffusion_webui
-from sglang.multimodal_gen.runtime.entrypoints.cli.checkpoint_inspection import (
-    add_checkpoint_inspection_args,
-    run_checkpoint_inspection,
-)
 from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcommand
 from sglang.multimodal_gen.runtime.launch_server import (
     dispatch_launch,
@@ -28,21 +24,17 @@ def add_multimodal_gen_serve_args(parser: argparse.ArgumentParser):
         required=False,
         help="Read CLI options from a config JSON or YAML file.",
     )
-    parser = ServerArgs.add_cli_args(parser)
-    return add_checkpoint_inspection_args(parser)
+    return ServerArgs.add_cli_args(parser)
 
 
 def execute_serve_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None):
     """The entry point for the serve command."""
     # serving defaults: server-based warmup, throughput-oriented encoders
-    launch_args = ServerArgs.collect_cli_args(
+    server_args = ServerArgs.from_cli_args(
         args,
         unknown_args,
         default_args={"warmup_mode": "server"},
     )
-    if run_checkpoint_inspection(launch_args):
-        return
-    server_args = ServerArgs.from_dict(launch_args)
 
     dispatch_launch(server_args)
 
