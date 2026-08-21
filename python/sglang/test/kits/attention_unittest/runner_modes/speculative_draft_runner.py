@@ -184,6 +184,9 @@ class _EagleDraftWorkerHarness:
         self.device = self.model_runner.device
         if self.topk == 1:
             self.speculative_num_draft_tokens = self.speculative_num_steps + 1
+        # draft_forward's topk==1 branch reads this; left unbound so the
+        # harness takes the platform-independent path.
+        self.aiter_greedy_sample = None
         self._topk1_parents_prealloc = None
         self._topk1_score_indices_prealloc = None
         EagleDraftWorker._rebuild_topk1_chain_buffers(self)

@@ -128,6 +128,10 @@ logger = logging.getLogger(__name__)
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
+    # Class-level default: StandaloneDraftWorker and the attention-unittest
+    # harness borrow draft_forward but skip __init__, and must still resolve it.
+    aiter_greedy_sample = None
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -150,6 +154,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.topk = get_spec().speculative_eagle_topk
         if get_spec().speculative_use_rejection_sampling:
             assert self.topk == 1, "Chain speculative sampling supports only topk=1"
+        # aiter's greedy_sample tie-breaks equal logits to the lowest index
+        # (hipcub::ArgMax); torch.argmax does not, hence #26397's CUDA-only gate.
+        if _is_hip and envs.SGLANG_USE_AITER.get():
+            from aiter import greedy_sample
+
+            self.aiter_greedy_sample = greedy_sample
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
@@ -690,6 +700,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         )
                         topk_p = torch.ones_like(topk_index, dtype=torch.float32)
                         forward_batch.positions.add_(1)
+                elif (
+                    self.topk == 1
+                    and self.aiter_greedy_sample is not None
+                    # greedy_sample elects an uninitialized index at or below
+                    # max(threadIdx) * VecSize = 1023 * 16 (aiter kernel bug).
+                    and logits_output.next_token_logits.shape[-1] > 1023 * 16
+                ):
+                    logits = logits_output.next_token_logits
+                    selected = torch.empty(
+                        logits.shape[0], dtype=torch.int32, device=logits.device
+                    )
+                    self.aiter_greedy_sample(selected, logits)
+                    topk_index = selected.to(torch.int64).unsqueeze(-1)
+                    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+                    forward_batch.positions.add_(1)
                 else:
                     probs = renorm_draft_probs(
                         logits_output.next_token_logits,
@@ -1019,6 +1044,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ret_topk_index = torch.argmax(
                 draft_logits_output.next_token_logits, dim=-1, keepdim=True
             )
+            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+            ret_draft_probs = None
+        elif (
+            self.topk == 1
+            and self.aiter_greedy_sample is not None
+            # greedy_sample elects an uninitialized index at or below
+            # max(threadIdx) * VecSize = 1023 * 16 (aiter kernel bug).
+            and draft_logits_output.next_token_logits.shape[-1] > 1023 * 16
+        ):
+            logits = draft_logits_output.next_token_logits
+            selected = torch.empty(
+                logits.shape[0], dtype=torch.int32, device=logits.device
+            )
+            self.aiter_greedy_sample(selected, logits)
+            ret_topk_index = selected.to(torch.int64).unsqueeze(-1)
             ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             ret_draft_probs = None
         else:
