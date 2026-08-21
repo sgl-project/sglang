@@ -15,10 +15,8 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.topk import TopKOutput
-from sglang.srt.layers.moe.topk import TopKOutputChecker
+from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.utils import DeepEPMode
-
 
 _MOONEP_UNSUPPORTED_MESSAGE = (
     "MoonEP MoE A2A is recognized by SGLang, but the runtime dispatcher is not "
@@ -112,13 +110,15 @@ class MoonEPBuffer:
 
         from sglang.srt.runtime_context import get_resources
 
-        buffers = get_resources().buffers
+        resources = get_resources()
+        buffers = resources.buffers
         state = buffers.get("moonep_ep_state")
         if state is None:
             state = SimpleNamespace(
                 buffers={},
                 active_key=None,
             )
+            resources.register_finalizer("moonep_ep_buffers", cls.destroy_all_buffers)
             buffers["moonep_ep_state"] = state
         return state
 
@@ -451,9 +451,7 @@ def run_moonep_bf16_expert(
             f"shape {cu_seqlens.shape}"
         )
     if route_weights_nvs is not None and route_weights_nvs.ndim != 1:
-        raise ValueError(
-            f"route_weights_nvs must be 1D, got {route_weights_nvs.shape}"
-        )
+        raise ValueError(f"route_weights_nvs must be 1D, got {route_weights_nvs.shape}")
 
     output = torch.empty_like(hidden_states)
     prev = 0

@@ -177,6 +177,37 @@ class TestMoonEPBuffer(unittest.TestCase):
         self.assertEqual(buffer.destroy_calls, 1)
         self.assertIsNone(MoonEPBuffer.get_existing_buffer())
 
+    def test_reset_context_destroys_all_cached_buffers_once(self):
+        group = object()
+
+        with (
+            patch.dict(sys.modules, {"moonep": _fake_moonep_module()}),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.moonep.dist.get_world_size",
+                return_value=4,
+            ),
+        ):
+            prefill_buffer = MoonEPBuffer.get_moonep_buffer(
+                group=group,
+                hidden_size=1024,
+                router_topk=8,
+                num_experts=64,
+                num_max_dispatch_tokens_per_rank=512,
+            )
+            decode_buffer = MoonEPBuffer.get_moonep_buffer(
+                group=group,
+                hidden_size=1024,
+                router_topk=8,
+                num_experts=64,
+                num_max_dispatch_tokens_per_rank=64,
+            )
+
+        reset_context()
+        reset_context()
+
+        self.assertEqual(prefill_buffer.destroy_calls, 1)
+        self.assertEqual(decode_buffer.destroy_calls, 1)
+
 
 class TestMoonEPExpertWeightLayout(unittest.TestCase):
     def _fake_layer(self):
@@ -289,9 +320,7 @@ class TestMoonEPBf16ExpertRunner(unittest.TestCase):
         for start, end, expert in [(0, 2, 0), (2, 3, 1)]:
             x = hidden_states[start:end]
             y = torch.nn.functional.linear(
-                torch.nn.functional.silu(
-                    torch.nn.functional.linear(x, gate[expert])
-                )
+                torch.nn.functional.silu(torch.nn.functional.linear(x, gate[expert]))
                 * torch.nn.functional.linear(x, up[expert]),
                 down[expert],
             )
