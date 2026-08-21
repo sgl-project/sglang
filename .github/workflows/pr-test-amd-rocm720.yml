@@ -1,5 +1,5 @@
 name: PR Test ROCm 7.2 (AMD)
-# Dynamic run-name for /rerun-stage commands to enable URL lookup
+# Dynamic run-name for manual stage dispatches to enable URL lookup
 # Format: "[stage-name] sha" for fork PRs, "[stage-name]" for non-fork, default for normal runs
 run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_head_sha && format('[{0}] {1}', inputs.target_stage || inputs.target_stage_select, inputs.pr_head_sha) || format('[{0}]', inputs.target_stage || inputs.target_stage_select)) || '' }}
 
@@ -56,7 +56,7 @@ on:
         type: string
         default: ""
       pr_head_sha:
-        description: "PR head SHA to checkout (for /rerun-stage on fork PRs)"
+        description: "PR head SHA to checkout (for stage dispatches on fork PRs)"
         required: false
         type: string
         default: ""
@@ -239,7 +239,7 @@ jobs:
   # pr-test.yml's `call-pr-test-extra`. On `schedule` (and run_all_tests
   # dispatch) the extra suite runs on `main` without needing the
   # `run-ci-extra` label (pr-gate.yml only enforces labels on pull_request
-  # events). Targeted /rerun-stage dispatches (target_stage set) are excluded.
+  # events). Targeted stage dispatches (target_stage set) are excluded.
   # Not added to `pr-test-amd-rocm720-finish` so the base AMD gate never depends on
   # the opt-in extra suite.
   call-pr-test-amd-extra-rocm720:
