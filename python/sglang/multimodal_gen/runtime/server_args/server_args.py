@@ -236,8 +236,6 @@ class ServerArgs(DisaggServerArgsMixin):
     # HuggingFace specific parameters
     trust_remote_code: bool = False
     revision: str | None = None
-    checkpoint_preflight: str | None = None
-    checkpoint_report_format: str = "text"
 
     # Parallelism
     num_gpus: int = 1
@@ -1693,13 +1691,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def __post_init__(self):
         # configure logger before use
-        log_stream = (
-            sys.stderr
-            if self.checkpoint_preflight is not None
-            and self.checkpoint_report_format == "json"
-            else sys.stdout
-        )
-        configure_logger(server_args=self, stream=log_stream)
+        configure_logger(server_args=self)
 
         # Convert string disagg_role to enum (from CLI/config)
         if isinstance(self.disagg_role, str):
@@ -1728,24 +1720,6 @@ class ServerArgs(DisaggServerArgsMixin):
             "--model-path",
             type=str,
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
-        )
-        parser.add_argument(
-            "--checkpoint-preflight",
-            choices=("metadata", "full"),
-            default=ServerArgs.checkpoint_preflight,
-            help=(
-                "Resolve the configured model, component overrides, transformer "
-                "weights override, and LoRA, print a report, then exit before "
-                "model construction. "
-                "'metadata' reads Hub metadata and tensor headers; 'full' also "
-                "downloads the selected checkpoints."
-            ),
-        )
-        parser.add_argument(
-            "--checkpoint-report-format",
-            choices=("text", "json"),
-            default=ServerArgs.checkpoint_report_format,
-            help="Output format used by --checkpoint-preflight.",
         )
         parser.add_argument(
             "--model-subfolder",
@@ -2840,12 +2814,13 @@ class ServerArgs(DisaggServerArgsMixin):
         return component_attention_backends, remaining
 
     @classmethod
-    def from_cli_args(
+    def collect_cli_args(
         cls,
         args: argparse.Namespace,
         unknown_args: list[str] | None = None,
         default_args: dict[str, Any] | None = None,
-    ) -> "ServerArgs":
+    ) -> dict[str, Any]:
+        """Merge CLI, config-file, and dynamic component arguments."""
         if unknown_args is None:
             unknown_args = []
 
@@ -2885,7 +2860,18 @@ class ServerArgs(DisaggServerArgsMixin):
             explicit_arg_names.add("component_attention_backends")
 
         provided_args["_explicit_arg_names"] = explicit_arg_names
-        return cls.from_dict(provided_args)
+        return provided_args
+
+    @classmethod
+    def from_cli_args(
+        cls,
+        args: argparse.Namespace,
+        unknown_args: list[str] | None = None,
+        default_args: dict[str, Any] | None = None,
+    ) -> "ServerArgs":
+        return cls.from_dict(
+            cls.collect_cli_args(args, unknown_args, default_args=default_args)
+        )
 
     @classmethod
     def from_dict(cls, kwargs: dict[str, Any]) -> "ServerArgs":

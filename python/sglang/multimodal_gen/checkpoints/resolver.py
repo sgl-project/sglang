@@ -1,4 +1,4 @@
-"""Resolve diffusion checkpoints without constructing model components."""
+"""Resolve checkpoint sources without constructing model components."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path, PurePosixPath
 from typing import Literal
 from urllib.parse import unquote, urlparse
 
-from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.utils import validate_repo_id
 from safetensors import safe_open
 
@@ -21,6 +21,7 @@ CheckpointSourceKind = Literal["local", "huggingface"]
 CheckpointRole = Literal["pipeline", "component", "component_weights", "lora"]
 
 _WEIGHT_SUFFIXES = (".safetensors", ".gguf", ".bin", ".pt", ".pth", ".ckpt")
+_WEIGHT_INDEX_SUFFIXES = (".safetensors.index.json", ".bin.index.json")
 
 
 @dataclass(frozen=True)
@@ -265,34 +266,6 @@ def resolve_checkpoint_inventory(source: CheckpointSource) -> CheckpointInventor
     )
 
 
-def materialize_checkpoint(inventory: CheckpointInventory) -> str:
-    """Download the pinned checkpoint selected by an inventory."""
-    source = inventory.source
-    if source.kind == "local":
-        assert source.local_path is not None
-        return source.local_path
-
-    assert source.repo_id is not None
-    revision = inventory.resolved_revision or source.revision
-    if source.filename is not None:
-        return hf_hub_download(
-            repo_id=source.repo_id,
-            filename=source.filename,
-            revision=revision,
-        )
-    allow_patterns = None
-    if source.subfolder is not None:
-        allow_patterns = [f"{source.subfolder}/**", f"{source.subfolder}/*"]
-    local_repo = snapshot_download(
-        repo_id=source.repo_id,
-        revision=revision,
-        allow_patterns=allow_patterns,
-    )
-    if source.subfolder is None:
-        return local_repo
-    return os.path.join(local_repo, source.subfolder)
-
-
 def _local_inventory_file_path(
     inventory: CheckpointInventory, inventory_path: str
 ) -> str:
@@ -366,7 +339,7 @@ def select_checkpoint_weight_files(
     index_files = tuple(
         item.path
         for item in inventory.files
-        if item.path.endswith(".safetensors.index.json")
+        if item.path.endswith(_WEIGHT_INDEX_SUFFIXES)
     )
     if len(index_files) == 1:
         weight_map = _read_inventory_json(inventory, index_files[0]).get(
@@ -495,7 +468,7 @@ def _resolve_quantization_metadata(
 
 
 def resolve_checkpoint(request: CheckpointRequest) -> ResolvedCheckpoint:
-    """Resolve one checkpoint request using the same metadata path as preflight."""
+    """Resolve one checkpoint request and inspect its declared metadata."""
     source = parse_checkpoint_source(request.source, revision=request.revision)
     inventory = resolve_checkpoint_inventory(source)
     selected_files = select_checkpoint_weight_files(request, inventory)
@@ -528,14 +501,4 @@ def resolve_checkpoint(request: CheckpointRequest) -> ResolvedCheckpoint:
         quantization_method=quantization_method,
         quantization_source=quantization_source,
         tensor_summary=_merge_tensor_summaries(summaries),
-    )
-
-
-def materialize_resolved_checkpoint(checkpoint: ResolvedCheckpoint) -> tuple[str, ...]:
-    """Download exactly the files selected by a resolved weights checkpoint."""
-    if checkpoint.request.role in ("pipeline", "component"):
-        return (materialize_checkpoint(checkpoint.inventory),)
-    return tuple(
-        _materialize_inventory_file(checkpoint.inventory, selected_file)
-        for selected_file in checkpoint.selected_files
     )

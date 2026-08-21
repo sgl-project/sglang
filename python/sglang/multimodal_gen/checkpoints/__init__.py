@@ -1,1 +1,1 @@
-"""Checkpoint discovery and inspection."""
+"""Checkpoint source discovery and metadata inspection."""

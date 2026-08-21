@@ -136,7 +136,7 @@ never silently changes prompt embeddings. For a native text encoder:
 - `--component-paths.text_encoder {MODEL}` replaces the text-encoder checkpoint; `--text-encoder-path {MODEL}` is its shorter alias
 - Quantization metadata is auto-detected from that checkpoint. Each native encoder must explicitly support the serialized format; this is not blanket quantization support for every component, and unsupported combinations fail before weight loading.
 
-### Checkpoint preflight
+### Checkpoint inspection
 
 Use the normal `generate` or `serve` command to inspect the configured model,
 component overrides, transformer weights override, and startup LoRA before
@@ -146,12 +146,11 @@ allocating a GPU:
 sglang serve \
   --model-path MiniMaxAI/MiniMax-H3 \
   --lora-path owner/adapter \
-  --checkpoint-preflight metadata
+  --inspect-checkpoints
 ```
 
-`metadata` reads Hub inventory, configs, and safetensors headers without
-downloading tensor payloads. `full` additionally downloads exactly the selected
-checkpoints but still exits before model construction. Add
+Inspection reads Hub inventory, configs, and safetensors headers without
+downloading tensor payloads, then exits before model construction. Add
 `--checkpoint-report-format json` for a machine-readable CI or support report.
 
 For supported realtime causal video models, `--kv-cache-quant {off|int4|int2}`
