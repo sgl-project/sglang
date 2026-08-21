@@ -117,8 +117,9 @@ flags.
   hook in `cache_finished_req`).
 - Reuse changes model outputs by construction: donor K/V attended to the
   donor's context. The provider's quality gates plus the per-layer
-  zero-out mask bound the drift; accuracy methodology and results are in
-  the PR description.
+  zero-out mask are intended to reduce the drift, not eliminate it. Reuse is not
+  lossless: measured per-workload quality deltas, the methodology, and
+  the negative control are in the PR description.
 - Not yet supported: MLA-style KV pools, EAGLE speculative decoding,
   multi-region (`|exact|miss|fuzzy|miss|...`) reuse, hierarchical (host)
   cache interaction. Each is rejected explicitly rather than silently.

@@ -27,12 +27,7 @@ Helpers:
 * ``copy_kv_with_rope_correction`` - per-layer K/V copy that reverses
   RoPE at the donor position and reapplies it at the target position.
   When a ``layer_recompute_mask`` is provided, flagged layers are zeroed
-  instead of copied (the bathtub-curve recompute path will produce fresh
-  K/V for those layers in the next prefill pass).
-
-* ``as_long_tensor`` - coerce list/numpy/torch input to a long-typed
-  torch.Tensor on a target device. Used for segment-pos plumbing where
-  Python providers may produce plain lists.
+  instead of copied. Nothing refills the zeroed entries afterward.
 """
 
 from __future__ import annotations
@@ -40,15 +35,6 @@ from __future__ import annotations
 from typing import List, Optional
 
 import torch
-
-
-def as_long_tensor(obj, device) -> torch.Tensor:
-    """Coerce list/numpy/torch input to a long-typed torch.Tensor on ``device``."""
-    if obj is None:
-        return torch.empty(0, dtype=torch.long, device=device)
-    if isinstance(obj, torch.Tensor):
-        return obj.to(device=device, dtype=torch.long, non_blocking=True)
-    return torch.as_tensor(list(obj), dtype=torch.long, device=device)
 
 
 def copy_kv_with_rope_correction(
@@ -87,10 +73,20 @@ def copy_kv_with_rope_correction(
         new_positions: Target-side absolute positions for ``new_locs``.
             Used to apply RoPE in the recipient's reference frame.
         layer_recompute_mask: Optional list of bools; when ``mask[i]`` is
-            True, layer ``i`` is zeroed instead of copied (the prefill
-            pass that bookends the block will produce fresh K/V for those
-            layers). Bathtub-curve drift mitigation. List shorter than
-            ``pool.layer_num`` is treated as no-mask for trailing layers.
+            True, layer ``i`` is zeroed instead of copied. Nothing refills
+            the zeroed entries: the extend pass computes only the missed
+            tokens, so the zeros survive the forward pass, and
+            ``cache_finished_req`` inserts the realized slots into the
+            radix tree, where later exact prefix matches and later fuzzy
+            matches that pick this request as a donor can see them. At a
+            zeroed layer each reused position scores a zero logit: it is
+            not masked out, it still takes softmax mass (equal across the
+            zeroed positions) while contributing V=0, so the reused span
+            dilutes the attention output at that layer instead of steering
+            it. Providers use the mask to attenuate reuse at layers they
+            consider most sensitive to cross-context reuse. List shorter
+            than ``pool.layer_num`` is treated as no-mask for trailing
+            layers.
         apply_rotary_emb / reverse_rotary_emb: Optional overrides for the
             rotary embedding kernels. Default: lazy-imported from SGLang's
             ``layers.rotary_embedding.utils``. The override hook lets unit

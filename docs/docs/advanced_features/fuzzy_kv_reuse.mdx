@@ -12,6 +12,8 @@ The feature is fully opt-in. It only activates when you select the backend expli
 
 Workloads that resend near-identical content where the shared part does not sit at a common prefix. Typical examples are a shared document wrapped in different task instructions, or session content resent with a shifted header. Exact prefix caching recovers nothing in these cases because the first differing token ends the match.
 
+The tradeoff is explicit. A fuzzy hit serves cache entries computed in a different context, so warm outputs can differ from cold outputs on reused spans even after position correction. The feature targets latency-sensitive, resend-heavy traffic where time to first token matters more than byte-level output stability, for example interactive sessions over shared documents or templated enterprise flows. Workloads that need reproducible outputs for identical inputs should keep the default backend.
+
 ## Enabling
 
 Install the default provider dependency and select the backend at launch:
@@ -60,5 +62,6 @@ Reuse is visible in the server log. `fuzzy match success` marks an accepted matc
 - The reused span is a single contiguous range per request in this version.
 - Input token logprobs are not available for reused spans, matching the existing behavior of exact prefix caching.
 - Quality depends on the provider's gates. The defaults are conservative, and lowering the similarity threshold or reuse ratio trades precision for hit rate.
+- Reuse is not lossless. On requests where a fuzzy match fires, generated text can drift from what a cold run would produce, with the size of the drift depending on how the reused content overlaps the prompt. In the reference evaluation, workloads where reuse fired scored ROUGE-L 0.45 to 0.55 against cold outputs while an identical-prompt rerun control scored about 0.88.
 
 Details on the provider interface and the internal call chain live in the module README at `python/sglang/srt/mem_cache/fuzzy_match/README.md`.

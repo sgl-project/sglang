@@ -28,7 +28,6 @@ from sglang.srt.mem_cache.fuzzy_match.fuzzy_radix_cache import (
     fuzzy_match_backend_factory,
 )
 from sglang.srt.mem_cache.fuzzy_match.rope_correction import (
-    as_long_tensor,
     copy_kv_with_rope_correction,
 )
 from sglang.srt.mem_cache.registry import register_radix_cache_backend
@@ -44,7 +43,6 @@ __all__ = [
     "FuzzyMatchProvider",
     "FuzzyMatchResult",
     "FuzzyRadixCache",
-    "as_long_tensor",
     "copy_kv_with_rope_correction",
     "create_fuzzy_match_provider",
     "fuzzy_match_backend_factory",
