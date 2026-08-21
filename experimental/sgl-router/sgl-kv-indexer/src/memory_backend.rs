@@ -8,17 +8,20 @@
 //! with another server, and lost when the process exits.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use tonic::Status;
 
 use crate::pb::{
-    ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvActionType,
-    ExternalKvNodeMatch, GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse,
-    HitCountEntry, MatchExternalKvPrefixRequest, MatchExternalKvPrefixResponse,
-    MatchExternalKvRequest, MatchExternalKvResponse, TierHashes, WorkerCacheSpec,
+    ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ConfigureExpectedWorkersRequest,
+    ConfigureExpectedWorkersResponse, ExternalKvActionType, ExternalKvNodeMatch,
+    GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse, HitCountEntry,
+    MatchExternalKvPrefixRequest, MatchExternalKvPrefixResponse, MatchExternalKvRequest,
+    MatchExternalKvResponse, ReplaceExternalKvSnapshotRequest, ReplaceExternalKvSnapshotResponse,
+    TierHashes, WorkerCacheSpec,
 };
 use crate::service::{assemble_prefix_response, prefix_limit, WorkerPrefixScanner};
+use crate::status::IndexerStatusHandle;
 use crate::{BlockComponents, KvIndexerBackend, WorkerPrefixInput};
 
 #[derive(Debug, Default)]
@@ -33,6 +36,9 @@ struct BlockRecord {
 struct WorkerRecord {
     address: String,
     spec: Option<WorkerCacheSpec>,
+    ready: bool,
+    epoch: Option<String>,
+    last_seq: Option<u64>,
     /// Reverse index used by CLEAR_ALL_AT_TIER.
     holdings: HashMap<i32, HashSet<i64>>,
 }
@@ -60,14 +66,39 @@ struct PrefixCandidate {
 }
 
 /// Single-process, soft-state KV placement index.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InMemoryKvIndexerBackend {
     state: RwLock<State>,
+    status: Option<Arc<IndexerStatusHandle>>,
+}
+
+impl Default for InMemoryKvIndexerBackend {
+    fn default() -> Self {
+        Self {
+            state: RwLock::new(State::default()),
+            status: None,
+        }
+    }
 }
 
 impl InMemoryKvIndexerBackend {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_status(status: Arc<IndexerStatusHandle>) -> Self {
+        Self {
+            state: RwLock::new(State::default()),
+            status: Some(status),
+        }
+    }
+
+    fn refresh_status(&self, state: &State) {
+        if let Some(status) = &self.status {
+            let total = state.workers.len();
+            let ready = state.workers.values().filter(|worker| worker.ready).count();
+            status.set_coverage(ready, total);
+        }
     }
 
     fn read_state(&self) -> Result<RwLockReadGuard<'_, State>, Status> {
@@ -87,17 +118,58 @@ impl InMemoryKvIndexerBackend {
         req: ApplyExternalKvBatchRequest,
     ) -> Result<ApplyExternalKvBatchResponse, Status> {
         let mut state = self.write_state()?;
-        let worker_id = req.worker_id;
+        let ApplyExternalKvBatchRequest {
+            worker_id,
+            seq,
+            actions,
+            worker_address,
+            cache_spec,
+            worker_epoch,
+            enforce_sequence,
+        } = req;
+
+        if enforce_sequence {
+            let Some(worker) = state.workers.get(&worker_id) else {
+                return Err(Status::failed_precondition(
+                    "worker must be configured before recovery-aware apply",
+                ));
+            };
+            if !worker.ready || worker.epoch.as_deref() != Some(worker_epoch.as_str()) {
+                return Err(Status::failed_precondition(
+                    "worker has no READY snapshot for this epoch",
+                ));
+            }
+            let last = worker.last_seq.unwrap_or_default();
+            if seq <= last {
+                return Ok(ApplyExternalKvBatchResponse {
+                    applied_seq: last,
+                    duplicate: true,
+                });
+            }
+            if seq != last.saturating_add(1) {
+                clear_worker_holdings(&mut state, &worker_id);
+                if let Some(worker) = state.workers.get_mut(&worker_id) {
+                    worker.ready = false;
+                    worker.epoch = None;
+                    worker.last_seq = None;
+                }
+                self.refresh_status(&state);
+                return Err(Status::failed_precondition(format!(
+                    "event sequence gap: expected {}, got {seq}",
+                    last.saturating_add(1)
+                )));
+            }
+        }
 
         // Address and spec are snapshots carried on every batch. Empty address
         // makes the worker unroutable; absent spec returns it to legacy mode.
         {
             let worker = state.workers.entry(worker_id.clone()).or_default();
-            worker.address = req.worker_address;
-            worker.spec = req.cache_spec;
+            worker.address = worker_address;
+            worker.spec = cache_spec;
         }
 
-        for action in req.actions {
+        for action in actions {
             match ExternalKvActionType::try_from(action.r#type) {
                 Ok(ExternalKvActionType::ActionReport) => {
                     let has_masks = !action.component_masks.is_empty();
@@ -162,7 +234,104 @@ impl InMemoryKvIndexerBackend {
             }
         }
 
-        Ok(ApplyExternalKvBatchResponse {})
+        if let Some(worker) = state.workers.get_mut(&worker_id) {
+            worker.ready = true;
+            if enforce_sequence {
+                worker.epoch = Some(worker_epoch);
+                worker.last_seq = Some(seq);
+            }
+        }
+        self.refresh_status(&state);
+        Ok(ApplyExternalKvBatchResponse {
+            applied_seq: seq,
+            duplicate: false,
+        })
+    }
+
+    fn configure_workers(
+        &self,
+        req: ConfigureExpectedWorkersRequest,
+    ) -> Result<ConfigureExpectedWorkersResponse, Status> {
+        let mut state = self.write_state()?;
+        let expected: HashSet<String> = req
+            .workers
+            .iter()
+            .map(|worker| worker.worker_id.clone())
+            .collect();
+        let removed: Vec<String> = state
+            .workers
+            .keys()
+            .filter(|worker| !expected.contains(*worker))
+            .cloned()
+            .collect();
+        for worker in removed {
+            clear_worker_holdings(&mut state, &worker);
+            state.workers.remove(&worker);
+        }
+        for expected in req.workers {
+            let worker = state.workers.entry(expected.worker_id).or_default();
+            worker.address = expected.worker_address;
+            worker.spec = expected.cache_spec;
+        }
+        self.refresh_status(&state);
+        Ok(coverage_response(&state))
+    }
+
+    fn replace_snapshot(
+        &self,
+        req: ReplaceExternalKvSnapshotRequest,
+    ) -> Result<ReplaceExternalKvSnapshotResponse, Status> {
+        let mut state = self.write_state()?;
+        if !state.workers.contains_key(&req.worker_id) {
+            return Err(Status::failed_precondition(
+                "worker must be configured before snapshot replacement",
+            ));
+        }
+        clear_worker_holdings(&mut state, &req.worker_id);
+        for tier in req.hashes_by_tier {
+            let has_masks = !tier.component_masks.is_empty();
+            let has_sizes = !tier.block_sizes.is_empty();
+            for (index, hash) in tier.hashes.into_iter().enumerate() {
+                let mask = if has_masks {
+                    tier.component_masks[index]
+                } else {
+                    0
+                };
+                let token_count = if has_sizes {
+                    tier.block_sizes[index]
+                } else {
+                    0
+                };
+                let block = state.blocks.entry(hash).or_default();
+                block
+                    .placements
+                    .insert((req.worker_id.clone(), tier.tier), mask);
+                if token_count > 0 {
+                    block.token_count = token_count;
+                }
+                state
+                    .workers
+                    .get_mut(&req.worker_id)
+                    .expect("configured worker exists")
+                    .holdings
+                    .entry(tier.tier)
+                    .or_default()
+                    .insert(hash);
+            }
+        }
+        let worker = state
+            .workers
+            .get_mut(&req.worker_id)
+            .expect("configured worker exists");
+        worker.address = req.worker_address;
+        worker.spec = req.cache_spec;
+        worker.ready = true;
+        worker.epoch = Some(req.worker_epoch);
+        worker.last_seq = Some(req.applied_seq);
+        self.refresh_status(&state);
+        Ok(ReplaceExternalKvSnapshotResponse {
+            applied_seq: req.applied_seq,
+        })
     }
 
     fn do_match(&self, req: MatchExternalKvRequest) -> Result<MatchExternalKvResponse, Status> {
@@ -392,6 +561,26 @@ impl InMemoryKvIndexerBackend {
     }
 }
 
+fn coverage_response(state: &State) -> ConfigureExpectedWorkersResponse {
+    ConfigureExpectedWorkersResponse {
+        total_workers: state.workers.len() as u32,
+        ready_workers: state.workers.values().filter(|worker| worker.ready).count() as u32,
+    }
+}
+
+fn clear_worker_holdings(state: &mut State, worker_id: &str) {
+    let holdings = state
+        .workers
+        .get(worker_id)
+        .map(|worker| worker.holdings.clone())
+        .unwrap_or_default();
+    for (tier, hashes) in holdings {
+        for hash in hashes {
+            revoke_one(state, worker_id, &hash, tier);
+        }
+    }
+}
+
 fn revoke_one(state: &mut State, worker_id: &str, hash: &i64, tier: i32) {
     let mut remove_block = false;
     if let Some(block) = state.blocks.get_mut(hash) {
@@ -425,6 +614,20 @@ fn dedup_preserve_order(hashes: &[i64]) -> Vec<i64> {
 
 #[tonic::async_trait]
 impl KvIndexerBackend for InMemoryKvIndexerBackend {
+    async fn configure_expected_workers(
+        &self,
+        request: ConfigureExpectedWorkersRequest,
+    ) -> Result<ConfigureExpectedWorkersResponse, Status> {
+        self.configure_workers(request)
+    }
+
+    async fn replace_external_kv_snapshot(
+        &self,
+        request: ReplaceExternalKvSnapshotRequest,
+    ) -> Result<ReplaceExternalKvSnapshotResponse, Status> {
+        self.replace_snapshot(request)
+    }
+
     async fn apply_external_kv_batch(
         &self,
         request: ApplyExternalKvBatchRequest,
@@ -496,5 +699,148 @@ mod tests {
             .unwrap();
         drop(read_guard);
         query.join().unwrap();
+    }
+
+    fn expected(id: &str, address: &str) -> crate::pb::ExpectedWorker {
+        crate::pb::ExpectedWorker {
+            worker_id: id.into(),
+            worker_address: address.into(),
+            cache_spec: None,
+        }
+    }
+
+    fn snapshot(
+        worker: &str,
+        address: &str,
+        epoch: &str,
+        seq: u64,
+        hashes: &[i64],
+    ) -> ReplaceExternalKvSnapshotRequest {
+        ReplaceExternalKvSnapshotRequest {
+            worker_id: worker.into(),
+            worker_address: address.into(),
+            worker_epoch: epoch.into(),
+            applied_seq: seq,
+            hashes_by_tier: vec![TierHashes {
+                tier: crate::pb::TierType::TierHbm as i32,
+                hashes: hashes.to_vec(),
+                component_masks: Vec::new(),
+                block_sizes: Vec::new(),
+            }],
+            cache_spec: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_workers_become_ready_only_after_atomic_snapshots() {
+        let status = Arc::new(IndexerStatusHandle::new(4));
+        let backend = InMemoryKvIndexerBackend::with_status(Arc::clone(&status));
+        backend
+            .configure_expected_workers(ConfigureExpectedWorkersRequest {
+                workers: vec![expected("w1", "http://w1"), expected("w2", "http://w2")],
+            })
+            .await
+            .unwrap();
+        assert!(!status.report("i".into(), "http://i".into()).ready);
+
+        backend
+            .replace_external_kv_snapshot(snapshot("w1", "http://w1", "e1", 2, &[1, 2]))
+            .await
+            .unwrap();
+        assert!(!status.report("i".into(), "http://i".into()).ready);
+        backend
+            .replace_external_kv_snapshot(snapshot("w2", "http://w2", "e2", 4, &[1]))
+            .await
+            .unwrap();
+        let report = status.report("i".into(), "http://i".into());
+        assert!(report.ready);
+        assert_eq!((report.ready_workers, report.total_workers), (2, 2));
+
+        let matched = backend
+            .match_external_kv_prefix(MatchExternalKvPrefixRequest {
+                hashes: vec![1, 2],
+                max_blocks: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(matched.best_prefix_blocks, 2);
+    }
+
+    #[tokio::test]
+    async fn fenced_apply_deduplicates_and_gap_invalidates_worker() {
+        let status = Arc::new(IndexerStatusHandle::new(4));
+        let backend = InMemoryKvIndexerBackend::with_status(Arc::clone(&status));
+        backend
+            .configure_expected_workers(ConfigureExpectedWorkersRequest {
+                workers: vec![expected("w", "http://w")],
+            })
+            .await
+            .unwrap();
+        backend
+            .replace_external_kv_snapshot(snapshot("w", "http://w", "e", 2, &[1]))
+            .await
+            .unwrap();
+        let request = ApplyExternalKvBatchRequest {
+            worker_id: "w".into(),
+            seq: 3,
+            actions: vec![crate::pb::ExternalKvAction {
+                r#type: ExternalKvActionType::ActionReport as i32,
+                tier: crate::pb::TierType::TierHbm as i32,
+                hashes: vec![2],
+                component_masks: Vec::new(),
+                block_sizes: Vec::new(),
+            }],
+            worker_address: "http://w".into(),
+            cache_spec: None,
+            worker_epoch: "e".into(),
+            enforce_sequence: true,
+        };
+        assert!(!backend.apply(request.clone()).unwrap().duplicate);
+        assert!(backend.apply(request).unwrap().duplicate);
+
+        let gap = ApplyExternalKvBatchRequest {
+            worker_id: "w".into(),
+            seq: 5,
+            actions: Vec::new(),
+            worker_address: "http://w".into(),
+            cache_spec: None,
+            worker_epoch: "e".into(),
+            enforce_sequence: true,
+        };
+        assert_eq!(
+            backend.apply(gap).unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert!(!status.report("i".into(), "http://i".into()).ready);
+        assert!(backend.read_state().unwrap().blocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconfiguration_removes_scaled_in_worker_holdings() {
+        let backend = InMemoryKvIndexerBackend::new();
+        backend
+            .configure_expected_workers(ConfigureExpectedWorkersRequest {
+                workers: vec![expected("w1", "http://w1"), expected("w2", "http://w2")],
+            })
+            .await
+            .unwrap();
+        backend
+            .replace_external_kv_snapshot(snapshot("w1", "http://w1", "e1", 1, &[1]))
+            .await
+            .unwrap();
+        backend
+            .replace_external_kv_snapshot(snapshot("w2", "http://w2", "e2", 1, &[2]))
+            .await
+            .unwrap();
+        backend
+            .configure_expected_workers(ConfigureExpectedWorkersRequest {
+                workers: vec![expected("w1", "http://w1")],
+            })
+            .await
+            .unwrap();
+        let state = backend.read_state().unwrap();
+        assert!(state.workers.contains_key("w1"));
+        assert!(!state.workers.contains_key("w2"));
+        assert!(!state.blocks.contains_key(&2));
     }
 }

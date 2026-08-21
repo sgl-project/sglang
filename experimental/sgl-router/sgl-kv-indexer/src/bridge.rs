@@ -105,7 +105,7 @@ impl std::fmt::Display for BridgeError {
 impl std::error::Error for BridgeError {}
 
 impl BridgeError {
-    fn is_permanent(&self) -> bool {
+    pub(crate) fn is_permanent(&self) -> bool {
         matches!(self, BridgeError::Config(_) | BridgeError::PermanentRpc(_))
     }
 }
@@ -122,7 +122,7 @@ impl From<tonic::transport::Error> for BridgeError {
     }
 }
 
-fn classify_rpc(status: Status) -> BridgeError {
+pub(crate) fn classify_rpc(status: Status) -> BridgeError {
     match status.code() {
         Code::InvalidArgument
         | Code::FailedPrecondition
@@ -147,7 +147,7 @@ fn classify_rpc(status: Status) -> BridgeError {
 /// `hashes`: `masks[i]` is `None` for a legacy whole-block store, and
 /// `block_sizes[i]` is the reported token count, `None` when none was supplied.
 #[derive(Debug, PartialEq, Eq)]
-enum Action {
+pub(crate) enum Action {
     Report {
         tier: i32,
         hashes: Vec<i64>,
@@ -162,8 +162,8 @@ enum Action {
 }
 
 #[derive(Debug, Default)]
-struct EventActions {
-    actions: Vec<Action>,
+pub(crate) struct EventActions {
+    pub(crate) actions: Vec<Action>,
 }
 
 impl EventActions {
@@ -391,7 +391,7 @@ async fn forward_raw_batch(
 /// Maps a decoded `EventActions` into a single `ApplyExternalKvBatchRequest`,
 /// preserving per-action order. A `ClearAll` is expanded in place into one
 /// `CLEAR_ALL_AT_TIER` action per configured clear tier.
-fn build_apply_request(
+pub(crate) fn build_apply_request(
     config: &BridgeConfig,
     seq: u64,
     events: EventActions,
@@ -441,6 +441,8 @@ fn build_apply_request(
         actions,
         worker_address: config.worker_address.clone(),
         cache_spec: config.cache_spec,
+        worker_epoch: String::new(),
+        enforce_sequence: false,
     }
 }
 
@@ -534,7 +536,7 @@ fn encode_block_sizes(block_sizes: &[Option<u32>]) -> Vec<u32> {
         .collect()
 }
 
-fn decode_event_batch(payload: &[u8]) -> Result<EventActions, BridgeError> {
+pub(crate) fn decode_event_batch(payload: &[u8]) -> Result<EventActions, BridgeError> {
     decode_event_batch_impl(payload, true)
 }
 
@@ -1001,6 +1003,8 @@ mod tests {
             }],
             worker_address: "http://worker-1".into(),
             cache_spec: None,
+            worker_epoch: String::new(),
+            enforce_sequence: false,
         };
 
         let batches = split_apply_request(request);
@@ -1032,6 +1036,8 @@ mod tests {
                 .collect(),
             worker_address: "http://worker-1".into(),
             cache_spec: None,
+            worker_epoch: String::new(),
+            enforce_sequence: false,
         };
 
         let batches = split_apply_request(request);

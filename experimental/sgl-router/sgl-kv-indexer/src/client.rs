@@ -444,4 +444,86 @@ mod tests {
         drop(permit);
         assert!(index.try_acquire_prefix_query().is_ok());
     }
+
+    #[tokio::test]
+    async fn fleet_query_fails_over_to_next_ready_indexer() {
+        use crate::pb::{
+            ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType, TierType,
+        };
+        use crate::{
+            server_builder, InMemoryKvIndexerBackend, IndexerStatusReport, KvIndexerBackend,
+            KvIndexerService,
+        };
+
+        let backend = Arc::new(InMemoryKvIndexerBackend::new());
+        backend
+            .apply_external_kv_batch(ApplyExternalKvBatchRequest {
+                worker_id: "w".into(),
+                seq: 1,
+                actions: vec![ExternalKvAction {
+                    r#type: ExternalKvActionType::ActionReport as i32,
+                    tier: TierType::TierHbm as i32,
+                    hashes: vec![7],
+                    component_masks: Vec::new(),
+                    block_sizes: Vec::new(),
+                }],
+                worker_address: "http://worker".into(),
+                cache_spec: None,
+                worker_epoch: String::new(),
+                enforce_sequence: false,
+            })
+            .await
+            .unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let service_backend: Arc<dyn KvIndexerBackend> = backend;
+        let server = tokio::spawn(async move {
+            server_builder()
+                .add_service(KvIndexerService::new(service_backend).into_server())
+                .serve(addr)
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let index = GrpcPrefixIndex::new(PrefixIndexConfig {
+            endpoint: "http://127.0.0.1:1".into(),
+            query_deadline: Duration::from_millis(50),
+            max_inflight: 4,
+        })
+        .unwrap();
+        let registry = index.status_registry();
+        registry
+            .record(IndexerStatusReport {
+                indexer_id: "dead".into(),
+                endpoint: "http://127.0.0.1:1".into(),
+                ready: true,
+                normalized_load: 0.0,
+                ready_workers: 1,
+                total_workers: 1,
+            })
+            .unwrap();
+        registry
+            .record(IndexerStatusReport {
+                indexer_id: "healthy".into(),
+                endpoint: format!("http://{addr}"),
+                ready: true,
+                normalized_load: 0.5,
+                ready_workers: 1,
+                total_workers: 1,
+            })
+            .unwrap();
+
+        let outcome = index.match_prefix(vec![7]).await.unwrap();
+        assert!(matches!(
+            outcome,
+            PrefixOutcome::Matched {
+                best_prefix_blocks: 1,
+                ..
+            }
+        ));
+        server.abort();
+    }
 }

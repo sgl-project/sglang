@@ -7,6 +7,8 @@
 
 pub mod bridge;
 pub mod client;
+pub mod recovery;
+pub mod snapshot;
 pub mod status;
 
 pub mod pb {
@@ -24,6 +26,7 @@ pub use client::{
     PrefixMatch, PrefixOutcome, DEFAULT_QUERY_MAX_INFLIGHT,
 };
 pub use memory_backend::InMemoryKvIndexerBackend;
+pub use recovery::{run_recoverable_bridge_fleet_until, BridgeFleetConfig};
 pub use service::{
     component_bit, server_builder, BlockComponents, KvIndexerBackend, KvIndexerService,
     WorkerPrefixInput, COMPONENT_FULL, COMPONENT_MAMBA, COMPONENT_SWA,

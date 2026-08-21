@@ -89,6 +89,14 @@ message ApplyExternalKvBatchRequest {
   // The worker's component cache spec, carried on every batch so it self-heals
   // across reconnects and indexer restarts. Absent means legacy / full-only.
   WorkerCacheSpec cache_spec = 6;
+
+  // Non-empty for recovery-aware streams. The Indexer rejects a batch whose
+  // epoch differs from the installed snapshot.
+  string worker_epoch = 7;
+  // When true, seq must be exactly the installed sequence + 1. Duplicates are
+  // acknowledged without reapplying; gaps invalidate this worker until a new
+  // snapshot is installed.
+  bool enforce_sequence = 8;
 }
 
 // Deliberately empty: applies are unconditional, so there is nothing to report
@@ -96,6 +104,8 @@ message ApplyExternalKvBatchRequest {
 message ApplyExternalKvBatchResponse {
   // Fields 1-3 held the durable seq checkpoint and duplicate flag.
   reserved 1, 2, 3;
+  uint64 applied_seq = 4;
+  bool duplicate = 5;
 }
 
 message TierHashes {
@@ -105,6 +115,38 @@ message TierHashes {
   // cannot expose component detail.
   repeated uint32 component_masks = 3;
   repeated uint32 block_sizes = 4;
+}
+
+message ExpectedWorker {
+  string worker_id = 1;
+  string worker_address = 2;
+  WorkerCacheSpec cache_spec = 3;
+}
+
+// Sent once by the 1:1 Bridge before recovery starts. Workers omitted from a
+// later call are removed atomically, which gives scale-in deterministic state.
+message ConfigureExpectedWorkersRequest {
+  repeated ExpectedWorker workers = 1;
+}
+
+message ConfigureExpectedWorkersResponse {
+  uint32 total_workers = 1;
+  uint32 ready_workers = 2;
+}
+
+// Atomically replaces all placement owned by one worker stream after the
+// Bridge has combined Snapshot + buffered Live Events.
+message ReplaceExternalKvSnapshotRequest {
+  string worker_id = 1;
+  string worker_address = 2;
+  string worker_epoch = 3;
+  uint64 applied_seq = 4;
+  repeated TierHashes hashes_by_tier = 5;
+  WorkerCacheSpec cache_spec = 6;
+}
+
+message ReplaceExternalKvSnapshotResponse {
+  uint64 applied_seq = 1;
 }
 
 message ExternalKvNodeMatch {
@@ -171,6 +213,10 @@ message GetExternalKvHitCountsResponse {
 }
 
 service KVIndexer {
+  rpc ConfigureExpectedWorkers(ConfigureExpectedWorkersRequest) returns (ConfigureExpectedWorkersResponse);
+
+  rpc ReplaceExternalKvSnapshot(ReplaceExternalKvSnapshotRequest) returns (ReplaceExternalKvSnapshotResponse);
+
   // The sole mutation API: applies an ordered SGLang KVEventBatch.
   rpc ApplyExternalKvBatch(ApplyExternalKvBatchRequest) returns (ApplyExternalKvBatchResponse);
 
