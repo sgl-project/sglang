@@ -847,6 +847,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         pages = self.draft_swa_layout.committed_pages
         return [buf.narrow(0, 0, pages) for buf in self.swa_kv_pool.kv_buffer]
 
+    def get_draft_swa_state_layer_ids(self) -> List[int]:
+        if self._unified_kv:
+            layer_num = len(self.unified_kv_pool.kv_buffer)
+        else:
+            layer_num = len(self.swa_kv_pool.kv_buffer)
+        return list(range(self._stage_start, self._stage_start + layer_num))
+
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
         data_lens: List[int] = []
