@@ -16,6 +16,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
+from sglang.srt.utils import get_device_core_count
 
 logger = logging.getLogger(__name__)
 
@@ -543,15 +544,11 @@ def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
     block_m, block_k = 64, 64
     grid_size = (num_tokens + block_m - 1) // block_m
     num_block_k = (hc_hidden_size + block_k - 1) // block_k
-    if torch.xpu.is_available():
-        props = torch.xpu.get_device_properties(0)
-        n_sms = getattr(props, "multi_processor_count", None)
-        if n_sms is None:
-            n_sms = getattr(
-                props, "max_compute_units", getattr(props, "gpu_subslice_count", 1)
-            )
-    else:
-        n_sms = torch.cuda.get_device_properties(0).multi_processor_count
+
+    n_sms = get_device_core_count()
+    if n_sms <= 0:
+        n_sms = 1
+
     return max(1, min(n_sms // max(grid_size, 1), num_block_k // 4))
 
 
@@ -596,24 +593,9 @@ def prewarm_mhc_pre(
     )
 
     logger.info("DeepSeek V4 MHC prenorm prewarm: %d n_splits buckets", len(buckets))
-
-    mhc_pre_impl = mhc_pre
-    if residual.device.type == "xpu":
-        try:
-            from sgl_kernel import mhc_pre as xpu_mhc_pre
-
-            mhc_pre_impl = xpu_mhc_pre
-            logger.info("DeepSeek V4 MHC prenorm prewarm: using sgl-kernel XPU mhc_pre")
-        except Exception as exc:
-            logger.warning(
-                "DeepSeek V4 MHC prenorm prewarm: failed to import sgl-kernel XPU mhc_pre (%s); "
-                "falling back to local mhc_pre",
-                exc,
-            )
-
     with torch.inference_mode():
         for num_tokens in buckets:
-            mhc_pre_impl(
+            mhc_pre(
                 residual.new_zeros(num_tokens, hc_mult, hidden_size),
                 fn,
                 hc_scale,
