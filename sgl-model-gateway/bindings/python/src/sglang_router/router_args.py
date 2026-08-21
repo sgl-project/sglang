@@ -75,6 +75,7 @@ class RouterArgs:
     service_discovery: bool = False
     selector: Dict[str, str] = dataclasses.field(default_factory=dict)
     service_discovery_port: int = 80
+    service_discovery_resync_secs: int = 30
     service_discovery_namespace: Optional[str] = None
     # PD service discovery configuration
     prefill_selector: Dict[str, str] = dataclasses.field(default_factory=dict)
@@ -449,6 +450,12 @@ class RouterArgs:
             type=int,
             default=RouterArgs.service_discovery_port,
             help="Port to use for discovered worker pods",
+        )
+        k8s_group.add_argument(
+            f"--{prefix}service-discovery-resync-secs",
+            type=int,
+            default=RouterArgs.service_discovery_resync_secs,
+            help="Interval (seconds) of the periodic full-LIST reconcile that repairs the discovered worker set independently of watch health",
         )
         k8s_group.add_argument(
             f"--{prefix}service-discovery-namespace",
