@@ -60,7 +60,7 @@ def test_save_outputs_can_materialize_without_saving(tmp_path):
 
 def test_file_path_transport_clears_in_memory_outputs():
     worker = GPUWorker.__new__(GPUWorker)
-    worker.rank = 0
+    worker.is_output_rank = True
     output_batch = OutputBatch(
         output=[object()],
         audio=torch.zeros(1),

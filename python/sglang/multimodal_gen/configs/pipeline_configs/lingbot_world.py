@@ -14,6 +14,9 @@ import torch
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models import DiTConfig
 from sglang.multimodal_gen.configs.models.dits import LingBotWorldVideoConfig
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_I2V_A14B_Config
 from sglang.multimodal_gen.runtime.realtime.session import (
     BaseRealtimeState,
@@ -284,6 +287,9 @@ class LingBotWorldI2VConfig(Wan2_2_I2V_A14B_Config):
         default_factory=lambda: (lingbot_prompt_clean,)
     )
 
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(dit_layerwise_offload_modes=("memory",))
+
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         kwargs = super().prepare_pos_cond_kwargs(batch, device, rotary_emb, dtype)
         if batch.c2ws_plucker_emb is not None:
@@ -331,6 +337,13 @@ class LingBotWorldCausalDMDConfig(LingBotWorldI2VConfig):
     interactive_kv_moving_window: int | None = 12
     interactive_kv_still_chunks: int = 2
     lazy_vae_encode_black_frames: int = 0
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            dit_layerwise_offload_modes=("memory",),
+            keep_resident_min_available_gb=70,
+            keep_resident_components=("dit",),
+        )
 
     def preprocess_vae_encode(self, image, vae):
         image = super().preprocess_vae_encode(image, vae)

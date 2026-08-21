@@ -26,8 +26,13 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+from sglang.srt.layers.moe.mega_moe_sm90 import (
+    is_sm90_fp8_mega_moe_available,
+    run_sm90_mega_routed,
+)
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.models.deepseek_common.utils import _device_sm
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -100,6 +105,9 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
         return False
+    if _device_sm == 90:
+        if not is_sm90_fp8_mega_moe_available(moe.experts):
+            return False
     if get_is_capture_mode():
         return True
 
@@ -214,6 +222,16 @@ def _run_mega_routed(
         topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
 
+    if _device_sm == 90:
+        return run_sm90_mega_routed(
+            moe,
+            hidden_states,
+            topk_ids_in,
+            topk_weights_in,
+            buf,
+            num_tokens,
+        )
+
     use_fp4_acts = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get()
     if use_fp4_acts:
         # FP4 path goes through DeepGEMM's mega_moe_pre_dispatch which
@@ -302,7 +320,6 @@ def _transpose_mega_moe_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
 def build_mega_moe_experts_weights(experts) -> None:
     from deep_gemm import (
         transform_sf_into_required_layout,
-        transform_weights_for_mega_moe,
     )
 
     if getattr(experts, "_mega_moe_weights_built", False):
@@ -335,31 +352,23 @@ def build_mega_moe_experts_weights(experts) -> None:
         disable_ue8m0_cast=False,
     )
 
-    if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
-        # Build the interleaved L1 weight + scale once; share the weight buffer
-        # between `w13_weight.data` (normal deep-ep path) and `mega_l1_weights[0]`
-        # (mega moe path). Mega moe additionally needs a UTCCP-transposed scale;
-        # the deep-ep path consumes the non-transposed interleaved scale and a
-        # swizzle-aware activation kernel. L2 weight is untouched by the mega
-        # transform, so the existing `w2_weight.data` is shared directly.
-        w13_interleaved, w13_sf_interleaved = _interleave_mega_moe_l1_weights(
-            (w13, w13_sf)
-        )
-        w13_sf_utccp = _transpose_mega_moe_sf_for_utccp(w13_sf_interleaved)
-        w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(w2_sf)
+    # Build the interleaved L1 weight + scale once; share the weight buffer
+    # between `w13_weight.data` (normal deep-ep path) and `mega_l1_weights[0]`
+    # (mega moe path). Mega moe additionally needs a UTCCP-transposed scale;
+    # the deep-ep path consumes the non-transposed interleaved scale and a
+    # swizzle-aware activation kernel. L2 weight is untouched by the mega
+    # transform, so the existing `w2_weight.data` is shared directly.
+    w13_interleaved, w13_sf_interleaved = _interleave_mega_moe_l1_weights((w13, w13_sf))
+    w13_sf_utccp = _transpose_mega_moe_sf_for_utccp(w13_sf_interleaved)
+    w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(w2_sf)
 
-        experts.w13_weight.data = w13_interleaved
-        experts.w13_weight_scale_inv.data = w13_sf_interleaved
-        experts.w2_weight_scale_inv.data = w2_sf
-        experts.w13_weight_scale_inv.format_ue8m0 = True
-        experts.w2_weight_scale_inv.format_ue8m0 = True
+    experts.w13_weight.data = w13_interleaved
+    experts.w13_weight_scale_inv.data = w13_sf_interleaved
+    experts.w2_weight_scale_inv.data = w2_sf
+    experts.w13_weight_scale_inv.format_ue8m0 = True
+    experts.w2_weight_scale_inv.format_ue8m0 = True
 
-        experts.mega_l1_weights = (experts.w13_weight.data, w13_sf_utccp)
-        experts.mega_l2_weights = (experts.w2_weight.data, w2_sf_utccp)
-    else:
-        l1_pair, l2_pair = transform_weights_for_mega_moe((w13, w13_sf), (w2, w2_sf))
-
-        experts.mega_l1_weights = l1_pair
-        experts.mega_l2_weights = l2_pair
+    experts.mega_l1_weights = (experts.w13_weight.data, w13_sf_utccp)
+    experts.mega_l2_weights = (experts.w2_weight.data, w2_sf_utccp)
 
     experts._mega_moe_weights_built = True
