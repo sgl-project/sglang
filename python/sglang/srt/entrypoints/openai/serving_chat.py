@@ -568,7 +568,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 return_dict=False,
                 **template_kwargs,
             )
-            if request.response_format is not None:
+            if "response_format" in template_kwargs:
                 baseline_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                     messages,
                     tokenize=True,
@@ -581,8 +581,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         if key != "response_format"
                     },
                 )
-                request._response_format_prompt_tokens = len(prompt_ids) - len(
-                    baseline_ids
+                request._response_format_prompt_tokens = max(
+                    0, len(prompt_ids) - len(baseline_ids)
                 )
             if assistant_prefix:
                 prompt_ids = self._append_assistant_prefix_to_prompt_ids(

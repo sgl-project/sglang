@@ -1053,6 +1053,23 @@ class ServingChatTestCase(unittest.TestCase):
             122 - self.chat._KIMI_K3_GENERATION_STUB_TOKENS,
         )
 
+    def test_kimi_k3_response_format_via_template_kwargs_not_billed(self):
+        self.template_manager.chat_template_name = None
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.tm.tokenizer.apply_chat_template.side_effect = [
+            list(range(186)),
+            list(range(119)),
+        ]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "hi"}],
+            chat_template_kwargs={"response_format": {"type": "json_object"}},
+        )
+
+        self.chat._process_messages(request, is_multimodal=False)
+
+        self.assertEqual(request._response_format_prompt_tokens, 67)
+
     def test_kimi_k3_neutralizes_text_only_assistant_history(self):
         self.template_manager.chat_template_name = None
         self.chat.chat_encoding_spec = "kimi_k3"
