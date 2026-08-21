@@ -2489,6 +2489,11 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.swa_attn_allocator.free(live)
         self.swa_attn_allocator.clear_inverse_history()
 
+    def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
+        # Unified allocation has no static full-to-SWA token mapping, so retain
+        # its virtual-page liveness filtering instead of the fixed-shape path.
+        self.free_swa(free_index)
+
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:
