@@ -638,7 +638,7 @@ class MoeLoraRunner:
         # The act stage runs the gate/up B GEMM. That GEMM always reads the
         # per-expert route.
         route = routes.aligned(False)
-        provider.run_fused_act(
+        provider.fused_act(
             base_gemm_state,
             plan.act.family.value,
             activation=self.activation.value,
@@ -826,7 +826,7 @@ class MoeLoraRunner:
             )
             return output
 
-        provider.run_shared_rank_finalize(
+        provider.shared_rank_finalize(
             base_gemm_state,
             down_masked=down_out,
             bridge=down_rank,

@@ -113,6 +113,26 @@ class MoeBaseProvider:
     ) -> None:
         raise NotImplementedError
 
+    def fused_act(
+        self,
+        row_state,
+        family: str,
+        *,
+        activation: str,
+        base_gateup: torch.Tensor,
+        act_masked: torch.Tensor,
+        act_pairs: torch.Tensor | None,
+        routing: RouteView,
+        config: Mapping[str, int],
+        bridge_gateup: torch.Tensor | None = None,
+        b_gate_up: torch.Tensor | None = None,
+        bridge_top_k: int = 1,
+        consume_base_pdl: bool = False,
+    ) -> None:
+        raise NotImplementedError(
+            f"{self.contract.key} has no fused-act implementation for {family!r}"
+        )
+
     def down(
         self,
         row_state,
@@ -154,24 +174,102 @@ class MoeBaseProvider:
             lora_delta=lora_delta,
         )
 
-    def run_fused_act(
+    def shared_rank_finalize(
         self,
         row_state,
-        family: str,
         *,
-        activation: str,
-        base_gateup: torch.Tensor,
-        act_masked: torch.Tensor,
-        act_pairs: torch.Tensor | None,
+        down_masked: torch.Tensor,
+        bridge: torch.Tensor,
+        b_down: torch.Tensor,
         routing: RouteView,
-        config: Mapping[str, int],
-        bridge_gateup: torch.Tensor | None = None,
-        b_gate_up: torch.Tensor | None = None,
-        bridge_top_k: int = 1,
-        consume_base_pdl: bool = False,
+        topk_weights: torch.Tensor,
+        routed_scaling_factor: float | None,
+        output: torch.Tensor,
+        token_rank: torch.Tensor,
+        config: Mapping[str, Mapping[str, int]],
     ) -> None:
-        raise NotImplementedError(
-            f"{self.contract.key} has no fused-act implementation for {family!r}"
+        self._shared_rank_reduce(
+            row_state,
+            bridge=bridge,
+            routing=routing,
+            topk_weights=topk_weights,
+            routed_scaling_factor=routed_scaling_factor,
+            token_rank=token_rank,
+            config=config["reduce"],
+        )
+        self._shared_rank_tail(
+            row_state,
+            down_masked=down_masked,
+            b_down=b_down,
+            routing=routing,
+            topk_weights=topk_weights,
+            routed_scaling_factor=routed_scaling_factor,
+            output=output,
+            token_rank=token_rank,
+            config=config["tail"],
+        )
+
+    def _shared_rank_reduce(
+        self,
+        row_state,
+        *,
+        bridge: torch.Tensor,
+        routing: RouteView,
+        topk_weights: torch.Tensor,
+        routed_scaling_factor: float | None,
+        token_rank: torch.Tensor,
+        config: Mapping[str, int],
+    ) -> None:
+        """Launch the shared-rank reduction. It does not wait for the base W2 GEMM."""
+        from sglang.srt.lora.moe.base_gemm_provider.masked_finalize import (
+            invoke_shared_rank_reduce,
+        )
+
+        # This launch reads pair data only. ``row_state`` stays in the
+        # signature so that every stage takes the same arguments.
+        del row_state
+        invoke_shared_rank_reduce(
+            bridge=bridge,
+            routing=routing,
+            topk_weights=topk_weights,
+            routed_scaling_factor=routed_scaling_factor,
+            token_rank=token_rank,
+            config=config,
+        )
+
+    def _shared_rank_tail(
+        self,
+        row_state,
+        *,
+        down_masked: torch.Tensor,
+        b_down: torch.Tensor,
+        routing: RouteView,
+        topk_weights: torch.Tensor,
+        routed_scaling_factor: float | None,
+        output: torch.Tensor,
+        token_rank: torch.Tensor,
+        config: Mapping[str, int],
+    ) -> None:
+        """Finish the shared-rank path.
+
+        Wait for the base W2 GEMM and the reduction. Then finalize the base
+        rows and add the shared-B tail.
+        """
+        from sglang.srt.lora.moe.base_gemm_provider.masked_finalize import (
+            invoke_shared_from_scratch_finalize,
+        )
+
+        invoke_shared_from_scratch_finalize(
+            down_masked=down_masked,
+            src2dst=row_state.src2dst,
+            token_rank=token_rank,
+            b_down=b_down,
+            routing=routing,
+            topk_weights=topk_weights,
+            routed_scaling_factor=routed_scaling_factor,
+            output=output,
+            num_local_experts=self.num_local_experts,
+            config=config,
         )
 
     def mapped_down_lora_a_input(
@@ -213,104 +311,6 @@ class MoeBaseProvider:
         return MappedLoraAInput(
             rows=activation.view(-1, activation.shape[-1]),
             pair_to_row=row_state.src2dst,
-        )
-
-    def run_shared_rank_finalize(
-        self,
-        row_state,
-        *,
-        down_masked: torch.Tensor,
-        bridge: torch.Tensor,
-        b_down: torch.Tensor,
-        routing: RouteView,
-        topk_weights: torch.Tensor,
-        routed_scaling_factor: float | None,
-        output: torch.Tensor,
-        token_rank: torch.Tensor,
-        config: Mapping[str, Mapping[str, int]],
-    ) -> None:
-        self.run_shared_rank_reduce(
-            row_state,
-            bridge=bridge,
-            routing=routing,
-            topk_weights=topk_weights,
-            routed_scaling_factor=routed_scaling_factor,
-            token_rank=token_rank,
-            config=config["reduce"],
-        )
-        self.finish_shared_rank_finalize(
-            row_state,
-            down_masked=down_masked,
-            b_down=b_down,
-            routing=routing,
-            topk_weights=topk_weights,
-            routed_scaling_factor=routed_scaling_factor,
-            output=output,
-            token_rank=token_rank,
-            config=config["tail"],
-        )
-
-    def run_shared_rank_reduce(
-        self,
-        row_state,
-        *,
-        bridge: torch.Tensor,
-        routing: RouteView,
-        topk_weights: torch.Tensor,
-        routed_scaling_factor: float | None,
-        token_rank: torch.Tensor,
-        config: Mapping[str, int],
-    ) -> None:
-        """Launch the shared-rank reduction. It does not wait for the base W2 GEMM."""
-        from sglang.srt.lora.moe.base_gemm_provider.masked_finalize import (
-            invoke_shared_rank_reduce,
-        )
-
-        # This launch reads pair data only. ``row_state`` stays in the
-        # signature so that every stage takes the same arguments.
-        del row_state
-        invoke_shared_rank_reduce(
-            bridge=bridge,
-            routing=routing,
-            topk_weights=topk_weights,
-            routed_scaling_factor=routed_scaling_factor,
-            token_rank=token_rank,
-            config=config,
-        )
-
-    def finish_shared_rank_finalize(
-        self,
-        row_state,
-        *,
-        down_masked: torch.Tensor,
-        b_down: torch.Tensor,
-        routing: RouteView,
-        topk_weights: torch.Tensor,
-        routed_scaling_factor: float | None,
-        output: torch.Tensor,
-        token_rank: torch.Tensor,
-        config: Mapping[str, int],
-    ) -> None:
-        """Finish the shared-rank path.
-
-        Wait for the base W2 GEMM and the reduction. Then finalize the base
-        rows and add the shared-B tail.
-        """
-        from sglang.srt.lora.moe.base_gemm_provider.masked_finalize import (
-            invoke_shared_from_scratch_finalize,
-        )
-
-        invoke_shared_from_scratch_finalize(
-            down_masked=down_masked,
-            src2dst=row_state.src2dst,
-            token_rank=token_rank,
-            b_down=b_down,
-            routing=routing,
-            topk_weights=topk_weights,
-            routed_scaling_factor=routed_scaling_factor,
-            output=output,
-            num_local_experts=self.num_local_experts,
-            config=config,
         )
 
     # The runner allocates every buffer, so it asks the provider for the shapes.

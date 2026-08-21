@@ -183,7 +183,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             consume_base_pdl=consume_base_pdl,
         )
 
-    def run_fused_act(
+    def fused_act(
         self,
         row_state: MaskedRowState,
         family: str,
