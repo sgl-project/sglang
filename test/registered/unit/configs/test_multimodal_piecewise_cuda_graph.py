@@ -115,7 +115,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         args._cuda_graph_config_locked = set()
         return args
 
-    def _resolve_with_varlen(self, args, lacks_varlen):
+    def _resolve_with_varlen(self, args, has_varlen):
         with (
             patch(
                 "sglang.srt.arg_groups.cuda_graph_hook"
@@ -127,8 +127,8 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
             ),
             patch(
                 "sglang.srt.arg_groups.cuda_graph_hook"
-                ".trtllm_mla_lacks_varlen_absorbed",
-                return_value=lacks_varlen,
+                ".trtllm_mla_has_varlen_absorbed",
+                return_value=has_varlen,
             ),
         ):
             apply_cuda_graph_compatibility(args)
@@ -140,7 +140,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         # runs, that reason is gone and the upgrade proceeds.
         args = self._trtllm_mla_args()
         self.assertEqual(
-            self._resolve_with_varlen(args, lacks_varlen=False), Backend.TC_PIECEWISE
+            self._resolve_with_varlen(args, has_varlen=True), Backend.TC_PIECEWISE
         )
 
     def test_trtllm_mla_keeps_the_exclusion_without_varlen_absorbed(self):
@@ -148,7 +148,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         # so stay on breakable exactly as before.
         args = self._trtllm_mla_args()
         self.assertEqual(
-            self._resolve_with_varlen(args, lacks_varlen=True), Backend.BREAKABLE
+            self._resolve_with_varlen(args, has_varlen=False), Backend.BREAKABLE
         )
 
     def test_explicit_tc_piecewise_overrides_trtllm_mla_default(self):
