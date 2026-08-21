@@ -14,20 +14,20 @@ logger = logging.getLogger(__name__)
 
 
 def _is_blackwell() -> bool:
-    """True iff running on SM100+ (Blackwell), where the chunk prefill kernels run."""
+    """True iff running on the SM100/SM103 family supported by chunk prefill."""
     if not torch.cuda.is_available():
         return False
     major, _ = torch.cuda.get_device_capability()
-    return major >= 10
+    return major == 10
 
 
 class CuteDSLKDAKernel(LinearAttnKernelBase):
     """CuTe DSL kernel for KDA.
 
     Decode: ``cutedsl_fused_sigmoid_gating_kda_update`` (SM90+).
-    Extend (prefill): SM100 chunk pipeline ``chunk_kda_cutedsl`` (SM100+ only,
-    ``head_k_dim`` must be 128). On SM90 the prefill path is unsupported; callers
-    query :attr:`supports_prefill` and fall back to Triton.
+    Extend (prefill): SM100 chunk pipeline ``chunk_kda_cutedsl`` (SM100/SM103
+    only, ``head_k_dim`` must be 128). On other architectures the prefill path is
+    unsupported; callers query :attr:`supports_prefill` and fall back to Triton.
     """
 
     def __init__(self):
@@ -45,7 +45,7 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
                 else -1
             )
             raise RuntimeError(
-                f"CuTe DSL KDA prefill requires SM100+ (Blackwell); got SM{major}."
+                f"CuTe DSL KDA prefill requires SM100/SM103; got SM{major}."
             )
         if head_k_dim != 128:
             raise RuntimeError(
