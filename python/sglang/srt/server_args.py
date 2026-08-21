@@ -3652,6 +3652,7 @@ class ServerArgs:
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
         self._validate_prefill_decode_interval()
+        self._validate_prefill_max_requests()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -8610,6 +8611,10 @@ class ServerArgs:
     def _validate_prefill_decode_interval(self):
         if self.prefill_decode_interval < 0:
             raise ValueError("--prefill-decode-interval must be non-negative.")
+
+    def _validate_prefill_max_requests(self) -> None:
+        if self.prefill_max_requests is not None and self.prefill_max_requests <= 0:
+            raise ValueError("--prefill-max-requests must be positive when set.")
 
     def _handle_other_validations(self):
         if self.default_chat_template_kwargs is not None and not isinstance(
