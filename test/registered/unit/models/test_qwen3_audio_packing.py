@@ -1,4 +1,4 @@
-"""Regression tests for heterogeneous Qwen3-Omni audio batches."""
+"""Regression tests for heterogeneous Qwen3 Omni/ASR audio batches."""
 
 from types import SimpleNamespace
 
@@ -8,6 +8,7 @@ import torch.nn as nn
 
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.models.qwen3_asr import Qwen3ASRForConditionalGeneration
 from sglang.srt.models.qwen3_omni_moe import (
     Qwen3OmniMoeThinkerForConditionalGeneration,
     _pack_audio_features,
@@ -42,6 +43,13 @@ class _RecordingAudioTower(nn.Module):
 
 class _FakeQwen3OmniThinker:
     get_audio_feature = Qwen3OmniMoeThinkerForConditionalGeneration.get_audio_feature
+
+    def __init__(self):
+        self.audio_tower = _RecordingAudioTower()
+
+
+class _FakeQwen3ASR:
+    get_audio_feature = Qwen3ASRForConditionalGeneration.get_audio_feature
 
     def __init__(self):
         self.audio_tower = _RecordingAudioTower()
@@ -114,6 +122,54 @@ def test_cross_request_mm_batch_encodes_heterogeneous_audio_once():
         torch.cat([features_900[0], features_700[0]], dim=1),
     )
     torch.testing.assert_close(embeddings[900], features_900[0].transpose(0, 1))
+    torch.testing.assert_close(embeddings[700], features_700[0].transpose(0, 1))
+
+
+def test_qwen3_asr_packs_multi_sample_and_heterogeneous_items_once():
+    features_900 = torch.arange(4 * 900, dtype=torch.float32).reshape(2, 2, 900)
+    features_700 = (
+        torch.arange(2 * 700, dtype=torch.float32).reshape(1, 2, 700) + 10_000
+    )
+    item_900 = _audio_item(features_900, torch.ones(2, 900, dtype=torch.long))
+    item_700 = _audio_item(features_700, torch.ones(1, 700, dtype=torch.long))
+    item_900.hash = 1_800
+    item_700.hash = 700
+
+    requests = [
+        mm_schedule.PerImageRequestInfo(
+            req_idx=0,
+            items=[item_900],
+            items_offset=[(0, 1799)],
+            extend_prefix_len=0,
+            extend_seq_len=1800,
+        ),
+        mm_schedule.PerImageRequestInfo(
+            req_idx=1,
+            items=[item_700],
+            items_offset=[(0, 699)],
+            extend_prefix_len=0,
+            extend_seq_len=700,
+        ),
+    ]
+    model = _FakeQwen3ASR()
+    mm_schedule.init_mm_embedding_cache(1 << 20)
+
+    embeddings = mm_schedule._batch_encode_per_image_misses(
+        model.get_audio_feature,
+        requests,
+        torch.device("cpu"),
+    )
+
+    assert len(model.audio_tower.calls) == 1
+    packed, feature_lens = model.audio_tower.calls[0]
+    expected_900 = torch.cat([features_900[0], features_900[1]], dim=1)
+    assert packed.shape == (2, 2500)
+    assert feature_lens.tolist() == [900, 900, 700]
+    torch.testing.assert_close(
+        packed,
+        torch.cat([expected_900, features_700[0]], dim=1),
+    )
+    torch.testing.assert_close(embeddings[1_800], expected_900.transpose(0, 1))
     torch.testing.assert_close(embeddings[700], features_700[0].transpose(0, 1))
 
 
