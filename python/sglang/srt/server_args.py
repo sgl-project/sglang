@@ -4596,9 +4596,12 @@ class ServerArgs:
             self.cuda_graph_config.prefill.backend == Backend.BREAKABLE
             and self.get_model_config().is_multimodal_piecewise_cuda_graph_supported
             and not self.get_model_config().is_multimodal_breakable_cuda_graph_supported
-            # Keep trtllm_mla on the preferred breakable path, which now serves
-            # MLA by falling back to the flashinfer MLA impl for extend.
-            and self._resolved_attention_backends()[0] != "trtllm_mla"
+            # trtllm_mla was excluded here while any captured prefill graph forced
+            # it onto the FlashInfer paged-MLA fallback. It now serves that extend
+            # with absorbed MLA over a ragged q, so keep the exclusion only for the
+            # configurations where that path is unavailable and the fallback (and
+            # its regression) would come back.
+            and not self._trtllm_mla_lacks_varlen_absorbed()
         ):
             logger.info(
                 "Using tc_piecewise CUDA graph for validated multimodal "
@@ -4612,6 +4615,20 @@ class ServerArgs:
             self._disable_breakable_cudagraph_if_incompatible()
         elif self.cuda_graph_config.prefill.backend == Backend.FULL:
             self._disable_full_prefill_cudagraph_if_incompatible()
+
+    def _trtllm_mla_lacks_varlen_absorbed(self) -> bool:
+        """True when prefill runs on trtllm_mla but the backend cannot serve a
+        captured-graph extend with absorbed MLA over a ragged query, so a
+        tc_piecewise upgrade would land it back on the FlashInfer paged-MLA
+        fallback. Reads the backend's own predicate so the two cannot drift.
+        """
+        if self._resolved_attention_backends()[0] != "trtllm_mla":
+            return False
+        from sglang.srt.layers.attention.trtllm_mla_backend import (
+            varlen_absorbed_mla_supported,
+        )
+
+        return not varlen_absorbed_mla_supported(self.kv_cache_dtype)
 
     def _apply_cuda_graph_disaggregation_roles(self):
         if self.disaggregation_mode == "prefill":
