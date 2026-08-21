@@ -19,7 +19,10 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.unified_cache import unified_tree_core
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+    UnifiedTreeCore,
+    UnifiedTreeNode,
+)
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
@@ -1132,11 +1135,11 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller._enqueue_direct_dispatch.assert_called_once_with(
             controller._merge_and_start_writing_ops,
             [op],
-            dependency=ready_event,
+            dependency=(ready_event,),
         )
         controller.move_hybrid_indices.assert_not_called()
 
-    def test_hybrid_merge_keeps_latest_device_value_dependency(self):
+    def test_hybrid_merge_keeps_each_node_device_value_dependency(self):
         first_event = object()
         latest_event = object()
         ops = [
@@ -1156,7 +1159,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
         merged = CacheOperation.merge_ops(ops)
 
-        self.assertIs(merged.device_values_ready_event, latest_event)
+        self.assertEqual(
+            merged.device_values_ready_event, (first_event, latest_event)
+        )
 
     def test_direct_hybrid_normalizes_aux_indices_on_helper_path(self):
         controller = HybridCacheController.__new__(HybridCacheController)
@@ -1181,20 +1186,30 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
         self.assertEqual(transfers[0].device_indices.dtype, torch.int64)
 
-    def test_tree_readiness_event_records_only_a_narrow_current_stream_point(self):
+    def test_tree_readiness_events_are_owned_by_each_node(self):
         tree = UnifiedTreeCore.__new__(UnifiedTreeCore)
         tree.device = torch.device("cuda")
-        event = mock.Mock()
+        first_node = UnifiedTreeNode(())
+        second_node = UnifiedTreeNode(())
+        tree._node_arena = {
+            first_node.id: first_node,
+            second_node.id: second_node,
+        }
+        first_event = mock.Mock()
+        second_event = mock.Mock()
         fake_device_module = mock.Mock()
-        fake_device_module.Event.return_value = event
+        fake_device_module.Event.side_effect = [first_event, second_event]
 
         with mock.patch.object(
             unified_tree_core, "device_module", fake_device_module
         ):
-            tree._record_device_values_ready()
+            tree._record_device_values_ready(first_node)
+            tree._record_device_values_ready(second_node)
 
-        event.record.assert_called_once_with()
-        self.assertIs(tree.device_values_ready_event(), event)
+        first_event.record.assert_called_once_with()
+        second_event.record.assert_called_once_with()
+        self.assertIs(tree.device_values_ready_event(first_node.id), first_event)
+        self.assertIs(tree.device_values_ready_event(second_node.id), second_event)
 
     def test_cache_controller_can_defer_write_submission_for_batching(self):
         controller = HiCacheController.__new__(HiCacheController)

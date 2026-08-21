@@ -225,7 +225,7 @@ class MambaComponent(TreeComponent):
         assert params.mamba_value is not None
         if is_new_leaf:
             node.component_data[self.component_type].value = params.mamba_value
-            self.tree_core._record_device_values_ready()
+            self.tree_core._record_device_values_ready(node)
             self.tree_core.lru_lists[self.component_type].insert_mru(node)
             self.tree_core.component_evictable_size_[self.component_type] += len(
                 params.mamba_value
@@ -234,7 +234,7 @@ class MambaComponent(TreeComponent):
             return
         if node.component_data[self.component_type].value is None:
             node.component_data[self.component_type].value = params.mamba_value
-            self.tree_core._record_device_values_ready()
+            self.tree_core._record_device_values_ready(node)
             # move from host LRU to device LRU
             host_lru = self.tree_core.host_lru_lists[self.component_type]
             if host_lru.in_list(node):
@@ -795,7 +795,7 @@ class MambaComponent(TreeComponent):
             if transfer.device_indices is not None:
                 cd = node.component_data[ct]
                 cd.value = transfer.device_indices.clone()
-                self.tree_core._record_device_values_ready()
+                self.tree_core._record_device_values_ready(node)
                 count = len(cd.value)
                 # Move from host LRU to device LRU
                 host_lru = self.tree_core.host_lru_lists[ct]
