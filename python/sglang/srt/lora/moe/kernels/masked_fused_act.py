@@ -24,7 +24,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.lora.moe.activation import ActivationFn
-from sglang.srt.lora.moe.base_gemm_provider.masked_activation import (
+from sglang.srt.lora.moe.kernels.masked_activation import (
     apply_activation,
 )
 from sglang.srt.lora.moe.route_view import RouteView

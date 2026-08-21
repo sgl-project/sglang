@@ -26,11 +26,22 @@ register_cpu_ci(est_time=3, suite="base-c-test-cpu")
 ROOT = Path(__file__).resolve().parents[4]
 LORA_MOE = ROOT / "python/sglang/srt/lora/moe"
 PROVIDER = LORA_MOE / "base_gemm_provider"
+KERNELS = LORA_MOE / "kernels"
 EP_MOE = ROOT / "python/sglang/kernels/ops/moe/ep_moe_kernels.py"
 
 
 def _source(name: str) -> str:
-    return (PROVIDER / name).read_text()
+    """Read a module by file name from either package.
+
+    The Triton kernels moved to moe/kernels while the providers stayed in
+    base_gemm_provider, so look in both rather than making every caller say
+    which one it means.
+    """
+    for base in (PROVIDER, KERNELS):
+        path = base / name
+        if path.exists():
+            return path.read_text()
+    raise AssertionError(f"{name!r} is in neither {PROVIDER} nor {KERNELS}")
 
 
 def _function(source: str, name: str) -> str:
@@ -53,8 +64,8 @@ class TestMaskedFusionSource(unittest.TestCase):
         # The benchmarks still use the A-to-B chain of Programmatic Dependent
         # Launch (PDL), so the kernels must keep it. The serving runner does
         # not use PDL. An A-to-B edge measured no better than launch order.
-        a = (LORA_MOE / "lora_a.py").read_text()
-        b = (LORA_MOE / "lora_b.py").read_text()
+        a = (KERNELS / "lora_a.py").read_text()
+        b = (KERNELS / "lora_b.py").read_text()
         runner = (LORA_MOE / "moe_lora_runner.py").read_text()
 
         grouped_a = _function(a, "_grouped_lora_a_kernel")
@@ -165,6 +176,7 @@ class TestMaskedFusionSource(unittest.TestCase):
             "sglang.srt.lora",
             "sglang.srt.lora.moe",
             "sglang.srt.lora.moe.base_gemm_provider",
+            "sglang.srt.lora.moe.kernels",
         ):
             package = types.ModuleType(name)
             package.__path__ = []
@@ -397,6 +409,7 @@ class TestMaskedFusionSource(unittest.TestCase):
             "sglang.srt.lora",
             "sglang.srt.lora.moe",
             "sglang.srt.lora.moe.base_gemm_provider",
+            "sglang.srt.lora.moe.kernels",
         ):
             package = types.ModuleType(name)
             package.__path__ = []
@@ -413,27 +426,19 @@ class TestMaskedFusionSource(unittest.TestCase):
         quant.MoeLoraBf16QuantInfo = object
         ep = types.ModuleType("sglang.kernels.ops.moe.ep_moe_kernels")
         ep.post_reorder_deepgemm = lambda *_args, **_kwargs: None
-        activation = types.ModuleType(
-            "sglang.srt.lora.moe.base_gemm_provider.masked_activation"
-        )
+        activation = types.ModuleType("sglang.srt.lora.moe.kernels.masked_activation")
         activation.act_delta_masked = lambda *_args, **_kwargs: None
-        dispatch = types.ModuleType(
-            "sglang.srt.lora.moe.base_gemm_provider.masked_dispatch"
-        )
+        dispatch = types.ModuleType("sglang.srt.lora.moe.kernels.masked_dispatch")
         dispatch.fused_masked_preprocess = lambda *_args, **_kwargs: None
-        finalize = types.ModuleType(
-            "sglang.srt.lora.moe.base_gemm_provider.masked_finalize"
-        )
+        finalize = types.ModuleType("sglang.srt.lora.moe.kernels.masked_finalize")
         finalize.MASKED_FINALIZE_TRITON = "triton"
         finalize.invoke_shared_from_scratch_finalize = lambda **_kwargs: None
         finalize.invoke_shared_rank_reduce = lambda **_kwargs: None
-        act = types.ModuleType(
-            "sglang.srt.lora.moe.base_gemm_provider.masked_fused_act"
-        )
+        act = types.ModuleType("sglang.srt.lora.moe.kernels.masked_fused_act")
         act.MASKED_ACT_FAMILIES = ("b_activation",)
         act.MASKED_ACT_TRITON = "triton"
         act.run_masked_fused_act = lambda *_args, **_kwargs: None
-        into_base = types.ModuleType("sglang.srt.lora.moe.lora_b")
+        into_base = types.ModuleType("sglang.srt.lora.moe.kernels.lora_b")
         into_base.invoke_down_b_into_base = lambda *_args, **_kwargs: None
 
         base_spec.loader.exec_module(base)
@@ -541,6 +546,7 @@ class TestMaskedFusionSource(unittest.TestCase):
             "sglang.srt.lora",
             "sglang.srt.lora.moe",
             "sglang.srt.lora.moe.base_gemm_provider",
+            "sglang.srt.lora.moe.kernels",
         ):
             package = types.ModuleType(name)
             package.__path__ = []

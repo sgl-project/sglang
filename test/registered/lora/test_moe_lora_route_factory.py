@@ -94,14 +94,12 @@ def _load_launch_config():
         package = types.ModuleType(name)
         package.__path__ = []
         packages[name] = package
-    finalize = types.ModuleType(
-        "sglang.srt.lora.moe.base_gemm_provider.masked_finalize"
-    )
+    finalize = types.ModuleType("sglang.srt.lora.moe.kernels.masked_finalize")
     finalize.SHARED_RANK_DEFAULT_CONFIG = {
         "reduce": {"BLOCK_SIZE_T": 16},
         "tail": {"BLOCK_SIZE_H": 16},
     }
-    act = types.ModuleType("sglang.srt.lora.moe.base_gemm_provider.masked_fused_act")
+    act = types.ModuleType("sglang.srt.lora.moe.kernels.masked_fused_act")
     act.FUSED_B_ACT_DEFAULT_CONFIG = {"BLOCK_SIZE_W": 16}
     module_name = "_host_launch_config"
     spec = importlib.util.spec_from_file_location(
@@ -184,7 +182,7 @@ def _load_routing():
 
             return launch
 
-    route_kernels = types.ModuleType("sglang.srt.lora.moe.route_kernels")
+    route_kernels = types.ModuleType("sglang.srt.lora.moe.kernels.routing")
     for kernel in (
         "_build_virtual_topk_ids_kernel",
         "_hist_kernel",
@@ -450,7 +448,7 @@ class TestRoutePdlWiring(unittest.TestCase):
             self.assertNotIn("launch_pdl", recorder.calls[0][2])
 
     def test_kernel_dependency_operations_are_complete(self):
-        source = (LORA_MOE / "route_kernels.py").read_text()
+        source = (LORA_MOE / "kernels" / "routing.py").read_text()
         tree = ast.parse(source)
         function_nodes = {
             node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)

@@ -427,7 +427,7 @@ def _post_reorder(down_rows, output, src2dst, topk_ids, topk_weights, lora_delta
 def test_into_base_matches_the_standalone_downb_plus_post_reorder(
     row_domain: str, num_tokens: int, top_k: int, num_experts: int
 ) -> None:
-    from sglang.srt.lora.moe.lora_b import (
+    from sglang.srt.lora.moe.kernels.lora_b import (
         invoke_down_b_into_base,
         one_launch_sliced_lora_b,
     )
@@ -554,7 +554,7 @@ def test_into_base_matches_the_standalone_downb_plus_post_reorder(
 
 @cuda_only
 def test_into_base_rejects_a_mismatched_route_block() -> None:
-    from sglang.srt.lora.moe.lora_b import (
+    from sglang.srt.lora.moe.kernels.lora_b import (
         invoke_down_b_into_base,
     )
     from sglang.srt.lora.moe.route_view import RouteViewKind

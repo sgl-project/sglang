@@ -43,13 +43,13 @@ from sglang.srt.lora.moe.execution_plan import (
     architecture_for_capability,
     resolve_plans,
 )
+from sglang.srt.lora.moe.kernels.lora_a import run_lora_a
+from sglang.srt.lora.moe.kernels.lora_b import invoke_down_b_into_base, run_lora_b
 from sglang.srt.lora.moe.launch_config import (
     MoeLoraLaunchConfig,
     TileTable,
     resolve_tiles,
 )
-from sglang.srt.lora.moe.lora_a import run_lora_a
-from sglang.srt.lora.moe.lora_b import invoke_down_b_into_base, run_lora_b
 from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
 from sglang.srt.lora.moe.route_view import RouteView
 from sglang.srt.lora.moe.routing import MoeLoraRoutes, build_routes

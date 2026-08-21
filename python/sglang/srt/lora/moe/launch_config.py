@@ -7,18 +7,18 @@ from typing import Any, Mapping
 import pydantic
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 
-from sglang.srt.lora.moe.base_gemm_provider.masked_finalize import (
-    SHARED_RANK_DEFAULT_CONFIG,
-)
-from sglang.srt.lora.moe.base_gemm_provider.masked_fused_act import (
-    FUSED_B_ACT_DEFAULT_CONFIG,
-)
 from sglang.srt.lora.moe.execution_plan import (
     ActFamily,
     DeviceArchitecture,
     MoeLoraExecutionPlan,
     RouteRequirement,
     Site,
+)
+from sglang.srt.lora.moe.kernels.masked_finalize import (
+    SHARED_RANK_DEFAULT_CONFIG,
+)
+from sglang.srt.lora.moe.kernels.masked_fused_act import (
+    FUSED_B_ACT_DEFAULT_CONFIG,
 )
 
 

@@ -16,7 +16,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.moe.route_kernels import virtual_expert_ids_inline
+from sglang.srt.lora.moe.kernels.routing import virtual_expert_ids_inline
 from sglang.srt.lora.moe.route_view import RouteView
 
 if TYPE_CHECKING:

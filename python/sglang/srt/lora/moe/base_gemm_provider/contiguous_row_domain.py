@@ -23,10 +23,10 @@ from sglang.srt.lora.moe.activation import ActivationFn
 from sglang.srt.lora.moe.base_gemm_provider.base import (
     MoeBaseProvider,
 )
-from sglang.srt.lora.moe.base_gemm_provider.masked_activation import (
+from sglang.srt.lora.moe.kernels.masked_activation import (
     _activation_delta_masked_kernel,
 )
-from sglang.srt.lora.moe.base_gemm_provider.masked_fused_act import (
+from sglang.srt.lora.moe.kernels.masked_fused_act import (
     MASKED_ACT_FAMILIES,
     _b_act_kernel,
     _is_power_of_two,

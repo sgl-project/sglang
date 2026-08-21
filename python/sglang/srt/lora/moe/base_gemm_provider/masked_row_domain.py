@@ -76,17 +76,17 @@ class MaskedRowDomainProvider(MoeBaseProvider):
 
         # This constructor runs once, when the LoRA attaches. These imports run
         # here so that no forward pass runs an import.
-        from sglang.srt.lora.moe.base_gemm_provider.masked_activation import (
+        from sglang.srt.lora.moe.kernels.masked_activation import (
             act_delta_masked,
         )
-        from sglang.srt.lora.moe.base_gemm_provider.masked_dispatch import (
+        from sglang.srt.lora.moe.kernels.masked_dispatch import (
             fused_masked_preprocess,
         )
 
         self._preprocess = fused_masked_preprocess
         self._act_kernel = act_delta_masked
 
-        from sglang.srt.lora.moe.base_gemm_provider.masked_fused_act import (
+        from sglang.srt.lora.moe.kernels.masked_fused_act import (
             run_masked_fused_act,
         )
 

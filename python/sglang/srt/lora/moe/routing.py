@@ -21,7 +21,7 @@ from sglang.srt.lora.moe.execution_plan import (
     RouteBuilderFamily,
     RouteRequirement,
 )
-from sglang.srt.lora.moe.route_kernels import (
+from sglang.srt.lora.moe.kernels.routing import (
     _build_virtual_topk_ids_kernel,
     _hist_kernel,
     _place_kernel,

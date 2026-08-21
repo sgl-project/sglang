@@ -8,7 +8,7 @@ from sglang.srt.lora.moe.execution_plan import (
     LoraBSpec,
     Site,
 )
-from sglang.srt.lora.moe.lora_b import (
+from sglang.srt.lora.moe.kernels.lora_b import (
     indexed_pairs_lora_b,
     one_launch_sliced_lora_b,
     run_lora_b,
