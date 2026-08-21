@@ -122,21 +122,14 @@ export const config = {
           // selector projects through the target lm_head — including
           // quantized heads — so it runs on the NVFP4 checkpoint too.
           // Validated on the SM120 pair (NVFP4 measured end to end; the
-          // RTX PRO 6000 BF16/FP8 cells boot-and-serve). On the other
-          // platforms the pick is offered with the in-progress hint below
-          // — the recipe composes from validated cells but has not been
-          // exercised there yet.
+          // RTX PRO 6000 BF16/FP8 cells boot-and-serve). The platforms where
+          // it has not been exercised carry verificationStatus "in-progress"
+          // on their cells.
           disabled: (sel) => sel.hw === "rtx5090" && sel.quant !== "nvfp4",
           disableReason:
             "On the 32GB RTX 5090 the DFlash2 draft model only fits on top of the NVFP4 weights",
-          hints: (sel) =>
-            ["rtx6000", "rtx5090"].includes(sel.hw)
-              ? []
-              : ["DFLASH2 on this platform: final verification in progress"],
-          // 5090: mem-fraction re-pins like DSPARK's, and fp32 additionally
-          // re-pins the ratio — the balanced L=9216 value leaves the state
-          // pool one slot short at every serviceable mem-fraction (see the
-          // DFlash2 bullet in Configuration Tips).
+          // fp32 is the one case that needs the balanced ratio overridden, so
+          // that family is stripped too and re-emitted below.
           stripPrefixes: (sel) =>
             sel.hw === "rtx5090"
               ? sel.ssmDtype === "float32"
@@ -147,15 +140,19 @@ export const config = {
             "--speculative-algorithm DFLASH",
             "--speculative-draft-model-path incoai/Qwen3.8-27B-DFlash2",
             "--speculative-num-draft-tokens 8",
-            // Measured on the 5090: bf16 state serves at 0.90 (DSPARK's
-            // pin); fp32 fits only at 0.945 + ratio 10 (0.94 is one state
-            // slot short, 0.95 OOMs at runtime) and leaves the Low-Latency
-            // KV pool a single-request envelope.
+            // Measured on the 5090 at commit 1cf2b8c, the build the Install
+            // accordion pins for this pick. bf16 serves at 0.88 on the balanced
+            // ratio (0.90, DSPARK's pin, OOMs on the first request). fp32 needs
+            // 0.895 AND the balanced ratio overridden to 10: these cells pin
+            // --max-running-requests 1, so the balanced value provisions KV for
+            // concurrency this recipe never uses, starving the state pool of the
+            // slots fp32 needs. Only High-Throughput reaches fp32 (S=4); the SSM
+            // dtype row greys fp32 out for Low-Latency (S=5).
             ...(sel.hw === "rtx5090"
               ? sel.ssmDtype === "float32"
-                ? ["--mem-fraction-static 0.945",
+                ? ["--mem-fraction-static 0.895",
                    "--mamba-full-memory-ratio 10"]
-                : ["--mem-fraction-static 0.90"]
+                : ["--mem-fraction-static 0.88"]
               : []),
           ],
         },
@@ -191,9 +188,33 @@ export const config = {
       title: "Mamba SSM Dtype",
       default: "float32",
       options: [
-        // Open on every platform, including with DSPARK on the 5090 (serves
-        // at mem-fraction 0.92 with the engine-default 2048 prefill chunk).
-        { id: "float32", label: "float32", flags: ["--mamba-ssm-dtype float32"] },
+        // Open on every platform except the 32GB RTX 5090 under DFLASH2:
+        // there the fp32 state pool and the prefill CUDA-graph capture cannot
+        // both fit, at any mem-fraction. Measured on main (2026-08-21, ratio
+        // pinned at 10 so slots are not the binding term): 0.945 and 0.92 OOM
+        // inside `Capture target prefill CUDA graph`, 0.90 OOMs on the first
+        // request, and 0.88 / 0.86 / 0.84 size the state pool below the 5 (LL)
+        // / 4 (HT) slots one request needs. bf16 state halves the pool and
+        // serves, and is the faster cell there anyway.
+        {
+          id: "float32", label: "float32",
+          // Only the Low-Latency tier is out of reach: it needs S=5 fp32 slots
+          // (735MB) plus >=9216 KV tokens for one request, and no mem-fraction
+          // holds both -- at 0.8975/r14 the pool buys the 5th slot but KV falls
+          // to 7752 tokens and generation stops after one token, while every
+          // mem-fraction with a big enough pool (>=0.90) dies in graph capture.
+          // High-Throughput needs one slot fewer and does fit; see the DFLASH2
+          // option's pins.
+          disabled: (sel) =>
+            sel.hw === "rtx5090" &&
+            sel.spec === "dflash" &&
+            sel.tier === "low-latency",
+          disableReason:
+            "On the 32GB RTX 5090 the Low-Latency tier cannot hold five fp32 state " +
+            "slots and a full request's KV at once — use bfloat16, or the " +
+            "High-Throughput tier which fits fp32",
+          flags: ["--mamba-ssm-dtype float32"],
+        },
         {
           id: "bfloat16", label: "bfloat16",
           disabled: (sel) => sel.hw === "rtx5090" && sel.quant !== "nvfp4",
@@ -405,6 +426,10 @@ export const config = {
       // runnable, but not a recipe this page ships.
       match: { hw: "h200", variant: "default", quant: "fp8", nodes: "single" },
       verified: true,
+      // DFLASH2 has not been exercised on this platform; every other overlay
+      // pick keeps this cell's original validation.
+      verificationStatus: (sel) =>
+        sel.spec === "dflash" ? "in-progress" : "verified",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -424,6 +449,10 @@ export const config = {
       // H200, BF16 reference checkpoint (~54GB of weights).
       match: { hw: "h200", variant: "default", quant: "bf16", nodes: "single" },
       verified: true,
+      // DFLASH2 has not been exercised on this platform; every other overlay
+      // pick keeps this cell's original validation.
+      verificationStatus: (sel) =>
+        sel.spec === "dflash" ? "in-progress" : "verified",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -545,6 +574,10 @@ export const config = {
       // exercises the 4-bit `lm_head` this checkpoint quantizes, with no shape
       // error.
       verified: true,
+      // DFLASH2 has not been exercised on this platform; every other overlay
+      // pick keeps this cell's original validation.
+      verificationStatus: (sel) =>
+        sel.spec === "dflash" ? "in-progress" : "verified",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -563,6 +596,10 @@ export const config = {
       match: { hw: "dgx-spark", variant: "default", quant: "fp8", nodes: "single" },
       // All 12 overlay combinations served on GB10.
       verified: true,
+      // DFLASH2 has not been exercised on this platform; every other overlay
+      // pick keeps this cell's original validation.
+      verificationStatus: (sel) =>
+        sel.spec === "dflash" ? "in-progress" : "verified",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -582,6 +619,10 @@ export const config = {
       // All 12 overlay combinations served on GB10. Heaviest checkpoint, so
       // it holds the sweep's tightest cell: DSPARK + float32 + extra_buffer.
       verified: true,
+      // DFLASH2 has not been exercised on this platform; every other overlay
+      // pick keeps this cell's original validation.
+      verificationStatus: (sel) =>
+        sel.spec === "dflash" ? "in-progress" : "verified",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -603,6 +644,10 @@ export const config = {
     {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", nodes: "single" },
       verified: true,
+      // DFLASH2 has not been exercised on this platform; every other overlay
+      // pick keeps this cell's original validation.
+      verificationStatus: (sel) =>
+        sel.spec === "dflash" ? "in-progress" : "verified",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -619,6 +664,10 @@ export const config = {
     {
       match: { hw: "gb300", variant: "default", quant: "fp8", nodes: "single" },
       verified: true,
+      // DFLASH2 has not been exercised on this platform; every other overlay
+      // pick keeps this cell's original validation.
+      verificationStatus: (sel) =>
+        sel.spec === "dflash" ? "in-progress" : "verified",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -635,6 +684,10 @@ export const config = {
     {
       match: { hw: "gb300", variant: "default", quant: "bf16", nodes: "single" },
       verified: true,
+      // DFLASH2 has not been exercised on this platform; every other overlay
+      // pick keeps this cell's original validation.
+      verificationStatus: (sel) =>
+        sel.spec === "dflash" ? "in-progress" : "verified",
       env: [],
       flags: [
         "--trust-remote-code",
