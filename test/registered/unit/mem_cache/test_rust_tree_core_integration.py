@@ -311,6 +311,28 @@ def test_extra_key_isolates_namespaces():
         MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3]), extra_key="other"))
     )
     assert other.device_indices.numel() == 0
+    assert core.prefetch_anchor_info(salted.best_match_node) == ("salt", None)
+    assert core.prefetch_anchor_info(core.root_node_handle()) == (None, None)
+
+
+def test_cache_salt_is_rejected_by_all_key_entry_points():
+    core = _tree_core()
+    key = RadixKey(array("q", [1, 2]), cache_salt="tenant-a")
+    message = "experimental Rust unified tree core"
+
+    with pytest.raises(ValueError, match=message):
+        core.match_prefix(MatchPrefixParams(key=key))
+    with pytest.raises(ValueError, match=message):
+        core.begin_insert(
+            InsertParams(key=key, value=torch.tensor([10, 11], dtype=torch.int64))
+        )
+    with pytest.raises(ValueError, match=message):
+        core.insert_host(
+            core.root_node_handle(),
+            key,
+            torch.tensor([100, 101], dtype=torch.int64),
+            ["h0", "h1"],
+        )
 
 
 def test_page_size_two_drops_the_ragged_tail():
