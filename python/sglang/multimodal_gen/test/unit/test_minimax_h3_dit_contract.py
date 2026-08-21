@@ -25,8 +25,10 @@ from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MINIMAX_H3_FP32_BUFFER_NAMES,
     MINIMAX_H3_FP32_PARAM_NAMES,
+    MiniMaxH3DiTBlock,
     MiniMaxH3DiTModel,
     _copy_grouped_qkv_tp_shard,
+    _modulate_gate,
     _reorder_grouped_qkv_to_qkv,
 )
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
@@ -95,36 +97,145 @@ def test_native_weight_names_and_grouped_qkv_reorder():
     ).reshape(12, 1)
     torch.testing.assert_close(actual, expected)
 
-    grouped = torch.arange(48, dtype=torch.int16).reshape(24, 2).view(torch.bfloat16)
-    reordered = _reorder_grouped_qkv_to_qkv(
-        grouped,
-        num_query_groups=4,
-        heads_per_group=1,
-        head_dim=2,
+    for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+        grouped = torch.arange(48, dtype=torch.float32).reshape(24, 2).to(dtype)
+        reordered = _reorder_grouped_qkv_to_qkv(
+            grouped,
+            num_query_groups=4,
+            heads_per_group=1,
+            head_dim=2,
+        )
+        for tp_size in (1, 2, 4):
+            local_rows = 8 // tp_size
+            for tp_rank in range(tp_size):
+                start = tp_rank * local_rows
+                param = torch.nn.Parameter(
+                    torch.empty(3 * local_rows, 2, dtype=dtype),
+                    requires_grad=False,
+                )
+                param.output_dim = 0
+                assert _copy_grouped_qkv_tp_shard(
+                    param,
+                    grouped,
+                    num_query_groups=4,
+                    head_dim=2,
+                    tp_rank=tp_rank,
+                    tp_size=tp_size,
+                )
+                expected_shard = reordered.view(3, 8, 2)[
+                    :, start : start + local_rows
+                ].reshape(-1, 2)
+                assert torch.equal(param, expected_shard)
+
+
+def test_pruned_adaln_curve_interpolates_without_timestep_mlp():
+    model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
+    torch.nn.Module.__init__(model)
+    model.time_embedder = None
+    model.adaln_t_table = torch.nn.Parameter(
+        torch.tensor([[0.0, 2.0], [2.0, 4.0], [4.0, 6.0]]),
+        requires_grad=False,
     )
-    for tp_size in (1, 2, 4):
-        local_rows = 8 // tp_size
-        for tp_rank in range(tp_size):
-            start = tp_rank * local_rows
-            param = torch.nn.Parameter(
-                torch.empty(3 * local_rows, 2, dtype=torch.bfloat16),
-                requires_grad=False,
-            )
-            param.output_dim = 0
-            assert _copy_grouped_qkv_tp_shard(
-                param,
-                grouped,
-                num_query_groups=4,
-                head_dim=2,
-                tp_rank=tp_rank,
-                tp_size=tp_size,
-            )
-            expected_shard = reordered.view(3, 8, 2)[
-                :, start : start + local_rows
-            ].reshape(-1, 2)
-            assert torch.equal(
-                param.view(torch.int16), expected_shard.view(torch.int16)
-            )
+
+    result = model._time_embedding(torch.tensor([0.0, 0.25, 1.0]))
+
+    torch.testing.assert_close(
+        result,
+        torch.tensor([[0.0, 2.0], [1.0, 3.0], [4.0, 6.0]]),
+        rtol=0,
+        atol=0,
+    )
+
+
+class _KwargIdentity(torch.nn.Module):
+    def forward(self, x, **_kwargs):
+        return x
+
+
+def test_cache_dit_preservation_only_makes_first_gate_out_of_place():
+    block = MiniMaxH3DiTBlock.__new__(MiniMaxH3DiTBlock)
+    torch.nn.Module.__init__(block)
+    block.norm1 = torch.nn.Identity()
+    block.norm2 = torch.nn.Identity()
+    block.attn = _KwargIdentity()
+    block.mlp = torch.nn.Identity()
+    gate_modes = []
+
+    def fake_gate(residual, _gate, _other, _indices, *, dtype, allow_inplace=True):
+        gate_modes.append(allow_inplace)
+        return residual.to(dtype)
+
+    def run(preserve):
+        block.preserve_input_for_cache_dit = preserve
+        gate_modes.clear()
+        block(
+            torch.zeros(2, 4),
+            adaln_input=torch.zeros(1, 4),
+            combined_indices=torch.zeros(2, dtype=torch.long),
+            rope_cache=None,
+            cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+            max_seqlen=2,
+            adaln_params=tuple(torch.zeros(1, 4) for _ in range(6)),
+        )
+        return list(gate_modes)
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3._modulate_scale_shift",
+            side_effect=lambda value, *_args, **_kwargs: value,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3._modulate_gate",
+            side_effect=fake_gate,
+        ),
+    ):
+        assert run(preserve=False) == [True, True]
+        # Only the first gated residual can alias the block input Cache-DiT
+        # holds by reference, so only it goes out-of-place. The second works on
+        # a block-local buffer and keeps the fused in-place kernel.
+        assert run(preserve=True) == [False, True]
+
+
+def test_cache_dit_input_preservation_toggles_every_block():
+    model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
+    torch.nn.Module.__init__(model)
+    model.blocks = torch.nn.ModuleList([torch.nn.Identity() for _ in range(5)])
+
+    model.set_cache_dit_input_preservation(True)
+    assert all(block.preserve_input_for_cache_dit for block in model.blocks)
+
+    model.set_cache_dit_input_preservation(False)
+    assert not any(block.preserve_input_for_cache_dit for block in model.blocks)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cache_dit_out_of_place_gate_preserves_cuda_input():
+    x = torch.randn(4, 16, device="cuda", dtype=torch.bfloat16)
+    original = x.clone()
+    gate = torch.randn(2, 16, device="cuda", dtype=torch.bfloat16)
+    other = torch.randn_like(x)
+    indices = torch.tensor([0, 1, 0, 1], device="cuda", dtype=torch.long)
+    expected = _modulate_gate(
+        x.clone(),
+        gate,
+        other,
+        indices,
+        dtype=torch.bfloat16,
+        allow_inplace=True,
+    )
+
+    output = _modulate_gate(
+        x,
+        gate,
+        other,
+        indices,
+        dtype=torch.bfloat16,
+        allow_inplace=False,
+    )
+
+    assert output.data_ptr() != x.data_ptr()
+    torch.testing.assert_close(x, original, rtol=0, atol=0)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
 def test_tp_and_ulysses_admission_uses_tp_local_shapes():
@@ -199,6 +310,27 @@ def test_meta_model_enforces_mixed_precision_weight_contract():
             assert tensor.dtype == torch.float32, name
         elif tensor.is_floating_point():
             assert tensor.dtype == torch.bfloat16, name
+
+
+def test_pruned_meta_model_preserves_curve_adaln_fp32_island():
+    _ensure_single_process_parallel_runtime()
+    config = MiniMaxH3DiTConfig(
+        arch_config=MiniMaxH3DiTArchConfig(
+            adaln_curve_grid=1025,
+            time_embed_dim=8,
+        )
+    )
+    with torch.device("meta"):
+        model = MiniMaxH3DiTModel(
+            config=config,
+            hf_config={},
+            quant_config=None,
+        )
+
+    assert model.time_embedder is None
+    assert model.adaln_t_table.dtype == torch.float32
+    assert model.blocks[0].adaln_proj.linear.weight.dtype == torch.float32
+    assert model.final_layer.adaln_proj.linear.weight.dtype == torch.float32
 
 
 def test_online_fp8_keeps_fp32_boundaries_and_ignored_layers_unquantized():
@@ -307,9 +439,7 @@ def test_packed_qkv_exchange_preserves_rank_and_head_order(_):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cuda_ulysses_qkv_pack_is_bit_exact():
-    from sglang.kernels.ops.diffusion.triton.ulysses_qkv import (
-        pack_qkv_destination_major,
-    )
+    from sglang.kernels.ops.diffusion import pack_qkv_destination_major
 
     torch.manual_seed(23)
     rows, world_size, heads, head_size = 65, 8, 56, 128

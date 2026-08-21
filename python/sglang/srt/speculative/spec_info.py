@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 
 import torch
 
+from sglang.srt.runtime_context import get_spec as get_spec_config
 from sglang.srt.speculative.spec_registry import (
     CustomSpecAlgo,
     ServerArgsValidator,
@@ -127,12 +128,6 @@ class SpeculativeAlgorithm(Enum):
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash_family()
 
-    def is_war_publish_phase(self, forward_mode) -> bool:
-        # The step's last shared-buffer-reading phase owns the WAR read-done publish.
-        if self.is_dflash_family():
-            return forward_mode.is_target_verify()
-        return forward_mode.is_draft_extend_v2()
-
     def supports_ragged_verify(self) -> bool:
         """Whether this algorithm's verify step may carry a RaggedVerifyLayout
         (per-request verify lengths); gates the token-bucket-keyed verify
@@ -178,7 +173,6 @@ class SpeculativeAlgorithm(Enum):
     def build_disagg_draft_input(
         self,
         batch: ScheduleBatch,
-        server_args: ServerArgs,
         last_tokens_tensor: torch.Tensor,
         future_map: FutureMap,
     ) -> Optional[SpecInput]:
@@ -187,16 +181,14 @@ class SpeculativeAlgorithm(Enum):
                 build_eagle_disagg_draft_input,
             )
 
-            return build_eagle_disagg_draft_input(
-                batch, server_args, last_tokens_tensor, future_map
-            )
+            return build_eagle_disagg_draft_input(batch, last_tokens_tensor, future_map)
         if self.is_dspark():
             from sglang.srt.speculative.dspark_disaggregation import (
                 build_dspark_disagg_draft_input,
             )
 
             return build_dspark_disagg_draft_input(
-                batch, server_args, last_tokens_tensor, future_map
+                batch, last_tokens_tensor, future_map
             )
         return None
 
@@ -392,13 +384,19 @@ def spec_scale_global_num_tokens(
 
 def create_dummy_verify_input(
     spec_algorithm: SpeculativeAlgorithm,
-    server_args: ServerArgs,
     custom_mask: torch.Tensor,
     num_tokens_per_req: int,
     is_draft_worker: bool,
 ) -> Optional[SpecInput]:
-    """Dummy verify ``SpecInput`` for CUDA-graph capture (per-algorithm dispatch)."""
+    """Dummy verify ``SpecInput`` for CUDA-graph capture (per-algorithm dispatch).
+
+    The tree shape comes from the bags so the dummy matches the step config
+    being captured; adaptive spec captures each candidate with that config's
+    leaves overridden.
+    """
     from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+    spec = get_spec_config()
 
     spec_info = None
     if spec_algorithm.is_eagle() or spec_algorithm.is_standalone():
@@ -415,9 +413,9 @@ def create_dummy_verify_input(
                 retrieve_next_token=None,
                 retrieve_next_sibling=None,
                 retrieve_cum_len=None,
-                spec_steps=server_args.speculative_num_steps,
-                topk=server_args.speculative_eagle_topk,
-                draft_token_num=server_args.speculative_num_draft_tokens,
+                spec_steps=spec.speculative_num_steps,
+                topk=spec.speculative_eagle_topk,
+                draft_token_num=spec.speculative_num_draft_tokens,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
                 seq_lens_sum=None,
                 seq_lens_cpu=None,
@@ -429,7 +427,7 @@ def create_dummy_verify_input(
         spec_info = DFlashVerifyInput(
             draft_token=None,
             positions=None,
-            draft_token_num=server_args.speculative_num_draft_tokens,
+            draft_token_num=spec.speculative_num_draft_tokens,
             custom_mask=None,
             capture_hidden_mode=(
                 CaptureHiddenMode.NULL if is_draft_worker else CaptureHiddenMode.FULL

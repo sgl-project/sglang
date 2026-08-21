@@ -11,6 +11,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
     sglang_per_token_group_quant_fp8_row_padded,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.runtime_context import get_exec, get_parallel
@@ -23,6 +24,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     fp8_max,
     fp8_min,
+    get_w8a8_channelwise_fp8_config,
     is_fp8_fnuz,
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -113,10 +115,21 @@ def materialize_bpreshuffle_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
 
 
 def view_aiter_fused_rms_transposed_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
-    """Expose AITER fused-RMS ``transpose_scale=True`` storage logically.
+    """Zero-copy view of a ``transpose_scale=True`` fp8 group scale.
 
-    The fused-RMS op returns transposed physical bytes through a row-major-looking
-    view. Restore logical ``[M, G]`` indexing without copying those bytes.
+    Producer-neutral counterpart of ``materialize_bpreshuffle_fp8_scale``. When an
+    AITER quant/fused-RMS kernel is asked for ``transpose_scale=True`` it writes the
+    per-token group scale directly in physical ``[num_groups, tokens]`` byte order
+    behind a row-major-looking ``[tokens, num_groups]`` tensor. Swapping the strides
+    restores logical ``[M, G]`` indexing over those same bytes -- i.e. the
+    column-major layout the gfx95 bpreshuffle GEMM consumes -- with no copy. Callers
+    that instead take the row-major (``transpose_scale=False``) path relayout via
+    ``materialize_bpreshuffle_fp8_scale``; this is the bit-identical no-copy path.
+
+    Only valid for M(tokens) >= 2. At M == 1 the ``[1, G]`` and ``[G, 1]`` byte
+    orders coincide, so producers keep ``transpose_scale=False`` and materialize;
+    the stride swap here would be a no-op on shape but is never taken at M == 1.
+    Non-2-D scales (e.g. per-tensor) pass through unchanged.
     """
     if scale.dim() != 2:
         return scale
@@ -132,6 +145,28 @@ def materialize_bpreshuffle_fp8_scale_tuple(
         materialize_bpreshuffle_fp8_scale(value[1]),
         *value[2:],
     )
+
+
+def view_aiter_fused_rms_transposed_fp8_scale_tuple(
+    value: Tuple[torch.Tensor, ...],
+) -> Tuple[torch.Tensor, ...]:
+    """Zero-copy scale reinterpret for FP8 ``(q_input, x_scale, ...)`` tuples."""
+    return (value[0], view_aiter_fused_rms_transposed_fp8_scale(value[1]), *value[2:])
+
+
+def emit_transposed_bpreshuffle_scale(m: int, *, on_bpreshuffle_gfx95: bool) -> bool:
+    """Whether a producer should emit its fp8 scale already transposed.
+
+    Producer sites choose between two equivalent gfx95 bpreshuffle scale layouts:
+    ``transpose_scale=True`` + zero-copy ``view_aiter_fused_rms_transposed_fp8_scale`` (this
+    predicate True), or row-major ``transpose_scale=False`` +
+    ``materialize_bpreshuffle_fp8_scale`` (this predicate False). The transposed
+    zero-copy path is only taken on gfx95 bpreshuffle and only for M(tokens) >= 2:
+    at M == 1 the ``[1, G]`` and ``[G, 1]`` byte orders coincide, so the transposed
+    emit buys nothing and the materialize path is used. Centralizes the gate shared
+    by the MoE-down and MLA o_proj producer sites.
+    """
+    return on_bpreshuffle_gfx95 and m >= 2
 
 
 def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
@@ -1161,15 +1196,24 @@ def aiter_w8a8_block_fp8_linear(
         # On ROCm >= 7.2, scale is in bpreshuffle's transposed layout.
         # Triton needs a row-major view, so adjust strides only. No copy.
         elif use_triton and _use_aiter_bpreshuffle_gfx95:
-            x_scale = torch.as_strided(x_scale, x_scale.shape, (1, x_scale.shape[0]))
+            x_scale = view_aiter_fused_rms_transposed_fp8_scale(x_scale)
     else:
         materialize_bpreshuffle_scale = _use_aiter_bpreshuffle_gfx95 and not use_triton
+        # No-copy bpreshuffle scale: emit it already transposed and stride-reinterpret
+        # to the column-major bpreshuffle layout, instead of a .t().contiguous().t()
+        # copy. Bit-identical for M>=2; M==1 keeps materialize (there the [1,G] and
+        # [G,1] byte orders coincide, so materialize is a no-op view anyway).
+        emit_bpreshuffle_scale = (
+            materialize_bpreshuffle_scale and input_2d.shape[0] >= 2
+        )
         q_input, x_scale = aiter_per1x128_quant(
             input_2d,
             quant_dtype=aiter.dtypes.fp8,
-            transpose_scale=False,
+            transpose_scale=emit_bpreshuffle_scale,
         )
-        if materialize_bpreshuffle_scale:
+        if emit_bpreshuffle_scale:
+            x_scale = view_aiter_fused_rms_transposed_fp8_scale(x_scale)
+        elif materialize_bpreshuffle_scale:
             x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
 
     if use_triton:
@@ -1788,6 +1832,12 @@ def apply_fp8_linear(
     use_cutlass_channelwise_gemm = (
         channelwise_cutlass and cutlass_compatible_b and not use_triton_w8a8_fp8_kernel
     )
+    # Consider a tuned Triton tile only where the shape would otherwise go to
+    # CUTLASS (that is the path the offline sweep tuned against). On by default;
+    # SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 is the kill switch.
+    use_tuned_triton_channelwise = (
+        use_cutlass_channelwise_gemm and envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.get()
+    )
     native_scalar_a_scale = use_cutlass_channelwise_gemm and (
         _is_sm90_supported or _is_sm100_supported or _is_sm120_supported
     )
@@ -1866,11 +1916,37 @@ def apply_fp8_linear(
                     )
 
     if channelwise_cutlass:
+        # A tuned config exists only for shapes where tuned Triton beat the
+        # CUTLASS dispatch on this GPU; otherwise this is None and the backend
+        # choice below is unchanged. weight is [K, N] here.
+        tuned_config = (
+            get_w8a8_channelwise_fp8_config(
+                N=weight.shape[1], K=weight.shape[0], M=qinput.shape[0]
+            )
+            if use_tuned_triton_channelwise
+            else None
+        )
         if not use_cutlass_channelwise_gemm:
             # Massage the input to be 2D
             qinput = qinput.view(-1, qinput.shape[-1])
             output = triton_scaled_mm(
                 qinput, weight, x_scale, weight_scale, output_dtype, bias
+            )
+        elif tuned_config is not None:
+            qinput = qinput.view(-1, qinput.shape[-1])
+            output = triton_scaled_mm(
+                qinput,
+                weight,
+                x_scale,
+                weight_scale,
+                output_dtype,
+                bias,
+                block_size_m=tuned_config["BLOCK_SIZE_M"],
+                block_size_n=tuned_config["BLOCK_SIZE_N"],
+                block_size_k=tuned_config["BLOCK_SIZE_K"],
+                use_heuristic=False,
+                num_warps=tuned_config["num_warps"],
+                num_stages=tuned_config["num_stages"],
             )
         else:
             output = fp8_scaled_mm(
