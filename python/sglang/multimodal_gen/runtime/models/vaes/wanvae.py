@@ -1482,22 +1482,29 @@ class AutoencoderKLWan(ParallelTiledVAE):
     def _should_use_spatial_parallel_decode(self, z: torch.Tensor) -> bool:
         return should_run_spatial_shard_parallel_decode(self.config, z)
 
+    @staticmethod
+    def _count_conv3d(model) -> int:
+        count = 0
+        for m in model.modules():
+            if isinstance(m, (WanCausalConv3d, SpatialParallelCausalConv3d)):
+                count += 1
+        return count
+
     def clear_cache(self) -> None:
-
-        def _count_conv3d(model) -> int:
-            count = 0
-            for m in model.modules():
-                if isinstance(m, (WanCausalConv3d, SpatialParallelCausalConv3d)):
-                    count += 1
-            return count
-
         if self.config.load_decoder:
-            self._conv_num = _count_conv3d(self.decoder)
+            self._conv_num = self._count_conv3d(self.decoder)
             self._conv_idx = 0
             self._feat_map = [None] * self._conv_num
         # cache encode
         if self.config.load_encoder:
-            self._enc_conv_num = _count_conv3d(self.encoder)
+            self._enc_conv_num = self._count_conv3d(self.encoder)
+            self._enc_conv_idx = 0
+            self._enc_feat_map = [None] * self._enc_conv_num
+
+    def clear_encode_cache(self) -> None:
+        """Reset only the encoder feature cache, leaving the decoder's untouched."""
+        if self.config.load_encoder:
+            self._enc_conv_num = self._count_conv3d(self.encoder)
             self._enc_conv_idx = 0
             self._enc_feat_map = [None] * self._enc_conv_num
 
@@ -1544,7 +1551,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_feature_cache:
-            self.clear_cache()
+            self.clear_encode_cache()
             if self.config.patch_size is not None:
                 x = patchify(x, patch_size=self.config.patch_size)
             with forward_context(
@@ -1563,7 +1570,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
             mu, logvar = enc[:, : self.z_dim, :, :, :], enc[:, self.z_dim :, :, :, :]
             enc = torch.cat([mu, logvar], dim=1)
             enc = DiagonalGaussianDistribution(enc)
-            self.clear_cache()
+            self.clear_encode_cache()
         else:
             for block in self.encoder.down_blocks:
                 if isinstance(block, WanResample) and block.mode == "downsample3d":
@@ -1605,10 +1612,9 @@ class AutoencoderKLWan(ParallelTiledVAE):
             self.clear_cache()
             iter_ = z.shape[2]
             x = self.post_quant_conv(z)
+            use_sp = self._should_use_spatial_parallel_decode(z)
             spatial_context = (
-                nullcontext()
-                if self._should_use_spatial_parallel_decode(z)
-                else disable_spatial_parallel_decode()
+                nullcontext() if use_sp else disable_spatial_parallel_decode()
             )
             with spatial_context:
                 with forward_context(
@@ -1618,7 +1624,11 @@ class AutoencoderKLWan(ParallelTiledVAE):
                     for i in range(iter_):
                         feat_idx.set(0)
                         first_chunk.set(i == 0)
-                        out_chunks.append(self.decoder(x[:, :, i : i + 1, :, :]))
+                        chunk = self.decoder(x[:, :, i : i + 1, :, :])
+                        # Stream to CPU on single-GPU to avoid OOM on long videos.
+                        if not use_sp:
+                            chunk = chunk.cpu()
+                        out_chunks.append(chunk)
                     out = (
                         torch.cat(out_chunks, 2)
                         if len(out_chunks) > 1

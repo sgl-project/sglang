@@ -2320,11 +2320,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             **guidance_kwargs,
             **kwargs,
         )
-        runner = self._maybe_get_bcg_runner(current_model)
-        if runner is not None:
-            model_output = self._bcg_run(runner, call_kwargs, current_model)
-        else:
-            model_output = current_model(**call_kwargs)
+        model_output = self.run_dit_with_bcg(current_model, call_kwargs)
         return _ensure_tensor_model_output(model_output)
 
     @staticmethod
@@ -2416,6 +2412,24 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             )
             self._bcg_runners[key] = runner
         return runner
+
+    def run_dit_with_bcg(self, current_model, call_kwargs: dict):
+        """Run a DiT forward through the BCG runner (reusable helper).
+
+        Model-specific denoising stages that own their own forward loop (e.g.
+        OmniDreams' autoregressive chunk rollout) call this instead of
+        duplicating ``_bcg_run`` / ``_maybe_get_bcg_runner`` logic. When BCG
+        is disabled the model runs eagerly as-is.
+
+        ``call_kwargs`` must contain only tensor leaves and simple constants
+        for signature matching. Mutable state objects (e.g. KV caches) are
+        keyed by identity in the signature so a new request/session never
+        replays a graph captured against another request's state.
+        """
+        runner = self._maybe_get_bcg_runner(current_model)
+        if runner is not None:
+            return self._bcg_run(runner, call_kwargs, current_model)
+        return current_model(**call_kwargs)
 
     def prepare_sta_param(self, batch: Req, server_args: ServerArgs):
         """

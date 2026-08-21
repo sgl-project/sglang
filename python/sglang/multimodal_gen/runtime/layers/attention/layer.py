@@ -1778,7 +1778,7 @@ class _BCGBoxedTupleOutput:
         return tuple(getattr(self, f"value_{i}") for i in range(self.num_values))
 
 
-def _make_breakable_attention_forward(forward_method):
+def make_breakable_attention_forward(forward_method):
     """Wrap a DiT attention module's ``forward`` so it becomes a breakable
     CUDA graph (BCG) break point.
 
@@ -1787,6 +1787,10 @@ def _make_breakable_attention_forward(forward_method):
     varlen packing, and dynamic/sparse attention kernels that live here
     cannot (or should not) be captured into a static CUDA graph. When BCG is
     disabled this is a transparent pass-through to the original method.
+
+    Public so that model-specific attention classes outside this module
+    (e.g. OmniDreamsAttention) can install the same break-point wrapper
+    without importing private internals.
     """
 
     def _forward_boxing_tuples(*args, **kwargs):
@@ -1815,5 +1819,5 @@ for _attn_cls in (
     LocalAttention,
     USPAttention,
 ):
-    _attn_cls.forward = _make_breakable_attention_forward(_attn_cls.forward)
+    _attn_cls.forward = make_breakable_attention_forward(_attn_cls.forward)
 del _attn_cls
