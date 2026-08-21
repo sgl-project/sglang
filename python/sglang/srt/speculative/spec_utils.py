@@ -1023,7 +1023,7 @@ def commit_mamba_states_after_verify(
     # `accept_lens` already includes the bonus token (drafts + 1 per req).
     if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
         speculative_eagle_topk = get_spec().speculative_eagle_topk
-        mamba_track_interval = get_exec().mamba.mamba_track_interval
+        mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
         track_indices_to_pass = batch.mamba_track_indices
         if _is_cuda and not _is_hip and speculative_eagle_topk in (None, 1):
             # Chain spec: accept_index[i, j] == i*draft + j on accepted slots,

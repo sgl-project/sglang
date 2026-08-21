@@ -130,8 +130,8 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
             "sglang.srt.speculative.spec_utils.get_spec",
             return_value=MagicMock(speculative_eagle_topk=2),
         ), patch(
-            "sglang.srt.speculative.spec_utils.get_exec",
-            return_value=MagicMock(mamba=MagicMock(mamba_track_interval=256)),
+            "sglang.srt.speculative.spec_utils.mamba_track_grid",
+            return_value=256,
         ):
             commit_mamba_states_after_verify(
                 target_worker,
@@ -204,14 +204,11 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
             "sglang.srt.speculative.spec_utils.mambaish_config",
             return_value={"some": "config"},
         ), patch(
-            "sglang.srt.speculative.spec_utils.get_exec",
-            return_value=MagicMock(mamba=MagicMock(mamba_track_interval=256)),
+            "sglang.srt.speculative.spec_utils.mamba_track_grid",
+            return_value=256,
         ), patch(
             "sglang.srt.speculative.spec_utils.get_spec",
             return_value=MagicMock(speculative_eagle_topk=2),
-        ), patch(
-            "sglang.srt.speculative.spec_utils.mamba_track_grid",
-            return_value=256,
         ):
             commit_mamba_states_after_verify(
                 target_worker,
@@ -477,8 +474,8 @@ class TestMambaTrackSkipAdaptiveBound(CustomTestCase):
             "sglang.srt.speculative.spec_utils.get_spec",
             return_value=MagicMock(speculative_eagle_topk=1),
         ), patch(
-            "sglang.srt.speculative.spec_utils.get_exec",
-            return_value=MagicMock(mamba=MagicMock(mamba_track_interval=interval)),
+            "sglang.srt.speculative.spec_utils.mamba_track_grid",
+            return_value=interval,
         ), patch(
             "sglang.srt.speculative.spec_utils.max_speculative_num_draft_tokens",
             return_value=max_draft,
