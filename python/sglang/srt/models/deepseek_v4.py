@@ -1332,10 +1332,7 @@ class MQALayer(MqaAttentionBase):
                     False,
                 )
                 if use_cp:
-                    # DSA CP: kv here is this rank's shard (round-robin token
-                    # subset), but swa_loc is in GLOBAL logical order, so the
-                    # in-kernel store would write local row i at global slot i.
-                    # Skip it and store the all-gathered kv below instead.
+                    # Store globally ordered KV after the CP gather.
                     swa_cache, swa_loc = None, None
 
             from sglang.kernels.ops.attention.fused_qk_norm_rope_store import (
@@ -1362,16 +1359,11 @@ class MQALayer(MqaAttentionBase):
             )
 
             if not unified and use_cp:
-                # DSA CP: keep the fused kernel's normalized and rotated bf16 kv
-                # for the cross-rank all-gather, then write it after gather.
                 kv = cp_materialize_global_token_order(
                     kv.contiguous(),
                     forward_batch,
                     torch.cuda.current_stream(),
                 )
-                # The fused kernel above skipped its SWA store under CP; write
-                # the globally-ordered kv at the global swa_out_cache_loc, the
-                # same way the non-fused CP branch does.
                 attn_backend.store_cache(
                     layer_id=self.layer_id,
                     swa_k=kv,
@@ -3147,10 +3139,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        # CP-v2 builds attn_cp_metadata in prepare_cp_forward and reindexes the
-        # core metadata inside the attention backend. Running the CP-v1 hook on
-        # top would overwrite the v2 metadata object and reindex a second time.
-        # (Mirrors deepseek_v4_nextn.py's guard.)
         if self.dsa_enable_prefill_cp and not is_cp_v2_active(forward_batch):
             if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
