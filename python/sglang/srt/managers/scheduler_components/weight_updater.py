@@ -141,7 +141,15 @@ class SchedulerWeightUpdaterManager:
     ) -> Tuple[bool, str]:
         """Update the online model parameter."""
         with self._observe_weight_load("distributed"):
-            success, message = self.tp_worker.update_weights_from_distributed(recv_req)
+            draft_model = None
+            if self.draft_worker is not None:
+                draft_runner = _get_draft_model_runner(self.draft_worker)
+                if draft_runner is not None:
+                    draft_model = draft_runner.model
+
+            success, message = self.tp_worker.update_weights_from_distributed(
+                recv_req, draft_model=draft_model
+            )
             if success:
                 self.flush_cache_after_weight_update(recv_req)
             else:

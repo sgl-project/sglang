@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import inspect
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
@@ -226,15 +227,17 @@ class WeightUpdater:
         shapes,
         group_name,
         load_format: Optional[str] = None,
+        draft_model=None,
     ):
         """
         Update specific parameter in the model weights online
         through `_model_update_group` process group.
 
         Args:
-            name: the name of the parameter to be updated.
-            dtype: the data type of the parameter to be updated.
-            shape: the shape of the parameter to be updated.
+            names: the names of the parameters to be updated.
+            dtypes: the data types of the parameters to be updated.
+            shapes: the shapes of the parameters to be updated.
+            draft_model: optional draft/MTP model to also update.
         """
         self._assert_weight_cache_inactive("update_weights_from_distributed")
         error = _unsupported_derived_weight_cache_error()
@@ -271,6 +274,15 @@ class WeightUpdater:
                 handle.wait()
 
             self.get_model().load_weights(weights)
+
+            if draft_model is not None:
+                if "is_mtp" in inspect.signature(draft_model.load_weights).parameters:
+                    draft_model.load_weights(weights, is_mtp=True)
+                else:
+                    logger.warning(
+                        f"Draft model {type(draft_model).__name__} does not support "
+                        "MTP weight sync; skipping"
+                    )
             return True, "Succeeded to update parameter online."
 
         except Exception as e:
