@@ -27,6 +27,9 @@ DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
 # AMD_CI_DOCKER_REGISTRY_MIRROR overrides that either way: a host:port to
 # retarget it, or the empty string to always pull from Docker Hub.
 DEFAULT_DOCKER_REGISTRY_MIRROR="10.44.14.109:5000"
+# Cap the mirror attempt so a degraded registry cannot cost more than the
+# Docker Hub pull it is meant to replace.
+MIRROR_PULL_TIMEOUT="${AMD_CI_MIRROR_PULL_TIMEOUT:-900}"
 
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
@@ -357,17 +360,17 @@ else
     loaded_from_cache=1
     IMAGE_SOURCE="local-tarball"
   elif [[ -n "${LOCAL_DOCKER_REGISTRY}" ]]; then
-    # Try the in-network mirror first: it avoids Docker Hub rate limits and is
-    # faster on the LAN. Capture stderr so the real failure reason (TLS
-    # handshake, 404, connection refused, etc.) is visible in the job log
-    # instead of being silently swallowed.
-    if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
-      echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
+    # Try the in-network mirror before Docker Hub, but bounded: it is not
+    # reliably the faster source. In run 32437655302 this pull moved 68GB at
+    # 4.3 MB/s and took 4.4h, against a Docker Hub p50 of ~7min, and the output
+    # was streamed nowhere because it used to be captured into a variable.
+    mirror_started=$SECONDS
+    if timeout "${MIRROR_PULL_TIMEOUT}" docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}"; then
+      echo "Pulled from local docker registry in $(( SECONDS - mirror_started ))s: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
       docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
       pulled_from_mirror=1
     else
-      echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
-      printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
+      echo "Local docker registry pull gave up after $(( SECONDS - mirror_started ))s (budget ${MIRROR_PULL_TIMEOUT}s); falling back to public registry: ${IMAGE}" >&2
     fi
   fi
   if (( loaded_from_cache == 0 )); then
