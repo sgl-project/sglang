@@ -17,6 +17,9 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    _model_load_weights_direct,
+)
 from sglang.srt.models.glm4_moe import Glm4MoeGate
 from sglang.srt.models.glm4_moe_lite import Glm4MoeLiteGate
 
@@ -82,6 +85,27 @@ class TestGlmMoeGateFp32Cache(unittest.TestCase):
 
                 self.assertEqual(gate._weight_fp32.data_ptr(), cache_ptr)
                 torch.testing.assert_close(gate._weight_fp32, updated.float())
+
+    def test_direct_load_refreshes_cache_in_place(self):
+        # update_weights_from_tensor(load_format="direct") bypasses
+        # param.weight_loader; the post_direct_write hook must resync the cache.
+        for gate_cls in self.GATE_CLASSES:
+            with self.subTest(gate=gate_cls.__name__):
+                gate, hidden_states = _make_gate(gate_cls)
+                initial = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
+                gate.weight.weight_loader(gate.weight, initial)
+                gate(hidden_states)
+                cache_ptr = gate._weight_fp32.data_ptr()
+
+                updated = initial + 1
+                _model_load_weights_direct(gate, [("weight", updated)])
+
+                self.assertEqual(gate._weight_fp32.data_ptr(), cache_ptr)
+                torch.testing.assert_close(gate._weight_fp32, updated.float())
+                torch.testing.assert_close(
+                    gate(hidden_states),
+                    F.linear(hidden_states.float(), updated.float()),
+                )
 
 
 if __name__ == "__main__":
