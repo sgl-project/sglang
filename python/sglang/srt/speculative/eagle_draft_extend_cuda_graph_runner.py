@@ -266,7 +266,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             dsa_seed_topk_capture=dsa_seed_topk_capture,
         )
-        self.buffers.share_buffers()
+        # The values depend on captured_req_width, while adaptive speculative
+        # decoding owns multiple runners whose select_index buffers all have
+        # shape [max_bs]. Sharing by field name and shape would alias those
+        # width-specific indices and can make a narrower graph gather OOB.
+        self.buffers.share_buffers(exclude={"select_index"})
 
         self.backend = resolve_decode_backend(self)
 
