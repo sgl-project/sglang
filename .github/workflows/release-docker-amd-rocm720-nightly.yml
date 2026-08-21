@@ -10,6 +10,7 @@ on:
         options:
           - 'all'
           - publish
+          - verify_only
       gpu_arch:
         description: 'Select which ROCm 7.2 GPU arch to build'
         required: false
@@ -140,6 +141,85 @@ jobs:
         run: |
           docker tag rocm/sgl-dev:${{ env.IMAGE_TAG }} lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
           docker push lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
+
+  # TEMPORARY, not for merge: proves the Dockerfile step in this branch produces
+  # an image that profiles graph replay with nothing preloaded. Applies the
+  # step's own code -- extracted from docker/rocm.Dockerfile, not a copy of it --
+  # to the published rocm724 image, and probes either side of it. Building the
+  # whole image would take ~45 minutes of a GPU runner to test one step.
+  test_dockerfile_step:
+    if: github.event_name == 'workflow_dispatch' && inputs.job_select == 'verify_only'
+    runs-on: linux-mi35x-gpu-1
+    env:
+      IMAGE: rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --custom-image "${IMAGE}"
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+          DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+      - name: Probe as published
+        id: before
+        continue-on-error: true
+        timeout-minutes: 20
+        run: |
+          set -o pipefail
+          docker exec -w /sglang-checkout ci_sglang \
+            python3 scripts/ci/amd/check_hip_graph_profiling.py 2>&1 | tee before.log
+
+      - name: Extract the Dockerfile step
+        run: |
+          python3 - <<'EOF'
+          import pathlib, re
+          src = pathlib.Path("docker/rocm.Dockerfile").read_text()
+          bodies = [m.group(1) for m in re.finditer(r"RUN python3 - <<'PY'\n(.*?\n)PY\n", src, re.S)]
+          body = [b for b in bodies if "not vendored by the wheel" in b]
+          assert len(body) == 1, f"expected one matching heredoc, got {len(body)}"
+          pathlib.Path("dockerfile_step.py").write_text(body[0])
+          EOF
+          cat dockerfile_step.py
+
+      - name: Apply it
+        run: docker exec -w /sglang-checkout ci_sglang python3 dockerfile_step.py
+
+      - name: Verify torch still imports
+        run: |
+          docker exec ci_sglang python3 -c \
+            "import torch; assert torch.version.hip is not None, torch.__version__; print(torch.__version__, torch.version.hip)"
+
+      - name: Probe after the step, nothing preloaded
+        timeout-minutes: 20
+        run: |
+          set -o pipefail
+          docker exec -w /sglang-checkout ci_sglang \
+            python3 scripts/ci/amd/check_hip_graph_profiling.py 2>&1 | tee after.log
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "### Dockerfile step on \`${IMAGE}\`"
+            echo "**As published** (\`${{ steps.before.outcome }}\`)"
+            echo '```'
+            cat before.log 2>/dev/null || echo "no output"
+            echo '```'
+            echo "**After the step, nothing preloaded**"
+            echo '```'
+            cat after.log 2>/dev/null || echo "no output"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop CI container
+        if: always()
+        run: docker rm -f ci_sglang || true
 
   # Mirror the freshly published rocm/sgl-dev image to the in-network Docker
   # registry so AMD CI runners can pull without hitting Docker Hub rate limits.
