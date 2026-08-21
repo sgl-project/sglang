@@ -65,6 +65,10 @@ from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 
+# Memfabric SDMA stream submission-queue depth is 2048; stay well under it so
+# one fragmented index list can never wedge the stream (see _transfer_data).
+_HYBM_SQ_SAFE_BATCH = 256
+
 FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
     "Number of mooncake_session_ids un-blacklisted via probe.",
@@ -649,10 +653,34 @@ class MooncakeKVManager(CommonKVManager):
         if not transfer_blocks:
             return 0
 
-        src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
-        return self.engine.batch_transfer_sync(
+        # The memfabric SDMA stream queues one task per block on a 2048-deep
+        # submission queue; a single oversized batch trips the near-full sync
+        # (1 s poll timeout) and leaves the stream permanently wedged
+        # ("stream synchronize failed!" then "stream is full!"). Each
+        # batch_transfer_sync call drains before returning, so submitting in
+        # sub-queue batches keeps the stream healthy regardless of how
+        # fragmented the index lists are.
+        for start in range(0, len(transfer_blocks), _HYBM_SQ_SAFE_BATCH):
+            batch = transfer_blocks[start : start + _HYBM_SQ_SAFE_BATCH]
+            ret = self._submit_transfer_batch(mooncake_session_id, batch)
+            if ret != 0:
+                return ret
+        return 0
+
+    def _submit_transfer_batch(self, mooncake_session_id, batch) -> int:
+        src_addrs, dst_addrs, lengths = zip(*batch)
+        ret = self.engine.batch_transfer_sync(
             mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
         )
+        if ret != 0:
+            # A transient SDMA fault (observed as HYBM "wait copy failed:-7")
+            # otherwise poisons the whole session: a single chunk failure
+            # blacklists it for every later request. Retry the batch once
+            # before propagating the failure.
+            return self.engine.batch_transfer_sync(
+                mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
+            )
+        return 0
 
     def _send_kvcache_generic(
         self,
@@ -1103,10 +1131,11 @@ class MooncakeKVManager(CommonKVManager):
                 # Nothing to transfer for this layer.
                 return 0
             dst_addr_list = dst_slice_addrs.reshape(-1).tolist()
-            total_slices = len(src_addr_list)
-            length_list = [heads_bytes_per_token_to_send] * total_slices
-            return self.engine.batch_transfer_sync(
-                mooncake_session_id, src_addr_list, dst_addr_list, length_list
+            length_list = [heads_bytes_per_token_to_send] * len(src_addr_list)
+            # Per-token tasks; must go through the chunked funnel or a large
+            # batch floods the memfabric submission queue (depth 2048).
+            return self._transfer_data(
+                mooncake_session_id, list(zip(src_addr_list, dst_addr_list, length_list))
             )
 
         futures = []
