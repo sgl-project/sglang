@@ -15,7 +15,9 @@ Use these paths:
 
 - `--model-path`: the base or original model
 - `--transformer-path`: a quantized transformers-style transformer component directory that already contains its own `config.json`
-- `--transformer-weights-path`: quantized transformer weights provided as a single safetensors file, a sharded safetensors directory, a local path, or a Hugging Face repo ID
+- `--transformer-weights-path`: replacement transformer weights in safetensors
+  format (file, directory, or Hub repository/file) or a supported GGUF file
+  (local or Hub)
 - `--quantization`: apply online quantization to unquantized models at load time (activations are quantized dynamically)
 - `--quantization-ignored-layers` layer name patterns to keep unquantized (e.g. `attention.to_`)
 - `--component-paths.text_encoder`: replace a native text encoder with a checkpoint whose `quantization_config` is auto-detected
@@ -44,6 +46,12 @@ NOTE: Some model-specific integrations also accept a quantized repo or local
 directory directly as `--model-path`, but that is a compatibility path. If a
 repo contains multiple candidate checkpoints, pass
 `--transformer-weights-path` explicitly.
+
+MiniMax-H3 auto-detects the per-layer metadata in Comfy's
+`pruned_fp8_scaled` safetensors. Pass one selected FL2VA or Ref2VA file by local
+path, `owner/repo/path/file.safetensors`, or direct Hugging Face file URL; do
+not combine it with `--quantization`. MiniMax-H3 GGUF usage is documented in
+the [MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#pre-quantized-gguf-transformer).
 
 ## Quant Families
 
@@ -110,6 +118,22 @@ backend.
       <td>FLUX.1, FLUX.2, Wan2.2, Qwen Image, Qwen Image 2512, Qwen Image Edit, Qwen Image Edit 2511</td>
       <td>None</td>
       <td>Mixed override repos keep the base model separate; full Qwen Image exports can be loaded directly as <code>--model-path</code>; raw exports such as <code>black-forest-labs/FLUX.2-dev-NVFP4</code> still use the weights-path flow</td>
+    </tr>
+    <tr>
+      <td><code>gguf</code></td>
+      <td>One selected GGUF DiT file</td>
+      <td><code>--transformer-weights-path</code></td>
+      <td>MiniMax-H3 original or pruned FL2VA / Ref2VA DiTs</td>
+      <td>None</td>
+      <td>CUDA only; auto-detected; supports standard and K-quant GGML types; FSDP and the separate Qwen3-VL text-encoder GGUF files are not supported</td>
+    </tr>
+    <tr>
+      <td><code>comfy-fp8</code></td>
+      <td>One selected Comfy safetensors file with per-layer <code>comfy_quant</code> metadata</td>
+      <td><code>--transformer-weights-path</code></td>
+      <td>MiniMax-H3 pruned FL2VA / Ref2VA DiTs</td>
+      <td>None</td>
+      <td>CUDA; auto-detected; TP, sequence parallelism, and component/layerwise offload are supported, while FSDP is not. Checkpoint-marked <code>fc2</code> layers retain FP8 storage and use compute-dtype matmul.</td>
     </tr>
     <tr>
       <td><code>qvg-kv</code></td>
@@ -260,7 +284,7 @@ sglang generate \
 
 MiniMax-H3 supports this path while preserving its required FP32 patch,
 timestep, and output projections. See the
-[MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#7-runtime-feature-recipes)
+[MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#7-feature-contracts-and-advanced-recipes)
 for its distributed serving recipe.
 
 ### MXFP4 Online Quantization
@@ -310,7 +334,7 @@ projections take that path.
 <Warning>
 `kitchen_int8` is approximate and is not a consistency ground-truth mode.
 The BF16 path is unchanged when `comfy-kitchen` is not installed. See the
-[MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#7-runtime-feature-recipes)
+[MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#7-feature-contracts-and-advanced-recipes)
 for the 24 GB offload recipe, including why `vae` must stay out of
 `--layerwise-offload-components`.
 </Warning>
