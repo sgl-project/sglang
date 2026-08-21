@@ -2191,9 +2191,10 @@ class ServerArgs(DisaggServerArgsMixin):
             action=StoreBoolean,
             default=ServerArgs.dit_layerwise_offload,
             help="Enable layerwise CPU offload with async H2D prefetch overlap for DiTs. "
-            "It selects only the DiT layerwise group. Cannot be used together with cache-dit "
-            "(SGLANG_CACHE_DIT_ENABLED) or use_fsdp_inference. If legacy DiT offload "
-            "flags are also provided, layerwise offload is the effective DiT mode.",
+            "It selects only the DiT layerwise group. Compatible with cache-dit: "
+            "skipped blocks are not streamed. Cannot be used together with "
+            "use_fsdp_inference. If legacy DiT offload flags are also provided, "
+            "layerwise offload is the effective DiT mode.",
         )
         parser.add_argument(
             "--layerwise-offload-components",
@@ -3115,17 +3116,6 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.has_layerwise_offload_components():
             if self.dit_offload_prefetch_size < 0.0:
                 raise ValueError("dit_offload_prefetch_size must be non-negative")
-
-            is_dit_layerwise_offload_selected = self.is_dit_layerwise_offload_selected
-
-            if envs.SGLANG_CACHE_DIT_ENABLED and is_dit_layerwise_offload_selected:
-                raise ValueError(
-                    "DiT layerwise offload cannot be enabled together with cache-dit. "
-                    "cache-dit may reuse skipped blocks whose weights have been released by layerwise offload, "
-                    "causing shape mismatch errors. "
-                    "Please disable --dit-layerwise-offload, remove DiT from --layerwise-offload-components, "
-                    "or disable SGLANG_CACHE_DIT_ENABLED."
-                )
 
             if (
                 self.performance_mode == "memory"
