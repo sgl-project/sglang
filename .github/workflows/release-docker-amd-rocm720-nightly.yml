@@ -233,6 +233,12 @@ jobs:
       # The image's own 7.2.4 HIP and roctracer, which is the configuration that
       # traces graph replay in full. LD_PRELOAD has to be set before the process
       # starts, so it goes on docker exec rather than inside the probe.
+      #
+      # Only as a measurement of what the image is capable of. A preload leaves
+      # both HIP copies mapped and has been reported to abort server startup
+      # during CUDA-graph capture, so it is not a way to run a workload; #35806
+      # replaces the wheel's copies at build time instead, and once that lands
+      # the default run above is the one to keep and this step can go.
       - name: Probe HIP-graph profiling (ROCm runtime preloaded)
         timeout-minutes: 20
         run: |
