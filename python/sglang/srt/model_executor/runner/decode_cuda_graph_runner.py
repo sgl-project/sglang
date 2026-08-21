@@ -689,7 +689,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         if self.require_mlp_sync:
-            is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
+            is_bs_supported = (
+                is_bs_supported and forward_batch.can_run_decode_cuda_graph
+            )
 
         # NOTE: cuda graph cannot handle mixed batch (encoder_len = 0)
         # If mixed batch cannot be supported, then encoder_lens can be removed in cuda graph
@@ -730,7 +732,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ] and forward_batch.batch_size <= self._ragged_capture_slots(admission_tokens)
 
         is_dp_supported = (
-            forward_batch.can_run_dp_cuda_graph if self.require_mlp_sync else True
+            forward_batch.can_run_decode_cuda_graph if self.require_mlp_sync else True
         )
 
         is_encoder_lens_supported = (
