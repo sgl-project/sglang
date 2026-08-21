@@ -597,7 +597,10 @@ class SchedulerDisaggregationPrefillMixin:
                     entry.mamba_indices = _copy_to_pinned_cpu(mamba_indices)
 
                 if StateType.SWA in state_types:
-                    window_start = max(0, end_idx - self.sliding_window_size)
+                    window_start = max(
+                        req.disagg_decode_prefix_len,
+                        end_idx - self.sliding_window_size,
+                    )
                     window_start = (window_start // page_size) * page_size
                     swa_indices = (
                         self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
