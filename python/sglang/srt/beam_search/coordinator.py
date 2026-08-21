@@ -362,6 +362,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         finished leader reappears for one overshoot tick, so the caller runs the
         shared finish machinery only on the committing tick."""
         newly_finished = set()
+        if self._num_live_groups == 0:
+            return newly_finished
         for req in batch.reqs:
             group = req.beam_group
             if group is None or group.retired:
@@ -477,16 +479,15 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         self._free_member_rows(group)
         self._retire_group(group)
 
-    def retire_aborted_beam_groups(self, reqs_to_abort: List[Req]) -> None:
-        """Leader aborted outside the commit path (retract_decode OOM); the
-        member rows were already freed there."""
-        for req in reqs_to_abort:
-            group = req.beam_group
-            if group is None or group.retired:
-                continue
-            group.state = BeamGroupState.FINISHED
-            group.final_results = []
-            self._retire_group(group)
+    def retire_group(self, req: Req) -> None:
+        """Leader ended outside the commit path -- retracted, or aborted while
+        still queued. Member rows, if any, were released by the caller."""
+        group = req.beam_group
+        if group is None or group.retired:
+            return
+        group.state = BeamGroupState.FINISHED
+        group.final_results = []
+        self._retire_group(group)
 
     def _free_member_rows(self, group: BeamGroup) -> None:
         # Staged orphans are unreachable from every row, so the group-wide

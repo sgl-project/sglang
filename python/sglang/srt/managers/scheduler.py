@@ -2885,6 +2885,7 @@ class Scheduler(
                 elif self.enable_hierarchical_cache:
                     self.tree_cache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
+                self.beam_coordinator.retire_group(candidate_req)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
@@ -2926,6 +2927,7 @@ class Scheduler(
                     req,
                 )
                 deleted_reqs.add(req)
+                self.beam_coordinator.retire_group(req)
 
         if deleted_reqs:
             self.waiting_queue = [
@@ -3668,9 +3670,10 @@ class Scheduler(
                     ),
                     req,
                 )
-            # Aborted beam leaders: their member rows were freed inside
-            # retract_decode; retire the groups from the live set.
-            self.beam_coordinator.retire_aborted_beam_groups(reqs_to_abort)
+            for req in reqs_to_abort:
+                # Member rows were freed inside retract_decode; the group only
+                # has to leave the live set.
+                self.beam_coordinator.retire_group(req)
 
             msg_prefix = (
                 "KV cache pool is full. Retract requests. "
@@ -4623,6 +4626,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            self.beam_coordinator.retire_group(req)
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
