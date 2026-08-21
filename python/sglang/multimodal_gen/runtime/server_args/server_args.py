@@ -236,8 +236,8 @@ class ServerArgs(DisaggServerArgsMixin):
     # HuggingFace specific parameters
     trust_remote_code: bool = False
     revision: str | None = None
-    artifact_preflight: str | None = None
-    artifact_report_format: str = "text"
+    checkpoint_preflight: str | None = None
+    checkpoint_report_format: str = "text"
 
     # Parallelism
     num_gpus: int = 1
@@ -1695,8 +1695,8 @@ class ServerArgs(DisaggServerArgsMixin):
         # configure logger before use
         log_stream = (
             sys.stderr
-            if self.artifact_preflight is not None
-            and self.artifact_report_format == "json"
+            if self.checkpoint_preflight is not None
+            and self.checkpoint_report_format == "json"
             else sys.stdout
         )
         configure_logger(server_args=self, stream=log_stream)
@@ -1730,22 +1730,22 @@ class ServerArgs(DisaggServerArgsMixin):
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
         )
         parser.add_argument(
-            "--artifact-preflight",
+            "--checkpoint-preflight",
             choices=("metadata", "full"),
-            default=ServerArgs.artifact_preflight,
+            default=ServerArgs.checkpoint_preflight,
             help=(
                 "Resolve the configured model, component overrides, transformer "
                 "weights override, and LoRA, print a report, then exit before "
                 "model construction. "
                 "'metadata' reads Hub metadata and tensor headers; 'full' also "
-                "downloads the selected artifacts."
+                "downloads the selected checkpoints."
             ),
         )
         parser.add_argument(
-            "--artifact-report-format",
+            "--checkpoint-report-format",
             choices=("text", "json"),
-            default=ServerArgs.artifact_report_format,
-            help="Output format used by --artifact-preflight.",
+            default=ServerArgs.checkpoint_report_format,
+            help="Output format used by --checkpoint-preflight.",
         )
         parser.add_argument(
             "--model-subfolder",

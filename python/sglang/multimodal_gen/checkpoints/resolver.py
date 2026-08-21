@@ -1,4 +1,4 @@
-"""Resolve diffusion artifact sources without constructing model components."""
+"""Resolve diffusion checkpoints without constructing model components."""
 
 from __future__ import annotations
 
@@ -17,16 +17,16 @@ from sglang.srt.model_loader.checkpoint_quantization import (
     resolve_checkpoint_quant_spec,
 )
 
-ArtifactSourceKind = Literal["local", "huggingface"]
-ArtifactRole = Literal["pipeline", "component", "component_weights", "lora"]
+CheckpointSourceKind = Literal["local", "huggingface"]
+CheckpointRole = Literal["pipeline", "component", "component_weights", "lora"]
 
 _WEIGHT_SUFFIXES = (".safetensors", ".gguf", ".bin", ".pt", ".pth", ".ckpt")
 
 
 @dataclass(frozen=True)
-class ArtifactSource:
+class CheckpointSource:
     original: str
-    kind: ArtifactSourceKind
+    kind: CheckpointSourceKind
     local_path: str | None = None
     repo_id: str | None = None
     revision: str | None = None
@@ -35,23 +35,23 @@ class ArtifactSource:
 
 
 @dataclass(frozen=True)
-class ArtifactFile:
+class CheckpointFile:
     path: str
     size: int | None = None
     blob_id: str | None = None
 
 
 @dataclass(frozen=True)
-class ArtifactInventory:
-    source: ArtifactSource
+class CheckpointInventory:
+    source: CheckpointSource
     resolved_revision: str | None
-    files: tuple[ArtifactFile, ...]
+    files: tuple[CheckpointFile, ...]
 
 
 @dataclass(frozen=True)
-class ArtifactRequest:
+class CheckpointRequest:
     name: str
-    role: ArtifactRole
+    role: CheckpointRole
     source: str
     component: str | None = None
     revision: str | None = None
@@ -68,9 +68,9 @@ class TensorSummary:
 
 
 @dataclass(frozen=True)
-class ResolvedArtifact:
-    request: ArtifactRequest
-    inventory: ArtifactInventory
+class ResolvedCheckpoint:
+    request: CheckpointRequest
+    inventory: CheckpointInventory
     selected_files: tuple[str, ...]
     container_format: str | None
     quantization_method: str | None
@@ -89,45 +89,47 @@ def _validate_relative_hub_path(path: str, field_name: str) -> str:
 def _merge_revision(url_revision: str | None, revision: str | None) -> str | None:
     if url_revision is not None and revision is not None and url_revision != revision:
         raise ValueError(
-            f"Artifact URL pins revision {url_revision!r}, which conflicts with "
+            f"Checkpoint URL pins revision {url_revision!r}, which conflicts with "
             f"--revision {revision!r}"
         )
     return url_revision or revision
 
 
-def _parse_huggingface_url(source: str, revision: str | None) -> ArtifactSource:
+def _parse_huggingface_url(source: str, revision: str | None) -> CheckpointSource:
     parsed = urlparse(source)
     if parsed.netloc.lower() not in ("huggingface.co", "www.huggingface.co"):
         raise ValueError(
-            "Only huggingface.co artifact URLs are supported; use a local path "
+            "Only huggingface.co checkpoint URLs are supported; use a local path "
             "or an owner/repo reference for other sources"
         )
 
     raw_parts = [part for part in parsed.path.split("/") if part]
     if raw_parts and raw_parts[0] in ("datasets", "spaces"):
-        raise ValueError("Diffusion artifacts must come from a Hugging Face model repo")
+        raise ValueError(
+            "Diffusion checkpoints must come from a Hugging Face model repo"
+        )
     if len(raw_parts) < 2:
-        raise ValueError(f"Hugging Face artifact URL has no model repo: {source!r}")
+        raise ValueError(f"Hugging Face checkpoint URL has no model repo: {source!r}")
 
     repo_id = "/".join(unquote(part) for part in raw_parts[:2])
     validate_repo_id(repo_id)
     action = raw_parts[2] if len(raw_parts) > 2 else None
     if action is None:
-        return ArtifactSource(
+        return CheckpointSource(
             original=source,
             kind="huggingface",
             repo_id=repo_id,
             revision=revision,
         )
     if action not in ("tree", "blob", "resolve") or len(raw_parts) < 4:
-        raise ValueError(f"Unsupported Hugging Face artifact URL: {source!r}")
+        raise ValueError(f"Unsupported Hugging Face checkpoint URL: {source!r}")
 
     url_revision = unquote(raw_parts[3])
     selected_revision = _merge_revision(url_revision, revision)
     tail = "/".join(unquote(part) for part in raw_parts[4:])
     if action == "tree":
         subfolder = _validate_relative_hub_path(tail, "subfolder") if tail else None
-        return ArtifactSource(
+        return CheckpointSource(
             original=source,
             kind="huggingface",
             repo_id=repo_id,
@@ -136,7 +138,7 @@ def _parse_huggingface_url(source: str, revision: str | None) -> ArtifactSource:
         )
     if not tail:
         raise ValueError(f"Hugging Face file URL has no filename: {source!r}")
-    return ArtifactSource(
+    return CheckpointSource(
         original=source,
         kind="huggingface",
         repo_id=repo_id,
@@ -145,11 +147,11 @@ def _parse_huggingface_url(source: str, revision: str | None) -> ArtifactSource:
     )
 
 
-def parse_artifact_source(
+def parse_checkpoint_source(
     source: str,
     *,
     revision: str | None = None,
-) -> ArtifactSource:
+) -> CheckpointSource:
     """Parse local paths, Hub repo IDs, subfolders, and exact Hub URLs."""
     expanded = os.path.expanduser(source)
     parsed = urlparse(source)
@@ -162,7 +164,7 @@ def parse_artifact_source(
         or source.startswith(("./", "../", "~"))
     )
     if looks_local:
-        return ArtifactSource(
+        return CheckpointSource(
             original=source,
             kind="local",
             local_path=os.path.abspath(expanded),
@@ -171,7 +173,7 @@ def parse_artifact_source(
     parts = source.split("/")
     if len(parts) < 2 or not all(parts[:2]):
         raise ValueError(
-            f"Artifact source {source!r} is neither a local path nor an "
+            f"Checkpoint source {source!r} is neither a local path nor an "
             "owner/repo Hugging Face reference"
         )
     repo_id = "/".join(parts[:2])
@@ -185,7 +187,7 @@ def parse_artifact_source(
     subfolder = tail if filename is None else None
     if subfolder is not None:
         subfolder = _validate_relative_hub_path(subfolder, "subfolder")
-    return ArtifactSource(
+    return CheckpointSource(
         original=source,
         kind="huggingface",
         repo_id=repo_id,
@@ -196,13 +198,13 @@ def parse_artifact_source(
 
 
 def _filter_inventory_files(
-    files: tuple[ArtifactFile, ...], source: ArtifactSource
-) -> tuple[ArtifactFile, ...]:
+    files: tuple[CheckpointFile, ...], source: CheckpointSource
+) -> tuple[CheckpointFile, ...]:
     if source.filename is not None:
         selected = tuple(item for item in files if item.path == source.filename)
         if not selected:
             raise FileNotFoundError(
-                f"Artifact file {source.filename!r} was not found in {source.repo_id}"
+                f"Checkpoint file {source.filename!r} was not found in {source.repo_id}"
             )
         return selected
     if source.subfolder is None:
@@ -211,32 +213,32 @@ def _filter_inventory_files(
     selected = tuple(item for item in files if item.path.startswith(prefix))
     if not selected:
         raise FileNotFoundError(
-            f"Artifact subfolder {source.subfolder!r} was not found in {source.repo_id}"
+            f"Checkpoint subfolder {source.subfolder!r} was not found in {source.repo_id}"
         )
     return selected
 
 
-def resolve_artifact_inventory(source: ArtifactSource) -> ArtifactInventory:
-    """List artifact files and pin a remote source to an immutable revision."""
+def resolve_checkpoint_inventory(source: CheckpointSource) -> CheckpointInventory:
+    """List checkpoint files and pin a remote source to an immutable revision."""
     if source.kind == "local":
         assert source.local_path is not None
         local_path = Path(source.local_path)
         if not local_path.exists():
-            raise FileNotFoundError(f"Artifact path does not exist: {local_path}")
+            raise FileNotFoundError(f"Checkpoint path does not exist: {local_path}")
         if local_path.is_file():
             files = (
-                ArtifactFile(path=local_path.name, size=local_path.stat().st_size),
+                CheckpointFile(path=local_path.name, size=local_path.stat().st_size),
             )
         else:
             files = tuple(
-                ArtifactFile(
+                CheckpointFile(
                     path=path.relative_to(local_path).as_posix(),
                     size=path.stat().st_size,
                 )
                 for path in sorted(local_path.rglob("*"))
                 if path.is_file()
             )
-        return ArtifactInventory(
+        return CheckpointInventory(
             source=source,
             resolved_revision=None,
             files=files,
@@ -249,22 +251,22 @@ def resolve_artifact_inventory(source: ArtifactSource) -> ArtifactInventory:
         files_metadata=True,
     )
     files = tuple(
-        ArtifactFile(
+        CheckpointFile(
             path=sibling.rfilename,
             size=sibling.size,
             blob_id=sibling.blob_id,
         )
         for sibling in model_info.siblings
     )
-    return ArtifactInventory(
+    return CheckpointInventory(
         source=source,
         resolved_revision=model_info.sha,
         files=_filter_inventory_files(files, source),
     )
 
 
-def materialize_artifact(inventory: ArtifactInventory) -> str:
-    """Download the pinned artifact selected by an inventory."""
+def materialize_checkpoint(inventory: CheckpointInventory) -> str:
+    """Download the pinned checkpoint selected by an inventory."""
     source = inventory.source
     if source.kind == "local":
         assert source.local_path is not None
@@ -292,7 +294,7 @@ def materialize_artifact(inventory: ArtifactInventory) -> str:
 
 
 def _local_inventory_file_path(
-    inventory: ArtifactInventory, inventory_path: str
+    inventory: CheckpointInventory, inventory_path: str
 ) -> str:
     source = inventory.source
     assert source.local_path is not None
@@ -302,7 +304,7 @@ def _local_inventory_file_path(
 
 
 def _materialize_inventory_file(
-    inventory: ArtifactInventory, inventory_path: str
+    inventory: CheckpointInventory, inventory_path: str
 ) -> str:
     source = inventory.source
     if source.kind == "local":
@@ -315,12 +317,12 @@ def _materialize_inventory_file(
     )
 
 
-def _read_inventory_json(inventory: ArtifactInventory, inventory_path: str) -> dict:
+def _read_inventory_json(inventory: CheckpointInventory, inventory_path: str) -> dict:
     local_path = _materialize_inventory_file(inventory, inventory_path)
     with open(local_path, encoding="utf-8") as file:
         value = json.load(file)
     if not isinstance(value, dict):
-        raise ValueError(f"Artifact metadata must be an object: {inventory_path}")
+        raise ValueError(f"Checkpoint metadata must be an object: {inventory_path}")
     return value
 
 
@@ -337,16 +339,16 @@ def _select_named_file(
         return basename_matches
     if not basename_matches:
         raise FileNotFoundError(
-            f"Requested artifact weight {weight_name!r} was not found"
+            f"Requested checkpoint weight {weight_name!r} was not found"
         )
     raise ValueError(
-        f"Artifact weight name {weight_name!r} matches multiple files: "
+        f"Checkpoint weight name {weight_name!r} matches multiple files: "
         f"{list(basename_matches)}"
     )
 
 
-def select_artifact_weight_files(
-    request: ArtifactRequest, inventory: ArtifactInventory
+def select_checkpoint_weight_files(
+    request: CheckpointRequest, inventory: CheckpointInventory
 ) -> tuple[str, ...]:
     """Select weights deterministically; never guess among independent files."""
     candidates = tuple(
@@ -371,7 +373,7 @@ def select_artifact_weight_files(
             "weight_map", {}
         )
         if not isinstance(weight_map, dict) or not weight_map:
-            raise ValueError(f"Artifact index has no weight_map: {index_files[0]}")
+            raise ValueError(f"Checkpoint index has no weight_map: {index_files[0]}")
         index_dir = str(PurePosixPath(index_files[0]).parent)
         prefix = "" if index_dir == "." else f"{index_dir}/"
         selected = tuple(
@@ -380,19 +382,19 @@ def select_artifact_weight_files(
         missing = [path for path in selected if path not in candidates]
         if missing:
             raise FileNotFoundError(
-                f"Artifact index {index_files[0]!r} references missing files: {missing}"
+                f"Checkpoint index {index_files[0]!r} references missing files: {missing}"
             )
         return selected
     if len(index_files) > 1:
         raise ValueError(
-            f"Artifact contains multiple weight indexes: {list(index_files)}"
+            f"Checkpoint contains multiple weight indexes: {list(index_files)}"
         )
     if len(candidates) == 1:
         return candidates
     if not candidates:
-        raise FileNotFoundError("Artifact contains no recognized weight files")
+        raise FileNotFoundError("Checkpoint contains no recognized weight files")
     raise ValueError(
-        "Artifact contains multiple independent weight files; select one with "
+        "Checkpoint contains multiple independent weight files; select one with "
         f"an exact file URL or weight name. Candidates: {list(candidates)}"
     )
 
@@ -429,7 +431,7 @@ def _summarize_local_safetensors(file_path: str) -> TensorSummary:
 
 
 def _summarize_remote_safetensors(
-    inventory: ArtifactInventory, inventory_path: str
+    inventory: CheckpointInventory, inventory_path: str
 ) -> TensorSummary:
     source = inventory.source
     assert source.repo_id is not None
@@ -475,7 +477,7 @@ def _merge_tensor_summaries(summaries: list[TensorSummary]) -> TensorSummary | N
 
 
 def _resolve_quantization_metadata(
-    inventory: ArtifactInventory,
+    inventory: CheckpointInventory,
 ) -> tuple[str | None, str | None]:
     config_files = tuple(
         item.path
@@ -492,11 +494,11 @@ def _resolve_quantization_metadata(
     return quant_spec.declared_method, quant_spec.source
 
 
-def resolve_artifact(request: ArtifactRequest) -> ResolvedArtifact:
-    """Resolve one artifact request using the same metadata path as preflight."""
-    source = parse_artifact_source(request.source, revision=request.revision)
-    inventory = resolve_artifact_inventory(source)
-    selected_files = select_artifact_weight_files(request, inventory)
+def resolve_checkpoint(request: CheckpointRequest) -> ResolvedCheckpoint:
+    """Resolve one checkpoint request using the same metadata path as preflight."""
+    source = parse_checkpoint_source(request.source, revision=request.revision)
+    inventory = resolve_checkpoint_inventory(source)
+    selected_files = select_checkpoint_weight_files(request, inventory)
     summaries = []
     summary_files = () if request.role == "pipeline" else selected_files
     for selected_file in summary_files:
@@ -518,7 +520,7 @@ def resolve_artifact(request: ArtifactRequest) -> ResolvedArtifact:
         container_format = "mixed"
     else:
         container_format = None
-    return ResolvedArtifact(
+    return ResolvedCheckpoint(
         request=request,
         inventory=inventory,
         selected_files=selected_files,
@@ -529,11 +531,11 @@ def resolve_artifact(request: ArtifactRequest) -> ResolvedArtifact:
     )
 
 
-def materialize_resolved_artifact(artifact: ResolvedArtifact) -> tuple[str, ...]:
-    """Download exactly the files selected by a resolved weights artifact."""
-    if artifact.request.role in ("pipeline", "component"):
-        return (materialize_artifact(artifact.inventory),)
+def materialize_resolved_checkpoint(checkpoint: ResolvedCheckpoint) -> tuple[str, ...]:
+    """Download exactly the files selected by a resolved weights checkpoint."""
+    if checkpoint.request.role in ("pipeline", "component"):
+        return (materialize_checkpoint(checkpoint.inventory),)
     return tuple(
-        _materialize_inventory_file(artifact.inventory, selected_file)
-        for selected_file in artifact.selected_files
+        _materialize_inventory_file(checkpoint.inventory, selected_file)
+        for selected_file in checkpoint.selected_files
     )

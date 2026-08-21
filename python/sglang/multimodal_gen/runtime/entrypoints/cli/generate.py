@@ -10,6 +10,9 @@ import os
 from typing import cast
 
 from sglang.multimodal_gen import DiffGenerator
+from sglang.multimodal_gen.checkpoints.preflight import (
+    run_checkpoint_preflight,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
@@ -19,9 +22,6 @@ from sglang.multimodal_gen.runtime.entrypoints.cli.utils import (
     RaiseNotImplementedAction,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import GenerationResult
-from sglang.multimodal_gen.runtime.loader.artifact_preflight import (
-    run_artifact_preflight,
-)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
@@ -159,7 +159,7 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
     args.request_id = "mocked_fake_id_for_offline_generate"
 
     server_args = ServerArgs.from_cli_args(args, unknown_args)
-    if run_artifact_preflight(server_args):
+    if run_checkpoint_preflight(server_args):
         return
     sampling_params_cls = _resolve_cli_sampling_params_cls(server_args)
 

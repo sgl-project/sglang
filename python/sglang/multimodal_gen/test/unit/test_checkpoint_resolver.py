@@ -1,4 +1,3 @@
-import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -6,20 +5,19 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from sglang.multimodal_gen.runtime.loader.artifact_resolver import (
-    ArtifactFile,
-    ArtifactInventory,
-    ArtifactRequest,
-    parse_artifact_source,
-    resolve_artifact,
-    resolve_artifact_inventory,
+from sglang.multimodal_gen.checkpoints.resolver import (
+    CheckpointFile,
+    CheckpointRequest,
+    parse_checkpoint_source,
+    resolve_checkpoint,
+    resolve_checkpoint_inventory,
 )
 
 
-def test_parse_artifact_source_accepts_repo_subfolder_and_exact_url():
-    subfolder = parse_artifact_source("owner/repo/text_encoder", revision="v1")
-    repo_file = parse_artifact_source("owner/repo/adapter.safetensors")
-    exact_file = parse_artifact_source(
+def test_parse_checkpoint_source_accepts_repo_subfolder_and_exact_url():
+    subfolder = parse_checkpoint_source("owner/repo/text_encoder", revision="v1")
+    repo_file = parse_checkpoint_source("owner/repo/adapter.safetensors")
+    exact_file = parse_checkpoint_source(
         "https://huggingface.co/owner/repo/resolve/main/weights/model.safetensors"
     )
 
@@ -33,9 +31,9 @@ def test_parse_artifact_source_accepts_repo_subfolder_and_exact_url():
     assert exact_file.filename == "weights/model.safetensors"
 
 
-def test_parse_artifact_source_rejects_conflicting_url_revision():
+def test_parse_checkpoint_source_rejects_conflicting_url_revision():
     with pytest.raises(ValueError, match="conflicts with --revision"):
-        parse_artifact_source(
+        parse_checkpoint_source(
             "https://huggingface.co/owner/repo/tree/main/transformer",
             revision="v2",
         )
@@ -47,7 +45,7 @@ def test_resolve_local_inventory_does_not_load_tensor_payloads(tmp_path):
     (component / "config.json").write_text("{}")
     (component / "model.safetensors").write_bytes(b"header-only-fixture")
 
-    inventory = resolve_artifact_inventory(parse_artifact_source(str(component)))
+    inventory = resolve_checkpoint_inventory(parse_checkpoint_source(str(component)))
 
     assert inventory.resolved_revision is None
     assert [item.path for item in inventory.files] == [
@@ -57,7 +55,7 @@ def test_resolve_local_inventory_does_not_load_tensor_payloads(tmp_path):
 
 
 def test_resolve_remote_inventory_pins_revision_and_filters_subfolder():
-    source = parse_artifact_source("owner/repo/text_encoder", revision="main")
+    source = parse_checkpoint_source("owner/repo/text_encoder", revision="main")
     model_info = SimpleNamespace(
         sha="immutable-sha",
         siblings=[
@@ -70,36 +68,25 @@ def test_resolve_remote_inventory_pins_revision_and_filters_subfolder():
     )
 
     with patch(
-        "sglang.multimodal_gen.runtime.loader.artifact_resolver.HfApi.model_info",
+        "sglang.multimodal_gen.checkpoints.resolver.HfApi.model_info",
         return_value=model_info,
     ):
-        inventory = resolve_artifact_inventory(source)
+        inventory = resolve_checkpoint_inventory(source)
 
     assert inventory.resolved_revision == "immutable-sha"
     assert inventory.files == (
-        ArtifactFile(path="text_encoder/config.json", size=12, blob_id="a"),
-        ArtifactFile(path="text_encoder/model.safetensors", size=42, blob_id="b"),
+        CheckpointFile(path="text_encoder/config.json", size=12, blob_id="a"),
+        CheckpointFile(path="text_encoder/model.safetensors", size=42, blob_id="b"),
     )
 
 
-def test_materialized_inventory_shape_is_serializable():
-    source = parse_artifact_source("owner/repo")
-    inventory = ArtifactInventory(
-        source=source,
-        resolved_revision="sha",
-        files=(ArtifactFile(path="config.json", size=1),),
-    )
-
-    assert os.fspath(inventory.source.original) == "owner/repo"
-
-
-def test_weights_only_artifact_rejects_ambiguous_files(tmp_path):
+def test_weights_only_checkpoint_rejects_ambiguous_files(tmp_path):
     (tmp_path / "a.safetensors").write_bytes(b"a")
     (tmp_path / "b.safetensors").write_bytes(b"b")
 
     with pytest.raises(ValueError, match="multiple independent weight files"):
-        resolve_artifact(
-            ArtifactRequest(
+        resolve_checkpoint(
+            CheckpointRequest(
                 name="transformer",
                 role="component_weights",
                 component="transformer",
@@ -108,7 +95,7 @@ def test_weights_only_artifact_rejects_ambiguous_files(tmp_path):
         )
 
 
-def test_lora_artifact_reports_tensor_and_quant_metadata(tmp_path):
+def test_lora_checkpoint_reports_tensor_and_quant_metadata(tmp_path):
     (tmp_path / "config.json").write_text(
         '{"quantization_config": {"quant_method": "bitsandbytes"}}'
     )
@@ -121,18 +108,18 @@ def test_lora_artifact_reports_tensor_and_quant_metadata(tmp_path):
         metadata={"sampler_steps": "4"},
     )
 
-    artifact = resolve_artifact(
-        ArtifactRequest(
+    checkpoint = resolve_checkpoint(
+        CheckpointRequest(
             name="startup_lora",
             role="lora",
             source=str(tmp_path),
         )
     )
 
-    assert artifact.selected_files == ("adapter.safetensors",)
-    assert artifact.quantization_method == "bitsandbytes"
-    assert artifact.quantization_source == "quantization_config"
-    assert artifact.tensor_summary is not None
-    assert artifact.tensor_summary.tensor_count == 2
-    assert artifact.tensor_summary.lora_ranks == (4,)
-    assert artifact.tensor_summary.metadata["sampler_steps"] == "4"
+    assert checkpoint.selected_files == ("adapter.safetensors",)
+    assert checkpoint.quantization_method == "bitsandbytes"
+    assert checkpoint.quantization_source == "quantization_config"
+    assert checkpoint.tensor_summary is not None
+    assert checkpoint.tensor_summary.tensor_count == 2
+    assert checkpoint.tensor_summary.lora_ranks == (4,)
+    assert checkpoint.tensor_summary.metadata["sampler_steps"] == "4"

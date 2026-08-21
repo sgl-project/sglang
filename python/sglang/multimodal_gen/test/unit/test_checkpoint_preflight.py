@@ -2,19 +2,19 @@ import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.multimodal_gen.checkpoints.preflight import (
+    checkpoint_requests_from_server_args,
+    run_checkpoint_preflight,
+)
+from sglang.multimodal_gen.checkpoints.resolver import (
+    CheckpointFile,
+    CheckpointInventory,
+    CheckpointRequest,
+    CheckpointSource,
+    ResolvedCheckpoint,
+)
 from sglang.multimodal_gen.runtime.entrypoints.cli.generate import generate_cmd
 from sglang.multimodal_gen.runtime.entrypoints.cli.serve import execute_serve_cmd
-from sglang.multimodal_gen.runtime.loader.artifact_preflight import (
-    artifact_requests_from_server_args,
-    run_artifact_preflight,
-)
-from sglang.multimodal_gen.runtime.loader.artifact_resolver import (
-    ArtifactFile,
-    ArtifactInventory,
-    ArtifactRequest,
-    ArtifactSource,
-    ResolvedArtifact,
-)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
@@ -26,25 +26,25 @@ def _server_args(**overrides):
         "transformer_weights_path": "/weights/dit.safetensors",
         "lora_path": "owner/lora",
         "lora_weight_name": "turbo.safetensors",
-        "artifact_preflight": "metadata",
-        "artifact_report_format": "text",
+        "checkpoint_preflight": "metadata",
+        "checkpoint_report_format": "text",
         "webui": False,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
 
 
-def _resolved_artifact() -> ResolvedArtifact:
-    request = ArtifactRequest(name="model", role="pipeline", source="owner/base")
-    source = ArtifactSource(
+def _resolved_checkpoint() -> ResolvedCheckpoint:
+    request = CheckpointRequest(name="model", role="pipeline", source="owner/base")
+    source = CheckpointSource(
         original="owner/base", kind="huggingface", repo_id="owner/base"
     )
-    return ResolvedArtifact(
+    return ResolvedCheckpoint(
         request=request,
-        inventory=ArtifactInventory(
+        inventory=CheckpointInventory(
             source=source,
             resolved_revision="sha",
-            files=(ArtifactFile(path="model_index.json", size=10),),
+            files=(CheckpointFile(path="model_index.json", size=10),),
         ),
         selected_files=(),
         container_format=None,
@@ -54,8 +54,8 @@ def _resolved_artifact() -> ResolvedArtifact:
     )
 
 
-def test_preflight_collects_all_configured_artifact_roles():
-    requests = artifact_requests_from_server_args(_server_args())
+def test_preflight_collects_all_configured_checkpoint_roles():
+    requests = checkpoint_requests_from_server_args(_server_args())
 
     assert [(request.name, request.role) for request in requests] == [
         ("model", "pipeline"),
@@ -73,18 +73,19 @@ def test_json_report_keeps_server_args_logs_off_stdout(capsys):
     ):
         server_args = ServerArgs(
             model_path="owner/base",
-            artifact_preflight="metadata",
-            artifact_report_format="json",
+            checkpoint_preflight="metadata",
+            checkpoint_report_format="json",
         )
     with patch(
-        "sglang.multimodal_gen.runtime.loader.artifact_preflight."
-        "resolve_server_artifacts",
-        return_value=(_resolved_artifact(),),
+        "sglang.multimodal_gen.checkpoints.preflight." "resolve_server_checkpoints",
+        return_value=(_resolved_checkpoint(),),
     ):
-        assert run_artifact_preflight(server_args)
+        assert run_checkpoint_preflight(server_args)
 
     captured = capsys.readouterr()
-    assert json.loads(captured.out)["schema_version"] == 1
+    report = json.loads(captured.out)
+    assert report["schema_version"] == 1
+    assert len(report["checkpoints"]) == 1
     assert "server_args" in captured.err
 
 
@@ -98,7 +99,7 @@ def test_generate_and_serve_stop_before_launch_after_preflight():
         ),
         patch(
             "sglang.multimodal_gen.runtime.entrypoints.cli.generate."
-            "run_artifact_preflight",
+            "run_checkpoint_preflight",
             return_value=True,
         ),
         patch(
@@ -117,7 +118,7 @@ def test_generate_and_serve_stop_before_launch_after_preflight():
         ),
         patch(
             "sglang.multimodal_gen.runtime.entrypoints.cli.serve."
-            "run_artifact_preflight",
+            "run_checkpoint_preflight",
             return_value=True,
         ),
         patch(
