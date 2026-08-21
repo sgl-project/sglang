@@ -1887,6 +1887,7 @@ class UnifiedRadixCache(BasePrefixCache):
             del self.ongoing_prefetch[req_id]
             if self.buffer_pipeline is not None:
                 self.buffer_pipeline.pop_prefix_ctx(req_id)
+                self.buffer_pipeline.release_anchor_lock(req_id)
             self.cache_controller.prefetch_tokens_occupied -= (
                 self._prefetch_occupied_span(prefetch_key, host_indices)
             )
@@ -1954,6 +1955,7 @@ class UnifiedRadixCache(BasePrefixCache):
         del self.ongoing_prefetch[rid]
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.pop_prefix_ctx(rid)
+            self.buffer_pipeline.release_anchor_lock(rid)
         self.cache_controller.append_host_mem_release(
             host_indices=host_indices[:completed_tokens],
             extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
@@ -2032,6 +2034,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self._invalidate_absent_from_hit_query(operation)
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.pop_prefix_ctx(req_id)
+            self.buffer_pipeline.release_anchor_lock(req_id)
         cc = self.cache_controller
         cc.append_host_mem_release(
             extra_pools=[x for xfers in comp_xfers.values() for x in xfers]
@@ -2114,6 +2117,10 @@ class UnifiedRadixCache(BasePrefixCache):
             self.ongoing_prefetch[req_id] = info._replace(host_indices=host_indices)
             if buffer_mode:
                 cc.prefetch_tokens_occupied += alloc_len
+                # IO commit: pin the anchor until consumption. Do not read
+                # attributes off `operation` here — alternative cache
+                # controllers may expose a narrower surface.
+                self.buffer_pipeline.try_lock_anchor(req_id, info.anchor_node_id)
             cc.prefetch_buffer.put(operation)
             return True
 
