@@ -116,6 +116,18 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         self.assertIn("not idle", out.message)
         s.teardown_disaggregation.assert_not_called()
 
+    def test_rejected_when_decode_graph_headroom_is_missing(self):
+        s = self._scheduler(DisaggregationMode.PREFILL)
+        s.tp_worker.get_decode_cuda_graph_bs.return_value = []
+        out = Scheduler.handle_pd_role_switch(
+            s, PdRoleSwitchReqInput(new_role="decode")
+        )
+
+        self.assertFalse(out.success)
+        self.assertTrue(out.safe_to_restore)
+        self.assertIn("decode_cuda_graph_memory_gb is required", out.message)
+        s.teardown_disaggregation.assert_not_called()
+
     def test_rejected_when_decode_graph_headroom_is_insufficient(self):
         s = self._scheduler(DisaggregationMode.PREFILL)
         s.device = "cuda"

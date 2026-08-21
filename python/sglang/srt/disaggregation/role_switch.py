@@ -83,12 +83,9 @@ def handle_pd_role_switch(
         new_role == "decode" and not scheduler.tp_worker.get_decode_cuda_graph_bs()
     )
     if will_capture_graphs and required_graph_gb is None:
-        logger.warning(
-            "PD role switch: capturing decode CUDA graphs without a headroom "
-            "check. The KV pool was already sized for the launch role, so the "
-            "capture allocates on top of it and can OOM. Pass "
-            "decode_cuda_graph_memory_gb on the switch request to have it "
-            "refused instead."
+        return _fail(
+            "decode_cuda_graph_memory_gb is required before capturing decode graphs",
+            safe_to_restore=True,
         )
     if will_capture_graphs and required_graph_gb is not None:
         if required_graph_gb < 0:
