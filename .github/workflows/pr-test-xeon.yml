@@ -183,6 +183,7 @@ jobs:
               -v ${{ github.workspace }}:/sglang-checkout/ --ipc=host \
               -v $HOME/.cache/huggingface:/root/.cache/huggingface \
               -e HF_TOKEN="$HF_TOKEN_VAL" \
+              -e SGLANG_CPU_OMP_THREADS_BIND="$cpus" \
               --name "$cname" \
               sglang_xeon
             # AMX sanity on this socket, then the partition it owns.
