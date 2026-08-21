@@ -338,7 +338,7 @@ sgl-eval run gsm8k \\
         "--port {{PORT}}",
       ],
     },
-];;
+];
     return [
       ...lowLatencyCells.flatMap((c) => [
         c,
