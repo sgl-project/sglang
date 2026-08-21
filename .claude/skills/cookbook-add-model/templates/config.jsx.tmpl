@@ -335,6 +335,9 @@ sgl-eval run gsm8k \\
     // ==== NVIDIA Blackwell + FP4 (single node) ====
     {
       match: { hw: "b200", variant: "default", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      // For a cell whose verification round is open, use `verificationStatus`
+      // instead ("verified" | "in-progress" | "unverified", or a function of
+      // the selection for a per-pick state) — authoring-reference §2.2.
       verified: true, // EXAMPLE — set false / replace with your verified recipe
       env: [],
       flags: [
