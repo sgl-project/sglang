@@ -50,7 +50,6 @@ import tqdm
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
-from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import (
@@ -110,7 +109,9 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     TCPCG_FAILURE_HINT,
     set_tc_piecewise_forward_context,
 )
-from sglang.srt.model_executor.runner_utils import maybe_publish_prefill_war_read_done
+from sglang.srt.model_executor.runner_utils import (
+    maybe_publish_prefill_shared_read_done,
+)
 from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
@@ -119,6 +120,7 @@ from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    is_cuda,
     is_npu,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -249,11 +251,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     buffer population, attention metadata init, and output slicing.
     """
 
-    # DSA forces use_mha=False in BCG capture/replay, so the sparse path
-    # serves any prefix and the MHA-prefix ban does not apply. Class
-    # default keeps __new__-built test instances on the ban.
-    dsa_sparse_prefill_forced: bool = False
-
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         # --- model flags ----------------------------------------------
@@ -299,13 +296,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.mamba_track_enabled = self._is_mamba_track_enabled()
 
         # --- buffers ---------------------------------------------------
+        # `hidden_size` here sizes only the multimodal `input_embeds` buffer,
+        # which `general_mm_embed_routine` copies the merged text+media
+        # embeddings into. A model whose merge happens above the embedding width
+        # (e.g. a residual-stream merge) writes a wider tensor than
+        # `config.hidden_size`, so let it declare that width.
+        input_embeds_hidden_size = self._input_embeds_hidden_size()
         self.buffers: PrefillInputBuffers = PrefillInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
             max_num_tokens=self.max_num_tokens,
             cache_loc_dtype=self._cache_loc_dtype(),
             is_multimodal=self.is_multimodal,
-            hidden_size=self.model_runner.model_config.hidden_size,
+            hidden_size=input_embeds_hidden_size,
             dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
         )
@@ -319,7 +322,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             max_num_token=self.max_num_tokens,
             cache_loc_dtype=self._cache_loc_dtype(),
             is_multimodal=self.is_multimodal,
-            hidden_size=self.model_runner.model_config.hidden_size,
+            hidden_size=input_embeds_hidden_size,
             embed_dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
             enable_num_token_non_padded=enable_num_token_non_padded(),
@@ -330,20 +333,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             source=self.buffers,
         )
 
-        self.dsa_sparse_prefill_forced = is_deepseek_dsa(
-            self.model_runner.model_config.hf_config
-        )
-
         self.attention_layers = self.model_runner.attention_layers
         self.mha_companion_layers = self.model_runner.mha_companion_layers
         self.has_mha_companion_layers = any(
             layer is not None for layer in self.mha_companion_layers
-        )
-        # Archs on the MLA-BCG allowlist pin the absorbed MLA path inside
-        # capture/replay (attention_backend_handler), so the MHA companion is
-        # never captured and the MHA-prefix restrictions below don't apply.
-        self.mla_pinned_under_bcg = (
-            self.model_runner.model_config.is_mla_breakable_cuda_graph_supported
         )
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
@@ -543,6 +536,25 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
+
+    def _input_embeds_hidden_size(self) -> int:
+        """Width of the `input_embeds` the model writes inside the graph.
+
+        Defaults to `config.hidden_size`; a model that merges multimodal
+        embeddings at a wider width declares it via `input_embeds_hidden_size`.
+
+        `getattr` with a default rather than an always-present field: the
+        property exists only on the handful of model classes whose merge width
+        differs, and adding it to every model in the registry to satisfy a
+        `None` check is not worth it. Same shape as the `hc_hidden_size`
+        opt-in already threaded through `base_runner` and
+        `decode_cuda_graph_runner`.
+        """
+        return getattr(
+            self.model_runner.model,
+            "input_embeds_hidden_size",
+            self.model_runner.model_config.hidden_size,
+        )
 
     def _next_token_logits_buffer(self, rows: int) -> Optional[torch.Tensor]:
         if not self.model_runner.pp_group.is_last_rank:
@@ -1058,16 +1070,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if replace_embeds is not None:
             return False
-        # A prefix forces the MHA companion path, whose captured state is
-        # frozen prefix-free; DSA models are exempt (capture/replay force
-        # the sparse path, which takes any prefix via device metadata), as
-        # are archs on the MLA-BCG allowlist (they pin the absorbed MLA path
-        # inside capture/replay, so the MHA companion is never captured).
+        # Off CUDA, BCG takes the MHA companion, whose prefix path is uncapturable.
         if (
             self.prefill_backend_name == Backend.BREAKABLE
             and self.has_mha_companion_layers
-            and not self.dsa_sparse_prefill_forced
-            and not self.mla_pinned_under_bcg
+            and not is_cuda()
             and prefix_lens is not None
             and any(prefix_lens)
         ):
@@ -1577,7 +1584,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if (
             isinstance(self.backend, BreakableCudaGraphBackend)
             and self.has_mha_companion_layers
-            and not self.mla_pinned_under_bcg
+            and not is_cuda()
         ):
             self._restore_mha_capture_state(static_forward_batch)
 
@@ -1778,7 +1785,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self._prepare_chunked_prefix_replay(shape_key, forward_batch)
             # Replay prep, including the optional chunked-prefix gather above,
             # has finished every scheduler-shared read.
-            maybe_publish_prefill_war_read_done(
+            maybe_publish_prefill_shared_read_done(
                 self.model_runner, forward_batch, self.device_module
             )
 

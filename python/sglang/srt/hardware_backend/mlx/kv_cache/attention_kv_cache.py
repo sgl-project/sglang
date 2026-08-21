@@ -21,8 +21,15 @@ def make_attention_mask(N, offset, return_array=False, window_size=None):
     layers pass it, including for N == 1) or windowed models silently fall
     back to full attention.
     """
-    if window_size is not None:
+    if window_size is not None and offset + N > window_size:
         return create_causal_mask(N, offset, window_size=window_size)
+    # Either no window, or a window that cannot bind: the lowest query position
+    # is ``offset``, so ``offset + N <= window_size`` puts every causally
+    # visible key inside the band and the banded mask is elementwise identical
+    # to a plain causal one (the same shortcut mlx_lm's RotatingKVCache takes).
+    # Worth the branch because a materialised mask forces
+    # mx.fast.scaled_dot_product_attention off its fused causal path: ~2x
+    # slower per layer, plus an N x (offset + N) allocation.
     if N == 1:
         return None
     if return_array:
@@ -141,9 +148,127 @@ class ContiguousAttentionKVCache:
         self.values[:, :, self.offset : end, :] = v
         self.offset = end
 
-    def get_kv(self) -> tuple[mx.array, mx.array]:
-        """Return valid K/V: (1, n_kv_heads, offset, head_dim)."""
-        return self.keys[:, :, : self.offset, :], self.values[:, :, : self.offset, :]
+    def get_kv(self, window: int | None = None) -> tuple[mx.array, mx.array]:
+        """Return valid K/V: (1, n_kv_heads, min(offset, window), head_dim).
+
+        ``window`` keeps only the trailing window a sliding-window layer can
+        attend to; slicing it here costs one op instead of two.
+        """
+        start = 0 if window is None else max(0, self.offset - window)
+        return (
+            self.keys[:, :, start : self.offset, :],
+            self.values[:, :, start : self.offset, :],
+        )
+
+    def reset(self) -> None:
+        """Reset for reuse, keeping allocated buffers."""
+        self.offset = 0
+
+
+class WindowedAttentionKVCache:
+    """Sliding-window attention KV buffer for one request and one layer.
+
+    Holds the trailing ``window`` tokens plus the in-flight chunk, in
+    temporal order, instead of the full sequence.  ``offset`` stays
+    absolute (RoPE positions, decode bookkeeping); the dropped prefix
+    shows up only in the shorter arrays returned by
+    ``update_and_fetch``/``get_kv`` and in the mask offset ``make_mask``
+    clamps to, so mask width always equals returned key length.
+    """
+
+    __slots__ = ("keys", "values", "offset", "window", "_local")
+
+    def __init__(self, window: int):
+        self.window = window
+        self.keys: mx.array | None = None
+        self.values: mx.array | None = None
+        self.offset = 0  # absolute: every token ever written
+        self._local = 0  # tokens currently in the buffer
+
+    @property
+    def state(self):
+        """Arrays for ``mx.eval`` unpacking."""
+        if self.keys is None:
+            return ()
+        return (self.keys, self.values)
+
+    def reset(self) -> None:
+        """Reset for reuse, keeping allocated buffers."""
+        self.offset = 0
+        self._local = 0
+
+    def make_mask(self, N, return_array=False, window_size=None, **kwargs):
+        kept = min(self._local, self.window)
+        if window_size is None and self.offset > kept:
+            raise RuntimeError(
+                "WindowedAttentionKVCache holds only the trailing window and "
+                "cannot serve a full-context attention mask"
+            )
+        # No N == 1 shortcut here: mlx_lm's banded mask is
+        # ``linds < rinds + window_size`` (strict), so a window of W admits
+        # exactly W keys, while this buffer returns W + 1 once ``kept ==
+        # window`` -- the trailing window plus the token just written.
+        return make_attention_mask(
+            N, kept, return_array=return_array, window_size=window_size
+        )
+
+    def _append(self, keys: mx.array, values: mx.array) -> tuple[int, int]:
+        """Append a chunk in place; return the (start, end) span it serves.
+
+        Split out of ``update_and_fetch`` so the decode path can skip building
+        the two return slices, which it discards in favour of ``get_kv``.
+        """
+        S = keys.shape[2]
+        kept = min(self._local, self.window)
+        capacity = self.window + max(S, self.window)
+        held = self.keys.shape[2] if self.keys is not None else 0
+        if self._local + S > held or held > capacity:
+            # Compact the trailing window into a right-sized buffer: this
+            # allocates on the first write, drops history when the buffer
+            # fills (amortised O(1) per decode token), and shrinks back to
+            # 2 * window once an oversized prefill chunk is behind us.
+            B, n_kv_heads, _, head_dim = keys.shape
+            new_k = mx.zeros((B, n_kv_heads, capacity, head_dim), dtype=keys.dtype)
+            new_v = mx.zeros((B, n_kv_heads, capacity, head_dim), dtype=keys.dtype)
+            if kept:
+                src = slice(self._local - kept, self._local)
+                new_k[:, :, :kept, :] = self.keys[:, :, src, :]
+                new_v[:, :, :kept, :] = self.values[:, :, src, :]
+            self.keys, self.values, self._local = new_k, new_v, kept
+        start, end = self._local - kept, self._local + S
+        self.keys[:, :, self._local : end, :] = keys
+        self.values[:, :, self._local : end, :] = values
+        self._local = end
+        self.offset += S
+        return start, end
+
+    def update_and_fetch(
+        self, keys: mx.array, values: mx.array
+    ) -> tuple[mx.array, mx.array]:
+        """Append a chunk and return the kept trailing window plus the chunk.
+
+        The kept prefix is ``min(local, window)``, matching what
+        ``make_mask`` clamps to earlier in the same forward pass.
+        """
+        start, end = self._append(keys, values)
+        return self.keys[:, :, start:end, :], self.values[:, :, start:end, :]
+
+    def write_token(self, k: mx.array, v: mx.array) -> None:
+        """Write one token. k, v shape: (1, n_kv_heads, 1, head_dim)."""
+        self._append(k, v)
+
+    def get_kv(self, window: int | None = None) -> tuple[mx.array, mx.array]:
+        """Return buffered trailing K/V: (1, n_kv_heads, kept, head_dim).
+
+        ``window`` mirrors :meth:`ContiguousAttentionKVCache.get_kv`, but the
+        slice is buffer-relative: this buffer holds at most ``2 * window``
+        tokens, so the trailing window starts from ``_local``, not ``offset``.
+        """
+        start = 0 if window is None else max(0, self._local - window)
+        return (
+            self.keys[:, :, start : self._local, :],
+            self.values[:, :, start : self._local, :],
+        )
 
 
 class PoolBackedAttentionKVCache:
