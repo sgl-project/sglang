@@ -1439,14 +1439,38 @@ def test_only_the_layers_the_budget_covers_are_pinned(tmp_path, monkeypatch):
     assert not (pinned & mapped), "a layer is in one store or the other"
 
 
-def test_pins_are_given_back_when_the_leftover_copies_do_not_fit(tmp_path, monkeypatch):
+def test_pins_are_given_back_when_they_do_not_fit_the_host(tmp_path, monkeypatch):
     if not pathlib.Path("/proc/self/maps").exists():
         pytest.skip("needs /proc to tell a mapping from anonymous memory")
-    # Four half-mapped layers. The budget pins two, but a demoted layer keeps
-    # its anonymous half, and pins plus that residue exceed the host: the plan
-    # must give a pin back rather than allocate more than the machine has.
+    # Four fully mapped layers. The budget covers two pins, but each pin copies
+    # its whole layer off the mapping and the host only has room for one plus
+    # the reserve: the plan must give the second pin back rather than allocate
+    # more than the machine has.
+    available = 4 * 1024**3 + int(1.5 * _BLOCK_BYTES)
+    manager = _mapped_manager(
+        tmp_path,
+        monkeypatch,
+        available_bytes=available,
+        pin_budget_bytes=2 * 1024**3 + 2 * _BLOCK_BYTES,
+        num_blocks=4,
+    )
+    on_mapping = {i for i in range(4) if manager._mapped_cpu_weights.get(i)}
+    assert on_mapping == {1, 2, 3}, (
+        "two pins add two layers of anonymous memory against room for 1.5, so "
+        "the least valuable pin (layer 1) is given back"
+    )
+    pinned = {i for i in range(4) if manager._consolidated_cpu_weights.get(i)}
+    assert pinned == {0}
+
+
+def test_replacing_an_anonymous_original_is_not_charged_as_new(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    # Half of each layer is a fused anonymous tensor whose store buffer
+    # replaces it -- a wash. Only the mapped half is a net addition, so a
+    # host with room for the mapped halves alone must still pin every layer.
     block = _MIXED_BLOCK_BYTES
-    available = 4 * 1024**3 + 3 * block
+    available = 4 * 1024**3 + int(2.5 * block)
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
     )
@@ -1462,23 +1486,18 @@ def test_pins_are_given_back_when_the_leftover_copies_do_not_fit(tmp_path, monke
         enabled=True,
         pin_cpu_memory=True,
         pin_budget=host_memory_budget.HostPinBudget(
-            available_bytes=2 * 1024**3 + 2 * block
+            available_bytes=2 * 1024**3 + 3 * block
         ),
         prefetch_size=1,
     )
+    pinned = {i for i in range(4) if 0 in manager._consolidated_cpu_weights}
     on_mapping = {i for i in range(4) if manager._mapped_cpu_weights.get(i)}
-    assert on_mapping == {1, 2, 3}, (
-        "pins 0 and 1 plus the demoted layers' anonymous halves exceed the "
-        "host, so the least valuable pin (layer 1) must be given back"
+    assert not on_mapping, (
+        "the net addition is three pinned mapped-halves plus one pageable "
+        "mapped-half (2 blocks) against room for 2.5 -- charging the replaced "
+        "anonymous originals as new would demote, then strip every pin"
     )
-    anonymous = sum(
-        buffer.numel() * buffer.element_size()
-        for store in manager._consolidated_cpu_weights.values()
-        for buffer in store.values()
-    )
-    assert (
-        anonymous < 3 * block
-    ), "what the plan allocates anonymously must fit the host it planned for"
+    assert all(manager._consolidated_cpu_weights.get(i) for i in range(4))
 
 
 def test_every_layer_is_pinned_when_the_budget_covers_them(tmp_path, monkeypatch):

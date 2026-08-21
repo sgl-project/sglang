@@ -460,40 +460,40 @@ class LayerwiseOffloadManager:
             else:
                 hosting[layer_idx] = "pageable"
 
-        def anonymous_bytes() -> int:
-            # What this plan will allocate that the page cache cannot drop: the
-            # pins, the pageable copies, and a mapped layer's non-view share.
+        def anonymous_new_bytes() -> int:
+            # What this plan adds, net, to anonymous memory. A store buffer
+            # that replaces an anonymous original -- the non-view share, such
+            # as a fused qkv -- is a wash: the original is freed when its
+            # parameter is rebound. The net cost of hosting a layer off its
+            # mapping is therefore only the checkpoint-view share it copies in,
+            # and a layer left on the mapping adds nothing.
             return sum(
-                totals[idx] if where != "mapped" else totals[idx] - mapped[idx]
-                for idx, where in hosting.items()
+                mapped[idx] for idx, where in hosting.items() if where != "mapped"
             )
 
         unpinned = [idx for idx, where in hosting.items() if where != "pinned"]
-        unpinned_bytes = sum(totals[idx] for idx in unpinned)
-        # The pins are booked but not yet allocated, so the copies have to be
-        # weighed against the pool they will share with them. Asking about the
-        # copies alone counts the same free bytes twice, and the error only ever
-        # says "fits".
-        if unpinned and host_copies_would_not_fit(pinned_bytes + unpinned_bytes):
+        # The pins are booked but not yet allocated, so what the plan adds has
+        # to be weighed as one sum against the live reading. Asking about any
+        # one tier alone counts the same free bytes twice, and the error only
+        # ever says "fits".
+        if unpinned and host_copies_would_not_fit(anonymous_new_bytes()):
             for layer_idx in unpinned:
                 if mapped[layer_idx]:
                     hosting[layer_idx] = "mapped"
-            # Demoting removes only the mapped share of a layer; whatever is not
-            # a checkpoint view still has to be copied somewhere, and if that
-            # residue plus the pins does not fit either, pins are what there is
-            # to give back. The tail of the pin order holds the least valuable
-            # pins, so they go first.
-            while pin_order and host_copies_would_not_fit(anonymous_bytes()):
+            # If the pins alone still do not fit, pins are what there is to
+            # give back. The tail of the pin order holds the least valuable
+            # ones, so they go first.
+            while pin_order and host_copies_would_not_fit(anonymous_new_bytes()):
                 layer_idx = pin_order.pop()
                 hosting[layer_idx] = "mapped" if mapped[layer_idx] else "pageable"
                 pinned_bytes -= totals[layer_idx]
-            if host_copies_would_not_fit(anonymous_bytes()):
+            if host_copies_would_not_fit(anonymous_new_bytes()):
                 logger.warning(
-                    "Layerwise offload: %s has to keep %.2f GiB in host memory "
-                    "that no mapping can absorb, and %.2f GiB is available. "
-                    "Expect the host to be the limit.",
+                    "Layerwise offload: %s adds %.2f GiB of anonymous host "
+                    "memory that no mapping can absorb, and %.2f GiB is "
+                    "available. Expect the host to be the limit.",
                     self._pin_component_name,
-                    anonymous_bytes() / 1024**3,
+                    anonymous_new_bytes() / 1024**3,
                     host_memory_available_bytes() / 1024**3,
                 )
         if pinned_bytes and self._pin_budget is not None:
