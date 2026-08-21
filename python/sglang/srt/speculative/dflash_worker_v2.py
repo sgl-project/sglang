@@ -40,6 +40,7 @@ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
+    build_speculative_verify_target_probs,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
@@ -55,6 +56,9 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
+from sglang.srt.speculative.sampling_mask import (
+    SpeculativeSamplingMaskCapture,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
@@ -174,6 +178,18 @@ def _commit_accept(candidates, accept_len, bonus_tokens):
 
 def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
+
+
+def _build_dflash_sampling_mask_capture(
+    *,
+    target_probs: Optional[torch.Tensor],
+    sampling_info,
+) -> SpeculativeSamplingMaskCapture:
+    return SpeculativeSamplingMaskCapture(
+        target_probs=target_probs,
+        return_sampling_masks=list(sampling_info.return_sampling_masks or []),
+        max_top_k=sampling_info.sampling_mask_max_top_k,
+    )
 
 
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
@@ -2011,6 +2027,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         candidates = draft_tokens
         new_seq_lens = None
         target_predict = None
+        return_sampling_masks = (
+            sampling_info.return_sampling_masks if sampling_info is not None else []
+        )
+        needs_sampling_masks = any(return_sampling_masks or [])
+        target_probs = None
         if self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
             accept_len, bonus = self._selector_sampling_accept(
@@ -2022,15 +2043,29 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_input=draft_input,
             )
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+            if needs_sampling_masks:
+                target_probs = build_speculative_verify_target_probs(
+                    next_token_logits=logits_output.next_token_logits,
+                    sampling_info=sampling_info,
+                    draft_token_num=int(self.block_size),
+                    bs=bs,
+                    max_top_k=draft_input.max_top_k,
+                    uniform_top_k_value=draft_input.uniform_top_k_value,
+                )
         elif (
             not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
         ):
-            accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
+            (
+                accept_len,
+                bonus,
+                target_probs,
+            ) = compute_dflash_sampling_correct_drafts_and_bonus(
                 candidates=candidates,
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
+                return_target_probs=needs_sampling_masks,
             )
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         else:
@@ -2103,6 +2138,18 @@ class DFlashWorkerV2(BaseSpecWorker):
             # The Triton path may have written new_seq_lens from the real
             # accept_len; recompute it from the forced commit_lens.
             new_seq_lens = None
+
+        if needs_sampling_masks:
+            sampling_mask_capture = _build_dflash_sampling_mask_capture(
+                target_probs=target_probs,
+                sampling_info=sampling_info,
+            )
+            logits_output.next_token_sampling_mask_output = (
+                sampling_mask_capture.build_output(
+                    out_tokens=out_tokens,
+                    commit_lens=commit_lens,
+                )
+            )
 
         if batch.return_logprob:
             compute_spec_logprobs(
