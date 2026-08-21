@@ -77,13 +77,18 @@ def validate_deepseek_v4_mega_moe_token_budget(
         // token_alignment
         * token_alignment
     )
-    max_tokens_per_rank = (
-        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-    )
+    if envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get():
+        max_tokens_env = "SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR"
+        max_tokens_per_rank = envs.SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR.get()
+    else:
+        max_tokens_env = "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK"
+        max_tokens_per_rank = (
+            envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+        )
     if max_tokens_per_rank < required_tokens_per_rank:
         raise ValueError(
             "DeepSeekV4 with MegaMoE requires "
-            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK to "
+            f"{max_tokens_env} to "
             "cover each rank's effective prefill token budget. "
             f"Current values: chunked_prefill_size="
             f"{server_args.chunked_prefill_size}, "
@@ -91,9 +96,8 @@ def validate_deepseek_v4_mega_moe_token_budget(
             f"token_partition_size={token_partition_size}, "
             f"token_alignment={token_alignment}, "
             f"required_per_rank={required_tokens_per_rank}, "
-            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
-            f"{max_tokens_per_rank}. Set "
-            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK to at "
+            f"{max_tokens_env}={max_tokens_per_rank}. Set "
+            f"{max_tokens_env} to at "
             f"least {required_tokens_per_rank}, or lower "
             "--chunked-prefill-size until the effective per-rank budget fits. "
             "Otherwise MegaMoE falls back to the fused MoE path at runtime."

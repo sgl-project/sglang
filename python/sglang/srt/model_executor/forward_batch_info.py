@@ -511,6 +511,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     _original_num_tokens: Optional[int] = None
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
+    mega_moe_global_num_tokens_cpu: Optional[List[int]] = None
+    mega_moe_global_max_tokens: Optional[int] = None
+    mega_moe_sync_tokens: Optional[int] = None
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
@@ -700,6 +703,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.global_num_tokens_for_logprob_gpu = torch.tensor(
             global_num_tokens_for_logprob, dtype=torch.int64
         ).to(device, non_blocking=True)
+        if batch.mega_moe_global_num_tokens is not None:
+            mega_moe_global_num_tokens = list(batch.mega_moe_global_num_tokens)
+            if self.spec_info is not None:
+                mega_moe_global_num_tokens = [
+                    value * self.spec_info.num_tokens_per_req
+                    for value in mega_moe_global_num_tokens
+                ]
+            self.mega_moe_global_num_tokens_cpu = mega_moe_global_num_tokens
+            self.mega_moe_global_max_tokens = max(mega_moe_global_num_tokens)
+            mega_moe_sync_tokens = batch.mega_moe_sync_tokens
+            if mega_moe_sync_tokens is not None and self.spec_info is not None:
+                mega_moe_sync_tokens *= self.spec_info.num_tokens_per_req
+            self.mega_moe_sync_tokens = mega_moe_sync_tokens
         self.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
 
     @classmethod
@@ -1281,6 +1297,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self._original_batch_size = self.batch_size
         global_num_tokens = list(self.global_num_tokens_cpu)
+        mega_moe_idle_materialize = bool(
+            envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
+            and self.is_extend_in_batch
+            and self.forward_mode.is_idle()
+        )
+        if mega_moe_idle_materialize:
+            global_num_tokens = [1]
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_parallel().attn_tp_size
 
@@ -1387,7 +1410,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.forward_mode = ForwardMode.TARGET_VERIFY
                 # Invert the spec_scale_global_num_tokens scaling.
                 bs = self.batch_size = num_tokens // self.spec_info.num_tokens_per_req
-            elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
+            elif mega_moe_idle_materialize or (
+                self.is_extend_in_batch and dp_padding_mode.is_max_len()
+            ):
                 self._original_forward_mode = self.forward_mode
                 self.forward_mode = ForwardMode.EXTEND
                 # Fabricate a single dummy request covering num_tokens for an
