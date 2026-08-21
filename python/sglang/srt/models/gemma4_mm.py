@@ -65,7 +65,7 @@ from sglang.srt.models.gemma4_causal import (
     pp_filter_load_weight,
 )
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -191,7 +191,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        self.enable_multimodal = get_server_args().enable_multimodal
+        self.enable_multimodal = bool(get_mm().enable_multimodal)
 
         text_config = config.text_config
 
@@ -708,6 +708,15 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             return
         return self.language_model.tie_weights()
 
+    # E2B / E4B carry vision + audio; 26B-A4B / 31B carry vision only; 12B is
+    # encoder-free and handled by Gemma4UnifiedForConditionalGeneration.
+    _MULTIMODAL_NAME_FRAGMENTS = (
+        "vision_tower.",
+        "embed_vision.",
+        "audio_tower.",
+        "embed_audio.",
+    )
+
     # Standard stacked-params mapping for fused QKV / GateUp linears
     # in the text decoder.  Also consumed by the tower QKV remap (step 2).
     stacked_params_mapping = [
@@ -832,6 +841,12 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         return name
 
+    def _should_skip_multimodal_weight(self, name: str) -> bool:
+        """Text-only serving never builds the towers, so drop their weights."""
+        return not self.enable_multimodal and any(
+            fragment in name for fragment in self._MULTIMODAL_NAME_FRAGMENTS
+        )
+
     def _get_k_eq_v_layers(self) -> set:
         """Return set of layer indices where attention_k_eq_v applies (full-attention layers)."""
         text_config = self.config.text_config
@@ -888,15 +903,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
-            if not self.enable_multimodal and any(
-                module_name in name
-                for module_name in (
-                    "vision_tower.",
-                    "embed_vision.",
-                    "audio_tower.",
-                    "embed_audio.",
-                )
-            ):
+            if self._should_skip_multimodal_weight(name):
                 continue
             if "embed_vision.embedding." in name or "embed_audio.embedding." in name:
                 continue

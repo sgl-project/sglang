@@ -53,7 +53,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.gemma4_causal import Gemma4TextModel, pp_filter_load_weight
 from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -136,6 +136,14 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
     vision tower and conformer audio tower for the encoder-free embedders.
     """
 
+    # 12B is the only encoder-free Gemma 4 size; its checkpoint carries both
+    # vision and audio.
+    _MULTIMODAL_NAME_FRAGMENTS = (
+        "vision_embedder.",
+        "embed_vision.",
+        "embed_audio.",
+    )
+
     def __init__(
         self,
         config,
@@ -148,7 +156,7 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        self.enable_multimodal = get_server_args().enable_multimodal
+        self.enable_multimodal = bool(get_mm().enable_multimodal)
 
         text_config = config.text_config
 
@@ -357,14 +365,7 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
         loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
-            if not self.enable_multimodal and any(
-                module_name in name
-                for module_name in (
-                    "vision_embedder.",
-                    "embed_vision.",
-                    "embed_audio.",
-                )
-            ):
+            if self._should_skip_multimodal_weight(name):
                 continue
             name = re.sub(r"^model\.", "", name)
 
