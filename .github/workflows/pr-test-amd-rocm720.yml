@@ -1,5 +1,5 @@
 name: PR Test ROCm 7.2 (AMD)
-# Dynamic run-name for /rerun-stage commands to enable URL lookup
+# Dynamic run-name for manual stage dispatches to enable URL lookup
 # Format: "[stage-name] sha" for fork PRs, "[stage-name]" for non-fork, default for normal runs
 run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_head_sha && format('[{0}] {1}', inputs.target_stage || inputs.target_stage_select, inputs.pr_head_sha) || format('[{0}]', inputs.target_stage || inputs.target_stage_select)) || '' }}
 
@@ -20,10 +20,10 @@ on:
         description: 'ROCm image version'
         required: false
         type: choice
-        default: rocm720
+        default: rocm724
         options:
-          - rocm720
           - rocm724
+          - rocm720
       target_stage_select:
         description: "Select a stage to run from dropdown (leave empty for auto-detect)"
         required: false
@@ -56,7 +56,7 @@ on:
         type: string
         default: ""
       pr_head_sha:
-        description: "PR head SHA to checkout (for /rerun-stage on fork PRs)"
+        description: "PR head SHA to checkout (for stage dispatches on fork PRs)"
         required: false
         type: string
         default: ""
@@ -94,7 +94,7 @@ on:
         description: 'ROCm image version'
         required: false
         type: string
-        default: rocm720
+        default: rocm724
       ref:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
         required: false
@@ -140,7 +140,7 @@ permissions:
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
   AMD_CI_IMAGE: ${{ inputs.amd_ci_image }}
-  ROCM_VERSION: ${{ inputs.rocm_version || 'rocm720' }}
+  ROCM_VERSION: ${{ inputs.rocm_version || 'rocm724' }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
@@ -239,7 +239,7 @@ jobs:
   # pr-test.yml's `call-pr-test-extra`. On `schedule` (and run_all_tests
   # dispatch) the extra suite runs on `main` without needing the
   # `run-ci-extra` label (pr-gate.yml only enforces labels on pull_request
-  # events). Targeted /rerun-stage dispatches (target_stage set) are excluded.
+  # events). Targeted stage dispatches (target_stage set) are excluded.
   # Not added to `pr-test-amd-rocm720-finish` so the base AMD gate never depends on
   # the opt-in extra suite.
   call-pr-test-amd-extra-rocm720:
@@ -250,7 +250,7 @@ jobs:
     with:
       ref: ${{ inputs.pr_head_sha || inputs.ref || '' }}
       runner_arch: ${{ inputs.runner_arch || 'mi300' }}
-      rocm_version: ${{ inputs.rocm_version || 'rocm720' }}
+      rocm_version: ${{ inputs.rocm_version || 'rocm724' }}
       aiter_ref: ${{ inputs.aiter_ref }}
       amd_ci_image: ${{ inputs.amd_ci_image }}
       continue_on_error: true
