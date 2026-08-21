@@ -109,7 +109,7 @@ class AscendFAImpl(AttentionImpl):
         )
         output = output.transpose(1, 2)
         if return_softmax_lse:
-            return output, lse
+            return output, lse.squeeze(-1)
         return output
 
     def forward_varlen(

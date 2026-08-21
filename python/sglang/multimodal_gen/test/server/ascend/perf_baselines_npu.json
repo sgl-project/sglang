@@ -329,7 +329,7 @@
                 "InputValidationStage": 0.07,
                 "PromptEnhancementStage": 8787.2,
                 "TextEncodingStage": 35.87,
-                "TimestepPreparationStage": 32.74,
+                "TimestepPreparationStage": 246.30,
                 "LatentPreparationStage": 0.2,
                 "DenoisingStage": 47471.93,
                 "DecodingStage": 42.24
@@ -645,7 +645,7 @@
             "stages_ms": {
                 "InputValidationStage": 3.8,
                 "TextEncodingStage": 1029.19,
-                "LTX2TextConnectorStage": 56.3,
+                "LTX2TextConnectorStage":  654.62,
                 "LTX2SigmaPreparationStage": 0.19,
                 "TimestepPreparationStage": 33.52,
                 "LTX2AVLatentPreparationStage": 0.45,
