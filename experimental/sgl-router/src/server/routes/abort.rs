@@ -80,10 +80,7 @@ impl AbortRequestResult {
 /// Status: `200 OK` when every worker handled the request (or the fleet is
 /// empty); `502 BAD_GATEWAY` when at least one worker failed. The JSON body
 /// always carries the full breakdown so a partial failure is actionable.
-pub async fn abort_request(
-    State(ctx): State<Arc<AppContext>>,
-    body: Bytes,
-) -> Response {
+pub async fn abort_request(State(ctx): State<Arc<AppContext>>, body: Bytes) -> Response {
     let workers = ctx.registry.all();
     let total_workers = workers.len();
 
@@ -99,13 +96,8 @@ pub async fn abort_request(
             .into_response();
     }
 
-    let (successful, failed) = fan_out_abort(
-        &workers,
-        &ctx.proxy.client,
-        ctx.proxy.request_timeout,
-        body,
-    )
-    .await;
+    let (successful, failed) =
+        fan_out_abort(&workers, &ctx.proxy.client, ctx.proxy.request_timeout, body).await;
 
     // Partial failure is an operational event an operator needs to see at the
     // common production log level — match the rest of the router, which warns
@@ -225,11 +217,8 @@ mod tests {
         (format!("http://127.0.0.1:{port}"), tx)
     }
 
-    async fn spawn_recording_abort_worker() -> (
-        String,
-        oneshot::Sender<()>,
-        mpsc::UnboundedReceiver<Bytes>,
-    ) {
+    async fn spawn_recording_abort_worker(
+    ) -> (String, oneshot::Sender<()>, mpsc::UnboundedReceiver<Bytes>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (body_tx, body_rx) = mpsc::unbounded_channel();
@@ -251,11 +240,7 @@ mod tests {
                 })
                 .await;
         });
-        (
-            format!("http://127.0.0.1:{port}"),
-            shutdown_tx,
-            body_rx,
-        )
+        (format!("http://127.0.0.1:{port}"), shutdown_tx, body_rx)
     }
 
     /// Reserve a port then drop the listener so a connect attempt fails fast
