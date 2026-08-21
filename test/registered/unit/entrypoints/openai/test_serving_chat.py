@@ -425,6 +425,7 @@ class ServingChatTestCase(unittest.TestCase):
 
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
         self.chat.chat_encoding_spec = "kimi_k3"
+        self.tm.server_args.enable_cache_report = True
         ret = [
             {
                 "text": "Answer",
@@ -432,7 +433,7 @@ class ServingChatTestCase(unittest.TestCase):
                     "id": "chatcmpl-kimi-k3-usage",
                     "prompt_tokens": 2075,
                     "completion_tokens": 1,
-                    "cached_tokens": 0,
+                    "cached_tokens": 2073,
                     "image_tokens": 2035,
                     "finish_reason": {"type": "stop", "matched": None},
                     "weight_version": "default",
@@ -444,7 +445,52 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.assertEqual(response.usage.prompt_tokens, 2072)
         self.assertEqual(response.usage.total_tokens, 2073)
+        self.assertEqual(response.usage.prompt_tokens_details.cached_tokens, 2072)
         self.assertEqual(response.usage.prompt_tokens_details.image_tokens, 2035)
+
+    def test_non_kimi_k3_usage_preserves_cached_tokens(self):
+        self.chat.chat_encoding_spec = None
+        self.tm.server_args.enable_cache_report = True
+        ret = [
+            {
+                "text": "Answer",
+                "meta_info": {
+                    "id": "chatcmpl-regular-cache-usage",
+                    "prompt_tokens": 2075,
+                    "completion_tokens": 1,
+                    "cached_tokens": 2073,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+        response = self.chat._build_chat_response(self.basic_req, ret, created=123)
+
+        self.assertEqual(response.usage.prompt_tokens, 2075)
+        self.assertEqual(response.usage.prompt_tokens_details.cached_tokens, 2073)
+
+    def test_kimi_k3_usage_preserves_cache_before_generation_stub(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.tm.server_args.enable_cache_report = True
+        ret = [
+            {
+                "text": "Answer",
+                "meta_info": {
+                    "id": "chatcmpl-kimi-k3-prefix-cache-usage",
+                    "prompt_tokens": 2075,
+                    "completion_tokens": 1,
+                    "cached_tokens": 2000,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+        response = self.chat._build_chat_response(self.basic_req, ret, created=123)
+
+        self.assertEqual(response.usage.prompt_tokens, 2072)
+        self.assertEqual(response.usage.prompt_tokens_details.cached_tokens, 2000)
 
     def test_kimi_tool_call_keeps_default_reasoning(self):
         self.template_manager.reasoning_config = ReasoningToggleConfig(
@@ -2821,7 +2867,9 @@ class ServingChatTestCase(unittest.TestCase):
                 choice_logprobs=None,
                 finish_reason_type="stop",
                 continuous_usage_stats=True,
-                prompt_tokens={0: 10},
+                prompt_tokens={
+                    0: self.chat._reported_prompt_tokens(content["meta_info"])
+                },
                 reasoning_tokens={0: 0},
                 completion_tokens={0: 2},
             ):
@@ -2837,6 +2885,16 @@ class ServingChatTestCase(unittest.TestCase):
         usages = self._collect_continuous_usage(cached_tokens=6)
         self.assertTrue(usages, "continuous_usage_stats attached no usage")
         self.assertEqual(usages[0]["prompt_tokens_details"]["cached_tokens"], 6)
+
+    def test_kimi_k3_continuous_usage_excludes_cached_generation_stub(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.tm.server_args.enable_cache_report = True
+
+        usages = self._collect_continuous_usage(cached_tokens=8)
+
+        self.assertTrue(usages, "continuous_usage_stats attached no usage")
+        self.assertEqual(usages[0]["prompt_tokens"], 7)
+        self.assertEqual(usages[0]["prompt_tokens_details"]["cached_tokens"], 7)
 
     def test_continuous_usage_omits_cached_tokens_when_report_disabled(self):
         """With cache reporting off, continuous_usage_stats must not leak cached tokens."""
