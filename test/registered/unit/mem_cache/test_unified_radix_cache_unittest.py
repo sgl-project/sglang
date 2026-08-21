@@ -5004,6 +5004,9 @@ class UnifiedRadixCacheSuite:
             self.skipTest("window must span past the leaf to reach the pin")
 
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        # commit_load_back pins its source nodes only under write-back; run the
+        # scenario in that mode so the foreign-pin path is reachable.
+        cache.is_write_back = True
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
         if len(chain) < 3:
             self.skipTest("chain collapsed below the two-node suffix being tested")
