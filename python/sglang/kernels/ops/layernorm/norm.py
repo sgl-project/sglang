@@ -104,7 +104,12 @@ def _schedule_rmsnorm(dim: int, dtype_bytes: int) -> Tuple[Schedule, Schedule, i
 
     # 2. choose high throughput config
     if cc_major >= 8 and dim_bytes >= 4096:
-        copy_mode = 2 if cc_major >= 9 else 1  # use TMA after sm90
+        # `cp.async` needs sm80. The bulk copy needs sm90 and is limited to
+        # the arches where it is known to behave: sm120's support for it is
+        # poor enough that a kernel using it reserves gigabytes of extra device
+        # memory, which buys a couple of percent over cp.async at the deepest
+        # tiles. Newer or unmeasured arches take the per-thread copy too.
+        copy_mode = 2 if cc_major in (9, 10) else 1
         schedule_tput = Schedule(min_vec_size, num_threads=128, copy_mode=copy_mode)
     else:
         if dim_bytes <= 3072:
