@@ -266,6 +266,7 @@ from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
     is_health_check_generate_req,
+    is_health_check_probe,
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
@@ -1912,7 +1913,7 @@ class Scheduler(
 
         for recv_req in recv_reqs:
             # Skip health check when server is busy — ongoing requests already carry health info.
-            if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
+            if is_health_check_probe(recv_req) and not self.is_fully_idle(
                 for_health_check=True
             ):
                 self.return_health_check_ipcs.append(
