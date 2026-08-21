@@ -34,16 +34,6 @@ class MoeBaseProviderContract(msgspec.Struct, frozen=True, kw_only=True):
     lora_activation_dtype: torch.dtype
 
 
-class MappedLoraAInput(msgspec.Struct, frozen=True, kw_only=True):
-    """``pair_to_row`` gives one row of ``rows`` for each routed pair.
-
-    It is a contiguous int32 tensor. A value of ``-1`` marks an invalid pair.
-    """
-
-    rows: torch.Tensor
-    pair_to_row: torch.Tensor
-
-
 class MoeBaseProvider:
     """One instance for each layer and quantization type.
 
@@ -276,8 +266,12 @@ class MoeBaseProvider:
         self,
         row_state,
         activation: torch.Tensor,
-    ) -> MappedLoraAInput:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Give the provider's activation rows to a standalone grouped down-A.
+
+        Returns ``(rows, pair_to_row)``. ``pair_to_row`` is a contiguous int32
+        tensor holding one row of ``rows`` for each routed pair, and ``-1``
+        marks an invalid pair.
 
         ``src2dst`` already holds one activation row for each routed pair. A
         sentinel pair's entry stays uninitialized and no kernel reads it: the
@@ -308,10 +302,7 @@ class MoeBaseProvider:
                 "mapped down-A pair-to-row metadata must be contiguous 1-D "
                 "int32 on the activation device"
             )
-        return MappedLoraAInput(
-            rows=activation.view(-1, activation.shape[-1]),
-            pair_to_row=row_state.src2dst,
-        )
+        return activation.view(-1, activation.shape[-1]), row_state.src2dst
 
     # The runner allocates every buffer, so it asks the provider for the shapes.
     def gateup_out_shape(self, row_state) -> tuple[int, ...]:

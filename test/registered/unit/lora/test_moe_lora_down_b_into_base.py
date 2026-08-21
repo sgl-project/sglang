@@ -265,7 +265,7 @@ class TestProviderIntoBaseSurface:
         assert "invoke_down_b_into_base(" in runner_src
         # The mapping is unconditional, so no other plan field can decide
         # whether the runner holds src2dst.
-        assert "mapped_down_a = provider.mapped_down_lora_a_input(" in runner_src
+        assert "= provider.mapped_down_lora_a_input(" in runner_src
         for cls in (MaskedRowDomainProvider, ContiguousRowDomainProvider):
             assert MaskedRowDomainProvider(quant_info).mapped_down_lora_a_input
 

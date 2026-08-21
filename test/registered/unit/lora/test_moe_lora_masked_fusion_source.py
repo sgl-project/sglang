@@ -269,7 +269,9 @@ class TestMaskedFusionSource(unittest.TestCase):
         reduce_body = _function(base, "_shared_rank_reduce")
         self.assertIn("del row_state", reduce_body)
         mapped = _function(base, "mapped_down_lora_a_input")
-        self.assertIn("pair_to_row=row_state.src2dst", mapped)
+        # It hands back the flat row view paired with the route's src2dst.
+        self.assertIn("row_state.src2dst)", mapped)
+        self.assertIn("activation.view(-1, activation.shape[-1])", mapped)
         for body in (shared, finish, reduce_body, mapped):
             self.assertNotIn("row_state.hidden_permuted", body)
             self.assertNotIn("row_state.masked_m", body)
@@ -474,10 +476,12 @@ class TestMaskedFusionSource(unittest.TestCase):
             retained_inputs=True,
         )
         activation_rows = torch.randn((2, 4, 8), dtype=torch.bfloat16)
-        mapped = provider.mapped_down_lora_a_input(workspace, activation_rows)
-        self.assertEqual(tuple(mapped.rows.shape), (8, 8))
-        self.assertIs(mapped.pair_to_row, src2dst)
-        self.assertEqual(mapped.rows.data_ptr(), activation_rows.data_ptr())
+        rows, pair_to_row = provider.mapped_down_lora_a_input(
+            workspace, activation_rows
+        )
+        self.assertEqual(tuple(rows.shape), (8, 8))
+        self.assertIs(pair_to_row, src2dst)
+        self.assertEqual(rows.data_ptr(), activation_rows.data_ptr())
         with self.assertRaisesRegex(ValueError, "must be"):
             provider.mapped_down_lora_a_input(workspace, activation_rows[:, :3])
         workspace.src2dst = torch.arange(8, dtype=torch.int32)[::2]

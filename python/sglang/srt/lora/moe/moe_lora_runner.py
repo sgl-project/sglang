@@ -70,12 +70,6 @@ class _LoraStageState:
     delta: torch.Tensor | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class _DownAInput:
-    rows: torch.Tensor
-    pair_to_row: torch.Tensor | None = None
-
-
 class MoeLoraBatch(msgspec.Struct, kw_only=True):
 
     gate_up_lora_a: torch.Tensor  # [L_cap, E_f, slices*R_phys, H]
@@ -351,7 +345,7 @@ class MoeLoraRunner:
             batch,
             num_tokens,
         )
-        act_out, down_a_input, src2dst = self._run_act(
+        act_out, down_a_input, down_a_gather, src2dst = self._run_act(
             plan,
             launch_config,
             provider,
@@ -379,6 +373,7 @@ class MoeLoraRunner:
             base_gemm_state,
             act_out,
             down_a_input,
+            down_a_gather,
             src2dst,
             batch,
         )
@@ -590,19 +585,16 @@ class MoeLoraRunner:
         topk_ids: torch.Tensor,
         batch: MoeLoraBatch,
         num_tokens: int,
-    ) -> tuple[torch.Tensor, _DownAInput | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
         act_out = self.workspace.tensor(
             "act:masked",
             provider.act_out_shape(base_gemm_state),
             dtype=provider.contract.lora_activation_dtype,
             device=gateup_out.device,
         )
-        # Always ask for the mapping. It is a view over ``act_out`` plus the
-        # route's ``src2dst``, so it allocates nothing, and the into-base
-        # epilogue needs ``src2dst`` whatever the down-A family turns out to
-        # be. Gating it on the down-A family would let one field silently
-        # decide whether another one works.
-        mapped_down_a = provider.mapped_down_lora_a_input(base_gemm_state, act_out)
+        provider_rows, src2dst = provider.mapped_down_lora_a_input(
+            base_gemm_state, act_out
+        )
         # A grouped down-A reads the provider's own rows, so only the other
         # families need the pair-major copy.
         exposes_pair_activation = not (
@@ -633,11 +625,11 @@ class MoeLoraRunner:
                 act_pairs,
                 activation=self.activation.value,
             )
-            return act_out, _DownAInput(act_pairs), mapped_down_a.pair_to_row
+            # Pair-major rows index themselves, so down-A takes no gather.
+            return act_out, act_pairs, None, src2dst
 
         # The act stage runs the gate/up B GEMM. That GEMM always reads the
         # per-expert route.
-        route = routes.aligned(False)
         provider.fused_act(
             base_gemm_state,
             plan.act.family.value,
@@ -645,7 +637,7 @@ class MoeLoraRunner:
             base_gateup=gateup_out,
             act_masked=act_out,
             act_pairs=act_pairs,
-            routing=route,
+            routing=routes.aligned(False),
             config=launch_config.for_act(plan.act.family),
             bridge_gateup=gate_up.rank,
             b_gate_up=batch.gate_up_lora_b.flatten(0, 1),
@@ -656,10 +648,11 @@ class MoeLoraRunner:
             ),
         )
         if exposes_pair_activation:
-            down_a_input = _DownAInput(act_pairs)
-        else:
-            down_a_input = _DownAInput(mapped_down_a.rows, mapped_down_a.pair_to_row)
-        return act_out, down_a_input, mapped_down_a.pair_to_row
+            return act_out, act_pairs, None, src2dst
+        # The provider's rows are expert-major, so down-A reaches a pair
+        # through src2dst. Handing that gather to pair-major rows instead
+        # would index twice.
+        return act_out, provider_rows, src2dst, src2dst
 
     def _run_down(
         self,
@@ -669,7 +662,8 @@ class MoeLoraRunner:
         routes: MoeLoraRoutes,
         base_gemm_state,
         act_out: torch.Tensor,
-        down_a_input: _DownAInput,
+        down_a_input: torch.Tensor,
+        down_a_gather: torch.Tensor | None,
         src2dst: torch.Tensor,
         batch: MoeLoraBatch,
     ) -> tuple[
@@ -683,11 +677,11 @@ class MoeLoraRunner:
             state.rank = self._run_a(
                 launch_config,
                 plan.down_a,
-                down_a_input.rows.view(-1, self.intermediate_size),
+                down_a_input.view(-1, self.intermediate_size),
                 batch.down_lora_a.flatten(0, 1),
                 routes,
                 "down_a",
-                pair_to_row=down_a_input.pair_to_row,
+                pair_to_row=down_a_gather,
             )
 
         def down_b() -> None:
