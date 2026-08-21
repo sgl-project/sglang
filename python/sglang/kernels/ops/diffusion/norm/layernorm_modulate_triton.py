@@ -52,6 +52,7 @@ from sglang.kernels.ops.diffusion.common.numerics import (
     div_rn_f32,
     round_bf16_to_fp32,
 )
+from sglang.kernels.ops.diffusion.common.platform import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
 
@@ -338,7 +339,11 @@ def is_plain_layer_norm(norm: torch.nn.Module, hidden: int) -> bool:
 
 
 def _is_bf16_cuda(t: torch.Tensor) -> bool:
-    return t.is_cuda and t.dtype is torch.bfloat16
+    # `is_cuda` also covers ROCm, where the inline PTX below cannot compile:
+    # LLVM makes the unusable `=f` constraint a fatal error that kills the
+    # process, so this has to reject before the first launch rather than let
+    # the caller's try/except fall back.
+    return is_cuda() and t.is_cuda and t.dtype is torch.bfloat16
 
 
 def _qk_head_launch_config() -> tuple[int, int]:

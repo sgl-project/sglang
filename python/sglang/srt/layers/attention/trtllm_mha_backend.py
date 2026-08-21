@@ -2,7 +2,14 @@ from __future__ import annotations
 
 """
 Support attention backend for TRTLLM MHA kernels from flashinfer.
-The kernel supports sm100 only, with sliding window and attention sink features.
+
+Prefill dispatch:
+  - SM90 / SM120: trtllm_fmha_v2_prefill (Q_PAGED_KV_NHD layout)
+  - SM100:        trtllm_batch_context_with_kv_cache (HND layout)
+
+Decode: uses XQA on SM90 and SM120, TRTLLM-GEN on SM100.
+
+Sliding window and attention sink features are supported.
 """
 
 import logging
@@ -217,6 +224,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
 
+        # fmha_v2 prefill kernel supports SM90 and SM120
+        self.use_fmha_v2 = is_sm90_supported() or is_sm120_supported()
+
         # trtllm-gen serves page_size >= 128 only through its dynamic
         # tokens-per-page kernels, which exist solely for GQA with equal QK/V
         # head dims (power-of-2 pages). Mirror that precondition here so an
@@ -261,6 +271,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             "trtllm_mha_default_kv_scale",
             lambda: torch.ones(1, dtype=torch.float32, device=self.device),
         )
+        self.decode_seq_len_splits = envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS.get()
+        if self.decode_seq_len_splits < 1:
+            raise ValueError(
+                "SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS must be at least 1, "
+                f"got {self.decode_seq_len_splits}"
+            )
 
     def _check_decode_kv_access(self) -> None:
         supported_kinds = {
@@ -1074,6 +1090,73 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         assert self.is_nvfp4_kvcache
         return self.kv_cache_quant_method.get_bmm_scales(layer.layer_id)
 
+    def _run_fixed_q_len_decode(
+        self,
+        query: torch.Tensor,
+        kv_cache,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        bmm1_scale,
+        bmm2_scale,
+        window_left: int,
+        sinks: Optional[torch.Tensor],
+        q_len_per_req: int = 1,
+        kv_cache_sf=None,
+    ) -> torch.Tensor:
+        """Run decode, optionally sorting and splitting requests by KV length."""
+
+        def run_group(group_query, group_block_tables, group_seq_lens):
+            kwargs = {}
+            if q_len_per_req != 1:
+                kwargs["q_len_per_req"] = q_len_per_req
+            return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                query=group_query,
+                kv_cache=kv_cache,
+                workspace_buffer=self.workspace_buffer,
+                block_tables=group_block_tables,
+                seq_lens=group_seq_lens,
+                max_seq_len=self.max_context_len,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                window_left=window_left,
+                sinks=sinks,
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                out_dtype=self.q_data_type,
+                kv_cache_sf=kv_cache_sf,
+                multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+                **kwargs,
+            )
+
+        num_requests = seq_lens.shape[0]
+        num_splits = min(self.decode_seq_len_splits, num_requests)
+        if num_splits == 1:
+            return run_group(query, block_tables, seq_lens)
+
+        order = torch.argsort(seq_lens)
+        query_by_request = query.view(
+            num_requests, q_len_per_req, query.shape[-2], query.shape[-1]
+        )
+        output_by_request = torch.empty(
+            query_by_request.shape,
+            dtype=self.q_data_type,
+            device=query.device,
+        )
+        for indices in torch.tensor_split(order, num_splits):
+            group_output = run_group(
+                query_by_request.index_select(0, indices).reshape(
+                    -1, query.shape[-2], query.shape[-1]
+                ),
+                block_tables.index_select(0, indices),
+                seq_lens.index_select(0, indices),
+            )
+            output_by_request.index_copy_(
+                0,
+                indices,
+                group_output.view(-1, q_len_per_req, query.shape[-2], query.shape[-1]),
+            )
+        return output_by_request.view(-1, query.shape[-2], query.shape[-1])
+
     def _get_nvfp4_decode_kv_cache(self, layer: RadixAttention) -> tuple[
         tuple[torch.Tensor, torch.Tensor],
         tuple[torch.Tensor, torch.Tensor],
@@ -1160,21 +1243,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         page_table = self._get_layer_page_table(layer, forward_batch)
 
-        o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-            query=q,
-            kv_cache=kv_cache,
-            workspace_buffer=self.workspace_buffer,
-            block_tables=page_table,
-            seq_lens=self.forward_metadata.cache_seqlens_int32,
-            max_seq_len=self.max_context_len,
+        o = self._run_fixed_q_len_decode(
+            q,
+            kv_cache,
+            page_table,
+            self.forward_metadata.cache_seqlens_int32,
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
             window_left=layer.sliding_window_size,
             sinks=attention_sink,
-            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-            out_dtype=self.q_data_type,  # model_runner.dtype
             kv_cache_sf=kv_cache_block_scales,
-            multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
         )
         if self.is_nvfp4_kvcache and o.dtype != self.q_data_type:
             o = o.to(self.q_data_type)
@@ -1247,33 +1325,41 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             and not use_fused_qkv
         ):
             q = q.to(torch.float8_e4m3fn)
-        q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
-        # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
-        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        k_cache = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-        v_cache = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
 
-        if layer.tp_k_head_num == 1:
-            k_cache = canonicalize_stride(k_cache)
-        if layer.tp_v_head_num == 1:
-            v_cache = canonicalize_stride(v_cache)
+        if self.use_fmha_v2:
+            q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        else:
+            q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+
+        # NHD layout (native pool format): [num_pages, page_size, num_kv_heads, head_dim]
+        k_cache_raw, v_cache_raw = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+
+        is_decode_mode = (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        )
+
+        if not self.use_fmha_v2 or is_decode_mode:
+            # Decode and SM100 batch_context kernels require HND layout.
+            k_cache, v_cache = self._reshape_paged_kv_cache(
+                k_cache_raw, v_cache_raw, layer, layer.head_dim
+            )
+        else:
+            k_cache = k_cache_raw.view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            )
+            v_cache = v_cache_raw.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+            )
 
         kv_cache = (k_cache, v_cache)
-
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
         bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
 
         page_table = self._get_layer_page_table(layer, forward_batch)
 
-        if (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
-        ):
+        if is_decode_mode:
             if (
                 forward_batch.forward_mode.is_target_verify()
                 and layer.attn_type == AttentionType.ENCODER_ONLY
@@ -1326,22 +1412,41 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 )
             else:
-                o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-                    query=q,
-                    kv_cache=kv_cache,
-                    workspace_buffer=self.workspace_buffer,
-                    block_tables=page_table,
-                    seq_lens=self.forward_metadata.cache_seqlens_int32,
-                    max_seq_len=self.max_context_len,
+                o = self._run_fixed_q_len_decode(
+                    q,
+                    kv_cache,
+                    page_table,
+                    self.forward_metadata.cache_seqlens_int32,
                     bmm1_scale=bmm1_scale,
                     bmm2_scale=bmm2_scale,
                     window_left=layer.sliding_window_size,
                     sinks=attention_sink,
-                    skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-                    out_dtype=self.q_data_type,
                     q_len_per_req=self.forward_metadata.max_seq_len_q,
-                    multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 )
+        elif self.use_fmha_v2 and not cp_v2_active:
+            # CP-v2 must go through cp_strategy.run_attention (per-shard
+            # masking); the plain-causal fmha_v2 call below would be wrong.
+            paged_kv = torch.stack([k_cache, v_cache], dim=1)
+            o = flashinfer.prefill.trtllm_fmha_v2_prefill(
+                (q, paged_kv),
+                input_layout="Q_PAGED_KV_NHD",
+                workspace_buffer=self.workspace_buffer,
+                seq_lens=self.forward_metadata.cache_seqlens_int32,
+                max_q_len=self.forward_metadata.max_seq_len_q,
+                max_kv_len=self.max_context_len,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                batch_size=forward_batch.batch_size,
+                cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
+                cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
+                block_tables=page_table,
+                out_dtype=self.q_data_type,
+                mask_mode="causal",
+                window_left=layer.sliding_window_size,
+                sinks=attention_sink,
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get()
+                or 0.0,
+            )
         else:
 
             def _trtllm_context_attn(
