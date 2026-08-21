@@ -149,6 +149,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.topk = server_args.speculative_eagle_topk
         if get_spec().speculative_use_rejection_sampling:
             assert self.topk == 1, "Chain speculative sampling supports only topk=1"
+        # ROCm can skip the topk==1 softmax too: aiter's greedy_sample reduces
+        # with hipcub::ArgMax, whose lowest-index tie-break is the guarantee
+        # torch.argmax lacks (#26397). Callers gate on vocab > 1023 * 16 — below
+        # that a thread in its 1024x16 launch skips its load and can elect an
+        # uninitialized index.
+        self.aiter_greedy_sample = None
+        if _is_hip and envs.SGLANG_USE_AITER.get():
+            from aiter import greedy_sample
+
+            self.aiter_greedy_sample = greedy_sample
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
@@ -682,6 +692,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         )
                         topk_p = torch.ones_like(topk_index, dtype=torch.float32)
                         forward_batch.positions.add_(1)
+                elif (
+                    self.topk == 1
+                    and self.aiter_greedy_sample is not None
+                    and logits_output.next_token_logits.shape[-1] > 1023 * 16
+                ):
+                    logits = logits_output.next_token_logits
+                    selected = torch.empty(
+                        logits.shape[0], dtype=torch.int32, device=logits.device
+                    )
+                    self.aiter_greedy_sample(selected, logits)
+                    topk_index = selected.to(torch.int64).unsqueeze(-1)
+                    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+                    forward_batch.positions.add_(1)
                 else:
                     probs = renorm_draft_probs(
                         logits_output.next_token_logits,
@@ -979,6 +1002,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ret_topk_index = torch.argmax(
                 draft_logits_output.next_token_logits, dim=-1, keepdim=True
             )
+            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+            ret_draft_probs = None
+        elif (
+            self.topk == 1
+            and self.aiter_greedy_sample is not None
+            and draft_logits_output.next_token_logits.shape[-1] > 1023 * 16
+        ):
+            logits = draft_logits_output.next_token_logits
+            selected = torch.empty(
+                logits.shape[0], dtype=torch.int32, device=logits.device
+            )
+            self.aiter_greedy_sample(selected, logits)
+            ret_topk_index = selected.to(torch.int64).unsqueeze(-1)
             ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             ret_draft_probs = None
         else:
