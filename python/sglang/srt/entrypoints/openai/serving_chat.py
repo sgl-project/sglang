@@ -1948,7 +1948,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Build sglext at response level (from first ret_item, as these are per-request)
         first_ret = ret[0]
-        routed_experts = process_routed_experts_from_ret(first_ret, request)
+        routed_experts = (
+            None
+            if request.return_meta_info
+            else process_routed_experts_from_ret(first_ret, request)
+        )
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )

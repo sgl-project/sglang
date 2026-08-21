@@ -209,6 +209,9 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
         ), patch(
             "sglang.srt.speculative.spec_utils.get_spec",
             return_value=MagicMock(speculative_eagle_topk=2),
+        ), patch(
+            "sglang.srt.speculative.spec_utils.mamba_track_grid",
+            return_value=256,
         ):
             commit_mamba_states_after_verify(
                 target_worker,
