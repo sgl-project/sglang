@@ -1343,15 +1343,24 @@ currently makes synchronously:
 
 | 12 GB VRAM + 32 GB host | denoise | request (warm) | host anonymous |
 | --- | ---: | ---: | ---: |
-| ComfyUI, bf16, 32 GiB world | **13.0 s/it** | 295–301 s | 30.3 GiB |
-| sglang, Recipe A | 17–18 s/it | ~9.5–10 min | 24.5 GiB |
+| sglang, Recipe A + in-flight PRs | **11.0–12.0 s/it** | ~7.5 min | 20.4 GiB |
+| ComfyUI, bf16, 32 GiB world | 13.0 s/it | 295–312 s | 30.3 GiB |
+| sglang, Recipe A today | 17–18 s/it | ~9.5–10 min | 24.5 GiB |
+
+The first row alternated with the ComfyUI row on the same GPU in the same
+bandwidth window, two rounds each; its medians won both (11.0 and 12.0 against
+13.0 both times). It is Recipe A plus three in-flight changes: the VAE staying
+on its checkpoint mapping (#35862), per-layer pinning with net-cost accounting
+(#35867, 13 of 50 DiT layers pinned inside this budget), and a courier thread
+that ships the still-mapped layers through pinned slots so their copies stop
+stalling the compute thread (#35882). Output equivalence was checked: the
+courier's video SSIM against baseline equals baseline's own run-to-run SSIM,
+and the audio stream is bit-identical. Until those merge, the last row is what
+this page's Recipe A measures.
 
 ComfyUI's requests are also shorter after the denoise: its decode runs the VAE
-whole once the DiT is unloaded, where Recipe A streams the decoder's blocks.
-
-The gap is one mechanism, not many: an unpinned or mapped source transfers
-synchronously on the compute path, while a pinned staging buffer lets the copy
-run ahead — closing it is tracked work on the sglang side. Two ComfyUI notes
+whole once the DiT is unloaded, where Recipe A streams the decoder's blocks —
+still the case, and still tracked. Two ComfyUI notes
 that still matter: `--fast-disk` measured no faster than its default here, and
 stacking `--novram --cache-none --disable-pinned-memory` made things strictly
 worse (69.1 GiB anonymous, 750 s requests) — the adaptive default is the right
