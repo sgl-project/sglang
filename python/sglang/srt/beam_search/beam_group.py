@@ -5,7 +5,7 @@ not requests: the group tracks them columnarly as req_to_token rows
 (member_rows) that decode in lockstep with the leader row.
 
 advance_*_frontier / commit_pending are this class's halves of the overlap
-split documented in coordinator.py's relay-hook section.
+split documented in coordinator.py.
 """
 
 from __future__ import annotations
@@ -116,8 +116,6 @@ class BeamGroup:
         held = self.beam_width * (end - start) - self.slots_freed
         return held - (end - start)
 
-    # ==================== step consumption ====================
-
     def next_step_is_final(self) -> bool:
         """The upcoming selection hits max_new_tokens (decided host-side)."""
         return self.num_generated + 1 >= self.max_new_tokens
@@ -225,8 +223,6 @@ class BeamGroup:
         """Consume a length-terminated select_final_topk result; always finishes."""
         self.advance_final_frontier(sel)
         return self.commit_pending()
-
-    # ==================== finalize ====================
 
     def beam_score(self, cum_logprob: float, num_tokens: int) -> float:
         """Length-normalized score: cum_logprob / num_tokens ** length_penalty."""

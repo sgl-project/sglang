@@ -199,7 +199,7 @@ class TestBeamGroup(CustomTestCase):
             [materialize_tokens(leaf) for leaf in group.leaves], [[1], [2]]
         )
 
-        # Step 2: the best candidate is a stop token; two survivors remain.
+        # The best candidate is a stop token; two survivors remain.
         sel = run_select(
             [-0.1, -0.2],
             [[-0.05, -0.2, -0.5, -0.9], [-0.11, -0.4, -0.8, -1.2]],
@@ -213,7 +213,7 @@ class TestBeamGroup(CustomTestCase):
             [materialize_tokens(leaf) for leaf in group.leaves], [[1, 5], [2, 8]]
         )
 
-        # Step 3 hits max_new_tokens: host decides, final top-k all finish.
+        # max_new_tokens reached: host decides, final top-k all finish.
         self.assertTrue(group.next_step_is_final())
         fsel = select_final_topk(
             group.frontier_cum_logprobs,

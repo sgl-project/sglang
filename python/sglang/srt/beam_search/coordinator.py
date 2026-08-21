@@ -94,8 +94,6 @@ class BeamCoordinator:
     # Live (non-retired) groups; the O(1) gate for the per-forward relay hook.
     _num_live_groups: int = 0
 
-    # ==================== admission ====================
-
     @staticmethod
     def request_beam_width(recv_req) -> int:
         """beam_width of an incoming request (1 = not a beam request)."""
@@ -107,7 +105,6 @@ class BeamCoordinator:
         user_params = req.sampling_params
         beam_width = user_params.beam_width
 
-        # Server-level compatibility (long-term exclusions).
         if not self.spec_algorithm.is_none():
             return "Beam search is not supported with speculative decoding."
         if self.server_args.disaggregation_mode != "null":
@@ -131,7 +128,6 @@ class BeamCoordinator:
         if self.tree_cache.supports_swa() or self.tree_cache.supports_mamba():
             return "Beam search is not supported with SWA/mamba hybrid caches."
 
-        # Request-level compatibility.
         if req.session_id is not None or recv_req.session_params is not None:
             return "Beam search is not supported for session requests."
         if req.lora_id is not None:
@@ -236,8 +232,6 @@ class BeamCoordinator:
             stop_ids |= set(getattr(tokenizer, "additional_stop_token_ids", None) or ())
         return sorted(stop_ids)
 
-    # ==================== relay hook ====================
-
     def maybe_select_and_relay(
         self, batch: ScheduleBatch, batch_result, chunked_req: Optional[Req] = None
     ) -> None:
@@ -279,8 +273,6 @@ class BeamCoordinator:
                     req, leader_pos[i], logits_output, tick=batch.forward_iter
                 )
 
-    # ==================== prefill hook ====================
-
     def select_leader_prefill(
         self,
         req: Req,
@@ -312,7 +304,6 @@ class BeamCoordinator:
         if group.retired:
             return
         if req.to_finish is not None:
-            # The leader was aborted mid-prefill; the group never starts.
             self._abort_group(group)
             return
         self._reclaim_orphans(group, up_to_tick)
@@ -340,8 +331,6 @@ class BeamCoordinator:
             [leader.req_pool_idx], dtype=torch.int64, device=device
         )
         group.all_rows = torch.cat([leader_row, member_rows])
-
-    # ==================== decode hook ====================
 
     def select_and_relay_decode(
         self, batch: ScheduleBatch, logits_output: LogitsProcessorOutput
@@ -468,8 +457,6 @@ class BeamCoordinator:
                 group.slots_freed += orphans.numel()
                 allocator.free(orphans)
 
-    # ==================== group finish ====================
-
     def _finish_group(self, group: BeamGroup) -> None:
         # The leader carries the best sequence's finish reason.
         group.final_results = group.finalize()
@@ -518,8 +505,6 @@ class BeamCoordinator:
             # Drops overshoot selections staged after the terminal commit.
             group._pending_steps.clear()
             self._num_live_groups -= 1
-
-    # ==================== helpers ====================
 
     def _stash_next_tokens(self, rows, tokens) -> None:
         # Accepts GPU tensors (decode path, no D2H) or host lists (prefill).

@@ -86,7 +86,6 @@ def joint_select(
     finished = is_stop & examined
     fin_rank = finished.long().cumsum(0)
 
-    # Non-selected candidates all target the dump slot, sliced away below.
     surv_slot = torch.where(survivor, non_stop_rank - 1, k)
     fin_slot = torch.where(finished, fin_rank - 1, num_candidates)
 
