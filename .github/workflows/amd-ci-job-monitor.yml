@@ -135,14 +135,12 @@ jobs:
           # Excluded: call-gate, check-changes, finish, cancel, check-all-jobs,
           # plus the stage waits -- they run on ubuntu-latest, so the
           # self-hosted-only snapshot has nothing for them. Keep the extra call:
-          # its delegated GPU jobs use the caller id as their display-name prefix.
-          # Job ids keep the -rocm720 lane suffix but display names no longer do
-          # (the flavor moved into the paren coordinates), so strip it to get the
-          # prefix query_job_status.py matches against. The reusable extra caller
-          # is the exception because its nested job names retain that suffix.
+          # its delegated GPU jobs use the explicit caller name as their prefix.
+          # Job ids keep the -rocm720 lane suffix but display names no longer do,
+          # so strip it to get the prefix query_job_status.py matches against.
           pr_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/pr-test-amd-rocm720.yml | \
             grep -v -E '^(call-gate|check-changes|pr-test-amd-rocm720-finish|cancel|check-all-jobs|wait-for-stage-[ab]-amd-rocm720)$' | \
-            sed '/^call-pr-test-amd-extra-rocm720$/!s/-rocm720$//' | \
+            sed 's/-rocm720$//' | \
             jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "pr_jobs=$pr_jobs" >> $GITHUB_OUTPUT
           echo "PR jobs: $pr_jobs"

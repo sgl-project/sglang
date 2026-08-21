@@ -242,6 +242,7 @@ jobs:
   # Not added to `pr-test-amd-rocm720-finish` so the base AMD gate never depends on
   # the opt-in extra suite.
   call-pr-test-amd-extra-rocm720:
+    name: call-pr-test-amd-extra
     if: |
       (github.event_name == 'schedule' || inputs.run_all_tests == true) &&
       !(inputs.target_stage || inputs.target_stage_select)
@@ -472,6 +473,7 @@ jobs:
   # For scheduled runs: wait jobs are skipped, enabling parallel execution of all stages.
 
   wait-for-stage-a-amd-rocm720:
+    name: wait-for-stage-a-amd
     needs: [check-changes, call-gate]
     if: |
       always() &&
@@ -488,7 +490,7 @@ jobs:
       - uses: ./.github/actions/wait-for-jobs
         id: wait
         with:
-          stage-name: stage-a-amd-rocm720
+          stage-name: stage-a-amd
           jobs: '[{"prefix": "stage-a-test-1-gpu-small-amd", "expected_count": 1}]'
           max-wait-minutes: '240'
 
@@ -976,6 +978,7 @@ jobs:
           retention-days: 7
 
   wait-for-stage-b-amd-rocm720:
+    name: wait-for-stage-b-amd
     needs: [check-changes, call-gate, wait-for-stage-a-amd-rocm720]
     if: |
       always() &&
@@ -993,7 +996,7 @@ jobs:
       - uses: ./.github/actions/wait-for-jobs
         id: wait
         with:
-          stage-name: stage-b-amd-rocm720
+          stage-name: stage-b-amd
           jobs: |
             [
               {"prefix": "stage-b-test-1-gpu-small-amd", "expected_count": 14},
@@ -1397,6 +1400,7 @@ jobs:
             -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-mi35x-disaggregation-amd --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   pr-test-amd-rocm720-finish:
+    name: pr-test-amd-finish
     needs:
       [
         call-gate,
