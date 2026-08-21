@@ -175,8 +175,18 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
-    def get_node_key(self, node_id: NodeId) -> RadixKey:
-        """The node's radix key."""
+    def get_node_key_length(self, node_id: NodeId) -> int:
+        """The node's logical radix-key length."""
+        ...
+
+    @abstractmethod
+    def get_node_token_ids(self, node_id: NodeId) -> list[int]:
+        """The raw token ids spanned by the node's radix key."""
+        ...
+
+    @abstractmethod
+    def is_node_key_bigram(self, node_id: NodeId) -> bool:
+        """Whether the node's radix key uses bigram atoms."""
         ...
 
     @abstractmethod

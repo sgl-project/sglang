@@ -20,6 +20,7 @@ import logging
 import sys
 from array import array
 from collections import defaultdict
+from collections.abc import Iterator
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, Sequence
 
@@ -516,11 +517,23 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """The node's child ids."""
         return [child.id for child in self.node_by_id(node_id).children.values()]
 
-    def get_node_key(self, node_id: NodeId) -> RadixKey:
-        """The node's radix key."""
+    def get_node_key_length(self, node_id: NodeId) -> int:
+        """The node's logical radix-key length."""
         key = self.node_by_id(node_id).key
         assert key is not None
-        return key
+        return len(key)
+
+    def get_node_token_ids(self, node_id: NodeId) -> list[int]:
+        """The raw token ids spanned by the node's radix key."""
+        key = self.node_by_id(node_id).key
+        assert key is not None
+        return list(key.raw_token_ids())
+
+    def is_node_key_bigram(self, node_id: NodeId) -> bool:
+        """Whether the node's radix key uses bigram atoms."""
+        key = self.node_by_id(node_id).key
+        assert key is not None
+        return key.is_bigram
 
     def get_last_hash_value(self, node_id: NodeId) -> Optional[str]:
         """The node's last page hash, or None when it was never hashed."""
@@ -1701,9 +1714,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         target: EvictLayer,
     ) -> None:
         """Validate the locks for a component-triggered cascade eviction."""
-        self._cascade_evict_targets(
+        for _ in self._iter_cascade_evict_targets(
             self.node_by_id(node_id), self.components_by_type[component_type], target
-        )
+        ):
+            pass
 
     def cleanup_tombstone_ancestors(self, node_id: NodeId) -> BaseEvictionResult:
         """Delete childless tombstone ancestors until a live or locked node is reached."""
@@ -1755,10 +1769,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     ):
         """Cascade eviction from trigger to lower-or-equal priority components."""
 
-        targets = self._cascade_evict_targets(node, trigger, target)
         base_evicted = False
 
-        for comp in targets:
+        for comp in self._iter_cascade_evict_targets(node, trigger, target):
             self._evict_component_and_detach_lru(
                 node,
                 comp,
@@ -1784,13 +1797,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         self._update_evictable_leaf_sets(node)
 
-    def _cascade_evict_targets(
+    def _iter_cascade_evict_targets(
         self,
         node: UnifiedTreeNode,
         trigger: TreeComponent,
         target: EvictLayer,
-    ) -> list[TreeComponent]:
-        """Collect cascade targets after validating their locks."""
+    ) -> Iterator[TreeComponent]:
+        """Yield cascade targets after validating each component's locks."""
 
         is_leaf = False
         if target == EvictLayer.DEVICE:
@@ -1799,8 +1812,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             is_leaf = node in self.evictable_host_leaves
 
         trigger_priority = trigger.eviction_priority(is_leaf)
-        targets = []
-
         for comp in self.components:
             if comp.eviction_priority(is_leaf) <= trigger_priority:
                 if comp is not trigger and comp.node_has_component_data(node, target):
@@ -1823,8 +1834,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                         assert cd.lock_ref == 0
                     if EvictLayer.HOST in target:
                         assert cd.host_lock_ref == 0
-                    targets.append(comp)
-        return targets
+                    yield comp
 
     def _remove_leaf_from_parent(self, node: UnifiedTreeNode):
         for component in self.components:
