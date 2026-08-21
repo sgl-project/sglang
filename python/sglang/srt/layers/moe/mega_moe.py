@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import os
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -42,6 +42,26 @@ if TYPE_CHECKING:
 
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
+
+
+@contextmanager
+def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+    current_num_sms = deep_gemm.get_num_sms()
+    # The SM90 MegaMoE implementation does not use the Blackwell whole-grid
+    # clustered launch that needs a residency margin.
+    target_num_sms = current_num_sms
+    if _device_sm >= 100:
+        reserved_num_sms = max(envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.get(), 0)
+        target_num_sms = max(2, current_num_sms - reserved_num_sms)
+        target_num_sms -= target_num_sms % 2
+
+    if target_num_sms != current_num_sms:
+        deep_gemm.set_num_sms(target_num_sms)
+    try:
+        yield
+    finally:
+        if target_num_sms != current_num_sms:
+            deep_gemm.set_num_sms(current_num_sms)
 
 
 def _get_mega_moe_symm_buffer(
@@ -247,16 +267,17 @@ def _run_mega_routed(
         device=hidden_states.device,
     )
     swiglu_limit = getattr(moe.config, "swiglu_limit", None)
-    deep_gemm.fp8_fp4_mega_moe(
-        y,
-        moe.experts.mega_l1_weights,
-        moe.experts.mega_l2_weights,
-        buf,
-        recipe=(1, 1, 32),
-        activation="swiglu",
-        activation_clamp=swiglu_limit,
-        fast_math=True,
-    )
+    with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+        deep_gemm.fp8_fp4_mega_moe(
+            y,
+            moe.experts.mega_l1_weights,
+            moe.experts.mega_l2_weights,
+            buf,
+            recipe=(1, 1, 32),
+            activation="swiglu",
+            activation_clamp=swiglu_limit,
+            fast_math=True,
+        )
     y = y[:num_tokens]
 
     if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
