@@ -17,7 +17,7 @@ from sglang.kernels.ops.layernorm.norm import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
+from sglang.srt.runtime_context import get_context, get_exec, get_mm, get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -401,7 +401,9 @@ class VisionSdpaAttention(nn.Module):
         else:
             attention_mask = attention_mask.to(device=q.device)
 
-        q, k, v = [rearrange(x, "(b s) h d -> b h s d", b=bsz) for x in [q, k, v]]
+        q = q.reshape(bsz, s, self.num_heads, self.head_size).transpose(1, 2)
+        k = k.reshape(bsz, s, self.num_kv_heads, self.head_size).transpose(1, 2)
+        v = v.reshape(bsz, s, self.num_kv_heads, self.head_size).transpose(1, 2)
 
         if self.softmax_in_single_precision:
             k = rearrange(k, "b h s d -> b h d s")
@@ -434,7 +436,7 @@ class VisionSdpaAttention(nn.Module):
             )
 
         # [b, h, s, head_size] --> [b * s, h, head_size]
-        output = rearrange(output, "b h s d -> (b s) h d")
+        output = output.transpose(1, 2).reshape(bsz * s, self.num_heads, self.head_size)
 
         return output
 
@@ -1010,6 +1012,10 @@ QKV_BACKEND_IMPL = {
     "xpu_attn": VisionIntelXPUAttention,
 }
 
+# backends that read q/k/v through explicit per-dim strides, and so accept the
+# strided views of the packed qkv projection output instead of dense copies
+STRIDED_QKV_BACKENDS = frozenset({"fa3", "fa4", "triton_attn", "amx_attn"})
+
 
 class VisionAttention(nn.Module):
     r"""
@@ -1102,7 +1108,7 @@ class VisionAttention(nn.Module):
         # Select attention backend via a unified method
         _passed_backend = qkv_backend
         qkv_backend = self._determine_attention_backend(_passed_backend)
-        if get_mm().mm_attention_backend is None and _passed_backend is None:
+        if _passed_backend is None and get_mm().mm_attention_backend is None:
             print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
         print_info_once(f"Using {qkv_backend} as multimodal attention backend.")
 
@@ -1124,6 +1130,19 @@ class VisionAttention(nn.Module):
         )
 
         self.use_qkv_parallel = use_qkv_parallel
+        # `qkv_proj` writes q, k and v interleaved into a single buffer, so slicing
+        # it back apart yields views whose only non-unit stride is over tokens.
+        # Backends in `STRIDED_QKV_BACKENDS` consume those views directly, which
+        # saves copying the whole projection output once per layer. Two consumers
+        # sitting between the projection and the backend need a dense layout and
+        # so opt out: the internvl qk-norm, which normalizes q/k in place, and the
+        # model-supplied position embedding appliers, which reshape q/k freely.
+        self.pass_strided_qkv = (
+            use_qkv_parallel
+            and self.qkv_backend_name in STRIDED_QKV_BACKENDS
+            and not qk_normalization
+            and customized_position_embedding_applier is None
+        )
         if use_qkv_parallel:
             self.qkv_proj = QKVParallelLinear(
                 hidden_size=embed_dim,
@@ -1212,7 +1231,14 @@ class VisionAttention(nn.Module):
         - Ascend NPU: "ascend_attn"
         - Other platforms: device-specific optimized backend or "sdpa"
         """
-        override_backend = get_mm().mm_attention_backend
+        try:
+            override_backend = get_mm().mm_attention_backend
+        except ValueError:
+            if passed_backend is None or get_context().is_config_namespace_published(
+                "mm"
+            ):
+                raise
+            override_backend = None
         if override_backend is not None:
             backend = override_backend
         elif passed_backend is not None:
@@ -1365,7 +1391,7 @@ class VisionAttention(nn.Module):
             # [s, b, head, head_size] --> [b, s, head, head_size]
             q, k, v = [rearrange(x, "s b ... -> b s ...") for x in (q, k, v)]
 
-        if not (_is_cpu and _is_cpu_amx_available):
+        if not self.pass_strided_qkv:
             q = q.contiguous()
             k = k.contiguous()
             v = v.contiguous()
@@ -1477,7 +1503,7 @@ class VisionAttention(nn.Module):
 
         if self.use_qkv_parallel:
             # [b * s, h, head_size] --> [b, s, h * head_size]
-            output = rearrange(output, "(b s) ... h d -> b s ... (h d)", b=bsz)
+            output = output.reshape(bsz, s, -1)
 
             # [b, s, h * head_size] --> [b, s, h * head_size]
             output, _ = self.proj(output)

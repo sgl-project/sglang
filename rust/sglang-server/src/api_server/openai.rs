@@ -4,11 +4,7 @@
 //! request and response primitives. Native [`ChunkEvent`] values remain the one
 //! backend output type for both unary and streaming responses.
 
-use axum::{
-    Json, Router,
-    http::StatusCode,
-    response::{IntoResponse, Response},
-};
+use axum::{Router, http::StatusCode, response::Response};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
@@ -28,6 +24,7 @@ use super::submit::submit;
 use crate::ids::Rid;
 use crate::message::{ChunkEvent, EgressItem, GenerateRequest, RequestKind};
 use crate::runtime::ServerArgs;
+use crate::utils::response::error_response;
 
 const MAX_OPENAI_CHOICES: usize = 4096;
 
@@ -86,10 +83,9 @@ fn unix_seconds_u32() -> u32 {
     u32::try_from(unix_seconds()).unwrap_or(u32::MAX)
 }
 
-/// The OpenAI `{"error": {...}}` payload: `type` is the SDK-facing error kind
-/// (`AuthenticationError` / `InternalServerError` / `BadRequestError`), and
-/// `code` carries the HTTP status — the shape Python's OpenAI frontend emits.
-fn error_payload(code: StatusCode, message: String) -> serde_json::Value {
+/// The OpenAI error payload.
+pub(super) fn error_payload(code: StatusCode, message: impl Into<String>) -> serde_json::Value {
+    let message = message.into();
     let error_type = if code == StatusCode::UNAUTHORIZED {
         "AuthenticationError"
     } else if code.is_server_error() {
@@ -108,36 +104,15 @@ fn error_payload(code: StatusCode, message: String) -> serde_json::Value {
     })
 }
 
-/// Shape a `StatusCode` + message into an OpenAI error response, mirroring
-/// `pre_submit_error`'s rule: unary requests get the JSON error with its
-/// status; a request whose stream is already committed gets 200 + one SSE
-/// error frame + `[DONE]`.
-pub(super) fn openai_error_response(
-    code: StatusCode,
-    message: impl Into<String>,
-    stream: bool,
-) -> Response {
-    let body = error_payload(code, message.into());
-    if !stream {
-        return (code, Json(body)).into_response();
-    }
-    super::submit::sse_error_response(body)
+/// Form an OpenAI error response: unary → `code` plus the JSON `body`,
+/// streaming → 200 with one SSE error frame + `[DONE]`.
+pub(super) fn openai_error(code: StatusCode, message: impl Into<String>, stream: bool) -> Response {
+    error_response(code, error_payload(code, message), stream)
 }
 
-/// Unary OpenAI error — the common pre-submit case (Python validates before
-/// the stream starts and answers 4xx in JSON even for `stream=true`).
-fn openai_error(code: StatusCode, message: impl Into<String>) -> Response {
-    openai_error_response(code, message, false)
-}
-
-/// The OpenAI error frame payload for errors raised *inside* a committed
-/// stream, where only a `data:` frame can be emitted (the status is folded
-/// into the body, since the response status is already 200).
-pub(super) fn streaming_error(code: u16, message: impl Into<String>) -> String {
-    let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    error_payload(status, message.into()).to_string()
-}
-
+/// Drain one submitted request to its terminal output: fold frames, disarm
+/// `guard` on a natural terminal, and map errors / validation aborts /
+/// truncation to `(status, message)` for the OpenAI error shape.
 async fn collect_output(
     mut rx: mpsc::Receiver<EgressItem>,
     guard: &mut AbortGuard,
@@ -191,10 +166,10 @@ async fn submit_generation(
             guard.arm(rid);
             Ok(rx)
         }
-        // Same rule as `pre_submit_error`: a committed stream gets 200 plus an
+        // Same `error_response` rule: a committed stream gets 200 plus an
         // SSE error frame + `[DONE]`, not a unary 503 — but with the OpenAI
         // error shape, since this is the OpenAI frontend.
-        Err(_) => Err(openai_error_response(
+        Err(_) => Err(openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "service unavailable",
             stream,

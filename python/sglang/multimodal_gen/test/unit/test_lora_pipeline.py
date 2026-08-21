@@ -7,6 +7,7 @@ import torch
 
 from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 
 _RANK_PATCH = "sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline.dist.get_rank"
 
@@ -120,3 +121,92 @@ def test_merged_lora_still_uses_weight_update_context():
     assert context_calls == 1
     assert layer.merged
     assert pipeline.is_lora_merged["transformer"]
+
+
+def test_lora_alpha_override_updates_cached_adapter_scale():
+    layer = _make_layer()
+    pipeline = _make_pipeline(layer)
+
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline.set_lora(
+            "adapter",
+            None,
+            target="transformer",
+            strength=1.0,
+            merge_mode="dynamic",
+            lora_alpha=8,
+        )
+
+    assert pipeline.loaded_adapter_alphas["adapter"] == 8
+    assert layer.lora_rank == 1
+    assert layer.lora_alpha == 8
+
+
+def test_lora_tree_url_selects_one_pinned_weight(tmp_path):
+    weight_name = "adapter-v4.safetensors"
+    adapter_dir = tmp_path / "adapters"
+    adapter_dir.mkdir()
+    weight_path = adapter_dir / weight_name
+    weight_path.touch()
+    model_info = SimpleNamespace(
+        sha="immutable-sha",
+        siblings=[
+            SimpleNamespace(rfilename="adapters/adapter-v3.safetensors"),
+            SimpleNamespace(rfilename="adapters/adapter-v4.safetensors"),
+        ],
+    )
+
+    download_target = (
+        "sglang.multimodal_gen.runtime.utils.hf_diffusers_utils.maybe_download_model"
+    )
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.weights.source.HfApi.model_info",
+            return_value=model_info,
+        ),
+        patch(download_target, return_value=str(tmp_path)) as download,
+    ):
+        actual = maybe_download_lora(
+            "https://huggingface.co/org/multi-adapter/tree/main/adapters",
+            weight_name=weight_name,
+        )
+
+    assert actual == str(weight_path)
+    assert download.call_args.args[0] == "org/multi-adapter"
+    assert download.call_args.kwargs["revision"] == "immutable-sha"
+    assert download.call_args.kwargs["allow_patterns"] == [
+        "*.json",
+        f"adapters/{weight_name}",
+    ]
+
+
+def test_lora_exact_file_url_needs_no_weight_name(tmp_path):
+    weight_path = tmp_path / "adapter.safetensors"
+    weight_path.touch()
+    model_info = SimpleNamespace(
+        sha="immutable-sha",
+        siblings=[
+            SimpleNamespace(rfilename="adapter.safetensors"),
+            SimpleNamespace(rfilename="other.safetensors"),
+        ],
+    )
+
+    download_target = (
+        "sglang.multimodal_gen.runtime.utils.hf_diffusers_utils.maybe_download_model"
+    )
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.weights.source.HfApi.model_info",
+            return_value=model_info,
+        ),
+        patch(download_target, return_value=str(tmp_path)) as download,
+    ):
+        actual = maybe_download_lora(
+            "https://huggingface.co/org/multi-adapter/resolve/main/adapter.safetensors"
+        )
+
+    assert actual == str(weight_path)
+    assert download.call_args.kwargs["allow_patterns"] == [
+        "*.json",
+        "adapter.safetensors",
+    ]

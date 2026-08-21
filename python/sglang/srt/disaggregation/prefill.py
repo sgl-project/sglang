@@ -175,10 +175,10 @@ class PrefillBootstrapQueue:
                     f"chunked_prefill_size that is a multiple of page_size "
                     f"({page_size}); got {chunked_prefill_size}."
                 )
-            if self.pp_size > 1:
-                # Staging writer accounting has no pp dimension.
+            if self.pp_size > 1 and self.transfer_backend != TransferBackend.MOONCAKE:
                 raise RuntimeError(
-                    "SGLANG_DISAGG_STAGING_BUFFER does not support pp_size > 1."
+                    "SGLANG_DISAGG_STAGING_BUFFER with pp_size > 1 is only "
+                    "supported by Mooncake."
                 )
             if get_parallel().enable_prefill_context_parallel:
                 # CP rewrites index_slice per rank, breaking the chunk grid.
@@ -1200,7 +1200,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             def _swa_payload():
                 window_size = self.sliding_window_size
-                window_start = max(0, seq_len - window_size)
+                window_start = max(req.disagg_decode_prefix_len, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, window_start:seq_len
@@ -1212,7 +1212,7 @@ class SchedulerDisaggregationPrefillMixin:
                 )
                 return kv_to_page_indices(window_kv_indices_swa, page_size)
 
-            def _dsa_payload():
+            def _full_kv_pages_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :seq_len
                 ]
@@ -1250,15 +1250,15 @@ class SchedulerDisaggregationPrefillMixin:
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
-            # MINIMAX_INDEX_K reuses _dsa_payload: index rows live at the same loc
-            # as main KV on the same page_size.
             payloads = {
                 StateType.MAMBA: _mamba_payload,
                 StateType.SWA: _swa_payload,
-                StateType.DSA: _dsa_payload,
-                StateType.MINIMAX_INDEX_K: _dsa_payload,
+                StateType.DSA: _full_kv_pages_payload,
+                StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.C128_STATE: _c128_state_payload,
+                StateType.BLOCK_SCALE: _full_kv_pages_payload,
+                StateType.BLOCK_SCALE_SWA: _swa_payload,
             }
             if _is_npu and isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(),
@@ -1274,8 +1274,7 @@ class SchedulerDisaggregationPrefillMixin:
                         req.req_pool_idx,
                         seq_len,
                         page_size,
-                        self.sliding_window_size,
-                        prefix_len=0,
+                        prefix_len=req.disagg_decode_prefix_len,
                     )
                 )
             state_indices = [
