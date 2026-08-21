@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.models.dits import (
 )
 from sglang.multimodal_gen.runtime.models.dits.lingbot_video_moe import (
     LingBotVideoAttention,
+    LingBotVideoBlock,
     LingBotVideoTransformer3DModel,
     _joint_position_ids,
     make_joint_position_ids,
@@ -234,6 +235,56 @@ def test_attention_rejects_heads_not_divisible_by_ulysses_degree(monkeypatch):
         LingBotVideoAttention(
             hidden_size=32, num_heads=4, norm_eps=1e-6, qkv_bias=True, out_bias=True
         )
+
+
+def test_block_casts_activations_to_the_residual_not_the_weight_dtype():
+    # fp8 weights are storage, not a dtype activations can carry: quantizing the
+    # input again leaves the kernel without a scale for it.
+    hidden = 8
+    seen = {}
+
+    def capture(name):
+        def call(tensor, *args, **kwargs):
+            seen[name] = tensor.dtype
+            return tensor
+
+        return call
+
+    block = object.__new__(LingBotVideoBlock)
+    torch.nn.Module.__init__(block)
+    block.scale_shift_table = torch.nn.Parameter(torch.zeros(1, 6 * hidden))
+    block.norm1 = block.norm2 = lambda t: t
+    block.norm_post_attn = block.norm_post_ffn = lambda t: t
+    block.attn = capture("attn")
+    block.attn.to_q = SimpleNamespace(
+        weight=torch.zeros(hidden, hidden, dtype=torch.float8_e4m3fn)
+    )
+    block.ffn = capture("ffn")
+
+    x = torch.randn(1, 4, hidden, dtype=torch.bfloat16)
+    block(x, torch.zeros(1, 6 * hidden), (torch.zeros(4, 4), torch.zeros(4, 4)))
+
+    assert seen["attn"] == torch.bfloat16
+    assert seen["ffn"] == torch.bfloat16
+
+
+# float32 takes the early return the loop below used to skip; bf16 takes the loop.
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_to_leaves_quantized_weights_at_their_own_dtype(dtype):
+    model = object.__new__(LingBotVideoTransformer3DModel)
+    torch.nn.Module.__init__(model)
+    model.proj_out = torch.nn.Linear(4, 4, bias=False)
+    model.proj_out.weight = torch.nn.Parameter(
+        torch.zeros(4, 4, dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    model.patch_embedder = torch.nn.Linear(4, 4, bias=False)
+    model.norm1 = torch.nn.Linear(4, 4, bias=False)
+
+    model.to(dtype)
+
+    assert model.proj_out.weight.dtype == torch.float8_e4m3fn
+    assert model.patch_embedder.weight.dtype == dtype
+    assert model.norm1.weight.dtype == torch.float32
 
 
 def test_shard_sequence_is_off_without_sequence_parallelism():

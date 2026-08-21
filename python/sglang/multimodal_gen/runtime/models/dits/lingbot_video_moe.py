@@ -81,6 +81,11 @@ def should_keep_in_fp32(name: str) -> bool:
     )
 
 
+def is_compute_dtype(dtype: torch.dtype) -> bool:
+    # Quantized weights (fp8) are storage, not a dtype activations can carry.
+    return dtype.is_floating_point and dtype.itemsize >= 2
+
+
 class LingBotVideoRMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -335,8 +340,7 @@ class LingBotVideoBlock(nn.Module):
         gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
         scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
 
-        bulk_dtype = self.attn.to_q.weight.dtype
-        attn_in = (self.norm1(x) * scale_msa + shift_msa).to(bulk_dtype)
+        attn_in = (self.norm1(x) * scale_msa + shift_msa).to(x.dtype)
         attn_out = self.attn(
             attn_in,
             freqs_cis,
@@ -345,7 +349,7 @@ class LingBotVideoBlock(nn.Module):
         )
         x = x + (gate_msa * self.norm_post_attn(attn_out)).to(x.dtype)
 
-        ffn_in = (self.norm2(x) * scale_mlp + shift_mlp).to(bulk_dtype)
+        ffn_in = (self.norm2(x) * scale_mlp + shift_mlp).to(x.dtype)
         ffn_out = self.ffn(ffn_in)
         ffn_normed = self.norm_post_ffn(ffn_out)
         x = x + (gate_mlp * ffn_normed).to(x.dtype)
@@ -367,18 +371,14 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
     def to(self, *args, **kwargs):
         # _parse_to is private but the only exact parser for .to() overloads.
         device, dtype, non_blocking, _ = torch._C._nn._parse_to(*args, **kwargs)
-        if dtype is None or dtype == torch.float32:
-            return super().to(*args, **kwargs)
-
-        dtype_is_floating = torch.is_floating_point(torch.empty((), dtype=dtype))
-        if not dtype_is_floating:
+        if dtype is None or not is_compute_dtype(dtype):
             return super().to(*args, **kwargs)
 
         if device is not None:
             super().to(device=device, non_blocking=non_blocking)
 
         for name, param in self.named_parameters():
-            if not torch.is_floating_point(param):
+            if not is_compute_dtype(param.dtype):
                 continue
             target_dtype = torch.float32 if should_keep_in_fp32(name) else dtype
             param.data = param.data.to(dtype=target_dtype, non_blocking=non_blocking)
@@ -388,7 +388,7 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
                 )
 
         for name, buffer in self.named_buffers():
-            if not torch.is_floating_point(buffer):
+            if not is_compute_dtype(buffer.dtype):
                 continue
             target_dtype = torch.float32 if should_keep_in_fp32(name) else dtype
             buffer.data = buffer.data.to(dtype=target_dtype, non_blocking=non_blocking)
