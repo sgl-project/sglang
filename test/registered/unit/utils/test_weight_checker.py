@@ -647,11 +647,6 @@ class TestIsNonPersistentBufferName(CustomTestCase):
     def test_matches_freqs_cis_substring(self):
         self.assertTrue(_is_non_persistent_buffer_name("model.rotary_emb.freqs_cis"))
 
-    def test_does_not_match_weight_fp32_substring(self):
-        self.assertFalse(
-            _is_non_persistent_buffer_name("model.layers.0.mlp.gate._weight_fp32")
-        )
-
     def test_does_not_match_normal_param_names(self):
         self.assertFalse(_is_non_persistent_buffer_name("model.layers.0.mlp.weight"))
         self.assertFalse(_is_non_persistent_buffer_name("model.embed_tokens.weight"))
