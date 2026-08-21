@@ -1325,19 +1325,37 @@ streamed decode.
 Same unpruned bf16 checkpoints, same card, same sampler settings (cfg 1.0,
 euler_ancestral, sigma shift 12.0/3.0, seed 1101), 864×480 / 124 frames / 20 NFE:
 
+When host memory is free, the engines are close and sglang is ahead:
+
 | | denoise | host anonymous | peak VRAM |
 | --- | ---: | ---: | ---: |
 | sglang, Recipe B | **6.01 s/it** | 116.7 GB pinned | ≤ 16 GiB |
 | ComfyUI KSampler | 6.58–6.59 s/it | 116.5 GiB | 13048 MiB |
-| ComfyUI, `--fast-disk` | 6.57–6.60 s/it | 57.5 GiB | 12880 MiB |
 
-Both need far more host memory than Recipe A's budget to reach those numbers.
-ComfyUI does ship a mode for this: `--fast-disk` prefers disk-backed loading
-over RAM and halves its anonymous footprint at no measurable cost in speed,
-which is the closest thing it has to Recipe A. It still needs 57.5 GiB, so
-inside 12 GB + 32 GB it cannot run these weights. Pushing further the other way
-costs rather than saves: adding `--novram --cache-none --disable-pinned-memory`
-took anonymous memory back up to 69.1 GiB and the request from 346 s to 750 s.
+Inside 12 GB + 32 GB, both run these weights — and today ComfyUI runs them
+faster. ComfyUI's memory manager reads system RAM and adapts, so measuring it
+on an unconstrained box says nothing about a 32 GB one; the row below patches
+`psutil` so it sees a 32 GiB world, the same convention the sglang rows were
+measured under. Under that budget its manager holds anonymous memory at
+30.3 GiB and its default `--async-offload` streams weights through pinned
+staging buffers, which overlaps the copies sglang's checkpoint-mapping path
+currently makes synchronously:
+
+| 12 GB VRAM + 32 GB host | denoise | request (warm) | host anonymous |
+| --- | ---: | ---: | ---: |
+| ComfyUI, bf16, 32 GiB world | **13.0 s/it** | 295–301 s | 30.3 GiB |
+| sglang, Recipe A | 17–18 s/it | ~9.5–10 min | 24.5 GiB |
+
+ComfyUI's requests are also shorter after the denoise: its decode runs the VAE
+whole once the DiT is unloaded, where Recipe A streams the decoder's blocks.
+
+The gap is one mechanism, not many: an unpinned or mapped source transfers
+synchronously on the compute path, while a pinned staging buffer lets the copy
+run ahead — closing it is tracked work on the sglang side. Two ComfyUI notes
+that still matter: `--fast-disk` measured no faster than its default here, and
+stacking `--novram --cache-none --disable-pinned-memory` made things strictly
+worse (69.1 GiB anonymous, 750 s requests) — the adaptive default is the right
+configuration on a small host.
 
 The path ComfyUI ships for 12 GB cards uses
 `minimax_h3_fl2va_pruned_int8_convrot` and `qwen3vl_32b_minimax_h3_nvfp4_awq`,
