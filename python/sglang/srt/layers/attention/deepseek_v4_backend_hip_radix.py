@@ -514,6 +514,7 @@ class DeepseekV4HipRadixBackend(
                 attn_tp_size=parallel.attn_tp_size,
                 attn_tp_rank=parallel.attn_tp_rank,
                 attn_dp_size=parallel.attn_dp_size,
+                comm_backend=parallel.dcp_comm_backend,
                 disaggregation_mode=get_disagg().disaggregation_mode,
             )
             if is_dsa_enable_prefill_cp():
