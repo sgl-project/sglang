@@ -128,8 +128,8 @@ For a pre-quantized main transformer checkpoint, prefer:
 - `--transformer-path` for a quantized `transformers` transformer component folder
 - `--transformer-weights-path` for a quantized safetensors file, directory,
   repo, or a supported GGUF transformer file
-- `--quantization` for online quantization of the main DiT at load time (activations are quantized dynamically)
-- `--quantization-ignored-layers` DiT layer name patterns to keep unquantized (e.g. `attention.to_`)
+- `--quantization` to override the quantization method used by the transformer loader
+- `--quantization-ignored-layers` transformer layer name patterns to keep unquantized during online quantization (e.g. `attention.to_`)
 
 Component checkpoint paths are selected separately, so changing DiT precision
 never silently changes prompt embeddings. Use
@@ -350,8 +350,9 @@ Path selection and quantized checkpoint support are separate capabilities. A
 pre-quantized component repo must carry its quantization metadata, and the
 selected loader must support that serialized format. Native plain-state loaders
 fail closed; library-managed components inherit the corresponding Transformers
-or Diffusers support. `--quantization` applies only to online quantization of the
-main DiT. See [Quantized Component Repositories](../quantization#quantized-component-repositories).
+or Diffusers support. The transformer-specific `--quantization` flag does not
+select the format of component checkpoints; their own metadata does. See
+[Quantized Component Repositories](../quantization#quantized-component-repositories).
 
 ## Component Attention Backend Overrides
 

@@ -847,8 +847,8 @@ The table below lists concrete Hugging Face component repos that are already use
    `model_index.json` or the native pipeline's registered module name.
 3. An override path does not enable quantization by itself. A pre-quantized
    component must include metadata for a format supported by its selected
-   loader. `--quantization` remains the online-quantization option for the main
-   DiT, not a generic per-component override.
+   loader. `--quantization` overrides the transformer loader; other component
+   checkpoints select their serialized format through their own metadata.
 
 ## Verified LoRA Examples
 

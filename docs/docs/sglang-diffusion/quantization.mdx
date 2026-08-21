@@ -21,8 +21,8 @@ Use these paths:
 - `--transformer-weights-path`: replacement transformer weights in safetensors
   format (file, directory, or Hub repository/file) or a supported GGUF file
   (local or Hub)
-- `--quantization`: apply online quantization to the main DiT at load time (activations are quantized dynamically)
-- `--quantization-ignored-layers`: DiT layer name patterns to keep unquantized (e.g. `attention.to_`)
+- `--quantization`: override the quantization method used by the transformer loader
+- `--quantization-ignored-layers`: transformer layer name patterns to keep unquantized during online quantization (e.g. `attention.to_`)
 - `--component-paths.text_encoder`: replace a native text encoder with a checkpoint whose `quantization_config` is auto-detected
 - `--text-encoder-path`: shorter alias for `--component-paths.text_encoder`
 - `--kv-cache-quant`: compress completed causal KV-cache chunks for supported realtime models
@@ -75,11 +75,12 @@ paths:
 | Library-managed Transformers or Diffusers components | Delegates to the upstream `from_pretrained` path and inherits its format support and validation behavior. The local PE model uses this path; compatible formats remain model-specific. |
 | Native auxiliary components that load raw state dicts | Quantized checkpoints are rejected before model construction until that component has a quantized materialization implementation. This includes connectors, duration heads, bridges, diffusion decoders, sound tokenizers, spatial upsamplers, and vocoders. |
 
-`--quantization` remains a transformer option. There is intentionally no
-generic per-component quantization override: a string option without a matching
+`--quantization` is the explicit override for the transformer loader; it is not
+the boundary of component quantization support. Other pre-quantized component
+repositories select their format through their own metadata and the capability
+of the selected loader. A generic string override without a matching
 materialization backend would advertise support that the component does not
-have. Pre-quantized component repositories should carry their quantization
-metadata. A quantized weight file without matching config metadata cannot be
+have, while a quantized weight file without matching config metadata cannot be
 identified or restored generically.
 
 ## Quant Families
@@ -297,10 +298,11 @@ support LongLive2 pinned sinks, global sinks, or dynamically growing caches.
 
 ## Online Quantization
 
-Online quantization applies to the main denoising transformer at load time. It
-is useful when a pre-quantized DiT checkpoint is not available; it does not
-quantize encoders, VAEs, or auxiliary components selected through component
-path overrides.
+This section describes the online methods currently implemented by the
+transformer loader. They are useful when a pre-quantized transformer checkpoint
+is not available. Encoders, VAEs, and auxiliary components are independent:
+their repositories may still carry serialized quantized weights, which are
+restored when the selected component loader supports that format.
 
 ### FP8 Online Quantization
 
@@ -378,9 +380,9 @@ thresholds with `SGLANG_KITCHEN_INT8_MAX_ROWS` and
 
 ### Skipping Layers
 
-By default, online quantization quantizes every supported linear layer in the
-main denoising transformer. However, `--quantization-ignored-layers` can be used
-to keep specific DiT layers in their original precision:
+By default, transformer online quantization quantizes every supported linear
+layer in that component. However, `--quantization-ignored-layers` can keep
+specific transformer layers in their original precision:
 
 ```bash
 sglang generate \
