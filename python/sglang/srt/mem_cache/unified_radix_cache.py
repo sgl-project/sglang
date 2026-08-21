@@ -2616,7 +2616,8 @@ class UnifiedRadixCache(BasePrefixCache):
             and swa is not None
             and not self.tree_core.has_swa_host_pool
         )
-        return swa.sliding_window_size if unified_compress_only_hicache else 0
+        layout_tail = swa.sliding_window_size if unified_compress_only_hicache else 0
+        return max(layout_tail, super().swa_reprefill_tail_tokens())
 
     def swa_retain_floor(self, req) -> int | None:
         if not self.is_mamba_enabled or self._sliding_window_size is None:

@@ -235,6 +235,7 @@ def zero_match_result(
 class BasePrefixCache(ABC, PrefixCacheTrait):
     """Cache can be indexed by either rid or key."""
 
+    _speculative_reprefill_tail_tokens = 0
     metrics_collector: Optional[RadixCacheMetricsCollector] = (
         None  # metrics collector for the cache
     )
@@ -395,8 +396,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def swa_reprefill_tail_tokens(self) -> int:
         # Only the unified_kv compress-only HiCache layout needs to hold back a
         # trailing sliding window for re-prefill; every other cache keeps SWA
-        # content-stable and overrides this where relevant.
-        return 0
+        # content-stable and overrides this where relevant. A speculative
+        # worker may additionally register a request-owned draft sidecar whose
+        # tail must be rebuilt on every prefix hit.
+        return self._speculative_reprefill_tail_tokens
+
+    def set_speculative_reprefill_tail_tokens(self, num_tokens: int) -> None:
+        self._speculative_reprefill_tail_tokens = max(0, int(num_tokens))
 
     def supports_mamba(self) -> bool:
         return False

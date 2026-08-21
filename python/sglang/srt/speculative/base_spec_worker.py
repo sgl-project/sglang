@@ -174,6 +174,11 @@ class BaseSpecWorker(ABC):
         return draft_runners[0].token_to_kv_pool if draft_runners else None
 
     @property
+    def prefix_reprefill_tail_tokens(self) -> int:
+        """Target-prefix tail that a request-owned draft cache must rebuild."""
+        return 0
+
+    @property
     def target_worker(self) -> TpModelWorker:
         return self._target_worker
 

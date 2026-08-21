@@ -60,6 +60,9 @@ class MemoryPoolConfig:
     max_running_requests: Optional[int] = None
     full_max_total_num_tokens: Optional[int] = None
     swa_max_total_num_tokens: Optional[int] = None
+    # Fixed-size request-owned pool for an all-SWA DFLASH draft. None keeps the
+    # legacy target-indexed draft pool with max_total_num_tokens slots.
+    dflash_draft_max_total_num_tokens: Optional[int] = None
 
     # DSV4 compressed-attention pool sizes (target only; draft workers leave at 0).
     c4_max_total_num_tokens: int = 0
@@ -98,6 +101,47 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     if cell_size is None or int(cell_size) <= 0:
         return 0
     return int(cell_size) * get_parallel().attn_dcp_size
+
+
+def _dflash_bounded_swa_pool_tokens(kvc: KVCacheConfigurator) -> int:
+    """Fixed all-SWA DFLASH draft slots for this attention-DP worker."""
+    window_tokens = getattr(kvc.spec_aux_config, "dflash_draft_swa_window_tokens", None)
+    if kvc.is_draft_worker or window_tokens is None:
+        return 0
+
+    max_running_requests = get_schedule().max_running_requests
+    draft_block_size = get_spec().speculative_num_draft_tokens
+    if max_running_requests is None or draft_block_size is None:
+        raise RuntimeError(
+            "DFLASH bounded SWA cache was enabled before its window, request "
+            "count, and draft block size were resolved."
+        )
+
+    from sglang.srt.speculative.dflash_utils import (
+        dflash_swa_cache_capacity_per_request,
+    )
+
+    capacity_per_request = dflash_swa_cache_capacity_per_request(
+        window_tokens=int(window_tokens),
+        page_size=kvc.page_size,
+        draft_block_size=int(draft_block_size),
+    )
+    max_reqs_per_worker = max(1, int(max_running_requests) // kvc.ps.attn_dp_size)
+    return capacity_per_request * max_reqs_per_worker
+
+
+def _available_after_fixed_dflash_draft(
+    available_bytes: int, fixed_draft_bytes: int
+) -> int:
+    remaining = int(available_bytes) - int(fixed_draft_bytes)
+    if remaining <= 0:
+        raise RuntimeError(
+            "The bounded all-SWA DFLASH draft KV pool requires "
+            f"{fixed_draft_bytes / (1 << 30):.2f} GiB, leaving no room for "
+            f"the target KV pool within {available_bytes / (1 << 30):.2f} GiB. "
+            "Reduce --max-running-requests or increase --mem-fraction-static."
+        )
+    return remaining
 
 
 def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
@@ -159,6 +203,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = kvc.layer_info.num_effective_layers
 
         self._cell_size = self._compute_cell_size(kvc, num_layers)
+        self._dflash_draft_pool_tokens = _dflash_bounded_swa_pool_tokens(kvc)
+        self._fixed_dflash_draft_bytes = (
+            self._dflash_draft_pool_tokens * _dflash_draft_cell_size(kvc)
+        )
         has_kv_on_another_pp_stage = (
             self._cell_size == 0
             and mambaish is not None
@@ -213,7 +261,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     )
 
         # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
-        if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
+        if (
+            kvc.spec_algorithm.is_dflash_family()
+            and not kvc.is_draft_worker
+            and self._dflash_draft_pool_tokens == 0
+        ):
             from sglang.srt.speculative.dflash_utils import (
                 scale_kv_cell_size_per_token_for_dflash,
             )
@@ -415,19 +467,29 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        if self._fixed_dflash_draft_bytes:
+            available_bytes = _available_after_fixed_dflash_draft(
+                available_bytes, self._fixed_dflash_draft_bytes
+            )
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size
             else self._zero_kv_max_tokens
         )
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
-        return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
+        return MemoryPoolConfig(
+            max_total_num_tokens=max_total_num_tokens,
+            dflash_draft_max_total_num_tokens=(self._dflash_draft_pool_tokens or None),
+        )
 
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
-        return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
+        return MemoryPoolConfig(
+            max_total_num_tokens=max_total_num_tokens,
+            dflash_draft_max_total_num_tokens=(self._dflash_draft_pool_tokens or None),
+        )
 
 
 class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
@@ -506,7 +568,12 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 self._draft_swa_full_layers_num = banded_depths
                 self._draft_full_layers_num = draft_layers - banded_depths
 
-        self._draft_cell_size = _dflash_draft_cell_size(kvc)
+        self._dflash_draft_pool_tokens = _dflash_bounded_swa_pool_tokens(kvc)
+        draft_cell_size = _dflash_draft_cell_size(kvc)
+        self._fixed_dflash_draft_bytes = (
+            self._dflash_draft_pool_tokens * draft_cell_size
+        )
+        self._draft_cell_size = 0 if self._dflash_draft_pool_tokens else draft_cell_size
 
         # Bytes per token of max_total_num_tokens.
         #
@@ -555,6 +622,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 max_total_num_tokens=swa_tokens,
                 full_max_total_num_tokens=0,
                 swa_max_total_num_tokens=swa_tokens,
+                dflash_draft_max_total_num_tokens=(
+                    self._dflash_draft_pool_tokens or None
+                ),
             )
 
         # Hybrid: full_tokens = max_total_num_tokens, swa_tokens = full_tokens * ratio
@@ -581,11 +651,16 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             max_total_num_tokens=full_tokens,
             full_max_total_num_tokens=full_tokens,
             swa_max_total_num_tokens=swa_tokens,
+            dflash_draft_max_total_num_tokens=(self._dflash_draft_pool_tokens or None),
         )
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        if self._fixed_dflash_draft_bytes:
+            available_bytes = _available_after_fixed_dflash_draft(
+                available_bytes, self._fixed_dflash_draft_bytes
+            )
         max_total_num_tokens = int(available_bytes // self._cell_size)
         return self._solve_pool_sizes(max_total_num_tokens, page_size)
 
@@ -672,8 +747,9 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
             self._full_per_token * (self._full_layers_num + self._draft_full_layers_num)
             + self._swa_per_token * self._draft_swa_full_layers_num
         )
+        fixed_bytes = fixed_swa_bytes + self._fixed_dflash_draft_bytes
         full_tokens = (
-            int((available_bytes - fixed_swa_bytes) // full_cell_size) // page_size
+            int((available_bytes - fixed_bytes) // full_cell_size) // page_size
         ) * page_size
         if full_tokens <= 0:
             raise RuntimeError(
@@ -687,6 +763,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
             max_total_num_tokens=full_tokens,
             full_max_total_num_tokens=full_tokens,
             swa_max_total_num_tokens=swa_tokens,
+            dflash_draft_max_total_num_tokens=(self._dflash_draft_pool_tokens or None),
         )
 
     def calculate_pool_sizes_from_max_tokens(
@@ -699,6 +776,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
             max_total_num_tokens=full_tokens,
             full_max_total_num_tokens=full_tokens,
             swa_max_total_num_tokens=min(swa_tokens, max_total_num_tokens),
+            dflash_draft_max_total_num_tokens=(self._dflash_draft_pool_tokens or None),
         )
 
 

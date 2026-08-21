@@ -37,6 +37,8 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_target_layer_ids: Any = None
     # DFLASH draft KV bytes/token; None when unresolved.
     dflash_draft_cell_size_per_token: int | None = None
+    # Set only when a request-owned bounded cache is safe for every draft layer.
+    dflash_draft_swa_window_tokens: int | None = None
 
 
 def resolve_spec_aux_hidden_state_config(
@@ -192,6 +194,82 @@ def _resolve_dflash_aux_hidden_state(
             draft_model_config=draft_model_config,
             draft_num_layers=int(draft_num_layers),
         )
+        if spec_algorithm.is_dflash():
+            config.dflash_draft_swa_window_tokens = (
+                _resolve_dflash_bounded_swa_window_tokens(
+                    server_args=server_args,
+                    model_config=model_config,
+                    draft_model_config=draft_model_config,
+                    draft_num_layers=int(draft_num_layers),
+                    draft_cell_size=config.dflash_draft_cell_size_per_token,
+                )
+            )
+
+
+def _resolve_dflash_bounded_swa_window_tokens(
+    *,
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    draft_model_config: ModelConfig,
+    draft_num_layers: int,
+    draft_cell_size: int | None,
+) -> int | None:
+    """Return the native SWA window when a bounded DFLASH cache is safe.
+
+    The ring is request-indexed rather than content-indexed. Prefix hits are
+    made safe by holding back one draft attention window for re-prefill; pool
+    sizing then becomes a fixed per-request cost instead of one draft row per
+    target token.
+    """
+    from sglang.srt.configs.model_config import is_deepseek_v4
+    from sglang.srt.speculative.dflash_utils import (
+        get_dflash_attention_sliding_window_size,
+        get_dflash_layer_types,
+    )
+
+    layer_types = get_dflash_layer_types(draft_model_config.hf_config)
+    if layer_types is None or len(layer_types) != draft_num_layers:
+        return None
+    if any(layer_type != "sliding_attention" for layer_type in layer_types):
+        return None
+
+    window_left = get_dflash_attention_sliding_window_size(draft_model_config.hf_config)
+    if window_left is None:
+        return None
+
+    unsupported_reasons = []
+    if server_args.speculative_draft_window_size is not None:
+        unsupported_reasons.append("the legacy compact draft cache was requested")
+    if server_args.max_running_requests is None:
+        unsupported_reasons.append("--max-running-requests is not explicit")
+    if server_args.enable_dp_attention:
+        unsupported_reasons.append("DP attention is enabled")
+    if server_args.attn_cp_size != 1:
+        unsupported_reasons.append("attention context parallelism is enabled")
+    if server_args.dcp_size != 1:
+        unsupported_reasons.append("DCP is enabled")
+    if server_args.pp_size != 1:
+        unsupported_reasons.append("pipeline parallelism is enabled")
+    if server_args.disaggregation_mode != "null":
+        unsupported_reasons.append("disaggregation is enabled")
+    if server_args.enable_hierarchical_cache:
+        unsupported_reasons.append("HiCache is enabled")
+    if server_args.enable_unified_memory:
+        unsupported_reasons.append("unified memory is enabled")
+    if is_deepseek_v4(model_config.hf_config):
+        unsupported_reasons.append("the target uses the DeepSeek-V4 pool family")
+    if draft_cell_size is None or int(draft_cell_size) <= 0:
+        unsupported_reasons.append("the draft KV bytes/token could not be resolved")
+
+    if unsupported_reasons:
+        logger.info(
+            "DFLASH all-SWA draft detected, but the bounded draft KV cache is "
+            "disabled because %s. Falling back to the target-indexed draft pool.",
+            ", ".join(unsupported_reasons),
+        )
+        return None
+
+    return int(window_left) + 1
 
 
 def _resolve_dflash_draft_cell_size(

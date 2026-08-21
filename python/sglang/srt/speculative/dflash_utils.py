@@ -152,6 +152,34 @@ def dflash_draft_cell_size_per_token(
     return int(num_kv_heads * kv_dim_per_head * int(draft_num_layers) * dtype_size)
 
 
+def dflash_swa_cache_capacity_per_request(
+    *,
+    window_tokens: int,
+    page_size: int,
+    draft_block_size: int,
+) -> int:
+    """Physical slots in one request-owned all-SWA DFLASH ring.
+
+    Two windows provide wraparound headroom. The lower bound guarantees
+    room for a page-aligned visible suffix and the two speculative blocks that
+    overlap scheduling may keep outstanding. This sizes storage only; attention
+    still uses the checkpoint's native sliding window.
+    """
+    window_tokens = int(window_tokens)
+    page_size = int(page_size)
+    draft_block_size = int(draft_block_size)
+    if window_tokens <= 0:
+        raise ValueError(f"window_tokens must be positive, got {window_tokens}.")
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}.")
+    if draft_block_size <= 0:
+        raise ValueError(f"draft_block_size must be positive, got {draft_block_size}.")
+
+    minimum = window_tokens + (page_size - 1) + 2 * draft_block_size
+    capacity = max(minimum, 2 * window_tokens)
+    return (capacity + page_size - 1) // page_size * page_size
+
+
 def scale_kv_cell_size_per_token_for_dflash(
     *,
     target_cell_size_per_token: int,

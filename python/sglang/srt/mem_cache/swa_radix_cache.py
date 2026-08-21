@@ -390,9 +390,12 @@ class SWARadixCache(BasePrefixCache):
             is_unified_kv_triton,
         )
 
-        if self.sliding_window_size and is_unified_kv_triton():
-            return self.sliding_window_size
-        return 0
+        layout_tail = (
+            self.sliding_window_size
+            if self.sliding_window_size and is_unified_kv_triton()
+            else 0
+        )
+        return max(layout_tail, super().swa_reprefill_tail_tokens())
 
     def reset(self) -> None:
         self.root_node = TreeNode()
