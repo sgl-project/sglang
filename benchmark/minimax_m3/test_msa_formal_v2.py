@@ -16,9 +16,11 @@ from probe_msa_e2e_dependencies import (
     REQUIRED_TP4_SM103_ROUTES,
     probe_blackwell_msa_route_manifest,
 )
-from run_msa_formal_v2 import run_test_only as run_formal_v2_self_tests
 from run_msa_formal_v2 import (
     repetitions_for_mode,
+)
+from run_msa_formal_v2 import run_test_only as run_formal_v2_self_tests
+from run_msa_formal_v2 import (
     server_healthy,
 )
 
