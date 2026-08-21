@@ -7,6 +7,7 @@
 
 pub mod bridge;
 pub mod client;
+pub mod status;
 
 pub mod pb {
     tonic::include_proto!("kv_indexer.v1");
@@ -29,6 +30,11 @@ pub use service::{
     DEFAULT_PREFIX_QUERY_MAX_INFLIGHT, MAX_CONCURRENT_STREAMS, MAX_GRPC_DECODING_MESSAGE_SIZE,
 };
 pub use shutdown::shutdown_signal;
+pub use status::{
+    spawn_status_reporter, IndexerCandidate, IndexerStatusHandle, IndexerStatusRegistry,
+    IndexerStatusReport, StatusReportError, StatusReporterConfig, DEFAULT_STATUS_FRESHNESS,
+    DEFAULT_STATUS_INTERVAL,
+};
 /// Re-exported because [`PrefixIndexError::Rejected`] carries it, so callers can
 /// match on a rejection without depending on tonic.
 pub use tonic::Code as RpcCode;
