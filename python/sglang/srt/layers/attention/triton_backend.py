@@ -11,7 +11,12 @@ from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
-from sglang.srt.configs.model_config import AttentionArch, is_kimi_k3
+from sglang.srt.configs.model_config import (
+    AttentionArch,
+    is_dspark_draft,
+    is_kimi_k3,
+    is_qwen3_5,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -76,6 +81,25 @@ def _mla_decode_kv_splits_cap(
     return max(base_max_kv_splits, min(sm_cap, ctx_cap))
 
 
+def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv):
+    if not is_gfx95_supported() or topk != 1:
+        return False
+    if use_mla:
+        return is_kimi_k3(model_config.hf_config)
+    if is_dspark_draft(model_config.hf_config):
+        # Added for the K3 DSpark draft model, which is qwen3 type attention,
+        # and using bidirectional (non-causal) mode.
+        return use_verify_splitkv
+    return (
+        use_verify_splitkv
+        and is_qwen3_5(model_config.hf_config)
+        and model_config.get_num_kv_heads(
+            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+        )
+        == 1
+    )
+
+
 def logit_capping_mod(logit_capping_method, logit_cap):
     # positive logit_cap -> tanh cap
     if logit_capping_method == "tanh":
@@ -134,7 +158,7 @@ class TritonAttnBackend(AttentionBackend):
             extend_attention_fwd_unified,
         )
         from sglang.kernels.ops.attention.verify_mla import (
-            verify_mla_fwd,
+            verify_shared_kv_fwd,
         )
         from sglang.kernels.ops.attention.verify_splitkv import (
             verify_splitkv_fwd,
@@ -150,8 +174,8 @@ class TritonAttnBackend(AttentionBackend):
         self.build_unified_kv_indices = torch.compiler.disable(build_unified_kv_indices)
         # Split-KV EAGLE-verify kernel; enabled below once topk is known (valid only at topk == 1).
         self.verify_splitkv_fwd = torch.compiler.disable(verify_splitkv_fwd)
-        # MLA split-KV EAGLE-verify kernel; enabled below once topk is known (valid only at topk == 1).
-        self.verify_mla_fwd = torch.compiler.disable(verify_mla_fwd)
+        # Grouped-head split-KV verify kernel for MLA or one shared local KV head.
+        self.verify_shared_kv_fwd = torch.compiler.disable(verify_shared_kv_fwd)
 
         # Parse args
         self.skip_prefill = skip_prefill
@@ -184,13 +208,13 @@ class TritonAttnBackend(AttentionBackend):
             and self.topk == 1
         )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
-        # The MLA verify kernel (verify_mla_fwd) is tuned and validated for the
-        # Kimi-K3 absorbed-MLA shape; gate it on K3.
-        self.use_verify_mla = (
-            is_gfx95_supported()
-            and self.topk == 1
-            and self.use_mla
-            and is_kimi_k3(model_runner.model_config.hf_config)
+        # The grouped-head verify kernel is tuned for Kimi-K3 MLA and Qwen3.5
+        # GQA with exactly one TP-local KV head.
+        self.use_verify_shared_kv = _should_use_verify_shared_kv(
+            model_runner.model_config,
+            self.topk,
+            self.use_mla,
+            self.use_verify_splitkv,
         )
         self.dcp_size = get_parallel().attn_dcp_size
         self.dcp_rank = get_parallel().attn_dcp_rank
@@ -1405,10 +1429,10 @@ class TritonAttnBackend(AttentionBackend):
         # serve bit-equivalently (its can_handle() gates on non-causal / sinks /
         # sliding-window / ragged / topk>1), so we fall through to
         # extend_attention_fwd below. Correctness is never at risk.
-        # Route target-verify to the K3-tuned MLA kernel when eligible, else the
+        # Route target-verify to the grouped-head kernel when eligible, else the
         # per-head split-KV kernel.
-        if self.use_verify_mla:
-            verify_fwd = self.verify_mla_fwd
+        if self.use_verify_shared_kv:
+            verify_fwd = self.verify_shared_kv_fwd
         elif self.use_verify_splitkv:
             verify_fwd = self.verify_splitkv_fwd
         else:

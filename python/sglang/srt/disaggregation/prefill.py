@@ -963,24 +963,6 @@ class SchedulerDisaggregationPrefillMixin:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
 
-    def get_transferred_rids(self: Scheduler) -> List[str]:
-        """
-        Used by PP, get the transferred rids but **do not pop**
-        """
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
-        )
-
-        transferred_rids: List[str] = []
-
-        for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
-            if poll == KVPoll.Success or poll == KVPoll.Failed:
-                transferred_rids.append(req.rid)
-
-        return transferred_rids
-
     def clear_pending_chunk_send(self: Scheduler, req: Req) -> None:
         """Drop `req` from the sent-but-unconcluded chunk set.
 
@@ -1200,7 +1182,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             def _swa_payload():
                 window_size = self.sliding_window_size
-                window_start = max(0, seq_len - window_size)
+                window_start = max(req.disagg_decode_prefix_len, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, window_start:seq_len
@@ -1212,7 +1194,7 @@ class SchedulerDisaggregationPrefillMixin:
                 )
                 return kv_to_page_indices(window_kv_indices_swa, page_size)
 
-            def _dsa_payload():
+            def _full_kv_pages_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :seq_len
                 ]
@@ -1250,15 +1232,15 @@ class SchedulerDisaggregationPrefillMixin:
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
-            # MINIMAX_INDEX_K reuses _dsa_payload: index rows live at the same loc
-            # as main KV on the same page_size.
             payloads = {
                 StateType.MAMBA: _mamba_payload,
                 StateType.SWA: _swa_payload,
-                StateType.DSA: _dsa_payload,
-                StateType.MINIMAX_INDEX_K: _dsa_payload,
+                StateType.DSA: _full_kv_pages_payload,
+                StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.C128_STATE: _c128_state_payload,
+                StateType.BLOCK_SCALE: _full_kv_pages_payload,
+                StateType.BLOCK_SCALE_SWA: _swa_payload,
             }
             if _is_npu and isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(),
@@ -1274,8 +1256,7 @@ class SchedulerDisaggregationPrefillMixin:
                         req.req_pool_idx,
                         seq_len,
                         page_size,
-                        self.sliding_window_size,
-                        prefix_len=0,
+                        prefix_len=req.disagg_decode_prefix_len,
                     )
                 )
             state_indices = [

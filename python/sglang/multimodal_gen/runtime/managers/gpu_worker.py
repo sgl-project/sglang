@@ -8,7 +8,7 @@ import os
 import tempfile
 import time
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterator, List, Union
 
 import numpy as np
@@ -24,6 +24,7 @@ globally_suppress_loggers()
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import (
+    get_replica_group,
     get_sp_group,
     get_tp_rank,
     get_tp_world_size,
@@ -65,9 +66,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin import (
     GPUWorkerPostTrainingMixin,
 )
-from sglang.multimodal_gen.runtime.realtime.session import (
-    RealtimeSessionCache,
-)
+from sglang.multimodal_gen.runtime.realtime.session import RealtimeSessionCache
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -153,6 +152,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self.pipeline: ComposedPipelineBase = None
 
         self.init_device_and_model()
+        self._load_peak_reserved_mb = (
+            0.0
+            if current_platform.is_cpu()
+            else capture_memory_snapshot().peak_reserved_mb
+        )
+        self._runtime_peak_reserved_mb = 0.0
         self.sp_group = get_sp_group()
         self.sp_cpu_group = self.sp_group.cpu_group
         self.tp_group = get_tp_group()
@@ -228,7 +233,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
-        current_platform.set_device(current_platform.get_device(self.local_rank))
+        if not current_platform.is_mps():
+            current_platform.set_device(current_platform.get_device(self.local_rank))
         # num_gpus is the total world size across every node; the co-located,
         # CPU-contending worker count on THIS host is num_gpus // nnodes.
         local_num_gpus = self.server_args.num_gpus // self.server_args.nnodes
@@ -289,13 +295,18 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         # apply layerwise offload after lora is applied while building LoRAPipeline
         # otherwise empty offloaded weights could fail lora converting
-        if self.server_args.layerwise_offload_components:
+        if self.server_args.has_layerwise_offload_components():
             configure_layerwise_offload_modules(
                 self.pipeline.modules,
                 self.server_args,
-                component_names=self.server_args.layerwise_offload_components,
+                component_names=(
+                    None
+                    if self.server_args.component_residency is not None
+                    else self.server_args.layerwise_offload_components
+                ),
                 warn_missing=(
-                    self.server_args.is_arg_explicitly_set(
+                    self.server_args.component_residency is not None
+                    or self.server_args.is_arg_explicitly_set(
                         "layerwise_offload_components"
                     )
                     or self.server_args.is_arg_explicitly_set("dit_layerwise_offload")
@@ -311,9 +322,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if output_batch.metrics:
             output_batch.metrics.record_memory_snapshot("mem_analysis", final_snapshot)
 
-        # for details on max_memory_reserved: https://docs.pytorch.org/docs/stable/generated/torch.cuda.memory.max_memory_reserved.html
-        peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
-        peak_allocated_bytes = torch.get_device_module().max_memory_allocated()
+        peak_reserved_bytes = final_snapshot.peak_reserved_mb * (1024**2)
+        peak_allocated_bytes = final_snapshot.peak_allocated_mb * (1024**2)
 
         output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
         peak_reserved_gb = peak_reserved_bytes / (1024**3)
@@ -461,7 +471,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         output_batch = None
         forward_failed = False
         try:
-            if self.is_output_rank and not current_platform.is_cpu():
+            if not current_platform.is_cpu() and not current_platform.is_mps():
                 torch.get_device_module().reset_peak_memory_stats()
 
             start_time = (
@@ -503,13 +513,25 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 return result
 
             output_batch = self._to_output_batch(result)
-            self._record_output_peak_memory(output_batch)
 
             output_metrics = self._iter_output_metrics(output_batch)
             if self.is_output_rank and output_metrics and not current_platform.is_cpu():
                 peak_snapshot = capture_memory_snapshot()
                 for metrics in output_metrics:
                     metrics.record_memory_snapshot("after_forward", peak_snapshot)
+
+            duration_ms = (time.monotonic() - start_time) * 1000
+            for metrics in output_metrics:
+                metrics.total_duration_ms = duration_ms
+
+            self._materialize_output_transport(output_batch, req, save_output_paths)
+            self._record_output_peak_memory(output_batch)
+
+            collect_perf = (
+                req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING
+            )
+            if collect_perf and not req.is_warmup:
+                self._record_replica_peak_memory(output_metrics)
 
             if (
                 self.is_output_rank
@@ -518,12 +540,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 and logger.isEnabledFor(logging.DEBUG)
             ):
                 self.do_mem_analysis(output_batch)
-
-            duration_ms = (time.monotonic() - start_time) * 1000
-            for metrics in output_metrics:
-                metrics.total_duration_ms = duration_ms
-
-            self._materialize_output_transport(output_batch, req, save_output_paths)
 
             if (
                 not current_platform.is_cpu()
@@ -683,10 +699,38 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         return np.asarray(materialized.frames)
 
     def _record_output_peak_memory(self, output_batch: OutputBatch) -> None:
-        if not self.is_output_rank or current_platform.is_cpu():
+        if current_platform.is_cpu():
             return
-        peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
-        output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
+        peak_reserved_mb = capture_memory_snapshot().peak_reserved_mb
+        self._runtime_peak_reserved_mb = max(
+            self._runtime_peak_reserved_mb, peak_reserved_mb
+        )
+        if self.is_output_rank:
+            output_batch.peak_memory_mb = peak_reserved_mb
+
+    def _record_replica_peak_memory(self, output_metrics: list[Any]) -> None:
+        """Record replica-wide loading and runtime allocator peaks."""
+        if not current_platform.is_cuda():
+            return
+
+        peaks = torch.tensor(
+            [self._load_peak_reserved_mb, self._runtime_peak_reserved_mb],
+            dtype=torch.float64,
+            device=current_platform.get_device(self.local_rank),
+        )
+        peaks = get_replica_group().all_reduce(peaks, op=torch.distributed.ReduceOp.MAX)
+        if not self.is_output_rank:
+            return
+
+        snapshot = capture_memory_snapshot()
+        load_peak_mb, runtime_peak_mb = peaks.tolist()
+        for metrics in output_metrics:
+            metrics.record_memory_snapshot(
+                "load_peak", replace(snapshot, peak_reserved_mb=load_peak_mb)
+            )
+            metrics.record_memory_snapshot(
+                "runtime_peak", replace(snapshot, peak_reserved_mb=runtime_peak_mb)
+            )
 
     def _forward_group(self, batch: list[Req]) -> OutputBatch:
         assert self.pipeline is not None
@@ -1049,7 +1093,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         List loaded LoRA adapters and current application status per module.
         """
-        from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
+        from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
             LoRAPipeline,
         )
 
