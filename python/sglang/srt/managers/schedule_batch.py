@@ -918,6 +918,16 @@ class Req(ReqDllmMixin):
         self._think_end_match_len = 0
 
         # Sampling info
+        self.batch_isolation_key = (
+            sampling_params.custom_params.get("__sglang_batch_isolation_key")
+            if isinstance(sampling_params.custom_params, dict)
+            else None
+        )
+        self.radix_cache_prefix_limit = (
+            sampling_params.custom_params.get("__sglang_radix_cache_prefix_limit")
+            if isinstance(sampling_params.custom_params, dict)
+            else None
+        )
         if isinstance(sampling_params.custom_params, dict):
             sampling_params = copy.copy(sampling_params)
             sampling_params.custom_params = sampling_params.custom_params | {
@@ -1309,6 +1319,33 @@ class Req(ReqDllmMixin):
 
         input_len = len(self.full_untruncated_fill_ids)
 
+        live_prefix_len = getattr(self, "_sensenova_u1_live_prefix_len", None)
+        if live_prefix_len is not None:
+            if tree_cache is None or self.req_pool_idx is None or self.kv is None:
+                raise RuntimeError(
+                    "SenseNova U1 live-prefix continuation lost its KV ownership"
+                )
+            live_prefix_len = int(live_prefix_len)
+            if not 0 < live_prefix_len < input_len:
+                raise RuntimeError(
+                    "SenseNova U1 live-prefix continuation has an invalid prefix "
+                    f"length: {live_prefix_len} for input length {input_len}"
+                )
+            self.prefix_indices = (
+                tree_cache.req_to_token_pool.req_to_token[
+                    self.req_pool_idx, :live_prefix_len
+                ]
+                .to(dtype=torch.int64)
+                .clone()
+            )
+            self.host_hit_length = 0
+            self.swa_host_hit_length = 0
+            self.mamba_host_hit_length = 0
+            self.storage_hit_length = 0
+            self.num_matched_prefix_tokens = live_prefix_len
+            self._sensenova_u1_live_prefix_len = None
+            return
+
         # Streaming sessions reuse committed KV from the session slot, so
         # custom logprob_start_len is not supported — override to -1.
         if (
@@ -1418,6 +1455,11 @@ class Req(ReqDllmMixin):
     def _compute_max_prefix_len(self, input_len: int) -> int:
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
+        if self.radix_cache_prefix_limit is not None:
+            max_prefix_len = min(
+                max_prefix_len,
+                int(self.radix_cache_prefix_limit),
+            )
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         return max(max_prefix_len, 0)
@@ -3156,6 +3198,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
+                and not getattr(
+                    self.reqs[i],
+                    "_sensenova_u1_interleave_parked",
+                    False,
+                )
                 and self.reqs[i] not in chunked_req_to_exclude
             ]
 

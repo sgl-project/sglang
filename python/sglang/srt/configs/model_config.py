@@ -333,10 +333,9 @@ class ModelConfig:
             self.hf_text_config, "rope_scaling", {}
         )
         self.is_lm_only = getattr(self.hf_config, "language_model_only", False)
-        self.model_is_mrope = (
-            not self.is_lm_only
-            and rope_scaling is not None
-            and "mrope_section" in rope_scaling
+        self.model_is_mrope = not self.is_lm_only and (
+            (rope_scaling is not None and "mrope_section" in rope_scaling)
+            or self.hf_config.model_type == "neo_chat"
         )
 
         self.hf_generation_config = get_generation_config(

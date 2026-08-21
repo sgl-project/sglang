@@ -102,6 +102,10 @@ from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompl
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
 from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
+from sglang.srt.entrypoints.openai.serving_sensenova_u1_images import (
+    serve_sensenova_u1_image_edit,
+    serve_sensenova_u1_image_generation,
+)
 from sglang.srt.entrypoints.openai.serving_tokenize import (
     OpenAIServingDetokenize,
     OpenAIServingTokenize,
@@ -453,6 +457,199 @@ class ORJSONRoute(APIRoute):
         return custom_handler
 
 
+_U1_IMAGE_EDIT_PATH = "/v1/images/edits"
+_U1_IMAGE_EDIT_MULTIPART_OVERHEAD_BYTES = 64 * 1024
+_U1_IMAGE_EDIT_UPLOAD_FILE_COUNT = 2
+_U1_MIB_BYTES = 1024 * 1024
+
+
+class _U1ImageEditBodyError(Exception):
+    def __init__(self, status_code: int, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _u1_image_edit_file_limit_bytes() -> int:
+    max_file_size_mb = (
+        _global_state.tokenizer_manager.server_args.media_url_max_file_size_mb
+    )
+    if isinstance(max_file_size_mb, bool) or not isinstance(max_file_size_mb, int):
+        raise TypeError("media_url_max_file_size_mb must be an integer")
+    if max_file_size_mb < 0:
+        raise ValueError("media_url_max_file_size_mb must be non-negative")
+    return max_file_size_mb * _U1_MIB_BYTES
+
+
+def _u1_image_edit_request_limit_bytes() -> int:
+    # One image plus one optional mask, with bounded room for multipart headers
+    # and scalar form fields. Per-file reads remain capped independently.
+    return (
+        _U1_IMAGE_EDIT_UPLOAD_FILE_COUNT * _u1_image_edit_file_limit_bytes()
+        + _U1_IMAGE_EDIT_MULTIPART_OVERHEAD_BYTES
+    )
+
+
+async def _send_u1_image_edit_body_error(scope, receive, send, error) -> None:
+    response = ORJSONResponse(
+        status_code=error.status_code,
+        content={
+            "error": {
+                "message": str(error),
+                "type": "invalid_request_error",
+                "param": None,
+                "code": error.status_code,
+            }
+        },
+    )
+    await response(scope, receive, send)
+
+
+class SensenovaU1ImageEditBodyLimitMiddleware:
+    """Reject oversized image-edit bodies before multipart materialization."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope["type"] != "http"
+            or scope.get("method") != "POST"
+            or scope.get("path") != _U1_IMAGE_EDIT_PATH
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        try:
+            request_limit = _u1_image_edit_request_limit_bytes()
+        except (AttributeError, TypeError, ValueError) as exc:
+            logger.error("SenseNova U1 image edit upload limit unavailable: %s", exc)
+            error = _U1ImageEditBodyError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "image edit upload limit is unavailable",
+            )
+            await _send_u1_image_edit_body_error(scope, receive, send, error)
+            return
+
+        headers = scope.get("headers", ())
+        if any(key.lower() == b"x-body-compressed" for key, _ in headers):
+            error = _U1ImageEditBodyError(
+                HTTPStatus.BAD_REQUEST,
+                "compressed image edit uploads are not supported",
+            )
+            await _send_u1_image_edit_body_error(scope, receive, send, error)
+            return
+
+        content_lengths = [
+            value for key, value in headers if key.lower() == b"content-length"
+        ]
+        if not content_lengths:
+            error = _U1ImageEditBodyError(
+                HTTPStatus.LENGTH_REQUIRED,
+                "Content-Length is required for image edit uploads",
+            )
+            await _send_u1_image_edit_body_error(scope, receive, send, error)
+            return
+        if len(content_lengths) != 1:
+            error = _U1ImageEditBodyError(
+                HTTPStatus.BAD_REQUEST,
+                "image edit uploads require exactly one Content-Length header",
+            )
+            await _send_u1_image_edit_body_error(scope, receive, send, error)
+            return
+
+        raw_content_length = content_lengths[0].strip()
+        if not raw_content_length or not raw_content_length.isdigit():
+            error = _U1ImageEditBodyError(
+                HTTPStatus.BAD_REQUEST,
+                "image edit upload Content-Length must be a non-negative integer",
+            )
+            await _send_u1_image_edit_body_error(scope, receive, send, error)
+            return
+
+        declared_length = int(raw_content_length)
+        if declared_length > request_limit:
+            error = _U1ImageEditBodyError(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                (
+                    "image edit multipart body exceeds the maximum "
+                    f"{request_limit} bytes"
+                ),
+            )
+            await _send_u1_image_edit_body_error(scope, receive, send, error)
+            return
+
+        received_length = 0
+        body_complete = False
+        body_error = None
+
+        async def limited_receive():
+            nonlocal body_complete, body_error, received_length
+
+            message = await receive()
+            if body_complete:
+                return message
+            if message["type"] == "http.disconnect":
+                body_error = _U1ImageEditBodyError(
+                    HTTPStatus.BAD_REQUEST,
+                    "image edit upload was interrupted",
+                )
+                raise body_error
+            if message["type"] != "http.request":
+                body_error = _U1ImageEditBodyError(
+                    HTTPStatus.BAD_REQUEST,
+                    "image edit upload stream is invalid",
+                )
+                raise body_error
+
+            body = message.get("body", b"")
+            if not isinstance(body, bytes):
+                body_error = _U1ImageEditBodyError(
+                    HTTPStatus.BAD_REQUEST,
+                    "image edit upload stream is invalid",
+                )
+                raise body_error
+            received_length += len(body)
+            if received_length > request_limit:
+                body_error = _U1ImageEditBodyError(
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    (
+                        "image edit multipart body exceeds the maximum "
+                        f"{request_limit} bytes"
+                    ),
+                )
+                raise body_error
+            if received_length > declared_length:
+                body_error = _U1ImageEditBodyError(
+                    HTTPStatus.BAD_REQUEST,
+                    "image edit upload exceeds its declared Content-Length",
+                )
+                raise body_error
+
+            if not message.get("more_body", False):
+                body_complete = True
+                if received_length != declared_length:
+                    body_error = _U1ImageEditBodyError(
+                        HTTPStatus.BAD_REQUEST,
+                        "image edit upload does not match its Content-Length",
+                    )
+                    raise body_error
+            return message
+
+        async def limited_send(message):
+            # Starlette converts multipart receive errors into its own generic
+            # 400 response. Suppress that response so this boundary can retain
+            # the precise fail-closed status and error contract.
+            if body_error is None:
+                await send(message)
+
+        try:
+            await self.app(scope, limited_receive, limited_send)
+        except _U1ImageEditBodyError as error:
+            body_error = error
+        if body_error is not None:
+            await _send_u1_image_edit_body_error(scope, receive, send, body_error)
+
+
 app = FastAPI(
     lifespan=lifespan,
     openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
@@ -472,6 +669,8 @@ if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
     )
 
     app.add_middleware(RequestDecompressionMiddleware)
+
+app.add_middleware(SensenovaU1ImageEditBodyLimitMiddleware)
 
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
@@ -937,6 +1136,104 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
+
+
+@app.post("/v1/images/generations")
+async def sensenova_u1_image_generations(request: Request):
+    from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+        ImageGenerationsRequest,
+    )
+
+    try:
+        body = await request.json()
+        image_request = ImageGenerationsRequest.model_validate(body)
+        return await serve_sensenova_u1_image_generation(
+            _global_state.tokenizer_manager,
+            image_request,
+            raw_request=request,
+        )
+    except (TypeError, ValueError) as error:
+        logger.error("[http_server] SenseNova U1 image error: %s", error)
+        return _create_error_response(error)
+
+
+_U1_UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
+
+
+async def _read_upload_file_limited(
+    upload: UploadFile,
+    *,
+    max_bytes: int,
+) -> bytes:
+    if max_bytes < 0:
+        raise ValueError("image upload byte limit must be non-negative")
+
+    content = bytearray()
+    while True:
+        remaining = max_bytes - len(content)
+        chunk = await upload.read(min(_U1_UPLOAD_READ_CHUNK_BYTES, remaining + 1))
+        if not chunk:
+            break
+        if len(content) + len(chunk) > max_bytes:
+            raise ValueError(f"image upload exceeds the maximum {max_bytes} bytes")
+        content.extend(chunk)
+
+    if not content:
+        raise ValueError("image upload is empty")
+    return bytes(content)
+
+
+@app.post("/v1/images/edits")
+async def sensenova_u1_image_edits(
+    request: Request,
+    image: UploadFile = File(...),
+    prompt: str = Form(...),
+    n: int = Form(1),
+    response_format: str = Form("b64_json"),
+    size: str = Form("1024x1024"),
+    output_format: Optional[str] = Form(None),
+    seed: Optional[int] = Form(None),
+    guidance_scale: Optional[float] = Form(None),
+    num_inference_steps: Optional[int] = Form(None),
+    mask: Optional[UploadFile] = File(None),
+):
+    from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+        ImageGenerationsRequest,
+    )
+
+    try:
+        try:
+            if mask is not None:
+                raise ValueError("SenseNova U1 image masks are not yet supported")
+            max_bytes = _u1_image_edit_file_limit_bytes()
+            image_bytes = await _read_upload_file_limited(
+                image,
+                max_bytes=max_bytes,
+            )
+        finally:
+            await image.close()
+            if mask is not None:
+                await mask.close()
+
+        image_request = ImageGenerationsRequest(
+            prompt=prompt,
+            n=n,
+            response_format=response_format,
+            size=size,
+            output_format=output_format,
+            seed=seed,
+            guidance_scale=guidance_scale,
+            num_inference_steps=num_inference_steps,
+        )
+        return await serve_sensenova_u1_image_edit(
+            _global_state.tokenizer_manager,
+            image_request,
+            image_data=[image_bytes],
+            raw_request=request,
+        )
+    except (TypeError, ValueError) as error:
+        logger.error("[http_server] SenseNova U1 image edit error: %s", error)
+        return _create_error_response(error)
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])

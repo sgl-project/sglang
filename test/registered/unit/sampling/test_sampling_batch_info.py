@@ -339,6 +339,13 @@ class TestFilterBatch(CustomTestCase):
         mask = info.custom_logit_processor[42][1]
         self.assertEqual(mask.shape[0], 2)
 
+    def test_filter_custom_params_without_logit_processor(self):
+        info = _make_info(batch_size=3)
+        info.custom_params = [{"a": 1}, {"b": 2}, {"c": 3}]
+        keep = torch.tensor([0, 2])
+        info.filter_batch([0, 2], keep)
+        self.assertEqual(info.custom_params, [{"a": 1}, {"c": 3}])
+
     def test_filter_removes_all_custom_processors(self):
         """Test cleanup when filter removes all requests using a processor."""
         proc = MagicMock()
@@ -417,6 +424,14 @@ class TestMergeBatch(CustomTestCase):
         info1.merge_batch(info2)
         self.assertTrue(info1.has_custom_logit_processor)
         self.assertEqual(len(info1.custom_params), 2)
+
+    def test_merge_custom_params_without_logit_processor(self):
+        info1 = _make_info(batch_size=1)
+        info1.custom_params = [{"a": 1}]
+        info2 = _make_info(batch_size=1)
+        info2.custom_params = [{"b": 2}]
+        info1.merge_batch(info2)
+        self.assertEqual(info1.custom_params, [{"a": 1}, {"b": 2}])
 
     def test_merge_with_none_sampling_seed(self):
         """Test that merge preserves None when both sampling_seeds are None."""
@@ -608,6 +623,22 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertFalse(mask[1].item())
         # custom_params should be collected for all reqs
         self.assertEqual(len(info.custom_params), 2)
+
+    def test_custom_params_collected_without_logit_processor(self):
+        req1 = self._make_req()
+        req1.custom_logit_processor = None
+        req1.sampling_params.custom_params = {"flow": {"steps": 2}}
+        req2 = self._make_req()
+        req2.custom_logit_processor = None
+        req2.sampling_params.custom_params = None
+
+        batch = MagicMock()
+        batch.reqs = [req1, req2]
+        batch.device = DEVICE
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+
+        self.assertFalse(info.has_custom_logit_processor)
+        self.assertEqual(info.custom_params, [{"flow": {"steps": 2}}, None])
 
 
 if __name__ == "__main__":
