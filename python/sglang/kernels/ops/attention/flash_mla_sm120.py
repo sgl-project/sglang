@@ -676,6 +676,60 @@ def _b12x_sink_f32(attn_sink: torch.Tensor, heads: int) -> torch.Tensor:
     return entry[1]
 
 
+# Single-cache index widths the SM120 unified-prefill kernel instantiates.
+# It also serves the SM121 single-pass decode route, so an unsupported width
+# is rejected in every mode, CUDA graph warmup included.
+_B12X_SINGLE_CACHE_WIDTHS = (128, 512, 1024, 2048)
+# What an unsupported width is padded up to. 128 is deliberately not a target:
+# 512 is the standing DSpark SWA index width vLLM pads to
+# (_DSPARK_SWA_INDEX_ALIGNMENT), and matching it keeps us on the same kernel.
+_B12X_PAD_WIDTHS = (512, 1024, 2048)
+
+
+def _b12x_pad_swa_indices(idx: torch.Tensor, *, rows: int) -> torch.Tensor:
+    """Pad single-cache index rows out to a width b12x instantiates.
+
+    The DSpark draft extend presents 192 (window 128 + draft block, 64-aligned)
+    and the shape gate rejects it at 32 heads. Per-row lengths keep the real
+    counts, so the padded columns are never read past the length.
+
+    The buffer is persistent and grow-only, because this runs on the captured
+    decode route too: superseded buffers are retired rather than freed. It is
+    keyed by the real width as well as the target, so the pad columns are the
+    ones the -1 allocation fill put there and no call ever writes into them --
+    which is what lets the steady-state path be a single copy_ with no memset.
+    """
+    from sglang.srt.runtime_context import get_resources
+
+    real_w = int(idx.shape[-1])
+    target_w = next((w for w in _B12X_PAD_WIDTHS if real_w <= w), None)
+    if target_w is None:
+        raise RuntimeError(
+            f"b12x instantiates the single-cache index widths "
+            f"{_B12X_SINGLE_CACHE_WIDTHS} only, and {real_w} is past the "
+            "widest one. Lower the SWA window or the speculative draft block "
+            "so the 64-aligned index width fits 2048."
+        )
+    buffers = get_resources().buffers
+    key = f"flash_mla_sm120_b12x_padidx:{real_w}:{target_w}:{idx.device}"
+    buf = buffers.get(key)
+    if buf is None or buf.shape[0] < rows:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"b12x index pad buffer needs {rows} rows during CUDA graph "
+                f"capture (have {0 if buf is None else buf.shape[0]}); the "
+                "eager pre-capture run must size it first."
+            )
+        if buf is not None:
+            _b12x_retire(buf)
+        with torch.inference_mode(False):
+            buf = torch.full((rows, target_w), -1, dtype=torch.int32, device=idx.device)
+        buffers[key] = buf
+    padded = buf[:rows]
+    padded[:, :real_w].copy_(idx)
+    return padded
+
+
 def _b12x_i32(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     if t is None:
         return None
@@ -744,6 +798,12 @@ def _flash_mla_b12x(
             int(extra_k_cache.shape[1]) if extra_k_cache.ndim >= 3 else _PBS_DST
         )
 
+    if mode is None:
+        mode = "decode" if B <= 256 else "extend"
+
+    if extra_idx is None and idx.shape[-1] not in _B12X_SINGLE_CACHE_WIDTHS:
+        idx = _b12x_pad_swa_indices(idx, rows=B)
+
     width = idx.shape[-1] + (extra_idx.shape[-1] if extra_idx is not None else 0)
     num_splits_cap = compressed_mla.split_chunks_for_contract(
         rows=max(1, B),
@@ -751,8 +811,6 @@ def _flash_mla_b12x(
         max_chunks=max(1, (width + 63) // 64),
         decode_row_capacity=None,
     )
-    if mode is None:
-        mode = "decode" if B <= 256 else "extend"
 
     caps = compressed_mla.Caps(
         device=dev,
