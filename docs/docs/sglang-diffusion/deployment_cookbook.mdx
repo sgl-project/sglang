@@ -185,6 +185,28 @@ In this example, `auto` will not re-enable FSDP. The same applies to parallelism
 
 **Layerwise offload** streams the declared layers of any supported native weighted component. It lowers peak accelerator memory further, but may increase latency and lower throughput.
 
+### Which components to stream
+
+`--layerwise-offload-components` takes a list, and more is not better. Streaming pays one host-to-device transfer of a component's weights **every time that component runs**, overlapped with that run's compute. What matters is how often it runs per request, not how large it is.
+
+- The **DiT** runs once per denoising step. Its transfer amortizes over every step and hides behind attention, so it is the component layerwise offload is for.
+- A **video VAE** runs once per temporal chunk, not once: H3's decoder re-runs whole for each chunk, so streaming its blocks pays their transfer per chunk.
+- A **text encoder** runs once. Keep it resident if it fits; otherwise stream it with its blocks resident.
+
+There are three placements, not two. A component can be in the list and still hold its blocks — `--layerwise-offload-components dit,text_encoder,vae` together with `--layerwise-resident-layers video_vae=36` transfers them once instead of per pass, and gives the VRAM back when the component finishes rather than holding it through denoise. On MiniMax-H3 at 864x480 / 124 frames that is 13 s of decode against 150 s streamed.
+
+So do not read "drop it from the list" as the fix for a one-shot component: that keeps it resident for the whole process. With no resident blocks on either side, moving H3's 10.4 GB video VAE out of the list took decode from 39.9 s to 5.3 s on one RTX 4090 — but it also added 5.8 GB of peak, which is the budget a 12 GB card does not have.
+
+### How deep to prefetch
+
+`--dit-offload-prefetch-size` is not monotonic. Deeper prefetch hides more of the copy, but its staging buffers crowd out activations, so latency turns back up and peak memory keeps climbing. On the H3 configuration above, 1/2/3/4 layers measured 17.3 / 15.3 / 15.8 / 16.7 s of denoise, with the deepest setting reaching 96% of a 24 GB card. Sweep two or three values rather than trusting the default.
+
+### When not to bother
+
+Before tuning residency or prefetch, measure whether the transfer is exposed — and measure it rather than inferring it from the checkpoint size. Bytes over bandwidth bounds what *could* be exposed, not what is, because prefetch exists to hide exactly that.
+
+A 1.3B video DiT moves about 2.6 GB a step, on the order of a tenth of a one-second step if none of it overlapped, and its residency settings measure flat: it overlaps, so there is nothing to recover. A 50-layer model at 1.4 GB a layer moves 66 GB a step, and there the same flags decide whether the model runs at all. Sweep two or three values on the target configuration and keep the measured winner.
+
 **FSDP** shards DiT weights across multiple GPUs and all-gathers weights during forward. It can reduce DiT CPU offload cost on multi-GPU deployments, especially for validated Wan I2V workloads.
 
 FSDP sharding granularity matters. SGLang Diffusion prefers sharding direct repeated transformer block entries such as `transformer_blocks.0` or `blocks.0`. Coarser sharding lowers wrapper count but can increase all-gather peak memory; finer sharding can reduce transient memory but adds communication and scheduling overhead. If a model does not define an explicit sharding rule, the loader falls back to repeated block class names and common direct numbered block paths.

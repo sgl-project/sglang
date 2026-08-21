@@ -6,6 +6,27 @@
 // deployment command engine.
 
 
+function offloadFlags(s) {
+  const recipe = config.commandBuilder.resource.verifiedRecipes.find((entry) =>
+    entry.hw === s.hw
+    && entry.nodes === Number(s.nodes)
+    && entry.gpus_per_node === Number(s.gpus_per_node)
+    && entry.placement === "offload");
+  const tuning = recipe?.offload || {
+    components: "dit,text_encoder,vae",
+    prefetchSize: 1,
+    residentLayers: 20,
+  };
+  // Only what differs from the defaults: with the component list explicit,
+  // the performance mode changes nothing here, and compile is already off.
+  return [
+    `--layerwise-offload-components ${tuning.components}`,
+    `--dit-offload-prefetch-size ${tuning.prefetchSize}`,
+    `--dit-layerwise-resident-layers ${tuning.residentLayers}`,
+  ];
+}
+
+
 export const config = {
   modelName: "MiniMax-H3",
 
@@ -17,9 +38,11 @@ export const config = {
     "mi300x",
     "mi355x",
     "rtx5090",
+    "rtx4090",
   ],
   hardware: [
     { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "consumer" },
+    { id: "rtx4090", label: "RTX 4090", vram: "24GB", vendor: "consumer" },
   ],
   groupHardware: false,
 
@@ -123,15 +146,9 @@ export const config = {
             const recipe = config.commandBuilder.resource.verifiedRecipes.find((entry) =>
               entry.hw === s.hw && entry.nodes === Number(s.nodes)
               && entry.gpus_per_node === Number(s.gpus_per_node));
-            const placement = recipe?.placement || (s.hw === "rtx5090" ? "offload" : "resident");
+            const placement = recipe?.placement || (["rtx5090", "rtx4090"].includes(s.hw) ? "offload" : "resident");
             if (placement === "fsdp") return ["--performance-mode speed", "--use-fsdp-inference true"];
-            return placement === "offload" ? [
-                "--performance-mode memory",
-                "--layerwise-offload-components dit,text_encoder,vae",
-                "--dit-offload-prefetch-size 1",
-                "--dit-layerwise-resident-layers 20",
-                "--enable-torch-compile false",
-              ] : ["--performance-mode speed"];
+            return placement === "offload" ? offloadFlags(s) : ["--performance-mode speed"];
           },
           description: "Use the recommended placement for the selected hardware and resource shape.",
         },
@@ -139,7 +156,7 @@ export const config = {
           id: "resident",
           label: "Resident",
           flags: ["--performance-mode speed"],
-          recommendedWhen: (s) => s.hw !== "rtx5090",
+          recommendedWhen: (s) => !["rtx5090", "rtx4090"].includes(s.hw),
           description: "Lowest-latency path when the full pipeline fits in aggregate GPU memory.",
         },
         {
@@ -153,16 +170,10 @@ export const config = {
         {
           id: "offload",
           label: "Layerwise offload",
-          flags: [
-            "--performance-mode memory",
-            "--layerwise-offload-components dit,text_encoder,vae",
-            "--dit-offload-prefetch-size 1",
-            "--dit-layerwise-resident-layers 20",
-            "--enable-torch-compile false",
-          ],
-          soft: (s) => s.hw !== "rtx5090",
-          softReason: "Tuned and verified on RTX 5090. It runs on the datacenter GPUs too, where a resident recipe is simply faster.",
-          recommendedWhen: (s) => s.hw === "rtx5090",
+          flags: offloadFlags,
+          soft: (s) => !["rtx5090", "rtx4090"].includes(s.hw),
+          softReason: "Tuned and verified on RTX 5090 and RTX 4090. It runs on the datacenter GPUs too, where a resident recipe is simply faster.",
+          recommendedWhen: (s) => ["rtx5090", "rtx4090"].includes(s.hw),
           description: "Capacity-first PCIe path. It is substantially slower than a resident datacenter recipe.",
         },
       ],
@@ -252,10 +263,10 @@ export const config = {
           id: "dp",
           label: "Data parallel",
           flags: ["--encoder-parallel dp"],
-          disabled: (s) => (s.topology_mode === "manual"
+          disabled: (s) => s.hw === "rtx4090" || (s.topology_mode === "manual"
             ? Number(s.tp_size)
             : config.commandBuilder.resource.autoTopology(s).tp_size) > 1,
-          disableReason: "The server rejects encoder DP with TP > 1 (encoder_parallel=dp requires tp_size=1).",
+          disableReason: "Encoder DP requires TP1 and a multi-GPU DP group; TP > 1 and the verified single-card RTX 4090 recipe do not qualify.",
           soft: (s) => s.nodes > 1,
           softReason: "Runs across nodes, but the measured 1.9× encode speedup comes from a single-node 2× H100 run; cross-node encoder DP is unverified.",
           description: "Useful for a real request batch; it is not bitwise-identical to fold scheduling.",
@@ -382,7 +393,8 @@ export const config = {
         { id: "mi355x-resident-2", hw: "mi355x", nodes: 1, gpus_per_node: 2, placement: "resident", tp_size: 1, ulysses_degree: 2, ring_degree: 1, encoder: "auto" },
         { id: "mi355x-resident-4", hw: "mi355x", nodes: 1, gpus_per_node: 4, placement: "resident", tp_size: 1, ulysses_degree: 4, ring_degree: 1, encoder: "auto" },
         { id: "mi355x-resident-8", hw: "mi355x", nodes: 1, gpus_per_node: 8, placement: "resident", tp_size: 1, ulysses_degree: 8, ring_degree: 1, encoder: "auto", default: true },
-        { id: "rtx5090-offload-2", hw: "rtx5090", nodes: 1, gpus_per_node: 2, placement: "offload", tp_size: 2, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
+        { id: "rtx5090-offload-2", hw: "rtx5090", nodes: 1, gpus_per_node: 2, placement: "offload", tp_size: 2, ulysses_degree: 1, ring_degree: 1, encoder: "auto", offload: { components: "dit,text_encoder,vae", prefetchSize: 1, residentLayers: 20 }, default: true },
+        { id: "rtx4090-offload-1", hw: "rtx4090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", offload: { components: "dit,text_encoder", prefetchSize: 2, residentLayers: 0 }, default: true },
       ],
       autoTopology: (s) => {
         const recipes = config.commandBuilder.resource.verifiedRecipes;
@@ -437,11 +449,11 @@ export const config = {
         && entry.ulysses_degree === topology.ulysses_degree
         && entry.ring_degree === topology.ring_degree);
       const resolvedPlacement = s.placement === "auto"
-        ? (automaticRecipe?.placement || (s.hw === "rtx5090" ? "offload" : "resident"))
+        ? (automaticRecipe?.placement || (["rtx5090", "rtx4090"].includes(s.hw) ? "offload" : "resident"))
         : s.placement;
       const coverageWarnings = [];
-      if (resolvedPlacement === "offload" && s.hw !== "rtx5090") {
-        coverageWarnings.push("Layerwise offload is tuned and verified on RTX 5090; on this hardware it runs unverified and a resident recipe is faster.");
+      if (resolvedPlacement === "offload" && !["rtx5090", "rtx4090"].includes(s.hw)) {
+        coverageWarnings.push("Layerwise offload is tuned and verified on RTX 5090 and RTX 4090; on this hardware it runs unverified and a resident recipe is faster.");
       }
       if (resolvedPlacement === "fsdp" && (s.nodes !== 1 || !["b200", "b300", "h200", "h100"].includes(s.hw))) {
         coverageWarnings.push("FSDP outside the single-node NVIDIA recipes runs unverified.");
@@ -507,6 +519,8 @@ export const config = {
       }
       if (s.hw === "rtx5090") {
         warnings.push("The 2× RTX 5090 path requires a 384 GiB-class host and prioritizes capacity over latency.");
+      } else if (s.hw === "rtx4090") {
+        warnings.push("Validated on a single RTX 4090 (24 GB) with a large-host-memory box: t2va at the default 768 short edge, 50 steps, 906 s end to end and 22.3 GB peak. The VAE stays resident because streaming it added 35 s of decode; prefetch 2 measured fastest. Consumer GPUs have no P2P, and TP2 failed in NCCL SHM during VAE decode.");
       }
 
       let automaticAttention = "FlashAttention (auto)";
@@ -514,7 +528,7 @@ export const config = {
         automaticAttention = "AITER (auto)";
       } else if (topology.ring_degree === 1 && ["b200", "b300"].includes(s.hw)) {
         automaticAttention = "Dynamic cuDNN / FA (auto)";
-      } else if (topology.ring_degree === 1 && s.hw === "rtx5090") {
+      } else if (topology.ring_degree === 1 && ["rtx5090", "rtx4090"].includes(s.hw)) {
         automaticAttention = "Torch SDPA (auto)";
       }
 
