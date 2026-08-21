@@ -525,6 +525,11 @@ struct AllReduceTwoshot {
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
           float2 f = __bfloat1622float2(bf_buf[j]);
+          // Scale down by an exact power of two so that values which overflow
+          // fp16 (and the fp16 accumulator that sums them) stay in range. Undone
+          // on store. See kQRFp16CastScaleLog2 in quick_all_reduce_base.h.
+          f.x *= kQRFp16CastInvScale;
+          f.y *= kQRFp16CastInvScale;
           half_buf[j] = __float22half2_rn(f);
         }
         tA[i] = *reinterpret_cast<const int32x4_t*>(half_buf);
@@ -620,6 +625,10 @@ struct AllReduceTwoshot {
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
           float2 f = __half22float2(half_buf[j]);
+          // Undo the load-side scale. Exact: a power of two only shifts the
+          // exponent, and the fp32 intermediate cannot overflow.
+          f.x *= kQRFp16CastScale;
+          f.y *= kQRFp16CastScale;
           bf16_buf[j] = __float22bfloat162_rn(f);
         }
         buffer_store_dwordx4(*reinterpret_cast<const int32x4_t*>(bf16_buf), dst_buffer.descriptor, dst_offset, 0, 0);

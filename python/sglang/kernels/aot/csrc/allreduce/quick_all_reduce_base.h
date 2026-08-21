@@ -32,6 +32,44 @@ using int32x4_t = __attribute__((__vector_size__(4 * sizeof(int)))) int;
 
 static constexpr int kNegOne = 0xBC00BC00;  // {-1, -1}, fp16x2_t
 
+// Range guard for the bf16 -> fp16 fast path (AllReduceTwoshot<..., true>).
+//
+// That path exists purely for speed: fp16 math is faster than bf16 on CDNA, so
+// bf16 payloads are converted to fp16 for the duration of the collective. But
+// fp16 saturates at 65504 while bf16 reaches ~3.4e38, and the reduced
+// activations of large models exceed the fp16 ceiling -- gpt-oss-120b reaches
+// 2.6e5..3.3e5 on TP4 with the auto-derived 16k-token chunk size. A saturated
+// value does not merely clip: it becomes inf, and inf poisons its entire
+// 32-element codec block through the block max (the block's encoding scale
+// degenerates), so one out-of-range element destroys 32.
+//
+// We therefore divide by a fixed power of two on load and multiply it back on
+// store. A power-of-two scale is a pure exponent shift, so it is exact wherever
+// it neither underflows nor overflows, and it composes through the reduction:
+//   sum(x_i / S) * S == sum(x_i)
+// exactly, while each codec's per-block scale absorbs it. The scale is a
+// compile-time constant, so there is no runtime detection, no host
+// synchronisation, and it is safe inside CUDA graphs.
+//
+// Choosing kQRFp16CastScaleLog2 = 4 (S = 16). The usable window measured on
+// captured gpt-oss-120b activations is S in [8, 32]:
+//   * S >= 8  is required by the data: the largest reduced magnitude seen is
+//     3.3e5, so S must exceed 3.3e5 / 65504 = 5.1.
+//   * S <= 32 is required by precision: replaying 8 captured collectives
+//     against an exact fp32 reduction, S = 1, 16 and 32 give the same relative
+//     L2 error to 8 significant figures in both the INT8 and FP regimes;
+//     degradation first appears at S = 64 (INT8 rel_l2 1.53e-2 -> 2.03e-2 on
+//     the smallest-magnitude tile, because the codec's per-block decoding scale
+//     itself goes denormal).
+// S = 16 is the midpoint of that window in log space: 2x margin against a
+// larger-than-observed activation, 2x margin against the precision cliff.
+// Concretely it gives a ceiling of 65504 * 16 = 1048064 (3.1x over the observed
+// peak), keeps bf16 -> fp16 exact down to 2^-13 = 1.2e-4 (was 2^-17 = 7.6e-6),
+// and flushes to zero below 16 * 2^-24 = 9.5e-7 (was 2^-24 = 6.0e-8).
+static constexpr int kQRFp16CastScaleLog2 = 4;
+static constexpr float kQRFp16CastScale = static_cast<float>(1 << kQRFp16CastScaleLog2);
+static constexpr float kQRFp16CastInvScale = 1.0f / kQRFp16CastScale;
+
 // Number of atoms (4xf16x2_t) processed by a single thread
 static constexpr int kAtoms = 8;
 
@@ -95,8 +133,15 @@ __quickreduce_device_inline__ static void
 buffer_store_dwordx4(int32x4_t data, int32x4_t srsrc, int32_t voffset, int32_t soffset, int32_t aux) {}
 #endif
 
+// MODE.FP16_OVFL: clamp overflowing fp16 *arithmetic* to +/-MAX_FP16 instead of
+// producing inf. gfx950 supports this register exactly as gfx942 does, but the
+// guard below never listed it, so every MI350X run had the protection silently
+// switched off. Note this covers VALU fp16 math only -- it does NOT cover the
+// f32 -> f16 conversion, which is why the conversion needs the explicit scale
+// above rather than relying on this bit. (Verified on gfx950: with the bit set,
+// v_pk_add_f16(65504, 65504) yields 65504, while cvt(333824) still yields inf.)
 __quickreduce_device_inline__ static void set_fp16_ovfl(bool const value) {
-#if defined(__gfx942__)
+#if defined(__gfx942__) || defined(__gfx950__)
   if (value) {
     asm volatile("s_setreg_imm32_b32 0xdc1, 1;" ::);
   } else {
