@@ -845,7 +845,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
-            if model_runner.server_args.enable_lora:
+            if model_runner.lora_manager is not None:
                 model_runner.lora_manager.reset_lora_batch()
             return ret
 
@@ -919,8 +919,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             else:
                 ret._compute_mrope_positions(model_runner, batch)
 
-        # Init lora information
-        if model_runner.server_args.enable_lora:
+        # Init lora information (None on a draft runner: it is unadapted)
+        if model_runner.lora_manager is not None:
             # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
             # as a batch, right before running the batch
             if not model_runner.server_args.enable_lora_overlap_loading:
