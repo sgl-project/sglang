@@ -39,6 +39,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     MmItemMemoryPool,
     get_mm_feature_pool_size_per_worker,
 )
+from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
     configure_media_url_security,
@@ -212,10 +213,10 @@ class BaseMultimodalProcessor(ABC):
         self.server_args = server_args
         self.transport_mode = transport_mode
         configure_media_url_security(
-            server_args.allowed_media_domains,
+            get_mm().allowed_media_domains,
             server_args.media_url_max_file_size_mb,
         )
-        configured_mm_feature_transport = server_args.mm_feature_transport
+        configured_mm_feature_transport = get_mm().mm_feature_transport
         self.mm_feature_transport = (
             configured_mm_feature_transport
             if configured_mm_feature_transport in ("cpu", "cuda_ipc", "cuda_vmm")
@@ -231,7 +232,7 @@ class BaseMultimodalProcessor(ABC):
         self.disable_fast_image_processor = self.image_processor_backend == "pil"
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
 
-        mm_process_config = self.server_args.mm_process_config
+        mm_process_config = get_mm().mm_process_config
         self.image_config = mm_process_config.get("image", {})
         self.video_config = mm_process_config.get("video", {})
         self.audio_config = mm_process_config.get("audio", {})
@@ -255,7 +256,7 @@ class BaseMultimodalProcessor(ABC):
         # The fingerprint is needed only to build artifact keys. Avoid inspecting
         # processor state when this processor will never retain artifacts.
         self.processor_fingerprint = (
-            build_processor_fingerprint(self, hf_config, server_args)
+            build_processor_fingerprint(self, hf_config)
             if self.mm_preprocess_cache.enabled
             else None
         )
@@ -675,6 +676,7 @@ class BaseMultimodalProcessor(ABC):
                 "Gemma4Processor",
                 "Gemma4UnifiedProcessor",
                 "GlmAsrProcessor",
+                "GraniteSpeechProcessor",
                 "Qwen2AudioProcessor",
                 "Qwen3ASRProcessor",
                 "Qwen3OmniMoeProcessor",
