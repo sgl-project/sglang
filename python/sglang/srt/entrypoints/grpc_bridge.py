@@ -419,6 +419,9 @@ class RuntimeHandle:
     def get_server_info(self) -> str:
         result: Dict[str, Any] = dataclasses.asdict(self.tokenizer_manager.server_args)
         result.update(self.scheduler_info)
+        result["kv_events"] = (
+            self.tokenizer_manager.server_args.describe_kv_events_publisher()
+        )
         return json.dumps(msgspec_to_builtins(result), default=str)
 
     def health_check(self) -> bool:
