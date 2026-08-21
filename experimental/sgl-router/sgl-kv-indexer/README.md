@@ -5,48 +5,46 @@ blocks. It records which worker and storage tier currently holds each
 content-addressed block, allowing a router to query likely cache hits without
 moving KV data itself.
 
-This build deliberately uses one process-local in-memory index. It has no
-external storage dependency, but it is soft-state: restarting the Indexer loses
-all placement metadata.
+Each Indexer uses a process-local in-memory index with no external storage
+dependency. The state is soft, but a paired Bridge rebuilds it from every
+Worker's Snapshot + Live Events before that replica reports READY.
 
 ## Architecture
 
 ```text
-SGLang worker ── ZMQ PUB ──> bridge ── gRPC ──> in-memory indexer
+Worker fleet ── Snapshot + ZMQ Live ──> Bridge i ── gRPC ──> Indexer i
+Router fleet <──── 100 ms status ───── Indexer fleet
+Router ───────── MatchPrefix ─────────> one fresh READY Indexer
 ```
 
 - SGLang publishes `BlockStored`, `BlockRemoved`, and `AllBlocksCleared` events.
-- One `kv-indexer-bridge` follows each independent worker/rank event stream.
-- One `kv-indexer-server` applies event batches and serves match queries.
+- One `kv-indexer-bridge` is paired 1:1 with one `kv-indexer-server`; that
+  Bridge follows every configured worker/rank stream.
+- Multiple Indexer replicas independently hold the complete placement view.
+- Every Indexer reports readiness, coverage, and normalized query saturation to
+  every Router at a 100 ms default interval.
 - Placement, worker metadata, reverse holdings, and hit counters live in that
   server process behind a single read/write lock.
 
-Each apply RPC is ordered and atomic within the process, and a query sees a
-consistent snapshot. The bridge splits larger worker event batches into
-ordered RPCs of at most 16,384 hashes and 256 actions while keeping per-hash
-metadata aligned. If a later RPC fails, earlier chunks may already be applied;
-there is no rollback or replay. There is no persistence, replication, or state
-sharing between Indexer servers.
+Each snapshot replacement and apply RPC is atomic within the process, and a
+query sees a consistent view. Recovery-aware applies are fenced by Worker epoch
+and contiguous sequence: duplicates are acknowledged, while a gap invalidates
+and clears that Worker until a new snapshot is installed. There is no Indexer
+leader, consensus, persistence, or state sharing between replicas.
 
 ## Operational contract
 
-Run exactly one Indexer server for a deployment. Multiple bridge processes and
-workers may report to it, but active-active Indexer servers have independent
-state and must not be treated as replicas.
+Run any number of `Bridge + Indexer` pairs. Routers select the lowest-load fresh
+READY report, retry another READY member on timeout/unreachable/overload, and
+fall back to load-only Worker routing when none is usable.
 
-This build has no sequence gate, incarnation fencing, replay recovery, worker
-liveness TTL, or restart recovery:
-
-- An Indexer restart starts with an empty index.
-- A worker death is not detected; its last placements remain until revoked or
-  until the Indexer restarts.
-- Events published while a bridge is disconnected are not replayed.
-- A publisher sequence gap is logged and otherwise ignored.
-- Redelivered or reordered batches are applied again in arrival order.
-
-Individual report, revoke, and clear mutations are idempotent. A future
-Snapshot plus event-replay mechanism is required before production high
-availability can rebuild state safely after restart or event loss.
+Fleet mode requires snapshot-capable Workers. The Bridge subscribes to Live
+Events before requesting `snapshot-v1`, waits for the exact barrier, installs
+the snapshot atomically, and then applies only contiguous events from the same
+epoch. Indexer restart (detected by a per-process epoch even while Workers are
+idle), Worker epoch change, sequence gap, or Bridge reconnect starts a fresh
+snapshot cycle. Snapshot v1 contains whole-block HBM placement;
+tier/component-complete recovery remains a future protocol version.
 
 ## In-memory data model
 
@@ -78,10 +76,14 @@ This produces:
 Component-aware routing requires an SGLang engine build that supports
 `component_types`. Start each command in its own terminal.
 
-1. Start the single Indexer server:
+1. Start each Indexer server. Status reporting is enabled when Router URLs are
+configured:
 
 ```bash
 KV_INDEXER_LISTEN_ADDR=127.0.0.1:50051 \
+KV_INDEXER_ID=indexer-1 \
+KV_INDEXER_ADVERTISE_ENDPOINT=http://127.0.0.1:50051 \
+KV_INDEXER_ROUTER_URLS=http://127.0.0.1:3001 \
   cargo run --release --bin kv-indexer-server
 ```
 
@@ -89,30 +91,34 @@ KV_INDEXER_LISTEN_ADDR=127.0.0.1:50051 \
 `KV_INDEXER_PREFIX_QUERY_MAX_INFLIGHT` sets the maximum number of prefix
 queries executing concurrently and defaults to `32`. Requests above the limit
 are rejected immediately with gRPC `RESOURCE_EXHAUSTED`.
-There is no backend or storage configuration.
+`KV_INDEXER_STATUS_INTERVAL_MS` defaults to `100`; Router reports expire after
+500 ms. The normalized load is current prefix-query saturation divided by the
+configured in-flight capacity.
 
-2. Start one bridge per worker event stream. This FULL+SWA example uses the
-worker URL registered with the Router:
+2. Start one Bridge paired with this Indexer. Fleet mode configures all Worker
+streams in one JSON array:
 
 ```bash
-KV_INDEXER_WORKER_ID=worker-0 \
-KV_INDEXER_WORKER_ADDRESS=http://127.0.0.1:30000 \
 KV_INDEXER_ENDPOINT=http://127.0.0.1:50051 \
-SGLANG_KV_EVENT_ENDPOINT=tcp://127.0.0.1:5567 \
-SGLANG_KV_EVENT_TOPIC=kv-events \
-KV_INDEXER_CACHE_COMPONENTS=full,swa \
-KV_INDEXER_SWA_WINDOW_TOKENS=<model-window-tokens> \
-KV_INDEXER_FULL_TIERS=HBM \
-KV_INDEXER_SWA_TIERS=HBM \
+KV_INDEXER_WORKERS_JSON='[
+  {
+    "worker_id":"worker-0",
+    "worker_address":"http://127.0.0.1:30000",
+    "event_endpoint":"tcp://127.0.0.1:5567",
+    "snapshot_endpoint":"tcp://127.0.0.1:5767",
+    "event_topic":"kv-events",
+    "dp_rank":0
+  },
+  {
+    "worker_id":"worker-1",
+    "worker_address":"http://127.0.0.1:30001",
+    "event_endpoint":"tcp://127.0.0.1:5568",
+    "snapshot_endpoint":"tcp://127.0.0.1:5768",
+    "event_topic":"kv-events",
+    "dp_rank":0
+  }
+]' \
   cargo run --release --bin kv-indexer-bridge
-```
-
-For FULL+MAMBA, use:
-
-```bash
-KV_INDEXER_CACHE_COMPONENTS=full,mamba
-KV_INDEXER_FULL_TIERS=HBM
-KV_INDEXER_MAMBA_TIERS=HBM
 ```
 
 3. Start the matching SGLang worker:
@@ -122,8 +128,7 @@ python -m sglang.launch_server \
   --model-path <model> \
   --port 30000 \
   --kv-events-config \
-    '{"publisher":"zmq","endpoint":"tcp://*:5567","topic":"kv-events"}' \
-  --enable-kv-events-component-types
+    '{"publisher":"zmq","endpoint":"tcp://*:5567","snapshot_endpoint":"tcp://*:5767","topic":"kv-events"}'
 ```
 
 4. Start the Router with the Indexer as the authoritative cache signal:
@@ -139,19 +144,21 @@ sgl-router \
   --kv-indexer-query-max-inflight 32
 ```
 
-For multiple workers, repeat steps 2–3 with unique worker IDs and ports.
-`KV_INDEXER_WORKER_ADDRESS` must exactly match the corresponding Router URL.
-
-The bridge sends its `WorkerCacheSpec` with every batch. Omitting
-`KV_INDEXER_CACHE_COMPONENTS` clears any previously stored spec and uses legacy
-whole-block matching.
+For multiple Indexer replicas, repeat steps 1–2 with unique Indexer ports/IDs;
+each Bridge uses the same Worker list and its paired Indexer endpoint.
 
 ## API
 
 The protobuf service in `proto/kv_indexer.proto` provides:
 
 - `ApplyExternalKvBatch`: ordered placement reports, revocations, and clears.
-  The request `seq` is carried for observability only.
+  Recovery-aware requests enforce epoch and contiguous sequence.
+- `ConfigureExpectedWorkers`: atomically configures desired Worker coverage and
+  removes scaled-in Worker state.
+- `InvalidateWorker`: clears one Worker's placement and marks it NOT_READY
+  before recovery/reconnect.
+- `ReplaceExternalKvSnapshot`: atomically installs one Worker snapshot and
+  sequence checkpoint.
 - `MatchExternalKv`: workers and tiers holding requested block hashes.
 - `MatchExternalKvPrefix`: per-worker longest contiguous reusable prefix.
 - `GetExternalKvHitCounts`: per-block hit counters.
@@ -233,9 +240,17 @@ linearly with sustained overload.
 
 Required or commonly used bridge variables:
 
+- `KV_INDEXER_WORKERS_JSON`: fleet-mode array shown above; each entry requires
+  `worker_id`, `worker_address`, `event_endpoint`, and `snapshot_endpoint`, and
+  optionally accepts `event_topic` and `dp_rank`
+- `KV_INDEXER_ENDPOINT`: paired Indexer endpoint, default
+  `http://[::1]:50051`
+
+The variables below are the backward-compatible, non-recoverable single-Worker
+mode. They are ignored when `KV_INDEXER_WORKERS_JSON` is present:
+
 - `KV_INDEXER_WORKER_ID`: unique ID for the worker event stream
 - `KV_INDEXER_WORKER_ADDRESS`: Router-facing worker URL
-- `KV_INDEXER_ENDPOINT`: Indexer endpoint, default `http://[::1]:50051`
 - `SGLANG_KV_EVENT_ENDPOINT`: worker PUB endpoint
 - `SGLANG_KV_EVENT_TOPIC`: ZMQ subscription topic
 - `KV_INDEXER_CLEAR_TIERS`: tiers affected by clear, default `HBM,DRAM,SSD`

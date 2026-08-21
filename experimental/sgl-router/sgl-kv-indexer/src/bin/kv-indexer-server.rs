@@ -52,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         %addr,
         prefix_query_max_inflight,
         max_concurrent_streams = MAX_CONCURRENT_STREAMS,
-        "starting single-server in-memory SGLang KV Indexer"
+        "starting in-memory SGLang KV Indexer"
     );
     server_builder()
         .add_service(service)

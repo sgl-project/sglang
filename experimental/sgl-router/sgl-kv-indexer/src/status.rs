@@ -258,7 +258,10 @@ pub fn spawn_status_reporter(
     config: StatusReporterConfig,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(config.interval)
+            .build()
+            .expect("status reporter HTTP client builds");
         let mut ticker = tokio::time::interval(config.interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -267,18 +270,29 @@ pub fn spawn_status_reporter(
                 config.indexer_id.clone(),
                 config.advertised_endpoint.clone(),
             );
+            let mut posts = tokio::task::JoinSet::new();
             for router in &config.router_urls {
+                let client = client.clone();
+                let report = report.clone();
+                let router = router.clone();
                 let url = format!("{}/v1/kv-indexer/status", router.trim_end_matches('/'));
-                match client.post(&url).json(&report).send().await {
-                    Ok(response) if response.status().is_success() => {
-                        debug!(router = %router, "reported KV Indexer status");
+                posts.spawn(async move {
+                    match client.post(&url).json(&report).send().await {
+                        Ok(response) if response.status().is_success() => {
+                            debug!(router = %router, "reported KV Indexer status");
+                        }
+                        Ok(response) => {
+                            warn!(router = %router, status = %response.status(), "Router rejected KV Indexer status");
+                        }
+                        Err(error) => {
+                            warn!(router = %router, %error, "failed to report KV Indexer status");
+                        }
                     }
-                    Ok(response) => {
-                        warn!(router = %router, status = %response.status(), "Router rejected KV Indexer status");
-                    }
-                    Err(error) => {
-                        warn!(router = %router, %error, "failed to report KV Indexer status");
-                    }
+                });
+            }
+            while let Some(result) = posts.join_next().await {
+                if let Err(error) = result {
+                    warn!(%error, "KV Indexer status report task failed");
                 }
             }
         }
@@ -288,6 +302,11 @@ pub fn spawn_status_reporter(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::{Json, State};
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use axum::Router;
+    use tokio::sync::mpsc;
 
     fn report(id: &str, ready: bool, load: f64) -> IndexerStatusReport {
         IndexerStatusReport {
@@ -316,6 +335,16 @@ mod tests {
         assert_eq!(ids, ["idle", "busy"]);
     }
 
+    #[tokio::test]
+    async fn stale_and_not_ready_replicas_are_excluded() {
+        let registry = IndexerStatusRegistry::new(Vec::new(), Duration::from_millis(20));
+        registry.record(report("ready", true, 0.1)).unwrap();
+        registry.record(report("syncing", false, 0.0)).unwrap();
+        assert_eq!(registry.candidates()[0].indexer_id, "ready");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(registry.candidates().is_empty());
+    }
+
     #[test]
     fn status_handle_reports_normalized_query_load_and_coverage() {
         let status = IndexerStatusHandle::new(2);
@@ -325,5 +354,46 @@ mod tests {
         assert!(!report.ready);
         assert_eq!(report.normalized_load, 0.5);
         drop(permit);
+    }
+
+    async fn capture_status(
+        State(tx): State<mpsc::Sender<IndexerStatusReport>>,
+        Json(report): Json<IndexerStatusReport>,
+    ) -> StatusCode {
+        tx.send(report).await.unwrap();
+        StatusCode::NO_CONTENT
+    }
+
+    #[tokio::test]
+    async fn reporter_posts_at_configured_interval() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let app = Router::new()
+            .route("/v1/kv-indexer/status", post(capture_status))
+            .with_state(tx);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let status = Arc::new(IndexerStatusHandle::new(4));
+        status.set_coverage(1, 1);
+        let reporter = spawn_status_reporter(
+            status,
+            StatusReporterConfig {
+                indexer_id: "i1".into(),
+                advertised_endpoint: "http://i1:50051".into(),
+                router_urls: vec![format!("http://{addr}")],
+                interval: Duration::from_millis(20),
+            },
+        );
+        for _ in 0..2 {
+            let report = tokio::time::timeout(Duration::from_millis(250), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(report.indexer_id, "i1");
+            assert!(report.ready);
+        }
+        reporter.abort();
+        server.abort();
     }
 }

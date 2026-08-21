@@ -132,6 +132,19 @@ message ConfigureExpectedWorkersRequest {
 message ConfigureExpectedWorkersResponse {
   uint32 total_workers = 1;
   uint32 ready_workers = 2;
+  // Changes on every Indexer process restart. Bridges poll this value so an
+  // idle Worker stream is still rebuilt after the paired Indexer restarts.
+  string indexer_epoch = 3;
+}
+
+message InvalidateWorkerRequest {
+  string worker_id = 1;
+}
+
+message InvalidateWorkerResponse {
+  uint32 total_workers = 1;
+  uint32 ready_workers = 2;
+  string indexer_epoch = 3;
 }
 
 // Atomically replaces all placement owned by one worker stream after the
@@ -214,6 +227,8 @@ message GetExternalKvHitCountsResponse {
 
 service KVIndexer {
   rpc ConfigureExpectedWorkers(ConfigureExpectedWorkersRequest) returns (ConfigureExpectedWorkersResponse);
+
+  rpc InvalidateWorker(InvalidateWorkerRequest) returns (InvalidateWorkerResponse);
 
   rpc ReplaceExternalKvSnapshot(ReplaceExternalKvSnapshotRequest) returns (ReplaceExternalKvSnapshotResponse);
 
