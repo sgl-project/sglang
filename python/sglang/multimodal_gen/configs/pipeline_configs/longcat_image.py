@@ -257,6 +257,28 @@ class LongCatImagePipelineConfig(ImagePipelineConfig):
             keep_resident_components=("text_encoder", "vae"),
         )
 
+    def expand_conditioning_to_sample_batch(self, batch):
+        # Noise/reference latents are built at batch_size = prompts * num_outputs,
+        # but text encoding stays per-prompt; repeat the embeds to match. No-op
+        # for num_outputs == 1. Shared by T2I and Edit.
+        from sglang.multimodal_gen.runtime.utils.condition_expansion import (
+            PromptToSampleBatchExpander,
+        )
+
+        expander = PromptToSampleBatchExpander.from_batch(batch)
+        if expander is None:
+            return batch
+        for field_name in (
+            "prompt_embeds",
+            "negative_prompt_embeds",
+            "prompt_embeds_mask",
+            "negative_prompt_embeds_mask",
+            "prompt_seq_lens",
+            "negative_prompt_seq_lens",
+        ):
+            expander.expand_field(batch, field_name)
+        return batch
+
     # --- LatentPreparationStage hooks ---
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):

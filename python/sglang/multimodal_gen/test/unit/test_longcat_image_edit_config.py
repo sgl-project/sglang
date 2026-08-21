@@ -107,3 +107,51 @@ def test_t2i_config_unchanged():
     assert t2i.slice_noise_pred(noise, torch.zeros(1, 5, 64)).shape == (1, 10, 64)
     ids = t2i.maybe_prepare_latent_ids(torch.zeros(1, 16, 8, 8))
     assert ids is not None and ids.shape == (16, 3)
+
+
+def test_expand_conditioning_repeats_embeds_for_num_outputs():
+    # Single prompt, num_outputs_per_prompt=2: text encoding produces per-prompt
+    # (batch 1) embeds while latents are built at batch 2, so the conditioning
+    # must be repeated to match or the DiT sees mismatched batch dims.
+    config = LongCatImageEditPipelineConfig()
+    batch = _make_batch(
+        prompt=["edit it"],
+        num_outputs_per_prompt=2,
+        prompt_embeds=[torch.randn(1, 850, 3584)],
+        negative_prompt_embeds=[torch.randn(1, 850, 3584)],
+        prompt_embeds_mask=[torch.ones(1, 850, dtype=torch.bool)],
+        negative_prompt_embeds_mask=[torch.ones(1, 850, dtype=torch.bool)],
+        prompt_seq_lens=[[850]],
+        negative_prompt_seq_lens=[[850]],
+    )
+    pos0 = batch.prompt_embeds[0]
+
+    config.expand_conditioning_to_sample_batch(batch)
+
+    assert batch.prompt_embeds[0].shape == (2, 850, 3584)
+    assert batch.negative_prompt_embeds[0].shape == (2, 850, 3584)
+    assert batch.prompt_embeds_mask[0].shape == (2, 850)
+    assert batch.negative_prompt_embeds_mask[0].shape == (2, 850)
+    assert batch.prompt_seq_lens[0] == [850, 850]
+    assert batch.negative_prompt_seq_lens[0] == [850, 850]
+    # Each sample is the original prompt, not garbage.
+    assert torch.equal(batch.prompt_embeds[0][0], pos0[0])
+    assert torch.equal(batch.prompt_embeds[0][1], pos0[0])
+
+
+def test_expand_conditioning_noop_for_single_output():
+    config = LongCatImagePipelineConfig()
+    pe = torch.randn(1, 850, 3584)
+    batch = _make_batch(
+        prompt=["a photo"],
+        num_outputs_per_prompt=1,
+        prompt_embeds=[pe],
+        negative_prompt_embeds=None,
+        prompt_embeds_mask=[torch.ones(1, 850, dtype=torch.bool)],
+        negative_prompt_embeds_mask=None,
+        prompt_seq_lens=[[850]],
+        negative_prompt_seq_lens=None,
+    )
+    config.expand_conditioning_to_sample_batch(batch)
+    assert batch.prompt_embeds[0] is pe  # untouched
+    assert batch.prompt_embeds[0].shape == (1, 850, 3584)
