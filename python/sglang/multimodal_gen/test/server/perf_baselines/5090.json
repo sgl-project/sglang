@@ -11,14 +11,18 @@
             "denoise_stage": 0.1,
             "non_denoise_stage": 0.5,
             "denoise_step": 0.25,
-            "denoise_agg": 0.15
+            "denoise_agg": 0.15,
+            "load_peak_vram": 0.01,
+            "runtime_peak_vram": 0.02
         },
         "pr_test": {
             "e2e": 0.25,
             "denoise_stage": 0.25,
             "non_denoise_stage": 0.8,
             "denoise_step": 0.3,
-            "denoise_agg": 0.2
+            "denoise_agg": 0.2,
+            "load_peak_vram": 0.01,
+            "runtime_peak_vram": 0.02
         }
     },
     "improvement_reporting": {
@@ -56,6 +60,8 @@
             "expected_e2e_ms": 18255.39,
             "expected_avg_denoise_ms": 338.78,
             "expected_median_denoise_ms": 345.95,
+            "load_peak_vram_mb": 1126.0,
+            "runtime_peak_vram_mb": 13180.0,
             "estimated_full_test_time_s": 94.0
         },
         "wan2_1_t2v_1.3b": {
@@ -78,6 +84,8 @@
             "expected_e2e_ms": 23418.73,
             "expected_avg_denoise_ms": 426.59,
             "expected_median_denoise_ms": 427.94,
+            "load_peak_vram_mb": 4934.0,
+            "runtime_peak_vram_mb": 18246.0,
             "estimated_full_test_time_s": 160.9
         },
         "zimage_image_t2i": {
@@ -100,6 +108,8 @@
             "expected_e2e_ms": 2492.09,
             "expected_avg_denoise_ms": 241.53,
             "expected_median_denoise_ms": 265.1,
+            "load_peak_vram_mb": 13120.0,
+            "runtime_peak_vram_mb": 17776.0,
             "estimated_full_test_time_s": 329.8
         },
         "lingbot_video_moe_t2v": {
