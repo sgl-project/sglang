@@ -128,6 +128,16 @@ def get_last_loc(
             req_to_token, req_pool_indices_tensor, prefix_lens_tensor
         )
 
+    if _is_npu and uses_triton_dispatch:
+        # Same failure class as HIP above: NPU triton mis-compiles the
+        # mixed-width store, producing out-of-range last_loc (observed on
+        # DSV4 prefill CP + EAGLE + page_size=128 as +/-1e9 garbage that
+        # flows through alloc_extend into req_to_token rows and the PD
+        # transfer page lists). The torch indexing impl is exact.
+        return get_last_loc_torch(
+            req_to_token, req_pool_indices_tensor, prefix_lens_tensor
+        )
+
     if uses_triton_dispatch:
         impl = get_last_loc_triton
     else:
