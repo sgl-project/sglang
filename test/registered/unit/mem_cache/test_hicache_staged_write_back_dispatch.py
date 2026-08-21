@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
+    _validate_rocm_kernel_host_pools,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool_host import (
@@ -37,6 +38,9 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 MEMORY_POOL_HOST_MODULE = "sglang.srt.mem_cache.memory_pool_host"
 MHA_POOL_HOST_MODULE = "sglang.srt.mem_cache.pool_host.mha"
 MLA_POOL_HOST_MODULE = "sglang.srt.mem_cache.pool_host.mla"
+HYBRID_CACHE_CONTROLLER_MODULE = (
+    "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller"
+)
 
 
 def _indices(start: int, end: int) -> torch.Tensor:
@@ -85,6 +89,32 @@ def _host_group_stub(captured, *, can_use_write_back_jit: bool) -> SimpleNamespa
         anchor_entry=entries[0],
         entry_map={entry.name: entry for entry in entries},
     )
+
+
+def _validation_host_group(
+    *, layout: str, capabilities: tuple[bool, ...]
+) -> HostPoolGroup:
+    names = (PoolName.KV, PoolName.SWA, PoolName.DEEPSEEK_V4_C4)
+    entries = []
+    for index, can_use_write_back_jit in enumerate(capabilities):
+        host_pool = SimpleNamespace(
+            layout=layout,
+            page_size=64,
+            device="cpu",
+            size=64,
+            logical_size=64,
+            can_use_write_back_jit=can_use_write_back_jit,
+        )
+        entries.append(
+            PoolEntry(
+                name=names[index],
+                host_pool=host_pool,
+                device_pool=None,
+                layer_mapper=lambda layer_id: layer_id,
+                is_primary_index_anchor=index == 0,
+            )
+        )
+    return HostPoolGroup(entries)
 
 
 def _cpu_staged_lf_pf_copy(
@@ -194,6 +224,58 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
     def setUp(self):
         transfer_module._timing_events_supported.cache_clear()
         self.addCleanup(transfer_module._timing_events_supported.cache_clear)
+
+    def test_rocm_kernel_page_first_requires_staged_jit_for_every_pool(self):
+        host_group = _validation_host_group(
+            layout="page_first", capabilities=(True, False, True)
+        )
+        with mock.patch(f"{HYBRID_CACHE_CONTROLLER_MODULE}._is_hip", True):
+            with self.assertRaisesRegex(RuntimeError, "staged JIT write-back.*swa"):
+                _validate_rocm_kernel_host_pools(host_group, "kernel")
+
+    def test_rocm_kernel_layer_first_fails_at_startup(self):
+        host_group = _validation_host_group(
+            layout="layer_first", capabilities=(True, True)
+        )
+        with mock.patch(f"{HYBRID_CACHE_CONTROLLER_MODULE}._is_hip", True):
+            with self.assertRaisesRegex(RuntimeError, "layout='layer_first'"):
+                _validate_rocm_kernel_host_pools(host_group, "kernel")
+
+    def test_rocm_safe_host_pool_configurations_pass_startup(self):
+        page_first = _validation_host_group(
+            layout="page_first", capabilities=(True, True, True)
+        )
+        layer_first = _validation_host_group(
+            layout="layer_first", capabilities=(False, False)
+        )
+        with mock.patch(f"{HYBRID_CACHE_CONTROLLER_MODULE}._is_hip", True):
+            _validate_rocm_kernel_host_pools(page_first, "kernel")
+            _validate_rocm_kernel_host_pools(layer_first, "direct")
+        with mock.patch(f"{HYBRID_CACHE_CONTROLLER_MODULE}._is_hip", False):
+            _validate_rocm_kernel_host_pools(layer_first, "kernel")
+
+    def test_rocm_dynamic_host_pool_is_validated_before_registration(self):
+        host_group = _validation_host_group(
+            layout="page_first", capabilities=(True, True)
+        )
+        entry = PoolEntry(
+            name=PoolName.DEEPSEEK_V4_C4,
+            host_pool=SimpleNamespace(
+                layout="page_first", can_use_write_back_jit=False
+            ),
+            device_pool=None,
+            layer_mapper=lambda layer_id: layer_id,
+        )
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mem_pool_host = host_group
+        controller.io_backend = "kernel"
+        controller.enable_storage = False
+
+        with mock.patch(f"{HYBRID_CACHE_CONTROLLER_MODULE}._is_hip", True):
+            with self.assertRaisesRegex(RuntimeError, "deepseek_v4_c4"):
+                controller.register_host_pool_entry(entry)
+
+        self.assertNotIn(PoolName.DEEPSEEK_V4_C4, host_group.entry_map)
 
     @staticmethod
     def _start_writing(controller):
