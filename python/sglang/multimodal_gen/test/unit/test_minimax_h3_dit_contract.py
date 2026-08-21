@@ -97,36 +97,35 @@ def test_native_weight_names_and_grouped_qkv_reorder():
     ).reshape(12, 1)
     torch.testing.assert_close(actual, expected)
 
-    grouped = torch.arange(48, dtype=torch.int16).reshape(24, 2).view(torch.bfloat16)
-    reordered = _reorder_grouped_qkv_to_qkv(
-        grouped,
-        num_query_groups=4,
-        heads_per_group=1,
-        head_dim=2,
-    )
-    for tp_size in (1, 2, 4):
-        local_rows = 8 // tp_size
-        for tp_rank in range(tp_size):
-            start = tp_rank * local_rows
-            param = torch.nn.Parameter(
-                torch.empty(3 * local_rows, 2, dtype=torch.bfloat16),
-                requires_grad=False,
-            )
-            param.output_dim = 0
-            assert _copy_grouped_qkv_tp_shard(
-                param,
-                grouped,
-                num_query_groups=4,
-                head_dim=2,
-                tp_rank=tp_rank,
-                tp_size=tp_size,
-            )
-            expected_shard = reordered.view(3, 8, 2)[
-                :, start : start + local_rows
-            ].reshape(-1, 2)
-            assert torch.equal(
-                param.view(torch.int16), expected_shard.view(torch.int16)
-            )
+    for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+        grouped = torch.arange(48, dtype=torch.float32).reshape(24, 2).to(dtype)
+        reordered = _reorder_grouped_qkv_to_qkv(
+            grouped,
+            num_query_groups=4,
+            heads_per_group=1,
+            head_dim=2,
+        )
+        for tp_size in (1, 2, 4):
+            local_rows = 8 // tp_size
+            for tp_rank in range(tp_size):
+                start = tp_rank * local_rows
+                param = torch.nn.Parameter(
+                    torch.empty(3 * local_rows, 2, dtype=dtype),
+                    requires_grad=False,
+                )
+                param.output_dim = 0
+                assert _copy_grouped_qkv_tp_shard(
+                    param,
+                    grouped,
+                    num_query_groups=4,
+                    head_dim=2,
+                    tp_rank=tp_rank,
+                    tp_size=tp_size,
+                )
+                expected_shard = reordered.view(3, 8, 2)[
+                    :, start : start + local_rows
+                ].reshape(-1, 2)
+                assert torch.equal(param, expected_shard)
 
 
 def test_pruned_adaln_curve_interpolates_without_timestep_mlp():
