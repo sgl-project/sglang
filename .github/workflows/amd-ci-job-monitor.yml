@@ -129,17 +129,20 @@ jobs:
       - name: Parse workflow files
         id: parse
         run: |
+          set -euo pipefail
+
           # Parse the default ROCm 7.2 PR gate (exclude utility jobs)
           # Excluded: call-gate, check-changes, finish, cancel, check-all-jobs,
-          # plus the extra call and the stage waits -- they run on ubuntu-latest
-          # (or delegate to another workflow), so the self-hosted-only snapshot
-          # has nothing for them and the sed below would not apply to them either.
+          # plus the stage waits -- they run on ubuntu-latest, so the
+          # self-hosted-only snapshot has nothing for them. Keep the extra call:
+          # its delegated GPU jobs use the caller id as their display-name prefix.
           # Job ids keep the -rocm720 lane suffix but display names no longer do
           # (the flavor moved into the paren coordinates), so strip it to get the
-          # prefix query_job_status.py matches against.
+          # prefix query_job_status.py matches against. The reusable extra caller
+          # is the exception because its nested job names retain that suffix.
           pr_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/pr-test-amd-rocm720.yml | \
-            grep -v -E '^(call-gate|check-changes|pr-test-amd-rocm720-finish|cancel|check-all-jobs|call-pr-test-amd-extra-rocm720|wait-for-stage-[ab]-amd-rocm720)$' | \
-            sed 's/-rocm720$//' | \
+            grep -v -E '^(call-gate|check-changes|pr-test-amd-rocm720-finish|cancel|check-all-jobs|wait-for-stage-[ab]-amd-rocm720)$' | \
+            sed '/^call-pr-test-amd-extra-rocm720$/!s/-rocm720$//' | \
             jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "pr_jobs=$pr_jobs" >> $GITHUB_OUTPUT
           echo "PR jobs: $pr_jobs"
@@ -152,7 +155,7 @@ jobs:
           # names carry the runner too, so pair each job id with its runs-on.
           # Keep in sync with the rocm_version matrix in the nightly workflow.
           rocm_flavors="rocm724 rocm720"
-          nightly_jobs=$(yq -r '.jobs | to_entries | .[] | "\(.key) \(.value["runs-on"])"' .github/workflows/nightly-test-amd-rocm720.yml | \
+          nightly_jobs=$(yq -r '.jobs | to_entries[] | .key + " " + .value."runs-on"' .github/workflows/nightly-test-amd-rocm720.yml | \
             grep -v -E '^check-all-jobs ' | \
             while read -r id runner; do
               stem=${id%-rocm720}
@@ -163,9 +166,10 @@ jobs:
           echo "Nightly jobs: $nightly_jobs"
 
           # Parse the ROCm 7.0 rollback shadow (exclude utility jobs)
-          # Excluded: call-gate, check-changes, finish, cancel, check-all-jobs
+          # Excluded: call-gate, check-changes, finish, and the stage waits.
+          # Keep the reusable extra caller so its nested GPU jobs remain covered.
           pr_rocm700_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/pr-test-amd.yml | \
-            grep -v -E '^(call-gate|check-changes|pr-test-amd-finish|cancel|check-all-jobs)$' | \
+            grep -v -E '^(call-gate|check-changes|pr-test-amd-finish|wait-for-stage-[ab]-amd)$' | \
             jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "pr_rocm700_jobs=$pr_rocm700_jobs" >> $GITHUB_OUTPUT
           echo "PR ROCm 7.0 shadow jobs: $pr_rocm700_jobs"
