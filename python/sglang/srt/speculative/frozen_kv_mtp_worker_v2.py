@@ -485,7 +485,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 self.cuda_graph_runner.execute(forward_batch)
             )
         else:
-            forward_batch.can_run_dp_cuda_graph = False
+            forward_batch.can_run_decode_cuda_graph = False
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
             )

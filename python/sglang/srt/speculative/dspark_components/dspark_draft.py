@@ -394,7 +394,7 @@ class DraftBlockProposer:
     ) -> None:
         # The dense DSpark draft still reuses the target batch's graph tier.
         # Set graph eligibility before the DP-MoE-only metadata early return.
-        forward_batch.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
+        forward_batch.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
         if not self._dp_moe_sync or batch.global_num_tokens is None:
             return
         # Graph bucket selection uses the raw per-rank request counts.  Keep
