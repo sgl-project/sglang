@@ -285,6 +285,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && python3 -m pip install \
         "better-profanity==0.7.0" \
         "nltk==3.9.1" \
+        "peft==0.18.1" \
     && python3 -c "import importlib.util as u; missing = [m for m in ('cosmos_guardrail', 'retinaface', 'better_profanity', 'nltk', 'cv2', 'peft', 'sentencepiece') if u.find_spec(m) is None]; assert not missing, f'guardrail deps missing: {missing}'"
 
 ########################################################
