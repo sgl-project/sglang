@@ -65,6 +65,9 @@ class _FakeEvent:
     def record(self, _stream) -> None:
         return None
 
+    def synchronize(self) -> None:
+        return None
+
 
 class _FakeDeviceModule:
     Stream = _FakeStream
@@ -1306,6 +1309,68 @@ class _MixedBlock(torch.nn.Module):
         self.fused = torch.nn.Parameter(
             torch.zeros(8, 8, dtype=torch.float32), requires_grad=False
         )
+
+
+def test_mapped_layers_ship_through_the_courier(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    model = manager.model
+    # the manager has already swapped the parameter for a placeholder; the
+    # checkpoint file itself holds zeros, so that is the expected content
+    expected = torch.zeros(8, 8)
+
+    manager.prefetch_layer(0, non_blocking=True)
+    assert 0 in manager._courier_inflight, "an async prefetch hands the layer over"
+    assert (
+        0 not in manager._gpu_layers
+    ), "the layer is not ready until its tensors are bound on this thread"
+
+    manager.prefetch_layer(0, non_blocking=False)
+    assert 0 in manager._gpu_layers and not manager._courier_inflight
+    assert torch.equal(
+        model.blocks[0].weight.detach().cpu(), expected
+    ), "the bytes that went through the courier's slot must be the checkpoint's"
+
+
+def test_release_all_drains_the_courier(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    manager.prefetch_layer(0, non_blocking=True)
+
+    manager.release_all()
+
+    assert not manager._courier_inflight
+    assert not manager._gpu_layers
+    courier = manager._mapped_courier
+    assert courier is not None and not courier._results, (
+        "an uncollected layer would keep its device tensors alive inside the "
+        "courier for the rest of the process"
+    )
+
+
+def test_a_broken_courier_falls_back_to_the_synchronous_copy(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    model = manager.model
+    expected = torch.zeros(8, 8)
+
+    manager.prefetch_layer(0, non_blocking=True)
+    # the courier dies with the layer still in flight
+    courier = manager._mapped_courier
+    courier._broken = True
+    with courier._ready:
+        courier._results.pop(0, None)
+        courier._pending.discard(0)
+        courier._ready.notify_all()
+
+    manager.prefetch_layer(0, non_blocking=False)
+
+    assert 0 in manager._gpu_layers
+    assert manager._mapped_courier is None, "a failed courier is retired"
+    assert torch.equal(model.blocks[0].weight.detach().cpu(), expected)
 
 
 class _MixedModel(torch.nn.Module):
