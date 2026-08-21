@@ -1922,14 +1922,14 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
 
         self.histogram_prefetch_bandwidth = Histogram(
             name="sglang:prefetch_bandwidth",
-            documentation="Histogram of prefetch bandwidth in GB/s.",
+            documentation="Histogram of prefetch bandwidth in GiB/s.",
             labelnames=labels.keys(),
             buckets=bucket_bandwidth,
         )
 
         self.histogram_backup_bandwidth = Histogram(
             name="sglang:backup_bandwidth",
-            documentation="Histogram of backup bandwidth in GB/s.",
+            documentation="Histogram of backup bandwidth in GiB/s.",
             labelnames=labels.keys(),
             buckets=bucket_bandwidth,
         )
