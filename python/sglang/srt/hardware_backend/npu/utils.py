@@ -106,7 +106,8 @@ def init_npu_backend():
     # and a significant reduction in performance.
     if "sglang.multimodal_gen" not in sys.modules:
         from torch_npu.contrib import transfer_to_npu  # noqa: F401
-
+        # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True
+        torch.cuda.is_available = lambda: False
         torch_npu.npu.config.allow_internal_format = True
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
