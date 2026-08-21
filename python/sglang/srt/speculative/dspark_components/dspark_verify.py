@@ -43,6 +43,8 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
+    record_stream_each,
+    record_stream_for_v2_verify,
     sample_simulated_acc_len,
 )
 from sglang.srt.utils import is_npu

@@ -667,17 +667,29 @@ class DeepseekV4AttnBackend(
         if not self.online_c128_mtp.enabled():
             return None
 
-        assert seq_lens_cpu is not None
-        if ragged_layout is None:
-            extend_lens_cpu = [self.speculative_num_draft_tokens] * len(seq_lens_cpu)
-        elif ragged_layout.verify_lens_cpu is not None:
-            extend_lens_cpu = ragged_layout.verify_lens_cpu
+        if seq_lens_cpu is None:
+            adjusted_seq_lens_cpu = None
+            extend_lens_cpu = None
+            num_q_tokens = (
+                ragged_layout.graph_num_tokens
+                if ragged_layout is not None
+                else len(seq_lens) * self.speculative_num_draft_tokens
+            )
         else:
-            extend_lens_cpu = ragged_layout.verify_lens.cpu().tolist()
-        seq_lens_cpu = [
-            int(seq_len) + int(extend_len)
-            for seq_len, extend_len in zip(seq_lens_cpu, extend_lens_cpu)
-        ]
+            if ragged_layout is None:
+                extend_lens_cpu = [self.speculative_num_draft_tokens] * len(
+                    seq_lens_cpu
+                )
+            elif ragged_layout.verify_lens_cpu is not None:
+                extend_lens_cpu = ragged_layout.verify_lens_cpu
+            else:
+                extend_lens_cpu = ragged_layout.verify_lens.cpu().tolist()
+            adjusted_seq_lens_cpu = [
+                int(seq_len) + int(extend_len)
+                for seq_len, extend_len in zip(seq_lens_cpu, extend_lens_cpu)
+            ]
+            num_q_tokens = None
+
         return create_paged_compressor_data(
             compress_ratio=128,
             is_prefill=True,
@@ -685,10 +697,11 @@ class DeepseekV4AttnBackend(
             req_to_token=self.req_to_token,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens + extend_seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
+            seq_lens_cpu=adjusted_seq_lens_cpu,
             extend_lens=extend_seq_lens,
             extend_lens_cpu=extend_lens_cpu,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
+            num_q_tokens=num_q_tokens,
             online_state_slot_offset=online_c128_state_slot_offset,
         )
 
@@ -877,6 +890,7 @@ class DeepseekV4AttnBackend(
                 extend_seq_lens,
                 use_prefill_cuda_graph,
                 online_c128_state_slot_offset,
+                ragged_layout=ragged_layout,
             ),
             extend_start_loc=extend_start_loc,
             verify_lens=verify_lens,

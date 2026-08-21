@@ -5,6 +5,7 @@ import sys
 import pytest
 import torch
 
+from sglang.kernels.ops.attention.dsv4 import CompressorPrefillPlan
 from sglang.kernels.ops.attention.dsv4.online_c128_mtp import (
     _jit_online_c128_mtp_module,
 )
@@ -16,6 +17,29 @@ register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-l
 HEAD_DIM = 512
 STATE_DIM = 3 * HEAD_DIM
 MAX_VERIFY_TOKENS = 8
+
+
+def test_online_c128_prefill_plan_allows_graph_padding_rows():
+    device = get_device()
+    num_q_tokens = 6
+    seq_lens = torch.tensor([1030, 1, 1, 1, 1, 1], dtype=torch.int64, device=device)
+    extend_lens = torch.tensor(
+        [num_q_tokens, 0, 0, 0, 0, 0], dtype=torch.int64, device=device
+    )
+    req_pool_indices = torch.arange(6, dtype=torch.int64, device=device)
+    req_to_token = torch.zeros((6, 1), dtype=torch.int32, device=device)
+
+    plan = CompressorPrefillPlan.generate_online(
+        seq_lens=seq_lens,
+        extend_lens=extend_lens,
+        req_pool_indices=req_pool_indices,
+        req_to_token=req_to_token,
+        num_q_tokens=num_q_tokens,
+        use_cuda_graph=True,
+    )
+
+    assert plan.plan_c.shape == (num_q_tokens, 16)
+    assert plan.plan_w.shape == (num_q_tokens, 16)
 
 
 def _layout(bs: int, ragged: bool, device: str):
