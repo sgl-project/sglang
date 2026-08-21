@@ -8,8 +8,7 @@ import requests
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
-    DEFAULT_DRAFT_MODEL_EAGLE,
-    DEFAULT_TARGET_MODEL_EAGLE,
+    DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -37,7 +36,7 @@ def _assert_spans_contiguous(test, meta_info):
 class TestWeightVersionSpans(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_TARGET_MODEL_EAGLE
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -46,22 +45,24 @@ class TestWeightVersionSpans(CustomTestCase):
             other_args=[
                 "--weight-version",
                 "base-v0",
+                "--trust-remote-code",
                 "--tp-size",
                 "2",
+                "--dp-size",
+                "2",
+                "--enable-dp-attention",
                 "--speculative-algorithm",
                 "EAGLE",
-                "--speculative-draft-model",
-                DEFAULT_DRAFT_MODEL_EAGLE,
+                "--speculative-draft-model-path",
+                DEFAULT_MODEL_NAME_FOR_TEST_MLA,
                 "--speculative-num-steps",
-                "5",
+                "2",
                 "--speculative-eagle-topk",
-                "4",
+                "3",
                 "--speculative-num-draft-tokens",
-                "8",
-                "--attention-backend",
-                "fa3",
-                "--mem-fraction-static",
-                "0.7",
+                "3",
+                "--cuda-graph-max-bs-decode",
+                "32",
             ],
         )
 
