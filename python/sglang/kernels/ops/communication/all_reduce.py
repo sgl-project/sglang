@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import enum
-from typing import TYPE_CHECKING, List, Tuple, Union
+from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 import tvm_ffi
@@ -36,10 +36,6 @@ _ALGO_NAMES = {
     AllReduceAlgo.ONE_SHOT_PULL: "1shot_pull",
     AllReduceAlgo.TWO_SHOT_PULL: "2shot_pull",
 }
-
-# ``pull_arg`` of the all-reduce kernel: a row of the graph-params pointer
-# table selects graph mode; a plain bool selects multicast (True) / eager.
-PullArg = Union[torch.Tensor, bool]
 
 if TYPE_CHECKING:
     # (cudaIpcMemHandle bytes, offset-in-allocation) for one device pointer
@@ -214,7 +210,7 @@ def get_all_reduce_module(dtype: torch.dtype, world_size: int) -> Module:
         "custom_all_reduce",
         *args,
         cuda_files=["distributed/custom_all_reduce.cuh"],
-        cuda_wrappers=[("all_reduce", f"custom_all_reduce<{args}>")],
+        cuda_wrappers=[("all_reduce", f"AllReduceKernel<{args}>::run")],
     )
 
 
@@ -223,10 +219,13 @@ def custom_all_reduce(
     comm: Communicator,
     input: torch.Tensor,
     algo: AllReduceAlgo,
-    pull_arg: PullArg,
-) -> tvm_ffi.Tensor:
+    *,
+    graph_params: torch.Tensor | None = None,
+    use_multicast: bool = False,
+) -> torch.Tensor:
     module = get_all_reduce_module(input.dtype, comm.world_size)
-    return module.all_reduce(comm, input, algo.algo_name, pull_arg)
+    result = module.all_reduce(comm, input, algo.algo_name, graph_params, use_multicast)
+    return torch.from_dlpack(result)
 
 
 @cache_once

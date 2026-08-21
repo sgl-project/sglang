@@ -30,12 +30,11 @@
 #include <sgl_kernel/distributed/communicator.cuh>
 
 #include <tvm/ffi/extra/stl.h>
+#include <tvm/ffi/object.h>
 
-#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <string>
-#include <variant>
 
 namespace sglang {
 
@@ -44,12 +43,6 @@ using device::distributed::PullWorkSpace, device::distributed::PushWorkSpace;
 using host::distributed::CommunicatorRef;
 
 inline constexpr uint32_t kMaxWorldSize = device::distributed::kMaxWorldSize;
-
-enum class PullMode {
-  Graph,
-  Eager,
-  Multicast,  // also eager
-};
 
 template <uint32_t kWorldSize>
 struct AllReducePushParams {
@@ -70,14 +63,13 @@ struct AllReducePullParams {
   PullWorkSpace<kWorldSize> ws;
 };
 
-/// `vec_offset` is a *vector index*, and it is folded into the base pointers
-/// here rather than added to `vid` at every access. Both halves of that matter:
-/// a typed 32-bit bias becomes one widening multiply-add off a constant-bank
-/// base, which ptxas keeps on the uniform datapath, so the whole peer table
-/// lives in uniform registers. Biasing `vid` instead makes all `kWorldSize`
-/// addresses thread-varying (~2 ordinary registers each), and a 64-bit byte
-/// bias does the same because the uniform datapath has no 64-bit add. Either
-/// way 2shot pays ~12 registers per thread and ~10% throughput.
+/// `vec_offset` is a *vector index* and must stay folded into the base pointers
+/// here: a typed 32-bit bias becomes one widening multiply-add off a
+/// constant-bank base, which ptxas keeps on the uniform datapath, so the whole
+/// peer table lives in uniform registers. Biasing `vid` at each access instead,
+/// or using a 64-bit byte bias (the uniform datapath has no 64-bit add), makes
+/// all `kWorldSize` addresses thread-varying and costs 2shot ~12 registers per
+/// thread and ~10% throughput.
 template <typename V, uint32_t kWorldSize, bool kUseGraph>
 struct LoadStoreImpl {
  public:
@@ -151,18 +143,20 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllR
   using Lamport = distributed::LamportTrait<T, kVecSize * 2, /*kAtom=*/4>;
   const auto r = params.rank;
   const auto num_vecs = params.num_vecs;
-  const auto stride_bytes = params.ws.slot_bytes;
-  PDLWaitPrimary<kUsePDL>();
-  const auto phase = params.counter[blockIdx.x].get() % 2;
-  const auto phase_stride_bytes = phase * stride_bytes * kWorldSize;
   const auto num_threads = blockDim.x * gridDim.x;
   const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  PDLWaitPrimary<kUsePDL>();
+  const auto lamport = distributed::Lamport<kWorldSize>{
+      params.counter,
+      params.ws.workspaces.data(),
+      params.ws.slot_bytes,
+  };
 
   // push to peer
-  void* push_ptr[kWorldSize];
+  void* push_ptrs[kWorldSize];
 #pragma unroll
   for (uint32_t i = 0; i < kWorldSize; ++i) {
-    push_ptr[i] = params.ws.workspaces[i] + r * stride_bytes + phase_stride_bytes;
+    push_ptrs[i] = lamport.get_phase_ptr(/*dst=*/i, /*src=*/r);
   }
 
   for (auto vid = global_tid; vid < num_vecs; vid += num_threads) {
@@ -171,25 +165,26 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllR
     Lamport::clear_pos_zero(vec.data());
 #pragma unroll
     for (uint32_t i = 0; i < kWorldSize; ++i) {
-      ptx::st_relaxed_16B(vec, push_ptr[i], vid);
+      ptx::st_relaxed_16B(vec, push_ptrs[i], vid);
     }
   }
 
   // poll from local
-  void* poll_ptr[kWorldSize];
+  void* poll_ptrs[kWorldSize];
 #pragma unroll
   for (uint32_t i = 0; i < kWorldSize; ++i) {
-    poll_ptr[i] = params.ws.workspaces[r] + i * stride_bytes + phase_stride_bytes;
+    poll_ptrs[i] = lamport.get_phase_ptr(/*dst=*/r, /*src=*/i);
   }
   vec_t pos_zero_vec;
   Lamport::fill_pos_zero(pos_zero_vec.data());
+
   for (auto vid = global_tid; vid < num_vecs; vid += num_threads) {
     vec_t vec[kWorldSize];
     do {
       bool has_zero = false;
 #pragma unroll
       for (uint32_t i = 0; i < kWorldSize; ++i) {
-        ptx::ld_relaxed_16B(vec[i], poll_ptr[i], vid);
+        ptx::ld_relaxed_16B(vec[i], poll_ptrs[i], vid);
       }
 #pragma unroll
       for (uint32_t i = 0; i < kWorldSize; ++i) {
@@ -198,16 +193,16 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllR
       if (!has_zero) break;
     } while (true);
     const auto out_vec = reduce_vec(vec);
-    ptx::st_global_16B(out_vec, params.output, vid);
+    out_vec.store(params.output, vid);
 #pragma unroll
     for (uint32_t i = 0; i < kWorldSize; ++i) {
-      ptx::st_global_16B(pos_zero_vec, poll_ptr[i], vid);
+      ptx::st_global_16B(pos_zero_vec, poll_ptrs[i], vid);
     }
   }
 
   PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
-  if (threadIdx.x == 0) params.counter[blockIdx.x].set(phase ^ 1);
+  lamport.exit();
 }
 
 template <typename Impl, typename T, uint32_t kWorldSize, bool kUsePDL>
@@ -217,9 +212,12 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_pull_kernel(const __grid_constant__ AllR
   using vec_t = AlignedVector<packed_t<T>, kVecSize>;
   const auto num_vecs = params.num_vecs;
   const auto impl = Impl{params};
-
   PDLWaitPrimary<kUsePDL>();
-  const auto barrier = distributed::Barrier<kWorldSize>(params.ws.semaphores.data(), params.rank, /*num_arrives=*/2);
+  const auto barrier = distributed::Barrier<kWorldSize>{
+      params.ws.semaphores.data(),
+      params.rank,
+      /*num_arrives=*/2,
+  };
   barrier.arrive_relaxed(/*n=*/0);
   __syncthreads();
 
@@ -248,7 +246,11 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_pull_kernel(const __grid_constant__ AllR
   const auto vec_offset = params.rank * avg_vecs + min(params.rank, rem_vecs);
   const auto impl = Impl{params, vec_offset};
   PDLWaitPrimary<kUsePDL>();
-  const auto barrier = distributed::Barrier<kWorldSize>(params.ws.semaphores.data(), params.rank, /*num_arrives=*/2);
+  const auto barrier = distributed::Barrier<kWorldSize>{
+      params.ws.semaphores.data(),
+      params.rank,
+      /*num_arrives=*/2,
+  };
   barrier.arrive_relaxed(/*n=*/0);
   __syncthreads();
 
@@ -301,30 +303,32 @@ struct AllReduceKernel {
   using vec_t = device::AlignedVector<packed_t<T>, 16 / (sizeof(T) * 2)>;
 
  public:
-  static Tensor run(CommunicatorRef comm_ref, Tensor in_, std::string algo, std::variant<TensorView, bool> pull_arg) {
+  static Tensor
+  run(const CommunicatorRef comm_ref,
+      const Tensor in,
+      const std::string algo,
+      const tvm::ffi::Optional<TensorView> graph_params_opt,
+      const bool use_multicast) {
     using namespace host;
     const auto& comm = *comm_ref.get();
-    RuntimeCheck(algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push", "Invalid algo: ", algo);
-    RuntimeCheck(comm.get_world_size() == kWorldSize, "Mismatch world size");
-    RuntimeCheck(in_.IsContiguous(), "Input tensor must be contiguous");
-    RuntimeCheck(is_type<T>(in_.dtype()), "Input dtype mismatch");
-    RuntimeCheck(in_.device().device_type == kDLCUDA, "Only CUDA device is supported");
-    RuntimeCheck(std::bit_cast<intptr_t>(in_.data_ptr()) % 16 == 0, "Input pointer is not properly aligned");
-    const auto num_elems_int64 = in_.numel();
+    CHECK_HOST(algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push") << algo;
+    CHECK_HOST(comm.get_world_size() == kWorldSize) << comm.get_world_size();
+    CHECK_HOST(in.IsContiguous() && is_type<T>(in.dtype()) && in.device().device_type == kDLCUDA);
+    const auto num_elems_int64 = in.numel();
     const auto num_elems = static_cast<uint32_t>(num_elems_int64);
-    RuntimeCheck(static_cast<int64_t>(num_elems) == num_elems_int64, "Number of items exceeds 4G limit");
-    const int64_t nbytes = num_elems_int64 * sizeof(T);
-    RuntimeCheck(nbytes % 16 == 0, "Input bytes must be a multiple of 16, got: ", nbytes);
-    const uint32_t num_vecs = num_elems / (16 / sizeof(T));
-    const bool use_graph = std::holds_alternative<TensorView>(pull_arg);
-    const auto stream = LaunchKernel::resolve_device(in_.device());
+    const auto nbytes = static_cast<int64_t>(num_elems_int64 * sizeof(T));
+    CHECK_HOST(static_cast<int64_t>(num_elems) == num_elems_int64) << num_elems_int64;
+    CHECK_HOST(reinterpret_cast<intptr_t>(in.data_ptr()) % 16 == 0 && nbytes % 16 == 0);
+    const auto num_vecs = static_cast<uint32_t>(num_elems / (16 / sizeof(T)));
+    const auto stream = LaunchKernel::resolve_device(in.device());
+    const auto use_graph = graph_params_opt.has_value();
 
     if (algo == "1shot_push") {
+      CHECK_HOST(!use_graph && !use_multicast);
       const auto& push = comm.get_push_obj();
-      RuntimeCheck(!use_graph, "Push mode doesn't have graph mode optimization");
-      Tensor out = ffi::empty_like(in_);
-      const PushParams params{
-          .input = in_.data_ptr(),
+      Tensor out = ffi::empty_like(in);
+      const auto params = PushParams{
+          .input = in.data_ptr(),
           .output = out.data_ptr(),
           .num_vecs = num_vecs,
           .rank = push.rank,
@@ -339,25 +343,23 @@ struct AllReduceKernel {
       return out;
     }
 
-    using enum PullMode;
     const auto& pull = comm.get_pull_obj();
-    const auto pull_mode = use_graph ? Graph : std::get<bool>(pull_arg) ? Multicast : Eager;
-    // Graph mode reduces over the caller's own registered buffers and only
-    // barriers on this plane; the eager modes stage the input through it.
-    const auto ws = pull.get_workspace<kWorldSize>(pull_mode == Graph ? 0 : nbytes);
-    RuntimeCheck(pull_mode != Multicast || ws.mc_workspace != nullptr, "Multicast requires an mc workspace");
-
-    const bool inplace = use_graph && algo == "2shot_pull";
-    Tensor out = inplace ? in_ : ffi::empty_like(in_);
-    const PullParams params{
+    const auto graph_params = use_graph ? graph_params_opt.value().data_ptr() : nullptr;
+    // only 2shot pull + graph mode forces inplace implementation
+    const auto is_inplace = use_graph && algo == "2shot_pull";
+    Tensor out = is_inplace ? in : ffi::empty_like(in);
+    const auto params = PullParams{
         .output = out.data_ptr(),
         .num_vecs = num_vecs,
         .rank = pull.rank,
-        .graph_params = use_graph ? static_cast<void* const*>(std::get<TensorView>(pull_arg).data_ptr()) : nullptr,
-        .ws = ws,
+        .graph_params = static_cast<void* const*>(graph_params),
+        // Graph mode reduces over the caller's own registered buffers and only
+        // barriers on this plane; the eager modes stage the input through it.
+        .ws = pull.get_workspace<kWorldSize>(use_graph ? 0 : nbytes),
     };
+    const auto& ws = params.ws;
+    CHECK_HOST(!use_multicast || ws.mc_workspace != nullptr) << "multicast needs a plane with an mc workspace";
 
-    const uint32_t num_blocks = comm.get_pull_blocks();
     const auto cuda_memcpy = [&](void* dst, const void* src) {
       if constexpr (SGL_ARCH_HOPPER_OR_GREATER) {  // PDL memcpy is faster
         // based on micro benchmark, only enable when batch size is small + aligned
@@ -373,8 +375,9 @@ struct AllReduceKernel {
         }
       }
       // safe fallback to cudaMemcpyAsync for large size or older architecture
-      RuntimeDeviceCheck(cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyDeviceToDevice, stream));
+      CHECK_CUDA(cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyDeviceToDevice, stream));
     };
+    const uint32_t num_blocks = comm.get_pull_blocks();
     const auto local_workspace = ws.workspaces[pull.rank];
 
     using LS = LoadStoreImpl<vec_t, kWorldSize, /*kUseGraph=*/false>;
@@ -382,41 +385,39 @@ struct AllReduceKernel {
     using MC = MultiCastImpl<vec_t, kWorldSize, /*kUseGraph=*/false>;
     if (algo == "1shot_pull") {
       // first copy to the workspace
-      if (!use_graph) cuda_memcpy(local_workspace, in_.data_ptr());
-      const auto kernel = (pull_mode == Graph) ? all_reduce_1shot_pull_kernel<LS_GRAPH, T, kWorldSize, kUsePDL>
-                          : pull_mode == Eager ? all_reduce_1shot_pull_kernel<LS, T, kWorldSize, kUsePDL>
-                                               : all_reduce_1shot_pull_kernel<MC, T, kWorldSize, kUsePDL>;
+      CHECK_HOST(!use_multicast);
+      if (!use_graph) cuda_memcpy(local_workspace, in.data_ptr());
+      const auto kernel = use_graph ? all_reduce_1shot_pull_kernel<LS_GRAPH, T, kWorldSize, kUsePDL>
+                                    : all_reduce_1shot_pull_kernel<LS, T, kWorldSize, kUsePDL>;
       // then launch kernel to reduce and write to output
       LaunchKernel(num_blocks, choose_block_size(num_vecs), stream)  //
           .enable_pdl(kUsePDL)(kernel, params);
-    } else /* 2shot_pull */ {
+    } else /* algo == "2shot_pull" */ {
       const uint32_t avg_vecs = div_ceil(num_vecs, kWorldSize);
       // first copy to the workspace
-      if (!use_graph) cuda_memcpy(local_workspace, in_.data_ptr());
+      if (!use_graph) cuda_memcpy(local_workspace, in.data_ptr());
+
       // then launch kernel to reduce in the workspace
-      const auto kernel = (pull_mode == Graph) ? all_reduce_2shot_pull_kernel<LS_GRAPH, T, kWorldSize, kUsePDL>
-                          : pull_mode == Eager ? all_reduce_2shot_pull_kernel<LS, T, kWorldSize, kUsePDL>
-                                               : all_reduce_2shot_pull_kernel<MC, T, kWorldSize, kUsePDL>;
-      if (pull_mode == Multicast) {
+      if (use_multicast) {
+        CHECK_HOST(!use_graph);
+        const auto kernel = all_reduce_2shot_pull_kernel<MC, T, kWorldSize, kUsePDL>;
+        // NOTE: too much traffic will degrade performance in multicast impl
         constexpr uint32_t kMulticastNumThreads = 512u;
-        // NOTE: too much traffic will degrade performance in multicast
-        LaunchKernel(comm.get_pull_multicast_blocks(), kMulticastNumThreads, stream)
+        const auto num_blocks = comm.get_pull_multicast_blocks();
+        LaunchKernel(num_blocks, kMulticastNumThreads, stream)  //
             .enable_pdl(kUsePDL)(kernel, params);
       } else {
+        const auto kernel = use_graph ? all_reduce_2shot_pull_kernel<LS_GRAPH, T, kWorldSize, kUsePDL>
+                                      : all_reduce_2shot_pull_kernel<LS, T, kWorldSize, kUsePDL>;
         LaunchKernel(num_blocks, choose_block_size(avg_vecs), stream)  //
             .enable_pdl(kUsePDL)(kernel, params);
       }
+
       // finally copy from the workspace to output
       if (!use_graph) cuda_memcpy(out.data_ptr(), local_workspace);
     }
     return out;
   }
 };
-
-template <typename T, uint32_t kWorldSize, bool kUsePDL>
-tvm::ffi::Tensor custom_all_reduce(
-    CommunicatorRef comm, tvm::ffi::Tensor input, std::string algo, std::variant<tvm::ffi::TensorView, bool> pull_arg) {
-  return AllReduceKernel<T, kWorldSize, kUsePDL>::run(comm, input, algo, pull_arg);
-}
 
 }  // namespace sglang

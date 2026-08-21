@@ -12,9 +12,9 @@ The CUDA side is split into independent pieces:
 - ``Communicator``: the two planes above (either may be absent), the handle
   every kernel takes, plus the pull launch widths.
 - the all-reduce kernel: a pure function of ``(Communicator, input, algo,
-  pull_arg)`` with three algorithms (1shot_push / 1shot_pull / 2shot_pull)
-  and three pull data sources (eager pull buffer / CUDA-graph pointer table
-  / multicast address).
+  graph_params, use_multicast)`` with three algorithms (1shot_push /
+  1shot_pull / 2shot_pull) and three pull data sources (eager pull buffer /
+  CUDA-graph pointer table / multicast address).
 
 All storage is allocated and owned here, in Python.
 
@@ -24,10 +24,9 @@ segments) and written into a device-side pointer table (``graph_params``);
 the kernel captured in the graph dereferences its row at replay time.
 """
 
-import enum
 import logging
 from contextlib import contextmanager
-from typing import List, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -77,12 +76,6 @@ _FORCE_PULL_SIZE_KB = envs.SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB.get()
 _FORCE_PUSH_SIZE_KB = envs.SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB.get()
 
 
-class _PullMode(enum.Enum):
-    EAGER = enum.auto()  # pull_arg = False (also used for 1shot_push)
-    MULTICAST = enum.auto()  # pull_arg = True
-    GRAPH = enum.auto()  # pull_arg = a graph_params row
-
-
 def _ceil_align(nbytes: int, align: int) -> int:
     return (nbytes + align - 1) // align * align
 
@@ -103,6 +96,12 @@ def _allocate_symmetric_memory(nbytes: int, device: torch.device, group: Process
     )
     symm_mem = _SymmetricMemory.rendezvous(tensor)
     return tensor, symm_mem
+
+
+class AllReduceConfig(NamedTuple):
+    algo: AllReduceAlgo
+    use_graph: bool = False
+    use_multicast: bool = False
 
 
 class CustomAllReduceV2:
@@ -333,21 +332,19 @@ class CustomAllReduceV2:
             and torch.cuda.is_current_stream_capturing()
         )
 
-    def _pick_algo(
-        self, nbytes: int, can_use_graph: bool
-    ) -> Tuple[Optional[AllReduceAlgo], _PullMode]:
+    def _pick_config(self, nbytes: int, can_use_graph: bool) -> AllReduceConfig | None:
+        # TODO: refactor this along with the config file
         heuristic = self.config.graph if can_use_graph else self.config.eager
-        default_mode = _PullMode.GRAPH if can_use_graph else _PullMode.EAGER
-        use_multicast = self.config.num_mc_blocks is not None
+        can_use_multicast = self.config.num_mc_blocks is not None
         if nbytes <= heuristic.one_shot_push_threshold:
-            return AllReduceAlgo.ONE_SHOT_PUSH, _PullMode.EAGER
+            return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PUSH)
         if nbytes <= heuristic.one_shot_pull_threshold:
-            return AllReduceAlgo.ONE_SHOT_PULL, default_mode
-        if use_multicast and heuristic.mc.contains(nbytes):
-            return AllReduceAlgo.TWO_SHOT_PULL, _PullMode.MULTICAST
+            return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PULL, use_graph=can_use_graph)
+        if can_use_multicast and heuristic.mc.contains(nbytes):
+            return AllReduceConfig(AllReduceAlgo.TWO_SHOT_PULL, use_multicast=True)
         if nbytes <= heuristic.two_shot_pull_threshold:
-            return AllReduceAlgo.TWO_SHOT_PULL, default_mode
-        return None, _PullMode.EAGER
+            return AllReduceConfig(AllReduceAlgo.TWO_SHOT_PULL, use_graph=can_use_graph)
+        return None
 
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         """Check if the input tensor is suitable for custom all-reduce."""
@@ -361,8 +358,7 @@ class CustomAllReduceV2:
             return False
         if self.override_algo is not None:
             return inp_size <= self.max_size
-        algo, _ = self._pick_algo(inp_size, can_use_graph=self._can_use_graph())
-        return algo is not None
+        return self._pick_config(inp_size, self._can_use_graph()) is not None
 
     # ------------------------------------------------------------------
     # All-reduce
@@ -370,25 +366,27 @@ class CustomAllReduceV2:
 
     def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor:
         nbytes = input.numel() * input.element_size()
-        can_use_graph = self._can_use_graph()
         if self.override_algo is not None:
+            # TODO: enhance this override pattern
             algo = self.override_algo
-            use_graph = can_use_graph and not algo.is_push()
-            mode = _PullMode.GRAPH if use_graph else _PullMode.EAGER
+            use_graph = self._can_use_graph() and not algo.is_push()
+            use_multicast = False
         else:
-            algo, mode = self._pick_algo(nbytes, can_use_graph=can_use_graph)
-            assert algo is not None, f"No algo for {nbytes} bytes"
-        if mode == _PullMode.GRAPH:
-            pull_arg: torch.Tensor | bool = self._allocate_graph_row(input, nbytes)
-        else:
-            pull_arg = mode == _PullMode.MULTICAST
-        return torch.from_dlpack(custom_all_reduce(self.obj, input, algo, pull_arg))
+            config = self._pick_config(nbytes, self._can_use_graph())
+            assert config is not None, f"No config for {nbytes = }"
+            algo, use_graph, use_multicast = config
+        graph_params = self._allocate_graph_row(input, nbytes) if use_graph else None
+        return custom_all_reduce(
+            self.obj,
+            input,
+            algo=algo,
+            graph_params=graph_params,
+            use_multicast=use_multicast,
+        )
 
     def _allocate_graph_row(self, input: torch.Tensor, nbytes: int) -> torch.Tensor:
         index = self._graph_counter + len(self._graph_inputs)
-        assert (
-            index < _MAX_GRAPH_INPUTS
-        ), "Graph input table overflow, increase _MAX_GRAPH_INPUTS!"
+        assert index < _MAX_GRAPH_INPUTS, "Graph input table overflow"
         self._graph_inputs.append((input.data_ptr(), nbytes))
         return self.graph_params[index]
 

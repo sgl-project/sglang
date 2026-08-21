@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <type_traits>
 #include <vector>
@@ -181,6 +182,32 @@ struct Barrier {
   Semaphore* const* m_semaphores;
 };
 
+template <uint32_t kWorldSize>
+struct Lamport {
+ public:
+  SGL_DEVICE Lamport(Counter* counter, uint8_t* const* workspaces, uint32_t slot_bytes)
+      : m_counter(counter), m_workspaces(workspaces), m_slot_bytes(slot_bytes), m_phase(m_counter[blockIdx.x].get()) {}
+
+  SGL_DEVICE uint32_t get_phase() const {
+    return m_phase & 1;
+  }
+
+  SGL_DEVICE void* get_phase_ptr(uint32_t dst, uint32_t src = 0) const {
+    const auto phase_stride_bytes = (m_phase & 1) * m_slot_bytes * kWorldSize;
+    return m_workspaces[dst] + src * m_slot_bytes + phase_stride_bytes;
+  }
+
+  SGL_DEVICE void exit() const {
+    if (threadIdx.x == 0) m_counter[blockIdx.x].set(m_phase ^ 1);
+  }
+
+ private:
+  Counter* m_counter;
+  uint8_t* const* m_workspaces;
+  uint32_t m_slot_bytes;
+  uint32_t m_phase;
+};
+
 /// Same window protocol as `Barrier`, but a single `multimem.red` reaches every
 /// peer's row at once instead of a `kWorldSize`-wide unicast fan-out. One
 /// thread drives the whole barrier, so `world_size` need not be a constant and
@@ -254,7 +281,7 @@ struct PushWorkSpace {
   }
   std::array<uint8_t*, kWorldSize> workspaces;
   uint8_t* mc_workspace;
-  int64_t slot_bytes;
+  uint32_t slot_bytes;
 };
 
 /// Kernel-facing slice of a pull plane. The semaphores are indexed by block,
@@ -331,7 +358,11 @@ struct PushPlaneObj : public tvm::ffi::Object, BasePlane {
     CHECK_HOST(N == world_size) << "Plane holds " << world_size << " ranks, asked for " << N;
     CHECK_HOST(size >= 0 && offset >= 0 && offset + size <= slot_bytes)
         << "slice [" << offset << ", " << offset + size << ") escapes the " << slot_bytes << "-byte push slot";
-    PushWorkSpace<N> ws{{}, offset_mc(mc_workspace, offset), slot_bytes};
+    // Device-side phase striding is 32-bit: the largest offset a kernel forms
+    // is `(2 * N - 1) * slot_bytes`, so the whole double-buffered plane must fit.
+    CHECK_HOST(2 * N * slot_bytes <= std::numeric_limits<uint32_t>::max())
+        << 2 * N * slot_bytes << " bytes of push plane exceeds the 32-bit offset range";
+    PushWorkSpace<N> ws{{}, offset_mc(mc_workspace, offset), static_cast<uint32_t>(slot_bytes)};
     for (uint32_t i = 0; i < N; ++i) {
       ws.workspaces[i] = workspaces[i] + offset;
     }
