@@ -14,13 +14,21 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
 from sglang.srt.models.deepseek_common import attention_backend_handler as abh
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
 )
+from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
+    ForwardBatchDeepSeekMHAMixin,
+)
 from sglang.srt.runtime_context import get_context, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+# Unbound so SimpleNamespace fakes can exercise the real predicate.
+_mixin_has_dp_padding_rows = ForwardBatchDeepSeekMHAMixin.has_dp_padding_rows
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -131,6 +139,35 @@ class TestMhaOneShotDpAttentionPadding(CustomTestCase):
         # check must not.
         method = self._dispatch([4], num_input_rows=8)
         self.assertEqual(method, AttnForwardMethod.MLA)
+
+
+class TestHasDpPaddingRows(CustomTestCase):
+    """Direct tests for the padding predicate both dispatch consumers read.
+
+    Guards the fail-closed contract: unknown padding state (gpu_only batches
+    without host extend lengths) must read as padded, not as padding-free.
+    """
+
+    def _batch(self, extend_seq_lens_cpu, positions):
+        return SimpleNamespace(
+            extend_seq_lens_cpu=extend_seq_lens_cpu, positions=positions
+        )
+
+    def test_no_padding_when_rows_match(self):
+        fb = self._batch([2, 6], torch.empty(8))
+        self.assertFalse(_mixin_has_dp_padding_rows(fb))
+
+    def test_padding_when_extra_rows(self):
+        fb = self._batch([2, 6], torch.empty(12))
+        self.assertTrue(_mixin_has_dp_padding_rows(fb))
+
+    def test_unknown_lengths_fail_closed(self):
+        fb = self._batch(None, torch.empty(8))
+        self.assertTrue(_mixin_has_dp_padding_rows(fb))
+
+    def test_missing_positions_fail_closed(self):
+        fb = self._batch([8], None)
+        self.assertTrue(_mixin_has_dp_padding_rows(fb))
 
 
 class TestResolveRocmForwardMethod(CustomTestCase):

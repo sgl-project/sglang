@@ -67,10 +67,14 @@ class ForwardBatchDeepSeekMHAMixin:
         from per-request extend lengths, so they are only correct when every input
         row is a real extend token — i.e. when ``sum(extend_seq_lens)`` equals the
         padded input row count.
+
+        Fail closed: without the host-side extend lengths (gpu_only batches) the
+        padding state is unknown, so report padding and let the callers fall
+        back to the padding-tolerant paths.
         """
         extend_seq_lens_cpu = self.extend_seq_lens_cpu
         if extend_seq_lens_cpu is None or self.positions is None:
-            return False
+            return True
         return sum(extend_seq_lens_cpu) != self.positions.shape[0]
 
     def set_prefix_chunk_idx(self, idx: int):
