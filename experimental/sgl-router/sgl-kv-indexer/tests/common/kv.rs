@@ -53,5 +53,7 @@ pub fn apply_request(
         actions,
         worker_address: address.to_string(),
         cache_spec: None,
+        worker_epoch: String::new(),
+        enforce_sequence: false,
     }
 }

@@ -9,10 +9,12 @@ use tonic::{Request, Response, Status};
 use crate::admission::{reject_if_deadline_passed, RejectionLog};
 use crate::pb::kv_indexer_server::{KvIndexer, KvIndexerServer};
 use crate::pb::{
-    ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvAction,
-    ExternalKvActionType, ExternalKvPrefixMatch, GetExternalKvHitCountsRequest,
-    GetExternalKvHitCountsResponse, MatchExternalKvPrefixRequest, MatchExternalKvPrefixResponse,
-    MatchExternalKvRequest, MatchExternalKvResponse, TierType, WorkerCacheSpec,
+    ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ConfigureExpectedWorkersRequest,
+    ConfigureExpectedWorkersResponse, ExternalKvAction, ExternalKvActionType,
+    ExternalKvPrefixMatch, GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse,
+    MatchExternalKvPrefixRequest, MatchExternalKvPrefixResponse, MatchExternalKvRequest,
+    MatchExternalKvResponse, ReplaceExternalKvSnapshotRequest, ReplaceExternalKvSnapshotResponse,
+    TierType, WorkerCacheSpec,
 };
 use crate::status::IndexerStatusHandle;
 
@@ -43,6 +45,24 @@ static OVERLOAD_LOG: RejectionLog = RejectionLog::new();
 /// dyn-safe so the server can hold it as `Arc<dyn KvIndexerBackend>`.
 #[tonic::async_trait]
 pub trait KvIndexerBackend: Send + Sync + 'static {
+    async fn configure_expected_workers(
+        &self,
+        _request: ConfigureExpectedWorkersRequest,
+    ) -> Result<ConfigureExpectedWorkersResponse, Status> {
+        Err(Status::unimplemented(
+            "backend does not support recoverable worker configuration",
+        ))
+    }
+
+    async fn replace_external_kv_snapshot(
+        &self,
+        _request: ReplaceExternalKvSnapshotRequest,
+    ) -> Result<ReplaceExternalKvSnapshotResponse, Status> {
+        Err(Status::unimplemented(
+            "backend does not support atomic worker snapshots",
+        ))
+    }
+
     /// Applies a whole SGLang KVEventBatch. The actions are pre-validated and
     /// must be applied in order. Applies are unconditional: the request `seq` is
     /// informational only and a redelivered batch is applied again.
@@ -108,6 +128,20 @@ pub trait KvIndexerBackend: Send + Sync + 'static {
 /// `Arc<dyn KvIndexerBackend>` and still satisfy `KvIndexerService<B>`.
 #[tonic::async_trait]
 impl KvIndexerBackend for std::sync::Arc<dyn KvIndexerBackend> {
+    async fn configure_expected_workers(
+        &self,
+        request: ConfigureExpectedWorkersRequest,
+    ) -> Result<ConfigureExpectedWorkersResponse, Status> {
+        (**self).configure_expected_workers(request).await
+    }
+
+    async fn replace_external_kv_snapshot(
+        &self,
+        request: ReplaceExternalKvSnapshotRequest,
+    ) -> Result<ReplaceExternalKvSnapshotResponse, Status> {
+        (**self).replace_external_kv_snapshot(request).await
+    }
+
     async fn apply_external_kv_batch(
         &self,
         request: ApplyExternalKvBatchRequest,
@@ -188,6 +222,47 @@ impl<B> KvIndexer for KvIndexerService<B>
 where
     B: KvIndexerBackend,
 {
+    async fn configure_expected_workers(
+        &self,
+        request: Request<ConfigureExpectedWorkersRequest>,
+    ) -> Result<Response<ConfigureExpectedWorkersResponse>, Status> {
+        let request = request.into_inner();
+        let mut seen = std::collections::HashSet::new();
+        for worker in &request.workers {
+            validate_worker_id(&worker.worker_id)?;
+            if !seen.insert(worker.worker_id.as_str()) {
+                return Err(Status::invalid_argument("worker_id must be unique"));
+            }
+        }
+        Ok(Response::new(
+            self.backend.configure_expected_workers(request).await?,
+        ))
+    }
+
+    async fn replace_external_kv_snapshot(
+        &self,
+        request: Request<ReplaceExternalKvSnapshotRequest>,
+    ) -> Result<Response<ReplaceExternalKvSnapshotResponse>, Status> {
+        let request = request.into_inner();
+        validate_worker_id(&request.worker_id)?;
+        if request.worker_epoch.is_empty() {
+            return Err(Status::invalid_argument("worker_epoch must not be empty"));
+        }
+        for tier in &request.hashes_by_tier {
+            validate_tier(tier.tier)?;
+            validate_hashes_bounded(&tier.hashes)?;
+            validate_aligned(
+                tier.component_masks.len(),
+                tier.hashes.len(),
+                "component_masks",
+            )?;
+            validate_aligned(tier.block_sizes.len(), tier.hashes.len(), "block_sizes")?;
+        }
+        Ok(Response::new(
+            self.backend.replace_external_kv_snapshot(request).await?,
+        ))
+    }
+
     async fn match_external_kv(
         &self,
         request: Request<MatchExternalKvRequest>,

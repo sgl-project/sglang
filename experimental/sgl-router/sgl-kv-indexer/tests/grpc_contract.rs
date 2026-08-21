@@ -303,6 +303,8 @@ async fn validation_errors_map_to_invalid_argument_over_grpc() {
         seq: 1,
         worker_address: String::new(),
         cache_spec: None,
+        worker_epoch: String::new(),
+        enforce_sequence: false,
         actions: vec![ExternalKvAction {
             r#type: 999,
             tier: hbm(),

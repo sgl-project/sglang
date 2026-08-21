@@ -28,8 +28,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .parse::<SocketAddr>()?;
     let prefix_query_max_inflight = prefix_query_max_inflight_from_env()?;
     let status = Arc::new(IndexerStatusHandle::new(prefix_query_max_inflight));
+    let status_reporter_config = StatusReporterConfig::from_env()
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+    if status_reporter_config.is_some() {
+        // A fleet member is not eligible until its paired Bridge configures and
+        // restores the expected Worker set.
+        status.set_ready(false);
+    }
 
-    let backend: Arc<dyn KvIndexerBackend> = Arc::new(InMemoryKvIndexerBackend::new());
+    let backend: Arc<dyn KvIndexerBackend> =
+        Arc::new(InMemoryKvIndexerBackend::with_status(Arc::clone(&status)));
     // The interceptor timestamps each request before its own task is queued,
     // which is what lets the query path shed work whose deadline expired.
     let service = InterceptedService::new(
@@ -37,9 +45,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         stamp_arrival,
     );
 
-    let _status_reporter = StatusReporterConfig::from_env()
-        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?
-        .map(|config| spawn_status_reporter(Arc::clone(&status), config));
+    let _status_reporter =
+        status_reporter_config.map(|config| spawn_status_reporter(Arc::clone(&status), config));
 
     info!(
         %addr,
