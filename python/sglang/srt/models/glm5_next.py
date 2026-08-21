@@ -112,7 +112,6 @@ from sglang.srt.models.glm_ocr import (
     GlmOcrVisionPatchEmbed,
     GlmOcrVisionPatchMerger,
 )
-from sglang.srt.multimodal.glm_visual import run_glm_visual_chunked
 from sglang.srt.multimodal.mm_utils import (
     run_dp_presharded_mrope_vision_model,
     run_dp_sharded_mrope_vision_model,
@@ -1426,14 +1425,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
 
-        def run_visual(px, grid):
-            if self.use_data_parallel:
-                return run_dp_sharded_mrope_vision_model(
-                    self.visual, px, grid.tolist(), rope_type="rope_3d"
-                )
-            return self.visual(px, grid_thw=grid)
-
-        return run_glm_visual_chunked(run_visual, pixel_values, image_grid_thw)
+        if self.use_data_parallel:
+            return run_dp_sharded_mrope_vision_model(
+                self.visual, pixel_values, image_grid_thw.tolist(), rope_type="rope_3d"
+            )
+        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        return image_embeds
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
@@ -1466,16 +1463,15 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 dp_meta["gpu_sample_counts"],
             )
 
-        def run_visual(px, grid):
-            if self.use_data_parallel:
-                return run_dp_sharded_mrope_vision_model(
-                    self.visual, px, grid.tolist(), rope_type="rope_3d"
-                )
-            return self.visual(px, grid_thw=grid)
-
-        return run_glm_visual_chunked(
-            run_visual, pixel_values, flattened_video_grid_thw
-        )
+        if self.use_data_parallel:
+            return run_dp_sharded_mrope_vision_model(
+                self.visual,
+                pixel_values,
+                flattened_video_grid_thw.tolist(),
+                rope_type="rope_3d",
+            )
+        video_embeds = self.visual(pixel_values, grid_thw=flattened_video_grid_thw)
+        return video_embeds
 
     def _prepare_context_parallel_metadata(
         self,
