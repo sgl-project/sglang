@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import random
 from collections import deque
 from contextlib import nullcontext
@@ -160,16 +159,8 @@ def unified_memory_disagg_move_gate(scheduler):
 #########################
 
 
-def _get_failure_prob() -> float:
-    try:
-        return float(envs.SGLANG_TEST_DISAGG_FAILURE_PROB.get())
-    except Exception:
-        # fallback to legacy env var
-        return float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", "0"))
-
-
 def _poll_with_failure_injection(pollers) -> List[int]:
-    if (failure_prob := _get_failure_prob()) > 0:
+    if (failure_prob := envs.SGLANG_TEST_DISAGG_FAILURE_PROB.get()) > 0:
         return [
             int(KVPoll.Failed) if random.random() < failure_prob else int(poller.poll())
             for poller in pollers
