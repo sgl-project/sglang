@@ -906,23 +906,8 @@ class MooncakeKVManager(CommonKVManager):
             dst_device_data_ptrs=dst_device_kv_ptrs,
         )
 
-    def _ensure_dcp_pack_buffers(self) -> None:
-        if not self.enable_dcp_pack or self._dcp_pack_buffers is not None:
-            return
-        if not self.kv_args.kv_item_lens:
-            return
-        with self._dcp_pack_lock:
-            if self._dcp_pack_buffers is not None:
-                return
-            from sglang.srt.disaggregation.common.dcp_pack import (
-                init_dcp_pack_buffers,
-            )
-
-            self._dcp_pack_buffers = init_dcp_pack_buffers(
-                lambda ptr, size: self.engine.batch_register([ptr], [size]),
-                self.kv_args,
-                len(self.transfer_queues),
-            )
+    def _register_dcp_pack_memory(self, ptr: int, size: int) -> None:
+        self.engine.batch_register([ptr], [size])
 
     def send_kvcache_dcp(
         self,
@@ -2117,7 +2102,7 @@ class MooncakeKVManager(CommonKVManager):
                                 * len(self.kv_args.kv_item_lens)
                             )
                         )
-                        self._ensure_dcp_pack_buffers()
+                        self._init_dcp_pack_buffers_once()
                     self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:

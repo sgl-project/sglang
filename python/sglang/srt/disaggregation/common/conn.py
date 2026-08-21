@@ -166,7 +166,6 @@ class CommonKVManager(BaseKVManager):
         self.enable_dcp_pack = envs.SGLANG_DISAGG_DCP_PACK.get()
         self.mla_kv_buffers: Optional[list] = None
         self._dcp_pack_buffers = None
-        self._dcp_pack_lock = threading.Lock()
         # for p/d multi node infer
         self.bootstrap_host = server_args.host
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
@@ -336,6 +335,24 @@ class CommonKVManager(BaseKVManager):
                 f"src={src_token_lens}, dst={dst_token_lens}"
             )
         return src_token_lens
+
+    def _register_dcp_pack_memory(self, ptr: int, size: int) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support DCP pack buffer registration"
+        )
+
+    def _init_dcp_pack_buffers_once(self) -> None:
+        if self._dcp_pack_buffers is not None or not self.enable_dcp_pack:
+            return
+        if not self.kv_args.kv_item_lens:
+            return
+        from sglang.srt.disaggregation.common.dcp_pack import init_dcp_pack_buffers
+
+        self._dcp_pack_buffers = init_dcp_pack_buffers(
+            self._register_dcp_pack_memory,
+            self.kv_args,
+            len(self.transfer_queues),
+        )
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]

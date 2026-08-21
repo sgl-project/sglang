@@ -1118,25 +1118,8 @@ class NixlKVManager(CommonKVManager):
                 dst_mem_kind=dst_mem_kind,
             )
 
-    def _ensure_dcp_pack_buffers(self) -> None:
-        if not self.enable_dcp_pack or self._dcp_pack_buffers is not None:
-            return
-        if not self.kv_args.kv_item_lens:
-            return
-        with self._dcp_pack_lock:
-            if self._dcp_pack_buffers is not None:
-                return
-            from sglang.srt.disaggregation.common.dcp_pack import (
-                init_dcp_pack_buffers,
-            )
-
-            self._dcp_pack_buffers = init_dcp_pack_buffers(
-                lambda ptr, size: self._register_staging_memory(
-                    ptr, size, self.kv_args.gpu_id
-                ),
-                self.kv_args,
-                len(self.transfer_queues),
-            )
+    def _register_dcp_pack_memory(self, ptr: int, size: int) -> None:
+        self._register_staging_memory(ptr, size, self.kv_args.gpu_id)
 
     def transfer_worker(self, queue: FastQueue, staging_buffer=None, worker_index=0):
         # Per-worker staging strategy: lazy-created on first chunk so we
@@ -1499,7 +1482,7 @@ class NixlKVManager(CommonKVManager):
             decode_kv_args.dst_dcp_size, decode_kv_args.dst_dcp_rank
         )
         if decode_kv_args.requires_dcp_relayout:
-            self._ensure_dcp_pack_buffers()
+            self._init_dcp_pack_buffers_once()
         self.decode_kv_args_table[agent_name] = decode_kv_args
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
