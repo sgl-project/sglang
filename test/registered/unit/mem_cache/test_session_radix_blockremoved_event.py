@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.disaggregation.kv_events import BlockRemoved
+from sglang.srt.disaggregation.kv_events import BlockRemoved, StorageMedium
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -33,7 +34,16 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
-def _make_cache(enable_events: bool) -> RadixCache:
+class _TestHiRadixCache(RadixCache):
+    """CPU-only harness for HiRadix's session-release override."""
+
+    _release_radix_session_node = HiRadixCache._release_radix_session_node
+    _update_host_leaf_status = HiRadixCache._update_host_leaf_status
+
+
+def _make_cache(
+    enable_events: bool, cache_cls: type[RadixCache] = RadixCache
+) -> RadixCache:
     dtype = torch.float16
     kv = MHATokenToKVPool(
         size=64,
@@ -51,7 +61,7 @@ def _make_cache(enable_events: bool) -> RadixCache:
     req_to_token_pool = ReqToTokenPool(
         size=8, max_context_len=1024, device="cpu", enable_memory_saver=False
     )
-    return RadixCache(
+    return cache_cls(
         CacheInitParams(
             disable=False,
             req_to_token_pool=req_to_token_pool,
@@ -175,6 +185,36 @@ class TestSessionRadixBlockRemovedEvent(CustomTestCase):
         # No crash, no events queued when events are disabled.
         self.assertGreater(cache.release_radix_session("A"), 0)
         self.assertEqual(cache.take_events(), [])
+
+    def test_hiradix_release_removes_host_and_device_blocks(self):
+        self.cache = _make_cache(enable_events=True, cache_cls=_TestHiRadixCache)
+        self.cache.evictable_host_leaves = set()
+        self.cache.ongoing_write_through = {}
+        released_host_values = []
+        self.cache.cache_controller = SimpleNamespace(
+            mem_pool_device_allocator=self.cache.token_to_kv_pool_allocator,
+            evict_host=lambda value: released_host_values.append(value) or len(value),
+        )
+        self._insert([1, 2, 3, 4])
+        self._tag([1, 2, 3, 4], "A")
+        leaf = self.cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3, 4])))
+        ).last_device_node
+        leaf.host_value = torch.arange(4, dtype=torch.int64)
+        self._drain()
+
+        self.assertEqual(self.cache.release_radix_session("A"), 1)
+
+        removed = self._block_removed(self._drain())
+        self.assertEqual(len(removed), 2)
+        self.assertEqual(
+            {event.medium for event in removed},
+            {StorageMedium.CPU, StorageMedium.GPU},
+        )
+        self.assertTrue(released_host_values)
+        self.assertIsNone(leaf.host_value)
+        self.assertNotIn(leaf, self.cache.evictable_host_leaves)
+        self.assertFalse(self.cache.root_node.children)
 
 
 if __name__ == "__main__":

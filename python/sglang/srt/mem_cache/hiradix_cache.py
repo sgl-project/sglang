@@ -1055,6 +1055,25 @@ class HiRadixCache(RadixCache):
         if node not in self.evictable_host_leaves:
             self.evictable_host_leaves.add(node)
 
+    def _release_radix_session_node(self, node: TreeNode) -> bool:
+        """Release all HiCache tiers for an unshared session leaf."""
+        if node.host_ref_counter > 0:
+            return False
+
+        if node.host_value is not None:
+            self._record_remove_event(node, medium=StorageMedium.CPU)
+            self.cache_controller.evict_host(node.host_value)
+            node.host_value = None
+
+        self._record_remove_event(node, medium=StorageMedium.GPU)
+        self.cache_controller.mem_pool_device_allocator.free(node.value)
+        self.ongoing_write_through.pop(node.id, None)
+        self.evictable_host_leaves.discard(node)
+        parent = node.parent
+        self._delete_leaf(node)
+        self._update_host_leaf_status(parent)
+        return True
+
     def evict(self, params: EvictParams) -> EvictResult:
         start_time = time.perf_counter()
         num_tokens = params.num_tokens

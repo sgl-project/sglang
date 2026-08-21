@@ -81,6 +81,21 @@ class SessionRadixCacheMixin:
                 len(self._session_leaves[sid]),
             )
 
+    def _release_radix_session_node(self, node) -> bool:
+        """Release one unshared session leaf.
+
+        Cache implementations with additional KV tiers may override this to
+        release those tiers before deleting the radix node.
+        """
+        self.token_to_kv_pool_allocator.free(node.value)
+        self._delete_leaf(node)
+        # Emit a BlockRemoved event for the freed node, mirroring the regular
+        # eviction path (see RadixCache.evict). Without this, KV-aware routers
+        # consuming the event queue would keep stale entries for blocks that a
+        # session release has already freed.
+        self._record_remove_event(node)
+        return True
+
     def release_radix_session(self, session_id: str) -> int:
         """Close: drop this session from each of its tagged leaves, freeing a node
         only once no other session still holds it (last holder). Shared
@@ -108,13 +123,8 @@ class SessionRadixCacheMixin:
                 ):
                     break
                 parent = node.parent
-                self.token_to_kv_pool_allocator.free(node.value)
-                self._delete_leaf(node)
-                # Emit a BlockRemoved event for the freed node, mirroring the
-                # regular eviction path (see RadixCache.evict). Without this,
-                # KV-aware routers consuming the event queue would keep stale
-                # entries for blocks that a session release has already freed.
-                self._record_remove_event(node)
+                if not self._release_radix_session_node(node):
+                    break
                 freed += 1
                 node = parent
         logger.info(
