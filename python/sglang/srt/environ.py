@@ -858,8 +858,6 @@ class Envs:
     SGLANG_NPU_MROPE_NPU_COMPUTE = EnvBool(False)
     # Enable pinned memory for DP.
     SGLANG_NPU_PINNED_MEMORY_DP = EnvBool(False)
-    # Use Triton fused causal_conv1d kernel for GDN decode (adds conv bias; differs from decomposed path when bias != 0).
-    SGLANG_NPU_GDN_CONV_FUSED = EnvBool(False)
     # Use Triton fused kernel for GDN qkvz/ba split+reshape+concat.
     SGLANG_NPU_FUSED_QKVZBA_SPLIT = EnvBool(False)
     # Use Triton fused sigmoid-gated multiply for attention/expert gating.

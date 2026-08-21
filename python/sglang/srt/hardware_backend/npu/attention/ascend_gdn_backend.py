@@ -5,12 +5,7 @@ from sgl_kernel_npu.fla.fused_gdn_gating import (
     fused_gdn_gating_kernel_without_sigmoid,
     fused_gdn_gating_npu,
 )
-from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent_decode_optimized import (
-    fused_sigmoid_gating_delta_rule_update_decode_npu,
-)
-from sgl_kernel_npu.mamba.causal_conv1d import causal_conv1d_update_npu
 
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
     AscendMambaAttnBackendBase,
 )
@@ -41,13 +36,6 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         decode_backend = backends.decode
         prefill_backend = backends.prefill
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
-        if envs.SGLANG_NPU_GDN_CONV_FUSED.get():
-            for m in model_runner.model.modules():
-                if (
-                    isinstance(m, RadixLinearAttention)
-                    and getattr(m, "conv_weights", None) is not None
-                ):
-                    m.conv_weights_t_npu = m.conv_weights.transpose(0, 1).contiguous()
 
     def _prepare_mamba_track_metadata(self, forward_batch: ForwardBatch):
         if self.forward_metadata.has_mamba_track_mask:
@@ -134,28 +122,17 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         assert isinstance(mixed_qkv, torch.Tensor)
-        if envs.SGLANG_NPU_GDN_CONV_FUSED.get():
-            mixed_qkv = causal_conv1d_update_npu(
-                mixed_qkv,
-                conv_states.transpose(1, 2),
-                layer.conv_weights,
-                bias=layer.bias,
-                activation=layer.activation,
-                conv_state_indices=cache_indices,
-                weight_t=getattr(layer, "conv_weights_t_npu", None),
-            )
-        else:
-            mixed_qkv = torch.ops.npu.causal_conv1d(
-                mixed_qkv,
-                self._get_conv_weights_t(layer),
-                conv_states=conv_states,
-                bias=layer.bias,
-                query_start_loc=query_start_loc,
-                cache_indices=cache_indices,
-                activation_mode=1,
-                pad_slot_id=-1,
-                run_mode=1,
-            )
+        mixed_qkv = torch.ops.npu.causal_conv1d(
+            mixed_qkv,
+            self._get_conv_weights_t(layer),
+            conv_states=conv_states,
+            bias=layer.bias,
+            query_start_loc=query_start_loc,
+            cache_indices=cache_indices,
+            activation_mode=1,
+            pad_slot_id=-1,
+            run_mode=1,
+        )
 
         query, key, value = torch.split(
             mixed_qkv,
@@ -167,36 +144,18 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         key = key.view(1, bs, layer.num_k_heads, layer.head_k_dim)
         value = value.view(1, bs, layer.num_v_heads, layer.head_v_dim)
 
-        if envs.SGLANG_NPU_GDN_UPDATE_FUSED.get():
-            core_attn_out = fused_sigmoid_gating_delta_rule_update_decode_npu(
-                A_log=layer.A_log,
-                a=a,
-                dt_bias=layer.dt_bias,
-                softplus_beta=1.0,
-                softplus_threshold=20.0,
-                q=query,
-                k=key,
-                v=value,
-                b=b,
-                initial_state_source=ssm_states,
-                initial_state_indices=cache_indices,
-                scale=layer.head_k_dim**-0.5,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=query_start_loc,
-            )
-        else:
-            core_attn_out = self.kernel_dispatcher.decode(
-                q=query,
-                k=key,
-                v=value,
-                a=a,
-                b=b,
-                A_log=layer.A_log,
-                dt_bias=layer.dt_bias,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-            )
+        core_attn_out = self.kernel_dispatcher.decode(
+            q=query,
+            k=key,
+            v=value,
+            a=a,
+            b=b,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+        )
 
         self._track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices
