@@ -661,10 +661,21 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
             server_args.pipeline_config.vae_config.arch_config
         )
 
-    def _should_merge_lora_for_phase(self, phase: str) -> bool:
+    def _should_merge_lora_for_phase(
+        self,
+        phase: str,
+        distilled_lora_strength: float | None = None,
+    ) -> bool:
         if phase == "stage2" and self._ltx2_residency.mode == "original":
             # original mode reuses one DiT for both phases; dynamic LoRA avoids
-            # request-time merge/unmerge without keeping another DiT resident
+            # request-time merge/unmerge without keeping another DiT resident.
+            if distilled_lora_strength is None:
+                distilled_lora_strength = float(self.STAGE_2_DISTILLED_LORA_STRENGTH)
+            if self._stage1_lora_path and distilled_lora_strength != 0.0:
+                # Dynamic LoRA supports only one adapter per target, but
+                # original stage2 may need both the user LoRA and the
+                # distilled LoRA on the same transformer.
+                return True
             return False
         return self._should_merge_stage2_distilled_lora(self.server_args)
 
@@ -982,9 +993,10 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
             if phase == "stage2":
                 # premerged modes keep official LTX-2.3 fused stage-2 LoRA; original
                 # avoids single-DiT request-time merge/unmerge with dynamic LoRA
-                set_lora_kwargs["merge_weights"] = self._should_merge_lora_for_phase(
-                    phase
+                merge_weights = self._should_merge_lora_for_phase(
+                    phase, distilled_lora_strength=distilled_lora_strength
                 )
+                set_lora_kwargs["merge_weights"] = merge_weights
             elif phase == "stage1" and self.pipeline_name == "LTX2TwoStageHQPipeline":
                 # Official HQ also builds stage 1 with distilled LoRA fused.
                 set_lora_kwargs["merge_weights"] = self._should_merge_lora_for_phase(

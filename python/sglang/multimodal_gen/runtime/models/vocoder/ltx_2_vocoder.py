@@ -713,7 +713,10 @@ class LTX2Vocoder(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
                 else nullcontext()
             )
             with autocast_ctx:
-                waveform = self.vocoder(hidden_states.float())
+                vocoder_input = hidden_states.to(
+                    dtype=self.vocoder.conv_pre.weight.dtype
+                )
+                waveform = self.vocoder(vocoder_input)
                 length_low_rate = waveform.shape[-1]
                 output_length = (
                     length_low_rate
@@ -724,7 +727,10 @@ class LTX2Vocoder(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
                 if remainder != 0:
                     waveform = F.pad(waveform, (0, self.hop_length - remainder))
                 mel = self._compute_ltx23_mel(waveform)
-                residual = self.bwe_generator(mel.transpose(2, 3))
+                bwe_input = mel.transpose(2, 3).to(
+                    dtype=self.bwe_generator.conv_pre.weight.dtype
+                )
+                residual = self.bwe_generator(bwe_input)
                 skip = self.resampler(waveform)
                 assert residual.shape == skip.shape
                 waveform = torch.clamp(residual + skip, -1, 1)[..., :output_length]
