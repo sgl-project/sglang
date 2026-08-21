@@ -817,9 +817,10 @@ def _verify_commit_step_indices(
         != seq_lens_post_verify // mamba_track_interval
     )
     tracking_point = seq_lens_post_verify // mamba_track_interval * mamba_track_interval
-    to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0).to(
-        torch.int64
-    )
+    to_track_ith = torch.clamp(
+        torch.minimum(tracking_point - seq_lens_pre_verify, accept_lens - 1),
+        min=0,
+    ).to(torch.int64)
     candidate_track_steps = accept_index[req_idx, to_track_ith] - accept_indices_offset
     mamba_steps_to_track = torch.where(
         to_track_mask,
