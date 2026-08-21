@@ -1552,6 +1552,31 @@ class CommonKVReceiver(BaseKVReceiver):
             logger.debug(f"Disconnected stale ZMQ PUSH socket (receiver): {endpoint}")
 
     @classmethod
+    def close_all_sockets(cls):
+        """Close all cached PUSH sockets on role switch, keeping ``_ctx`` reusable."""
+        with cls._global_lock:
+            entries = list(cls._socket_cache.items())
+            locks = cls._socket_locks.copy()
+            cls._socket_cache.clear()
+            cls._socket_locks.clear()
+
+        # Close outside _global_lock: _connect drops it before the per-endpoint lock.
+        for endpoint, sock in entries:
+            lock = locks.get(endpoint)
+            try:
+                if lock:
+                    with lock:
+                        sock.close(linger=0)
+                else:
+                    sock.close(linger=0)
+            except Exception:
+                logger.exception(
+                    f"Failed to close ZMQ PUSH socket (receiver): {endpoint}"
+                )
+        if entries:
+            logger.debug(f"Closed {len(entries)} receiver ZMQ PUSH socket(s)")
+
+    @classmethod
     def _connect_to_bootstrap_server(cls, bootstrap_info: dict):
         ip_address = bootstrap_info["rank_ip"]
         port = bootstrap_info["rank_port"]

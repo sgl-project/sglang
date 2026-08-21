@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import PdRoleSwitchReqInput, PdRoleSwitchReqOutput
 from sglang.srt.runtime_context import get_context
+from sglang.srt.disaggregation.common.conn import CommonKVReceiver
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -148,6 +149,11 @@ def _reject_reason(scheduler: Scheduler, new_role: str) -> Optional[str]:
             lambda: f"transfer backend {sa.disaggregation_transfer_backend!r} "
             "does not support runtime role switch",
         ),
+        (
+            getattr(km, "enable_staging", False),
+            lambda: "staging buffer (SGLANG_DISAGG_STAGING_BUFFER) is not "
+            "supported with runtime role switch",
+        ),
     )
     return next((msg() for failed, msg in checks if failed), None)
 
@@ -183,6 +189,8 @@ def teardown_disaggregation(scheduler: Scheduler) -> None:
                 km.teardown()
             scheduler.disagg_decode_prealloc_queue = None
         scheduler.disagg_decode_transfer_queue = None
+        # clear socket ctx in CommonKVReceiver
+        CommonKVReceiver.close_all_sockets()
     scheduler.disagg_metadata_buffers = None
     scheduler.req_to_metadata_buffer_idx_allocator = None
     _release_prefix_cache_for_role_switch(scheduler)
