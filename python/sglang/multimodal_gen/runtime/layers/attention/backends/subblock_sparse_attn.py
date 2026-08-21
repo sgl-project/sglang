@@ -137,6 +137,7 @@ def _sm90_sparse_attention(
     q2k_block_index: torch.Tensor,
     topk: int,
     softmax_scale: float,
+    block_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run a SubBlock routing plan through the existing SM90 CuTe kernel."""
     BlockSparseTensorsTorch, flash_attn_func = _load_sm90_block_sparse_attention()
@@ -146,13 +147,14 @@ def _sm90_sparse_attention(
     # sequence-tail masking to the first block. Sort explicitly so the largest
     # block id -- the possible ragged tail -- occupies the highest slot without
     # depending on the fused top-k kernel's current ascending output order.
-    ordered_index = q2k_block_index.sort(dim=-1).values
-    block_counts = torch.full(
-        ordered_index.shape[:-1],
-        topk,
-        dtype=torch.int32,
-        device=ordered_index.device,
-    )
+    ordered_index = q2k_block_index
+    if block_counts is None:
+        block_counts = torch.full(
+            ordered_index.shape[:-1],
+            topk,
+            dtype=torch.int32,
+            device=ordered_index.device,
+        )
     sparse_tensors = BlockSparseTensorsTorch(
         mask_block_cnt=block_counts,
         mask_block_idx=ordered_index,
@@ -183,6 +185,7 @@ def _sm100_sparse_attention(
     q2k_block_index: torch.Tensor,
     topk: int,
     softmax_scale: float,
+    block_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run a SubBlock routing plan through FlashInfer's SM100 kernel."""
     out = load_bsa_attn_blk64_fwd()(
@@ -192,7 +195,7 @@ def _sm100_sparse_attention(
         q2k_block_index,
         topk,
         block_sizes=_cached_block_sizes(k.shape[1], k.device),
-        q2k_block_nums=None,  # the budget is uniform across rows
+        q2k_block_nums=block_counts,
         softmax_scale=softmax_scale,
     )
     return out[0] if isinstance(out, tuple) else out
@@ -219,6 +222,7 @@ def _run_subblock_sparse_attention(
     q2k_block_index: torch.Tensor,
     topk: int,
     softmax_scale: float,
+    block_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dispatch the same 64x64 routing plan to Hopper or Blackwell."""
     runner = _get_subblock_sparse_attention_runner(q.device)
@@ -229,6 +233,7 @@ def _run_subblock_sparse_attention(
         q2k_block_index,
         topk,
         softmax_scale,
+        block_counts,
     )
 
 
@@ -406,11 +411,11 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
         k: torch.Tensor,
         v: torch.Tensor,
         *,
-        routing_q: torch.Tensor | None = None,
+        sparse_query_block_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Q ``[1, Sq, H, 128]`` against K/V ``[1, Sk, H, 128]``."""
         plan = self.router.route(
-            q if routing_q is None else routing_q,
+            q,
             k,
             sparsity=self.schedule.sparsity,
             softmax_scale=self.softmax_scale,
@@ -429,13 +434,49 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
             f"keeping {plan.topk}/{plan.num_blocks} key blocks per query block "
             f"(sparsity {1 - plan.density:.4f})"
         )
+        block_counts = None
+        block_index = plan.index.sort(dim=-1).values
+        kernel_topk = plan.topk
+        if sparse_query_block_mask is not None:
+            sparse_query_block_mask = sparse_query_block_mask.to(
+                device=q.device, dtype=torch.bool
+            ).view(-1)
+            if sparse_query_block_mask.numel() != expected_q_blocks:
+                raise ValueError(
+                    "SubBlock sparse query-block mask length does not match Q"
+                )
+            num_k_blocks = plan.num_blocks
+            full_index = torch.arange(
+                num_k_blocks, device=q.device, dtype=block_index.dtype
+            ).view(1, 1, 1, num_k_blocks)
+            heterogeneous_index = full_index.expand(
+                *block_index.shape[:-1], num_k_blocks
+            ).clone()
+            sparse_rows = sparse_query_block_mask.view(1, 1, -1, 1)
+            heterogeneous_index[..., : plan.topk] = torch.where(
+                sparse_rows,
+                block_index,
+                heterogeneous_index[..., : plan.topk],
+            )
+            block_counts = (
+                torch.where(
+                    sparse_query_block_mask.view(1, 1, -1),
+                    plan.topk,
+                    num_k_blocks,
+                )
+                .expand(*block_index.shape[:-1])
+                .to(torch.int32)
+            )
+            block_index = heterogeneous_index
+            kernel_topk = num_k_blocks
         return _run_subblock_sparse_attention(
             q,
             k,
             v,
-            plan.index,
-            plan.topk,
+            block_index,
+            kernel_topk,
             self.softmax_scale,
+            block_counts,
         )
 
     def _dense_query_attention(
@@ -468,61 +509,19 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
         v: torch.Tensor,
         query_plan: dict[str, Any],
     ) -> torch.Tensor:
-        """Combine dense non-video Q with sparse outputs from video Q blocks.
-
-        Every original 64-row block containing at least one video query is
-        routed intact so SubBlock sees the same query-block contents as the
-        unsplit sequence. Non-video rows inside those boundary blocks are
-        therefore computed by SubBlock too, but their sparse outputs are
-        discarded; only video rows consume sparse results.
-        """
-        dense_indices = self._query_plan_indices(
-            query_plan, "dense_query_indices", q.device
+        """Run one BSA call with dense non-video and sparse video Q blocks."""
+        sparse_query_block_mask = query_plan.get("sparse_query_block_mask")
+        if not isinstance(sparse_query_block_mask, torch.Tensor):
+            raise ValueError("SubBlock query plan requires a query-block mask")
+        out = self._sparse_attention(
+            q,
+            k,
+            v,
+            sparse_query_block_mask=sparse_query_block_mask,
         )
-        video_indices = self._query_plan_indices(
-            query_plan, "video_query_indices", q.device
-        )
-        sparse_gather = self._query_plan_indices(
-            query_plan, "sparse_query_gather_indices", q.device
-        )
-        sparse_video_outputs = self._query_plan_indices(
-            query_plan, "sparse_video_output_indices", q.device
-        )
-        sparse_valid_len = query_plan.get("sparse_query_valid_len")
-        if not isinstance(sparse_valid_len, int):
-            raise ValueError(
-                "SubBlock query plan sparse_query_valid_len must be an integer"
-            )
-        if dense_indices.numel() + video_indices.numel() != q.shape[1]:
-            raise ValueError("SubBlock query plan must cover every query row")
-
-        out = torch.empty_like(q)
-        if dense_indices.numel():
-            dense_out = self._dense_query_attention(q, k, v, dense_indices)
-            out.index_copy_(1, dense_indices, dense_out)
-        if video_indices.numel():
-            if sparse_gather.numel() % SUBBLOCK_SPARSE_BLOCK_SIZE:
-                raise ValueError(
-                    "SubBlock sparse query gather must contain full blocks"
-                )
-            if not 0 < sparse_valid_len <= sparse_gather.numel():
-                raise ValueError("SubBlock sparse query valid length is out of range")
-            if sparse_video_outputs.numel() != video_indices.numel():
-                raise ValueError(
-                    "SubBlock sparse video source/destination sizes must match"
-                )
-            sparse_q = q.index_select(1, sparse_gather)
-            sparse_out = self._sparse_attention(
-                sparse_q,
-                k,
-                v,
-                routing_q=sparse_q[:, :sparse_valid_len],
-            )
-            video_out = sparse_out.index_select(1, sparse_video_outputs)
-            out.index_copy_(1, video_indices, video_out)
         logger.info_once(
-            "SubBlock hybrid query routing active: non-video queries use "
-            "dense FA and video query blocks use sparse attention"
+            "SubBlock heterogeneous BSA active: non-video query blocks are "
+            "dense and pure-video query blocks are sparse"
         )
         return out
 

@@ -356,7 +356,7 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
         )
         self.assertEqual(query_plan["sparse_query_valid_len"], 76)
 
-    def test_hybrid_query_routing_uses_fa_once_and_subblock_only_for_video_blocks(self):
+    def test_hybrid_query_routing_uses_one_heterogeneous_bsa_call(self):
         impl = object.__new__(SubBlockSparseAttentionImpl)
         impl.softmax_scale = 2**-0.5
         impl.causal = False
@@ -375,19 +375,10 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
             torch.tensor([0, 2]),
             used_len=4,
         )
-        dense_indices = query_plan["dense_query_indices"]
-        dense_q = q.index_select(1, dense_indices)
-        expected_dense = torch.nn.functional.scaled_dot_product_attention(
-            dense_q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            scale=impl.softmax_scale,
-        ).transpose(1, 2)
         impl.dense_impl = Mock()
-        impl.dense_impl.forward.return_value = expected_dense
-        sparse_out = torch.zeros(1, 64, 1, 2)
-        sparse_out[:, 0] = torch.tensor([9.0, 10.0])
-        sparse_out[:, 2] = torch.tensor([11.0, 12.0])
+        sparse_out = torch.tensor(
+            [[[[9.0, 10.0]], [[3.0, 4.0]], [[11.0, 12.0]], [[7.0, 8.0]]]]
+        )
 
         with patch(
             "sglang.multimodal_gen.runtime.layers.attention.backends."
@@ -401,23 +392,17 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
                 query_plan,
             )
 
-        impl.dense_impl.forward.assert_called_once()
-        dense_call = impl.dense_impl.forward.call_args.args
-        torch.testing.assert_close(dense_call[0], dense_q)
-        self.assertIs(dense_call[1], k)
-        self.assertIs(dense_call[2], v)
-        self.assertIsNone(dense_call[3])
-        torch.testing.assert_close(out.index_select(1, dense_indices), expected_dense)
-        torch.testing.assert_close(
-            out[:, [0, 2]],
-            torch.tensor([[[[9.0, 10.0]], [[11.0, 12.0]]]]),
-        )
+        impl.dense_impl.forward.assert_not_called()
+        torch.testing.assert_close(out, sparse_out)
         routing_q = impl.router.route.call_args.args[0]
         self.assertEqual(routing_q.shape[1], 4)
         sparse_call = run_sparse.call_args.args
-        self.assertEqual(sparse_call[0].shape[1], 64)
+        self.assertEqual(sparse_call[0].shape[1], 4)
         self.assertIs(sparse_call[1], k)
         self.assertIs(sparse_call[2], v)
+        torch.testing.assert_close(
+            sparse_call[6], torch.ones(1, 1, 1, dtype=torch.int32)
+        )
 
 
 if __name__ == "__main__":

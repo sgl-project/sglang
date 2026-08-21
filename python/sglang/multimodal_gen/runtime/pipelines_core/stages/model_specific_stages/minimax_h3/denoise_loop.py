@@ -94,12 +94,18 @@ def _minimax_h3_subblock_query_plan(
     block_size = _MINIMAX_H3_SUBBLOCK_QUERY_BLOCK_SIZE
     if video_query_indices.numel() == 0:
         empty = torch.empty(0, dtype=torch.long, device=video_query_indices.device)
+        query_blocks = -(-used_len // _MINIMAX_H3_SUBBLOCK_QUERY_BLOCK_SIZE)
         return {
             "dense_query_indices": dense_query_indices,
             "video_query_indices": video_query_indices,
             "sparse_query_gather_indices": empty,
             "sparse_video_output_indices": empty,
             "sparse_query_valid_len": 0,
+            "sparse_query_block_mask": torch.zeros(
+                query_blocks,
+                dtype=torch.bool,
+                device=video_query_indices.device,
+            ),
         }
 
     video_block_ids = torch.unique(
@@ -127,6 +133,21 @@ def _minimax_h3_subblock_query_plan(
     sparse_video_output_indices = (
         video_block_rank * block_size + video_query_indices.remainder(block_size)
     )
+    num_query_blocks = -(-used_len // block_size)
+    video_rows_per_block = torch.bincount(
+        torch.div(video_query_indices, block_size, rounding_mode="floor"),
+        minlength=num_query_blocks,
+    )
+    block_ids = torch.arange(
+        num_query_blocks, device=video_query_indices.device, dtype=torch.long
+    )
+    real_rows_per_block = (used_len - block_ids * block_size).clamp(
+        min=0, max=block_size
+    )
+    # BSA is block-granular. Only blocks whose real rows are all video may use
+    # the sparse budget; mixed boundary blocks stay dense so their non-video
+    # rows retain exact attention in the single heterogeneous BSA call.
+    sparse_query_block_mask = video_rows_per_block == real_rows_per_block
     if dense_query_indices.numel() + video_query_indices.numel() != used_len:
         raise ValueError("SubBlock query plan must cover every real query exactly once")
     return {
@@ -135,6 +156,7 @@ def _minimax_h3_subblock_query_plan(
         "sparse_query_gather_indices": sparse_query_gather_indices,
         "sparse_video_output_indices": sparse_video_output_indices,
         "sparse_query_valid_len": sparse_query_valid_len,
+        "sparse_query_block_mask": sparse_query_block_mask,
     }
 
 
