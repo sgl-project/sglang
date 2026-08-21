@@ -16,12 +16,12 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
+    ForwardBatchDeepSeekMHAMixin,
+)
 from sglang.srt.models.deepseek_common import attention_backend_handler as abh
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
-)
-from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
-    ForwardBatchDeepSeekMHAMixin,
 )
 from sglang.srt.runtime_context import get_context, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci

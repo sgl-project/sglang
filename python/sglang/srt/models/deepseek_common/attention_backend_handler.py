@@ -95,10 +95,7 @@ def _support_mha_one_shot(attn, forward_batch, backend_name):
     )
     return (
         attn_supported
-        and (
-            backend_name != "flashinfer"
-            or not forward_batch.has_dp_padding_rows()
-        )
+        and (backend_name != "flashinfer" or not forward_batch.has_dp_padding_rows())
         and sum_seq_lens <= forward_batch.get_max_chunk_capacity()
     )
 
@@ -132,10 +129,7 @@ def _handle_attention_backend(attn, forward_batch, backend_name):
             or sum_extend_prefix_lens == 0
         )
     ):
-        if (
-            backend_name == "flashinfer"
-            and forward_batch.has_dp_padding_rows()
-        ):
+        if backend_name == "flashinfer" and forward_batch.has_dp_padding_rows():
             return _dispatch_mla_subtype(attn, forward_batch)
         if _support_mha_one_shot(attn, forward_batch, backend_name):
             return AttnForwardMethod.MHA_ONE_SHOT
