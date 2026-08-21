@@ -129,6 +129,76 @@ def test_rmsnorm_hidden_size_support(hidden_size: int) -> None:
     assert is_jit_rmsnorm_supported(hidden_size)
 
 
+@pytest.mark.parametrize("hidden_size", [8, 14, 100, 1000, 3841, 16400])
+def test_rmsnorm_rejects_unschedulable_hidden_size(hidden_size: int) -> None:
+    """A row that does not divide into 32-byte units has no schedule.
+
+    Regression guard: these sizes used to be reported as supported and then
+    picked a thread count the kernel's `static_assert`s reject, so the JIT
+    compile failed at runtime and took the server down with it.
+    """
+    from sglang.kernels.ops.layernorm.norm import is_jit_rmsnorm_supported
+
+    assert not is_jit_rmsnorm_supported(hidden_size)
+
+
+def _assert_schedulable(dim: int, schedule) -> None:
+    """Mirror of the `static_assert`s in `csrc/elementwise/rmsnorm.cuh`.
+
+    They are compile-time, so a schedule the traits reject shows up as a JIT
+    build failure inside whatever launched the kernel rather than as a test
+    failure here.
+    """
+    num_threads, vec_size = schedule.num_threads, schedule.vec_size
+    warp = 32
+    assert (
+        vec_size % 2 == 0
+    ), f"{dim=} {schedule=}: vector must be a whole number of pairs"
+    assert dim % vec_size == 0, f"{dim=} {schedule=}: vector must divide the row"
+    if num_threads <= warp:
+        assert (
+            num_threads.bit_count() == 1
+        ), f"{dim=} {schedule=}: warp trait needs a power of two"
+    else:
+        assert (
+            num_threads % warp == 0
+        ), f"{dim=} {schedule=}: CTA trait needs whole warps"
+        assert (
+            num_threads // warp <= warp
+        ), f"{dim=} {schedule=}: too many warps to reduce"
+    if schedule.copy_mode != 0:
+        assert vec_size * 2 == 16, f"{dim=} {schedule=}: staged copies are 16B only"
+        assert num_threads > warp, f"{dim=} {schedule=}: staging is CTA-trait only"
+
+
+def test_every_supported_hidden_size_is_schedulable() -> None:
+    """Every size `is_jit_rmsnorm_supported` admits must get a legal schedule.
+
+    Critical-path bookkeeping: the schedule tables are hand-written per size
+    range, so widening the predicate or retuning a range can emit a thread
+    count the traits reject.
+    """
+    from sglang.kernels.ops.layernorm.norm import (
+        _RMSNORM_MAX_HIDDEN_SIZE,
+        _schedule_fused_add_rmsnorm,
+        _schedule_rmsnorm,
+        is_jit_rmsnorm_supported,
+    )
+
+    dtype_bytes = 2
+    sizes = [
+        d
+        for d in range(2, _RMSNORM_MAX_HIDDEN_SIZE + 1, 2)
+        if is_jit_rmsnorm_supported(d)
+    ]
+    assert sizes, "the predicate admits nothing; the sweep below would be vacuous"
+    for dim in sizes:
+        latency, throughput, _ = _schedule_rmsnorm(dim, dtype_bytes)
+        _assert_schedulable(dim, latency)
+        _assert_schedulable(dim, throughput)
+        _assert_schedulable(dim, _schedule_fused_add_rmsnorm(dim, dtype_bytes))
+
+
 def _hf_semantics_reference(
     x: torch.Tensor, w: torch.Tensor, eps: float
 ) -> torch.Tensor:

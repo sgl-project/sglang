@@ -487,7 +487,7 @@ class RMSNorm(BaseFusedOp):
                 self.weight.data,
                 self.variance_epsilon,
             )
-            if original_shape is not None:
+            if needs_reshape:
                 out = out.reshape(original_shape)
             return out
         # Fuse the downstream FP8 static per-tensor activation quant into the

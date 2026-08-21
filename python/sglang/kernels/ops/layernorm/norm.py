@@ -54,17 +54,22 @@ class Schedule(NamedTuple):
 
 
 def is_jit_rmsnorm_supported(hidden_size: int) -> bool:
-    return 0 < hidden_size <= _RMSNORM_MAX_HIDDEN_SIZE and hidden_size % 2 == 0
+    """Whether the schedules below can cover `hidden_size`.
+
+    The row has to divide into 32-byte units: every schedule hands each thread
+    a whole number of 16-byte vectors, and `_try_vectorize` may widen that to
+    32. 16 elements is the strictest form of that over the supported dtypes
+    (fp16/bf16 need 16, fp32 needs 8), so it is the single gate.
+    """
+    return 0 < hidden_size <= _RMSNORM_MAX_HIDDEN_SIZE and hidden_size % 16 == 0
 
 
 @cache_once
 def _schedule_rmsnorm(dim: int, dtype_bytes: int) -> Tuple[Schedule, Schedule, int]:
     dim_bytes = dim * dtype_bytes
-    if dim_bytes % 32 != 0:
-        # NOTE: slow path. Each thread 16 elem
-        assert dim % 2 == 0
-        schedule = Schedule(2, num_threads=dim // 16)
-        return schedule, schedule, -1
+    assert (
+        dim_bytes % 32 == 0
+    ), f"{dim=} is not schedulable; see is_jit_rmsnorm_supported"
 
     max_vec_bytes = get_max_vector_bytes()
     assert max_vec_bytes in (16, 32)
@@ -135,10 +140,9 @@ def _schedule_fused_add_rmsnorm(dim: int, dtype_bytes: int) -> Schedule:
     the old kernel had a single form and picked it regardless of batch size.
     """
     dim_bytes = dim * dtype_bytes
-    if dim_bytes % 32 != 0:
-        # NOTE: slow path. Each thread 16 elem
-        assert dim % 2 == 0
-        return Schedule(2, num_threads=dim // 16)
+    assert (
+        dim_bytes % 32 == 0
+    ), f"{dim=} is not schedulable; see is_jit_rmsnorm_supported"
 
     vec_size = get_max_vector_bytes() // dtype_bytes
     num_threads = _div_ceil(dim_bytes // 32, 32) * 32
