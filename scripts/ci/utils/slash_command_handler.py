@@ -1033,31 +1033,25 @@ def _check_rerun_test_permissions(gh_repo, pr, comment, user_perms, command_name
     """
     Check permissions shared by /rerun-test and /rerun-group.
     """
-    # SECURITY: These commands check out and execute code from the PR branch on
-    # self-hosted GPU runners, so fork PRs require a trusted collaborator.
-    is_fork = pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
-    if is_fork:
-        commenter = comment.user.login
-        perm = gh_repo.get_collaborator_permission(commenter)
-        if perm not in ("admin", "write"):
-            print(f"Permission denied: /{command_name} on fork PR by {commenter}.")
-            comment.create_reaction("confused")
-            pr.create_issue_comment(
-                f"⛔ `/{command_name}` is not available for fork PRs unless the commenter "
-                "has write permission on the repo.\n\n"
-                "Please ask a maintainer to run this command, or use the normal CI flow."
-            )
-            return False
-        print(f"Fork PR, but commenter {commenter} has write+ permission. Proceeding.")
+    # A rerun dispatches rerun-test.yml, which never passes through pr-gate.yml,
+    # so it is unthrottled either way; gate on what pr-gate waives the limit for.
+    if user_perms.get("cooldown_interval_minutes") == 0:
+        return True
 
-    if not (
-        user_perms.get("can_rerun_test", False)
-        or user_perms.get("can_rerun_stage", False)
-    ):
-        print("Permission denied: neither can_rerun_test nor can_rerun_stage is true.")
-        return False
+    commenter = comment.user.login
+    perm = gh_repo.get_collaborator_permission(commenter)
+    if perm in ("admin", "write"):
+        print(f"Commenter {commenter} has write+ permission. Proceeding.")
+        return True
 
-    return True
+    print(f"Permission denied: /{command_name} by {commenter} (permission: {perm}).")
+    comment.create_reaction("confused")
+    pr.create_issue_comment(
+        f"⛔ `/{command_name}` requires `cooldown_interval_minutes: 0` in "
+        "`.github/CI_PERMISSIONS.json`, or write permission on the repo.\n\n"
+        "Please ask a maintainer to run this command, or use the normal CI flow."
+    )
+    return False
 
 
 def handle_rerun_test(
@@ -1320,10 +1314,10 @@ def main():
     pr = repo.get_pull(pr_number)
     comment = repo.get_issue(pr_number).get_comment(comment_id)
 
-    # PR authors can always rerun failed CI and rerun individual UTs on their own PRs,
-    # even if they are not listed in CI_PERMISSIONS.json.
+    # PR authors can always rerun failed CI on their own PRs, even if they are not
+    # listed in CI_PERMISSIONS.json.
     # Note: /tag-run-ci-label still requires CI_PERMISSIONS.json.
-    # Note: /rerun-test is blocked entirely for fork PRs in handle_rerun_test() itself.
+    # Authorship grants nothing for /rerun-test; that gate reads the commenter.
     if pr.user.login == user_login:
         if user_perms is None:
             print(
@@ -1336,11 +1330,11 @@ def main():
                 f"User {user_login} is the PR author and has existing CI permissions."
             )
         user_perms["can_rerun_failed_ci"] = True
-        user_perms["can_rerun_test"] = True
 
-    if not user_perms:
-        print(f"User {user_login} does not have any configured permissions. Exiting.")
-        return
+    # No early exit on a missing entry: /rerun-test also gates on repo permission,
+    # so a write-holder absent from the file must still reach its handler.
+    if user_perms is None:
+        user_perms = {}
 
     # 4. Parse Command and Execute
     first_line = comment_body.split("\n")[0].strip()
@@ -1379,31 +1373,6 @@ def main():
             print("Combined command processed successfully; reaction added.")
         else:
             print("Combined command finished, but no actions were taken.")
-
-    elif first_line.startswith("/rerun-stage"):
-        print("/rerun-stage is deprecated; posting deprecation notice.")
-        comment.create_reaction("-1")
-        pr.create_issue_comment(
-            "⚠️ **`/rerun-stage` has been deprecated.**\n\n"
-            "Stage granularity is too coarse — a stage usually doesn't map to one "
-            "feature, so rerunning a stage re-pays the cost of unrelated tests. "
-            "If you don't know which exact test files to rerun, you shouldn't be "
-            "using `/rerun-stage` or `/rerun-test` in the first place.\n\n"
-            "**Use one of these instead:**\n"
-            "- **Selective tests** (you know exactly which files to rerun):\n"
-            "  ```\n"
-            "  /rerun-test test_foo.py test_bar.py\n"
-            "  ```\n"
-            "- **Rerun only failed jobs**:\n"
-            "  ```\n"
-            "  /rerun-failed-ci\n"
-            "  ```\n"
-            "- **Full CI rerun** (with extra coverage): add the `run-ci` or "
-            "`run-ci-extra` label and push a new commit (or use `/tag-and-rerun-ci`).\n\n"
-            "**AMD CI**: stage-level dispatch is still available via "
-            "Actions UI → *PR Test ROCm 7.2 (AMD)* (default) / *PR Test ROCm 7.0 (AMD)* → "
-            "*Run workflow* → pick a stage from the dropdown."
-        )
 
     elif first_line.startswith("/rerun-group"):
         group_names = first_line.split()[1:]

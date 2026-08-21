@@ -184,7 +184,7 @@ class LoRAPipeline(ComposedPipelineBase):
             )  # type: ignore
 
     def is_target_layer(self, module_name: str) -> bool:
-        if self.lora_target_modules is None:
+        if getattr(self, "lora_target_modules", None) is None:
             return True
         return any(
             target_name in module_name for target_name in self.lora_target_modules
@@ -348,12 +348,38 @@ class LoRAPipeline(ComposedPipelineBase):
 
         return converted_count
 
+    def _reject_lora_on_packed_weights(self) -> None:
+        """Fail before any layer is replaced if a target has no plain weight.
+
+        ``BaseLayerWithLoRA`` reads ``base_layer.weight``, which a
+        weight-packing quantization (GGUF) does not expose -- it registers
+        ``qweight``. Checking up front keeps a rejected request from leaving the
+        model half converted, and covers the dynamic ``set_lora`` API as well as
+        a startup ``--lora-path``.
+        """
+        for module_name in ("transformer", "transformer_2"):
+            module = self.modules.get(module_name)
+            if module is None:
+                continue
+            for name, layer in module.named_modules():
+                if not self.is_target_layer(name):
+                    continue
+                params = dict(layer.named_parameters(recurse=False))
+                if "weight" not in params and "qweight" in params:
+                    raise ValueError(
+                        f"LoRA is not supported on {module_name}.{name}: its "
+                        "weights are stored packed (GGUF), which an adapter "
+                        "cannot be merged into or applied alongside. Serve the "
+                        "unquantized checkpoint to use LoRA."
+                    )
+
     def convert_to_lora_layers(self) -> None:
         """
         Unified method to convert the transformer to a LoRA transformer.
         """
         if self.lora_initialized:
             return
+        self._reject_lora_on_packed_weights()
         self.lora_initialized = True
 
         # Convert transformer
@@ -895,6 +921,11 @@ class LoRAPipeline(ComposedPipelineBase):
             raise ValueError(
                 f"Invalid target(s): {invalid_targets}. Valid targets: {self.VALID_TARGETS}"
             )
+
+        # Checked before disabling offload, which materializes every layer: on a
+        # memory-constrained deployment that would OOM instead of returning the
+        # unsupported-LoRA error. Offloaded placeholders still carry the name.
+        self._reject_lora_on_packed_weights()
 
         # Disable layerwise offload before convert_to_lora_layers to ensure weights are accessible
         # This is critical because convert_to_lora_layers needs to save cpu_weight from actual weights,
