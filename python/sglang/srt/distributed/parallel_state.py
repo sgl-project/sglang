@@ -1818,17 +1818,28 @@ class GroupCoordinator:
         recv_src: Optional[int] = None,
         send_all_gather_group: Optional["GroupCoordinator"] = None,
         recv_all_gather_group: Optional["GroupCoordinator"] = None,
-    ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
+    ) -> Tuple[Optional[Dict[str, Union[torch.Tensor, Any]]], List[P2PWork]]:
         """Send tensor dict to *send_dst* and simultaneously recv from *recv_src*.
 
         Uses ``batch_isend_irecv`` to submit all send/recv operations
         atomically, avoiding deadlock on backends (e.g. NPU/HCCL) where
         ``isend`` may block until a matching ``recv`` is posted.
 
+        Returns ``(recv_tensor_dict, send_works)``. Only the recv requests
+        are waited for before returning; the send requests are returned as
+        ``P2PWork`` handles so the caller can commit them later. A send
+        request completes only after the peer has fully received the data,
+        so waiting on it inline would serialize this rank's subsequent
+        computation with the peer's progress (observed ~10% throughput
+        regression on NPU PP). Callers must eventually wait on the returned
+        works (e.g. on the next scheduler iteration), mirroring
+        ``send_tensor_dict(async_send=True)``.
+
         NOTE: ``send_dst`` / ``recv_src`` are local ranks within this group.
         """
+        send_works: List[P2PWork] = []
         if not torch.distributed.is_initialized() or self.world_size == 1:
-            return None
+            return None, send_works
 
         if send_dst is None:
             send_dst = (self.rank_in_group + 1) % self.world_size
@@ -1893,7 +1904,9 @@ class GroupCoordinator:
 
         # ---- 2. Prepare recv buffers and collect all tensor ops ----
         recv_tensor_dict: Dict[str, Any] = {}
-        tensor_ops: List[torch.distributed.P2POp] = []
+        send_ops: List[torch.distributed.P2POp] = []
+        send_payloads: List[torch.Tensor] = []
+        recv_ops: List[torch.distributed.P2POp] = []
         recv_tensor_info: List[
             Tuple[str, torch.Tensor, bool, Optional[torch.Size]]
         ] = []
@@ -1919,7 +1932,7 @@ class GroupCoordinator:
                     )[recv_all_gather_group.rank_in_group]
 
                 comm_group = metadata_group if tensor.is_cpu else group
-                tensor_ops.append(
+                recv_ops.append(
                     torch.distributed.P2POp(
                         torch.distributed.irecv,
                         tensor,
@@ -1933,7 +1946,7 @@ class GroupCoordinator:
             else:
                 recv_tensor_dict[key] = value
 
-        # Add send ops
+        # Collect send ops
         for tensor in send_tensor_list:
             if tensor.numel() == 0:
                 continue
@@ -1946,7 +1959,7 @@ class GroupCoordinator:
                     send_all_gather_group.world_size, -1
                 )[send_all_gather_group.rank_in_group]
             comm_group = metadata_group if send_t.is_cpu else group
-            tensor_ops.append(
+            send_ops.append(
                 torch.distributed.P2POp(
                     torch.distributed.isend,
                     send_t,
@@ -1954,12 +1967,24 @@ class GroupCoordinator:
                     group=comm_group,
                 )
             )
+            # Hold the (possibly sliced) tensor so its buffer stays alive
+            # until the deferred send work is committed.
+            send_payloads.append(send_t)
 
         # ---- 3. Batch exchange all tensors ----
-        if tensor_ops:
-            reqs = torch.distributed.batch_isend_irecv(tensor_ops)
-            for req in reqs:
+        # Submit sends first and recvs second (works are returned in op
+        # order), so the slicing below can split them.
+        if send_ops or recv_ops:
+            reqs = torch.distributed.batch_isend_irecv(send_ops + recv_ops)
+            # Wait only for the recvs, which gate the data dependency. The
+            # send works are handed back to the caller for a deferred
+            # commit so the transfers overlap with subsequent compute.
+            for req in reqs[len(send_ops) :]:
                 req.wait()
+            send_works.extend(
+                P2PWork(req, payload)
+                for req, payload in zip(reqs[: len(send_ops)], send_payloads)
+            )
 
         # ---- 4. Post-process received tensors (all_gather if needed) ----
         for key, tensor, use_all_gather, orig_shape in recv_tensor_info:
@@ -1968,7 +1993,7 @@ class GroupCoordinator:
                 tensor = tensor.reshape(orig_shape)
             recv_tensor_dict[key] = tensor
 
-        return recv_tensor_dict
+        return recv_tensor_dict, send_works
 
     def barrier(self):
         """Barrier synchronization among the group.
