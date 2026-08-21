@@ -279,7 +279,7 @@ class TestAbortOutputPayload(CustomTestCase):
     def test_abort_includes_prompt_token_ids_only_when_requested(self):
         """The abort chunk carries prompt_token_ids captured at tokenization,
         and omits the field when the request did not ask for them."""
-        tm = _make_tokenizer_manager()
+        tm = _make_tokenizer_manager(self)
         with_ids = _make_req_state("abort_prompt_ids_rid")
         with_ids.prompt_token_ids = [1, 2, 3]
         without_ids = _make_req_state("abort_no_prompt_ids_rid")
@@ -302,7 +302,7 @@ class TestAbortOutputPayload(CustomTestCase):
         ]
         for name, is_stream, incremental, expected in cases:
             with self.subTest(name):
-                tm = _make_tokenizer_manager()
+                tm = _make_tokenizer_manager(self)
                 tm.incremental_streaming_output = incremental
                 rid = f"abort_output_ids_{name}"
                 state = _make_req_state(rid)
