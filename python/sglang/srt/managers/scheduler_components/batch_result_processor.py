@@ -417,8 +417,11 @@ class SchedulerBatchResultProcessor:
                     x.tolist() for x in logits_output.next_token_top_logprobs_idx
                 ]
             if logits_output.next_token_token_ids_logprobs_val:
+                # Mixed batches use list placeholders for requests that do not
+                # ask for token-id logprobs.
                 logits_output.next_token_token_ids_logprobs_val = [
-                    v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
+                    v.tolist() if torch.is_tensor(v) else v
+                    for v in logits_output.next_token_token_ids_logprobs_val
                 ]
 
     def _apply_prefill_logprobs(
@@ -948,8 +951,11 @@ class SchedulerBatchResultProcessor:
                 ]
 
             if logits_output.next_token_token_ids_logprobs_val:
+                # Mixed batches use list placeholders for requests that do not
+                # ask for token-id logprobs.
                 logits_output.next_token_token_ids_logprobs_val = [
-                    v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
+                    v.tolist() if torch.is_tensor(v) else v
+                    for v in logits_output.next_token_token_ids_logprobs_val
                 ]
         return next_token_ids, next_token_logprobs
 
