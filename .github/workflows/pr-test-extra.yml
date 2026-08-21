@@ -149,6 +149,16 @@ jobs:
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit
 
+  simulator-test-cpu:
+    needs: [check-changes, call-gate, rust-ext-build]
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
+    uses: ./.github/workflows/_pr-test-simulator-cpu.yml
+    with:
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+    # No `secrets: inherit`: this hosted CPU job has no secret consumer.
+
   # =============================================== extra-a (1-/2-gpu) ===============================================
   extra-a-test-1-gpu-small:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
@@ -249,6 +259,7 @@ jobs:
         call-gate,
         sgl-kernel-build-wheels,
         rust-ext-build,
+        simulator-test-cpu,
         extra-a-test-1-gpu-small,
         extra-a-test-1-gpu-large,
         extra-a-test-2-gpu-large,
