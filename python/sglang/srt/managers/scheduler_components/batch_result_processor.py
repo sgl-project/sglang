@@ -1034,9 +1034,22 @@ class SchedulerBatchResultProcessor:
                 )
 
             if req.return_sampling_mask:
-                # return_sampling_mask + speculative decoding is rejected at
-                # request entry, so this remains one support mask per token.
-                self.add_sampling_mask_return_values(i, req, logits_output)
+                # DFlash-family workers emit one sampling support per accepted
+                # token, so this remains one support mask per token.
+                num_mask_tokens = new_accept_len
+                if req.finished_len is not None:
+                    previous_output_len = len(req.output_ids) - new_accept_len
+                    num_mask_tokens = min(
+                        num_mask_tokens,
+                        max(0, req.finished_len - previous_output_len),
+                    )
+                self.add_sampling_mask_return_values(
+                    i,
+                    req,
+                    logits_output,
+                    num_tokens=num_mask_tokens,
+                    speculative=is_spec,
+                )
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 # hidden_states is [bs * stride, hidden_dim], one row per emitted
@@ -1161,12 +1174,18 @@ class SchedulerBatchResultProcessor:
         i: int,
         req: Req,
         output: LogitsProcessorOutput,
+        *,
+        num_tokens: int = 1,
+        speculative: bool = False,
     ) -> None:
         """Attach sparse sampling support metadata to the return values."""
-        req.sampling_mask_rows.append(
-            output.next_token_sampling_mask_idx[i],
-            output.next_token_sampling_logprobs[i],
-        )
+        masks = output.next_token_sampling_mask_idx[i]
+        logprobs = output.next_token_sampling_logprobs[i]
+        if speculative:
+            for token in range(num_tokens):
+                req.sampling_mask_rows.append(masks[token], logprobs[token])
+        else:
+            req.sampling_mask_rows.append(masks, logprobs)
 
     @staticmethod
     def materialize_sampling_mask_output(
@@ -1194,20 +1213,66 @@ class SchedulerBatchResultProcessor:
             if sampling_output.support_logprobs is None
             else sampling_output.support_logprobs.cpu().numpy()
         )
+        output_lens = (
+            None
+            if getattr(sampling_output, "output_lens", None) is None
+            else sampling_output.output_lens.tolist()
+        )
+        assert output_lens is None or len(batch_indices) == len(output_lens)
+        packed_width = token_ids.shape[-1]
         support_row = 0
         for row, batch_index in enumerate(batch_indices):
             returns_support_logprobs = (
                 reqs[batch_index].sampling_logprobs_mode == "support"
             )
-            status = int(statuses[row])
-            length = int(lengths[row])
+            if output_lens is None:
+                row_output_len = None
+                row_lengths = [int(lengths[row])]
+                row_statuses = [int(statuses[row])]
+            else:
+                row_output_len = int(output_lens[row])
+                if not 0 <= row_output_len <= token_ids.shape[1]:
+                    row_output_len = 0
+                    row_statuses = [int(SamplingMaskStatus.INVALID)]
+                    row_lengths = []
+                else:
+                    row_statuses = [
+                        int(value) for value in statuses[row][:row_output_len]
+                    ]
+                    row_lengths = [
+                        int(value) for value in lengths[row][:row_output_len]
+                    ]
+
+            status = max(row_statuses, default=int(SamplingMaskStatus.OK))
+            if status == SamplingMaskStatus.OK and any(
+                not 0 <= length <= packed_width for length in row_lengths
+            ):
+                status = SamplingMaskStatus.INVALID
             status_by_batch[batch_index] = status
             if status == SamplingMaskStatus.OK:
-                masks[batch_index] = token_ids[row, :length]
-                if returns_support_logprobs:
-                    logprobs[batch_index] = support_logprobs[support_row, :length]
+                if row_output_len is None:
+                    masks[batch_index] = token_ids[row, : row_lengths[0]]
+                    logprobs[batch_index] = (
+                        support_logprobs[support_row, : row_lengths[0]]
+                        if returns_support_logprobs
+                        else selected_logprobs[row : row + 1]
+                    )
                 else:
-                    logprobs[batch_index] = selected_logprobs[row : row + 1]
+                    masks[batch_index] = [
+                        token_ids[row, token, :length]
+                        for token, length in enumerate(row_lengths)
+                    ]
+                    logprobs[batch_index] = (
+                        [
+                            support_logprobs[support_row, token, :length]
+                            for token, length in enumerate(row_lengths)
+                        ]
+                        if returns_support_logprobs
+                        else [
+                            selected_logprobs[row, token : token + 1]
+                            for token in range(row_output_len)
+                        ]
+                    )
             if returns_support_logprobs:
                 support_row += 1
 
