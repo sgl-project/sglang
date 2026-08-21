@@ -14,7 +14,7 @@ from sglang.kernels.ops.speculative.reject_sampling import (
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
-    build_dflash_verify_target_probs,
+    build_speculative_verify_target_probs,
     compute_dflash_correct_drafts_and_bonus,
 )
 
@@ -97,7 +97,7 @@ def _accept_sampling_core(
             rows_per_request=verify_num_draft_tokens,
         ).view(bs, verify_num_draft_tokens, -1)
     else:
-        target_probs = build_dflash_verify_target_probs(
+        target_probs = build_speculative_verify_target_probs(
             next_token_logits=target_logits,
             sampling_info=sampling_info,
             draft_token_num=verify_num_draft_tokens,
