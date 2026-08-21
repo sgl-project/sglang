@@ -66,9 +66,13 @@ commit out rather than tracking a moving branch.
 **The RTX 5090 recipes are pinned to that same commit**, DSpark included. A
 draft model plus the automatic prefill CUDA-graph capture no longer fit at the
 mem-fractions the older builds allowed, so DSpark on this card serves at 0.89
-(fp32) and 0.88 (bf16) rather than 0.92 / 0.90. EAGLE, MTP and no-speculation
-keep their pins on every card, and the other platforms — H200, RTX PRO 6000,
-DGX Spark, GB300 — run the pinned tag as written.
+(fp32) and 0.88 (bf16) rather than 0.92 / 0.90. **The DGX Spark grid was
+re-measured end to end on that same commit** — all 48 cells serve, DFLASH2
+included, with the platform's base mem-fraction moved to 0.80 (see
+Configuration Tips for why 0.85 collides with the host's earlyoom on unified
+memory). EAGLE, MTP and no-speculation keep their pins on every card, and the
+remaining platforms — H200, RTX PRO 6000, GB300 — run the pinned tag as
+written.
 </Warning>
 
 </Accordion>
@@ -106,17 +110,17 @@ import { Qwen38MambaRatioCalculator } from "/src/snippets/_qwen38_mamba_ratio_ca
   Decoding / Serving Strategy / SSM dtype combination — were validated at
   ISL 8192 / OSL 1024, concurrency 1; for DFLASH2, to that full standard on
   NVFP4 and to boot-and-serve on the RTX PRO 6000 BF16/FP8 cells. The DGX Spark
-  cells cover the same combination set minus DFLASH2, but to a weaker standard:
-  each was confirmed to **boot and serve** at ISL 8192 / OSL 1024,
-  concurrency 1, with no throughput or acceptance-length numbers taken. The
-  H200 and GB300 recipes carry their original validation, which covers the
-  default overlay picks (plus MTP on GB300); non-default overlay picks there
-  are valid but unmeasured.
+  cells cover the full combination set — DFLASH2 included — re-measured end to
+  end on `1cf2b8c`, but to a weaker standard: each of the 48 was confirmed to
+  **boot and serve** at ISL 8192 / OSL 1024, concurrency 1, with no throughput
+  or acceptance-length numbers taken. The H200 and GB300 recipes carry their
+  original validation, which covers the default overlay picks (plus MTP on
+  GB300); non-default overlay picks there are valid but unmeasured.
 
-  DFLASH2 has not been exercised on H200, DGX Spark or GB300: selecting it
-  there switches the cell's badge to **Final Verification In Progress** until
-  that round lands. The other picks on those platforms keep the validation
-  described above.
+  DFLASH2 has not been exercised on H200 or GB300: selecting it there switches
+  the cell's badge to **Final Verification In Progress** until that round
+  lands. The other picks on those platforms keep the validation described
+  above.
 </Note>
 
 ### Mamba ratio calculator
@@ -235,17 +239,26 @@ checkpoint's calibration scales automatically.
   requires a FlashInfer build whose prefill `plan` accepts `uniform_q_len`
   (newer than 0.6.15.post1); otherwise run spec with `--attention-backend triton`.
   On DGX Spark the 128GB is unified memory shared with the host CPU, so all
-  three checkpoints fit, and its cells reuse the RTX PRO 6000 recipe verbatim
-  rather than a separate operating point. **Validated on SM121 / aarch64**: all
-  36 configurations (3 checkpoints x Speculative Decoding x Serving Strategy x
-  Mamba SSM Dtype) booted and served on GB10 under `lmsysorg/sglang:qwen38-27b`
-  at ISL 8192 / OSL 1024, concurrency 1. That is boot-and-serve coverage only —
-  no throughput or acceptance-length numbers — and it includes the FlashInfer `plan` /
-  `uniform_q_len` path above, which raised no arity error on that image. Two
-  host quirks when reproducing on GB10: docker GPU access is CDI-only
-  (`--device nvidia.com/gpu=all`, as no `nvidia` runtime is registered), and
-  `nvidia-smi` reports `Not Supported` for memory because it is unified with the
-  CPU — gate a relaunch on `MemAvailable` in `/proc/meminfo` instead.
+  three checkpoints fit, and its cells reuse the RTX PRO 6000 recipe at
+  `--mem-fraction-static 0.80` rather than a separate operating point. The one
+  lower pin is the unified pool pricing the host's memory too: 0.85 of 128GB
+  leaves ~8GB for the OS — exactly DGX OS earlyoom's SIGTERM threshold — and
+  the first long prefill or boot-time graph capture dips under it and gets the
+  scheduler killed with `exit code -15` and no traceback (`journalctl -u
+  earlyoom` shows the kill). At 0.85, 15 of the 48 cells were killed that way,
+  and which cells is margin noise; at 0.80 every cell served on every attempt.
+  **Validated on SM121 / aarch64**: all 48 configurations (3 checkpoints x
+  Speculative Decoding x Serving Strategy x Mamba SSM Dtype, DFLASH2 included)
+  booted and served on GB10 at `1cf2b8c` at ISL 8192 / OSL 1024, concurrency 1.
+  That is boot-and-serve coverage only — no throughput or acceptance-length
+  numbers — and it includes the FlashInfer `plan` / `uniform_q_len` path above,
+  which raised no arity error on that build. Three host quirks when reproducing
+  on GB10: docker GPU access is CDI-only (`--device nvidia.com/gpu=all`, as no
+  `nvidia` runtime is registered); `nvidia-smi` reports `Not Supported` for
+  memory because it is unified with the CPU — gate a relaunch on `MemAvailable`
+  in `/proc/meminfo` instead; and the BF16 checkpoint takes ~6.5 minutes just
+  to load its 18 shards from NVMe, so budget ~10 minutes to READY before
+  calling a boot hung.
 - **H200 (SM90)**: BF16 and FP8 only — the card has no FP4 tensor cores, so the
   NVFP4 checkpoint's MLP would fall back to the Marlin W4A16 weight-only path
   and its cell is greyed out. The H200 recipes use 32768-token prefill chunks
@@ -281,9 +294,10 @@ checkpoint's calibration scales automatically.
   including quantized heads, so it runs on the NVFP4 checkpoint (whose head
   is NVFP4-packed; the BF16 and FP8 checkpoints keep a dense head).
   Validation: NVFP4 measured end-to-end on RTX PRO 6000 and RTX 5090; the
-  RTX PRO 6000 BF16/FP8 cells boot and serve; on H200, DGX Spark and GB300
-  those cells carry the **Final Verification In Progress**
-  badge. The
+  RTX PRO 6000 BF16/FP8 cells boot and serve; all 12 DGX Spark DFLASH2 cells
+  boot and serve on `1cf2b8c` with the selector folded into the draft CUDA
+  graph; on H200 and GB300 those cells carry the
+  **Final Verification In Progress** badge. The
   RTX PRO 6000 recipe needs no changes. On the 32GB RTX 5090 every pin is
   re-measured against that commit, and the panel applies them automatically:
   DFlash2 at `--mem-fraction-static 0.91` with `--chunked-prefill-size 1024` —

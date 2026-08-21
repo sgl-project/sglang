@@ -551,32 +551,41 @@ export const config = {
     },
     // DGX Spark (GB10, SM121): single node, 128GB coherent unified memory
     // shared with the CPU — every checkpoint fits, so all three quants get a
-    // cell. These cells reuse the RTX PRO 6000 recipe verbatim rather than a
-    // separate SM121 operating point: both cards are SM12x Blackwell, and
-    // GB10's 128GB unified pool is larger than the 6000's 96GB, so a recipe
-    // that fits the smaller card has headroom here.
+    // cell. These cells reuse the RTX PRO 6000 recipe at one lower
+    // mem-fraction rather than a separate SM121 operating point: both cards
+    // are SM12x Blackwell, and GB10's 128GB unified pool is larger than the
+    // 6000's 96GB, so a recipe that fits the smaller card has headroom here.
     //
-    // Validated on GB10 (SM121 / aarch64): all 36 configurations booted and
-    // served at ISL 8192 / OSL 1024, concurrency 1. Boot-and-serve only -- no
-    // throughput or acceptance-length numbers were taken, so this is a weaker
-    // standard than the SM120 pair's validation, and the Deploy-panel Note says
-    // so.
+    // Why 0.80 and not the 0.85 every other SM12x cell pins: the pool is
+    // unified, so mem-fraction prices the HOST's memory too. 0.85 of 128GB
+    // leaves ~8GB for the OS — exactly DGX OS earlyoom's SIGTERM threshold —
+    // and the first long prefill or boot-time graph capture dips under it and
+    // gets the scheduler killed (exit code -15, no traceback; check
+    // `journalctl -u earlyoom`). Re-measured on 1cf2b8c (2026-08-21): at 0.85,
+    // 15 of 48 cells were SIGTERMed, and which 15 is margin noise, biased
+    // toward the big-state configs (bfloat16 SSM, DSPARK/DFLASH2 ratios); at
+    // 0.80 every cell served on every attempt.
+    //
+    // Validated on GB10 (SM121 / aarch64) at 1cf2b8c: all 48 configurations —
+    // DFLASH2 included — booted and served at ISL 8192 / OSL 1024,
+    // concurrency 1. Boot-and-serve only -- no throughput or acceptance-length
+    // numbers were taken, so this is a weaker standard than the SM120 pair's
+    // validation, and the Deploy-panel Note says so. NVFP4 was exercised with
+    // the BF16-LMHead export (same as the SM120 re-measurement); the
+    // packed-head export also served its DFLASH2 cells on this platform in the
+    // 12-cell DFLASH2 pass.
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", nodes: "single" },
-      // All 12 overlay combinations served on GB10. DSPARK here also
-      // exercises the 4-bit `lm_head` this checkpoint quantizes, with no shape
-      // error.
+      // All 16 overlay combinations served on GB10 at 1cf2b8c, DFLASH2
+      // included — its selector folded into the draft CUDA graph in all four
+      // of its cells here.
       verified: true,
-      // DFLASH2 has not been exercised on this platform; every other overlay
-      // pick keeps this cell's original validation.
-      verificationStatus: (sel) =>
-        sel.spec === "dflash" ? "in-progress" : "verified",
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--kv-cache-dtype fp8_e4m3",
-        "--mem-fraction-static 0.85",
+        "--mem-fraction-static 0.80",
         "--attention-backend flashinfer",
         "--chunked-prefill-size 2048",
         "--reasoning-parser qwen3",
@@ -587,18 +596,16 @@ export const config = {
     },
     {
       match: { hw: "dgx-spark", variant: "default", quant: "fp8", nodes: "single" },
-      // All 12 overlay combinations served on GB10.
+      // All 16 overlay combinations served on GB10 at 1cf2b8c, DFLASH2
+      // included. This checkpoint held the sweep's most earlyoom-prone cells
+      // at 0.85 (every bfloat16-SSM pick was killed); all clean at 0.80.
       verified: true,
-      // DFLASH2 has not been exercised on this platform; every other overlay
-      // pick keeps this cell's original validation.
-      verificationStatus: (sel) =>
-        sel.spec === "dflash" ? "in-progress" : "verified",
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--kv-cache-dtype fp8_e4m3",
-        "--mem-fraction-static 0.85",
+        "--mem-fraction-static 0.80",
         "--attention-backend flashinfer",
         "--chunked-prefill-size 2048",
         "--reasoning-parser qwen3",
@@ -609,19 +616,16 @@ export const config = {
     },
     {
       match: { hw: "dgx-spark", variant: "default", quant: "bf16", nodes: "single" },
-      // All 12 overlay combinations served on GB10. Heaviest checkpoint, so
-      // it holds the sweep's tightest cell: DSPARK + float32 + extra_buffer.
+      // All 16 overlay combinations served on GB10 at 1cf2b8c, DFLASH2
+      // included. Heaviest checkpoint (52GB, ~6.5 min to load its 18 shards
+      // from NVMe — budget ~10 min to READY before calling a boot hung).
       verified: true,
-      // DFLASH2 has not been exercised on this platform; every other overlay
-      // pick keeps this cell's original validation.
-      verificationStatus: (sel) =>
-        sel.spec === "dflash" ? "in-progress" : "verified",
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--kv-cache-dtype fp8_e4m3",
-        "--mem-fraction-static 0.85",
+        "--mem-fraction-static 0.80",
         "--attention-backend flashinfer",
         "--chunked-prefill-size 2048",
         "--reasoning-parser qwen3",
