@@ -1204,6 +1204,21 @@ host RAM sits behind it. H3's weights are about 108 GB — 61.73 GB of DiT and
 46.18 GB of text encoder — so no consumer configuration holds them all, and where
 the shortfall lands decides the throughput.
 
+**The command** — most consumer machines need exactly one flag beyond the model:
+
+```bash consumer single GPU, lossless
+sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
+  --layerwise-offload-components dit,text_encoder,vae
+```
+
+With 16 GB of VRAM or more, add `--layerwise-resident-layers video_vae=36` for
+the 13 s decode; with ~96 GB of host RAM and 16 GB+ of VRAM, add
+`--dit-layerwise-resident-layers 4` for the 6 s step. That is the whole flag
+surface. The [builder at the top of this page](#1-quick-start) has consumer
+cards and a Host RAM selector: pick your budget and it emits this command with
+your tier's measured expectations attached as comments. The table below is the
+same data in one view.
+
 **Two budgets, and what each one buys**
 
 | | 12 GB VRAM + 32 GB host | host free, VRAM 16 GB |
@@ -1283,6 +1298,27 @@ Recipe B pins 116.7 GB of host memory (DiT 61.56 GB, text encoder 46.18 GB, VAE
 - Recipe A's flags are what the automatic policy should choose on its own. Until
   the model declares its own placement, `--performance-mode memory` plus the
   explicit component list is what makes it happen; pass them.
+
+**Reading the startup log**
+
+The server prints the memory decisions it made; checking three lines against
+your budget catches a mis-set machine in the first minute instead of the first
+request.
+
+- `Layerwise offload: host memory available: N GiB` — what the runtime sees
+  after loading, not your DIMM size. On a 32 GB host expect single digits here;
+  a much larger number means another process's memory accounting (or a
+  container limit) is in play.
+- `leaving N GiB of weights on the checkpoint mapping` — the expected line on a
+  32 GB host: the DiT streams from the checkpoint file. If instead the log
+  reports pinned weights, the runtime decided your host has room — which is
+  faster, and means the 32 GB figures above do not apply to you.
+- `Loaded video_vae: ... host mmap` vs `host pageable` — where the VAE's 9.7 GB
+  landed. `Loaded <component>` lines carry the same buckets for every component.
+
+If a request dies after the denoise finishes, it is the decode: you are holding
+`video_vae=36` on a card without room for it. Drop the flag and take the
+streamed decode.
 
 **Against ComfyUI, on the same weights**
 

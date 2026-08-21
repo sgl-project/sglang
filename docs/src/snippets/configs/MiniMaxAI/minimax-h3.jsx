@@ -6,6 +6,52 @@
 // deployment command engine.
 
 
+// Single-GPU consumer cards run H3 lossless through layerwise offload. The
+// flags carry only what differs from the defaults; what changes with the
+// machine is the expectation, which the hints spell out per budget. Measured
+// on one RTX 4090 (denoise medians across interleaved runs, outputs verified
+// end to end); 48-64 GB hosts sit between the measured points.
+const CONSUMER_SINGLE = ["rtx4070", "rtx4080", "rtx4090"];
+const CONSUMER_VRAM_16_PLUS = ["rtx4080", "rtx4090"];
+
+function consumerFlags(s) {
+  const flags = ["--layerwise-offload-components dit,text_encoder,vae"];
+  if (CONSUMER_VRAM_16_PLUS.includes(s.hw)) {
+    // 9 GB of VAE blocks held on the device turn the 3.5 min streamed decode
+    // into 13 s. At 12 GB the decode's own activations need that room: the
+    // denoise completes and the decode OOMs, so the flag is 16 GB and up.
+    flags.push("--layerwise-resident-layers video_vae=36");
+    if (s.host_ram === "ram96") flags.push("--dit-layerwise-resident-layers 4");
+  }
+  return flags;
+}
+
+function consumerHints(s) {
+  const hints = [];
+  const bigHost = s.host_ram === "ram96";
+  const midHost = s.host_ram === "ram64";
+  if (bigHost) {
+    if (CONSUMER_VRAM_16_PLUS.includes(s.hw)) {
+      hints.push("verified end to end: ~6 s per denoise step, 13 s decode");
+    } else {
+      hints.push("~6 s per step once the host pins the DiT; the decode still streams (~3.5 min) because 12 GB cannot hold the VAE blocks");
+    }
+    return hints;
+  }
+  if (CONSUMER_VRAM_16_PLUS.includes(s.hw)) {
+    hints.push("measured: ~17-18 s per denoise step, 13 s decode with the VAE blocks held");
+  } else {
+    hints.push("measured: ~17-18 s per denoise step; the decode streams (~3.5 min); output verified end to end");
+  }
+  if (midHost) {
+    hints.push("48-64 GB hosts land between the 32 GB and 96 GB figures; this tier is not individually verified");
+  } else {
+    hints.push("a 32 GB host cannot cache the 108 GB checkpoint: NVMe is required, and real runs land above the quoted step time");
+  }
+  hints.push('the startup log should say "leaving ... GiB of weights on the checkpoint mapping" -- if it does not, the host is not the constraint you set');
+  return hints;
+}
+
 export const config = {
   modelName: "MiniMax-H3",
 
@@ -17,15 +63,34 @@ export const config = {
     "mi300x",
     "mi355x",
     "rtx5090",
+    "rtx4090",
+    "rtx4080",
+    "rtx4070",
   ],
   hardware: [
     { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "consumer" },
+    { id: "rtx4090", label: "RTX 4090", vram: "24GB", vendor: "consumer" },
+    { id: "rtx4080", label: "16 GB class", vram: "16GB", vendor: "consumer" },
+    { id: "rtx4070", label: "12 GB class", vram: "12GB", vendor: "consumer" },
   ],
   groupHardware: false,
 
   matchDims: [],
 
   overlayDims: [
+    {
+      id: "host_ram",
+      title: "Host RAM",
+      scope: "serve",
+      description: "System memory decides where the DiT weights wait between steps: pinned when they fit, on the checkpoint mapping when they do not.",
+      default: "ram32",
+      showWhen: (s) => CONSUMER_SINGLE.includes(s.hw),
+      options: [
+        { id: "ram32", label: "32 GB" },
+        { id: "ram64", label: "48-64 GB" },
+        { id: "ram96", label: "96 GB+" },
+      ],
+    },
     {
       id: "weights",
       title: "Checkpoint Weights",
@@ -120,6 +185,7 @@ export const config = {
           id: "auto",
           label: "Auto",
           flags: (s) => {
+            if (CONSUMER_SINGLE.includes(s.hw)) return consumerFlags(s);
             const recipe = config.commandBuilder.resource.verifiedRecipes.find((entry) =>
               entry.hw === s.hw && entry.nodes === Number(s.nodes)
               && entry.gpus_per_node === Number(s.gpus_per_node));
@@ -133,13 +199,16 @@ export const config = {
                 "--enable-torch-compile false",
               ] : ["--performance-mode speed"];
           },
+          hints: (s) => (CONSUMER_SINGLE.includes(s.hw) ? consumerHints(s) : []),
           description: "Use the recommended placement for the selected hardware and resource shape.",
         },
         {
           id: "resident",
           label: "Resident",
           flags: ["--performance-mode speed"],
-          recommendedWhen: (s) => s.hw !== "rtx5090",
+          disabled: (s) => CONSUMER_SINGLE.includes(s.hw),
+          disableReason: "The 61.7 GB DiT cannot be resident on a single consumer card.",
+          recommendedWhen: (s) => s.hw !== "rtx5090" && !CONSUMER_SINGLE.includes(s.hw),
           description: "Lowest-latency path when the full pipeline fits in aggregate GPU memory.",
         },
         {
@@ -383,6 +452,9 @@ export const config = {
         { id: "mi355x-resident-4", hw: "mi355x", nodes: 1, gpus_per_node: 4, placement: "resident", tp_size: 1, ulysses_degree: 4, ring_degree: 1, encoder: "auto" },
         { id: "mi355x-resident-8", hw: "mi355x", nodes: 1, gpus_per_node: 8, placement: "resident", tp_size: 1, ulysses_degree: 8, ring_degree: 1, encoder: "auto", default: true },
         { id: "rtx5090-offload-2", hw: "rtx5090", nodes: 1, gpus_per_node: 2, placement: "offload", tp_size: 2, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
+        { id: "rtx4090-offload-1", hw: "rtx4090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
+        { id: "rtx4080-offload-1", hw: "rtx4080", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
+        { id: "rtx4070-offload-1", hw: "rtx4070", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
       ],
       autoTopology: (s) => {
         const recipes = config.commandBuilder.resource.verifiedRecipes;
@@ -437,11 +509,16 @@ export const config = {
         && entry.ulysses_degree === topology.ulysses_degree
         && entry.ring_degree === topology.ring_degree);
       const resolvedPlacement = s.placement === "auto"
-        ? (automaticRecipe?.placement || (s.hw === "rtx5090" ? "offload" : "resident"))
+        ? (automaticRecipe?.placement
+          || (s.hw === "rtx5090" || CONSUMER_SINGLE.includes(s.hw) ? "offload" : "resident"))
         : s.placement;
       const coverageWarnings = [];
-      if (resolvedPlacement === "offload" && s.hw !== "rtx5090") {
-        coverageWarnings.push("Layerwise offload is tuned and verified on RTX 5090; on this hardware it runs unverified and a resident recipe is faster.");
+      if (resolvedPlacement === "offload" && s.hw !== "rtx5090"
+        && !CONSUMER_SINGLE.includes(s.hw)) {
+        coverageWarnings.push("Layerwise offload is tuned and verified on consumer cards; on this hardware it runs unverified and a resident recipe is faster.");
+      }
+      if (CONSUMER_SINGLE.includes(s.hw) && s.host_ram === "ram64") {
+        coverageWarnings.push("48-64 GB hosts sit between the measured 32 GB and 96 GB points and have not been through their own verification round.");
       }
       if (resolvedPlacement === "fsdp" && (s.nodes !== 1 || !["b200", "b300", "h200", "h100"].includes(s.hw))) {
         coverageWarnings.push("FSDP outside the single-node NVIDIA recipes runs unverified.");
