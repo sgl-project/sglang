@@ -276,9 +276,7 @@ class RayEngine(Engine):
     PlacementGroup handle, not a ServerArgs field).
     """
 
-    def __init__(
-        self, *, placement_group: Optional[PlacementGroup] = None, **kwargs
-    ):
+    def __init__(self, *, placement_group: Optional[PlacementGroup] = None, **kwargs):
         with _placement_group_context(placement_group):
             super().__init__(**kwargs)
 
