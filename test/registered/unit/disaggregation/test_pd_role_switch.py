@@ -312,6 +312,11 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
             self._run(self._sa(dp_size=2))
         self.assertIn("data parallelism", str(ctx.exception))
 
+    def test_reject_decode_context_parallelism(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._run(self._sa(dcp_size=2))
+        self.assertIn("decode context parallelism", str(ctx.exception))
+
     def test_reject_speculative_decoding(self):
         with self.assertRaises(ValueError) as ctx:
             self._run(self._sa(speculative_algorithm="EAGLE"))

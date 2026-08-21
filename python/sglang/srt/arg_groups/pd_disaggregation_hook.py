@@ -140,6 +140,10 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 unsupported.append(f"pipeline parallelism (--pp-size {view.pp_size})")
             if view.dp_size > 1:
                 unsupported.append(f"data parallelism (--dp-size {view.dp_size})")
+            if view.dcp_size > 1:
+                unsupported.append(
+                    f"decode context parallelism (--dcp-size {view.dcp_size})"
+                )
             if view.speculative_algorithm is not None:
                 unsupported.append(
                     "speculative decoding "
