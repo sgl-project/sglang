@@ -18,19 +18,56 @@ from safetensors.torch import safe_open
 from torch.distributed.tensor import DTensor
 from tqdm.auto import tqdm
 
-try:
-    from runai_model_streamer import SafetensorsStreamer
-
-    HAS_RUNAI_MODEL_STREAMER = True
-except ImportError:
-    HAS_RUNAI_MODEL_STREAMER = False
-
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
+from sglang.multimodal_gen.runtime.loader.weight_readers import (
+    FALLBACK_READER,
+    RunaiStreamerReader,
+    select_weight_reader,
+)
+from sglang.multimodal_gen.runtime.loader.weight_readers.runai_streamer import (
+    HAS_RUNAI_MODEL_STREAMER,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def _disable_runai_streamer_rank_discovery_collective() -> None:
+    """RunAI Model Streamer's ``find_local_ranks()`` fires a full-world
+    collective on the first ``stream_files()`` of every streamer instance even
+    when the caller passes ``is_distributed=False`` — it only populates an env
+    var for the library's distributed-streaming path, which this loader never
+    uses (each rank loads its own full copy). Ranks reach it with divergent
+    timing, so it can fire out of lockstep and hang
+    (https://github.com/run-ai/runai-model-streamer/issues/84).
+
+    Patch it to the single-process early return it already has; the only
+    behavior lost is the collective this loader never wanted.
+    """
+    try:
+        from runai_model_streamer.distributed_streamer.distributed_streamer import (
+            _distributedStreamerParams,
+        )
+    except ImportError:
+        return
+    if not hasattr(_distributedStreamerParams, "find_local_ranks"):
+        logger.warning(
+            "runai_model_streamer find_local_ranks not found; skipping the "
+            "rank-discovery-collective workaround (multi-rank loads may hang, "
+            "see run-ai/runai-model-streamer#84)."
+        )
+        return
+
+    def _find_local_ranks_no_collective(self):
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        return 1, rank, [[rank]]
+
+    _distributedStreamerParams.find_local_ranks = _find_local_ranks_no_collective
+
+
+if HAS_RUNAI_MODEL_STREAMER:
+    _disable_runai_streamer_rank_discovery_collective()
 
 # use system-level temp directory for file locks, so that multiple users
 # can share the same lock without error.
@@ -54,6 +91,12 @@ def get_lock(model_name_or_path: str | Path, cache_dir: str | None = None):
     hash_name = hashlib.sha256(model_name.encode()).hexdigest()
     # add hash to avoid conflict with old users' lock files
     lock_file_name = hash_name + model_name + ".lock"
+    # Linux filesystems commonly cap one filename at 255 bytes. Absolute
+    # snapshot paths can exceed that even though the full path is valid.
+    # The digest is already collision-resistant, so fall back to it alone
+    # while preserving the historical name for ordinary paths.
+    if len(os.fsencode(lock_file_name)) > 255:
+        lock_file_name = hash_name + ".lock"
     # mode 0o666 is required for the filelock to be shared across users
     lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
     return lock
@@ -117,55 +160,38 @@ def filter_files_not_needed_for_inference(hf_weights_files: list[str]) -> list[s
 _BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]\n"  # noqa: E501
 
 
-def _validate_safetensors_file(file_path: str) -> bool:
-    """
-    Validate that a safetensors file is readable and not corrupted.
-
-    Args:
-        file_path: Path to the safetensors file
-
-    Returns:
-        True if file is valid, False if corrupted
-    """
-    try:
-        with safe_open(file_path, framework="pt", device="cpu") as f:
-            _ = list(f.keys())
-        return True
-    except Exception as e:
-        logger.error(
-            "Corrupted safetensors file detected: %s - %s: %s",
-            file_path,
-            type(e).__name__,
-            str(e),
-        )
-        return False
-
-
-def _raise_if_duplicate_safetensors_keys(hf_weights_files: list[str]) -> None:
-    """Fail fast when multiple safetensors files define the same tensor name. Make sure runtime behavior is deterministic
-
-    Duplicate keys across files are almost always a packaging error for inference:
-    for example shipping both full and fp16 variants, or mixing consolidated and
-    sharded checkpoints. Continuing would make the final loaded value depend on
-    file iteration or streamer delivery order.
-    """
-    if len(hf_weights_files) <= 1:
-        return
-
+def _scan_safetensors_files(
+    hf_weights_files: list[str],
+) -> tuple[list[str], dict[str, set[str]]]:
+    """Validate headers and detect cross-file duplicate keys in one pass."""
+    corrupted_files: list[str] = []
     key_to_file: dict[str, str] = {}
     duplicate_files_by_key: dict[str, set[str]] = defaultdict(set)
 
     for st_file in hf_weights_files:
-        with safe_open(st_file, framework="pt", device="cpu") as f:
-            for name in f.keys():  # noqa: SIM118
-                previous_file = key_to_file.get(name)
-                if previous_file is None:
-                    key_to_file[name] = st_file
-                    continue
-                if previous_file == st_file:
-                    continue
-                duplicate_files_by_key[name].update((previous_file, st_file))
+        try:
+            with safe_open(st_file, framework="pt", device="cpu") as f:
+                for name in f.keys():  # noqa: SIM118
+                    previous_file = key_to_file.get(name)
+                    if previous_file is None:
+                        key_to_file[name] = st_file
+                    elif previous_file != st_file:
+                        duplicate_files_by_key[name].update((previous_file, st_file))
+        except Exception as e:
+            logger.error(
+                "Corrupted safetensors file detected: %s - %s: %s",
+                st_file,
+                type(e).__name__,
+                str(e),
+            )
+            corrupted_files.append(st_file)
 
+    return corrupted_files, duplicate_files_by_key
+
+
+def _raise_if_duplicate_safetensors_keys(
+    duplicate_files_by_key: dict[str, set[str]],
+) -> None:
     if not duplicate_files_by_key:
         return
 
@@ -204,17 +230,22 @@ def safetensors_weights_iterator(
         device = str(checkpoint_device)
     else:
         device = "cpu" if to_cpu else str(get_local_torch_device())
-    if use_runai_model_streamer is None:
-        use_runai_model_streamer = (
-            HAS_RUNAI_MODEL_STREAMER and envs.SGLANG_USE_RUNAI_MODEL_STREAMER
+    # The caller may still pass the old boolean; map it onto a backend name so
+    # there is one place that decides, and it is the place that knows which
+    # backends can skip keys.
+    requested = None
+    if use_runai_model_streamer is not None:
+        requested = (
+            RunaiStreamerReader.name
+            if use_runai_model_streamer
+            else FALLBACK_READER.name
         )
+    backend = select_weight_reader(
+        requested=requested, needs_key_filter=key_filter is not None
+    )
 
     # Validate files before loading
-    corrupted_files = [
-        st_file
-        for st_file in hf_weights_files
-        if not _validate_safetensors_file(st_file)
-    ]
+    corrupted_files, duplicate_files_by_key = _scan_safetensors_files(hf_weights_files)
 
     if corrupted_files:
         # Delete corrupted files (both symlink and blob if applicable)
@@ -245,40 +276,16 @@ def safetensors_weights_iterator(
             "Please retry - the files will be re-downloaded automatically."
         )
 
-    _raise_if_duplicate_safetensors_keys(hf_weights_files)
+    _raise_if_duplicate_safetensors_keys(duplicate_files_by_key)
 
-    if use_runai_model_streamer:
-        logger.info(
-            "Loading safetensors with Run:ai Model Streamer to %s",
-            "cpu" if to_cpu else device,
-        )
-        with SafetensorsStreamer() as streamer:
-            if to_cpu:
-                streamer.stream_files(hf_weights_files)
-            else:
-                streamer.stream_files(hf_weights_files, device=device)
-            for name, tensor in streamer.get_tensors():
-                if key_filter is not None and not key_filter(name):
-                    continue
-                if to_cpu:
-                    yield name, tensor.clone().detach()
-                elif clone_streamed_tensors:
-                    yield name, tensor.clone().detach()
-                else:
-                    yield name, tensor
-    else:
-        for st_file in tqdm(
-            hf_weights_files,
-            desc="Loading safetensors checkpoint shards",
-            disable=not enable_tqdm,
-            bar_format=_BAR_FORMAT,
-        ):
-            with safe_open(st_file, framework="pt", device=device) as f:
-                for name in f.keys():  # noqa: SIM118
-                    if key_filter is not None and not key_filter(name):
-                        continue
-                    param = f.get_tensor(name)
-                    yield name, param
+    yield from backend.iter_weights(
+        hf_weights_files,
+        device=device,
+        to_cpu=to_cpu,
+        key_filter=key_filter,
+        clone_tensors=clone_streamed_tensors,
+        show_progress=enable_tqdm,
+    )
 
 
 def _load_pt_file(bin_file: str, device: str) -> dict:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import logging
+import math
 from dataclasses import replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
@@ -40,7 +41,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_position,
 )
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.runtime_context import get_device, get_exec, get_parallel
+from sglang.srt.runtime_context import (
+    attention_backends,
+    get_device,
+    get_parallel,
+)
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import BumpAllocator, empty_context, get_bool_env_var, is_hip
 
@@ -447,11 +452,9 @@ class TboDPAttentionPreparer:
 
         return local_can_run_tbo, local_forward_mode
 
-    def compute_output(self, partial_global_info):
-        # Perform only one Device-to-Host (D2H) memory copy
-        cpu_data = partial_global_info[:, :2].cpu()
-        local_can_run_tbo_aggregated = min(cpu_data[:, 0].tolist())
-        forward_modes = cpu_data[:, 1].tolist()
+    def compute_output(self, partial_global_info_cpu):
+        local_can_run_tbo_aggregated = min(partial_global_info_cpu[:, 0].tolist())
+        forward_modes = partial_global_info_cpu[:, 1].tolist()
 
         global_forward_mode, forward_mode_agree = self._compute_global_forward_mode(
             forward_modes
@@ -633,8 +636,10 @@ class TboForwardBatchPreparer:
             device_field="extend_prefix_lens",
             sum_field=None,
         )
+        # The prefill half: this computes extend positions.
+        prefill_backend, _ = attention_backends()
         _, child_b.extend_start_loc = compute_position(
-            get_exec().kernel.attention_backend,
+            prefill_backend,
             child_b.extend_prefix_lens,
             child_b.extend_seq_lens,
             child_b.extend_num_tokens,
@@ -674,6 +679,12 @@ class TboForwardBatchPreparer:
         _tbo_padded_len = (
             (end_token_index - start_token_index - 1) // attention_tp_size + 1
         ) * attention_tp_size
+        if _is_hip:
+            from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+
+            align = math.lcm(attention_tp_size, get_cp_padding_align_size())
+            n_tokens = end_token_index - start_token_index
+            _tbo_padded_len = ((n_tokens + align - 1) // align) * align
         output_dict["tbo_padded_len"] = _tbo_padded_len
 
         for key in [

@@ -29,6 +29,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
@@ -155,6 +156,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         """Denoise a single chunk with full timestep loop."""
         batch_size = latents.shape[0]
         do_cfg = guidance_scale > 1.0
+        profiler = SGLDiffusionProfiler.get_instance()
 
         for i, t in enumerate(timesteps):
             with StageProfiler(
@@ -252,6 +254,8 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                         )
 
                 latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                if profiler:
+                    profiler.step_denoising_step()
 
         return latents
 
@@ -286,6 +290,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         """Denoise a single chunk using pyramid super-resolution (Stage 2)."""
         batch_size, num_channel, num_frames, height, width = latents.shape
         patch_size = self.transformer.patch_size
+        profiler = SGLDiffusionProfiler.get_instance()
 
         # Downsample to lowest pyramid level
         latents = latents.permute(0, 2, 1, 3, 4).reshape(
@@ -467,6 +472,8 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                         dmd_timesteps=scheduler.timesteps,
                         all_timesteps=timesteps,
                     )[0]
+                    if profiler:
+                        profiler.step_denoising_step()
 
                 step_counter += 1
 
@@ -503,16 +510,6 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         is_distilled = pipeline_config.is_distilled
         is_amplify_first_chunk = pipeline_config.is_amplify_first_chunk
         gamma = pipeline_config.gamma
-
-        transformer_use = ComponentUse(
-            self.__class__.__name__,
-            "transformer",
-            phase="transformer",
-            preferred_ready_after_request=True,
-            memory_intensive=True,
-        )
-        manager = self._component_residency_manager
-        manager.begin_use(transformer_use, module=self.transformer)
 
         # Get encoder outputs (prompt_embeds is a list of tensors, one per encoder)
         prompt_embeds = batch.prompt_embeds

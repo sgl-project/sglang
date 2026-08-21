@@ -13,7 +13,6 @@ so the chunked-MHA path never runs.
 """
 
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -46,9 +45,10 @@ class _ChunkKVMLARunner(MockMLAModelRunner):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         from sglang.srt.runtime_context import get_context
+        from sglang.test.test_utils import server_args_variant
 
-        self.server_args = self.server_args.derive(
-            "attention-unittest",
+        self.server_args = server_args_variant(
+            self.server_args,
             disable_chunked_prefix_cache=False,
             flashinfer_mla_disable_ragged=False,
         )
@@ -142,8 +142,4 @@ class TestHybridLinearChunkMetadataDelegation(CustomTestCase):
 
 
 if __name__ == "__main__":
-    sys_path_parent = str(Path(__file__).resolve().parents[1])
-    import sys
-
-    sys.path.insert(0, sys_path_parent)
     unittest.main()

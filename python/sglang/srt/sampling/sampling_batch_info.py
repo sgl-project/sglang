@@ -12,7 +12,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     GrammarMask,
     GrammarRow,
 )
-from sglang.srt.runtime_context import get_exec, get_server_args
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
@@ -85,7 +85,6 @@ class SamplingBatchInfo:
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
-        global_server_args = get_server_args()
         enable_deterministic = get_exec().deterministic.enable_deterministic_inference
 
         reqs = batch.reqs

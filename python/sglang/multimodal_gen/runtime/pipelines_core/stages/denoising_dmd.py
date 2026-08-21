@@ -20,7 +20,6 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_context as precision_autocast_context,
 )
-from sglang.multimodal_gen.utils import dict_to_3d_list
 
 logger = init_logger(__name__)
 
@@ -91,7 +90,6 @@ class DmdDenoisingStage(DenoisingStage):
             self.transformer.forward,
             {
                 "encoder_hidden_states_image": image_embeds,
-                "mask_strategy": dict_to_3d_list(None, t_max=50, l_max=60, h_max=24),
             },
         )
 

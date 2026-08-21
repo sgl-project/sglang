@@ -53,6 +53,7 @@ from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     normalize_flat_modelopt_quant_config,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils.hf_transformers import check_gguf_file
 from sglang.utils import is_in_ci
 
 logger = init_logger(__name__)
@@ -75,6 +76,22 @@ _WEIGHT_FILE_PATTERNS = (
 
 def _model_hub_name() -> str:
     return "ModelScope" if envs.SGLANG_USE_MODELSCOPE.get() else "Hugging Face Hub"
+
+
+def _is_revisionless_snapshot_root(local_path: str) -> bool:
+    """Detect a resolved "snapshot" that is really the ``snapshots/`` parent.
+
+    An empty ``refs/<revision>`` makes the offline resolver join ``""`` onto
+    ``snapshots/`` and return the parent, which holds only revision subdirectories.
+    The ``models--*`` folder above is required too, since a ``local_dir`` may
+    legitimately be named ``snapshots``.
+    """
+    head, tail = os.path.split(os.path.normpath(local_path))
+    return tail == "snapshots" and os.path.basename(head).split("--")[0] in (
+        "models",
+        "datasets",
+        "spaces",
+    )
 
 
 def _snapshot_has_files(
@@ -167,6 +184,24 @@ def _get_missing_declared_weight_components(model_path: str) -> list[str]:
         elif not _has_local_weight_files(component_path):
             missing_files.append(f"{component_dir}/<weights>")
     return missing_files
+
+
+def _is_metadata_only_pipeline_snapshot(model_path: str) -> bool:
+    """Detect a snapshot holding only pipeline metadata, with no component weights.
+
+    ``maybe_download_model_index`` probes a repo by fetching just ``model_index.json``;
+    that single-file fetch materializes a full cache entry, so a later
+    ``local_files_only`` snapshot resolves it as a hit — offline there is no remote file
+    list to tell "cached" from "fully cached", so completeness must be read off disk.
+
+    Requires *all* declared components missing, not any: a partially populated snapshot
+    is legitimate (``allow_patterns``-filtered fetch), so only total absence is
+    unambiguously the probe stub. No declarations means no evidence to act on.
+    """
+    declared = _get_declared_weight_component_dirs(model_path)
+    if not declared:
+        return False
+    return len(_get_missing_declared_weight_components(model_path)) == len(declared)
 
 
 def _check_index_files_for_missing_shards(
@@ -440,13 +475,31 @@ def load_dict(file_path):
         ) from e
 
 
+def _split_hf_subfolder(path: str) -> tuple[str, str | None]:
+    """Split 'namespace/repo/subfolder' into (repo_id, subfolder), or return (path, None)."""
+    if os.path.isabs(path):
+        return path, None
+    parts = path.split("/")
+    if len(parts) > 2:
+        return "/".join(parts[:2]), "/".join(parts[2:])
+    return path, None
+
+
 def prepare_diffusers_component_path_for_loading(component_path: str) -> str:
     """Download component repos if needed and patch legacy flat ModelOpt configs."""
-    local_component_path = (
-        maybe_download_model(component_path)
-        if not os.path.exists(component_path)
-        else component_path
-    )
+    if os.path.exists(component_path):
+        local_component_path = component_path
+    else:
+        repo_id, subfolder = _split_hf_subfolder(component_path)
+        if subfolder is not None:
+            # component_path is 'namespace/repo/subfolder' — download only that subfolder
+            local_repo = maybe_download_model(
+                repo_id,
+                allow_patterns=[f"{subfolder}/**", f"{subfolder}/*"],
+            )
+            local_component_path = os.path.join(local_repo, subfolder)
+        else:
+            local_component_path = maybe_download_model(component_path)
     config_path = os.path.join(local_component_path, "config.json")
     if not os.path.exists(config_path):
         return local_component_path
@@ -545,19 +598,6 @@ def attach_additional_stop_token_ids(tokenizer):
         tokenizer.additional_stop_token_ids = None
 
 
-def check_gguf_file(model: str | os.PathLike) -> bool:
-    """Check if the file is a GGUF model."""
-    model = Path(model)
-    if not model.is_file():
-        return False
-    elif model.suffix == ".gguf":
-        return True
-
-    with open(model, "rb") as f:
-        header = f.read(4)
-    return header == b"GGUF"
-
-
 def maybe_download_lora(
     model_name_or_path: str,
     local_dir: str | None = None,
@@ -576,7 +616,14 @@ def maybe_download_lora(
     Returns:
         Local path to the model
     """
-    allow_patterns = ["*.json", "*.safetensors", "*.bin"]
+    # Repositories often publish several adapter revisions side by side.  If a
+    # filename is pinned, do not download every weight before selecting it.
+    # Keep JSON metadata so PEFT's lora_alpha remains available.
+    allow_patterns = (
+        ["*.json", weight_name, f"**/{weight_name}"]
+        if weight_name is not None
+        else ["*.json", "*.safetensors", "*.bin"]
+    )
 
     local_path = maybe_download_model(
         model_name_or_path,
@@ -790,6 +837,7 @@ def maybe_download_model(
     is_lora: bool = False,
     allow_patterns: list[str] | None = None,
     force_diffusers_model: bool = False,
+    revision: str | None = None,
     skip_overlay_resolution: bool = False,
 ) -> str:
     """
@@ -801,6 +849,7 @@ def maybe_download_model(
         download: Whether to download the model from Hugging Face Hub
         is_lora: If True, skip model completeness verification (LoRA models don't have transformer/vae directories)
         force_diffusers_model: If True, apply diffusers model check. Otherwise it should be a component model
+        revision: Specific Hugging Face Hub revision to resolve
     Returns:
         Local path to the model
     """
@@ -866,13 +915,37 @@ def maybe_download_model(
         local_path = snapshot_download(
             repo_id=model_name_or_path,
             ignore_patterns=["*.onnx", "*.msgpack"],
+            allow_patterns=allow_patterns,
             local_dir=local_dir,
             local_files_only=True,
             max_workers=8,
+            revision=revision,
         )
+        if _is_revisionless_snapshot_root(local_path):
+            # A cache miss, so the download below re-resolves and rewrites the ref.
+            raise LocalEntryNotFoundError(
+                f"Cached ref for {model_name_or_path} is corrupt: resolved to the "
+                f"snapshots parent {local_path!r} instead of a revision directory."
+            )
         if not force_diffusers_model:
-            return str(local_path)
-        if is_lora or _verify_diffusers_model_complete(local_path):
+            # maybe_download_model_index's model_index.json fetch materializes a full
+            # cache entry, so this resolve reports that stub as a hit; returning it
+            # would skip the download. LoRA repos declare no components.
+            if not is_lora and _is_metadata_only_pipeline_snapshot(local_path):
+                if not download:
+                    raise ValueError(
+                        f"Model {model_name_or_path} found in cache but only contains "
+                        "pipeline metadata (no component weights) and download=False."
+                    )
+                logger.info(
+                    "Cached snapshot for %s only contains pipeline metadata, "
+                    "will download component weights from %s",
+                    model_name_or_path,
+                    _model_hub_name(),
+                )
+            else:
+                return str(local_path)
+        elif is_lora or _verify_diffusers_model_complete(local_path):
             if not is_lora:
                 is_valid, cleanup_performed = _ci_validate_diffusers_model(local_path)
                 if not is_valid:
@@ -939,6 +1012,7 @@ def maybe_download_model(
                     allow_patterns=allow_patterns,
                     local_dir=local_dir,
                     max_workers=8,
+                    revision=revision,
                 )
 
             if not force_diffusers_model:
@@ -953,9 +1027,11 @@ def maybe_download_model(
                     local_path = snapshot_download(
                         repo_id=model_name_or_path,
                         ignore_patterns=["*.onnx", "*.msgpack"],
+                        allow_patterns=allow_patterns,
                         local_dir=local_dir,
                         max_workers=8,
                         force_download=True,
+                        revision=revision,
                     )
                 if not _verify_diffusers_model_complete(local_path):
                     raise ValueError(
@@ -1000,6 +1076,28 @@ def maybe_download_model(
                 attempt + 1,
                 MAX_RETRIES,
                 e,
+                wait_time,
+            )
+            time.sleep(wait_time)
+        except RuntimeError as e:
+            if "client has been closed" not in str(e).lower():
+                raise ValueError(
+                    f"Could not find model at {model_name_or_path} and failed to download from {_model_hub_name()}: {e}"
+                ) from e
+            if attempt == MAX_RETRIES - 1:
+                raise ValueError(
+                    f"Could not find model at {model_name_or_path} and failed to download from {_model_hub_name()} "
+                    f"after {MAX_RETRIES} attempts due to network error: {e}"
+                ) from e
+            from huggingface_hub.utils._http import close_session
+
+            close_session()
+            wait_time = 2**attempt
+            logger.warning(
+                "Download failed (attempt %d/%d) because the Hugging Face client was closed. "
+                "Retrying in %d seconds...",
+                attempt + 1,
+                MAX_RETRIES,
                 wait_time,
             )
             time.sleep(wait_time)
