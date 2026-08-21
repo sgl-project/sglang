@@ -62,6 +62,13 @@ FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
 
+# ROCm/HIP new-token crossover between the two aiter c4-indexer kernels. Below
+# this many query rows the paged preshuffle kernel (no KV gather) wins; at or
+# above it the ragged fp8_mqa_logits kernel wins despite the gather. Measured on
+# MI355 at 128K-256K KV; see Task.md for the sweep.
+_HIP_RAGGED_INDEXER_MIN_QUERY_TOKENS = 2048
+
+
 _arange_cache = {}
 
 
@@ -945,6 +952,7 @@ class C4IndexerBackendMixin:
         if (
             is_hip()
             and not use_fp4_indexer
+            and query_rows >= _HIP_RAGGED_INDEXER_MIN_QUERY_TOKENS
             and self._can_use_nonpaged_indexer(
                 c4_indexer=c4_indexer,
                 forward_batch=forward_batch,
