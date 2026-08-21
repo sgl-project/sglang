@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
 )
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
     _TREE_CORE_REGISTRY,
+    cpp_tree_core_unsupported_reason,
     create_tree_core,
     register_tree_core_backend,
     registered_tree_core_backends,
@@ -25,13 +26,15 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _cache_init_params(**kwargs) -> CacheInitParams:
+def _cache_init_params(
+    tree_components=(ComponentType.FULL,), **kwargs
+) -> CacheInitParams:
     return CacheInitParams(
         disable=False,
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
         page_size=2,
-        tree_components=(ComponentType.FULL,),
+        tree_components=tree_components,
         **kwargs,
     )
 
@@ -90,6 +93,12 @@ class TreeCoreRegistryTest(CustomTestCase):
     def test_registry_contains_python(self):
         self.assertIn("python", registered_tree_core_backends())
 
+    def test_registry_contains_cpp(self):
+        self.assertIn("cpp", registered_tree_core_backends())
+
+    def test_registry_contains_auto(self):
+        self.assertIn("auto", registered_tree_core_backends())
+
     def test_python_backend_builds_the_python_tree(self):
         component = mock.MagicMock()
         core = create_tree_core(
@@ -126,6 +135,48 @@ class TreeCoreRegistryTest(CustomTestCase):
         result = create_tree_core(name="custom", params=params, components=components)
         factory.assert_called_once_with(params, components)
         self.assertIs(result, core)
+
+    def test_auto_selects_cpp_for_full_device_only(self):
+        params = _cache_init_params()
+        components = {ComponentType.FULL: mock.MagicMock()}
+        cpp_core = mock.MagicMock()
+        with mock.patch(
+            "sglang.srt.mem_cache.unified_cache.tree_core_registry._cpp_tree_core_factory",
+            return_value=cpp_core,
+        ) as cpp_factory:
+            result = create_tree_core("auto", params, components)
+        cpp_factory.assert_called_once_with(params, components)
+        self.assertIs(result, cpp_core)
+
+    def test_auto_falls_back_to_python_for_unsupported_components(self):
+        params = _cache_init_params(
+            tree_components=(ComponentType.FULL, ComponentType.MAMBA)
+        )
+        components = {
+            ComponentType.FULL: mock.MagicMock(),
+            ComponentType.MAMBA: mock.MagicMock(),
+        }
+        python_core = mock.MagicMock()
+        with (
+            mock.patch(
+                "sglang.srt.mem_cache.unified_cache.tree_core_registry._python_tree_core_factory",
+                return_value=python_core,
+            ) as python_factory,
+            mock.patch(
+                "sglang.srt.mem_cache.unified_cache.tree_core_registry._cpp_tree_core_factory"
+            ) as cpp_factory,
+        ):
+            result = create_tree_core("auto", params, components)
+        python_factory.assert_called_once_with(params, components)
+        cpp_factory.assert_not_called()
+        self.assertIs(result, python_core)
+
+    def test_cpp_compatibility_rejects_hicache(self):
+        params = _cache_init_params(enable_hicache=True)
+        reason = cpp_tree_core_unsupported_reason(
+            params, {ComponentType.FULL: mock.MagicMock()}
+        )
+        self.assertIn("HiCache", reason)
 
 
 class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
@@ -174,11 +225,16 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
         cache = UnifiedRadixCache(params)
         self.assertTrue(cache.tree_core.is_eagle)
 
-    def test_default_backend_builds_the_python_tree_core(self):
-        cache = UnifiedRadixCache(params=self._cache_params())
-        self.assertIsInstance(cache.tree_core, UnifiedTreeCore)
+    def test_default_backend_routes_to_auto(self):
+        core = mock.MagicMock()
+        factory = mock.MagicMock(return_value=core)
+        _TREE_CORE_REGISTRY["auto"] = factory
+        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("auto"):
+            cache = UnifiedRadixCache(params=self._cache_params())
+        factory.assert_called_once()
+        self.assertIs(cache.tree_core, core)
         component = cache.components[ComponentType.FULL]
-        self.assertIs(component.tree_core, cache.tree_core)
+        self.assertIs(component.tree_core, core)
 
     def test_env_var_routes_construction_to_the_selected_backend(self):
         """SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND selects the registered factory

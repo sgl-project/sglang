@@ -1,18 +1,20 @@
 """Registry for pluggable TreeCore implementations.
 
 The unified cache constructs its TreeCore through `create_tree_core`, selected
-by SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND (default "python"). To plug in a custom
+by SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND (default "auto"). To plug in a custom
 implementation, register it under a string name via
 `register_tree_core_backend(name, factory)`.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Callable, Optional
+
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-    from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
     from sglang.srt.mem_cache.unified_cache.components import TreeComponent
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
         UnifiedTreeCoreInterface,
@@ -24,6 +26,8 @@ TreeCoreFactory = Callable[
 ]
 
 _TREE_CORE_REGISTRY: dict[str, TreeCoreFactory] = {}
+
+logger = logging.getLogger(__name__)
 
 
 def register_tree_core_backend(name: str, factory: TreeCoreFactory) -> None:
@@ -54,7 +58,60 @@ def _python_tree_core_factory(
     return UnifiedTreeCore(params, components)
 
 
+def _cpp_tree_core_factory(
+    params: CacheInitParams, components: dict[ComponentType, TreeComponent]
+) -> UnifiedTreeCoreInterface:
+    """The experimental C++ FULL/device-only TreeCore.
+
+    Keep the extension import lazy: selecting the Python backend must not pay
+    the C++ JIT build cost.
+    """
+    from sglang.srt.mem_cache.unified_cache.cpp_unified_tree_core import (
+        CppUnifiedTreeCore,
+    )
+
+    return CppUnifiedTreeCore(params, components)
+
+
+def cpp_tree_core_unsupported_reason(
+    params: CacheInitParams, components: dict[ComponentType, TreeComponent]
+) -> Optional[str]:
+    """Return why the first-stage C++ core cannot serve this configuration."""
+    component_types = tuple(components)
+    if component_types != (ComponentType.FULL,):
+        return f"components={component_types!r} (only FULL is supported)"
+    if params.enable_hicache:
+        return "HiCache/host-tier caching is enabled"
+    if params.enable_session_radix_cache:
+        return "session radix cache is enabled"
+    if params.enable_kv_cache_events:
+        return "KV cache events are enabled"
+    if params.is_eagle:
+        return "EAGLE/bigram keys are enabled"
+    if params.eviction_policy.lower() != "lru":
+        return f"eviction policy is {params.eviction_policy!r} (only LRU is supported)"
+    return None
+
+
+def _auto_tree_core_factory(
+    params: CacheInitParams, components: dict[ComponentType, TreeComponent]
+) -> UnifiedTreeCoreInterface:
+    """Prefer C++ when its current feature envelope covers the configuration."""
+    reason = cpp_tree_core_unsupported_reason(params, components)
+    if reason is None:
+        return _cpp_tree_core_factory(params, components)
+
+    logger.info(
+        "Using Python unified radix TreeCore because the C++ backend does not "
+        "support this configuration yet: %s.",
+        reason,
+    )
+    return _python_tree_core_factory(params, components)
+
+
 register_tree_core_backend("python", _python_tree_core_factory)
+register_tree_core_backend("cpp", _cpp_tree_core_factory)
+register_tree_core_backend("auto", _auto_tree_core_factory)
 
 
 def create_tree_core(

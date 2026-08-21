@@ -47,6 +47,8 @@ struct RadixTree {
   std::size_t protected_size() const;
   /// @return How many size are used on device.
   std::size_t total_size() const;
+  /// @return All device indices owned by the tree, grouped by tree node.
+  std::vector<at::Tensor> all_values() const;
 
   /// @brief Print debug information of the tree.
   void debug_print() const;

@@ -140,4 +140,8 @@ std::size_t RadixTree::total_size() const {
   return m_impl->total_size();
 }
 
+std::vector<at::Tensor> RadixTree::all_values() const {
+  return m_impl->all_values();
+}
+
 }  // namespace radix_tree_v2

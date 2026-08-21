@@ -599,8 +599,10 @@ class Envs:
     # registry no longer reads this. Kept because a few model/arch call sites
     # still assert on it; do not use in new code.
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
-    # Registered TreeCore backend serving the unified radix cache.
-    SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("python")
+    # Registered TreeCore backend serving the unified radix cache. ``auto``
+    # selects C++ for the supported FULL/device-only configuration and falls
+    # back to Python for features that have not been ported yet.
+    SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("auto")
     # TODO(DSV4): @ispobock this has bug on main branch when retract
     SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)
     SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(False)

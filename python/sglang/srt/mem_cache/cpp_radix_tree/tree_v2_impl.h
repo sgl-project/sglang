@@ -216,6 +216,19 @@ struct RadixTree::Impl {
     return size;
   }
 
+  std::vector<at::Tensor> all_values() const {
+    std::vector<at::Tensor> values;
+    std::vector<const TreeNode*> stack = {&m_root};
+    while (!stack.empty()) {
+      const auto* node = stack.back();
+      stack.pop_back();
+      if (node->on_gpu()) values.push_back(node->device_indices());
+      for (const auto& [_, child] : *node)
+        stack.push_back(child.get());
+    }
+    return values;
+  }
+
   std::size_t evictable_size() const {
     return m_evictable_size;
   }

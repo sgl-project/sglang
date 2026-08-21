@@ -184,6 +184,13 @@ def _create_unified_radix_cache(
         params.component_registry_override = {
             ComponentType.MAMBA: MlxAuxiliaryStateComponent,
         }
+    # HiCache attaches after UnifiedRadixCache constructs the TreeCore. Carry
+    # that future requirement into construction so the default ``auto`` core
+    # selector does not choose the current device-only C++ implementation.
+    params.enable_hicache = (
+        ctx.enable_hierarchical_cache
+        or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
+    )
     cache = UnifiedRadixCache(params)
     if (
         ctx.enable_hierarchical_cache

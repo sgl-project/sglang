@@ -32,6 +32,10 @@ class CacheInitParams:
     enable_metrics: bool = False
     enable_kv_cache_events: bool = False
     enable_session_radix_cache: bool = False
+    # Construction-time signal used by TreeCore auto-selection. HiCache is
+    # attached after UnifiedRadixCache builds its tree, so the core cannot
+    # otherwise know that host-tier operations will be required.
+    enable_hicache: bool = False
 
     enable_mamba_extra_buffer: bool = False
     enable_mamba_extra_buffer_lazy: bool = False
