@@ -900,7 +900,9 @@ class Envs:
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
     SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
-    # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
+    # SM120 FlashMLA decode backend: "flashinfer" (default), "b12x"
+    # (compressed MLA, same kernels as vLLM's DGX Spark image), "triton",
+    # or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
