@@ -63,6 +63,7 @@ from sglang.srt.managers.load_snapshot import (
     zmq_reader_owner,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
@@ -518,7 +519,7 @@ class MultiTokenizerRouter:
         from sglang.srt.load_reporter.snapshot_source import RouterLoadSnapshotSource
 
         source = RouterLoadSnapshotSource(
-            self.load_snapshot_reader, range(self.server_args.dp_size)
+            self.load_snapshot_reader, range(get_parallel().dp_size)
         )
         future = asyncio.run_coroutine_threadsafe(
             start_load_reporter(self.server_args, source),

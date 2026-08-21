@@ -18,6 +18,7 @@ import time
 from aiohttp import web
 
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqType
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
@@ -230,7 +231,9 @@ async def serve_grpc(server_args, model_info=None):
 
             reporter_handle = await start_load_reporter(
                 server_args,
-                ManagerLoadSnapshotSource(request_manager, range(server_args.dp_size)),
+                ManagerLoadSnapshotSource(
+                    request_manager, range(get_parallel().dp_size)
+                ),
             )
 
     # Older smg-grpc-servicer releases (≤ 0.5.2) accept only (server_args,
