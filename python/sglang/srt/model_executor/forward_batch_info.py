@@ -33,15 +33,12 @@ from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, Union
-import logging
 
 import torch
 
 from sglang.kernels.ops.attention.position import compute_position_triton
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
-
-logger = logging.getLogger(__name__)
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
 )
@@ -1311,31 +1308,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
             else:
                 deltas_list = []
-                n_mm_none = 0  # mm is None (text-only request)
-                n_delta_npu_none = 0  # mm not None but delta_npu not set
-                n_ok = 0  # using pre-loaded delta_npu
                 for i in range(batch_size):
                     mm = batch.multimodal_inputs[i]
                     if mm is not None and mm.mrope_position_delta_npu is not None:
                         deltas_list.append(mm.mrope_position_delta_npu)
-                        n_ok += 1
                     else:  # fallback strategy
                         deltas_list.append(
                             torch.zeros(1, dtype=torch.int64, device=device)
                         )
-                        if mm is None:
-                            n_mm_none += 1
-                        else:
-                            n_delta_npu_none += 1
-                if envs.SGLANG_NPU_MROPE_NPU_LOGPRINT.get() and (
-                    n_delta_npu_none > 0 or n_mm_none > 0
-                ):
-                    logger.warning(
-                        f"NPU decode fallback: ok={n_ok}"
-                        f" mm_none={n_mm_none}"
-                        f" delta_npu_none={n_delta_npu_none}"
-                        f" bs={batch_size}"
-                    )
                 deltas_npu = torch.cat(deltas_list)  # (bs,) single NPU kernel
                 positions = (
                     self.seq_lens[:batch_size]

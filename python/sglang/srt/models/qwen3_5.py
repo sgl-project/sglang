@@ -1223,7 +1223,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             elif envs.SGLANG_NPU_FUSED_SIGMOID_MUL.get():
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
                 if gate_val.numel() == attn_output.numel():
-                    # 同形 elementwise: 单 kernel 完成 attn_output * sigmoid(gate)
                     from sgl_kernel_npu.activation.fused_sigmoid_mul import (
                         fused_sigmoid_mul as npu_fused_sigmoid_mul,
                     )
