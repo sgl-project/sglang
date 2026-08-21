@@ -36,8 +36,9 @@ Install the pinned tree::
 image.) Earlier generations -- 0.15.x and the PyPI 1.2.x wheels -- keep the old
 ``b12x.integration.tp_moe`` API and different W4A16 kernels; they are rejected
 at startup rather than silently producing different numerics -- see
-:func:`_require_aligned_generation`. The last 0.15.3-based revision of this
-file is the parent of the commit that introduced this docstring.
+:func:`sglang.srt.utils.b12x.require_aligned_generation`. The last 0.15.3-based
+revision of this file is the parent of the commit that introduced this
+docstring.
 """
 
 from __future__ import annotations
@@ -51,50 +52,18 @@ from torch.nn import Module
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import log_info_on_rank0
+from sglang.srt.utils.b12x import install_compile_cache_dir, require_aligned_generation
 from sglang.srt.utils.common import is_sm120_supported
 
 # Suppress TRT-LLM CUTLASS trace logs without overriding user configuration.
 os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
 
-# Route the b12x compile cache through sglang's cache tree (same pattern as
-# DG_JIT_CACHE_DIR in deep_gemm_wrapper). b12x resolves B12X_COMPILE_CACHE_DIR
-# at first compile, so import time is early enough. (The pre-op-registry name
-# B12X_CUTE_COMPILE_CACHE_DIR must not be set: unrecognized B12X_* variables
-# are folded into the compile-cache key and would fragment the cache.)
-os.environ["B12X_COMPILE_CACHE_DIR"] = envs.SGLANG_B12X_CACHE_DIR.get()
+install_compile_cache_dir()
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
-
-_B12X_INSTALL_HINT = (
-    "pip install --no-deps 'b12x @ https://github.com/local-inference-lab/"
-    "b12x/archive/85d3681bb2c3749e4e94e121d5d829c7ec6f0b9f.tar.gz'"
-)
-
-
-def _require_aligned_generation() -> None:
-    """This backend runs against the b12x op-registry generation only.
-
-    The API moved twice (0.15.x ``b12x.integration.tp_moe`` -> PyPI 1.2.x same
-    module, new kernels -> master op registry ``b12x.moe.fused_moe``), and the
-    kernels changed with it, so a generation mismatch must fail here rather
-    than surface as different numerics. The probe is structural: only the
-    op-registry generation has a ``b12x.moe.fused_moe`` module.
-    """
-    import importlib.util
-
-    try:
-        import b12x  # noqa: F401
-    except ImportError as e:
-        raise RuntimeError(f"b12x is not installed. {_B12X_INSTALL_HINT}") from e
-    if importlib.util.find_spec("b12x.moe.fused_moe") is None:
-        raise RuntimeError(
-            "The installed b12x predates the op-registry API "
-            "(b12x.moe.fused_moe); this backend requires the pinned master "
-            f"tree. {_B12X_INSTALL_HINT}"
-        )
 
 
 def _b12x_max_tokens() -> int:
@@ -349,7 +318,7 @@ class Mxfp4B12xMoEMethod:
     """b12x MXFP4 MoE: one fused kernel per expert layer."""
 
     def __init__(self, fp8_method, prefix: str):
-        _require_aligned_generation()
+        require_aligned_generation()
         if not is_sm120_supported():
             raise RuntimeError("Mxfp4B12xMoEMethod requires SM120 or SM121.")
         self._fp8 = fp8_method
@@ -497,7 +466,7 @@ class Mxfp4B12xMoEMethod:
         self._keepalive = (experts, w13, s13, w2, s2, ones, plan_or_arena)
         # b12x will not compile while a CUDA graph is being captured, so every
         # shape a graph can present has to have run once already.
-        if not _B12X_WARMED and envs.SGLANG_B12X_WARMUP.get():
+        if not _B12X_WARMED and envs.SGLANG_B12X_ENABLE_WARMUP.get():
             log_info_on_rank0(
                 logger,
                 f"Compiling b12x {quant_mode} kernels for {len(counts)} "

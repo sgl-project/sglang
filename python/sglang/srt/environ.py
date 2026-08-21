@@ -1543,8 +1543,8 @@ class Envs:
     # shapes are still compiled by the graph runner's pre-capture warmup runs,
     # and the prefill ladder then JIT-compiles on the first real chunks
     # (~80 s cold on DSv4-Flash).
-    SGLANG_B12X_WARMUP = EnvBool(True)
-    # b12x compile-cache directory, forwarded to B12X_CUTE_COMPILE_CACHE_DIR.
+    SGLANG_B12X_ENABLE_WARMUP = EnvBool(True)
+    # b12x compile-cache directory, forwarded to B12X_COMPILE_CACHE_DIR.
     # Resolved lazily so it tracks SGLANG_CACHE_DIR, which is defined below.
     SGLANG_B12X_CACHE_DIR = EnvStr(lambda: _default_cache_subdir("b12x"))
 
