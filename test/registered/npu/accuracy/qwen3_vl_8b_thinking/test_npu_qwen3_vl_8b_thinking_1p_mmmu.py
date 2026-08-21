@@ -20,7 +20,7 @@ ENVS = {
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
-    "HCCL_BUFFSIZE": "2000",
+    "DEEPEP_HCCL_BUFFSIZE": "2000",
 }
 
 OTHER_ARGS = [
@@ -52,7 +52,7 @@ OTHER_ARGS = [
 ]
 
 
-class TestQwen3(TestNpuAccuracyTestCaseBase):
+class TestQwen3_VL_8B_Thinking_MMMU(TestNpuAccuracyTestCaseBase):
     model = QWEN3_VL_8B_THINKING_MODEL_PATH
     envs = ENVS
     other_args = OTHER_ARGS
