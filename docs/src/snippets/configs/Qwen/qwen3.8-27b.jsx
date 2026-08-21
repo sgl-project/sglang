@@ -133,25 +133,16 @@ export const config = {
           // pool one slot short at every serviceable mem-fraction (see the
           // DFlash2 bullet in Configuration Tips).
           stripPrefixes: (sel) =>
-            sel.hw === "rtx5090"
-              ? sel.ssmDtype === "float32"
-                ? ["--mem-fraction-static", "--mamba-full-memory-ratio"]
-                : ["--mem-fraction-static"]
-              : [],
+            sel.hw === "rtx5090" ? ["--mem-fraction-static"] : [],
           flags: (sel) => [
             "--speculative-algorithm DFLASH",
             "--speculative-draft-model-path incoai/Qwen3.8-27B-DFlash2",
             "--speculative-num-draft-tokens 8",
-            // Measured on the 5090: bf16 state serves at 0.90 (DSPARK's
-            // pin); fp32 fits only at 0.945 + ratio 10 (0.94 is one state
-            // slot short, 0.95 OOMs at runtime) and leaves the Low-Latency
-            // KV pool a single-request envelope.
-            ...(sel.hw === "rtx5090"
-              ? sel.ssmDtype === "float32"
-                ? ["--mem-fraction-static 0.945",
-                   "--mamba-full-memory-ratio 10"]
-                : ["--mem-fraction-static 0.90"]
-              : []),
+            // Measured on the 5090 against main: the bf16 state pool serves at
+            // 0.88 (0.90, DSPARK's pin, OOMs on the first request). fp32 has no
+            // serviceable mem-fraction here at all, so the SSM dtype row greys
+            // it out for this pick.
+            ...(sel.hw === "rtx5090" ? ["--mem-fraction-static 0.88"] : []),
           ],
         },
       ],
@@ -186,9 +177,22 @@ export const config = {
       title: "Mamba SSM Dtype",
       default: "float32",
       options: [
-        // Open on every platform, including with DSPARK on the 5090 (serves
-        // at mem-fraction 0.92 with the engine-default 2048 prefill chunk).
-        { id: "float32", label: "float32", flags: ["--mamba-ssm-dtype float32"] },
+        // Open on every platform except the 32GB RTX 5090 under DFLASH2:
+        // there the fp32 state pool and the prefill CUDA-graph capture cannot
+        // both fit, at any mem-fraction. Measured on main (2026-08-21, ratio
+        // pinned at 10 so slots are not the binding term): 0.945 and 0.92 OOM
+        // inside `Capture target prefill CUDA graph`, 0.90 OOMs on the first
+        // request, and 0.88 / 0.86 / 0.84 size the state pool below the 5 (LL)
+        // / 4 (HT) slots one request needs. bf16 state halves the pool and
+        // serves, and is the faster cell there anyway.
+        {
+          id: "float32", label: "float32",
+          disabled: (sel) => sel.hw === "rtx5090" && sel.spec === "dflash",
+          disableReason:
+            "On the 32GB RTX 5090 the fp32 GDN state pool and the prefill CUDA-graph " +
+            "capture do not both fit alongside the DFlash2 draft — use bfloat16",
+          flags: ["--mamba-ssm-dtype float32"],
+        },
         {
           id: "bfloat16", label: "bfloat16",
           disabled: (sel) => sel.hw === "rtx5090" && sel.quant !== "nvfp4",

@@ -269,18 +269,16 @@ checkpoint's calibration scales automatically.
   RTX PRO 6000 BF16/FP8 cells boot and serve; on H200, DGX Spark and GB300
   those cells carry the **Final Verification In Progress**
   badge. The
-  RTX PRO 6000 recipe needs no changes. On the 32GB RTX 5090 prefer
-  `--mamba-ssm-dtype bfloat16` at `--mem-fraction-static 0.90`: measured
-  strictly better than float32 for this draft (6.1 vs 8.3 ms TPOT, accept
-  3.30 vs 3.09) — the opposite of the EAGLE trade, so measure before assuming.
-  float32 still fits, but only at `--mem-fraction-static 0.945` with
-  `--mamba-full-memory-ratio 10` pinned in place of the balanced value: the
-  L = 9216 ratio leaves the fp32 state pool one slot short at every
-  serviceable mem-fraction (0.94 allocates four of Low-Latency's five slots;
-  0.95 OOMs at runtime), and the re-weighted split leaves the Low-Latency KV
-  pool a single-request envelope (~9.4k tokens) — no headroom for longer
-  requests or radix reuse. The panel's DFLASH2 option applies these re-pins
-  automatically.
+  RTX PRO 6000 recipe needs no changes. On the 32GB RTX 5090 the SSM dtype row
+  greys float32 out for this pick, and the recipe runs `--mamba-ssm-dtype
+  bfloat16` at `--mem-fraction-static 0.88`, which the panel re-pins
+  automatically. fp32 has no serviceable mem-fraction on that card: with the
+  ratio pinned at 10 so state slots are not the binding term, 0.945 and 0.92
+  OOM inside the prefill CUDA-graph capture, 0.90 OOMs on the first request,
+  and 0.88 and below size the state pool below the five (Low-Latency) or four
+  (High-Throughput) slots a single request needs. bf16 is the better operating
+  point there regardless — measured faster than fp32 for this draft, the
+  opposite of the EAGLE trade, so measure before assuming.
 - **Hardware fit**: FP8 weights ~28.5GB (not serviceable beyond bs≤2 on
   32GB cards); NVFP4 weights ~16.5GB (recommended for RTX 5090-class GPUs).
 - `--mamba-radix-cache-strategy extra_buffer_lazy` lowers the state cost per
