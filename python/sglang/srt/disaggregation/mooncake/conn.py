@@ -962,7 +962,7 @@ class MooncakeKVManager(CommonKVManager):
         if pack_buffer is not None:
             from sglang.srt.disaggregation.common.dcp_pack import try_pack_dcp_src
 
-            src_tensors = self._mla_tensors_for_ptrs(src_kv_ptrs)
+            src_tensors = self._pack_src_tensors(src_kv_ptrs)
             packed = (
                 try_pack_dcp_src(
                     pack_buffer=pack_buffer,
