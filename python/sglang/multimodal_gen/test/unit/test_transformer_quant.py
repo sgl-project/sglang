@@ -499,8 +499,10 @@ class TestTransformerQuantHelpers(unittest.TestCase):
 
         warning.assert_called_once()
 
-    def test_modelopt_fp8_device_postprocess_depends_on_serialization(self):
-        self.assertFalse(
+    def test_modelopt_fp8_always_needs_device_weight_postprocess(self):
+        # Even a serialized checkpoint requantizes fused shards through
+        # scaled_fp8_quant(), which cannot process CPU tensors.
+        self.assertTrue(
             _needs_device_weight_postprocess(
                 ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
             )
