@@ -351,6 +351,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=state_checkpoint_cu_starts,
             checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
+            use_cp="auto",
         )
 
         # Write back state to pool
