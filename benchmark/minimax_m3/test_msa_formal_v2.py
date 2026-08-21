@@ -18,6 +18,7 @@ from probe_msa_e2e_dependencies import (
 )
 from run_msa_formal_v2 import run_test_only as run_formal_v2_self_tests
 from run_msa_formal_v2 import (
+    repetitions_for_mode,
     server_healthy,
 )
 
@@ -115,9 +116,17 @@ class MSAFormalV2Test(unittest.TestCase):
             | {(dtype_code, 256, False, 0, 128, False, 1)},
         )
 
+    def test_formal_mode_repetition_counts(self) -> None:
+        self.assertEqual(repetitions_for_mode("accuracy"), 3)
+        self.assertEqual(repetitions_for_mode("external-speed"), 1)
+        self.assertEqual(repetitions_for_mode("triton-speed"), 1)
+        with self.assertRaisesRegex(ValueError, "unsupported mode"):
+            repetitions_for_mode("unknown")
+
     def test_formal_v2_fail_closed_contract(self) -> None:
         required = {
             "alternating_order_contract",
+            "mode_specific_repetition_counts",
             "loopback_api_key_default_and_preservation_contract",
             "speed_modes_have_no_accuracy_requests",
             "wrong_external_route_rejected",
@@ -159,7 +168,9 @@ class MSAFormalV2Test(unittest.TestCase):
             row["id"] for row in receipt["test_results"] if row.get("status") == "pass"
         }
         self.assertEqual(receipt["status"], "pass")
-        self.assertGreaterEqual(receipt["test_count"], 87)
+        self.assertEqual(receipt["test_count"], 88)
+        self.assertEqual(len(receipt["test_results"]), 88)
+        self.assertEqual(len(passed), 88)
         self.assertTrue(required <= passed, sorted(required - passed))
 
 

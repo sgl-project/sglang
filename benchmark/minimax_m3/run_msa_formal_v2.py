@@ -183,6 +183,11 @@ def roles_for_mode(mode: str) -> tuple[str, str]:
     raise ValueError(f"unsupported mode: {mode}")
 
 
+def repetitions_for_mode(mode: str) -> int:
+    roles_for_mode(mode)
+    return 3 if mode == "accuracy" else 1
+
+
 def expected_order(mode: str, repetition: int) -> list[str]:
     left, right = roles_for_mode(mode)
     return [left, right] if repetition % 2 else [right, left]
@@ -1237,7 +1242,7 @@ def gpqa_pair_audit(source_path: Path, export_path: Path) -> dict:
 
 def cross_rep_stability(root: Path, role: str) -> dict:
     per_rep = []
-    for repetition in range(1, 4):
+    for repetition in range(1, repetitions_for_mode("accuracy") + 1):
         payload = json.loads(
             (root / f"rep{repetition:02d}" / role / "gpqa_per_example.json").read_text()
         )
@@ -1276,7 +1281,7 @@ def summarize_accuracy(root: Path) -> dict:
     gpqa_deltas = []
     longbench_deltas = []
     failures = []
-    for repetition in range(1, 4):
+    for repetition in range(1, repetitions_for_mode("accuracy") + 1):
         rep_dir = root / f"rep{repetition:02d}"
         audit = gpqa_pair_audit(
             rep_dir / "external" / "gpqa_per_example.json",
@@ -1364,7 +1369,7 @@ def summarize_speed(root: Path, mode: str, min_median_gain: float) -> dict:
     baseline, candidate = roles_for_mode(mode)
     repetitions = []
     gains = {str(value): [] for value in CONCURRENCIES}
-    for repetition in range(1, 4):
+    for repetition in range(1, repetitions_for_mode(mode) + 1):
         rep = {
             "repetition": repetition,
             "order": expected_order(mode, repetition),
@@ -1465,7 +1470,10 @@ def run_test_only(output: Path | None) -> None:
         raise AssertionError(f"{test_id}: synthetic failure was accepted")
 
     orders = {
-        mode: [expected_order(mode, rep) for rep in range(1, 4)]
+        mode: [
+            expected_order(mode, rep)
+            for rep in range(1, repetitions_for_mode(mode) + 1)
+        ]
         for mode in ("accuracy", "external-speed", "triton-speed")
     }
     require(
@@ -1488,15 +1496,21 @@ def run_test_only(output: Path | None) -> None:
         "accuracy order contract mismatch",
     )
     require(
-        orders["triton-speed"]
-        == [
-            ["triton", "flashinfer"],
-            ["flashinfer", "triton"],
-            ["triton", "flashinfer"],
-        ],
+        orders["external-speed"] == [["external", "flashinfer"]],
+        "external speed order contract mismatch",
+    )
+    require(
+        orders["triton-speed"] == [["triton", "flashinfer"]],
         "triton speed order contract mismatch",
     )
     passed("alternating_order_contract")
+    require(
+        repetitions_for_mode("accuracy") == 3
+        and repetitions_for_mode("external-speed") == 1
+        and repetitions_for_mode("triton-speed") == 1,
+        "mode-specific repetition counts drifted",
+    )
+    passed("mode_specific_repetition_counts")
     require(fixed_parity_required("accuracy"), "accuracy fixed parity was disabled")
     require(
         not fixed_parity_required("external-speed")
@@ -2080,7 +2094,7 @@ def run_test_only(output: Path | None) -> None:
 
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        for repetition in range(1, 4):
+        for repetition in range(1, repetitions_for_mode("accuracy") + 1):
             rep = root / f"rep{repetition:02d}"
             for role in ("external", "flashinfer"):
                 role_dir = rep / role
@@ -2110,7 +2124,7 @@ def run_test_only(output: Path | None) -> None:
             "aggregate GPQA" in message and "aggregate LongBench" in message,
             "aggregate accuracy failures were not both reported",
         )
-        for repetition in range(1, 4):
+        for repetition in range(1, repetitions_for_mode("accuracy") + 1):
             role_dir = root / f"rep{repetition:02d}" / "flashinfer"
             payload = json.loads((role_dir / "gpqa_per_example.json").read_text())
             payload["examples"][98]["correct"] = True
@@ -2131,7 +2145,7 @@ def run_test_only(output: Path | None) -> None:
 
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        for repetition in range(1, 4):
+        for repetition in range(1, repetitions_for_mode("external-speed") + 1):
             for role, throughput in (("external", 100.0), ("flashinfer", 99.0)):
                 role_dir = root / f"rep{repetition:02d}" / role
                 role_dir.mkdir(parents=True)
@@ -2349,8 +2363,11 @@ def main() -> None:
         "mode": args.mode,
         "model": args.model,
         "seed": SEED,
-        "repetitions": 3,
-        "orders": [expected_order(args.mode, rep) for rep in range(1, 4)],
+        "repetitions": repetitions_for_mode(args.mode),
+        "orders": [
+            expected_order(args.mode, rep)
+            for rep in range(1, repetitions_for_mode(args.mode) + 1)
+        ],
         "roles": list(roles_for_mode(args.mode)),
         "server_command": server_command(args),
         "fresh_server_and_cache_per_arm": True,
@@ -2394,7 +2411,7 @@ def main() -> None:
     (args.output_root / "run_manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
-    for repetition in range(1, 4):
+    for repetition in range(1, repetitions_for_mode(args.mode) + 1):
         rep_dir = args.output_root / f"rep{repetition:02d}"
         rep_dir.mkdir()
         order = expected_order(args.mode, repetition)

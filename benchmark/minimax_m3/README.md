@@ -162,14 +162,16 @@ python benchmark/minimax_m3/run_msa_formal_v2.py \
   --min-median-throughput-gain 0
 ```
 
-Each mode runs exactly three fresh, alternating pairs. Accuracy uses
-`external,flashinfer`, `flashinfer,external`, `external,flashinfer`; the Triton
-speed reference uses the analogous `triton,flashinfer` order. Every arm gets a
-new server and isolated JIT/cache directories. The driver verifies the selected
-route, sends one unmeasured fixed-seed 8K/1K warmup, brackets the measured server
-log by byte offset, and rejects port reuse, JIT activity, errors, retries,
-timeouts, client exhaustion, thermal throttling, or an unexpected count of
-successful requests. It never resumes into an existing result root.
+Accuracy runs exactly three fresh, alternating pairs in the order
+`external,flashinfer`, `flashinfer,external`, `external,flashinfer`. Each speed
+mode runs exactly one fresh pair: `external,flashinfer` for external speed and
+`triton,flashinfer` for the Triton reference. There are no `rep02` or `rep03`
+speed runs. Every arm gets a new server and isolated JIT/cache directories. The
+driver verifies the selected route, sends one unmeasured fixed-seed 8K/1K
+warmup, brackets the measured server log by byte offset, and rejects port reuse,
+JIT activity, errors, retries, timeouts, client exhaustion, thermal throttling,
+or an unexpected count of successful requests. It never resumes into an
+existing result root.
 For the loopback OpenAI-compatible evaluator client, the runner supplies the
 non-secret dummy key `EMPTY` only when `OPENAI_API_KEY` is absent; an explicitly
 provided value is preserved.
