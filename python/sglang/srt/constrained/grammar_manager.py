@@ -14,6 +14,7 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_context
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq
@@ -128,6 +129,33 @@ class GrammarManager:
         if isinstance(req.grammar, ReasonerGrammarObject):
             req.grammar.max_think_tokens = thinking_budget
 
+    def _no_grammar_backend_error(self) -> str:
+        prefix = (
+            "Grammar-based generation (json_schema, regex, ebnf, structural_tag) is "
+        )
+        if self.server_args.skip_tokenizer_init:
+            return prefix + (
+                "unavailable because the server was launched with --skip-tokenizer-init."
+            )
+        # server_args is the pristine startup record, so a backend disabled by the
+        # import fallback still reads as the requested one; the override log is what
+        # distinguishes "operator asked for none" from "backend failed to load".
+        for source, fields in get_context().overrides_log():
+            if (
+                source == "grammar.import_fallback"
+                and fields.get("grammar_backend") == "none"
+            ):
+                return prefix + (
+                    f"unavailable: the '{self.server_args.grammar_backend}' backend "
+                    "failed to initialize for this model's tokenizer and was disabled "
+                    "at startup. Search the server log for 'Grammar backend disabled' "
+                    "for the underlying error, and try --grammar-backend llguidance or "
+                    "--grammar-backend outlines."
+                )
+        return prefix + (
+            "not supported when the server is launched with --grammar-backend none"
+        )
+
     def process_req_with_grammar(self, req: Req) -> bool:
         # Init grammar cache for this request
         add_to_grammar_queue = False
@@ -138,8 +166,7 @@ class GrammarManager:
             or req.sampling_params.structural_tag is not None
         ):
             if self.grammar_backend is None:
-                error_msg = "Grammar-based generation (json_schema, regex, ebnf, structural_tag) is not supported when the server is launched with --grammar-backend none"
-                req.set_finish_with_abort(error_msg)
+                req.set_finish_with_abort(self._no_grammar_backend_error())
             else:
                 if req.sampling_params.json_schema is not None:
                     key = ("json", req.sampling_params.json_schema)
