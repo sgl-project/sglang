@@ -1434,3 +1434,62 @@ def test_parking_is_a_no_op_outside_memory_mode(monkeypatch):
     comp.configure_layerwise_offload(_server_args(performance_mode="speed"))
     comp.park_non_layer_weights()
     assert not comp._parked_non_layer_weights
+
+
+def _headroom(monkeypatch, gib):
+    monkeypatch.setattr(
+        layerwise_offload_mod.current_platform,
+        "get_available_gpu_memory",
+        lambda **_: float(gib),
+    )
+    module = layerwise_offload_mod.torch.get_device_module()
+    monkeypatch.setattr(module, "memory_reserved", lambda *_: 0, raising=False)
+    monkeypatch.setattr(module, "memory_allocated", lambda *_: 0, raising=False)
+
+
+def test_parking_is_skipped_when_the_card_has_room(monkeypatch):
+    """A component holding a sliver of a large headroom is left alone."""
+    _patch_fake_device(monkeypatch)
+    comp = _ResidentComponent(4)
+    comp.configure_layerwise_offload(_server_args(performance_mode="memory"))
+    _headroom(monkeypatch, 400)
+    comp.park_non_layer_weights()
+    assert not comp._parked_non_layer_weights
+
+
+def test_parking_happens_when_the_headroom_is_small(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    comp = _ResidentComponent(4)
+    comp.configure_layerwise_offload(_server_args(performance_mode="memory"))
+    _headroom(monkeypatch, 0)
+    comp.park_non_layer_weights()
+    assert comp._parked_non_layer_weights
+
+
+def test_host_copies_are_given_back_when_room_appears(monkeypatch):
+    """Skipping must not leave host memory held for a park that will not happen."""
+    _patch_fake_device(monkeypatch)
+    comp = _ResidentComponent(4)
+    comp.configure_layerwise_offload(_server_args(performance_mode="memory"))
+    _headroom(monkeypatch, 0)
+    comp.park_non_layer_weights()
+    assert comp._parked_non_layer_weights
+    comp.restore_non_layer_weights()
+
+    _headroom(monkeypatch, 400)
+    comp.park_non_layer_weights()
+    assert not comp._parked_non_layer_weights, "host copies should be released"
+
+
+def test_park_placeholders_are_shared(monkeypatch):
+    """One stand-in per (device, dtype), not one allocation per parked weight."""
+    _patch_fake_device(monkeypatch)
+    comp = _ResidentComponent(4)
+    comp.configure_layerwise_offload(_server_args(performance_mode="memory"))
+    _headroom(monkeypatch, 0)
+    comp.park_non_layer_weights()
+    managed = comp._managed_layer_parameter_names()
+    stand_ins = {
+        id(p) for n, p in comp.named_parameters() if n not in managed and p.numel() == 1
+    }
+    assert len(stand_ins) <= len(comp._park_placeholders)

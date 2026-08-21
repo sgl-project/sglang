@@ -94,6 +94,13 @@ def compute_streamed_layers(
 # of table size to rows actually read makes residency clearly wasteful.
 HOST_RESIDENT_TABLE_MIN_BYTES = 256 * 1024**2
 
+# Parking a component's non-layer weights frees device memory at the cost of two
+# transfers per use and a host copy that competes with the page cache. It is
+# worth that only when what it frees is a meaningful share of the headroom
+# actually available; on a card with room it is pure loss. Below this share of
+# free device memory, the component stays where it is.
+PARK_SIGNIFICANCE = 0.1
+
 
 def _resolve_submodule(root: torch.nn.Module, path: str) -> torch.nn.Module | None:
     current: Any = root
@@ -1141,16 +1148,51 @@ class LayerwiseOffloadableModuleMixin:
             # MPS parks its own non-layer weights, scoped to subphases
             return
         managed = self._managed_layer_parameter_names()
+        resident = [
+            (name, parameter)
+            for name, parameter in self.named_parameters()
+            if name not in managed and parameter.device.type != "cpu"
+        ]
+        holds = sum(p.numel() * p.element_size() for _, p in resident)
+        if holds <= self._device_headroom_bytes() * PARK_SIGNIFICANCE:
+            # There is room. Give back any host copies rather than hold them.
+            self._parked_non_layer_weights.clear()
+            return
+
         parked = self._parked_non_layer_weights
         with torch.inference_mode(False), torch.no_grad():
-            for name, parameter in self.named_parameters():
-                if name in managed or parameter.device.type == "cpu":
-                    continue
+            for name, parameter in resident:
                 if name not in parked:
                     parked[name] = parameter.detach().to("cpu", copy=True)
-                parameter.data = torch.empty(
-                    (1,), dtype=parameter.dtype, device=parameter.device
-                )
+                parameter.data = self._park_placeholder(parameter)
+
+    def _device_headroom_bytes(self) -> int:
+        """What an allocation could get without the allocator growing its pool.
+
+        `get_available_gpu_memory` reports driver-level free memory, which
+        excludes blocks the caching allocator has already reserved and not
+        handed out. On a warm process that undercounts the real headroom badly,
+        so the allocator's own unused reserve is added back.
+        """
+        free = int(
+            current_platform.get_available_gpu_memory(empty_cache=False) * (1 << 30)
+        )
+        device_module = torch.get_device_module()
+        unused_reserve = (
+            device_module.memory_reserved() - device_module.memory_allocated()
+        )
+        return free + max(0, unused_reserve)
+
+    def _park_placeholder(self, parameter: torch.Tensor) -> torch.Tensor:
+        """One shared stand-in per (device, dtype), not one per parked weight."""
+        key = (parameter.device, parameter.dtype)
+        placeholder = self._park_placeholders.get(key)
+        if placeholder is None:
+            placeholder = torch.empty(
+                (1,), dtype=parameter.dtype, device=parameter.device
+            )
+            self._park_placeholders[key] = placeholder
+        return placeholder
 
     def restore_non_layer_weights(self) -> None:
         """Bring parked parameters back before this component is used again."""
@@ -1164,7 +1206,12 @@ class LayerwiseOffloadableModuleMixin:
                 parameter = parameters.get(name)
                 if parameter is None:
                     continue
-                parameter.data = host_tensor.to(device, non_blocking=True)
+                # The parked copy is pageable, so this transfer stages through
+                # the driver's own pinned buffer and is synchronous whatever is
+                # asked for. Pinning it instead would make the copy async, at
+                # the price of host memory the kernel can never reclaim -- the
+                # wrong trade on the hosts this path exists for.
+                parameter.data = host_tensor.to(device)
 
     def _capture_mps_cpu_non_layer_weights(self) -> None:
         managed_names = {
@@ -1264,6 +1311,14 @@ class LayerwiseOffloadableModuleMixin:
         if store is None:
             store = {}
             self.__dict__["_parked_non_layer_weight_store"] = store
+        return store
+
+    @property
+    def _park_placeholders(self) -> dict:
+        store = self.__dict__.get("_park_placeholder_store")
+        if store is None:
+            store = {}
+            self.__dict__["_park_placeholder_store"] = store
         return store
 
     def configure_layerwise_offload(
