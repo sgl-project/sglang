@@ -2117,7 +2117,7 @@ class FlashAttentionBackend(AttentionBackend):
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
-        max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
+        max_num_pages = self.max_num_pages
 
         # This is being used by normal decode and draft decode when topk == 1
         self.decode_cuda_graph_metadata = {

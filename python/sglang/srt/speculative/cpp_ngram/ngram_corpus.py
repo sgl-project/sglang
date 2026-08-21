@@ -1,14 +1,11 @@
 # -*- coding: utf-8 -*-
 
-import logging
 from collections.abc import Iterable, Sequence
 from typing import Dict, List, Tuple
 
 import numpy as np
 
 from sglang.kernels.ops.speculative.ngram_corpus import get_ngram_corpus_cls
-
-logger = logging.getLogger(__name__)
 
 
 class NgramCorpus:
@@ -34,7 +31,6 @@ class NgramCorpus:
             external_sam_budget=external_sam_budget,
             external_corpus_max_tokens=external_corpus_max_tokens,
         )
-        self.draft_token_num = draft_token_num
         self.external_corpus_max_tokens = external_corpus_max_tokens
         self._req_id_to_state_id: Dict[str, int] = {}
         self._next_state_id: int = 0
@@ -106,6 +102,26 @@ class NgramCorpus:
         state_ids = [self._get_state_id(rid) for rid in req_ids]
         return self._obj.match_stateful(state_ids, batch_tokens, total_lens)
 
+    def precompute_drafts_dense(
+        self,
+        base_tokens: List[List[int]],
+        total_lens: List[int],
+        draft_tokens,
+        tree_mask,
+        bonus_topk: int,
+        max_trie_depth: int,
+        wide_bonus_ratio: float = 0.5,
+    ):
+        return self._obj.precompute_drafts_dense_wrapper(
+            base_tokens,
+            total_lens,
+            draft_tokens,
+            tree_mask,
+            bonus_topk,
+            max_trie_depth,
+            wide_bonus_ratio,
+        )
+
     def erase_match_state(self, req_ids: List[str]):
         state_ids = []
         for rid in req_ids:
@@ -149,52 +165,3 @@ class NgramCorpus:
             result.append(path)
 
         return result
-
-    def debug_result(
-        self, decoding_ids: np.ndarray, decoding_masks: np.ndarray, tokenizer=None
-    ):
-        decoding_ids = decoding_ids.reshape(-1, self.draft_token_num)
-        decoding_masks = decoding_masks.reshape(
-            -1, self.draft_token_num, self.draft_token_num
-        )
-        logger.info(f"\n{decoding_ids=}\n{decoding_masks=}")
-        for i in range(decoding_ids.shape[0]):
-            leaf_paths = self.leaf_paths_from_mask(
-                decoding_ids[i].tolist(), decoding_masks[i].tolist()
-            )
-            if tokenizer is None:
-                logger.info(f"draft path {i}: {leaf_paths}")
-            else:
-                logger.info(f"result {i}:")
-                for leaf_path in leaf_paths:
-                    logger.info(
-                        f"draft path {i}: {leaf_path} -> {tokenizer.decode(leaf_path, ensure_ascii=False)}"
-                    )
-
-
-# main function
-if __name__ == "__main__":
-    format = f"%(levelname)s %(asctime)s %(filename)s:%(lineno)d] %(message)s"
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format=format,
-        datefmt="%Y-%m-%d %H:%M:%S",
-        force=True,
-    )
-
-    token_ids = [
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-        [1, 2, 3, 44, 55, 66, 77, 88, 99, 100],
-    ]
-    corpus = NgramCorpus(max_trie_depth=12, draft_token_num=8)
-    corpus.batch_put(token_ids)
-
-    corpus.synchronize()
-    queries = [[1, 2, 3], [3, 44], [3, 6, 999]]
-    decoding_ids, decoding_masks = corpus.batch_get(
-        req_ids=[f"query-{i}" for i in range(len(queries))],
-        batch_tokens=queries,
-        total_lens=[len(q) for q in queries],
-    )
-
-    corpus.debug_result(decoding_ids, decoding_masks)

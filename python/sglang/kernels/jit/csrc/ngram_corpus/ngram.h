@@ -19,6 +19,18 @@ namespace sglang {
 
 namespace ngram {
 
+struct PrecomputeDraftsStats {
+  int64_t num_paths = 0;
+  int64_t num_phase2_contexts = 0;
+  int64_t num_cache_entries = 0;
+};
+
+struct PrecomputeDraftsDenseCache {
+  std::vector<int32_t> bonus_tokens;
+  std::vector<int32_t> draft_tokens;
+  std::vector<uint8_t> tree_mask;
+};
+
 class Ngram {
   std::unique_ptr<Trie> trie_;
   std::unordered_map<std::string, std::unique_ptr<SuffixAutomaton>> sams_;
@@ -68,6 +80,16 @@ class Ngram {
       const std::vector<std::vector<int32_t>>& tokens,
       const std::vector<size_t>& total_lens);
 
+  PrecomputeDraftsStats precomputeDraftsDense(
+      const std::vector<std::vector<int32_t>>& base_tokens,
+      const std::vector<size_t>& base_total_lens,
+      const std::vector<int32_t>& draft_tokens,
+      const std::vector<uint8_t>& tree_mask,
+      size_t bonus_topk,
+      size_t max_trie_depth,
+      double wide_bonus_ratio,
+      PrecomputeDraftsDenseCache& dense_cache);
+
   void eraseMatchState(const std::vector<int64_t>& state_ids);
 
   // Resets the online trie and match state but preserves external corpora
@@ -87,6 +109,10 @@ class Ngram {
 
  private:
   void insertWorker();
+  Result buildMatchUnlocked(
+      const std::vector<int32_t>& suffix, size_t total_len, MatchState& state, size_t batch_size_for_budget) const;
+  std::vector<int32_t> buildRootCandidatesUnlocked(
+      const std::vector<int32_t>& suffix, size_t total_len, MatchState& state, size_t max_candidates) const;
 };
 
 }  // namespace ngram

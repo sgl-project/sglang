@@ -1150,7 +1150,15 @@ class Envs:
     # extend_attention_fwd for unsupported cases or when set false (e.g. for
     # debugging). Correctness is unaffected; this only changes performance.
     SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
+    # Ngram
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
+    # Enable NGRAM draft precompute and its fully-overlapped GPU selection path.
+    SGLANG_ENABLE_NGRAM_PRECOMPUTE = EnvBool(False)
+    # Fraction of early draft-tree tokens whose precompute bonus candidates use
+    # full bonus_topk.
+    SGLANG_NGRAM_PRECOMPUTE_WIDE_BONUS_RATIO = EnvFloat(0.5)
+    # Log ngram precompute hit-rate stats every N forward steps; <=0 disables.
+    SGLANG_LOG_NGRAM_PRECOMPUTE_STATS_INTERVAL = EnvInt(0)
 
     # ===================================================================
     # Multimodal processing

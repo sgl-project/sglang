@@ -5,11 +5,16 @@ import unittest
 import uuid
 
 import numpy as np
+import torch
 
 from sglang.srt.speculative.cpp_ngram.external_corpus import (
     iter_external_corpus_chunks,
 )
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
+from sglang.srt.speculative.ngram_precompute import (
+    apply_precomputed_drafts_for_rows,
+    select_precomputed_drafts_for_rows,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -573,6 +578,169 @@ class TestNgramCorpusIncremental(CustomTestCase):
         np.testing.assert_array_equal(inc_masks, full_masks)
 
 
+class TestNgramCorpusPrecomputeConsistency(CustomTestCase):
+    """Verify the runtime dense precompute/select path against fresh batch_get."""
+
+    @staticmethod
+    def _make_branchy_corpus(
+        draft_token_num: int,
+        max_trie_depth: int,
+    ) -> tuple[NgramCorpus, list[int]]:
+        corpus = _make_corpus(
+            "BFS",
+            max_trie_depth=max_trie_depth,
+            draft_token_num=draft_token_num,
+            min_bfs_breadth=1,
+            max_bfs_breadth=2,
+            capacity=500000,
+        )
+        prefix = [101, 102, 103]
+        rows = []
+        for root_token in range(2000, 2020):
+            for branch_token in range(3000, 3012):
+                rows.append(
+                    prefix
+                    + [
+                        root_token,
+                        branch_token,
+                        root_token + branch_token,
+                        branch_token + 100000,
+                    ]
+                )
+        corpus.batch_put(rows)
+        corpus.synchronize()
+        return corpus, prefix
+
+    def test_precomputed_hit_tree_matches_fresh_batch_get(self):
+        draft_token_num = 8
+        max_trie_depth = 8
+        bonus_topk = 3
+        corpus, prefix = self._make_branchy_corpus(draft_token_num, max_trie_depth)
+
+        bs = 3
+        req_ids = [f"precompute-root-{i}" for i in range(bs)]
+        base_tokens = [prefix[:] for _ in range(bs)]
+        base_total_lens = [len(prefix)] * bs
+        current_drafts, current_masks = corpus.batch_get(
+            req_ids, base_tokens, base_total_lens
+        )
+
+        root_only_stats, _, _, _ = corpus.precompute_drafts_dense(
+            base_tokens,
+            base_total_lens,
+            current_drafts,
+            current_masks,
+            bonus_topk,
+            max_trie_depth,
+            1.0 / draft_token_num,
+        )
+        (
+            wide_bonus_stats,
+            dense_bonus_tokens,
+            dense_draft_tokens,
+            dense_tree_masks,
+        ) = corpus.precompute_drafts_dense(
+            base_tokens,
+            base_total_lens,
+            current_drafts,
+            current_masks,
+            bonus_topk,
+            max_trie_depth,
+            0.5,
+        )
+        self.assertGreater(wide_bonus_stats[1], root_only_stats[1])
+        self.assertGreater(wide_bonus_stats[2], root_only_stats[2])
+        dense_bonus_tokens = dense_bonus_tokens.reshape(bs, draft_token_num, bonus_topk)
+        dense_draft_tokens = dense_draft_tokens.reshape(
+            bs, draft_token_num, bonus_topk, draft_token_num
+        )
+        dense_tree_masks = dense_tree_masks.reshape(
+            bs,
+            draft_token_num,
+            bonus_topk,
+            draft_token_num,
+            draft_token_num,
+        )
+        current_drafts = current_drafts.reshape(bs, draft_token_num)
+        current_masks = current_masks.reshape(bs, draft_token_num, draft_token_num)
+
+        cache_rows = []
+        path_nodes = []
+        bonus_tokens = []
+        fallback_tokens = []
+        fallback_total_lens = []
+        for req_idx in range(bs):
+            for path_node in range(draft_token_num):
+                path_cols = np.flatnonzero(current_masks[req_idx, path_node])
+                if len(path_cols) == 0 or path_cols[0] != 0:
+                    continue
+                path_drafts = [
+                    int(current_drafts[req_idx, col]) for col in path_cols if col != 0
+                ]
+                for bonus_slot in range(bonus_topk):
+                    bonus_token = int(
+                        dense_bonus_tokens[req_idx, path_node, bonus_slot]
+                    )
+                    if bonus_token < 0:
+                        continue
+                    cache_rows.append(req_idx)
+                    path_nodes.append(path_node)
+                    bonus_tokens.append(bonus_token)
+                    fallback_tokens.append(
+                        (base_tokens[req_idx] + path_drafts + [bonus_token])[
+                            -max_trie_depth:
+                        ]
+                    )
+                    fallback_total_lens.append(
+                        base_total_lens[req_idx] + len(path_drafts) + 1
+                    )
+
+        self.assertEqual(len(cache_rows), wide_bonus_stats[2])
+        self.assertGreaterEqual(len(cache_rows), bs)
+        num_cases = len(cache_rows)
+        accept_tokens = torch.zeros((num_cases, draft_token_num), dtype=torch.int32)
+        accept_tokens[:, 0] = torch.tensor(bonus_tokens, dtype=torch.int32)
+        fallback_tree_mask = (
+            torch.eye(draft_token_num, dtype=torch.bool)
+            | (torch.arange(draft_token_num) == 0)[None, :]
+        ).unsqueeze(0)
+        selected_tokens, selected_masks, cache_hits = (
+            select_precomputed_drafts_for_rows(
+                cache_rows,
+                accept_tokens.flatten(),
+                torch.ones(num_cases, dtype=torch.int32),
+                torch.tensor(path_nodes),
+                torch.from_numpy(dense_bonus_tokens),
+                torch.from_numpy(dense_draft_tokens),
+                torch.from_numpy(dense_tree_masks).bool(),
+                fallback_tree_mask,
+            )
+        )
+        self.assertTrue(cache_hits.all().item())
+
+        fresh_req_ids = [f"fresh-precompute-{i}" for i in range(num_cases)]
+        fresh_tokens, fresh_masks = corpus.batch_get(
+            fresh_req_ids,
+            fallback_tokens,
+            fallback_total_lens,
+        )
+        corpus.erase_match_state(fresh_req_ids)
+        debug_context = (
+            f"cache_rows={cache_rows}, path_nodes={path_nodes}, "
+            f"bonus_tokens={bonus_tokens}"
+        )
+        np.testing.assert_array_equal(
+            selected_tokens.numpy(),
+            fresh_tokens.reshape(num_cases, draft_token_num),
+            err_msg=debug_context,
+        )
+        np.testing.assert_array_equal(
+            selected_masks.numpy(),
+            fresh_masks.reshape(num_cases, draft_token_num, draft_token_num),
+            err_msg=debug_context,
+        )
+
+
 class TestNgramCorpusExternalSam(CustomTestCase):
     """Verify external SAM loading and fixed-budget composition."""
 
@@ -752,6 +920,231 @@ class TestNgramCorpusMatchBenchmark(CustomTestCase):
             f"Incremental ({incremental_us:.1f} us) should not be slower than "
             f"rebuild ({rebuild_us:.1f} us)",
         )
+
+
+@unittest.skipUnless(
+    os.getenv("RUN_NGRAM_PRECOMPUTE_PERF_TEST") == "1",
+    "Set RUN_NGRAM_PRECOMPUTE_PERF_TEST=1 to run the manual ngram precompute perf test.",
+)
+class TestNgramCorpusPrecomputePerf(CustomTestCase):
+    """Manual timing for batch_get vs runtime dense precompute/GPU selection."""
+
+    @staticmethod
+    def _parse_int_list_env(name: str, default: list[int]) -> list[int]:
+        raw = os.getenv(name)
+        if not raw:
+            return default
+        return [int(piece.strip()) for piece in raw.split(",") if piece.strip()]
+
+    @staticmethod
+    def _avg_ms(fn, repeats: int, device: torch.device = None):
+        import time
+
+        if device is not None and device.type != "cpu":
+            torch.get_device_module(device).synchronize()
+        last = None
+        start = time.perf_counter()
+        for _ in range(repeats):
+            last = fn()
+        if device is not None and device.type != "cpu":
+            torch.get_device_module(device).synchronize()
+        elapsed_ms = (time.perf_counter() - start) * 1000.0 / repeats
+        return elapsed_ms, last
+
+    @staticmethod
+    def _make_perf_corpus(draft_token_num: int, max_trie_depth: int):
+        corpus = _make_corpus(
+            "BFS",
+            max_trie_depth=max_trie_depth,
+            draft_token_num=draft_token_num,
+            min_bfs_breadth=1,
+            max_bfs_breadth=draft_token_num,
+            capacity=2000000,
+        )
+        prefix = [101, 102, 103]
+        rows = []
+        for round_idx in range(32):
+            for child in range(2000, 2080):
+                rows.append(
+                    prefix
+                    + [
+                        child,
+                        child + 100000,
+                        child + 200000,
+                        round_idx,
+                    ]
+                )
+        corpus.batch_put(rows)
+        corpus.synchronize()
+        return corpus
+
+    @staticmethod
+    def _build_select_payload(
+        root_bonus_tokens: np.ndarray,
+        hit_count: int,
+        draft_token_num: int,
+        device: torch.device,
+    ):
+        bs = len(root_bonus_tokens)
+        accept_tokens = torch.zeros(
+            (bs, draft_token_num), dtype=torch.int32, device=device
+        )
+        for i in range(bs):
+            if i < hit_count:
+                bonus_token = int(root_bonus_tokens[i])
+            else:
+                bonus_token = 900000000 + i
+            accept_tokens[i, 0] = bonus_token
+        return (
+            accept_tokens.flatten(),
+            torch.ones(bs, dtype=torch.int32, device=device),
+            torch.zeros(bs, dtype=torch.long, device=device),
+        )
+
+    def test_batch_get_vs_precomputed_select_perf(self):
+        draft_token_num = int(os.getenv("NGRAM_PRECOMPUTE_PERF_DRAFT_NUM", "12"))
+        max_trie_depth = int(os.getenv("NGRAM_PRECOMPUTE_PERF_MAX_DEPTH", "18"))
+        repeats = int(os.getenv("NGRAM_PRECOMPUTE_PERF_REPEATS", "20"))
+        precompute_repeats = int(os.getenv("NGRAM_PRECOMPUTE_PERF_PRE_REPEATS", "5"))
+        wide_bonus_ratio = float(
+            os.getenv("NGRAM_PRECOMPUTE_PERF_WIDE_BONUS_RATIO", "0.5")
+        )
+        batch_sizes = self._parse_int_list_env(
+            "NGRAM_PRECOMPUTE_PERF_BATCH_SIZES",
+            [1, 8, 32, 128],
+        )
+        requested_device = os.getenv("NGRAM_PRECOMPUTE_PERF_DEVICE")
+        if requested_device:
+            device = torch.device(requested_device)
+        else:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        corpus = self._make_perf_corpus(draft_token_num, max_trie_depth)
+        prefix = [101, 102, 103]
+
+        print(
+            "\nNgram precompute perf "
+            f"(draft={draft_token_num}, max_depth={max_trie_depth}, "
+            f"select_repeats={repeats}, precompute_repeats={precompute_repeats}, "
+            f"wide_bonus_ratio={wide_bonus_ratio}, select_device={device})"
+        )
+        for bs in batch_sizes:
+            req_ids = [f"precompute-perf-bs{bs}-{i}" for i in range(bs)]
+            base_tokens = [prefix[:] for _ in range(bs)]
+            total_lens = [len(prefix)] * bs
+
+            batch_get_ms, batch_result = self._avg_ms(
+                lambda: corpus.batch_get(req_ids, base_tokens, total_lens),
+                repeats,
+            )
+            draft_tokens, tree_mask = batch_result
+
+            precompute_ms, precompute_result = self._avg_ms(
+                lambda: corpus.precompute_drafts_dense(
+                    base_tokens,
+                    total_lens,
+                    draft_tokens,
+                    tree_mask,
+                    draft_token_num,
+                    max_trie_depth,
+                    wide_bonus_ratio,
+                ),
+                precompute_repeats,
+            )
+            (
+                precompute_stats,
+                dense_bonus_tokens,
+                dense_draft_tokens,
+                dense_tree_masks,
+            ) = precompute_result
+            dense_bonus_tokens = dense_bonus_tokens.reshape(
+                bs, draft_token_num, draft_token_num
+            )
+            dense_draft_tokens = dense_draft_tokens.reshape(
+                bs,
+                draft_token_num,
+                draft_token_num,
+                draft_token_num,
+            )
+            dense_tree_masks = dense_tree_masks.reshape(
+                bs,
+                draft_token_num,
+                draft_token_num,
+                draft_token_num,
+                draft_token_num,
+            )
+            root_bonus_tokens = dense_bonus_tokens[:, 0, 0]
+            self.assertTrue(
+                np.all(root_bonus_tokens >= 0),
+                f"Perf corpus should expose root bonus cache hits, got {root_bonus_tokens}",
+            )
+            cached_bonus_tokens = torch.from_numpy(dense_bonus_tokens).to(device)
+            cached_draft_tokens = torch.from_numpy(dense_draft_tokens).to(device)
+            cached_tree_masks = torch.from_numpy(dense_tree_masks).to(
+                device=device, dtype=torch.bool
+            )
+            req_id_to_row = {req_id: row for row, req_id in enumerate(req_ids)}
+            selected_draft_tokens = torch.empty(
+                bs * draft_token_num, dtype=torch.int64, device=device
+            )
+            selected_tree_mask = torch.empty(
+                bs * draft_token_num * draft_token_num,
+                dtype=torch.bool,
+                device=device,
+            )
+            fallback_tree_mask = (
+                torch.eye(draft_token_num, dtype=torch.bool, device=device)
+                | (torch.arange(draft_token_num, device=device) == 0)[None, :]
+            ).unsqueeze(0)
+
+            hit_counts = sorted({0, bs // 2, bs})
+            select_parts = []
+            for hit_count in hit_counts:
+                (
+                    accept_tokens,
+                    accept_lens,
+                    accept_path_nodes,
+                ) = self._build_select_payload(
+                    root_bonus_tokens,
+                    hit_count,
+                    draft_token_num,
+                    device,
+                )
+                select_ms, select_result = self._avg_ms(
+                    lambda: apply_precomputed_drafts_for_rows(
+                        [req_id_to_row.get(req_id, -1) for req_id in req_ids],
+                        accept_tokens,
+                        accept_lens,
+                        accept_path_nodes,
+                        cached_bonus_tokens,
+                        cached_draft_tokens,
+                        cached_tree_masks,
+                        fallback_tree_mask,
+                        selected_draft_tokens,
+                        selected_tree_mask,
+                    ),
+                    repeats,
+                    device,
+                )
+                cache_hits = select_result
+                self.assertEqual(selected_draft_tokens.numel(), bs * draft_token_num)
+                self.assertEqual(
+                    selected_tree_mask.numel(),
+                    bs * draft_token_num * draft_token_num,
+                )
+                actual_hit_count = int(cache_hits.sum().item())
+                self.assertEqual(actual_hit_count, hit_count)
+                select_parts.append(
+                    f"hit={hit_count}/{bs}: {select_ms:.3f} ms "
+                    f"(cache={actual_hit_count}/{bs})"
+                )
+
+            print(
+                f"  bs={bs:4d} batch_get={batch_get_ms:.3f} ms "
+                f"precompute={precompute_ms:.3f} ms "
+                f"(paths={precompute_stats[0]}, phase2={precompute_stats[1]}, "
+                f"cache={precompute_stats[2]}) | " + " | ".join(select_parts)
+            )
 
 
 class TestNgramCorpusMultiSam(CustomTestCase):
