@@ -229,6 +229,30 @@ def _is_fused_mhc_post_pre_enabled() -> bool:
 _FLASHINFER_MHC_PRE_SPLITS = (1, 2, 4, 8, 16)
 
 
+# The sparse-MLA backend is fixed for the process and the pad below is on the
+# per-forward path, so resolve it at import (same as _FP8_WO_A_GEMM above).
+_B12X_SPARSE_MLA = envs.SGLANG_SM120_FLASHMLA_BACKEND.get() == "b12x"
+# h_q values b12x's sparse-MLA kernels specialize for.
+_B12X_H_Q_SPECIALIZATIONS = (16, 32, 64, 128)
+
+
+def _dsv4_mqa_padded_num_heads(n_local_heads: int, n_heads: int) -> int:
+    """Head padding for the sparse-MLA core attention under attention-TP.
+
+    FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128},
+    so the flashinfer-family backends pad the per-rank heads to 64. b12x
+    supports {16, 32, 64, 128} natively with per-count tuned modes; padding
+    32 real heads to 64 there doubles the attention work and disqualifies
+    the tuned 32-head configurations.
+    """
+    if _B12X_SPARSE_MLA and is_sm120_supported():
+        for h in _B12X_H_Q_SPECIALIZATIONS:
+            if n_local_heads <= h:
+                return h
+        return n_heads
+    return 64 if n_local_heads <= 64 else n_heads
+
+
 @functools.cache
 def _cuda_sm_count() -> int:
     return torch.cuda.get_device_properties(0).multi_processor_count
@@ -643,7 +667,7 @@ class MqaAttentionBase(nn.Module):
         if self._attn_sink_local is None:
             rank = self.attn_tp_rank
             num_heads = self.n_local_heads
-            padded_num_heads = 64 if num_heads <= 64 else self.n_heads
+            padded_num_heads = _dsv4_mqa_padded_num_heads(num_heads, self.n_heads)
             sink = self.attn_sink.new_zeros(padded_num_heads)
             sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
             self._attn_sink_local = sink
@@ -1282,11 +1306,11 @@ class MQALayer(MqaAttentionBase):
 
         tp_slice, q_padded, q_out = slice(None), None, None
         if self.attn_tp_size > 1:
-            # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
-            # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
-            # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
-            # this rank and padded to match.
-            padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
+            # Backend-dependent head pad (see _dsv4_mqa_padded_num_heads);
+            # attn_sink is sliced to this rank and padded to match.
+            padded_num_heads = _dsv4_mqa_padded_num_heads(
+                self.n_local_heads, self.n_heads
+            )
             # Only [0:n_local_heads] is written below. Uninitialized padded TP
             # heads inject NaN into attention on gfx942 (fnuz), so zero-init
             # there; other archs tolerate new_empty and skip the per-forward
