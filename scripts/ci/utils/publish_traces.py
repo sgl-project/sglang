@@ -352,8 +352,8 @@ def publish_traces_from_files(files_to_upload, run_id, run_number):
         sys.exit(1)
 
     # Repository configuration
-    repo_owner = "sglang-bot"
-    repo_name = "sglang-ci-data"
+    repo_owner = "sgl-project"
+    repo_name = "ci-data"
     branch = "main"
 
     # Verify token permissions before proceeding

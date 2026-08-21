@@ -3,14 +3,14 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.triton_ops.decode_attention import (
+from sglang.kernels.ops.attention.decode_attention import (
     decode_attention_fwd_grouped as triton_decode_attention_fwd_grouped,
 )
-from sglang.srt.layers.attention.triton_ops.extend_attention import (
+from sglang.kernels.ops.attention.extend_attention import (
     extend_attention_fwd,
     redundant_attention,
 )
-from sglang.srt.layers.attention.triton_ops.prefill_attention import (
+from sglang.kernels.ops.attention.prefill_attention import (
     context_attention_fwd,
 )
 from sglang.srt.layers.attention.wave_ops.decode_attention import (
@@ -25,7 +25,7 @@ from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci
 
 # Wave attention kernel unit tests (AMD only - requires wave_lang)
-register_amd_ci(est_time=60, suite="stage-a-test-1-amd")
+register_amd_ci(est_time=60, suite="stage-a-test-1-gpu-small-amd")
 
 
 class TestWaveAttention(unittest.TestCase):

@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -17,6 +16,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.step3p5 import Step3p5DecoderLayer, Step3p5ForCausalLM
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -130,15 +130,14 @@ class Step3p5AMultiTokenPredictor(nn.Module):
         return self.embed_tokens(input_ids)
 
 
-# The current implementation differs slightly from the standard MTP implementation in Step3.5 Flash.
-# In the standard multi-layer MTP design of Step3.5 Flash,
-# the hidden states of each MTP layer are passed from the preceding MTP layer
-# (the hidden states of the initial (layer-0) MTP still being provided by the target model).
-# In contrast, the current SGL implementation obtains hidden states directly from the target model for all MTP layers.
-# Empirical evaluations indicate that the overall performance remains strong;
-# however, this design choice may lead to a slight reduction in acceptance rate in certain scenarios.
-# This behavior will be corrected shortly, and we expect to implement the standard multi-layer MTP design of Step3.5 Flash in the near future.
-# FIXME(yhyang201)
+# Chain-style multi-layer MTP (standard Step-3.5 Flash design):
+# each MTP layer consumes the hidden states produced by the preceding MTP layer,
+# while layer-0 consumes the hidden states from the target model.
+# The chain propagation is driven by MultiLayerEagleDraftWorker via the
+# ``chain_mtp_hidden_states`` flag: between speculative steps it overwrites
+# ``forward_batch.spec_info.hidden_states`` (and the CUDA-graph hidden_states
+# buffer in the draft-extend graph) with the previous layer's
+# ``hidden_states_before_norm`` returned by ``Step3p5AMultiTokenPredictor``.
 class Step3p5MTP(Step3p5ForCausalLM):
     def __init__(
         self,
@@ -149,7 +148,7 @@ class Step3p5MTP(Step3p5ForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.draft_model_idx = draft_model_idx
 

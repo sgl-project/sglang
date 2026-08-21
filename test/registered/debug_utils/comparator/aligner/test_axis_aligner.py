@@ -9,11 +9,16 @@ from sglang.srt.debug_utils.comparator.aligner.axis_aligner import (
     compute_axis_aligner_plan,
     execute_axis_aligner_plan,
 )
+from sglang.srt.debug_utils.comparator.dims_spec import (
+    apply_dim_names,
+    without_dim_names,
+)
 from sglang.srt.debug_utils.comparator.log_sink import log_sink
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="default", nightly=True)
+register_cpu_ci(est_time=15, suite="base-a-test-cpu", nightly=True)
+register_cpu_ci(est_time=1, suite="base-c-test-cpu")
 
 
 class TestComputeAxisAlignerPlan:
@@ -227,7 +232,7 @@ class TestComputeAxisAlignerPlanFused:
 class TestExecuteAxisAlignerPlan:
     def test_rearrange(self) -> None:
         torch.manual_seed(42)
-        tensor: torch.Tensor = torch.randn(4, 8, 16).refine_names("t", "h", "d")
+        tensor: torch.Tensor = apply_dim_names(torch.randn(4, 8, 16), ["t", "h", "d"])
         plan = AxisAlignerPlan(pattern=Pair(x="t h d -> t d h", y=None))
 
         result: torch.Tensor = execute_axis_aligner_plan(
@@ -236,11 +241,13 @@ class TestExecuteAxisAlignerPlan:
 
         assert result.shape == (4, 16, 8)
         for i in range(4):
-            assert torch.equal(result[i], tensor.rename(None)[i].T)
+            assert torch.equal(result[i], without_dim_names(tensor)[i].T)
 
     def test_execute_squeeze(self) -> None:
         torch.manual_seed(42)
-        tensor: torch.Tensor = torch.randn(4, 1, 8).refine_names("t", "singleton0", "h")
+        tensor: torch.Tensor = apply_dim_names(
+            torch.randn(4, 1, 8), ["t", "singleton0", "h"]
+        )
         plan = AxisAlignerPlan(pattern=Pair(x="t 1 h -> t h", y=None))
 
         result: torch.Tensor = execute_axis_aligner_plan(
@@ -251,8 +258,8 @@ class TestExecuteAxisAlignerPlan:
 
     def test_execute_squeeze_then_swap(self) -> None:
         torch.manual_seed(42)
-        tensor: torch.Tensor = torch.randn(4, 1, 8, 16).refine_names(
-            "t", "singleton0", "h", "d"
+        tensor: torch.Tensor = apply_dim_names(
+            torch.randn(4, 1, 8, 16), ["t", "singleton0", "h", "d"]
         )
         plan = AxisAlignerPlan(pattern=Pair(x="t 1 h d -> t d h", y=None))
 
@@ -264,7 +271,9 @@ class TestExecuteAxisAlignerPlan:
 
     def test_execute_y_side(self) -> None:
         torch.manual_seed(42)
-        tensor: torch.Tensor = torch.randn(4, 1, 8).refine_names("t", "singleton0", "h")
+        tensor: torch.Tensor = apply_dim_names(
+            torch.randn(4, 1, 8), ["t", "singleton0", "h"]
+        )
         plan = AxisAlignerPlan(pattern=Pair(x=None, y="t 1 h -> t h"))
 
         result: torch.Tensor = execute_axis_aligner_plan(
@@ -275,7 +284,7 @@ class TestExecuteAxisAlignerPlan:
 
     def test_noop_side(self) -> None:
         torch.manual_seed(42)
-        tensor: torch.Tensor = torch.randn(4, 8, 16).refine_names("t", "h", "d")
+        tensor: torch.Tensor = apply_dim_names(torch.randn(4, 8, 16), ["t", "h", "d"])
         plan = AxisAlignerPlan(pattern=Pair(x="t h d -> t d h", y=None))
 
         result: torch.Tensor = execute_axis_aligner_plan(
@@ -430,6 +439,116 @@ class TestEndToEndThreeWayFused:
 
         assert y_aligned.shape == x_tensor.shape
         assert torch.equal(y_aligned, x_tensor)
+
+
+class TestSeqTokenEquivalencePlan:
+    """Tests for s≡t dimension name equivalence in compute_axis_aligner_plan."""
+
+    def test_s_t_equivalence_squeeze(self) -> None:
+        """sglang 't h' vs megatron 's 1 h': plan squeezes y-side singleton, x-side no-op."""
+        result: Optional[AxisAlignerPlan] = compute_axis_aligner_plan(
+            Pair(x="t h", y="s 1 h")
+        )
+        assert result is not None
+        assert result.pattern.x is None
+        assert result.pattern.y == "s 1 h -> s h"
+
+    def test_s_t_equivalence_same_shape(self) -> None:
+        """'t h d' vs 's h d': same order after normalization → no plan needed."""
+        result: Optional[AxisAlignerPlan] = compute_axis_aligner_plan(
+            Pair(x="t h d", y="s h d")
+        )
+        assert result is None
+
+    def test_s_t_equivalence_with_swap(self) -> None:
+        """'t d h' vs 's h d': plan not None, x-pattern reorders."""
+        result: Optional[AxisAlignerPlan] = compute_axis_aligner_plan(
+            Pair(x="t d h", y="s h d")
+        )
+        assert result is not None
+        assert result.pattern.x is not None
+
+    def test_s_t_equivalence_with_fused(self) -> None:
+        """'t (a*b)' vs 's a b': plan not None, y-pattern flattens."""
+        result: Optional[AxisAlignerPlan] = compute_axis_aligner_plan(
+            Pair(x="t (a*b)", y="s a b")
+        )
+        assert result is not None
+        assert result.pattern.y is not None
+
+    def test_s_t_equivalence_with_squeeze_and_fused(self) -> None:
+        """'t (num_heads*head_dim)' vs 's 1 num_heads head_dim': plan squeezes + flattens."""
+        result: Optional[AxisAlignerPlan] = compute_axis_aligner_plan(
+            Pair(x="t (num_heads*head_dim)", y="s 1 num_heads head_dim")
+        )
+        assert result is not None
+
+
+class TestSeqTokenEquivalenceExecute:
+    """Tests for s≡t dimension name equivalence in execute_axis_aligner_plan."""
+
+    def test_execute_s_t_squeeze(self) -> None:
+        """Tensor [4,1,8] with pattern 's 1 h -> s h' → shape [4,8]."""
+        torch.manual_seed(42)
+        tensor: torch.Tensor = torch.randn(4, 1, 8)
+        plan = AxisAlignerPlan(pattern=Pair(x=None, y="s 1 h -> s h"))
+
+        result: torch.Tensor = execute_axis_aligner_plan(
+            tensor=tensor, plan=plan, side="y"
+        )
+
+        assert result.shape == (4, 8)
+        assert torch.equal(result, tensor.squeeze(1))
+
+
+class TestEndToEndSeqTokenEquivalence:
+    """End-to-end tests for s≡t equivalence through compute + execute pipeline."""
+
+    def test_s_t_squeeze_full_pipeline(self) -> None:
+        """x=tensor(4,8) dims='t h', y=tensor(4,1,8) dims='s 1 h' → both aligned to (4,8)."""
+        torch.manual_seed(42)
+        data: torch.Tensor = torch.randn(4, 8)
+        x_tensor: torch.Tensor = data.clone()
+        y_tensor: torch.Tensor = data.unsqueeze(1)
+
+        plan: Optional[AxisAlignerPlan] = compute_axis_aligner_plan(
+            Pair(x="t h", y="s 1 h")
+        )
+        assert plan is not None
+
+        x_aligned: torch.Tensor = execute_axis_aligner_plan(
+            tensor=x_tensor, plan=plan, side="x"
+        )
+        y_aligned: torch.Tensor = execute_axis_aligner_plan(
+            tensor=y_tensor, plan=plan, side="y"
+        )
+
+        assert x_aligned.shape == y_aligned.shape == (4, 8)
+        assert torch.equal(x_aligned, y_aligned)
+
+    def test_s_t_fused_full_pipeline(self) -> None:
+        """x=tensor(4,128) dims='t (nh*hd)', y=tensor(4,1,8,16) dims='s 1 nh hd' → both (4,128)."""
+        torch.manual_seed(42)
+        num_heads: int = 8
+        head_dim: int = 16
+        data: torch.Tensor = torch.randn(4, num_heads * head_dim)
+        x_tensor: torch.Tensor = data.clone()
+        y_tensor: torch.Tensor = data.reshape(4, num_heads, head_dim).unsqueeze(1)
+
+        plan: Optional[AxisAlignerPlan] = compute_axis_aligner_plan(
+            Pair(x="t (nh*hd)", y="s 1 nh hd")
+        )
+        assert plan is not None
+
+        x_aligned: torch.Tensor = execute_axis_aligner_plan(
+            tensor=x_tensor, plan=plan, side="x"
+        )
+        y_aligned: torch.Tensor = execute_axis_aligner_plan(
+            tensor=y_tensor, plan=plan, side="y"
+        )
+
+        assert x_aligned.shape == y_aligned.shape == (4, num_heads * head_dim)
+        assert torch.equal(x_aligned, y_aligned)
 
 
 if __name__ == "__main__":

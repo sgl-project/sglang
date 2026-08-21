@@ -1,0 +1,219 @@
+{
+    "_comment": "Per-model comparison config. Sampling params omitted where model defaults are correct — only override resolution, seed, and params that differ from defaults.",
+    "test_image_url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/cat.png",
+    "cases": [
+        {
+            "id": "flux1_dev_t2i_1024",
+            "model": "black-forest-labs/FLUX.1-dev",
+            "task": "text-to-image",
+            "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
+            "width": 1024,
+            "height": 1024,
+            "seed": 42,
+            "num_gpus": 2,
+            "frameworks": {
+                "sglang": {
+                    "serve_args": "--warmup-mode server --component-residency dit=resident --tp-size 2",
+                    "extra_env": {}
+                }
+            }
+        },
+        {
+            "id": "flux2_dev_t2i_1024",
+            "model": "black-forest-labs/FLUX.2-dev",
+            "task": "text-to-image",
+            "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
+            "width": 1024,
+            "height": 1024,
+            "seed": 42,
+            "num_gpus": 2,
+            "frameworks": {
+                "sglang": {
+                    "serve_args": "--warmup-mode server --component-residency dit=resident --tp-size 2",
+                    "extra_env": {}
+                }
+            }
+        },
+        {
+            "id": "qwen_image_2512_t2i_1024",
+            "model": "Qwen/Qwen-Image-2512",
+            "task": "text-to-image",
+            "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
+            "width": 1024,
+            "height": 1024,
+            "seed": 42,
+            "num_gpus": 2,
+            "frameworks": {
+                "sglang": {
+                    "serve_args": "--warmup-mode server --tp-size 2",
+                    "extra_env": {}
+                }
+            }
+        },
+        {
+            "id": "qwen_image_edit_2511",
+            "model": "Qwen/Qwen-Image-Edit-2511",
+            "task": "image-edit",
+            "prompt": "Make the cat wear a red hat",
+            "reference_image": true,
+            "width": 1024,
+            "height": 1024,
+            "seed": 42,
+            "num_gpus": 2,
+            "frameworks": {
+                "sglang": {
+                    "serve_args": "--warmup-mode server --tp-size 2",
+                    "extra_env": {}
+                }
+            }
+        },
+        {
+            "id": "zimage_turbo_t2i_1024",
+            "model": "Tongyi-MAI/Z-Image-Turbo",
+            "task": "text-to-image",
+            "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
+            "width": 1024,
+            "height": 1024,
+            "seed": 42,
+            "num_gpus": 2,
+            "frameworks": {
+                "sglang": {
+                    "serve_args": "--warmup-mode server --tp-size 2",
+                    "extra_env": {}
+                }
+            }
+        },
+        {
+            "id": "wan22_t2v_a14b_720p",
+            "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+            "task": "text-to-video",
+            "prompt": "A cat and a dog baking a cake together in a kitchen.",
+            "width": 1280,
+            "height": 720,
+            "num_frames": 81,
+            "seed": 42,
+            "num_gpus": 4,
+            "frameworks": {
+                "sglang": {
+                    "serve_args": "--warmup-mode server --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory",
+                    "extra_env": {}
+                }
+            }
+        },
+        {
+            "id": "wan22_ti2v_5b_720p",
+            "model": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+            "task": "text-image-to-video",
+            "prompt": "The cat starts walking slowly towards the camera.",
+            "reference_image": true,
+            "width": 1280,
+            "height": 720,
+            "num_frames": 81,
+            "seed": 42,
+            "num_gpus": 1,
+            "frameworks": {
+                "sglang": {
+                    "serve_args": "--warmup-mode server",
+                    "extra_env": {}
+                }
+            }
+        },
+        {
+            "id": "ltx2.3_twostage_ti2v_2gpus",
+            "model": "Lightricks/LTX-2.3",
+            "task": "text-image-to-video",
+            "prompt": "The cat starts walking slowly towards the camera.",
+            "reference_image": true,
+            "width": 768,
+            "height": 512,
+            "num_frames": 121,
+            "seed": 42,
+            "num_gpus": 2,
+            "frameworks": {
+                "sglang": {
+                    "serve_args": "--warmup-mode server --pipeline-class-name LTX2TwoStagePipeline --cfg-parallel-size 2",
+                    "extra_env": {}
+                }
+            }
+        },
+        {
+            "id": "ideogram4_fp8_t2i_2gpu",
+            "model": "ideogram-ai/ideogram-4-fp8",
+            "task": "text-to-image",
+            "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
+            "width": 1024,
+            "height": 1024,
+            "seed": 42,
+            "num_gpus": 2,
+            "frameworks": {
+                "sglang": {
+                    "serve_args": "--warmup-mode server --tp-size 2 --attention-backend fa",
+                    "extra_env": {}
+                }
+            }
+        },
+        {
+            "id": "cosmos3_super_t2v_2gpu",
+            "model": "nvidia/Cosmos3-Super",
+            "task": "text-to-video",
+            "prompt": "A cat and a dog baking a cake together in a kitchen.",
+            "width": 1280,
+            "height": 720,
+            "num_frames": 81,
+            "seed": 42,
+            "num_gpus": 2,
+            "frameworks": {
+                "sglang": {
+                    "serve_args": "--warmup-mode server --tp-size 2",
+                    "extra_env": {"SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1"}
+                }
+            }
+        },
+        {
+            "id": "wan22_i2v_a14b_720p",
+            "model": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+            "task": "image-to-video",
+            "prompt": "The cat starts walking slowly towards the camera.",
+            "reference_image": true,
+            "width": 1280,
+            "height": 720,
+            "num_frames": 81,
+            "seed": 42,
+            "num_gpus": 4,
+            "frameworks": {
+                "sglang": {
+                    "serve_args": "--warmup-mode server --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory",
+                    "extra_env": {}
+                }
+            }
+        },
+        {
+            "id": "minimax_h3_t2va_5s",
+            "model": "MiniMaxAI/MiniMax-H3",
+            "task": "text-to-video",
+            "prompt": "At night, while their owner sleeps in a bedroom, three cats march in loudly playing tiny brass instruments, then abruptly file out.",
+            "width": 1344,
+            "height": 768,
+            "num_frames": 124,
+            "fps": 24,
+            "num_inference_steps": 50,
+            "seed": 1101,
+            "num_gpus": 4,
+            "sglang_request_extra": {
+                "task": "t2va",
+                "conditions": [],
+                "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0},
+                "flow_shift": 12.0,
+                "audio_flow_shift": 3.0,
+                "num_frames": null,
+                "fps": null
+            },
+            "frameworks": {
+                "sglang": {
+                    "serve_args": "--warmup-mode server --model-variant fl2va --tp-size 2 --ulysses-degree 2 --performance-mode speed --enable-torch-compile false",
+                    "extra_env": {}
+                }
+            }
+        }
+    ]
+}

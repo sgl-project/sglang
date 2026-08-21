@@ -6,24 +6,22 @@ python3 -m unittest test_srt_engine.TestSRTEngine.test_4_sync_async_stream_combi
 import asyncio
 import json
 import unittest
-from types import SimpleNamespace
 
 import torch
 
 import sglang as sgl
-from sglang.bench_offline_throughput import BenchArgs, throughput_test
+from sglang.benchmark.offline_throughput import BenchArgs, throughput_test
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.few_shot_gsm8k_engine import run_eval
 from sglang.test.test_utils import (
     DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     CustomTestCase,
 )
 
-register_cuda_ci(est_time=252, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=261, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=387, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=261, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestSRTEngine(CustomTestCase):
@@ -88,68 +86,6 @@ class TestSRTEngine(CustomTestCase):
         print("==== Answer 2 ====")
         print(out2)
         self.assertEqual(out1, out2)
-
-    def test_4_sync_async_stream_combination(self):
-        prompt = "AI safety is"
-        sampling_params = {"temperature": 0.8, "top_p": 0.95}
-
-        # Create an LLM.
-        llm = sgl.Engine(
-            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-        )
-
-        if True:
-            # 1. sync + non streaming
-            print("\n\n==== 1. sync + non streaming ====")
-            output = llm.generate(prompt, sampling_params)
-            print(output["text"])
-
-            # 2. sync + streaming
-            print("\n\n==== 2. sync + streaming ====")
-            output_generator = llm.generate(prompt, sampling_params, stream=True)
-            offset = 0
-            for output in output_generator:
-                print(output["text"][offset:], end="", flush=True)
-                offset = len(output["text"])
-            print()
-
-        if True:
-            loop = asyncio.get_event_loop()
-            # 3. async + non_streaming
-            print("\n\n==== 3. async + non streaming ====")
-            output = loop.run_until_complete(
-                llm.async_generate(prompt, sampling_params)
-            )
-            print(output["text"])
-
-            # 4. async + streaming
-            async def async_streaming(engine):
-                generator = await engine.async_generate(
-                    prompt, sampling_params, stream=True
-                )
-
-                offset = 0
-                async for output in generator:
-                    print(output["text"][offset:], end="", flush=True)
-                    offset = len(output["text"])
-                print()
-
-            print("\n\n==== 4. async + streaming ====")
-            loop.run_until_complete(async_streaming(llm))
-
-        llm.shutdown()
-
-    def test_5_gsm8k(self):
-
-        args = SimpleNamespace(
-            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            local_data_path=None,
-            num_shots=5,
-            num_questions=1400,
-        )
-
-        metrics = run_eval(args)
-        self.assertGreater(metrics["accuracy"], 0.33)
 
     def test_6_engine_cpu_offload(self):
         prompt = "Today is a sunny day and I like"

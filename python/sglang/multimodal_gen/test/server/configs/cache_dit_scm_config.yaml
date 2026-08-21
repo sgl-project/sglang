@@ -1,0 +1,13 @@
+cache_config:
+  max_warmup_steps: 2
+  warmup_interval: 2
+  max_cached_steps: -1
+  max_continuous_cached_steps: 2
+  Fn_compute_blocks: 1
+  Bn_compute_blocks: 0
+  residual_diff_threshold: 0.12
+  enable_taylorseer: true
+  taylorseer_order: 1
+  num_inference_steps: 8
+  steps_computation_mask: "medium"
+  steps_computation_policy: dynamic

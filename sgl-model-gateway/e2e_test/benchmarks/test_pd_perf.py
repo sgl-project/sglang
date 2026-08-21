@@ -21,6 +21,11 @@ class TestPDPerf:
                 "e2e_latency_mean_max": 16,
                 "input_throughput_mean_min": 350,
                 "output_throughput_mean_min": 18,
-                "gpu_util_p50_min": 99,
+                # gpu_util_p50_min intentionally omitted: the new 4-gpu-h100
+                # runner produces only ~11-14 GPU-util samples per run and
+                # the median routinely lands at 0% even when mean is 17-50%
+                # (PD test pattern is bursty). Throughput/latency floors
+                # still validate end-to-end perf; recalibrate once the
+                # bench window is longer.
             },
         )

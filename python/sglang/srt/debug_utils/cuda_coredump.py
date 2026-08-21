@@ -29,7 +29,24 @@ def is_enabled() -> bool:
 
 
 def get_dump_dir() -> str:
-    return envs.SGLANG_CUDA_COREDUMP_DIR.get()
+    # Resolve the base dir the same way as the uploader
+    # (.github/actions/upload-cuda-coredumps/action.yml) so they agree; an empty
+    # SGLANG_CUDA_COREDUMP_DIR counts as unset, like the action's `[ -n ... ]`.
+    explicit = envs.SGLANG_CUDA_COREDUMP_DIR.get()
+    runner_temp = os.getenv("RUNNER_TEMP")
+    if explicit:
+        base = explicit
+    elif runner_temp:
+        base = os.path.join(runner_temp, "sglang_cuda_coredumps")
+    else:
+        base = "/tmp/sglang_cuda_coredumps"
+    # Isolate dumps per (run, attempt): on a shared self-hosted runner a leftover
+    # dump from one job must not be picked up and mis-attributed by a later one.
+    run_id = os.getenv("GITHUB_RUN_ID")
+    if run_id:
+        attempt = os.getenv("GITHUB_RUN_ATTEMPT", "1")
+        return os.path.join(base, f"{run_id}-{attempt}")
+    return base
 
 
 def _inject_env():

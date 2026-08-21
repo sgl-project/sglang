@@ -168,6 +168,10 @@ class NVILALiteForConditionalGeneration(nn.Module):
             if name.startswith("llm."):
                 self.llm.load_weights([(name[len("llm.") :], loaded_weight)])
             else:
+                if name not in params_dict and name.startswith(
+                    "vision_tower.vision_model."
+                ):
+                    name = "vision_tower." + name[len("vision_tower.vision_model.") :]
                 param = params_dict[name]
                 weight_loader = getattr(
                     param, "weight_loader", weight_utils.default_weight_loader

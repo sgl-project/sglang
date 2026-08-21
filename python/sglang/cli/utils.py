@@ -4,9 +4,34 @@ import os
 import subprocess
 from functools import lru_cache
 
+from huggingface_hub import HfApi
+
 from sglang.srt.environ import envs
+from sglang.utils import (
+    has_diffusion_overlay_registry_match,
+    load_diffusion_overlay_registry_from_env,
+)
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _load_overlay_registry() -> dict:
+    return load_diffusion_overlay_registry_from_env()
+
+
+def _is_overlay_diffusion_model(model_path: str) -> bool:
+    return has_diffusion_overlay_registry_match(model_path, _load_overlay_registry())
+
+
+def _is_diffusion_model_from_registry(model_path: str) -> bool:
+    try:
+        from sglang.multimodal_gen.registry import is_registered_diffusion_model_path
+    except ImportError:
+        # if diffusion dependencies are not installed
+        return False
+
+    return is_registered_diffusion_model_path(model_path)
 
 
 def _is_diffusers_model_dir(model_dir: str) -> bool:
@@ -21,28 +46,37 @@ def _is_diffusers_model_dir(model_dir: str) -> bool:
     return "_diffusers_version" in config
 
 
+def _is_gated_diffusion_repo(repo_id: str) -> bool:
+    """Query HF model card metadata to check if a gated repo is a diffusers model."""
+    try:
+        info = HfApi().model_info(repo_id)
+        return getattr(info, "library_name", None) == "diffusers"
+    except Exception:
+        return False
+
+
 def get_is_diffusion_model(model_path: str) -> bool:
     """Detect whether model_path points to a diffusion model.
 
-    For local directories, checks the filesystem directly.
-    For HF/ModelScope model IDs, attempts to fetch only model_index.json.
+    For registered models, consults the diffusion registry first.
+    For other local directories, checks the filesystem directly.
+    For other HF/ModelScope model IDs, attempts to fetch only model_index.json.
+    For gated repos where file download fails, falls back to HF model card
+    metadata (library_name == "diffusers").
     Returns False on any failure (network error, 404, offline mode, etc.)
     so that the caller falls through to the standard LLM server path.
     """
-    try:
-        from sglang.multimodal_gen.registry import (
-            is_known_non_diffusers_multimodal_model,
-        )
-    except ImportError:
-        is_known_non_diffusers_multimodal_model = lambda _: False
+    if _is_overlay_diffusion_model(model_path):
+        # short-circuit, if applicable for the overlay mechanism (diffusion-only)
+        return True
+
+    # the diffusion registry is authoritative for native models, including
+    # local directories without a top-level model_index.json
+    if _is_diffusion_model_from_registry(model_path):
+        return True
 
     if os.path.isdir(model_path):
-        if _is_diffusers_model_dir(model_path):
-            return True
-        return is_known_non_diffusers_multimodal_model(model_path)
-
-    if is_known_non_diffusers_multimodal_model(model_path):
-        return True
+        return _is_diffusers_model_dir(model_path)
 
     try:
         if envs.SGLANG_USE_MODELSCOPE.get():
@@ -62,17 +96,25 @@ def get_is_diffusion_model(model_path: str) -> bool:
         return False
 
 
-def get_model_path(extra_argv):
-    # Find the model_path argument
+def try_get_model_path(extra_argv) -> str | None:
+    """Return a model path from command-line arguments when one is present."""
+
     model_path = None
     for i, arg in enumerate(extra_argv):
-        if arg == "--model-path":
+        if arg in ("--model-path", "--model"):
             if i + 1 < len(extra_argv):
                 model_path = extra_argv[i + 1]
                 break
-        elif arg.startswith("--model-path="):
+        elif arg.startswith("--model-path=") or arg.startswith("--model="):
             model_path = arg.split("=", 1)[1]
             break
+
+    return model_path
+
+
+def get_model_path(extra_argv):
+    # Find the model_path argument
+    model_path = try_get_model_path(extra_argv)
 
     if model_path is None:
         # Fallback for --help or other cases where model-path is not provided
@@ -80,8 +122,7 @@ def get_model_path(extra_argv):
             raise Exception(
                 "Usage: sglang serve --model-path <model-name-or-path> [additional-arguments]\n\n"
                 "This command can launch either a standard language model server or a diffusion model server.\n"
-                "The server type is determined by the model path.\n"
-                "For specific arguments, please provide a model_path."
+                "The server type is determined by the --model-path.\n"
             )
         else:
             raise Exception(

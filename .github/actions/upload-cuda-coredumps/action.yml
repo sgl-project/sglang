@@ -1,5 +1,5 @@
 name: Upload CUDA Coredumps
-description: Upload CUDA coredump files as artifacts and clean up the directory.
+description: Upload CUDA coredump files as artifacts, optionally signal to a tracker issue, and clean up.
 
 inputs:
   artifact-suffix:
@@ -10,18 +10,92 @@ inputs:
     description: Number of days to retain the artifact
     required: false
     default: "7"
+  tracker-issue:
+    description: |
+      If set, post a one-line comment to sgl-project/sglang issue
+      #<tracker-issue> when at least one coredump is detected. Requires
+      `bot-token` with issues:write on sgl-project/sglang.
+    required: false
+    default: ""
+  bot-token:
+    description: PAT with issues:write on sgl-project/sglang. Required when tracker-issue is set.
+    required: false
+    default: ""
 
 runs:
   using: composite
   steps:
+    - name: Check for coredumps
+      id: check
+      shell: bash
+      run: |
+        # Mirror get_dump_dir() in python/sglang/srt/debug_utils/cuda_coredump.py:
+        # explicit override > per-job RUNNER_TEMP > /tmp default, then a
+        # per-(run, attempt) subdir so dumps are never mis-attributed across CI
+        # jobs that share a self-hosted runner's filesystem.
+        if [ -n "$SGLANG_CUDA_COREDUMP_DIR" ]; then
+          base="$SGLANG_CUDA_COREDUMP_DIR"
+        elif [ -n "$RUNNER_TEMP" ]; then
+          base="$RUNNER_TEMP/sglang_cuda_coredumps"
+        else
+          base="/tmp/sglang_cuda_coredumps"
+        fi
+        if [ -n "$GITHUB_RUN_ID" ]; then
+          dir="$base/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1}"
+        else
+          dir="$base"
+        fi
+        echo "dump_dir=$dir" >> "$GITHUB_OUTPUT"
+        if [ -d "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
+          echo "has_dumps=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "has_dumps=false" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Upload CUDA coredumps
+      if: steps.check.outputs.has_dumps == 'true'
       uses: actions/upload-artifact@v4
       with:
         name: cuda-coredumps-${{ github.job }}${{ inputs.artifact-suffix && format('-{0}', inputs.artifact-suffix) }}
-        path: ${{ env.SGLANG_CUDA_COREDUMP_DIR || '/tmp/sglang_cuda_coredumps' }}/
+        path: ${{ steps.check.outputs.dump_dir }}/
         retention-days: ${{ inputs.retention-days }}
-        if-no-files-found: ignore
+
+    - name: Signal coredump to tracker issue
+      if: steps.check.outputs.has_dumps == 'true' && inputs.tracker-issue != '' && inputs.bot-token != ''
+      shell: bash
+      env:
+        BOT_TOKEN: ${{ inputs.bot-token }}
+        PR_NUM: ${{ github.event.pull_request.number }}
+        EVENT_NAME: ${{ github.event_name }}
+        TRACKER_ISSUE: ${{ inputs.tracker-issue }}
+      run: |
+        if [ -n "$PR_NUM" ]; then
+          ref_label="PR #${PR_NUM}"
+        else
+          ref_label="$EVENT_NAME"
+        fi
+        # Resolve own job_id via REST API: match by runner_name + status
+        # in_progress (the current job is the only one in_progress on this
+        # runner). Robust across matrix expansions and artifact-suffix shapes.
+        job_id=$(curl -sS \
+          -H "Authorization: Bearer ${BOT_TOKEN}" \
+          -H "Accept: application/vnd.github+json" \
+          "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}/jobs?per_page=100" \
+          | python3 -c 'import json,sys,os; print(next((j["id"] for j in json.load(sys.stdin)["jobs"] if j.get("runner_name")==os.environ["RUNNER_NAME"] and j.get("status")=="in_progress"), ""))')
+        if [ -n "$job_id" ]; then
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/job/${job_id}"
+        else
+          # Fallback to run-attempt URL if job_id lookup failed
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
+        fi
+        body_json=$(printf '{"body":"@hnyls2002 [Coredump Tracker] %s - %s"}' "${ref_label}" "${run_url}")
+        curl -sS -X POST \
+          -H "Authorization: Bearer ${BOT_TOKEN}" \
+          -H "Accept: application/vnd.github+json" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          "https://api.github.com/repos/sgl-project/sglang/issues/${TRACKER_ISSUE}/comments" \
+          -d "${body_json}"
 
     - name: Cleanup CUDA coredumps
       shell: bash
-      run: rm -rf "${{ env.SGLANG_CUDA_COREDUMP_DIR || '/tmp/sglang_cuda_coredumps' }}"
+      run: rm -rf "${{ steps.check.outputs.dump_dir }}"

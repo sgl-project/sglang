@@ -337,13 +337,13 @@ def parse_args():
     parser.add_argument(
         "--prefill-shapes",
         type=str,
-        default="2048x8192,8192x8192,16384x8192",
+        default="2048x2880,2048x8192,8192x8192,16384x8192",
         help="Comma-separated MxN shapes for eager mode.",
     )
     parser.add_argument(
         "--decode-shapes",
         type=str,
-        default="1x8192,2x8192,4x8192,8x8192,16x8192",
+        default="1x2880,4x2880,16x2880,1x8192,2x8192,4x8192,8x8192,16x8192",
         help="Comma-separated MxN shapes for graph mode.",
     )
     parser.add_argument("--warmup", type=int, default=10)

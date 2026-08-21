@@ -1,6 +1,6 @@
 """MI35x GLM-5 GSM8K Completion Evaluation Test (8-GPU)
 
-Tests GLM-5 with NSA attention backend using few-shot completion
+Tests GLM-5 with DSA attention backend using few-shot completion
 benchmark on MI35x.
 
 Registry: nightly-amd-8-gpu-mi35x-glm5 suite
@@ -8,11 +8,6 @@ Registry: nightly-amd-8-gpu-mi35x-glm5 suite
 
 import ast
 import os
-
-# Set HF cache for MI35x
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import re
 import time
 import unittest
@@ -60,20 +55,24 @@ class ModelConfig:
         return self.model_path
 
 
-# GLM-5 models for MI35x - NSA attention backend
+# GLM-5 models for MI35x - DSA attention backend
 MI35X_GLM5_MODELS = [
-    # GLM-5 with NSA attention (TP=8)
+    # GLM-5 with DSA attention (TP=8)
     ModelConfig(
-        model_path="zai-org/GLM-5",
+        model_path="zai-org/GLM-5-FP8",
         tp_size=8,
         accuracy_threshold=0.93,
         timeout=5400,
-        variant="nsa",
+        variant="dsa",
         other_args=[
             "--trust-remote-code",
-            "--nsa-prefill-backend",
+            "--reasoning-parser",
+            "glm45",
+            "--tool-call-parser",
+            "glm47",
+            "--dsa-prefill-backend",
             "tilelang",
-            "--nsa-decode-backend",
+            "--dsa-decode-backend",
             "tilelang",
             "--chunked-prefill-size",
             "131072",
@@ -82,7 +81,7 @@ MI35X_GLM5_MODELS = [
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
             "--watchdog-timeout",
-            "1200",  # 20 minutes for weight loading
+            "1200",
         ],
         env_vars={},
     ),

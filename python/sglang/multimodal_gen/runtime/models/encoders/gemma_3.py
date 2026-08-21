@@ -4,7 +4,6 @@
 # Adapted from sglang: python/sglang/srt/models/gemma3_causal.py
 
 import logging
-from functools import partial
 from typing import Any, Iterable, Optional, Set, Tuple
 
 import torch
@@ -14,9 +13,7 @@ from sglang.multimodal_gen.configs.models.encoders.base import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.gemma_3 import Gemma3Config
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.activation import GeluAndMul
-from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.linear import (
-    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -24,7 +21,14 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import get_rope
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
+from sglang.multimodal_gen.runtime.models.encoders.base import (
+    EncoderTensorParallelMixin,
+)
 from sglang.multimodal_gen.runtime.utils.common import add_prefix
+from sglang.srt.models.siglip import SiglipVisionModel
 
 logger = logging.getLogger(__name__)
 
@@ -146,27 +150,72 @@ class Gemma3Attention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        self.is_sliding = (
-            config.text_config.layer_types[layer_id] == "sliding_attention"
-        )
+        layer_types = getattr(config.text_config, "layer_types", None)
+        if layer_types:
+            self.layer_type = layer_types[layer_id]
+            self.is_sliding = self.layer_type == "sliding_attention"
+        else:
+            # official Gemma3 uses sliding_window_pattern when layer_types is absent
+            sliding_window_pattern = getattr(
+                config.text_config, "sliding_window_pattern", None
+            )
+            self.is_sliding = (
+                bool((layer_id + 1) % sliding_window_pattern)
+                if sliding_window_pattern
+                else False
+            )
+            self.layer_type = "sliding_attention" if self.is_sliding else None
+
+        rope_parameters = getattr(config.text_config, "rope_parameters", None) or {}
+        layer_rope_params = {}
+        if self.layer_type is not None and isinstance(rope_parameters, dict):
+            layer_rope_params = dict(rope_parameters.get(self.layer_type) or {})
 
         # Initialize the rotary embedding.
         if self.is_sliding:
             # Local attention.
-            self.rope_theta = config.text_config.rope_local_base_freq
-            rope_scaling = None  # Default
+            self.rope_theta = float(
+                layer_rope_params.get(
+                    "rope_theta",
+                    getattr(
+                        config.text_config,
+                        "rope_local_base_freq",
+                        getattr(
+                            getattr(config.text_config, "default_theta", {}),
+                            "get",
+                            lambda *_: 10_000.0,
+                        )("local", 10_000.0),
+                    ),
+                )
+            )
+            rope_scaling = layer_rope_params or None
             # sliding window
             self.sliding_window = get_attention_sliding_window_size(config.text_config)
             # (left, right) = (window, 0) effectively for causal
             self.window_size = (self.sliding_window, 0)
         else:
             # Global attention.
-            self.rope_theta = config.text_config.rope_theta
-            rope_scaling = config.text_config.rope_scaling
+            self.rope_theta = float(
+                layer_rope_params.get(
+                    "rope_theta",
+                    getattr(
+                        config.text_config,
+                        "rope_theta",
+                        getattr(
+                            getattr(config.text_config, "default_theta", {}),
+                            "get",
+                            lambda *_: 1_000_000.0,
+                        )("global", 1_000_000.0),
+                    ),
+                )
+            )
+            rope_scaling = layer_rope_params or getattr(
+                config.text_config, "rope_scaling", None
+            )
             self.sliding_window = None
             self.window_size = (-1, -1)
 
-        self.rotary_emb = get_rope(
+        self.rotary_pos_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=config.text_config.max_position_embeddings,
@@ -174,19 +223,6 @@ class Gemma3Attention(nn.Module):
             rope_scaling=rope_scaling,
             is_neox_style=True,
         )
-
-        # NOTE(gmixiaojin): The shared RotaryEmbedding above computes inv_freq on
-        # GPU and uses the x1*cos - x2*sin formula, which causes slight
-        # numerical differences vs HuggingFace (see the NOTE in
-        # rotary_embedding.py:_compute_inv_freq).  For HF-exact alignment we
-        # precompute inv_freq on CPU and use rotate_half in self.rotary_emb().
-        freq_indices = (
-            torch.arange(0, self.head_dim, 2, dtype=torch.int64).float() / self.head_dim
-        )
-        inv_freq = 1.0 / (self.rope_theta**freq_indices)
-        if rope_scaling and rope_scaling.get("factor"):
-            inv_freq = inv_freq / float(rope_scaling["factor"])
-        self.register_buffer("_hf_inv_freq", inv_freq, persistent=False)
 
         # Local Attention not support attention mask, we use global attention instead.
         # self.attn = LocalAttention(
@@ -207,16 +243,18 @@ class Gemma3Attention(nn.Module):
             dim=self.head_dim, eps=config.text_config.rms_norm_eps
         )
 
-    def rotary_emb(self, positions, q, k):
-        """Apply RoPE using HF-exact formula with precomputed inv_freq."""
-        positions_flat = positions.flatten().float()
+    def _apply_rotary_pos_emb(self, positions, q, k):
+        positions_flat = positions.flatten().to(
+            device=self.rotary_pos_emb.cos_sin_cache.device, dtype=torch.long
+        )
+        cos_sin = self.rotary_pos_emb.cos_sin_cache.index_select(0, positions_flat)
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        # match HF Gemma3: expand half-dim freqs to full head dim before rotate_half
+        cos = torch.cat((cos, cos), dim=-1).to(device=q.device, dtype=q.dtype)
+        sin = torch.cat((sin, sin), dim=-1).to(device=q.device, dtype=q.dtype)
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
         num_tokens = positions_flat.shape[0]
-
-        with torch.autocast(device_type=q.device.type, enabled=False):
-            freqs = torch.outer(positions_flat, self._hf_inv_freq.float())
-            emb = freqs.repeat(1, 2)
-            cos = emb.cos().to(q.dtype).unsqueeze(1)
-            sin = emb.sin().to(q.dtype).unsqueeze(1)
 
         q = q.reshape(num_tokens, -1, self.head_dim)
         k = k.reshape(num_tokens, -1, self.head_dim)
@@ -243,7 +281,7 @@ class Gemma3Attention(nn.Module):
         k = self.k_norm(k)
 
         # Apply RoPE
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = self._apply_rotary_pos_emb(positions, q, k)
         q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         k = k.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
 
@@ -252,11 +290,10 @@ class Gemma3Attention(nn.Module):
         key = k.transpose(1, 2)
         value = v.transpose(1, 2)
 
-        min_val = torch.finfo(query.dtype).min
-        attn_mask = torch.zeros(
+        attn_mask = torch.ones(
             (seq_len, seq_len),
             device=hidden_states.device,
-            dtype=query.dtype,
+            dtype=torch.bool,
         )
         causal = torch.triu(
             torch.ones(
@@ -264,30 +301,39 @@ class Gemma3Attention(nn.Module):
             ),
             diagonal=1,
         )
-        attn_mask = attn_mask.masked_fill(causal, min_val)
+        attn_mask = attn_mask.masked_fill(causal, False)
         if self.is_sliding and self.sliding_window is not None:
             idx = torch.arange(seq_len, device=hidden_states.device)
-            dist = idx[None, :] - idx[:, None]
+            dist = idx[:, None] - idx[None, :]
             too_far = dist > self.sliding_window
-            attn_mask = attn_mask.masked_fill(too_far, min_val)
+            attn_mask = attn_mask.masked_fill(too_far, False)
 
-        key_pad = ~attention_mask.to(torch.bool)
         attn_mask = attn_mask[None, None, :, :].expand(batch_size, 1, seq_len, seq_len)
-        attn_mask = attn_mask.masked_fill(
-            key_pad[:, None, None, :].expand(batch_size, 1, seq_len, seq_len),
-            min_val,
-        )
+        attn_mask = attn_mask & attention_mask.to(torch.bool)[:, None, None, :]
 
-        attn_kwargs = {
-            "attn_mask": attn_mask,
-            "dropout_p": 0.0,
-            "is_causal": False,
-            "scale": self.scaling,
-        }
         if query.shape[1] != key.shape[1]:
-            attn_kwargs["enable_gqa"] = True
+            num_key_value_groups = query.shape[1] // key.shape[1]
+            key = key[:, :, None, :, :].expand(
+                batch_size, key.shape[1], num_key_value_groups, seq_len, self.head_dim
+            )
+            value = value[:, :, None, :, :].expand(
+                batch_size,
+                value.shape[1],
+                num_key_value_groups,
+                seq_len,
+                self.head_dim,
+            )
+            key = key.reshape(batch_size, query.shape[1], seq_len, self.head_dim)
+            value = value.reshape(batch_size, query.shape[1], seq_len, self.head_dim)
+
         attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query, key, value, **attn_kwargs
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=self.scaling,
         )
         attn_output = attn_output.transpose(1, 2)
 
@@ -395,267 +441,6 @@ class Gemma3TextScaledWordEmbedding(nn.Embedding):
         return super().forward(input_ids) * self.embed_scale
 
 
-# --- Siglip Vision Model Implementation ---
-
-
-class QuickGELU(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x * torch.sigmoid(1.702 * x)
-
-
-class SiglipVisionEmbeddings(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.embed_dim = config.hidden_size
-        self.image_size = config.image_size
-        self.patch_size = config.patch_size
-
-        self.patch_embedding = nn.Conv2d(
-            in_channels=config.num_channels,
-            out_channels=self.embed_dim,
-            kernel_size=self.patch_size,
-            stride=self.patch_size,
-            padding="valid",
-        )
-
-        self.num_patches = (self.image_size // self.patch_size) ** 2
-        self.num_positions = self.num_patches
-        # Use simple Embedding for position embeddings (usually small enough)
-        self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
-        self.register_buffer(
-            "position_ids",
-            torch.arange(self.num_positions).expand((1, -1)),
-            persistent=False,
-        )
-
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        target_dtype = self.patch_embedding.weight.dtype
-        patch_embeds = self.patch_embedding(
-            pixel_values.to(dtype=target_dtype)
-        )  # shape = [*, width, grid, grid]
-        embeddings = patch_embeds.flatten(2).transpose(1, 2)
-        embeddings = embeddings + self.position_embedding(self.position_ids)
-
-        return embeddings
-
-
-class SiglipMLP(nn.Module):
-    def __init__(
-        self,
-        config,
-        act_layer: type[nn.Module] = QuickGELU,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.fc1 = ColumnParallelLinear(
-            config.hidden_size,
-            config.intermediate_size,
-            quant_config=quant_config,
-            prefix=add_prefix("fc1", prefix),
-        )
-        self.act = act_layer()
-        self.fc2 = RowParallelLinear(
-            config.intermediate_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("fc2", prefix),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_parallel, _ = self.fc1(x)
-        x_parallel = self.act(x_parallel)
-        x, _ = self.fc2(x_parallel)
-        return x
-
-
-class SiglipAttention(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        tp_size = get_tp_world_size()
-        self.head_dim = hidden_size // num_heads
-        self.num_heads_per_partition = num_heads // tp_size
-        self.scaling = self.head_dim**-0.5
-
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size=hidden_size,
-            head_size=self.head_dim,
-            total_num_heads=num_heads,
-            total_num_kv_heads=num_heads,
-            bias=True,
-            quant_config=quant_config,
-            prefix=add_prefix("qkv_proj", prefix),
-        )
-
-        self.out_proj = RowParallelLinear(
-            input_size=hidden_size,
-            output_size=hidden_size,
-            bias=True,
-            quant_config=quant_config,
-            prefix=add_prefix("out_proj", prefix),
-        )
-
-        self.attn = LocalAttention(
-            num_heads=self.num_heads_per_partition,
-            head_size=self.head_dim,
-            num_kv_heads=self.num_heads_per_partition,
-            softmax_scale=self.scaling,
-            causal=False,  # Bidirectional for Vision
-        )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.hidden_size // get_tp_world_size()] * 3, dim=-1)
-
-        batch_size, seq_len, _ = q.shape
-        q = q.view(batch_size, seq_len, self.num_heads_per_partition, self.head_dim)
-        k = k.view(batch_size, seq_len, self.num_heads_per_partition, self.head_dim)
-        v = v.view(batch_size, seq_len, self.num_heads_per_partition, self.head_dim)
-
-        attn_output = self.attn(q, k, v)
-
-        attn_output = attn_output.reshape(
-            batch_size, seq_len, self.hidden_size // get_tp_world_size()
-        )
-
-        output, _ = self.out_proj(attn_output)
-        return output
-
-
-class SiglipEncoderLayer(nn.Module):
-    def __init__(
-        self,
-        config,
-        act_layer: type[nn.Module] = QuickGELU,
-        norm_layer: type[nn.Module] = None,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        if norm_layer is None:
-            norm_layer = partial(nn.LayerNorm, eps=config.layer_norm_eps)
-        self.layer_norm1 = norm_layer(config.hidden_size)
-        self.layer_norm2 = norm_layer(config.hidden_size)
-        self.self_attn = SiglipAttention(
-            hidden_size=config.hidden_size,
-            num_heads=config.num_attention_heads,
-            quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix),
-        )
-        self.mlp = SiglipMLP(
-            config,
-            act_layer=act_layer,
-            quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.layer_norm1(hidden_states)
-        hidden_states = self.self_attn(hidden_states)
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.layer_norm2(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
-
-
-class SiglipEncoder(nn.Module):
-    def __init__(
-        self,
-        config,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.config = config
-        num_hidden_layers = config.num_hidden_layers
-        norm_layer = partial(nn.LayerNorm, eps=config.layer_norm_eps)
-        self.layers = nn.ModuleList(
-            [
-                SiglipEncoderLayer(
-                    config=config,
-                    norm_layer=norm_layer,
-                    quant_config=quant_config,
-                    prefix=add_prefix(f"layers.{layer_idx}", prefix),
-                )
-                for layer_idx in range(num_hidden_layers)
-            ]
-        )
-
-    def forward(
-        self,
-        inputs_embeds: torch.Tensor,
-    ) -> torch.Tensor:
-        hidden_states = inputs_embeds
-        for encoder_layer in self.layers:
-            hidden_states = encoder_layer(hidden_states)
-        return hidden_states
-
-
-class SiglipVisionTransformer(nn.Module):
-    def __init__(
-        self,
-        config,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.config = config
-        embed_dim = config.hidden_size
-        self.embeddings = SiglipVisionEmbeddings(config)
-        self.encoder = SiglipEncoder(
-            config=config,
-            quant_config=quant_config,
-            prefix=add_prefix("encoder", prefix),
-        )
-        self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
-
-    @property
-    def device(self) -> torch.device:
-        return self.encoder.layers[0].layer_norm1.weight.device
-
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.embeddings(pixel_values.to(self.device))
-        last_hidden_state = self.encoder(inputs_embeds=hidden_states)
-        last_hidden_state = self.post_layernorm(last_hidden_state)
-        return last_hidden_state
-
-
-class SiglipVisionModel(nn.Module):
-    def __init__(
-        self,
-        config,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.vision_model = SiglipVisionTransformer(
-            config, quant_config, prefix=add_prefix("vision_model", prefix)
-        )
-
-    @property
-    def device(self) -> torch.device:
-        return self.vision_model.device
-
-    def forward(self, pixel_values: torch.Tensor):
-        return self.vision_model(pixel_values)
-
-
 class Gemma3MultiModalProjector(nn.Module):
     """Projector for Gemma3 multimodal."""
 
@@ -734,7 +519,9 @@ class Gemma3TextModel(nn.Module):
                     layer_id=i,
                     config=config,
                     quant_config=self.quant_config,
-                    prefix=f"{config.text_config.prefix}.layers.{i}",
+                    prefix=add_prefix(
+                        f"layers.{i}", getattr(config.text_config, "prefix", "")
+                    ),
                 )
                 for i in range(config.text_config.num_hidden_layers)
             ]
@@ -890,7 +677,24 @@ class Gemma3TextModel(nn.Module):
         return loaded_params
 
 
-class Gemma3ForConditionalGeneration(nn.Module):
+class Gemma3ForConditionalGeneration(
+    EncoderTensorParallelMixin, nn.Module, LayerwiseOffloadableModuleMixin
+):
+    # transformers 5.6.0 flattened SiglipVisionModel, dropping the
+    # `vision_model` intermediate wrapper. Our reimpl keeps it, so remap
+    # HF source keys back into our nested namespace when transferring weights.
+    layerwise_offload_dit_group_enabled = False
+    layer_names = ["language_model.layers"]
+
+    param_names_mapping = {
+        r"^(vision_tower\.)(embeddings|encoder|post_layernorm|head)\.": r"\1vision_model.\2.",
+        r"^(vision_tower\.vision_model\.encoder\.layers\.\d+\.self_attn\.)out_proj\.": r"\1proj.",
+    }
+    reverse_param_names_mapping = {
+        r"^(vision_tower\.)vision_model\.(embeddings|encoder|post_layernorm|head)\.": r"\1\2.",
+        r"^(vision_tower\.vision_model\.encoder\.layers\.\d+\.self_attn\.)proj\.": r"\1out_proj.",
+    }
+
     def __init__(
         self,
         config: Gemma3Config,
@@ -905,6 +709,7 @@ class Gemma3ForConditionalGeneration(nn.Module):
         # Vision Tower
         self.vision_tower = SiglipVisionModel(
             config=config.vision_config,
+            qkv_backend="sdpa",
             quant_config=quant_config,
             prefix=add_prefix("vision_tower", prefix),
         )

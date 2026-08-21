@@ -5,8 +5,8 @@ import inspect
 import warnings
 from typing import List, Optional, Union
 
-from sglang.global_config import global_config
 from sglang.lang.choices import ChoicesSamplingMethod
+from sglang.lang.global_config import global_config
 
 REGEX_INT = r"[-+]?[0-9]+[ \n]*"
 REGEX_FLOAT = r"[-+]?[0-9]*\.?[0-9]+[ \n]*"
@@ -30,9 +30,9 @@ class SglSamplingParams:
     presence_penalty: float = 0.0
     ignore_eos: bool = False
     return_logprob: Optional[bool] = None
-    logprob_start_len: Optional[int] = (None,)
-    top_logprobs_num: Optional[int] = (None,)
-    return_text_in_logprobs: Optional[bool] = (None,)
+    logprob_start_len: Optional[int] = None
+    top_logprobs_num: Optional[int] = None
+    return_text_in_logprobs: Optional[bool] = None
     json_schema: Optional[str] = None
 
     # for constrained generation, not included in to_xxx_kwargs
@@ -473,7 +473,7 @@ class SglGen(SglExpr):
         regex: Optional[str] = None,
         json_schema: Optional[str] = None,
     ):
-        """Call the model to generate. See the meaning of the arguments in docs/backend/sampling_params.md"""
+        """Call the model to generate. See the meaning of the arguments in docs/docs/basic_usage/sampling_params.mdx"""
         super().__init__()
         self.name = name
         self.sampling_params = SglSamplingParams(

@@ -1,3 +1,5 @@
+# Weekly CUDA tests. Same shape as nightly-test-nvidia.yml (see its header); a
+# test joins by declaring `stage="weekly"` plus a runner_config.
 name: Weekly Test (Nvidia)
 
 on:
@@ -5,45 +7,53 @@ on:
     - cron: '0 0 * * 0'  # Run every Sunday at midnight UTC
   workflow_dispatch:
     inputs:
-      job_filter:
-        description: 'Select which job to run (leave empty or "all" to run all jobs)'
+      runner_filter:
+        description: 'Select which runner_config to run (leave empty or "all" to run all)'
         required: false
         type: choice
         default: 'all'
         options:
           - 'all'
-          - 'weekly-test-8-gpu-h200'
+          - '8-gpu-h200'
+      full_parallel:
+        description: 'Run all shards of a job at once (faster, but competes with per-commit CI for machines). Off by default: one shard at a time.'
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: weekly-test-nvidia-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  SGLANG_IS_IN_CI: true
-  HF_HUB_DOWNLOAD_TIMEOUT: 300
-  HF_HUB_ETAG_TIMEOUT: 300
+permissions:
+  actions: write
+  contents: read
+  issues: read
+  pull-requests: read
 
 jobs:
-  # Weekly tests - 8 GPU H200
+  # run_all_tests skips the paths-filter, so main_package is 'true' and
+  # sgl_kernel stays empty: every test runs, and no job waits on a wheel this
+  # workflow never builds.
+  check-changes:
+    uses: ./.github/workflows/_pr-test-check-changes.yml
+    with:
+      pr_test_yml: '.github/workflows/weekly-test-nvidia.yml'
+      run_all_tests: true
+      force_continue_on_error: true
+    secrets: inherit
+
   weekly-test-8-gpu-h200:
-    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'weekly-test-8-gpu-h200')
-    runs-on: 8-gpu-h200
-    timeout-minutes: 120
-    env:
-      RUNNER_LABELS: 8-gpu-h200
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/cuda/ci_install_dependency.sh
-
-      - name: Run weekly 8-GPU H200 tests
-        timeout-minutes: 120
-        env:
-          GPU_CONFIG: "8-gpu-h200"
-          IS_H200: "1"
-        run: |
-          cd test
-          python3 run_suite.py --hw cuda --suite weekly-8-gpu-h200 --nightly --continue-on-error --timeout-per-file 7200
+    needs: check-changes
+    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '8-gpu-h200')
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: weekly-test-8-gpu-h200
+      runner_config: 8-gpu-h200
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '240'
+      job_timeout_minutes: '300'
+      scheduled: true
+    secrets: inherit

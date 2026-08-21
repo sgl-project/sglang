@@ -1,0 +1,57 @@
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=60, suite="base-a-test-cpu")
+
+import os
+import shutil
+import subprocess
+import unittest
+from unittest import mock
+
+from sglang.srt.utils.common import get_bool_env_var
+from sglang.test.test_utils import CustomTestCase
+
+
+def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
+    if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
+        from modelscope import snapshot_download
+
+        if not os.path.exists(model_path):
+            model_path = snapshot_download(model_path)
+        if not os.path.exists(tokenizer_path):
+            tokenizer_path = snapshot_download(
+                tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
+            )
+    return model_path, tokenizer_path
+
+
+class TestDownloadFromModelScope(CustomTestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "iic/nlp_lstmcrf_word-segmentation_chinese-news"
+        stat, output = subprocess.getstatusoutput("pip install modelscope")
+
+        cls.with_modelscope_environ = {k: v for k, v in os.environ.items()}
+        cls.with_modelscope_environ["SGLANG_USE_MODELSCOPE"] = "True"
+
+    @classmethod
+    def tearDownClass(cls):
+        pass
+
+    def test_prepare_model_and_tokenizer(self):
+        from modelscope.utils.file_utils import get_model_cache_root
+
+        model_cache_root = get_model_cache_root()
+        if os.path.exists(model_cache_root):
+            shutil.rmtree(model_cache_root)
+        with mock.patch.dict(os.environ, self.with_modelscope_environ, clear=True):
+            model_path, tokenizer_path = prepare_model_and_tokenizer(
+                self.model, self.model
+            )
+            assert os.path.exists(os.path.join(model_path, "pytorch_model.bin"))
+            assert os.path.exists(os.path.join(tokenizer_path, "config.json"))
+
+
+if __name__ == "__main__":
+    unittest.main()

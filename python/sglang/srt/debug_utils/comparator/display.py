@@ -52,6 +52,19 @@ def _render_polars_as_text(df: pl.DataFrame, *, title: Optional[str] = None) -> 
     return buf.getvalue().rstrip("\n")
 
 
+def _render_polars_as_rich_table(
+    df: pl.DataFrame, *, title: Optional[str] = None
+) -> Any:
+    from rich.table import Table
+
+    table = Table(title=title)
+    for col in df.columns:
+        table.add_column(col)
+    for row in df.iter_rows():
+        table.add_row(*[str(v) for v in row])
+    return table
+
+
 def _collect_rank_info(
     df: pl.DataFrame, dump_dir: Path
 ) -> Optional[list[dict[str, Any]]]:

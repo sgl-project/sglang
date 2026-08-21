@@ -25,7 +25,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_amd_ci(est_time=450, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 QWEN3_CODER_NEXT_MODEL_PATH = "Qwen/Qwen3-Coder-Next"
 SERVER_LAUNCH_TIMEOUT = 1800
@@ -146,7 +146,7 @@ class TestQwen3CoderNextMTP(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]

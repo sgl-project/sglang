@@ -6,12 +6,6 @@ completion benchmark on MI35x.
 Registry: nightly-amd-accuracy-8-gpu-mi35x-deepseek-v32-mtp suite
 """
 
-import os
-
-# Set HF cache for MI35x
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import unittest
 from types import SimpleNamespace
 
@@ -59,9 +53,9 @@ class TestDeepseekV32TPMTP(CustomTestCase):
             "--trust-remote-code",
             "--tp",
             "8",
-            "--nsa-prefill-backend",
+            "--dsa-prefill-backend",
             "tilelang",
-            "--nsa-decode-backend",
+            "--dsa-decode-backend",
             "tilelang",
             "--speculative-algorithm",
             "EAGLE",
@@ -108,7 +102,7 @@ class TestDeepseekV32TPMTP(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]

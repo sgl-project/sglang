@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_amd_ci(est_time=1000, suite="stage-b-test-small-1-gpu-amd")
+register_amd_ci(est_time=1000, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestLLaDA2MiniAMD(CustomTestCase):
@@ -55,19 +55,17 @@ class TestLLaDA2MiniAMD(CustomTestCase):
     def test_gsm8k(self):
         """Test GSM8K accuracy with DLLM on AMD."""
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(f"{metrics=}")
 
         # Relaxed thresholds for AMD - may need adjustment
-        self.assertGreater(metrics["accuracy"], 0.80)
+        self.assertGreater(metrics["score"], 0.80)
         self.assertGreater(metrics["output_throughput"], 50)
 
     def test_bs_1_speed(self):

@@ -13,10 +13,14 @@ else
   echo "Warning: could not parse GPU family from '${HOSTNAME_VALUE}'"
 fi
 
-WORKDIR="/sglang-checkout/test/srt"
+WORKDIR="/sglang-checkout/test"
 declare -A ENV_MAP=(
   [SGLANG_IS_IN_CI_AMD]=1
   [SGLANG_IS_IN_CI]=1
+  # Disabled on AMD: the async-assert probes (#27461) fire torch._assert_async in
+  # the MXFP4 EAGLE-MTP decode path and abort the queue with an HSA hardware
+  # exception.
+  [SGLANG_ENABLE_ASYNC_ASSERT]=0
   [SGLANG_USE_AITER]=1
 )
 

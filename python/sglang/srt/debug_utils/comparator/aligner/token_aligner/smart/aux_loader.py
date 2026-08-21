@@ -29,6 +29,7 @@ from sglang.srt.debug_utils.comparator.dims_spec import (
     TokenLayout,
     apply_dim_names,
     resolve_dim_names,
+    without_dim_names,
 )
 from sglang.srt.debug_utils.comparator.dp_utils import filter_to_non_empty_dp_rank
 from sglang.srt.debug_utils.comparator.log_sink import log_sink
@@ -175,7 +176,7 @@ def _load_non_tensor_aux(
     loaded: list[ValueWithMeta] = [
         ValueWithMeta.load(dump_path / r["filename"]) for r in rows
     ]
-    loaded = filter_to_non_empty_dp_rank(loaded)
+    loaded = filter_to_non_empty_dp_rank(loaded, dp_axis=ParallelAxis.DP)
 
     if len(loaded) > 1:
         first_value = loaded[0].value
@@ -212,7 +213,7 @@ def _load_and_align_aux_tensor(
     loaded: list[ValueWithMeta] = [
         ValueWithMeta.load(dump_path / r["filename"]) for r in rows
     ]
-    loaded = filter_to_non_empty_dp_rank(loaded)
+    loaded = filter_to_non_empty_dp_rank(loaded, dp_axis=ParallelAxis.DP)
 
     tensors: list[torch.Tensor] = [
         item.value for item in loaded if isinstance(item.value, torch.Tensor)
@@ -242,8 +243,8 @@ def _load_and_align_aux_tensor(
 
         sub_result = execute_sub_plans(tensors=tensors, plans=sub_plans)
         assert sub_result.tensor is not None
-        return sub_result.tensor.rename(
-            None
+        return without_dim_names(
+            sub_result.tensor
         )  # strip named dims before returning to plugin
 
     log_sink.add(

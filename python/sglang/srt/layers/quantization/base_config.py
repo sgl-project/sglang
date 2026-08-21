@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/v0.5.5/vllm/model_executor/layers/quantization/base_config.py
 from __future__ import annotations
 
@@ -8,8 +10,11 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 import torch
 from torch import nn
 
+from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+    from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.models.utils import WeightsMapper
 
@@ -106,6 +111,19 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ) -> CombineInput:
         raise NotImplementedError
 
+    def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
+        """Return a ``TritonMoeQuantInfo`` describing the quantisation state
+        stored on *layer*.
+
+        The LoRA MoE runner calls this so that ``invoke_fused_moe_kernel``
+        receives the correct flags / scales / block-shape for the base
+        weights.  Each quantisation method must override this with the
+        same construction it already uses inside ``apply()``.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement get_triton_quant_info()"
+        )
+
 
 class QuantizationConfig(ABC):
     """Base class for quantization configs."""
@@ -114,6 +132,9 @@ class QuantizationConfig(ABC):
         super().__init__()
         # mapping is updated by models as they initialize
         self.packed_modules_mapping: Dict[str, List[str]] = dict()
+
+    def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
+        self.packed_modules_mapping = mapping
 
     @abstractmethod
     def get_name(self) -> str:
@@ -144,7 +165,7 @@ class QuantizationConfig(ABC):
 
     @classmethod
     @abstractmethod
-    def from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+    def from_config(cls, config: Dict[str, Any]) -> QuantizationConfig:
         """Create a config class from the model's quantization config."""
         raise NotImplementedError()
 
@@ -166,15 +187,22 @@ class QuantizationConfig(ABC):
         if hf_quant_config is None:
             return None
 
+        # If the user explicitly requested an online requantization (e.g.
+        # quark_mxfp4 on top of an NVFP4 checkpoint), do not override it back
+        # to the source format.
+        from sglang.srt.configs.model_config import REQUANTIZATION_METHODS
+
+        if user_quant == "nvfp4_online" or user_quant in REQUANTIZATION_METHODS:
+            return None
+
         # Check if this is a ModelOpt config
         quant_algo = hf_quant_config.get("quant_algo", "").upper()
 
         # If user specified generic "modelopt", auto-detect the specific method
         if user_quant == "modelopt":
-            if "FP8" in quant_algo:
-                return "modelopt_fp8"
-            elif "NVFP4" in quant_algo or "FP4" in quant_algo:
-                return "modelopt_fp4"
+            canonical_method = canonicalize_modelopt_quant_algo(quant_algo)
+            if canonical_method is not None:
+                return canonical_method
 
         # The hf_quant_config may be a parsed quant config, so we need to check the
         # quant_method.
@@ -227,7 +255,7 @@ class QuantizationConfig(ABC):
         raise NotImplementedError()
 
     def apply_weight_name_mapper(
-        self, hf_to_sglang_mapper: "WeightsMapper"
+        self, hf_to_sglang_mapper: WeightsMapper
     ):  # noqa: B027
         """
         Interface for models to update module names referenced in

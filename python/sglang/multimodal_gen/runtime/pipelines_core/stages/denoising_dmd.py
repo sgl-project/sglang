@@ -9,14 +9,17 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
-from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    pred_noise_to_pred_video,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import DenoisingStage
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
-from sglang.multimodal_gen.utils import dict_to_3d_list
+from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_context as precision_autocast_context,
+)
 
 logger = init_logger(__name__)
 
@@ -65,11 +68,12 @@ class DmdDenoisingStage(DenoisingStage):
         """
         prepared_vars = self._prepare_denoising_loop(batch, server_args)
 
-        target_dtype = prepared_vars["target_dtype"]
-        autocast_enabled = prepared_vars["autocast_enabled"]
-        num_warmup_steps = prepared_vars["num_warmup_steps"]
-        latents = prepared_vars["latents"]
+        target_dtype = prepared_vars.target_dtype
+        autocast_enabled = prepared_vars.autocast_enabled
+        num_warmup_steps = prepared_vars.num_warmup_steps
+        latents = prepared_vars.latents
         video_raw_latent_shape = latents.shape
+        scheduler = self.scheduler
 
         timesteps = torch.tensor(
             server_args.pipeline_config.dmd_denoising_steps,
@@ -86,14 +90,13 @@ class DmdDenoisingStage(DenoisingStage):
             self.transformer.forward,
             {
                 "encoder_hidden_states_image": image_embeds,
-                "mask_strategy": dict_to_3d_list(None, t_max=50, l_max=60, h_max=24),
             },
         )
 
-        pos_cond_kwargs = prepared_vars["pos_cond_kwargs"]
+        pos_cond_kwargs = prepared_vars.pos_cond_kwargs
 
         denoising_loop_start_time = time.time()
-        with self.progress_bar(total=len(timesteps)) as progress_bar:
+        with self.progress_bar(total=len(timesteps), batch=batch) as progress_bar:
             for i, t in enumerate(timesteps):
                 # Skip if interrupted
                 if hasattr(self, "interrupt") and self.interrupt:
@@ -104,22 +107,21 @@ class DmdDenoisingStage(DenoisingStage):
                     logger=logger,
                     metrics=batch.metrics,
                     perf_dump_path_provided=batch.perf_dump_path is not None,
+                    record_as_step=True,
                 ):
                     t_int = int(t.item())
                     if self.transformer_2 is not None:
-                        current_model, current_guidance_scale = (
-                            self._select_and_manage_model(
-                                t_int=t_int,
-                                boundary_timestep=self._handle_boundary_ratio(
-                                    server_args, batch
-                                ),
-                                server_args=server_args,
-                                batch=batch,
-                            )
+                        current_model, _ = self._select_and_manage_model(
+                            t_int=t_int,
+                            boundary_timestep=self._handle_boundary_ratio(
+                                server_args, batch, scheduler
+                            ),
+                            server_args=server_args,
+                            batch=batch,
                         )
                     else:
                         current_model = self.transformer
-                        self._manage_device_placement(current_model, None, server_args)
+                        self._manage_dit_use_site(current_model, "transformer", batch)
                     # Expand latents for I2V
                     noise_latents = latents.clone()
                     latent_model_input = latents.to(target_dtype)
@@ -146,9 +148,9 @@ class DmdDenoisingStage(DenoisingStage):
                     )
 
                     # Predict noise residual
-                    with torch.autocast(
-                        device_type=current_platform.device_type,
-                        dtype=target_dtype,
+                    with precision_autocast_context(
+                        target_dtype,
+                        server_args.disable_autocast,
                         enabled=autocast_enabled,
                     ):
                         attn_metadata = self._build_attn_metadata(i, batch, server_args)
@@ -168,11 +170,14 @@ class DmdDenoisingStage(DenoisingStage):
                                 **pos_cond_kwargs,
                             ).permute(0, 2, 1, 3, 4)
 
+                        video_timesteps = t_expand[:, None].expand(
+                            -1, pred_noise.shape[1]
+                        )
                         pred_video = pred_noise_to_pred_video(
                             pred_noise=pred_noise.flatten(0, 1),
                             noise_input_latent=noise_latents.flatten(0, 1),
-                            timestep=t_expand,
-                            scheduler=self.scheduler,
+                            timestep=video_timesteps,
+                            scheduler=scheduler,
                         ).unflatten(0, pred_noise.shape[:2])
 
                         if i < len(timesteps) - 1:
@@ -185,7 +190,7 @@ class DmdDenoisingStage(DenoisingStage):
                                 generator=batch.generator[0],
                                 device=self.device,
                             )
-                            latents = self.scheduler.add_noise(
+                            latents = scheduler.add_noise(
                                 pred_video.flatten(0, 1),
                                 noise.flatten(0, 1),
                                 next_timestep,
@@ -196,7 +201,7 @@ class DmdDenoisingStage(DenoisingStage):
                         # Update progress bar
                         if i == len(timesteps) - 1 or (
                             (i + 1) > num_warmup_steps
-                            and (i + 1) % self.scheduler.order == 0
+                            and (i + 1) % scheduler.order == 0
                             and progress_bar is not None
                         ):
                             progress_bar.update()
@@ -219,76 +224,3 @@ class DmdDenoisingStage(DenoisingStage):
         )
 
         return batch
-
-    def _select_and_manage_model(
-        self,
-        t_int: int,
-        boundary_timestep: float | None,
-        server_args: ServerArgs,
-        batch: Req,
-    ):
-        if boundary_timestep is None or t_int >= boundary_timestep:
-            # High-noise stage
-            current_model = self.transformer
-            model_to_offload = self.transformer_2
-            current_guidance_scale = batch.guidance_scale
-        else:
-            # Low-noise stage
-            current_model = self.transformer_2
-            model_to_offload = self.transformer
-            current_guidance_scale = batch.guidance_scale_2
-
-        self._manage_device_placement(current_model, model_to_offload, server_args)
-
-        assert current_model is not None, "The model for the current step is not set."
-        return current_model, current_guidance_scale
-
-    def _manage_device_placement(
-        self,
-        model_to_use: torch.nn.Module,
-        model_to_offload: torch.nn.Module | None,
-        server_args: ServerArgs,
-    ):
-        """
-        Manages the offload / load behavior of dit
-        """
-        if not server_args.dit_cpu_offload:
-            return
-
-        # Offload the unused model if it's on CUDA
-        if (
-            model_to_offload is not None
-            and next(model_to_offload.parameters()).device.type == "cuda"
-        ):
-            model_to_offload.to("cpu")
-
-        # Load the model to use if it's on CPU
-        if (
-            model_to_use is not None
-            and next(model_to_use.parameters()).device.type == "cpu"
-        ):
-            model_to_use.to(get_local_torch_device())
-
-    def _handle_boundary_ratio(
-        self,
-        server_args,
-        batch,
-    ):
-        """
-        (Wan2.2) Calculate timestep to switch from high noise expert to low noise expert
-        """
-        boundary_ratio = server_args.pipeline_config.dit_config.boundary_ratio
-        if batch.boundary_ratio is not None:
-            logger.info(
-                "Overriding boundary ratio from %s to %s",
-                boundary_ratio,
-                batch.boundary_ratio,
-            )
-            boundary_ratio = batch.boundary_ratio
-
-        if boundary_ratio is not None:
-            boundary_timestep = boundary_ratio * self.scheduler.num_train_timesteps
-        else:
-            boundary_timestep = None
-
-        return boundary_timestep

@@ -1,0 +1,31 @@
+---
+title: Intern-S1
+metatags:
+    description: "Deploy Intern-S1 with SGLang - community contribution guide for InternLM's Intern-S1 model deployment."
+---
+
+import { InternS1Deployment } from '/src/snippets/autoregressive/intern-s1-deployment.jsx';
+
+## 1. Model Introduction
+
+Intern-S1 includes the large **Intern-S1** MoE model and the smaller **Intern-S1-mini** dense model. The command generator below covers BF16 and FP8 serving on NVIDIA H100/H200/B200/B300 platforms.
+
+## 2. SGLang Installation
+
+Refer to the [official SGLang installation guide](../../../docs/get-started/install), or install from source:
+
+```bash Command
+uv pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
+```
+
+## 3. Model Deployment
+
+### 3.1 Basic Configuration
+
+<InternS1Deployment />
+
+### 3.2 Configuration Tips
+
+- FP8 checkpoints use the matching BF16 checkpoint as tokenizer path.
+- B300 deployments use `--attention-backend flashinfer`.
+- Enable `--reasoning-parser interns1` and `--tool-call-parser interns1` when your workload needs structured reasoning or tool-call parsing.

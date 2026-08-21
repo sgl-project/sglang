@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  lint:
+  auto-tune-lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

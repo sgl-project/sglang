@@ -1,10 +1,12 @@
-import os
+import subprocess
 import unittest
 from types import SimpleNamespace
 
+import requests
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import get_rdma_devices_args
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
@@ -13,20 +15,25 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_in_ci,
     popen_launch_server,
+    try_cached_model,
 )
 
-register_cuda_ci(est_time=660, suite="stage-c-test-deepep-4-gpu")
+register_cuda_ci(
+    est_time=189,
+    stage="base-c",
+    runner_config="4-gpu-h100",
+    disabled="Temporarily disabled until the next Mooncake release includes the PyTorch 2.13 collective forwarding fix.",
+)
 
 ib_devices = get_rdma_devices_args()
 
 
-@unittest.skipIf(is_in_ci(), "Skip since mooncake-ep is flaky.")
 class TestTP(CustomTestCase):
     extra_args = []
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -54,7 +61,7 @@ class TestTP(CustomTestCase):
                 "72",
                 "--chunked-prefill-size",
                 "512",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "128",
                 "--max-running-requests",
                 "512",
@@ -70,21 +77,20 @@ class TestTP(CustomTestCase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.60)
+        self.assertGreater(metrics["score"], 0.60)
 
 
-@unittest.skipIf(is_in_ci(), "Skip since mooncake-ep is flaky.")
 class TestPureDP(TestTP):
     extra_args = [
         "--enable-dp-attention",
@@ -95,11 +101,26 @@ class TestPureDP(TestTP):
     pkill_process_1 = "sglang::scheduler_DP1_TP1_EP1"
     pkill_process_2 = "sglang::scheduler_DP3_TP3_EP3"
 
+    def _kill_and_bootstrap(self, process_name: str) -> None:
+        subprocess.run(["pkill", "-f", process_name], check=True)
+        # Bootstrap one forward on a survivor so the controller learns the
+        # post-fault active-rank mask before dispatching concurrent requests.
+        response = requests.post(
+            f"{self.base_url}/generate",
+            json={
+                "text": "Hello",
+                "sampling_params": {"max_new_tokens": 1},
+                "routed_dp_rank": 0,
+            },
+            timeout=120,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
     def test_gsm8k_fault_1(self):
         """
         Kill one rank and the system should remain operational.
         """
-        os.system(f"pkill -f {self.pkill_process_1}")
+        self._kill_and_bootstrap(self.pkill_process_1)
         super().test_gsm8k()
 
     @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
@@ -107,7 +128,7 @@ class TestPureDP(TestTP):
         """
         Kill another rank and the system should remain operational.
         """
-        os.system(f"pkill -f {self.pkill_process_2}")
+        self._kill_and_bootstrap(self.pkill_process_2)
         super().test_gsm8k()
 
 

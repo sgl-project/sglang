@@ -10,10 +10,66 @@ class Hunyuan3DDiTArchConfig(DiTArchConfig):
 
     param_names_mapping: dict = field(
         default_factory=lambda: {
-            r"(.*)\.img_mlp\.0\.(.*)$": r"\1.img_mlp.fc_in.\2",
-            r"(.*)\.img_mlp\.2\.(.*)$": r"\1.img_mlp.fc_out.\2",
-            r"(.*)\.txt_mlp\.0\.(.*)$": r"\1.txt_mlp.fc_in.\2",
-            r"(.*)\.txt_mlp\.2\.(.*)$": r"\1.txt_mlp.fc_out.\2",
+            # Strip leading "model." prefix used by some exports
+            r"^model\.(.*)$": r"\1",
+            # MLP linear renames (double-stream blocks)
+            r"^(double_blocks\.\d+\.img_mlp)\.0\.(.*)$": r"\1.fc_in.\2",
+            r"^(double_blocks\.\d+\.img_mlp)\.2\.(.*)$": r"\1.fc_out.\2",
+            r"^(double_blocks\.\d+\.txt_mlp)\.0\.(.*)$": r"\1.fc_in.\2",
+            r"^(double_blocks\.\d+\.txt_mlp)\.2\.(.*)$": r"\1.fc_out.\2",
+            # Double-stream attention: fuse split Q/K/V into fused qkv for both txt_attn and img_attn
+            r"^(double_blocks\.\d+\.(?:txt_attn|img_attn))\.(?:to_q|q_proj|query)\.(.*)$": (
+                r"\1.qkv.\2",
+                0,
+                3,
+            ),
+            r"^(double_blocks\.\d+\.(?:txt_attn|img_attn))\.(?:to_k|k_proj|key)\.(.*)$": (
+                r"\1.qkv.\2",
+                1,
+                3,
+            ),
+            r"^(double_blocks\.\d+\.(?:txt_attn|img_attn))\.(?:to_v|v_proj|value)\.(.*)$": (
+                r"\1.qkv.\2",
+                2,
+                3,
+            ),
+            # Double-stream out projection (image/text): to_out[.0].{weight,bias} and
+            # txt_attn.to_add_out[.0].{weight,bias} -> proj.{weight,bias}
+            r"^(double_blocks\.\d+\.(?:txt_attn|img_attn))\.to_out(?:\.0)?\.(weight|bias)$": r"\1.proj.\2",
+            r"^(double_blocks\.\d+\.txt_attn)\.to_add_out(?:\.0)?\.(weight|bias)$": r"\1.proj.\2",
+            # Double-stream Q/K norm aliases and convert HF 'weight' to internal 'scale'
+            r"^(double_blocks\.\d+\.(?:txt_attn|img_attn))\.norm_q\.(.*)$": r"\1.norm.query_norm.\2",
+            r"^(double_blocks\.\d+\.(?:txt_attn|img_attn))\.norm_k\.(.*)$": r"\1.norm.key_norm.\2",
+            r"^(.*norm\.query_norm)\.weight$": r"\1.scale",
+            r"^(.*norm\.key_norm)\.weight$": r"\1.scale",
+            # Single-stream blocks: pack Q/K/V and MLP into linear1 ([Q, K, V, MLP]) and map out-proj to linear2
+            # Apply to both single_blocks.* and single_transformer_blocks.* exports
+            r"^(?:single_blocks|single_transformer_blocks)\.(\d+)\.attn\.(?:to_q|q_proj|query)\.(.*)$": (
+                r"single_blocks.\1.linear1.\2",
+                0,
+                4,
+            ),
+            r"^(?:single_blocks|single_transformer_blocks)\.(\d+)\.attn\.(?:to_k|k_proj|key)\.(.*)$": (
+                r"single_blocks.\1.linear1.\2",
+                1,
+                4,
+            ),
+            r"^(?:single_blocks|single_transformer_blocks)\.(\d+)\.attn\.(?:to_v|v_proj|value)\.(.*)$": (
+                r"single_blocks.\1.linear1.\2",
+                2,
+                4,
+            ),
+            r"^(?:single_blocks|single_transformer_blocks)\.(\d+)\.(?:proj_mlp|mlp_fc1)\.(.*)$": (
+                r"single_blocks.\1.linear1.\2",
+                3,
+                4,
+            ),
+            # Single-stream out projection variants -> linear2 (only weight/bias)
+            r"^(?:single_blocks|single_transformer_blocks)\.(\d+)\.(?:proj_out|out_proj)(?:\.0)?\.(weight|bias)$": r"single_blocks.\1.linear2.\2",
+            r"^(?:single_blocks|single_transformer_blocks)\.(\d+)\.attn\.to_out(?:\.0)?\.(weight|bias)$": r"single_blocks.\1.linear2.\2",
+            # Single-stream Q/K norm aliases
+            r"^(?:single_blocks|single_transformer_blocks)\.(\d+)\.attn\.norm_q\.(.*)$": r"single_blocks.\1.norm.query_norm.\2",
+            r"^(?:single_blocks|single_transformer_blocks)\.(\d+)\.attn\.norm_k\.(.*)$": r"single_blocks.\1.norm.key_norm.\2",
         }
     )
 

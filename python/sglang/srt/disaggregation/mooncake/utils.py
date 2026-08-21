@@ -23,7 +23,7 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 # Global constants for custom memory pool types
-SUPPORTED_MOONCAKE_CUSTOM_MEM_POOL_TYPES = ["NVLINK", "BAREX", "INTRA_NVLINK"]
+SUPPORTED_MOONCAKE_CUSTOM_MEM_POOL_TYPES = ["NVLINK", "BAREX", "INTRA_NODE_NVLINK"]
 
 
 def init_mooncake_custom_mem_pool(

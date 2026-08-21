@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -440,7 +442,7 @@ class Phi4MMForCausalLM(nn.Module):
             self.embed_tokens_extend(
                 # item.feature: (num_audios_in_a_sequence, T, D)
                 # item.audio_attention_mask: (num_audios_in_a_sequence, T, D) BoolTensor or None
-                audio_features=item.feature.to(device).type(dtype),
+                audio_features=item.feature.type(dtype),
                 audio_attention_mask=(
                     item.audio_attention_mask.to(device)
                     if hasattr(item, "audio_attention_mask")
@@ -529,7 +531,7 @@ class Phi4MMForCausalLM(nn.Module):
                 param = params_dict.get(name)
                 if param is None:
                     if "lora" not in name:
-                        logger.warning("Warning: {name} not found in model parameters")
+                        logger.warning(f"Warning: {name} not found in model parameters")
                     continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)

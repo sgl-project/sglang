@@ -17,8 +17,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipel
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-    maybe_download_model,
-    verify_model_config_and_directory,
+    maybe_download_model as maybe_download_model,
+)
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    verify_model_config_and_directory as verify_model_config_and_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -46,26 +48,25 @@ def build_pipeline(
     # Check if pipeline class is explicitly specified
     if server_args.pipeline_class_name:
         from sglang.multimodal_gen.registry import (
-            _PIPELINE_REGISTRY,
-            _discover_and_register_pipelines,
+            get_pipeline_class,
+            get_registered_pipeline_names,
         )
 
-        _discover_and_register_pipelines()
+        available_pipelines = get_registered_pipeline_names()
         logger.info(f"Requested pipeline_class_name: {server_args.pipeline_class_name}")
-        logger.info(
-            f"Available pipelines in registry: {list(_PIPELINE_REGISTRY.keys())}"
-        )
-        pipeline_cls = _PIPELINE_REGISTRY.get(server_args.pipeline_class_name)
+        logger.info(f"Available pipelines in registry: {available_pipelines}")
+        pipeline_cls = get_pipeline_class(server_args.pipeline_class_name)
         if pipeline_cls is None:
             raise ValueError(
                 f"Pipeline class '{server_args.pipeline_class_name}' not found in registry. "
-                f"Available pipelines: {list(_PIPELINE_REGISTRY.keys())}"
+                f"Available pipelines: {available_pipelines}"
             )
         logger.info(
             f"✓ Using explicitly specified pipeline: {server_args.pipeline_class_name} (class: {pipeline_cls.__name__})"
         )
     else:
         logger.info("No pipeline_class_name specified, using model_index.json")
+
         model_info = get_model_info(
             model_path,
             backend=server_args.backend,

@@ -1,10 +1,9 @@
 import unittest
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.json_constrained_kit import TestJSONConstrainedMixin
-from sglang.test.kits.regex_constrained_kit import TestRegexConstrainedMixin
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
+from sglang.test.kits.regex_constrained_kit import RegexConstrainedMixin
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_TARGET_MODEL_EAGLE,
@@ -14,11 +13,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=100, suite="stage-b-test-large-1-gpu")
+register_cuda_ci(est_time=116, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=165, stage="stage-b", runner_config="1-gpu-large-amd")
 
 
 class TestEagleConstrainedDecoding(
-    CustomTestCase, TestRegexConstrainedMixin, TestJSONConstrainedMixin
+    CustomTestCase, RegexConstrainedMixin, JSONConstrainedMixin
 ):
     max_running_requests = 64
     attention_backend = "triton"
@@ -30,7 +30,8 @@ class TestEagleConstrainedDecoding(
     model = DEFAULT_TARGET_MODEL_EAGLE
     draft_model = DEFAULT_DRAFT_MODEL_EAGLE
     grammar_backend = "xgrammar"
-    spec_v2 = False
+    # Run the synchronous (non-overlap) scheduling path.
+    disable_overlap = True
 
     @classmethod
     def setUpClass(cls):
@@ -58,14 +59,15 @@ class TestEagleConstrainedDecoding(
             "--grammar-backend",
             cls.grammar_backend,
         ]
+        if cls.disable_overlap:
+            launch_args.append("--disable-overlap-schedule")
         launch_args.extend(cls.other_launch_args)
-        with envs.SGLANG_ENABLE_SPEC_V2.override(cls.spec_v2):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=launch_args,
-            )
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=launch_args,
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -73,7 +75,7 @@ class TestEagleConstrainedDecoding(
 
 
 class TestEagleConstrainedDecodingV2(TestEagleConstrainedDecoding):
-    spec_v2 = True
+    disable_overlap = False
 
 
 if __name__ == "__main__":

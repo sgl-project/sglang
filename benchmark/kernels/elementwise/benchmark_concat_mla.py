@@ -3,6 +3,8 @@ import triton
 import triton.language as tl
 from sgl_kernel import concat_mla_k as concat_mla_k_cuda
 
+from sglang.benchmark.bench_utils import run_bench
+
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 num_local_heads = 128
@@ -179,7 +181,7 @@ if not torch.all(output_ref == output_exp):
 )
 def benchmark(num_tokens, provider):
     data = create_data(num_tokens=num_tokens)
-    quantiles = [0.5, 0.2, 0.8]
+    quantiles = (0.5, 0.2, 0.8)
     fn = {
         "torch": fn_torch,
         "torch_compiled": fn_torch_compiled,
@@ -187,9 +189,7 @@ def benchmark(num_tokens, provider):
         "hack_non_strided": fn_hack_non_strided,
         "cuda": fn_cuda,
     }[provider]
-    ms, min_ms, max_ms = triton.testing.do_bench(
-        lambda: fn(**data), quantiles=quantiles
-    )
+    ms, min_ms, max_ms = run_bench(lambda: fn(**data), quantiles=quantiles)
     return ms, min_ms, max_ms
 
 

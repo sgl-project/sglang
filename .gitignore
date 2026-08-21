@@ -71,9 +71,6 @@ instance/
 # Scrapy stuff:
 .scrapy
 
-# Sphinx documentation
-docs/_build/
-
 # PyBuilder
 .pybuilder/
 target/
@@ -168,9 +165,6 @@ cython_debug/
 # Vim
 *.swp
 
-# Documentation
-docs/_build
-
 # SGL
 benchmark/mmlu/data
 benchmark/mmlu/data.tar
@@ -178,6 +172,7 @@ benchmark/llava_bench/images
 benchmark/llava_bench/mme_pack
 *.jsonl
 tmp*.txt
+/tmp/
 
 # Torch Compile logs
 tl_out/
@@ -191,6 +186,7 @@ work_dirs/
 *.csv
 
 !logo.png
+!docs/images/*.png
 
 # Prerequisites
 *.d
@@ -224,25 +220,22 @@ work_dirs/
 *.exe
 *.out
 *.app
-
-compile_commands.json
-
 *.iml
 
 # VSCode
 .vscode
-
-1
 
 # Autoenv
 .env.leave
 
 # Rust lib
 Cargo.lock
+!rust/Cargo.lock
 
 # Generated vision test fixtures (regenerate with: python scripts/generate_vision_golden.py)
 sgl-model-gateway/tests/fixtures/golden/
 
+# Other repos
 lmms-eval
 
 **/.serena/
@@ -261,19 +254,30 @@ inputs/
 
 # setuptools-scm generated version file
 python/sglang/_version.py
-
+python/kernel.lock
 
 # MUSA section
 # Generated source files by torchada
-sgl-kernel/csrc_musa/
-sgl-kernel/include_musa/
-sgl-kernel/csrc/**/*_musa/
+python/sglang/kernels/aot/csrc_musa/
+python/sglang/kernels/aot/include_musa/
+python/sglang/kernels/aot/csrc/**/*_musa/
 
 # MUSA core dump files
 *.mudmp
+
+# Local-only XPU test: Nemotron-3 Nano 30B-A3B is too large to run in CI
+# (requires tp=4; no 4-GPU XPU runner). Kept on disk for local development,
+# never tracked/pushed.
+test/registered/xpu/test_nvidia_nemotron_3_nano.py
 
 # Others
 # diffusion 3D outputs
 *.glb
 *.ply
 *.npz
+artifacts/
+.claude/scheduled_tasks.lock
+.humanize/
+
+# Internal, non-published docs
+internal-docs/

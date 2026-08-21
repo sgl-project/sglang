@@ -5,8 +5,8 @@ import time
 import aiohttp
 import requests
 
-from sglang.bench_serving import RequestFuncOutput
 from sglang.benchmark.datasets.random import sample_random_requests
+from sglang.benchmark.serving import RequestFuncOutput
 from sglang.benchmark.utils import get_tokenizer, remove_prefix
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
@@ -221,7 +221,7 @@ async def _send_round(
 def _get_page_size(base_url: str) -> int:
     """Query server for page_size used by radix cache."""
     try:
-        resp = requests.get(f"{base_url}/get_server_info", timeout=10)
+        resp = requests.get(f"{base_url}/server_info", timeout=10)
         resp.raise_for_status()
         info = resp.json()
         return info.get("page_size", 1)
@@ -344,6 +344,15 @@ def run_multiturn_cache_hit_test(
             print(msg)
 
             assert resp.cached_tokens >= expected_cached
+            # Upper bound: cached tokens are a subset of the prompt, so they can
+            # never exceed prompt_len. In PD disaggregation with decode radix
+            # cache, the shared prefix was previously counted on both the prefill
+            # and the decode node, making cached_tokens exceed prompt_len.
+            assert resp.cached_tokens <= resp.prompt_len, (
+                f"Round {round_num}, client {i}: cached_tokens="
+                f"{resp.cached_tokens} exceeds prompt_len={resp.prompt_len} "
+                f"(double-counted prefix across prefill/decode)"
+            )
 
             # Record this round's prompt_len for next round's expected calc
             prev_prompt_lens[i] = resp.prompt_len

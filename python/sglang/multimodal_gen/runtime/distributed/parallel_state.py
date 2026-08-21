@@ -1,5 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/distributed/parallel_state.py
 # Copyright 2023 The vLLM team.
 # Adapted from
@@ -55,18 +56,29 @@ from .group_coordinator import (
     PipelineGroupCoordinator,
     SequenceParallelGroupCoordinator,
     get_local_torch_device,
+    new_device_group,
 )
 
 logger = init_logger(__name__)
 
-_WORLD: Optional[GroupCoordinator] = None
-_TP: Optional[GroupCoordinator] = None
-_SP: Optional[SequenceParallelGroupCoordinator] = None
-_PP: Optional[PipelineGroupCoordinator] = None
-_CFG: Optional[GroupCoordinator] = None
-_DP: Optional[GroupCoordinator] = None
-_DIT: Optional[GroupCoordinator] = None
-_VAE: Optional[GroupCoordinator] = None
+_WORLD: GroupCoordinator | None = None
+_TP: GroupCoordinator | None = None
+_SP: SequenceParallelGroupCoordinator | None = None
+_PP: PipelineGroupCoordinator | None = None
+_CFG: GroupCoordinator | None = None
+_DP: GroupCoordinator | None = None
+# all ranks serving one pipeline replica (every dim except dp); with
+# dp_size == 1 it coincides with the world group
+_REPLICA: GroupCoordinator | None = None
+# Corresponding TP lanes across the replicated encoder copies in one pipeline
+# replica. None means the encoder has only one TP copy, so batch DP cannot run.
+_ENCODER_DP: GroupCoordinator | None = None
+_VAE_DECODE: GroupCoordinator | None = None
+_DIT: ProcessGroup | None = None
+_VAE: ProcessGroup | None = None
+_VAE_DECODE_PARALLEL_AXES = "tp-sp-pp-cfg"
+_REPLICA_PARALLEL_AXES = "tp-sp-pp-cfg"
+_ENCODER_DP_PARALLEL_AXES = "sp-pp-cfg"
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -116,13 +128,13 @@ def all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     return torch.empty_like(tensor)
 
 
-_WORLD: GroupCoordinator | None = None
-_NODE: GroupCoordinator | None = None
-
-
 def get_world_group() -> GroupCoordinator:
     assert _WORLD is not None, "world group is not initialized"
     return _WORLD
+
+
+def world_group_is_initialized() -> bool:
+    return _WORLD is not None
 
 
 def init_world_group(
@@ -137,7 +149,38 @@ def init_world_group(
     )
 
 
-# xDiT
+def _sync_srt_world_group() -> None:
+    import sglang.srt.distributed.parallel_state as srt_parallel_state
+
+    if srt_parallel_state._WORLD is None:
+        srt_parallel_state._WORLD = _WORLD
+
+
+def _clear_srt_world_group() -> None:
+    import sglang.srt.distributed.parallel_state as srt_parallel_state
+
+    if srt_parallel_state._WORLD is _WORLD:
+        srt_parallel_state._WORLD = None
+
+
+def _sync_srt_tp_group() -> None:
+    import sglang.srt.distributed.parallel_state as srt_parallel_state
+
+    if srt_parallel_state._TP is None:
+        srt_parallel_state._TP = _TP
+    if srt_parallel_state._ATTN_TP is None:
+        srt_parallel_state._ATTN_TP = _TP
+
+
+def _clear_srt_tp_group() -> None:
+    import sglang.srt.distributed.parallel_state as srt_parallel_state
+
+    if srt_parallel_state._ATTN_TP is _TP:
+        srt_parallel_state._ATTN_TP = None
+    if srt_parallel_state._TP is _TP:
+        srt_parallel_state._TP = None
+
+
 def init_parallel_group_coordinator(
     group_ranks: List[List[int]],
     local_rank: int,
@@ -145,15 +188,16 @@ def init_parallel_group_coordinator(
     parallel_mode: str,
     **kwargs,
 ) -> GroupCoordinator:
-    """
-    Returns a Group Coordinator for the given parallel mode
-    """
+    """Return a group coordinator for the given parallel mode."""
     assert parallel_mode in [
         "data",
         "pipeline",
         "tensor",
         "sequence",
         "classifier_free_guidance",
+        "vae_decode",
+        "replica",
+        "encoder_data",
     ], f"parallel_mode {parallel_mode} is not supported"
     if parallel_mode == "pipeline":
         return PipelineGroupCoordinator(
@@ -171,33 +215,34 @@ def init_parallel_group_coordinator(
             **kwargs,
         )
     else:
-        # fallback to GroupCoordinator
+        group_name = {
+            "tensor": "tp_group",
+            "vae_decode": "vae_decode_group",
+            "replica": "replica_group",
+            "encoder_data": "encoder_dp_group",
+        }.get(parallel_mode, "cfg_group")
         return GroupCoordinator(
             group_ranks=group_ranks,
             local_rank=local_rank,
             torch_distributed_backend=backend,
-            group_name="cfg_group",
+            use_device_communicator=parallel_mode != "tensor",
+            use_srt_custom_allreduce=parallel_mode == "tensor",
+            group_name=group_name,
         )
 
 
-# def init_parallel_group_coordinator(
-#     group_ranks: list[list[int]],
-#     local_rank: int,
-#     backend: str,
-#     use_message_queue_broadcaster: bool = False,
-#     group_name: str | None = None,
-# ) -> GroupCoordinator:
-#     return GroupCoordinator(
-#         group_ranks=group_ranks,
-#         local_rank=local_rank,
-#         torch_distributed_backend=backend,
-#         use_device_communicator=True,
-#         use_message_queue_broadcaster=use_message_queue_broadcaster,
-#         group_name=group_name,
-#     )
+def _get_vae_decode_group_ranks(
+    rank_generator: RankGenerator,
+) -> list[list[int]]:
+    # VAE decode happens after each DP replica owns a different request result.
+    # Decode can shard one request across TP/SP/PP/CFG ranks, but must not cross DP.
+    return rank_generator.get_ranks(_VAE_DECODE_PARALLEL_AXES)
 
 
-_TP: GroupCoordinator | None = None
+def _get_encoder_data_parallel_group_ranks(
+    rank_generator: RankGenerator,
+) -> list[list[int]]:
+    return rank_generator.get_ranks(_ENCODER_DP_PARALLEL_AXES)
 
 
 def get_tp_group() -> GroupCoordinator:
@@ -205,30 +250,23 @@ def get_tp_group() -> GroupCoordinator:
     return _TP
 
 
-_ENABLE_CUSTOM_ALL_REDUCE = True
-
-
-def set_custom_all_reduce(enable: bool):
-    global _ENABLE_CUSTOM_ALL_REDUCE
-    _ENABLE_CUSTOM_ALL_REDUCE = enable
-
-
 def init_distributed_environment(
     world_size: int = 1,
     rank: int = 0,
     distributed_init_method: str = "env://",
     local_rank: int = 0,
-    backend: str = "nccl",
+    backend: str | None = None,
     device_id: torch.device | None = None,
     timeout: int | None = None,
 ):
     # Determine the appropriate backend based on the platform
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
-    if backend == "nccl" and not current_platform.is_cuda_alike():
-        # Use gloo backend for non-CUDA platforms (MPS, CPU)
-        backend = "gloo"
-        logger.info("Using gloo backend for %s platform", current_platform.device_name)
+    if backend is None:
+        backend = current_platform.get_torch_distributed_backend_str()
+        logger.info(
+            "Using %s backend for %s platform", backend, current_platform.device_name
+        )
 
     logger.debug(
         "world_size=%d rank=%d local_rank=%d "
@@ -246,13 +284,15 @@ def init_distributed_environment(
             "distributed environment"
         )
 
-        # For MPS and MUSA, don't pass device_id as it doesn't support device indices
+        # For MPS, MUSA, and XPU, don't pass device_id as it doesn't support device indices
         extra_args = (
             {}
             if (
                 current_platform.is_mps()
                 or current_platform.is_musa()
                 or current_platform.is_npu()
+                or current_platform.is_cpu()
+                or current_platform.is_xpu()
             )
             else dict(device_id=device_id)
         )
@@ -288,22 +328,46 @@ def init_distributed_environment(
         assert (
             _WORLD.world_size == torch.distributed.get_world_size()
         ), "world group already initialized with a different world size"
-
-
-_SP: GroupCoordinator | None = None
+    _sync_srt_world_group()
 
 
 def get_sp_group() -> SequenceParallelGroupCoordinator:
-    assert _SP is not None, "pipeline model parallel group is not initialized"
+    assert _SP is not None, "sequence parallel group is not initialized"
     return _SP
-
-
-_DP: GroupCoordinator | None = None
 
 
 def get_dp_group() -> GroupCoordinator:
     assert _DP is not None, "data parallel group is not initialized"
     return _DP
+
+
+def get_replica_group() -> GroupCoordinator:
+    """The ranks that share this rank's request batch — its pipeline replica.
+
+    Replica-wide encoder folding uses this group rather than the world group,
+    which spans replicas when dp_size > 1. The encoder batch-DP group is the
+    orthogonal non-TP subset of this replica. A process that only initialized
+    the world group has exactly one replica by construction, so the world group
+    doubles as it."""
+    if _REPLICA is not None:
+        return _REPLICA
+    return get_world_group()
+
+
+def get_encoder_data_parallel_group() -> GroupCoordinator | None:
+    """Encoder copies that may split a batch inside one pipeline replica.
+
+    Native encoders use the DiT TP group when they are not folded. The batch-DP
+    group is therefore the orthogonal non-TP part of the replica: ranks with the
+    same TP coordinate receive different batch slices, while every rank in one
+    TP group receives the same slice. A pure-TP replica has only one encoder
+    copy and returns None.
+    """
+    if _ENCODER_DP is not None:
+        return _ENCODER_DP
+    if not model_parallel_is_initialized():
+        return get_world_group()
+    return None
 
 
 # xDiT
@@ -466,92 +530,78 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="tensor",
     )
+    _sync_srt_tp_group()
+
+    global _REPLICA
+    assert _REPLICA is None, "replica group is already initialized"
+    if data_parallel_size == 1:
+        _REPLICA = get_world_group()
+    else:
+        replica_axis_groups = [
+            group
+            for degree, group in (
+                (tensor_parallel_degree, _TP),
+                (sequence_parallel_degree, _SP),
+                (pipeline_parallel_degree, _PP),
+                (classifier_free_guidance_degree, _CFG),
+            )
+            if degree > 1
+        ]
+        if len(replica_axis_groups) <= 1:
+            # One nontrivial axis already is the replica group. If every axis
+            # is size one, any singleton axis group represents the replica.
+            _REPLICA = replica_axis_groups[0] if replica_axis_groups else _TP
+        else:
+            _REPLICA = init_parallel_group_coordinator(
+                group_ranks=rank_generator.get_ranks(_REPLICA_PARALLEL_AXES),
+                local_rank=get_world_group().local_rank,
+                backend=backend,
+                parallel_mode="replica",
+            )
+
+    global _ENCODER_DP
+    assert _ENCODER_DP is None, "encoder data parallel group is already initialized"
+    encoder_dp_degree = (
+        sequence_parallel_degree
+        * pipeline_parallel_degree
+        * classifier_free_guidance_degree
+    )
+    if tensor_parallel_degree == 1:
+        # With no encoder TP sharding, every replica rank owns a full encoder.
+        _ENCODER_DP = _REPLICA
+    elif encoder_dp_degree > 1:
+        nontrivial_groups = [
+            group
+            for degree, group in (
+                (sequence_parallel_degree, _SP),
+                (pipeline_parallel_degree, _PP),
+                (classifier_free_guidance_degree, _CFG),
+            )
+            if degree > 1
+        ]
+        if len(nontrivial_groups) == 1:
+            # Reuse the existing axis group in the common TP x SP case.
+            _ENCODER_DP = nontrivial_groups[0]
+        else:
+            _ENCODER_DP = init_parallel_group_coordinator(
+                group_ranks=_get_encoder_data_parallel_group_ranks(rank_generator),
+                local_rank=get_world_group().local_rank,
+                backend=backend,
+                parallel_mode="encoder_data",
+            )
+
+    global _VAE_DECODE
+    assert _VAE_DECODE is None, "VAE decode parallel group is already initialized"
+    _VAE_DECODE = init_parallel_group_coordinator(
+        group_ranks=_get_vae_decode_group_ranks(rank_generator),
+        local_rank=get_world_group().local_rank,
+        backend=backend,
+        parallel_mode="vae_decode",
+    )
 
     if vae_parallel_size > 0:
         init_vae_group(dit_parallel_size, vae_parallel_size, backend)
     init_dit_group(dit_parallel_size, backend)
-
-
-#
-
-
-# def initialize_model_parallel(
-#     tensor_model_parallel_size: int = 1,
-#     sequence_model_parallel_size: int = 1,
-#     data_parallel_size: int = 1,
-#     backend: str | None = None,
-# ) -> None:
-#     """
-#     Initialize model parallel groups.
-#
-#     Arguments:
-#         tensor_model_parallel_size: number of GPUs used for tensor model
-#             parallelism (used for language encoder).
-#         sequence_model_parallel_size: number of GPUs used for sequence model
-#             parallelism (used for DiT).
-#     """
-#     # Get world size and rank. Ensure some consistencies.
-#     assert (
-#         _WORLD is not None
-#     ), "world group is not initialized, please call init_distributed_environment first"
-#     world_size: int = get_world_size()
-#     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
-#     assert (
-#         world_size >= tensor_model_parallel_size
-#     ), f"world_size({world_size}) must be greater than or equal to tensor_model_parallel_size({tensor_model_parallel_size})"
-#     num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
-#     global _TP
-#     assert _TP is None, "tensor model parallel group is already initialized"
-#     group_ranks = []
-#     for i in range(num_tensor_model_parallel_groups):
-#         ranks = list(
-#             range(i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size)
-#         )
-#         group_ranks.append(ranks)
-#
-#     # message queue broadcaster is only used in tensor model parallel group
-#     _TP = init_parallel_group_coordinator(
-#         group_ranks,
-#         get_world_group().local_rank,
-#         backend,
-#         use_message_queue_broadcaster=True,
-#         group_name="tp",
-#     )
-#
-#     # Build the sequence model-parallel groups.
-#     num_sequence_model_parallel_groups: int = world_size // sequence_model_parallel_size
-#     global _SP
-#     assert _SP is None, "sequence model parallel group is already initialized"
-#     group_ranks = []
-#
-#     # Since SP is incompatible with TP and PP, we can use a simpler group creation logic
-#     for i in range(num_sequence_model_parallel_groups):
-#         # Create groups of consecutive ranks
-#         ranks = list(
-#             range(
-#                 i * sequence_model_parallel_size, (i + 1) * sequence_model_parallel_size
-#             )
-#         )
-#         group_ranks.append(ranks)
-#
-#     _SP = init_parallel_group_coordinator(
-#         group_ranks, get_world_group().local_rank, backend, group_name="sp"
-#     )
-#
-#     # Build the data parallel groups.
-#     num_data_parallel_groups: int = sequence_model_parallel_size
-#     global _DP
-#     assert _DP is None, "data parallel group is already initialized"
-#     group_ranks = []
-#
-#     for i in range(num_data_parallel_groups):
-#         ranks = list(range(i, world_size, num_data_parallel_groups))
-#         group_ranks.append(ranks)
-#
-#     _DP = init_parallel_group_coordinator(
-#         group_ranks, get_world_group().local_rank, backend, group_name="dp"
-#     )
-#
 
 
 def get_sp_world_size() -> int:
@@ -587,7 +637,7 @@ def get_dp_rank() -> int:
 def maybe_init_distributed_environment_and_model_parallel(
     tp_size: int,
     sp_size: int,
-    enable_cfg_parallel: bool,
+    cfg_degree: int = 1,
     ulysses_degree: int = 1,
     ring_degree: int = 1,
     dp_size: int = 1,
@@ -617,6 +667,7 @@ def maybe_init_distributed_environment_and_model_parallel(
         main_process_only=False,
     )
 
+    current_platform.set_device(device)
     init_distributed_environment(
         world_size=world_size,
         rank=rank,
@@ -628,51 +679,44 @@ def maybe_init_distributed_environment_and_model_parallel(
     )
     initialize_model_parallel(
         data_parallel_size=dp_size,
-        classifier_free_guidance_degree=2 if enable_cfg_parallel else 1,
+        classifier_free_guidance_degree=cfg_degree,
         tensor_parallel_degree=tp_size,
         ulysses_degree=ulysses_degree,
         ring_degree=ring_degree,
         sequence_parallel_degree=sp_size,
     )
 
-    # Only set CUDA device if we're on a CUDA platform
-    if current_platform.is_cuda_alike():
-        device = torch.device(f"cuda:{local_rank}")
-        torch.cuda.set_device(device)
-    elif current_platform.is_npu():
-        device = torch.device(f"npu:{local_rank}")
-        torch.npu.set_device(device)
-
 
 def model_parallel_is_initialized() -> bool:
-    """Check if tensor, sequence parallel groups are initialized."""
-    return _TP is not None and _SP is not None and _DP is not None and _CFG is not None
-
-
-_TP_STATE_PATCHED = False
+    """Check if model parallel groups are initialized."""
+    return (
+        _DP is not None
+        and _CFG is not None
+        and _SP is not None
+        and _PP is not None
+        and _TP is not None
+        and _VAE_DECODE is not None
+    )
 
 
 @contextmanager
-def patch_tensor_parallel_group(tp_group: GroupCoordinator):
-    """Patch the tp group temporarily until this function ends.
-
-    This method is for draft workers of speculative decoding to run draft model
-    with different tp degree from that of target model workers.
-
-    """
-    global _TP_STATE_PATCHED
-    assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
-
-    _TP_STATE_PATCHED = True
+def use_tensor_parallel_group(tp_group: GroupCoordinator):
+    """Use one TP group consistently across diffusion and reused SRT modules."""
     old_tp_group = get_tp_group()
+    import sglang.srt.distributed.parallel_state as srt_parallel_state
+
+    old_srt_tp_group = srt_parallel_state._TP
+    old_srt_attention_tp_group = srt_parallel_state._ATTN_TP
     global _TP
     _TP = tp_group
+    srt_parallel_state._TP = tp_group
+    srt_parallel_state._ATTN_TP = tp_group
     try:
         yield
     finally:
-        # restore the original state
-        _TP_STATE_PATCHED = False
         _TP = old_tp_group
+        srt_parallel_state._TP = old_srt_tp_group
+        srt_parallel_state._ATTN_TP = old_srt_attention_tp_group
 
 
 def get_tp_world_size() -> int:
@@ -687,6 +731,7 @@ def get_tp_rank() -> int:
 
 def destroy_distributed_environment() -> None:
     global _WORLD
+    _clear_srt_world_group()
     if _WORLD:
         _WORLD.destroy()
     _WORLD = None
@@ -795,184 +840,55 @@ def is_the_same_node_as(
     return [x == 1 for x in aggregated_data.tolist()]
 
 
-def initialize_tensor_parallel_group(
-    tensor_model_parallel_size: int = 1,
-    backend: str | None = None,
-    group_name_suffix: str = "",
-) -> GroupCoordinator:
-    """Initialize a tensor parallel group for a specific model.
-
-    This function creates a tensor parallel group that can be used with the
-    patch_tensor_parallel_group context manager. It allows different models
-    to use different tensor parallelism configurations.
-
-    Arguments:
-        tensor_model_parallel_size: number of GPUs used for tensor model parallelism.
-        backend: communication backend to use.
-        group_name_suffix: optional suffix to make the group name unique.
-
-    Returns:
-        A GroupCoordinator for tensor parallelism that can be used with
-        the patch_tensor_parallel_group context manager.
-
-    Example usage:
-        ```python
-        # Initialize tensor parallel group for model1
-        tp_group_model1 = initialize_tensor_parallel_group(
-            tensor_model_parallel_size=4,
-            group_name_suffix="model1"
-        )
-
-        # Use tensor parallelism for model1
-        with patch_tensor_parallel_group(tp_group_model1):
-            # Run model1 with tensor parallelism
-            output1 = model1(input1)
-        ```
-    """
-    # Get world size and rank. Ensure some consistencies.
-    assert torch.distributed.is_initialized()
-    world_size: int = torch.distributed.get_world_size()
-    backend = backend or torch.distributed.get_backend(get_world_group().device_group)
-
-    # Ensure the world size is compatible with the parallelism configuration
-    assert (
-        world_size % tensor_model_parallel_size == 0
-    ), f"World size ({world_size}) must be divisible by tensor_model_parallel_size ({tensor_model_parallel_size})"
-
-    # Build the tensor model-parallel groups.
-    num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
-    tp_group_ranks = []
-    for i in range(num_tensor_model_parallel_groups):
-        ranks = list(
-            range(i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size)
-        )
-        tp_group_ranks.append(ranks)
-
-    # Create TP group coordinator with a unique name
-    group_name = f"tp_{group_name_suffix}" if group_name_suffix else "tp"
-    tp_group = init_parallel_group_coordinator(
-        tp_group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_message_queue_broadcaster=True,
-        group_name=group_name,
-    )
-
-    return tp_group
-
-
-def initialize_sequence_parallel_group(
-    sequence_model_parallel_size: int = 1,
-    backend: str | None = None,
-    group_name_suffix: str = "",
-) -> GroupCoordinator:
-    """Initialize a sequence parallel group for a specific model.
-
-    This function creates a sequence parallel group that can be used with the
-    patch_sequence_parallel_group context manager. It allows different models
-    to use different sequence parallelism configurations.
-
-    Arguments:
-        sequence_model_parallel_size: number of GPUs used for sequence model parallelism.
-        backend: communication backend to use.
-        group_name_suffix: optional suffix to make the group name unique.
-
-    Returns:
-        A GroupCoordinator for sequence parallelism that can be used with
-        the patch_sequence_parallel_group context manager.
-
-    Example usage:
-        ```python
-        # Initialize sequence parallel group for model2
-        sp_group_model2 = initialize_sequence_parallel_group(
-            sequence_model_parallel_size=2,
-            group_name_suffix="model2"
-        )
-
-        # Use sequence parallelism for model2
-        with patch_sequence_parallel_group(sp_group_model2):
-            # Run model2 with sequence parallelism
-            output2 = model2(input2)
-        ```
-    """
-    # Get world size and rank. Ensure some consistencies.
-    assert torch.distributed.is_initialized()
-    world_size: int = torch.distributed.get_world_size()
-    backend = backend or torch.distributed.get_backend(get_world_group().device_group)
-
-    # Ensure the world size is compatible with the parallelism configuration
-    assert (
-        world_size % sequence_model_parallel_size == 0
-    ), f"World size ({world_size}) must be divisible by sequence_model_parallel_size ({sequence_model_parallel_size})"
-
-    # Build the sequence model-parallel groups.
-    num_sequence_model_parallel_groups: int = world_size // sequence_model_parallel_size
-    sp_group_ranks = []
-
-    for i in range(num_sequence_model_parallel_groups):
-        # Create groups of consecutive ranks
-        ranks = list(
-            range(
-                i * sequence_model_parallel_size, (i + 1) * sequence_model_parallel_size
-            )
-        )
-        sp_group_ranks.append(ranks)
-
-    # Create SP group coordinator with a unique name
-    group_name = f"sp_{group_name_suffix}" if group_name_suffix else "sp"
-    sp_group = init_parallel_group_coordinator(
-        sp_group_ranks, get_world_group().local_rank, backend, group_name=group_name
-    )
-
-    return sp_group
-
-
-# * QUERY
-def get_world_group() -> GroupCoordinator:
-    assert _WORLD is not None, "world group is not initialized"
-    return _WORLD
-
-
-# TP
-def get_tp_group() -> GroupCoordinator:
-    assert _TP is not None, "tensor model parallel group is not initialized"
-    return _TP
-
-
-def get_tensor_model_parallel_world_size():
+def get_tensor_model_parallel_world_size() -> int:
     """Return world size for the tensor model parallel group."""
-    return get_tp_group().world_size
+    return get_tp_world_size()
 
 
-def get_tensor_model_parallel_rank():
+def get_tensor_model_parallel_rank() -> int:
     """Return my rank for the tensor model parallel group."""
-    return get_tp_group().rank_in_group
+    return get_tp_rank()
 
 
-def get_sequence_parallel_world_size():
+def get_sequence_parallel_world_size() -> int:
     """Return world size for the sequence parallel group."""
-    return get_sp_group().world_size
+    return get_sp_world_size()
 
 
-def get_sequence_parallel_rank():
+def get_sequence_parallel_rank() -> int:
     """Return my rank for the sequence parallel group."""
-    return get_sp_group().rank_in_group
+    return get_sp_parallel_rank()
 
 
-def get_ulysses_parallel_world_size():
+def get_ulysses_parallel_world_size() -> int:
     return get_sp_group().ulysses_world_size
 
 
-def get_ulysses_parallel_rank():
+def get_ulysses_parallel_rank() -> int:
     return get_sp_group().ulysses_rank
 
 
-def get_ring_parallel_world_size():
+def get_ring_parallel_world_size() -> int:
     return get_sp_group().ring_world_size
 
 
-def get_ring_parallel_rank():
+def get_ring_parallel_rank() -> int:
     return get_sp_group().ring_rank
+
+
+def get_ulysses_ctx() -> tuple[int, int]:
+    """(world_size, rank) of the Ulysses group; (1, 0) when uninitialized
+    (unit tests / single-process debug paths)."""
+    if not model_parallel_is_initialized():
+        return 1, 0
+    return get_ulysses_parallel_world_size(), get_ulysses_parallel_rank()
+
+
+def get_ring_ctx() -> tuple[int, int]:
+    """(world_size, rank) of the Ring group; (1, 0) when uninitialized."""
+    if not model_parallel_is_initialized():
+        return 1, 0
+    return get_ring_parallel_world_size(), get_ring_parallel_rank()
 
 
 # PP
@@ -981,22 +897,22 @@ def get_pp_group() -> PipelineGroupCoordinator:
     return _PP
 
 
-def get_pipeline_parallel_world_size():
+def get_pipeline_parallel_world_size() -> int:
     """Return world size for the pipeline model parallel group."""
     return get_pp_group().world_size
 
 
-def get_pipeline_parallel_rank():
+def get_pipeline_parallel_rank() -> int:
     """Return my rank for the pipeline model parallel group."""
     return get_pp_group().rank_in_group
 
 
-def is_pipeline_first_stage():
+def is_pipeline_first_stage() -> bool:
     """Return True if in the first pipeline model parallel stage, False otherwise."""
     return get_pipeline_parallel_rank() == 0
 
 
-def is_pipeline_last_stage():
+def is_pipeline_last_stage() -> bool:
     """Return True if in the last pipeline model parallel stage, False otherwise."""
     return get_pipeline_parallel_rank() == (get_pipeline_parallel_world_size() - 1)
 
@@ -1009,33 +925,27 @@ def get_cfg_group() -> GroupCoordinator:
     return _CFG
 
 
-def get_classifier_free_guidance_world_size():
+def get_classifier_free_guidance_world_size() -> int:
     """Return world size for the classifier_free_guidance parallel group."""
     return get_cfg_group().world_size
 
 
-def get_classifier_free_guidance_rank():
+def get_classifier_free_guidance_rank() -> int:
     """Return my rank for the classifier_free_guidance parallel group."""
     return get_cfg_group().rank_in_group
 
 
-# DP
-def get_dp_group() -> GroupCoordinator:
-    assert _DP is not None, "pipeline model parallel group is not initialized"
-    return _DP
-
-
-def get_data_parallel_world_size():
+def get_data_parallel_world_size() -> int:
     """Return world size for the data parallel group."""
-    return get_dp_group().world_size
+    return get_dp_world_size()
 
 
-def get_data_parallel_rank():
+def get_data_parallel_rank() -> int:
     """Return my rank for the data parallel group."""
-    return get_dp_group().rank_in_group
+    return get_dp_rank()
 
 
-def is_dp_last_group():
+def is_dp_last_group() -> bool:
     """Return True if in the last data parallel group, False otherwise."""
     return (
         get_sequence_parallel_rank() == (get_sequence_parallel_world_size() - 1)
@@ -1045,7 +955,7 @@ def is_dp_last_group():
     )
 
 
-def get_dit_world_size():
+def get_dit_world_size() -> int:
     """Return world size for the DiT model (excluding VAE)."""
     return (
         get_data_parallel_world_size()
@@ -1056,57 +966,44 @@ def get_dit_world_size():
     )
 
 
-# Add VAE getter functions
-def get_vae_parallel_group() -> GroupCoordinator:
+def get_vae_parallel_group() -> ProcessGroup:
     assert _VAE is not None, "VAE parallel group is not initialized"
     return _VAE
 
 
-def get_vae_parallel_world_size():
+def get_vae_parallel_world_size() -> int:
     """Return world size for the VAE parallel group."""
-    return get_vae_parallel_group().world_size
+    return torch.distributed.get_world_size(group=get_vae_parallel_group())
 
 
-def get_vae_parallel_rank():
+def get_vae_parallel_rank() -> int:
     """Return my rank for the VAE parallel group."""
-    return get_vae_parallel_group().rank_in_group
+    return torch.distributed.get_rank(group=get_vae_parallel_group())
 
 
-# * SET
+def get_decode_parallel_group_coordinator() -> GroupCoordinator:
+    assert _VAE_DECODE is not None, "VAE decode parallel group is not initialized"
+    return _VAE_DECODE
 
 
-def init_world_group(
-    ranks: List[int], local_rank: int, backend: str
-) -> GroupCoordinator:
-    return GroupCoordinator(
-        group_ranks=[ranks],
-        local_rank=local_rank,
-        torch_distributed_backend=backend,
-    )
+def get_decode_parallel_world_size() -> int:
+    return get_decode_parallel_group_coordinator().world_size
 
 
-def model_parallel_is_initialized():
-    """Check if tensor and pipeline parallel groups are initialized."""
-    return (
-        _DP is not None
-        and _CFG is not None
-        and _SP is not None
-        and _PP is not None
-        and _TP is not None
-    )
+def get_decode_parallel_rank() -> int:
+    return get_decode_parallel_group_coordinator().rank_in_group
 
 
 def init_dit_group(
     dit_parallel_size: int,
     backend: str,
-):
+) -> None:
     global _DIT
-    _DIT = torch.distributed.new_group(
-        ranks=list(range(dit_parallel_size)), backend=backend
-    )
+    assert _DIT is None, "DIT group is already initialized"
+    _DIT = new_device_group(list(range(dit_parallel_size)), backend)
 
 
-def get_dit_group():
+def get_dit_group() -> ProcessGroup:
     assert _DIT is not None, "DIT group is not initialized"
     return _DIT
 
@@ -1120,65 +1017,61 @@ def init_vae_group(
     global _VAE
     assert _VAE is None, "VAE parallel group is already initialized"
     vae_ranks = list(range(dit_parallel_size, dit_parallel_size + vae_parallel_size))
-    _VAE = torch.distributed.new_group(ranks=vae_ranks, backend=backend)
+    _VAE = new_device_group(vae_ranks, backend)
 
 
 def destroy_model_parallel() -> None:
     """Set the groups to none and destroy them."""
-    global _TP
-    if _TP:
-        _TP.destroy()
-    _TP = None
+    global _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE, _REPLICA, _ENCODER_DP
 
-    global _SP
-    if _SP:
-        _SP.destroy()
-    _SP = None
+    _clear_srt_tp_group()
+    # The IPC transport keeps CUDA mappings associated with the current
+    # Ulysses group. Drop them before tearing down the process groups.
+    from .device_communicators.ipc_a2a import IPC_A2A
+    from .parallel_groups import PROCESS_GROUP
 
-    global _DP
-    if _DP:
-        _DP.destroy()
-    _DP = None
+    IPC_A2A.reset()
 
+    destroyed_groups = []
+    for group in (
+        _TP,
+        _SP,
+        _DP,
+        _CFG,
+        _PP,
+        _REPLICA,
+        _ENCODER_DP,
+        _VAE_DECODE,
+    ):
+        # Replica-derived groups may alias each other or the world group.
+        if (
+            group is not None
+            and group is not _WORLD
+            and all(group is not destroyed for destroyed in destroyed_groups)
+        ):
+            group.destroy()
+            destroyed_groups.append(group)
 
-# xDit
-# def destroy_model_parallel():
-#     """Set the groups to none and destroy them."""
-#     global _DP
-#     if _DP:
-#         _DP.destroy()
-#     _DP = None
-#
-#     global _CFG
-#     if _CFG:
-#         _CFG.destroy()
-#     _CFG = None
-#
-#     global _SP
-#     if _SP:
-#         _SP.destroy()
-#     _SP = None
-#
-#     global _TP
-#     if _TP:
-#         _TP.destroy()
-#     _TP = None
-#
-#     global _PP
-#     if _PP:
-#         _PP.destroy()
-#     _PP = None
-#
-#     global _VAE
-#     if _VAE:
-#         _VAE.destroy()
-#     _VAE = None
+    # Ulysses and Ring groups are created separately from the SP coordinator,
+    # so GroupCoordinator.destroy() does not own or release them. Explicitly
+    # destroy them here; otherwise repeated Ulysses/Ring topology switches leak
+    # NCCL communicators and their CUDA memory.
+    destroyed_sequence_groups = []
+    for group in (PROCESS_GROUP.ULYSSES_PG, PROCESS_GROUP.RING_PG):
+        if (
+            group is not None
+            and group is not torch.distributed.group.WORLD
+            and all(group is not destroyed for destroyed in destroyed_sequence_groups)
+        ):
+            torch.distributed.destroy_process_group(group)
+            destroyed_sequence_groups.append(group)
+    PROCESS_GROUP.ULYSSES_PG = None
+    PROCESS_GROUP.RING_PG = None
 
+    for group in (_DIT, _VAE):
+        if group is not None:
+            torch.distributed.destroy_process_group(group)
 
-def destroy_distributed_environment():
-    global _WORLD
-    if _WORLD:
-        _WORLD.destroy()
-    _WORLD = None
-    if torch.distributed.is_initialized():
-        torch.distributed.destroy_process_group()
+    _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE, _REPLICA, _ENCODER_DP = (
+        None,
+    ) * 10

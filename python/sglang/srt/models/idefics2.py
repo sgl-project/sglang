@@ -25,7 +25,12 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.activation import get_act_fn
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
+)
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import add_prefix, is_npu
@@ -98,6 +103,7 @@ class Idefics2EncoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -107,7 +113,11 @@ class Idefics2EncoderLayer(nn.Module):
         """
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
-        hidden_states = self.self_attn(hidden_states, cu_seqlens=cu_seqlens)
+        hidden_states = self.self_attn(
+            hidden_states,
+            cu_seqlens=cu_seqlens,
+            forward_metadata=forward_metadata,
+        )
 
         hidden_states = residual + hidden_states
         residual = hidden_states
@@ -151,6 +161,7 @@ class Idefics2Encoder(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         r"""
         Args:
@@ -162,13 +173,18 @@ class Idefics2Encoder(nn.Module):
                 internal embedding lookup matrix.
         """
         # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
+        hidden_states = inputs_embeds
         if is_npu():
             cu_seqlens = cu_seqlens.to("cpu")
-        hidden_states = inputs_embeds
+        if forward_metadata is None:
+            forward_metadata = prepare_vision_attention_metadata(
+                cu_seqlens, device=hidden_states.device
+            )
         for encoder_layer in self.layers:
             layer_outputs = encoder_layer(
                 hidden_states,
                 cu_seqlens=cu_seqlens,
+                forward_metadata=forward_metadata,
             )
             hidden_states = layer_outputs
         return hidden_states
@@ -193,7 +209,7 @@ class Idefics2VisionEmbeddings(nn.Module):
         self.embed_dim = config.hidden_size
         self.image_size = config.image_size
         self.patch_size = config.patch_size
-        self.patch_embedding = nn.Conv2d(
+        self.patch_embedding = Conv2dLayer(
             in_channels=config.num_channels,
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,
@@ -339,6 +355,9 @@ class Idefics2VisionTransformer(nn.Module):
         encoder_outputs = self.encoder(
             hidden_states,
             cu_seqlens=cu_seqlens,
+            forward_metadata=prepare_vision_attention_metadata(
+                cu_seqlens, device=hidden_states.device
+            ),
         )
         last_hidden_state = self.post_layernorm(encoder_outputs)
         return last_hidden_state

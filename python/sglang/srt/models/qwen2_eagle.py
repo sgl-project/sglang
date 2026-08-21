@@ -45,13 +45,13 @@ class Qwen2DecoderLayer(Qwen2DecoderLayer):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        super().__init__(config, layer_id, quant_config, prefix=prefix)
+        super().__init__(config, layer_id, quant_config=quant_config, prefix=prefix)
 
         # Skip the input_layernorm
         # https://github.com/SafeAILab/EAGLE/blob/35c78f6cdc19a73e05cf5c330b4c358dad970c6a/eagle/model/cnets.py#L427
         if layer_id == 0:
             del self.input_layernorm
-            setattr(self, "input_layernorm", lambda x: x)
+            setattr(self, "input_layernorm", lambda x, quant_linear=None: x)
 
 
 class Qwen2Model(nn.Module):
@@ -135,6 +135,7 @@ class Qwen2ForCausalLMEagle(Qwen2ForCausalLM):
                 prefix=add_prefix("lm_head", prefix),
             )
         self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         for name, loaded_weight in weights:

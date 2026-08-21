@@ -1,7 +1,6 @@
 import unittest
 
-from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
-
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
     ModelOptFp8KVCacheMethod,

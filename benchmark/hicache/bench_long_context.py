@@ -13,13 +13,13 @@ from bench_multiturn import (
 from tqdm.asyncio import tqdm
 
 from sglang.benchmark.utils import get_tokenizer
+from sglang.test.kits.cache_hit_kit import async_request_sglang_generate
 
 
 class ContextWorkloadGenerator(WorkloadGenerator):
     def __init__(self, args):
-        # Construct the base URL for requests
-        self.baseurl = f"http://{args.host}:{args.port}/"
-        self.url = self.baseurl + "generate"
+        self.url = f"http://{args.host}:{args.port}/generate"
+        self.request_func = async_request_sglang_generate
 
         self.tokenizer = get_tokenizer(args.model_path)
         self.distribution = args.distribution

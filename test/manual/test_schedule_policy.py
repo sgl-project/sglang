@@ -1,4 +1,5 @@
 import unittest
+from array import array
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import (
@@ -9,6 +10,18 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.test_utils import CustomTestCase
+
+
+def _make_req(rid, origin_input_text, origin_input_ids, sampling_params=None, **kwargs):
+    if sampling_params is None:
+        sampling_params = SamplingParams()
+    return Req(
+        rid,
+        origin_input_text,
+        array("q", origin_input_ids),
+        sampling_params,
+        **kwargs,
+    )
 
 
 class TestSchedulePolicy(CustomTestCase):
@@ -60,9 +73,9 @@ class TestSchedulePolicy(CustomTestCase):
     def test_calc_priority_fcfs(self):
         tree_cache = RadixCache.create_simulated()
         waiting_queue = [
-            Req(1, "a b", [1, 2], SamplingParams()),
-            Req(3, "a b c", [1, 2, 3], SamplingParams()),
-            Req(2, "a", [1], SamplingParams()),
+            _make_req(1, "a b", [1, 2]),
+            _make_req(3, "a b c", [1, 2, 3]),
+            _make_req(2, "a", [1]),
         ]
 
         policy = SchedulePolicy(
@@ -80,9 +93,9 @@ class TestSchedulePolicy(CustomTestCase):
 
     def test_calc_priority_priority_enabled_fcfs_scheduling(self):
         tree_cache = RadixCache.create_simulated()
-        r1 = Req(1, "a b", [1, 2], SamplingParams())
-        r2 = Req(3, "a b c", [1, 2, 3], SamplingParams())
-        r3 = Req(2, "a", [1], SamplingParams())
+        r1 = _make_req(1, "a b", [1, 2])
+        r2 = _make_req(3, "a b c", [1, 2, 3])
+        r3 = _make_req(2, "a", [1])
         r1.priority, r1.time_stats.wait_queue_entry_time = 1, 1
         r2.priority, r2.time_stats.wait_queue_entry_time = 0, 1
         r3.priority, r3.time_stats.wait_queue_entry_time = 0, 0
@@ -107,9 +120,9 @@ class TestSchedulePolicy(CustomTestCase):
         self,
     ):
         tree_cache = RadixCache.create_simulated()
-        r1 = Req(1, "a b", [1, 2], SamplingParams())
-        r2 = Req(3, "a b c", [1, 2, 3], SamplingParams())
-        r3 = Req(2, "a", [1], SamplingParams())
+        r1 = _make_req(1, "a b", [1, 2])
+        r2 = _make_req(3, "a b c", [1, 2, 3])
+        r3 = _make_req(2, "a", [1])
         r1.priority, r1.time_stats.wait_queue_entry_time = -1, 1
         r2.priority, r2.time_stats.wait_queue_entry_time = 0, 1
         r3.priority, r3.time_stats.wait_queue_entry_time = 0, 0
@@ -133,9 +146,9 @@ class TestSchedulePolicy(CustomTestCase):
         tree_cache = RadixCache.create_simulated()
 
         waiting_queue = [
-            Req(1, "a b", [1, 2], SamplingParams(max_new_tokens=1000)),
-            Req(3, "a b c", [1, 2, 3], SamplingParams(max_new_tokens=10)),
-            Req(2, "a", [1], SamplingParams(max_new_tokens=100)),
+            _make_req(1, "a b", [1, 2], SamplingParams(max_new_tokens=1000)),
+            _make_req(3, "a b c", [1, 2, 3], SamplingParams(max_new_tokens=10)),
+            _make_req(2, "a", [1], SamplingParams(max_new_tokens=100)),
         ]
 
         policy = SchedulePolicy(
@@ -155,9 +168,11 @@ class TestSchedulePolicy(CustomTestCase):
         tree_cache = RadixCache.create_simulated()
 
         waiting_queue = [
-            Req(1, "a b", [1, 2], SamplingParams(max_new_tokens=1), priority=1),
-            Req(3, "a b c", [1, 2, 3], SamplingParams(max_new_tokens=10), priority=0),
-            Req(2, "a", [1], SamplingParams(max_new_tokens=100), priority=0),
+            _make_req(1, "a b", [1, 2], SamplingParams(max_new_tokens=1), priority=1),
+            _make_req(
+                3, "a b c", [1, 2, 3], SamplingParams(max_new_tokens=10), priority=0
+            ),
+            _make_req(2, "a", [1], SamplingParams(max_new_tokens=100), priority=0),
         ]
 
         policy = SchedulePolicy(
@@ -179,9 +194,11 @@ class TestSchedulePolicy(CustomTestCase):
         tree_cache = RadixCache.create_simulated()
 
         waiting_queue = [
-            Req(1, "a b", [1, 2], SamplingParams(max_new_tokens=1), priority=0),
-            Req(3, "a b c", [1, 2, 3], SamplingParams(max_new_tokens=10), priority=1),
-            Req(2, "a", [1], SamplingParams(max_new_tokens=100), priority=1),
+            _make_req(1, "a b", [1, 2], SamplingParams(max_new_tokens=1), priority=0),
+            _make_req(
+                3, "a b c", [1, 2, 3], SamplingParams(max_new_tokens=10), priority=1
+            ),
+            _make_req(2, "a", [1], SamplingParams(max_new_tokens=100), priority=1),
         ]
 
         policy = SchedulePolicy(
@@ -202,16 +219,16 @@ class TestSchedulePolicy(CustomTestCase):
         tree_cache = RadixCache.create_simulated()
 
         running_reqs = [
-            Req("r1", "a", [1], SamplingParams(), routing_key="key_a"),
-            Req("r2", "b", [2], SamplingParams(), routing_key="key_a"),
-            Req("r3", "c", [3], SamplingParams(), routing_key="key_b"),
+            _make_req("r1", "a", [1], routing_key="key_a"),
+            _make_req("r2", "b", [2], routing_key="key_a"),
+            _make_req("r3", "c", [3], routing_key="key_b"),
         ]
         running_batch = ScheduleBatch(reqs=running_reqs)
 
         waiting_queue = [
-            Req("w1", "d", [4], SamplingParams(), routing_key="key_b"),
-            Req("w2", "e", [5], SamplingParams(), routing_key="key_a"),
-            Req("w3", "f", [6], SamplingParams(), routing_key="key_c"),
+            _make_req("w1", "d", [4], routing_key="key_b"),
+            _make_req("w2", "e", [5], routing_key="key_a"),
+            _make_req("w3", "f", [6], routing_key="key_c"),
         ]
 
         policy = SchedulePolicy(
@@ -232,14 +249,14 @@ class TestSchedulePolicy(CustomTestCase):
         tree_cache = RadixCache.create_simulated()
 
         running_reqs = [
-            Req("r1", "a", [1], SamplingParams(), routing_key="key_b"),
-            Req("r2", "b", [2], SamplingParams(), routing_key="key_a"),
+            _make_req("r1", "a", [1], routing_key="key_b"),
+            _make_req("r2", "b", [2], routing_key="key_a"),
         ]
         running_batch = ScheduleBatch(reqs=running_reqs)
 
         waiting_queue = [
-            Req("w1", "d", [4], SamplingParams(), routing_key="key_b"),
-            Req("w2", "e", [5], SamplingParams(), routing_key="key_a"),
+            _make_req("w1", "d", [4], routing_key="key_b"),
+            _make_req("w2", "e", [5], routing_key="key_a"),
         ]
 
         policy = SchedulePolicy(
@@ -259,16 +276,16 @@ class TestSchedulePolicy(CustomTestCase):
         tree_cache = RadixCache.create_simulated()
 
         running_reqs = [
-            Req("r1", "a", [1], SamplingParams(), routing_key="key_a"),
-            Req("r2", "b", [2], SamplingParams(), routing_key="key_b"),
-            Req("r3", "c", [3], SamplingParams(), routing_key="key_c"),
+            _make_req("r1", "a", [1], routing_key="key_a"),
+            _make_req("r2", "b", [2], routing_key="key_b"),
+            _make_req("r3", "c", [3], routing_key="key_c"),
         ]
         running_batch = ScheduleBatch(reqs=running_reqs)
 
         waiting_queue = [
-            Req("w1", "d", [4], SamplingParams(), routing_key="key_d"),
-            Req("w2", "e", [5], SamplingParams(), routing_key="key_e"),
-            Req("w3", "f", [6], SamplingParams(), routing_key="key_c"),
+            _make_req("w1", "d", [4], routing_key="key_d"),
+            _make_req("w2", "e", [5], routing_key="key_e"),
+            _make_req("w3", "f", [6], routing_key="key_c"),
         ]
 
         policy = SchedulePolicy(
@@ -291,9 +308,9 @@ class TestSchedulePolicy(CustomTestCase):
         running_batch = ScheduleBatch(reqs=[])
 
         waiting_queue = [
-            Req("w1", "d", [4], SamplingParams(), routing_key="key_a"),
-            Req("w2", "e", [5], SamplingParams(), routing_key="key_b"),
-            Req("w3", "f", [6], SamplingParams(), routing_key="key_c"),
+            _make_req("w1", "d", [4], routing_key="key_a"),
+            _make_req("w2", "e", [5], routing_key="key_b"),
+            _make_req("w3", "f", [6], routing_key="key_c"),
         ]
 
         policy = SchedulePolicy(

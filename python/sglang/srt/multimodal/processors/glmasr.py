@@ -1,5 +1,6 @@
 import re
 
+from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.glmasr import GlmAsrForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -28,14 +29,47 @@ class GlmAsrProcessor(BaseMultimodalProcessor):
             audio_token_id=self.audio_token_id,
         ).build(_processor)
 
+    # GLM-ASR's chat template keys on ``{"type": "audio"}`` (or any mapping
+    # containing an ``audio`` key) to emit its audio placeholder span.
+    _TRANSCRIPTION_CONVERSATION = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "audio", "audio": ""},
+                {"type": "text", "text": "Transcribe the audio."},
+            ],
+        }
+    ]
+
+    def _build_transcription_prompt(self, input_text) -> str:
+        """Fall back to a default ASR prompt for audio-only requests.
+
+        The ``/v1/audio/transcriptions`` endpoint sends empty text (and hence
+        empty ``input_ids``), which carries no audio placeholder. Render the
+        GLM-ASR chat prompt with one audio span so the encoder features have a
+        slot to fill; otherwise the caller-supplied text is used as-is.
+        """
+        if isinstance(input_text, list):
+            input_text = (
+                self._processor.tokenizer.decode(input_text) if input_text else ""
+            )
+        if input_text and input_text.strip():
+            return input_text
+        return self._processor.apply_chat_template(
+            self._TRANSCRIPTION_CONVERSATION,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+
     async def process_mm_data_async(
         self,
         audio_data,
         input_text,
         **kwargs,
     ):
-        base_output = self.load_mm_data(
-            prompt=input_text,
+        prompt = self._build_transcription_prompt(input_text)
+        base_output = await self.load_mm_data(
+            prompt=prompt,
             audio_data=audio_data,
             multimodal_tokens=self.mm_tokens,
         )
@@ -44,10 +78,10 @@ class GlmAsrProcessor(BaseMultimodalProcessor):
         mm_items, input_ids, ret = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
-        return {
-            "mm_items": mm_items,
-            "input_ids": input_ids.tolist(),
-            "audio_start_id": self.audio_start_id,
-            "audio_token_id": self.audio_token_id,
-            "audio_end_id": self.audio_end_id,
-        }
+        return MultimodalProcessorOutput(
+            mm_items=mm_items,
+            input_ids=input_ids.tolist(),
+            audio_start_id=self.audio_start_id,
+            audio_token_id=self.audio_token_id,
+            audio_end_id=self.audio_end_id,
+        )

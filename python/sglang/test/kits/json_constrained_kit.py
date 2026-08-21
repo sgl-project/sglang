@@ -5,7 +5,8 @@ import openai
 import requests
 
 
-class TestJSONConstrainedMixin:
+class JSONConstrainedMixin:
+
     json_schema = json.dumps(
         {
             "type": "object",

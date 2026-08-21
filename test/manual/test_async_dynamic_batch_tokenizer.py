@@ -7,6 +7,7 @@ including batch efficiency, timeout handling, and error cases.
 
 import asyncio
 import logging
+import sys
 import time
 from unittest.mock import Mock
 
@@ -292,4 +293,4 @@ class TestAsyncDynamicbatchTokenizer:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

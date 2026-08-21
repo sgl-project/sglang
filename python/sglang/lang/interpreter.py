@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import tqdm
 
-from sglang.global_config import global_config
+from sglang.lang.global_config import global_config
 from sglang.lang.ir import (
     SglCommitLazy,
     SglConcateAndAppend,
@@ -245,6 +245,30 @@ def cache_program(program, backend):
     prefix = extract_prefix_by_tracing(program, backend)
     if prefix and len(prefix) > 64:
         backend.cache_prefix(prefix)
+
+
+_INCREMENTAL_STREAMING_META_INFO_KEYS = (
+    "output_token_logprobs",
+    "output_top_logprobs",
+    "output_token_ids_logprobs",
+)
+
+
+def _merge_stream_meta_info(
+    pending_meta_info: dict[str, Any] | None,
+    meta_info: dict[str, Any],
+) -> dict[str, Any]:
+    if pending_meta_info is None:
+        return meta_info
+
+    merged_meta_info = dict(meta_info)
+    for key in _INCREMENTAL_STREAMING_META_INFO_KEYS:
+        if key not in meta_info and key not in pending_meta_info:
+            continue
+        merged_meta_info[key] = list(pending_meta_info.get(key, [])) + list(
+            meta_info.get(key, [])
+        )
+    return merged_meta_info
 
 
 class StreamExecutor:
@@ -949,6 +973,7 @@ class ProgramState:
                         break
             else:
                 event = None
+                pending_meta_info = None
                 while not event:
                     if var_name in self.stream_executor.stream_var_event:
                         event = self.stream_executor.stream_var_event[var_name]
@@ -960,12 +985,24 @@ class ProgramState:
                     await loop.run_in_executor(None, event.wait)
                     event.clear()
                     out = str(self.stream_executor.variables[var_name][prev:])
+                    meta_info = self.stream_executor.meta_info.get(var_name)
                     prev += len(out)
                     if out:
                         if return_meta_data:
-                            yield out, self.stream_executor.meta_info[var_name]
+                            assert meta_info is not None
+                            merged_meta_info = _merge_stream_meta_info(
+                                pending_meta_info,
+                                meta_info,
+                            )
+                            pending_meta_info = None
+                            yield out, merged_meta_info
                         else:
                             yield out
+                    elif return_meta_data and meta_info is not None:
+                        pending_meta_info = _merge_stream_meta_info(
+                            pending_meta_info,
+                            meta_info,
+                        )
                     if self.stream_executor.variable_event[var_name].is_set():
                         break
         else:

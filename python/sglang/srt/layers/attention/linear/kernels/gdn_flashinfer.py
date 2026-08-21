@@ -1,27 +1,32 @@
 """FlashInfer-based kernels for GDN (Gated Delta Network) linear attention.
 
-Provides K-last SSM layout support using FlashInfer CUTLASS kernels (SM90+).
-The K-last layout stores SSM states as [pool, HV, V, K] instead of V-last
-[pool, HV, K, V], enabling more efficient memory access patterns for decode.
+Both SM90 and SM100 use the same pool layout: [pool, HV, V, K] (K-last).
 
-Requires ``flashinfer`` with GDN kernel support to be installed, e.g.
-``pip install -e ".[cutlass]"`` from the FlashInfer repo.
+SM90 (Hopper): full support — decode, prefill, MTP.  State dtype: fp32.
+SM100 (Blackwell): full support — decode, prefill, MTP.
 
-NOTE: FlashInfer >= 0.6.4 includes a fix (PR#2509) that caches
-cudaGetDeviceProperties in the GDN prefill JIT launcher, eliminating ~80ms
-of CPU overhead per prefill. Upgrading from 0.6.3 to 0.6.4 recovers ~50%
-prefill throughput regression observed with stock FlashInfer.
+Requires flashinfer >= 0.6.14.
 """
+
+from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
+from sglang.srt.runtime_context import (
+    mamba_cache_chunk_size,
+)
+from sglang.srt.utils import is_cuda
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
 
@@ -32,14 +37,56 @@ _flashinfer_gdn_available: Optional[bool] = None
 _flashinfer_chunk_gated_delta_rule = None
 _flashinfer_gated_delta_rule_mtp = None
 _flashinfer_gated_delta_rule_decode = None
+_flashinfer_gated_delta_rule_mtp_bf16 = None
+
+
+def maybe_build_flashinfer_checkpoint_plan(
+    forward_batch: ForwardBatch,
+    forward_metadata: ForwardMetadata,
+    device: str,
+) -> None:
+    """Populate packed FlashInfer checkpoint metadata when tracking requires it."""
+    if (
+        forward_metadata.track_ssm_h_src is None
+        or forward_metadata.track_ssm_h_src.numel() == 0
+    ):
+        return
+
+    checkpoint_every_n_tokens = mamba_cache_chunk_size()
+    extend_seq_lens = forward_batch.extend_seq_lens.to(device="cpu", dtype=torch.int64)
+    track_mask = forward_batch.mamba_track_mask.to(device="cpu", dtype=torch.bool)
+    relative_track_lens = forward_batch.mamba_track_seqlens.to(
+        device="cpu", dtype=torch.int64
+    ) - forward_batch.extend_prefix_lens.to(device="cpu", dtype=torch.int64)
+
+    checkpoint_counts = extend_seq_lens // checkpoint_every_n_tokens
+    checkpoint_cu_starts = torch.zeros(checkpoint_counts.numel() + 1, dtype=torch.int64)
+    checkpoint_cu_starts[1:] = torch.cumsum(checkpoint_counts, dim=0)
+
+    use_checkpoint = track_mask & (relative_track_lens % checkpoint_every_n_tokens != 0)
+    track_checkpoint_src = checkpoint_cu_starts[:-1][use_checkpoint] + (
+        relative_track_lens[use_checkpoint] // checkpoint_every_n_tokens - 1
+    )
+    if track_checkpoint_src.numel() and track_checkpoint_src.min() < 0:
+        raise ValueError("Tracked GDN state precedes the first FlashInfer checkpoint.")
+    assert track_checkpoint_src.numel() == forward_metadata.track_ssm_h_dst.numel()
+
+    forward_metadata.track_ssm_h_src = track_checkpoint_src.to(
+        device, non_blocking=True
+    )
+    forward_metadata.state_checkpoint_cu_starts = checkpoint_cu_starts.to(
+        device, non_blocking=True
+    )
+    forward_metadata.num_state_checkpoints = int(checkpoint_cu_starts[-1])
+    forward_metadata.state_checkpoint_every_n_tokens = checkpoint_every_n_tokens
 
 
 def _get_flashinfer_gdn_kernels():
     """Lazy import for FlashInfer GDN prefill, decode and verify (MTP) kernels.
 
-    Returns (available, prefill_fn, mtp_fn, decode_fn).
+    Returns (available, prefill_fn, mtp_fn, decode_fn, mtp_bf16_fn).
     """
-    global _flashinfer_gdn_available, _flashinfer_chunk_gated_delta_rule, _flashinfer_gated_delta_rule_mtp, _flashinfer_gated_delta_rule_decode
+    global _flashinfer_gdn_available, _flashinfer_chunk_gated_delta_rule, _flashinfer_gated_delta_rule_mtp, _flashinfer_gated_delta_rule_decode, _flashinfer_gated_delta_rule_mtp_bf16
     if _flashinfer_gdn_available is None:
         try:
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
@@ -48,21 +95,20 @@ def _get_flashinfer_gdn_kernels():
                 gated_delta_rule_decode_pretranspose,
                 gated_delta_rule_mtp,
             )
+            from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
+                gated_delta_rule_mtp as gated_delta_rule_mtp_bf16,
+            )
             from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
             _flashinfer_chunk_gated_delta_rule = chunk_gated_delta_rule
             _flashinfer_gated_delta_rule_mtp = gated_delta_rule_mtp
-            # Use pretranspose (K-last / V-major) decode kernel to match
-            # the K-last pool layout [pool, HV, V, K]
+            _flashinfer_gated_delta_rule_mtp_bf16 = gated_delta_rule_mtp_bf16
             _flashinfer_gated_delta_rule_decode = gated_delta_rule_decode_pretranspose
-            # SM90+ required for FlashInfer GDN CUTLASS kernels
             _flashinfer_gdn_available = (
-                torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9
+                is_cuda() and torch.cuda.get_device_capability()[0] >= 9
             )
             if _flashinfer_gdn_available:
-                logger.info(
-                    "FlashInfer GDN kernels (prefill + decode + MTP) loaded successfully"
-                )
+                logger.info("FlashInfer GDN kernels loaded successfully")
         except (ImportError, RuntimeError) as e:
             logger.warning(f"FlashInfer GDN kernels not available: {e}")
             _flashinfer_gdn_available = False
@@ -72,7 +118,14 @@ def _get_flashinfer_gdn_kernels():
         _flashinfer_chunk_gated_delta_rule,
         _flashinfer_gated_delta_rule_mtp,
         _flashinfer_gated_delta_rule_decode,
+        _flashinfer_gated_delta_rule_mtp_bf16,
     )
+
+
+def is_flashinfer_gdn_prefill_available() -> bool:
+    """Return whether the kernel loader can construct the prefill path."""
+    available, prefill_fn, *_ = _get_flashinfer_gdn_kernels()
+    return bool(available and prefill_fn is not None)
 
 
 # ---------------------------------------------------------------------------
@@ -81,11 +134,15 @@ def _get_flashinfer_gdn_kernels():
 
 
 class FlashInferGDNKernel(LinearAttnKernelBase):
-    """FlashInfer CUTLASS kernel for GDN with K-last SSM state layout.
+    """FlashInfer kernel for GDN with K-last SSM state layout.
 
-    Supports decode (pooled pretranspose), extend (chunked prefill) and
-    target_verify (MTP).  Requires SM90+ and FlashInfer with GDN support.
+    SM90 (Hopper): decode uses gather/scatter; prefill and MTP verify supported.
+    SM100 (Blackwell): decode uses gather/scatter; prefill and MTP verify supported.
+
+    Requires flashinfer >= 0.6.14.
     """
+
+    uses_state_checkpoints = True
 
     def __init__(self):
         (
@@ -93,6 +150,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             self._prefill_fn,
             self._mtp_fn,
             self._decode_fn,
+            mtp_bf16_fn,
         ) = _get_flashinfer_gdn_kernels()
 
         if not available:
@@ -100,16 +158,56 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 "FlashInfer GDN kernels are not available. "
                 "Requires SM90+ and FlashInfer with GDN kernel support."
             )
-        if self._prefill_fn is None:
-            raise RuntimeError("FlashInfer GDN prefill kernel is unavailable.")
-        if self._mtp_fn is None:
-            raise RuntimeError("FlashInfer GDN MTP (verify) kernel is unavailable.")
         if self._decode_fn is None:
             raise RuntimeError("FlashInfer GDN decode kernel is unavailable.")
 
-        logger.info(
-            "K-last mode: Using FlashInfer GDN prefill, decode and MTP (verify) kernels"
-        )
+        sm_major = torch.cuda.get_device_capability()[0]
+        self.use_state_pool = sm_major >= 10
+        # The SM120 chunked-prefill kernel only accepts float32 initial
+        # states; SM100 accepts the state-pool dtype directly.
+        self._prefill_needs_fp32_state = sm_major >= 12
+        self.supports_target_verify = sm_major in (9, 10)
+
+        if sm_major == 9 and self._prefill_fn is None:
+            raise RuntimeError("FlashInfer GDN prefill kernel is unavailable.")
+        if self._mtp_fn is None:
+            raise RuntimeError("FlashInfer GDN MTP (verify) kernel is unavailable.")
+
+        if self.use_state_pool and mtp_bf16_fn is not None:
+            # Adapt bf16 kernel to fp32 kernel interface so target_verify needs no branching.
+            def _mtp_bf16_adapted(
+                q,
+                k,
+                v,
+                initial_state,
+                initial_state_indices,
+                A_log,
+                a,
+                dt_bias,
+                b,
+                use_qk_l2norm=True,
+                **kw,
+            ):
+                out = mtp_bf16_fn(
+                    A_log=A_log.float(),
+                    a=a,
+                    dt_bias=dt_bias,
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
+                    q=q,
+                    k=k,
+                    v=v,
+                    b=b,
+                    initial_state_source=initial_state,
+                    initial_state_indices=initial_state_indices,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm,
+                    **kw,
+                )
+                return out, None
+
+            self._mtp_fn = _mtp_bf16_adapted
+
+        logger.info("Using FlashInfer GDN kernels")
 
     # ---- decode ----
 
@@ -128,13 +226,6 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        """K-last decode using FlashInfer pretranspose kernel (stock, no pool indexing).
-
-        TODO: Once FlashInfer PR#2521 is merged and released, switch back
-        to pool-indexed decode (passing state_indices directly) to avoid
-        the gather/scatter overhead (~7-9% decode regression).
-        https://github.com/flashinfer-ai/flashinfer/pull/2521
-        """
         batch_size = cache_indices.shape[0]
         num_heads = q.shape[2]
         head_k_dim = q.shape[3]
@@ -147,27 +238,39 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         a_fi = a.view(batch_size, 1, num_v_heads)
         b_fi = b.view(batch_size, 1, num_v_heads)
 
-        # Gather states from pool
-        state_batch = ssm_states[cache_indices]
+        if self.use_state_pool:
+            output_fi, _ = self._decode_fn(
+                q=query_fi,
+                k=key_fi,
+                v=value_fi,
+                state=None,
+                A_log=A_log.detach().float(),
+                a=a_fi,
+                dt_bias=dt_bias.detach(),
+                b=b_fi,
+                use_qk_l2norm=True,
+                initial_state=ssm_states,
+                initial_state_indices=cache_indices,
+            )
+        else:
+            # TODO: Once FlashInfer PR#2521 is merged for SM90, gather/scatter
+            # will no longer be needed here.
+            state_batch = ssm_states[cache_indices]
+            output_fi, new_state = self._decode_fn(
+                q=query_fi,
+                k=key_fi,
+                v=value_fi,
+                state=state_batch,
+                A_log=A_log.detach(),
+                a=a_fi,
+                dt_bias=dt_bias.detach(),
+                b=b_fi,
+                scale=None,
+                output=None,
+                use_qk_l2norm=True,
+            )
+            ssm_states[cache_indices] = new_state
 
-        output_fi, new_state = self._decode_fn(
-            q=query_fi,
-            k=key_fi,
-            v=value_fi,
-            state=state_batch,
-            A_log=A_log.detach(),
-            a=a_fi,
-            dt_bias=dt_bias.detach(),
-            b=b_fi,
-            scale=None,
-            output=None,
-            use_qk_l2norm=True,
-        )
-
-        # Scatter updated states back to pool
-        ssm_states[cache_indices] = new_state
-
-        # [bs, 1, HV, V] -> [1, bs, HV, V]
         return output_fi.view(1, batch_size, num_v_heads, head_v_dim)
 
     # ---- extend (prefill) ----
@@ -183,18 +286,13 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        state_checkpoint_cu_starts: Optional[torch.Tensor] = None,
+        num_state_checkpoints: int = 0,
+        state_checkpoint_every_n_tokens: int = 0,
         **kwargs,
     ) -> tuple:
-        """K-last chunked prefill using FlashInfer GDN prefill kernel.
+        from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 
-        The FlashInfer kernel natively supports K-last state layout [N, H, V, K].
-        q and k are L2-normalized before calling the kernel (the kernel is called
-        with ``use_qk_l2norm_in_kernel=False``).
-        """
-        from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
-
-        # q, k: [1, seq, H, K] -> [seq, H, K]
-        # v:    [1, seq, HV, V] -> [seq, HV, V]
         total_seq_len = q.shape[1]
         num_v_heads = v.shape[2]
         head_v_dim = v.shape[3]
@@ -207,18 +305,37 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         alpha_fi = torch.exp(g[0].to(torch.float32))
         beta_fi = beta[0].to(torch.float32)
 
-        cu_seqlens_fi = query_start_loc.to(torch.int64)
+        if self.use_state_pool:
+            # Negative indices (e.g. -1) are padding markers for slots not yet
+            # assigned to a real sequence; clamp them to 0 (the reserved dummy
+            # slot) so the FlashInfer kernel never reads out-of-bounds state.
+            ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
+            initial_state_fi = (
+                ssm_states[ssm_cache_indices].to(torch.float32)
+                if self._prefill_needs_fp32_state
+                else ssm_states[ssm_cache_indices].contiguous()
+            )
+            cu_seqlens = query_start_loc.to(torch.int64)  # kernel requires int64
+        else:
+            # SM90: preserve original negative-index handling (remap to last slot).
+            ssm_cache_indices = torch.where(
+                cache_indices >= 0,
+                cache_indices,
+                ssm_states.shape[0] - 1,
+            ).to(torch.int64)
+            # State must be float32; kernel requires int64 cu_seqlens.
+            initial_state_fi = ssm_states[ssm_cache_indices].to(torch.float32)
+            cu_seqlens = query_start_loc.to(torch.int64)
 
-        # Remap negative padding indices to sentinel slot
-        ssm_cache_indices = torch.where(
-            cache_indices >= 0,
-            cache_indices,
-            ssm_states.shape[0] - 1,
-        ).to(torch.int64)
-
-        # FlashInfer requires float32 initial state, K-last layout [B, HV, V, K]
-        initial_state_fi = ssm_states[ssm_cache_indices].to(torch.float32)
-
+        # Keep final state and checkpoints in the same kernel state dtype.
+        output_state_fi = torch.empty_like(initial_state_fi)
+        state_checkpoints = (
+            initial_state_fi.new_empty(
+                (num_state_checkpoints, *initial_state_fi.shape[1:])
+            )
+            if num_state_checkpoints > 0
+            else None
+        )
         output_fi, output_state_fi = self._prefill_fn(
             q=q_fi,
             k=k_fi,
@@ -228,8 +345,12 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             scale=None,
             initial_state=initial_state_fi,
             output_final_state=True,
-            cu_seqlens=cu_seqlens_fi,
+            cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=False,
+            output_state=output_state_fi,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=state_checkpoint_cu_starts,
+            checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
         )
 
         # Write back state to pool
@@ -242,20 +363,21 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # Output: [seq, HV, V] -> [1, seq, HV, V]
         core_attn_out = output_fi.view(1, total_seq_len, num_v_heads, head_v_dim)
 
-        # Return (output, last_recurrent_state, h) to match Triton kernel interface.
-        # h=None since FlashInfer doesn't provide intermediate states
-        # (prefix caching for K-last prefill is not supported).
-        return core_attn_out, None, None
+        # Match Triton's [1, checkpoints, H, V, K] intermediate-state layout.
+        h = state_checkpoints.unsqueeze(0) if state_checkpoints is not None else None
+        return core_attn_out, None, h
 
     # ---- target_verify (MTP) ----
 
     def target_verify(
         self,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
         *,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
@@ -266,18 +388,13 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         retrieve_parent_token: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        """K-last MTP verify using FlashInfer GDN MTP kernel.
-
-        Only supports topk=1 (retrieve_parent_token must be None).
-        """
+        # MTP verify using FlashInfer gated_delta_rule_mtp kernel (SM90 + SM100+).
         if retrieve_parent_token is not None:
             raise RuntimeError(
                 "FlashInfer GDN verify kernel only supports topk=1 "
                 "(retrieve_parent_token must be None)."
             )
 
-        # Recover batch_size and draft_token_num from g shape
-        # g: [1, seq_len, HV] where seq_len = batch_size * draft_token_num
         seq_len = q.shape[1]
         batch_size = query_start_loc.shape[0] - 1
         draft_token_num = seq_len // batch_size
@@ -287,28 +404,24 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         num_v_heads = v.shape[2]
         head_v_dim = v.shape[3]
 
-        # Reshape [1, seq, H, D] -> [B, T, H, D] for FlashInfer MTP
         query_mtp = q.view(batch_size, draft_token_num, num_heads, head_k_dim)
         key_mtp = k.view(batch_size, draft_token_num, num_heads, head_k_dim)
         value_mtp = v.view(batch_size, draft_token_num, num_v_heads, head_v_dim)
 
-        # a, b from g/beta: [1, seq, HV] -> [B, T, HV]
-        # But the MTP kernel expects raw a, b (pre-gating), not g, beta.
-        # We need to recover a and b from the gdn_backend caller.
-        # The caller passes them via **kwargs from the dispatcher.
-        a_raw = kwargs.get("a_raw")
-        b_raw = kwargs.get("b_raw")
-        A_log = kwargs.get("A_log")
-        dt_bias = kwargs.get("dt_bias")
-
-        if a_raw is None or b_raw is None or A_log is None or dt_bias is None:
+        if a is None or b is None or A_log is None or dt_bias is None:
             raise RuntimeError(
-                "FlashInfer GDN MTP kernel requires a_raw, b_raw, A_log, "
-                "dt_bias to be passed via kwargs."
+                "FlashInfer GDN MTP kernel requires a, b, A_log, dt_bias."
             )
 
-        a_mtp = a_raw.view(batch_size, draft_token_num, num_v_heads)
-        b_mtp = b_raw.view(batch_size, draft_token_num, num_v_heads)
+        a_mtp = a.view(batch_size, draft_token_num, num_v_heads)
+        b_mtp = b.view(batch_size, draft_token_num, num_v_heads)
+
+        intermediate_states_buffer_mtp = intermediate_states_buffer
+        if self.use_state_pool and intermediate_states_buffer is not None:
+            # The SM100 bf16 MTP kernel indexes this scratch buffer by the
+            # per-call batch id, while SGLang's speculative state cache is
+            # pool-scoped and may include an extra dummy slot.
+            intermediate_states_buffer_mtp = intermediate_states_buffer[:batch_size]
 
         output_fi, _ = self._mtp_fn(
             q=query_mtp,
@@ -322,10 +435,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             b=b_mtp,
             scale=None,
             output=None,
-            intermediate_states_buffer=intermediate_states_buffer,
+            intermediate_states_buffer=intermediate_states_buffer_mtp,
             disable_state_update=True,
             use_qk_l2norm=True,
         )
 
-        # [B, T, HV, V] -> [1, seq_len, HV, V]
         return output_fi.view(1, seq_len, num_v_heads, head_v_dim)
