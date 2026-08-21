@@ -7,12 +7,16 @@ from types import SimpleNamespace
 import pandas
 import pytest
 
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.run_eval import (
     validate_per_example_evidence_args,
     write_per_example_evidence,
 )
 from sglang.test.simple_eval_common import SingleEvalResult, aggregate_results
 from sglang.test.simple_eval_gpqa import GPQAEval
+
+
+register_cpu_ci(est_time=10, suite="base-b-test-cpu")
 
 
 class FakeSampler:
