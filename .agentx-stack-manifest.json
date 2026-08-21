@@ -136,7 +136,7 @@
     "parent_commit": "4cc13a84fb3bc6316ffc6d9752dd573a67cf1b44",
     "file": "python/sglang/srt/disaggregation/decode.py",
     "change": "For decode-cache-off paged PD allocation, stage the already-selected free-page IDs to pinned host memory before alloc_extend, while preserving allocation, request mapping, release-page, and merge ordering. Merge and unsupported paths retain the existing materialization.",
-    "targeted_validation": "CMH job 3199523: 4096-token/page64 repeated alloc/free/merge page IDs, request mapping, and free-list exact; 93.75% fast-path coverage; stage 0.071624 ms/admission; concurrent graph -0.000071 ms; trace-reweighted mechanism saving estimate 0.651473 ms/step. Production validation is pending."
+    "targeted_validation": "CMH job 3199523: 4096-token/page64 repeated alloc/free/merge page IDs, request mapping, and free-list exact; 93.75% fast-path coverage; stage 0.071624 ms/admission; concurrent graph -0.000071 ms; trace-reweighted mechanism saving estimate 0.651473 ms/step. Direct-code job 3199656 exposed and rejected a 55 ms cold int64-to-int32 GPU conversion; the final implementation keeps native int64 D2H and converts only 64 host page IDs. Production validation is pending."
   },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",

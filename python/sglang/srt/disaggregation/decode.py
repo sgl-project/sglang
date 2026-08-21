@@ -438,14 +438,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self._page_index_copy_stream = copy_stream
         selected_pages = allocator.free_pages[:num_pages]
         host_pages = torch.empty(
-            num_pages, dtype=torch.int32, device="cpu", pin_memory=True
+            num_pages, dtype=torch.int64, device="cpu", pin_memory=True
         )
         selected_pages.record_stream(copy_stream)
         with torch.cuda.stream(copy_stream):
-            device_pages = selected_pages.to(dtype=torch.int32)
-            host_pages.copy_(device_pages, non_blocking=True)
+            host_pages.copy_(selected_pages, non_blocking=True)
         copy_stream.synchronize()
-        return host_pages.numpy()
+        return host_pages.numpy().astype(np.int32)
 
     def _swa_tail_len(self, seq_len: int) -> int:
         if not self._uses_swa_tail_prealloc() or seq_len <= 0:
