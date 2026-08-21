@@ -107,12 +107,18 @@ export const config = {
             "--speculative-algorithm DSPARK",
             "--speculative-draft-model-path RadixArk/Qwen3.8-27B-DSpark",
             "--speculative-draft-attention-backend flashinfer",
-            // Measured on the 5090: bf16 state serves at 0.90, fp32 needs
-            // 0.92 — the opposite correction to EAGLE's (see above).
+            // Measured on the 5090 at commit 1cf2b8c, the build the Install
+            // accordion pins for this card: fp32 serves at 0.89, bf16 at 0.88.
+            // Both are lower than the pins this recipe carried when it was
+            // measured on an older build, because a draft model plus the
+            // automatic prefill CUDA-graph capture no longer fit at 0.90+ —
+            // the same reason DFLASH2 sits at 0.88/0.895. EAGLE and no-spec are
+            // unaffected: replayssm keeps EAGLE's state pool tiny and no-spec
+            // loads no draft weights, so both still serve at their old pins.
             ...(sel.hw === "rtx5090"
               ? [sel.ssmDtype === "float32"
-                  ? "--mem-fraction-static 0.92"
-                  : "--mem-fraction-static 0.90"]
+                  ? "--mem-fraction-static 0.89"
+                  : "--mem-fraction-static 0.88"]
               : []),
           ],
         },

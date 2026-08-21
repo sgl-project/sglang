@@ -21,9 +21,9 @@ pip install --upgrade pip
 pip install uv
 uv pip install sglang
 
-# For the DFLASH2 cells only — DFlash2 selector support is newer than the
-# latest release, so build from the commit those cells were validated on
-# instead of the line above:
+# For the DFLASH2 cells, and for every RTX 5090 cell — those pins were
+# measured on the commit below, and DFlash2 support is newer than the latest
+# release. Build from it instead of the line above:
 # git clone https://github.com/sgl-project/sglang.git && cd sglang
 # git checkout 1cf2b8c54d81802abc15dcf23a29b9cc687bc01e   # PR #35496
 # uv pip install -e "python[all]"
@@ -38,8 +38,9 @@ Then run the **Python** output of the command panel below in that environment.
 ```bash Command
 docker pull lmsysorg/sglang:qwen38-27b
 
-# For the DFLASH2 cells only — that tag predates DFlash2 selector support.
-# Build the image from the commit those cells were validated on instead:
+# For the DFLASH2 cells, and for every RTX 5090 cell — that tag predates
+# DFlash2 support, and the 5090 pins were measured on the commit below.
+# Build the image from it instead:
 # git clone https://github.com/sgl-project/sglang.git && cd sglang
 # git checkout 1cf2b8c54d81802abc15dcf23a29b9cc687bc01e   # PR #35496
 # docker build -t sglang:dflash2 -f docker/Dockerfile .
@@ -60,8 +61,14 @@ than the pinned `lmsysorg/sglang:qwen38-27b` tag and than the latest PyPI
 release. A build without #35496 fails on the NVFP4 cells at boot with `requires
 a dense FP16/BF16/FP32 target lm_head`. The DFLASH2 pins on this page were
 measured on `1cf2b8c` exactly, which is why both install paths above check that
-commit out rather than tracking a moving branch. Every other recipe on this
-page — no speculation, MTP, DSpark — runs on the pinned tag as written.
+commit out rather than tracking a moving branch.
+
+**The RTX 5090 recipes are pinned to that same commit**, DSpark included. A
+draft model plus the automatic prefill CUDA-graph capture no longer fit at the
+mem-fractions the older builds allowed, so DSpark on this card serves at 0.89
+(fp32) and 0.88 (bf16) rather than 0.92 / 0.90. EAGLE, MTP and no-speculation
+keep their pins on every card, and the other platforms — H200, RTX PRO 6000,
+DGX Spark, GB300 — run the pinned tag as written.
 </Warning>
 
 </Accordion>
