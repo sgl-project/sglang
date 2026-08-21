@@ -72,7 +72,9 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
             },
         )
         Image.MAX_IMAGE_PIXELS = None
-        self.image_size = hf_config.image_size
+        self.image_size = getattr(
+            hf_config, "image_size", getattr(hf_config, "force_image_size", None)
+        )
         self.VIDEO_CONTEXT_TOKEN = hf_config.video_context_token
         self.IMG_CONTEXT_TOKEN = hf_config.img_context_token
         self.IMG_START_TOKEN = hf_config.img_start_token
