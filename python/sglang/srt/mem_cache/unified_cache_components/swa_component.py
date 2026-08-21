@@ -110,7 +110,7 @@ class SWAComponent(TreeComponent):
         allocator = self.cache.token_to_kv_pool_allocator
         swa_value = self._translate_full_to_swa(incoming_full_value)
         allocator.set_full_to_swa_mapping(full_value, swa_value)
-        allocator.full_to_swa_index_mapping[incoming_full_value.to(torch.int64)] = 0
+        allocator.clear_full_to_swa_mapping(incoming_full_value)
         allocator.full_attn_allocator.free(incoming_full_value)
         self._restore_device_value(node, swa_value)
 
