@@ -19,6 +19,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt import runtime_context as rc
 from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     GenerateReqInput,
@@ -56,6 +57,7 @@ _EXACT_VAL_ROWS = [None, [-0.5, -2.5], [-0.25, -1.5], [-0.125, -4.0]]
 class _TokenizerManagerStub:
     """Borrow the real logprob meta_info methods without a full manager."""
 
+    convert_logprob_style = TokenizerManager.convert_logprob_style
     add_logprob_to_meta_info = TokenizerManager.add_logprob_to_meta_info
     detokenize_logprob_tokens = TokenizerManager.detokenize_logprob_tokens
     detokenize_top_logprobs_tokens = TokenizerManager.detokenize_top_logprobs_tokens
@@ -318,9 +320,8 @@ class TestB64MetaInfo(CustomTestCase):
 
 
 def _make_logprob_processor() -> SchedulerLogprobResultProcessor:
-    # The processor only reads enable_mis and vocab_size from these.
+    # enable_mis comes from the published exec bag, not from here; see setUp.
     return SchedulerLogprobResultProcessor(
-        server_args=SimpleNamespace(enable_mis=False),
         model_config=SimpleNamespace(vocab_size=1_000_000),
     )
 
@@ -340,6 +341,14 @@ _SCHED_IDX_ROWS = [[11, 22], [33, 44], [55, 66], [77, 88], [99, 100]]
 
 class TestSchedulerFlatAssembly(CustomTestCase):
     """Scheduler-side flat assembly in the logprob result processor."""
+
+    def setUp(self):
+        super().setUp()
+        self._server_args_override = rc.get_context().override_server_args()
+        self._server_args_override.install()
+
+    def tearDown(self):
+        self._server_args_override.restore()
 
     def _make_req(self, flat: bool, num_tokens: int = 5) -> Req:
         return Req(
@@ -533,6 +542,32 @@ class TestMetaInfoFromSchedulerArrays(CustomTestCase):
         self.assertIs(
             again["input_top_logprobs_val_flat"], first["input_top_logprobs_val_flat"]
         )
+
+
+class TestTokenizerManagerLogprobs(CustomTestCase):
+    def test_output_logprobs_without_input_logprobs(self):
+        state = _make_state(return_logprob=True, top_logprobs_num=0)
+        recv_obj = SimpleNamespace(
+            input_token_logprobs_val=None,
+            input_token_logprobs_idx=None,
+            output_token_logprobs_val=[[-0.25]],
+            output_token_logprobs_idx=[[42]],
+        )
+        meta_info = {}
+
+        _TokenizerManagerStub().convert_logprob_style(
+            meta_info,
+            state,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            return_text_in_logprobs=False,
+            recv_obj=recv_obj,
+            recv_obj_index=0,
+        )
+
+        self.assertEqual(meta_info["input_token_logprobs"], [])
+        self.assertEqual(meta_info["output_token_logprobs"], [(-0.25, 42, None)])
+        self.assertEqual(meta_info["output_token_logprobs_length"], 1)
 
 
 def _make_batch_token_id_output(**overrides) -> BatchTokenIDOutput:

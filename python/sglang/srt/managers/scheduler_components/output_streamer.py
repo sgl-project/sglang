@@ -503,7 +503,9 @@ class _GenerationStreamAccumulator:
                 self.input_token_ids_logprobs_idx.append([])
 
             if req.return_logprob:
-                logprob_end = max(len(output_ids_), 1)
+                logprob_end = (
+                    len(output_ids_) if req.is_retracted else max(len(output_ids_), 1)
+                )
                 self.output_token_logprobs_val.append(
                     req.logprob.output_token_logprobs_val[
                         send_output_token_logprobs_offset:logprob_end
@@ -564,11 +566,19 @@ class _GenerationStreamAccumulator:
 
         if self.return_hidden_states:
             if req.return_hidden_states:
-                # Mirror output_ids_through_stop: spec verify steps can overshoot finished_len.
-                hs = req.hidden_states
-                if req.finished_len is not None:
-                    hs = hs[: req.finished_len]
-                self.output_hidden_states.append(hs)
+                if req.return_hidden_states == "last":
+                    # Collection keeps this list bounded to the final valid
+                    # accepted token, including speculative verify overshoot.
+                    self.output_hidden_states.append(
+                        req.hidden_states[-1] if req.hidden_states else None
+                    )
+                else:
+                    # Mirror output_ids_through_stop: spec verify steps can
+                    # overshoot finished_len.
+                    hs = req.hidden_states
+                    if req.finished_len is not None:
+                        hs = hs[: req.finished_len]
+                    self.output_hidden_states.append(hs)
             else:
                 self.output_hidden_states.append(None)
         if self.return_routed_experts:

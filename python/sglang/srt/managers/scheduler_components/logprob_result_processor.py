@@ -14,17 +14,13 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import build_flat_input_top_logprobs_arrays
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.server_args import (
-    MIS_DELIMITER_TOKEN_ID,
-    ServerArgs,
-)
+from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerLogprobResultProcessor:
-    server_args: ServerArgs
     model_config: ModelConfig
 
     def _process_input_token_logprobs(
@@ -331,7 +327,13 @@ class SchedulerLogprobResultProcessor:
         else:
             self._initialize_empty_logprob_containers(req)
 
-        if req.logprob.top_logprobs_num > 0:
+        if (
+            req.logprob.top_logprobs_num > 0
+            and output.next_token_top_logprobs_val is not None
+        ):
+            # Guarded like next_token_logprobs above: a backend may leave the
+            # top-logprob fields unset even for a request that asked for them
+            # (indexing None raises TypeError).
             req.logprob.output_top_logprobs_val.append(
                 output.next_token_top_logprobs_val[i]
             )

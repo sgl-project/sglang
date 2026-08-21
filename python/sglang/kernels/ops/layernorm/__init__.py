@@ -138,7 +138,7 @@ class RMSNormOp(BaseFusedOp):
         rmsnorm2d_fwd(out, input, weight, eps)
         return out
 
-    def forward_npu(
+    def forward_torch_npu(
         self,
         input: torch.Tensor,
         weight: torch.Tensor,
@@ -253,7 +253,7 @@ class FusedAddRMSNormOp(BaseFusedOp):
         input.copy_(out)
         residual.copy_(residual_out)
 
-    def forward_npu(
+    def forward_torch_npu(
         self,
         input: torch.Tensor,
         residual: torch.Tensor,
@@ -344,7 +344,7 @@ class GemmaRMSNormOp(BaseFusedOp):
         out.copy_(result)
         return out
 
-    def forward_npu(
+    def forward_torch_npu(
         self,
         input: torch.Tensor,
         weight: torch.Tensor,
