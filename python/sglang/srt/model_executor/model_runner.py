@@ -807,13 +807,12 @@ class ModelRunner:
         return value
 
     def account_preloaded_weights(self, preloaded_weights_bytes: int) -> None:
-        # Rank-local correction must happen before the distributed MIN. Skip
-        # the extra reduction when no loader reported resident weight memory.
+        # Dist-init sampled B after the daemon already held weights, so slack
+        # (B * (1 - mem_fraction_static)) is too small. Add those bytes back
+        # onto the existing MIN'd baseline. Skip when nothing was preloaded.
         if preloaded_weights_bytes == 0:
             return
-        self.pre_model_load_memory = bootstrap.reduce_min_gpu_memory(
-            self.local_pre_model_load_memory + preloaded_weights_bytes / (1 << 30)
-        )
+        self.pre_model_load_memory += preloaded_weights_bytes / (1 << 30)
 
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
@@ -1059,7 +1058,6 @@ class ModelRunner:
         self.pp_group = result.pp_group
         self.attention_tp_group = result.attention_tp_group
         self.pre_model_load_memory = result.pre_model_load_memory
-        self.local_pre_model_load_memory = result.local_pre_model_load_memory
 
     def init_shared_mooncake_transfer_engine(self):
         maybe_init_shared_mooncake_transfer_engine(
