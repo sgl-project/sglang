@@ -270,9 +270,11 @@ def fused_experts(
         moe_runner_config.num_experts is None
         or moe_runner_config.num_experts != moe_runner_config.num_local_experts
     )
-    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.distributed import get_tp_group, model_parallel_is_initialized
 
-    comm = get_tp_group().torch_symm_mem_comm
+    comm = (
+        get_tp_group().torch_symm_mem_comm if model_parallel_is_initialized() else None
+    )
     fused_topk_reduce_rs = comm is not None and comm.use_cp
     if fused_topk_reduce_rs:
         return outplace_fused_experts(
