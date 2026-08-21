@@ -190,6 +190,20 @@ class SchedulerBatchResultProcessor:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
+    @staticmethod
+    def _finalize_sampling_mask_output(result: GenerationBatchResult) -> None:
+        logits_output = result.logits_output
+        if logits_output is None:
+            return
+        pending = logits_output.next_token_sampling_mask_output
+        if pending is None:
+            return
+        (
+            logits_output.next_token_sampling_mask_idx,
+            logits_output.next_token_sampling_logprobs,
+        ) = pending.finalize()
+        logits_output.next_token_sampling_mask_output = None
+
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
@@ -207,6 +221,7 @@ class SchedulerBatchResultProcessor:
             if result.indexer_topk_output is not None:
                 result.indexer_topk_output.finalize()
                 result.indexer_topk_output = None
+            self._finalize_sampling_mask_output(result)
 
             (
                 logits_output,
@@ -815,6 +830,7 @@ class SchedulerBatchResultProcessor:
         if result.indexer_topk_output is not None:
             result.indexer_topk_output.finalize()
             result.indexer_topk_output = None
+        self._finalize_sampling_mask_output(result)
 
         logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
@@ -879,9 +895,22 @@ class SchedulerBatchResultProcessor:
                 )
 
             if req.return_sampling_mask:
-                # return_sampling_mask + speculative decoding is rejected at
-                # request entry, so this remains one support mask per token.
-                self.add_sampling_mask_return_values(i, req, logits_output)
+                # DFlash-family workers emit one sampling support per accepted
+                # token, so this remains one support mask per token.
+                num_mask_tokens = new_accept_len
+                if req.finished_len is not None:
+                    previous_output_len = len(req.output_ids) - new_accept_len
+                    num_mask_tokens = min(
+                        num_mask_tokens,
+                        max(0, req.finished_len - previous_output_len),
+                    )
+                self.add_sampling_mask_return_values(
+                    i,
+                    req,
+                    logits_output,
+                    num_tokens=num_mask_tokens,
+                    speculative=is_spec,
+                )
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 # hidden_states is [bs * stride, hidden_dim], one row per emitted
@@ -999,14 +1028,25 @@ class SchedulerBatchResultProcessor:
         i: int,
         req: Req,
         output: LogitsProcessorOutput,
+        *,
+        num_tokens: int = 1,
+        speculative: bool = False,
     ) -> None:
         """Attach sparse sampling support metadata to the return values."""
         mask = output.next_token_sampling_mask_idx
         logprobs = output.next_token_sampling_logprobs
-        req.output_token_sampling_mask.append(None if mask is None else mask[i])
-        req.output_token_sampling_logprobs.append(
-            None if logprobs is None else logprobs[i]
-        )
+        if speculative:
+            req.output_token_sampling_mask.extend(
+                [None] * num_tokens if mask is None else mask[i][:num_tokens]
+            )
+            req.output_token_sampling_logprobs.extend(
+                [None] * num_tokens if logprobs is None else logprobs[i][:num_tokens]
+            )
+        else:
+            req.output_token_sampling_mask.append(None if mask is None else mask[i])
+            req.output_token_sampling_logprobs.append(
+                None if logprobs is None else logprobs[i]
+            )
 
     def _handle_finish_state_updated_req(
         self,

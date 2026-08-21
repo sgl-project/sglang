@@ -910,7 +910,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
             dtype=torch.float32,
         )
 
-    target_probs = build_dflash_verify_target_probs(
+    target_probs = build_speculative_verify_target_probs(
         next_token_logits=next_token_logits,
         sampling_info=sampling_info,
         draft_token_num=draft_token_num,
@@ -960,7 +960,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     return correct_len, bonus
 
 
-def build_dflash_verify_target_probs(
+def build_speculative_verify_target_probs(
     *,
     next_token_logits: torch.Tensor,
     sampling_info: Any,
