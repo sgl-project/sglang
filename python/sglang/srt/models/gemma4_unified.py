@@ -190,7 +190,9 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
         )
 
         text_tie = getattr(text_config, "tie_word_embeddings", True)
-        if self.pp_group.world_size == 1 and text_tie:
+        # The tower-based parent's forward() reads lm_head_is_tied.
+        self.lm_head_is_tied = self.pp_group.world_size == 1 and text_tie
+        if self.lm_head_is_tied:
             self.lm_head = self.language_model.embed_tokens
         elif self.pp_group.is_last_rank:
             self.lm_head = ParallelLMHead(
