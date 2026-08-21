@@ -1134,6 +1134,11 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
                 "-c",
                 """
 import builtins
+import sys
+from unittest.mock import MagicMock
+
+for module in ("sgl_kernel", "sgl_kernel.quantization", "sgl_kernel.scalar_type"):
+    sys.modules[module] = MagicMock()
 
 original_import = builtins.__import__
 
