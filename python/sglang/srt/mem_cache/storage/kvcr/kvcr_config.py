@@ -88,9 +88,10 @@ class KVCRBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
         - ``control_port = 0`` binds an OS-assigned port that only exists inside
           the scheduler process, so there is nothing to register; and it is not
           stable across a restart even if there were.
-        - ``control_host = "0.0.0.0"`` (or ``"::"``) is a bind wildcard, not an
-          address a peer can connect to, so it needs an explicit
-          ``control_advertise_host`` to name the interface peers should use.
+        - ``control_host`` is a bind address -- commonly the ``"0.0.0.0"``
+          wildcard, which no peer can connect to -- so it cannot double as the
+          advertised address. ``control_advertise_host`` names the interface
+          peers should dial, and remote hints require it explicitly.
 
         Neither breaks startup. The worker comes up, offloads, gets indexed by
         the router, and receives hints -- every fetch just quietly fails to
@@ -116,13 +117,13 @@ class KVCRBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
                 "(each scheduler offsets it by its own rank, so one base port "
                 "per engine is enough)."
             )
-        advertise = self.control_advertise_host or self.control_host
-        if advertise in _UNROUTABLE_HOSTS:
+        advertise = self.control_advertise_host
+        if not advertise or advertise in _UNROUTABLE_HOSTS:
             raise ValueError(
-                f"KVCR enable_remote_hint cannot advertise {advertise!r}: it is "
-                "a bind wildcard, not an address a peer can dial. Set "
-                "control_advertise_host (or a non-wildcard control_host) in "
-                "--hicache-storage-backend-extra-config."
+                f"KVCR enable_remote_hint cannot advertise {advertise!r}. Set "
+                "control_advertise_host to an address peers can dial in "
+                "--hicache-storage-backend-extra-config; control_host is the "
+                "bind address and is not a substitute."
             )
 
     @classmethod

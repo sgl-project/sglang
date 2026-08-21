@@ -36,19 +36,32 @@ class RemoteHintEndpointValidationTest(unittest.TestCase):
         self.assertIn("control_port", str(caught.exception))
 
     def test_wildcard_advertise_host_with_remote_hint_is_refused(self):
-        """A bind wildcard is not an address; a peer handed it dials itself.
-
-        Covers the case where ``control_advertise_host`` is left unset and the
-        wildcard ``control_host`` default is what would be advertised.
-        """
+        """A bind wildcard is not an address; a peer handed it dials itself."""
         for host in ("0.0.0.0", "::"):
             with self.subTest(host=host):
+                with self.assertRaises(ValueError) as caught:
+                    KVCRBackendConfig(**{**_DIALABLE, "control_advertise_host": host})
+                self.assertIn("control_advertise_host", str(caught.exception))
+
+    def test_missing_advertise_host_is_refused_even_when_the_bind_host_is_routable(
+        self,
+    ):
+        """``control_host`` is where to bind, not what to tell peers.
+
+        Falling back to it happens to work when an operator binds one routable
+        address, and silently advertises the wrong interface as soon as they
+        bind more than one. Requiring the advertise host makes the two
+        independent, and keeps this in step with the dynamo bridge, which
+        advertises the same field.
+        """
+        for host in (None, ""):
+            with self.subTest(control_advertise_host=host):
                 with self.assertRaises(ValueError) as caught:
                     KVCRBackendConfig(
                         **{
                             **_DIALABLE,
-                            "control_host": host,
-                            "control_advertise_host": None,
+                            "control_host": "10.0.0.7",
+                            "control_advertise_host": host,
                         }
                     )
                 self.assertIn("control_advertise_host", str(caught.exception))
