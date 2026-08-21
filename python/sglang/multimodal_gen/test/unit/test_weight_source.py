@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import pytest
 
-from sglang.multimodal_gen.runtime.weight_source import (
+from sglang.multimodal_gen.runtime.weights.source import (
     parse_weight_source,
     resolve_weight,
     resolve_weight_inventory,
@@ -62,7 +62,7 @@ def test_resolve_remote_inventory_pins_revision_and_filters_subfolder():
     )
 
     with patch(
-        "sglang.multimodal_gen.runtime.weight_source.HfApi.model_info",
+        "sglang.multimodal_gen.runtime.weights.source.HfApi.model_info",
         return_value=model_info,
     ):
         inventory = resolve_weight_inventory(source)

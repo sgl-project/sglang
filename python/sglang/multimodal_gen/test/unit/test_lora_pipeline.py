@@ -161,7 +161,7 @@ def test_lora_tree_url_selects_one_pinned_weight(tmp_path):
     )
     with (
         patch(
-            "sglang.multimodal_gen.runtime.weight_source.HfApi.model_info",
+            "sglang.multimodal_gen.runtime.weights.source.HfApi.model_info",
             return_value=model_info,
         ),
         patch(download_target, return_value=str(tmp_path)) as download,
@@ -196,7 +196,7 @@ def test_lora_exact_file_url_needs_no_weight_name(tmp_path):
     )
     with (
         patch(
-            "sglang.multimodal_gen.runtime.weight_source.HfApi.model_info",
+            "sglang.multimodal_gen.runtime.weights.source.HfApi.model_info",
             return_value=model_info,
         ),
         patch(download_target, return_value=str(tmp_path)) as download,

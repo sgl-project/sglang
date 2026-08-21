@@ -52,7 +52,7 @@ from sglang.multimodal_gen.runtime.utils.model_overlay import (
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     normalize_flat_modelopt_quant_config,
 )
-from sglang.multimodal_gen.runtime.weight_source import resolve_weight
+from sglang.multimodal_gen.runtime.weights.source import resolve_weight
 from sglang.srt.environ import envs
 from sglang.srt.utils.hf_transformers import check_gguf_file
 from sglang.utils import is_in_ci
