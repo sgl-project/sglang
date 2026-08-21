@@ -250,8 +250,8 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
 
 
 if _is_npu:
-    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
-        split_qkvgate_gemma_rmsnorm_rope,
+    from sgl_kernel_npu.norm.split_qkv_rmsnorm_mrope import (
+        triton_split_qkv_rmsnorm_mrope,
     )
 
 
@@ -1158,21 +1158,23 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
-        # Calculate first full attention layer ID based on config
-        if self.attn.layer_id == (self.config.full_attention_interval - 1):
-            self.rotary_emb.get_cos_sin_with_position(positions)
+        cos_sin = self.rotary_emb.cos_sin_cache[positions]
+        if cos_sin.device != qkv.device or cos_sin.dtype != qkv.dtype:
+            cos_sin = cos_sin.to(device=qkv.device, dtype=qkv.dtype)
 
-        q, k, v, gate = split_qkvgate_gemma_rmsnorm_rope(
-            qkv,
-            self.rotary_emb.position_sin,
-            self.rotary_emb.position_cos,
-            self.q_size,
-            self.kv_size,
-            self.head_dim,
-            int(self.head_dim * self.partial_rotary_factor),
+        q, k, v, gate = triton_split_qkv_rmsnorm_mrope(
+            qkv=qkv,
+            q_weight=self.q_norm.gemma_weight,
+            k_weight=self.k_norm.gemma_weight,
+            cos_sin=cos_sin,
+            num_q_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_dim,
             eps=self.q_norm.variance_epsilon,
-            q_weight=self.q_norm.weight,
-            k_weight=self.k_norm.weight,
+            mrope_section=self.rotary_emb.mrope_section,
+            is_interleaved=self.rotary_emb.mrope_interleaved,
+            rope_dim=self.rotary_emb.rotary_dim,
+            has_gate=self.attn_output_gate,
         )
         return q, k, v, gate
 
@@ -1193,11 +1195,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
             )
-        elif (
-            not _is_npu
-            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-            or not self.attn_output_gate
-        ):
+        elif not _is_npu or not self.attn_output_gate:
             q, k, v, gate = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
