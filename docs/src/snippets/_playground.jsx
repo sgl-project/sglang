@@ -826,6 +826,7 @@ export const Playground = ({ config }) => {
               || head === "--speculative-num-draft-tokens"
               || head === "--speculative-dspark-block-size"
               || head === "--enable-linear-replayssm-spec"
+              || head === "--linear-replayssm-cache-len"
               || head === "--speculative-ngram-max-bfs-breadth";
         });
         if (baseSpec.length === 0) return "off";
@@ -852,6 +853,7 @@ export const Playground = ({ config }) => {
           "--speculative-algorithm", "--speculative-num-steps",
           "--speculative-eagle-topk", "--speculative-num-draft-tokens",
           "--speculative-dspark-block-size", "--enable-linear-replayssm-spec",
+          "--linear-replayssm-cache-len",
           "--speculative-ngram-max-bfs-breadth",
         ]);
         const preset = (fc.options || []).find((p) => p.id === value);
