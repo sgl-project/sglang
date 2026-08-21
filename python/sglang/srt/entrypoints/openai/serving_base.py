@@ -209,7 +209,12 @@ class OpenAIServingBase(ABC):
             param=param,
             code=status_code,
         )
-        return ORJSONResponse(content=error.model_dump(), status_code=status_code)
+        # Wrap in an "error" envelope to match the OpenAI error schema, the
+        # streaming path below, and the Rust router. Clients built on the
+        # official OpenAI SDK read the message out of response["error"].
+        return ORJSONResponse(
+            content={"error": error.model_dump()}, status_code=status_code
+        )
 
     def create_streaming_error_response(
         self,
