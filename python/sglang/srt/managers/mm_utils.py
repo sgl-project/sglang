@@ -10,7 +10,7 @@ import sys
 from abc import abstractmethod
 from collections import defaultdict
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -38,6 +38,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.multimodal.transport import (
+    TensorTransportMode,
+    determine_tensor_transport_mode,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_server_args,
@@ -47,30 +51,10 @@ from sglang.srt.utils import flatten_nested_list, print_warning_once
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
 
-if TYPE_CHECKING:
-    from sglang.srt.server_args import ServerArgs
-
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
 # propagation that can cause some log messages (like 'server is fired up') to not appear
 # in the console when multimodal support is enabled.
-
-# TODO(mick): nccl
-# cuda_ipc: for intranode tensor sharing
-TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
-
-
-def determine_tensor_transport_mode(
-    server_args: "ServerArgs",
-) -> TensorTransportMode:
-    """Select tensor transport based on whether the deployment spans nodes."""
-    # dist_init_addr is a process-group rendezvous endpoint, not a topology
-    # signal. Single-node multi-GPU TP may set it as well.
-    if server_args.nnodes > 1:
-        # CUDA IPC and POSIX shared memory are local to one node.
-        return "default"
-    return "cuda_ipc"
-
 
 _GPU_FEATURE_BUFFER: Optional[torch.Tensor] = None
 _BUFFER_OFFSET = 0

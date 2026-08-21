@@ -31,10 +31,10 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
-from sglang.srt.managers.mm_utils import determine_tensor_transport_mode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Modality, Req
 from sglang.srt.multimodal.cache import media_preprocess_kwargs
+from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.runtime_context import get_disagg, get_exec, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData
