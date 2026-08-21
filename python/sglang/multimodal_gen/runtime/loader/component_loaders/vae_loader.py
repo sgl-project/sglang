@@ -133,8 +133,11 @@ class VAELoader(ComponentLoader):
     def customized_load_kwargs_for_component(
         self, server_args: ServerArgs, component_name: str
     ) -> dict[str, bool]:
-        if current_platform.is_mps() and self._is_component_set_as_layerwise_load(
-            server_args, component_name
+        if (
+            current_platform.is_mps()
+            and server_args.should_configure_layerwise_offload_for_lazy_component(
+                component_name
+            )
         ):
             logger.info(
                 "Loading %s on CPU first for MPS layerwise offload", component_name

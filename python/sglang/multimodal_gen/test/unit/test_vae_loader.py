@@ -33,6 +33,7 @@ class _FakeServerArgs:
         self.model_paths = {}
         self.revision = "test-revision"
         self.trust_remote_code = True
+        self.layerwise_components = set()
 
     def resolve_component_attention_backend(self, _component_name):
         return None, None
@@ -40,8 +41,26 @@ class _FakeServerArgs:
     def should_start_component_on_cpu(self, _component_name):
         return False
 
+    def should_configure_layerwise_offload_for_lazy_component(self, component_name):
+        return component_name in self.layerwise_components
+
 
 class TestVAELoader(unittest.TestCase):
+    def test_mps_layerwise_load_uses_residency_api(self):
+        loader = vae_loader.VAELoader()
+        server_args = _FakeServerArgs(QwenImagePipelineConfig())
+        server_args.layerwise_components.add("vae")
+
+        with patch.object(vae_loader.current_platform, "is_mps", return_value=True):
+            self.assertEqual(
+                loader.customized_load_kwargs_for_component(server_args, "vae"),
+                {"cpu_offload_flag": True},
+            )
+            self.assertEqual(
+                loader.customized_load_kwargs_for_component(server_args, "audio_vae"),
+                {},
+            )
+
     def test_quantized_vae_admission_leaves_plain_configs_unchanged(self):
         _require_native_loader_for_quantized_vae(
             {"_class_name": "AutoencoderKL"}, "vae"
