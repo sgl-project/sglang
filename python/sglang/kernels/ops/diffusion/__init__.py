@@ -460,6 +460,11 @@ _EXPORTS: dict[str, str] = {
     "mark_ltx2_rms_norm_modulate_site": "sites.ltx2_rmsnorm_modulate_site",
     "mount_ltx2_rms_norm_modulate": "sites.ltx2_rmsnorm_modulate_site",
     "unmount_ltx2_rms_norm_modulate": "sites.ltx2_rmsnorm_modulate_site",
+    "mark_sana_video_linear_attention_site": "sites.sana_video_linear_attention_site",
+    "mount_sana_video_linear_attention": "sites.sana_video_linear_attention_site",
+    "sana_video_linear_attention_active": "sites.sana_video_linear_attention_site",
+    "try_sana_video_linear_attention": "sites.sana_video_linear_attention_site",
+    "unmount_sana_video_linear_attention": "sites.sana_video_linear_attention_site",
     "QualityGatedFusion": "sites.quality_gate",
     # JIT C++/CUDA extensions (not kernels, not in the registry)
     "interpolate": "ext.hunyuan3d_rasterizer",
