@@ -1,31 +1,34 @@
-"""
-QwenImage executor for SGLang Diffusion ComfyUI integration.
-"""
-
-import torch
-
-try:
-    from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-    from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
-except ImportError:
-    print(
-        "Error: sglang.multimodal_gen is not installed. Please install it using 'pip install sglang[diffusion]'"
-    )
+"""Qwen-Image adapters for the ComfyUI DiT-forward contract."""
 
 import comfy.ldm.common_dit
 
+from .adapter import ComfyUIModelAdapter, PackedForward
 from .base import SGLDiffusionExecutor
 
 
-class QwenImageExecutor(SGLDiffusionExecutor):
-    """Executor for QwenImage models in ComfyUI."""
+class QwenImageAdapter(ComfyUIModelAdapter):
+    model_types = ("qwen_image",)
+    pipeline_class_name = "QwenImagePipeline"
+    patch_size = 2
 
-    def __init__(self, generator, model_path, model, config):
-        super().__init__(generator, model_path, model, config)
-        self.patch_size = 2
+    def pack(self, x, timestep, context, **kwargs) -> PackedForward:
+        latents, orig_shape = self._pack_latents(x)
+        return PackedForward(
+            latents=latents,
+            timesteps=timestep * 1000.0,
+            prompt_embeds=[context],
+            height=orig_shape[-2] * 8,
+            width=orig_shape[-1] * 8,
+            unpack_ctx={"num_embeds": latents.shape[1], "orig_shape": orig_shape, "x": x},
+        )
+
+    def unpack(self, noise_pred, packed, x):
+        ctx = packed.unpack_ctx
+        return self._unpack_latents(
+            noise_pred, ctx["num_embeds"], ctx["orig_shape"], ctx["x"]
+        )
 
     def _pack_latents(self, x):
-        """Process hidden states for QwenImage model."""
         latents = comfy.ldm.common_dit.pad_to_patch_size(
             x, (1, self.patch_size, self.patch_size)
         )
@@ -47,8 +50,8 @@ class QwenImageExecutor(SGLDiffusionExecutor):
         )
         return latents, orig_shape
 
-    def _unpack_latents(self, latents, num_embeds, orig_shape, x):
-        """Unpack hidden states from packed format to standard format."""
+    @staticmethod
+    def _unpack_latents(latents, num_embeds, orig_shape, x):
         latents = latents[:, :num_embeds].view(
             orig_shape[0],
             orig_shape[-3],
@@ -59,57 +62,14 @@ class QwenImageExecutor(SGLDiffusionExecutor):
             2,
         )
         latents = latents.permute(0, 4, 1, 2, 5, 3, 6)
-        latents = latents.reshape(orig_shape)[:, :, :, : x.shape[-2], : x.shape[-1]]
-        return latents
-
-    def forward(self, x, timestep, context, **kwargs):
-        """Forward pass for QwenImage model."""
-        latents, orig_shape = self._pack_latents(x)
-        num_embeds = latents.shape[1]
-        height = orig_shape[-2] * 8
-        width = orig_shape[-1] * 8
-
-        sampling_params = SamplingParams.from_user_sampling_params_args(
-            self.model_path,
-            server_args=self.generator.server_args,
-            prompt=" ",
-            guidance_scale=1.0,
-            height=height,
-            width=width,
-            num_frames=1,
-            num_inference_steps=1,
-            save_output=False,
-            suppress_logs=self.should_suppress_logs(timestep),
-        )
-
-        # Prepare request (converts SamplingParams to Req)
-        req = prepare_request(
-            server_args=self.generator.server_args,
-            sampling_params=sampling_params,
-        )
-        # Set ComfyUI-specific inputs directly on the Req object
-        req.latents = latents
-        req.timesteps = timestep * 1000.0
-        req.prompt_embeds = [context]
-        req.raw_latent_shape = torch.tensor(latents.shape, dtype=torch.long)
-        req.do_classifier_free_guidance = False
-        req.generator = [
-            torch.Generator("cuda") for _ in range(req.num_outputs_per_prompt)
-        ]
-
-        output_batch = self.generator._send_to_scheduler_and_wait_for_response([req])
-        noise_pred = output_batch.noise_pred
-
-        return self._unpack_latents(noise_pred, num_embeds, orig_shape, x)
+        return latents.reshape(orig_shape)[:, :, :, : x.shape[-2], : x.shape[-1]]
 
 
-class QwenImageEditExecutor(QwenImageExecutor):
-    """Executor for QwenImageEdit models in ComfyUI."""
+class QwenImageEditAdapter(QwenImageAdapter):
+    model_types = ("qwen_image_edit",)
+    pipeline_class_name = "QwenImageEditPlusPipeline"
 
-    def __init__(self, generator, model_path, model, config):
-        super().__init__(generator, model_path, model, config)
-
-    def forward(
+    def pack(
         self,
         x,
         timestep,
@@ -117,56 +77,22 @@ class QwenImageEditExecutor(QwenImageExecutor):
         attention_mask=None,
         ref_latents=None,
         additional_t_cond=None,
-        transformer_options={},
+        transformer_options=None,
         **kwargs,
-    ):
-        """Forward pass for QwenImageEdit model."""
-        latents, orig_shape = self._pack_latents(x)
-        num_embeds = latents.shape[1]
-        height = orig_shape[-2] * 8
-        width = orig_shape[-1] * 8
+    ) -> PackedForward:
+        packed = super().pack(x, timestep, context, **kwargs)
+        if ref_latents:
+            pack_ref, orig_ref_shape = self._pack_latents(ref_latents[0])
+            packed.extra_req["image_latent"] = pack_ref
+            packed.extra_req["vae_image_sizes"] = [
+                (orig_ref_shape[-1], orig_ref_shape[-2])
+            ]
+        return packed
 
-        # Prepare vae_image_sizes for the condition image (ref_latents)
-        vae_image_sizes = []
-        pack_ref_latents = None
 
-        # TODO: sgld now don't support multiple condition images, so we only support one condition image for now.
-        if ref_latents is not None and len(ref_latents) > 0:
-            pack_ref_latents, orig_ref_shape = self._pack_latents(ref_latents[0])
-            vae_image_sizes = [(orig_ref_shape[-1], orig_ref_shape[-2])]
+class QwenImageExecutor(SGLDiffusionExecutor):
+    adapter_cls = QwenImageAdapter
 
-        sampling_params = SamplingParams.from_user_sampling_params_args(
-            self.model_path,
-            server_args=self.generator.server_args,
-            prompt=" ",
-            guidance_scale=1.0,
-            image_path="",
-            height=height,
-            width=width,
-            num_frames=1,
-            num_inference_steps=1,
-            save_output=False,
-            suppress_logs=self.should_suppress_logs(timestep),
-        )
 
-        # Prepare request (converts SamplingParams to Req)
-        req = prepare_request(
-            server_args=self.generator.server_args,
-            sampling_params=sampling_params,
-        )
-        # Set ComfyUI-specific inputs directly on the Req object
-        req.latents = latents
-        req.image_latent = pack_ref_latents
-        req.timesteps = timestep * 1000.0
-        req.vae_image_sizes = vae_image_sizes
-        req.prompt_embeds = [context]
-        req.raw_latent_shape = torch.tensor(latents.shape, dtype=torch.long)
-        req.do_classifier_free_guidance = False
-        req.generator = [
-            torch.Generator("cuda") for _ in range(req.num_outputs_per_prompt)
-        ]
-
-        output_batch = self.generator._send_to_scheduler_and_wait_for_response([req])
-        noise_pred = output_batch.noise_pred
-
-        return self._unpack_latents(noise_pred, num_embeds, orig_shape, x)
+class QwenImageEditExecutor(SGLDiffusionExecutor):
+    adapter_cls = QwenImageEditAdapter
