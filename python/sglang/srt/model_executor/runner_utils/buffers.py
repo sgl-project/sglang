@@ -117,7 +117,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
             num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
             custom_mask = torch.ones(
-                (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_req,
+                (max_bs * seq_len_fill_value + 2 * max_num_token) * num_tokens_per_req,
                 dtype=torch.bool,
             )
             mamba_track_indices = (
