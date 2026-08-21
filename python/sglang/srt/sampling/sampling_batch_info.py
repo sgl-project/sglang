@@ -98,6 +98,7 @@ class SamplingBatchInfo:
     return_sampling_support_logprobs: Optional[List[bool]] = None
     sampling_mask_batch_indices: Optional[torch.Tensor] = None
     sampling_support_logprobs_capture_indices: Optional[torch.Tensor] = None
+    sampling_mask_max_top_k: int = 1
 
     # Device
     device: str = "cuda"
@@ -201,6 +202,10 @@ class SamplingBatchInfo:
                 device,
             )
         )
+        sampling_mask_max_top_k = max(
+            (int(r.sampling_params.top_k) for r in reqs if r.return_sampling_mask),
+            default=1,
+        )
 
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
@@ -271,6 +276,7 @@ class SamplingBatchInfo:
             sampling_support_logprobs_capture_indices=(
                 sampling_support_logprobs_capture_indices
             ),
+            sampling_mask_max_top_k=sampling_mask_max_top_k,
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -536,6 +542,10 @@ class SamplingBatchInfo:
                     self.return_sampling_support_logprobs,
                     self.device,
                 )
+            )
+            self.sampling_mask_max_top_k = max(
+                self.sampling_mask_max_top_k,
+                other.sampling_mask_max_top_k,
             )
 
         # Note: because the __len()__ operator is defined on the temperatures tensor,
