@@ -41,9 +41,6 @@ _PAGE_ELEMS = HEAD_DIM * GLUON_PAGE_SIZE
 _MAX_SCRATCH_PAGES = (512 * 1024 * 1024) // (_PAGE_ELEMS * 2)
 
 
-# NHD pool -> SHUFFLE 5D scratch gather.
-
-
 @triton.jit
 def _gather_nhd_to_shuffle_kernel(
     k_pool_ptr,  # [max_slots, 1, HEAD_DIM] (NHD main pool, this layer)
