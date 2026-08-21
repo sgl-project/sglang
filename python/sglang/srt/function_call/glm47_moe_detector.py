@@ -613,8 +613,9 @@ class Glm47MoeDetector(BaseFormatDetector):
             self._last_arguments += "{}"
             self.streamed_args_for_tool[self.current_tool_id] += "{}"
             self._sent_empty_object = True
-        elif not self._last_arguments.endswith("}") and not self._sent_empty_object:
-            # Need to close brace
+        elif not self._sent_empty_object:
+            # The converter opens the outer argument object but never closes it,
+            # and a trailing `}` may belong to an object-valued final argument.
             calls.append(
                 ToolCallItem(
                     tool_index=self.current_tool_id,

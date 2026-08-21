@@ -3225,6 +3225,43 @@ class TestGlm47MoeDetector(unittest.TestCase):
         ]
         self.detector = Glm47MoeDetector()
 
+    @staticmethod
+    def _make_tool(properties, required, name="set_options"):
+        return Tool(
+            type="function",
+            function=Function(
+                name=name,
+                description="Regression-test tool",
+                parameters={
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                },
+            ),
+        )
+
+    @staticmethod
+    def _stream_source(tools, source):
+        calls = {}
+        detector = Glm47MoeDetector()
+        for chunk in source:
+            result = detector.parse_streaming_increment(chunk, tools)
+            for call in result.calls:
+                item = calls.setdefault(call.tool_index, {"name": "", "parameters": ""})
+                if call.name:
+                    item["name"] = call.name
+                item["parameters"] += call.parameters
+        return calls
+
+    def _stream_call(self, tool, arguments):
+        source = [f"<tool_call>{tool.function.name}"]
+        source.extend(
+            f"<arg_key>{key}</arg_key><arg_value>{value}</arg_value>"
+            for key, value in arguments
+        )
+        source.append("</tool_call>")
+        return self._stream_source([tool], "".join(source))[0]
+
     def test_multiple_tool_calls(self):
         text = (
             "<tool_call>get_weather"
@@ -3282,6 +3319,128 @@ class TestGlm47MoeDetector(unittest.TestCase):
         self.assertEqual(tool_calls[1]["name"], "get_weather")
         self.assertEqual(
             tool_calls[1]["parameters"], '{"city": "Shanghai", "date": "2024-06-28"}'
+        )
+
+    def test_streaming_object_final_argument_closes_outer_object(self):
+        object_tool = self._make_tool(
+            {
+                "mode": {"type": "string"},
+                "options": {"type": "object"},
+            },
+            ["mode", "options"],
+        )
+        single_object_tool = self._make_tool(
+            {"options": {"type": "object"}}, ["options"]
+        )
+        cases = [
+            (
+                "object-valued final argument",
+                object_tool,
+                [("mode", "fast"), ("options", '{"topic":"t"}')],
+                {"mode": "fast", "options": {"topic": "t"}},
+            ),
+            (
+                "nested object final argument",
+                object_tool,
+                [
+                    ("mode", "fast"),
+                    ("options", '{"topic":"t","meta":{"attempt":1}}'),
+                ],
+                {
+                    "mode": "fast",
+                    "options": {"topic": "t", "meta": {"attempt": 1}},
+                },
+            ),
+            (
+                "empty object final argument",
+                object_tool,
+                [("mode", "fast"), ("options", "{}")],
+                {"mode": "fast", "options": {}},
+            ),
+            (
+                "single object argument",
+                single_object_tool,
+                [("options", '{"nested":{"ok":true}}')],
+                {"options": {"nested": {"ok": True}}},
+            ),
+        ]
+
+        for name, tool, arguments, expected in cases:
+            with self.subTest(name=name):
+                call = self._stream_call(tool, arguments)
+                self.assertEqual(call["name"], tool.function.name)
+                self.assertEqual(json.loads(call["parameters"]), expected)
+                self.assertTrue(call["parameters"].endswith("}}"))
+
+    def test_streaming_finalizer_preserves_unaffected_argument_shapes(self):
+        cases = [
+            (
+                "scalar final argument",
+                self._make_tool(
+                    {
+                        "options": {"type": "object"},
+                        "mode": {"type": "string"},
+                    },
+                    ["options", "mode"],
+                ),
+                [("options", '{"topic":"t"}'), ("mode", "fast")],
+                {"options": {"topic": "t"}, "mode": "fast"},
+                '"}',
+            ),
+            (
+                "array final argument",
+                self._make_tool(
+                    {"items": {"type": "array"}}, ["items"], name="collect"
+                ),
+                [("items", '[{"n":1},{"n":2}]')],
+                {"items": [{"n": 1}, {"n": 2}]},
+                "]}",
+            ),
+            (
+                "no arguments",
+                self._make_tool({}, [], name="noop"),
+                [],
+                {},
+                "{}",
+            ),
+        ]
+
+        for name, tool, arguments, expected, suffix in cases:
+            with self.subTest(name=name):
+                call = self._stream_call(tool, arguments)
+                self.assertEqual(json.loads(call["parameters"]), expected)
+                self.assertTrue(call["parameters"].endswith(suffix))
+
+    def test_streaming_finalizer_resets_between_calls(self):
+        noop = self._make_tool({}, [], name="noop")
+        set_options = self._make_tool(
+            {
+                "mode": {"type": "string"},
+                "options": {"type": "object"},
+            },
+            ["mode", "options"],
+        )
+        source = (
+            "<tool_call>noop</tool_call>"
+            "<tool_call>set_options"
+            "<arg_key>mode</arg_key><arg_value>fast</arg_value>"
+            '<arg_key>options</arg_key><arg_value>{"topic":"first"}</arg_value>'
+            "</tool_call>"
+            "<tool_call>set_options"
+            "<arg_key>mode</arg_key><arg_value>fast</arg_value>"
+            '<arg_key>options</arg_key><arg_value>{"topic":"second"}</arg_value>'
+            "</tool_call>"
+        )
+        calls = self._stream_source([noop, set_options], source)
+
+        self.assertEqual(sorted(calls), [0, 1, 2])
+        self.assertEqual(
+            [json.loads(calls[index]["parameters"]) for index in range(3)],
+            [
+                {},
+                {"mode": "fast", "options": {"topic": "first"}},
+                {"mode": "fast", "options": {"topic": "second"}},
+            ],
         )
 
     def test_tool_call_id(self):
