@@ -1,4 +1,5 @@
 import unittest
+from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -12,6 +13,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -31,6 +33,14 @@ class FakeReceiver:
 
 class TestDecodeQueueCleanup(CustomTestCase):
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
+        # resume_retracted_reqs reads the retraction backend off the disagg
+        # bag, so the case publishes a config instead of injecting one.
+        override = get_context().override_server_args(
+            disaggregation_decode_retraction_backup="cpu_tensor"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
         page_size = 128
         fill_len = 574
         physical_tokens_per_req = 5 * page_size
@@ -42,6 +52,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
                 origin_input_ids=[0] * fill_len,
                 output_ids=[],
                 is_retracted=True,
+                retraction_backup=None,
                 load_kv_cache=MagicMock(),
             )
             for i in range(4)
@@ -52,6 +63,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.num_reserved_decode_tokens = 0
         queue.req_to_token_pool = SimpleNamespace(available_size=lambda: len(reqs))
         queue.token_to_kv_pool_allocator = SimpleNamespace(page_size=page_size)
+        queue.tree_cache = MagicMock()
         queue.scheduler = SimpleNamespace(
             sliding_window_size=2047,
             server_args=SimpleNamespace(disable_radix_cache=True),
@@ -59,6 +71,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
         queue._swa_aware_allocatable_token_budgets = MagicMock(
             return_value=(physical_available, physical_available)
+        )
+        queue._swa_tail_allocatable_token_budget = MagicMock(
+            side_effect=lambda **_: physical_available
         )
 
         def pre_alloc(_req):
@@ -158,6 +173,72 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertTrue(all(r is not decode_req for r in queue.pending_reqs))
         self.assertIsNone(decode_req.kv_receiver)
 
+    def test_swa_reclaim_failure_rejects_only_request(self):
+        receiver = FakeReceiver()
+        req = SimpleNamespace(
+            rid="swa-reclaim-failed",
+            origin_input_ids=[1, 2, 3],
+            output_ids=[],
+            finished_reason=None,
+            return_logprob=False,
+            sampling_params=SimpleNamespace(max_new_tokens=1),
+        )
+        decode_req = SimpleNamespace(
+            req=req,
+            kv_receiver=receiver,
+            waiting_for_input=True,
+            is_rebootstrap=False,
+        )
+
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pp_size = 1
+        queue.queue = [decode_req]
+        queue.pending_reqs = [decode_req]
+        queue.retracted_queue = []
+        queue.num_reserved_decode_tokens = 0
+        queue._resolve_pending_reqs = MagicMock()
+        queue._update_handshake_waiters = MagicMock()
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
+        queue._swa_aware_allocatable_token_budgets = MagicMock(
+            return_value=(1024, 1024)
+        )
+        queue._prealloc_required_tokens = MagicMock(return_value=(3, 3))
+        queue._prealloc_kv_lens = MagicMock(return_value=(3, 3))
+        queue._reclaim_swa_tail_capacity = MagicMock(
+            return_value=(
+                "SWA eviction insufficient: needed=64, available=0, "
+                "req=swa-reclaim-failed"
+            )
+        )
+        queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+        queue._pre_alloc = MagicMock()
+        queue.req_to_token_pool = MagicMock()
+        queue.req_to_token_pool.available_size.return_value = 1
+        queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+        queue.req_to_metadata_buffer_idx_allocator.available_size.return_value = 1
+
+        scheduler = MagicMock()
+        scheduler.running_batch.reqs = []
+        scheduler.enable_priority_scheduling = False
+        scheduler.enable_hisparse = False
+        scheduler.server_args.disaggregation_decode_enable_radix_cache = False
+        scheduler.output_streamer = MagicMock()
+        queue.scheduler = scheduler
+
+        preallocated, failed = queue.pop_preallocated()
+
+        self.assertEqual(preallocated, [])
+        self.assertEqual(failed, [decode_req])
+        self.assertEqual(queue.queue, [])
+        self.assertEqual(queue.pending_reqs, [])
+        self.assertTrue(receiver.clear_called)
+        self.assertIsNone(decode_req.kv_receiver)
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        queue._pre_alloc.assert_not_called()
+        scheduler.output_streamer.stream_output.assert_called_once_with(
+            [req], req.return_logprob
+        )
+
     def test_ensure_prefill_info_tolerates_cleared_receiver(self):
         # A req whose kv_receiver was already cleared must not crash on .abort().
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
@@ -177,6 +258,51 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         self.assertEqual(ready, {})
         self.assertEqual(remaining, [])
+
+    def test_prefetches_prefill_dp_rank_query(self):
+        addr = "127.0.0.1:11500"
+        executor = MagicMock()
+        future = Future()
+        future.set_result({"7": 1})
+        executor.submit.return_value = future
+
+        def decode_req(room):
+            return SimpleNamespace(
+                req=SimpleNamespace(
+                    bootstrap_host="127.0.0.1",
+                    bootstrap_port=11500,
+                    bootstrap_room=room,
+                ),
+                kv_receiver=MagicMock(),
+            )
+
+        first = decode_req(7)
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pending_reqs = [first]
+        queue._prefill_dp_rank_queries = {}
+        queue.kv_manager = SimpleNamespace(
+            prefill_info_table={addr: object()},
+            _ensure_prefill_recompute_executor=lambda: executor,
+        )
+        queue._resolve_prefill_dp_rank = MagicMock(return_value=None)
+        queue._ensure_prefill_info = lambda groups: (groups, [])
+
+        queue.prefetch_prefill_dp_rank_queries()
+        tail = decode_req(8)
+        queue.pending_reqs.append(tail)
+        with patch(
+            "sglang.srt.disaggregation.decode."
+            "CommonKVReceiver.query_prefill_dp_ranks",
+            return_value={"8": 2},
+        ) as query:
+            queue._resolve_pending_reqs()
+
+        _, called_addr, called_rooms = executor.submit.call_args.args
+        self.assertEqual((called_addr, called_rooms), (addr, [7]))
+        query.assert_called_once_with(addr, [8])
+        first.kv_receiver.init.assert_called_once_with(1)
+        tail.kv_receiver.init.assert_called_once_with(2)
+        self.assertEqual(queue.pending_reqs, [])
 
     @patch("sglang.srt.disaggregation.decode.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
@@ -200,6 +326,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
         queue.queue = [decode_req]
         queue.enable_staging = False
+        queue.enable_deferred_kv_release = False
         queue.gloo_group = MagicMock()
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.tp_rank = 0

@@ -1,7 +1,9 @@
 import unittest
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import torch
+import torch.nn as nn
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
@@ -13,8 +15,12 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     WanT2V480PConfig,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders import vae_loader
+from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    ComponentCheckpointUnsupportedError,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import (
     _backfill_ltx2_audio_vae_latent_stats,
+    _require_native_loader_for_quantized_vae,
     _should_use_channels_last_3d,
 )
 from sglang.multimodal_gen.runtime.models.vaes import wanvae
@@ -24,9 +30,134 @@ class _FakeServerArgs:
     def __init__(self, pipeline_config, num_gpus=1):
         self.pipeline_config = pipeline_config
         self.num_gpus = num_gpus
+        self.model_paths = {}
+        self.revision = "test-revision"
+        self.trust_remote_code = True
+
+    def resolve_component_attention_backend(self, _component_name):
+        return None, None
+
+    def should_start_component_on_cpu(self, _component_name):
+        return False
 
 
 class TestVAELoader(unittest.TestCase):
+    def test_quantized_vae_admission_leaves_plain_configs_unchanged(self):
+        _require_native_loader_for_quantized_vae(
+            {"_class_name": "AutoencoderKL"}, "vae"
+        )
+
+        with self.assertRaisesRegex(
+            ComponentCheckpointUnsupportedError, "compression_config"
+        ):
+            _require_native_loader_for_quantized_vae(
+                {
+                    "_class_name": "AutoencoderKL",
+                    "compression_config": {"quant_method": "compressed-tensors"},
+                },
+                "vae",
+            )
+
+        with self.assertRaisesRegex(
+            ComponentCheckpointUnsupportedError,
+            r"text_config\.quantization_config",
+        ):
+            _require_native_loader_for_quantized_vae(
+                {
+                    "_class_name": "AutoencoderKL",
+                    "text_config": {
+                        "quantization_config": {
+                            "quant_method": "bitsandbytes",
+                            "load_in_4bit": True,
+                        }
+                    },
+                },
+                "vae",
+            )
+
+    def test_quantized_vae_routes_to_diffusers_native_loader(self):
+        loader = vae_loader.VAELoader()
+        server_args = _FakeServerArgs(QwenImagePipelineConfig())
+        native_vae = nn.Linear(1, 1)
+
+        with (
+            TemporaryDirectory() as component_path,
+            patch.object(
+                vae_loader,
+                "get_diffusers_component_config",
+                return_value={
+                    "_class_name": "AutoencoderKL",
+                    "quantization_config": {
+                        "quant_method": "bitsandbytes",
+                        "load_in_4bit": True,
+                    },
+                },
+            ),
+            patch(
+                "diffusers.AutoModel.from_pretrained",
+                return_value=native_vae,
+            ) as native_load,
+            patch.object(loader, "target_device", return_value=torch.device("cpu")),
+            patch.object(native_vae, "to", wraps=native_vae.to) as module_to,
+            patch.object(
+                vae_loader.current_platform,
+                "get_available_gpu_memory",
+                side_effect=[10.0, 9.0],
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "component_loader.get_memory_usage_of_component",
+                return_value=1.0,
+            ),
+        ):
+            loaded, consumed = loader.load(
+                component_path, server_args, "vae", "diffusers"
+            )
+
+        self.assertIs(loaded, native_vae)
+        self.assertFalse(loaded.training)
+        self.assertEqual(consumed, 1.0)
+        self.assertEqual(server_args.model_paths["vae"], component_path)
+        native_load.assert_called_once_with(
+            component_path,
+            revision="test-revision",
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+        )
+        module_to.assert_called_once_with(torch.device("cpu"))
+
+    def test_native_only_quantized_vae_fails_closed(self):
+        pipeline_config = QwenImagePipelineConfig()
+        pipeline_config.native_only_components = ("vae",)
+        server_args = _FakeServerArgs(pipeline_config)
+        loader = vae_loader.VAELoader()
+
+        with (
+            patch.object(
+                vae_loader,
+                "get_diffusers_component_config",
+                return_value={
+                    "_class_name": "AutoencoderKL",
+                    "quantization_config": {
+                        "quant_method": "bitsandbytes",
+                        "load_in_4bit": True,
+                    },
+                },
+            ),
+            patch("diffusers.AutoModel.from_pretrained") as native_load,
+            patch.object(
+                vae_loader.current_platform,
+                "get_available_gpu_memory",
+                return_value=10.0,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ComponentCheckpointUnsupportedError, "native-only SGLang"
+            ):
+                loader.load("/quantized/vae", server_args, "vae", "diffusers")
+
+        native_load.assert_not_called()
+
     def test_backfill_ltx2_audio_vae_latent_stats_maps_official_keys(self):
         loaded = {
             "per_channel_statistics.mean-of-means": torch.tensor([1.0, 2.0]),
