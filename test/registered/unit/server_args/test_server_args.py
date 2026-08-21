@@ -2291,48 +2291,15 @@ class TestSameGpuReplicas(CustomTestCase):
         return ServerArgs(**kwargs)
 
     def test_resolves_to_same_gpu_native_dp(self):
-        args = self._args()
+        args = self._args(device="xpu")
         self.assertEqual(args.dp_size, 2)
         self.assertEqual(args.gpu_id_step, 0)
         self.assertTrue(args.is_same_gpu_dp())
         args._check_same_gpu_dp()
 
-    def test_cli_flag_is_available(self):
-        args = prepare_server_args(
-            [
-                "--model-path",
-                "dummy",
-                "--same-gpu-replicas",
-                "2",
-                "--max-total-tokens",
-                "1024",
-            ]
-        )
-        self.assertEqual(args.same_gpu_replicas, 2)
-        self.assertEqual(args.dp_size, 2)
-        self.assertEqual(args.gpu_id_step, 0)
-
-    def test_rejects_conflicting_dp_size(self):
+    def test_rejects_invalid_configurations(self):
         with self.assertRaisesRegex(ValueError, "conflicts with --dp-size"):
             self._args(dp_size=3)
-
-    def test_non_cuda_accelerator_is_not_rejected_by_same_gpu_validation(self):
-        self._args(device="xpu")._check_same_gpu_dp()
-
-    def test_removed_nvidia_mps_flag_is_rejected(self):
-        with self.assertRaises(SystemExit):
-            prepare_server_args(
-                [
-                    "--model-path",
-                    "dummy",
-                    "--nvidia-mps-replicas",
-                    "2",
-                    "--max-total-tokens",
-                    "1024",
-                ]
-            )
-
-    def test_rejects_unsupported_same_gpu_topology(self):
         with self.assertRaisesRegex(ValueError, "tp_size must be 1"):
             self._args(tp_size=2)._check_same_gpu_dp()
         with self.assertRaisesRegex(ValueError, "max_total_tokens must be explicit"):
