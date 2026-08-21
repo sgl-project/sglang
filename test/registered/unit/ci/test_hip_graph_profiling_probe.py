@@ -193,6 +193,45 @@ class TestVendoredRuntimeDetection(CustomTestCase):
         libs = [ROCM_LIBS[0]] + VENDORED_LIBS
         self.assertEqual(probe.vendored_runtime_libs(libs), [VENDORED_LIBS[1]])
 
+    def test_the_rocm_library_copied_over_the_wheel_path_is_not_a_finding(self):
+        # What the image build leaves behind: the ROCm build sitting at the
+        # wheel's path. Reporting it would tell the reader to redo a fix that is
+        # already in place, so the size decides rather than the location.
+        probe = _load_probe()
+        with tempfile.TemporaryDirectory() as tmp:
+            rocm_dir = Path(tmp) / "rocm"
+            torch_dir = Path(tmp) / "torch-lib"
+            rocm_dir.mkdir()
+            torch_dir.mkdir()
+            mapped = []
+            for name, payload in (
+                ("libamdhip64", b"rocm-hip-build"),
+                ("libroctracer64", b"rocm-tracer"),
+            ):
+                (rocm_dir / f"{name}.so.7.2.70204").write_bytes(payload)
+                vendored = torch_dir / f"{name}.so"
+                vendored.write_bytes(payload)
+                mapped.append(str(vendored))
+            self.assertEqual(
+                probe.vendored_runtime_libs(mapped, str(rocm_dir)),
+                [],
+            )
+
+    def test_the_wheel_build_at_the_wheel_path_is_still_a_finding(self):
+        probe = _load_probe()
+        with tempfile.TemporaryDirectory() as tmp:
+            rocm_dir = Path(tmp) / "rocm"
+            torch_dir = Path(tmp) / "torch-lib"
+            rocm_dir.mkdir()
+            torch_dir.mkdir()
+            (rocm_dir / "libamdhip64.so.7.2.70204").write_bytes(b"rocm-hip-build")
+            vendored = torch_dir / "libamdhip64.so"
+            vendored.write_bytes(b"a wheel copy of a different size")
+            self.assertEqual(
+                probe.vendored_runtime_libs([str(vendored)], str(rocm_dir)),
+                [str(vendored)],
+            )
+
 
 class TestPreloadValue(CustomTestCase):
     def test_names_the_real_files_and_skips_the_symlinks(self):
