@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import logging
-import os
+import time
 from typing import List, Optional
 
 import torch
@@ -84,7 +84,7 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
         )
         self._adapter = self._adapter_cls(config=self._adapter_config)
         self._fallback_tokenizer = None
-        self._fallback_tokenizer_name = os.environ.get("SEMBLEND_MODEL_NAME")
+        self._fallback_tokenizer_name = config.served_model_path
         logger.info(
             "SemanticEmbeddingProvider initialized: threshold=%.2f, "
             "min_reuse=%.2f, model_arch=%s",
@@ -106,17 +106,7 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
         cache_end_pos: int,
         radix_tree=None,
     ) -> bool:
-        import time as _time
-
-        request_id = getattr(request, "rid", None) or getattr(
-            request, "request_id", None
-        )
-        if request_id is None:
-            logger.debug(
-                "[SemanticEmbedding] request has no rid; skipping registration"
-            )
-            return False
-        request_id = str(request_id)
+        request_id = str(request.rid)
         if request_id.startswith(HEALTH_CHECK_RID_PREFIX):
             logger.debug(
                 "[SemanticEmbedding] skipping health-check donor registration: %s",
@@ -132,10 +122,10 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
                 cache_end_pos,
             )
             return False
-        t_decode_start = _time.monotonic()
+        t_decode_start = time.monotonic()
         prompt_text = self._decode(request, token_ids[cache_start_pos:cache_end_pos])
-        t_decode_ms = (_time.monotonic() - t_decode_start) * 1000
-        t_submit_start = _time.monotonic()
+        t_decode_ms = (time.monotonic() - t_decode_start) * 1000
+        t_submit_start = time.monotonic()
         ok = self._adapter.register_donor(
             request_id=request_id,
             token_ids=list(token_ids),
@@ -143,11 +133,11 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
             cache_start_pos=cache_start_pos,
             cache_end_pos=cache_end_pos,
             prompt_text=prompt_text,
-            extra_key=getattr(request, "extra_key", None),
+            extra_key=_cache_namespace(request.extra_key, request.cache_salt),
             radix_tree=radix_tree,
         )
-        t_submit_ms = (_time.monotonic() - t_submit_start) * 1000
-        logger.info(
+        t_submit_ms = (time.monotonic() - t_submit_start) * 1000
+        logger.debug(
             "[FUZZY] cache_on_request_finished: rid=%s tokens=%d "
             "decode=%.1fms submit=%.1fms ok=%s",
             request_id,
@@ -166,6 +156,8 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
         extra_key=None,
     ) -> Optional[FuzzyMatchResult]:
         prompt_text = self._decode(request, prompt_token_ids[already_matched_len:])
+        if request is not None:
+            extra_key = _cache_namespace(extra_key, request.cache_salt)
         adapter_result = self._adapter.match(
             prompt_token_ids=list(prompt_token_ids),
             already_matched_len=already_matched_len,
@@ -178,9 +170,7 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
 
     def on_donor_inserted(self, request, donor_last_node_id: int) -> None:
         """Forward the donor's TreeNode id from RadixCache to the adapter."""
-        request_id = getattr(request, "rid", None) or getattr(
-            request, "request_id", None
-        )
+        request_id = str(request.rid) if request is not None else None
         if request_id is None:
             return
         self._adapter.on_donor_inserted(
@@ -274,22 +264,21 @@ def _adapter_to_sglang_result(adapter_result) -> FuzzyMatchResult:
     Field names are kept identical so this is a straightforward dataclass
     copy. Segments are mapped element-wise.
     """
+    # Empty segment lists normalize to None so every consumer has a single
+    # "no segments" sentinel to test.
     segments = None
-    if adapter_result.segments is not None:
+    if adapter_result.segments:
         segments = [
             FuzzyMatchSegment(
                 target_positions=_as_tensor(s.target_positions),
                 donor_positions=_as_tensor(s.donor_positions),
-                donor_node_id=s.donor_node_id,
-                donor_offset=s.donor_offset,
                 length=s.length,
                 donor_kv_indices=(
                     _as_tensor(s.donor_kv_indices)
                     if s.donor_kv_indices is not None
                     else None
                 ),
-                donor_req_id=s.donor_req_id,
-                layer_recompute_mask=s.layer_recompute_mask,
+                layer_zero_mask=s.layer_recompute_mask,
             )
             for s in adapter_result.segments
         ]
@@ -302,21 +291,18 @@ def _adapter_to_sglang_result(adapter_result) -> FuzzyMatchResult:
             reuse_ratio=qs.reuse_ratio,
             confidence_tier=qs.confidence_tier,
             passed_quality_gate=qs.passed_quality_gate,
-            rejection_reason=qs.rejection_reason,
         )
 
     return FuzzyMatchResult(
         cached_token_count=adapter_result.cached_token_count,
-        cached_token_ids=list(adapter_result.cached_token_ids),
         prompt_token_count=adapter_result.prompt_token_count,
         kv_cache_indices=_as_tensor(adapter_result.kv_cache_indices),
         position_offset=adapter_result.position_offset,
         cached_start_pos=adapter_result.cached_start_pos,
         segments=segments,
-        layer_recompute_mask=adapter_result.layer_recompute_mask,
+        layer_zero_mask=adapter_result.layer_recompute_mask,
         quality_signals=quality,
         donor_last_node_id=getattr(adapter_result, "donor_last_node_id", None),
-        match_entry=adapter_result._match_entry,
     )
 
 
@@ -329,13 +315,24 @@ def _as_tensor(obj) -> torch.Tensor:
     return torch.as_tensor(list(obj), dtype=torch.int64)
 
 
+def _cache_namespace(extra_key, cache_salt):
+    """Combine caller classification and cache salt into the donor namespace.
+
+    A donor registered under one salt must never serve a request under
+    another; the NUL joiner keeps the two components from colliding.
+    """
+    if cache_salt is None:
+        return extra_key
+    return f"{extra_key or ''}\x00{cache_salt}"
+
+
 def _version_lt(installed: str, minimum: str) -> bool:
     """Compare two semver-style strings without pulling in `packaging`.
 
     Returns True iff ``installed`` is strictly less than ``minimum`` on a
     component-by-component numeric comparison of the leading dotted prefix.
-    Non-numeric suffixes (e.g. ".dev0", "rc1") are treated as zero on each
-    side, which is conservative for a "must-be-at-least" gate.
+    Non-numeric suffixes (e.g. ".dev0", "rc1") are ignored, so a
+    pre-release of the minimum version passes the gate.
     """
 
     def parts(v: str) -> list[int]:

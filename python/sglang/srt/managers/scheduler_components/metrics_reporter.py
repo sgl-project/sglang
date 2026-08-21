@@ -85,8 +85,9 @@ class PrefillStats:
     log_host_hit_tokens: int = 0
     log_storage_hit_tokens: int = 0
     num_pending_tokens: int = 0
-    # Tokens covered by a fuzzy (non-exact) match this round. Realized into
-    # recipient slots pre-forward, so they are not part of log_hit_tokens.
+    # Tokens covered by a fuzzy (non-exact) match this round. The fuzzy span
+    # is merged into the request prefix, so this is a SUBSET of
+    # log_hit_tokens; subtract it to get exact-only hits.
     log_fuzzy_tokens: int = 0
 
     @classmethod

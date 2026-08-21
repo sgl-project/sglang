@@ -150,9 +150,14 @@ class FuzzyRadixCache(RadixCache):
         if 0 < exact_matched_len < min_match_length:
             return None
 
+        prompt_token_ids = key.token_ids
+        if key.limit is not None and key.limit < len(prompt_token_ids):
+            # RadixKey.limit caps the tokens this lookup may see; the provider
+            # must never match content beyond it.
+            prompt_token_ids = prompt_token_ids[: key.limit]
         try:
             fuzzy_result = self.fuzzy_match_provider.match_on_prefix_miss(
-                prompt_token_ids=key.token_ids,
+                prompt_token_ids=prompt_token_ids,
                 already_matched_len=exact_matched_len,
                 request=req,
                 extra_key=key.extra_key,
@@ -182,8 +187,8 @@ class FuzzyRadixCache(RadixCache):
             if quality is not None
             else ""
         )
-        logger.info(
-            "[FUZZY RADIX] fuzzy match success: rid=%s cached=%d prompt=%d "
+        logger.debug(
+            "[FUZZY RADIX] fuzzy match candidate: rid=%s cached=%d prompt=%d "
             "offset=%d%s",
             req.rid,
             fuzzy_result.cached_token_count,
@@ -244,7 +249,7 @@ class FuzzyRadixCache(RadixCache):
         # two nodes owning the same pool slots. Token- and position-aligned
         # content is the exact radix tree's job; skip such matches.
         if (
-            fuzzy_result.segments is None
+            not fuzzy_result.segments
             and fuzzy_result.cached_start_pos == exact_matched_len
         ):
             logger.debug(
@@ -280,15 +285,27 @@ class FuzzyRadixCache(RadixCache):
 
         req.fuzzy_match_result = fuzzy_result
 
+        quality = fuzzy_result.quality_signals
         logger.info(
-            "[FUZZY RADIX] match_prefix: rid=%s exact=%d fuzzy=%d miss=%d "
-            "total=%d cached_start_pos=%d realized_locs=pre-allocated",
+            "[FUZZY RADIX] fuzzy match success: rid=%s cached=%d prompt=%d "
+            "offset=%d exact=%d miss=%d%s",
             req.rid,
-            exact_matched_len,
             fuzzy_matched_len,
+            fuzzy_result.prompt_token_count,
+            fuzzy_result.position_offset,
+            exact_matched_len,
             total_len - exact_matched_len - fuzzy_matched_len,
-            total_len,
-            fuzzy_result.cached_start_pos,
+            (
+                ", reuse=%.3f, cosine=%.3f, tier=%s, gate=%s"
+                % (
+                    quality.reuse_ratio,
+                    quality.cosine_similarity,
+                    quality.confidence_tier,
+                    quality.passed_quality_gate,
+                )
+                if quality is not None
+                else ""
+            ),
         )
 
         merged = torch.cat([result.device_indices, fuzzy_kv_indices])
@@ -307,6 +324,18 @@ class FuzzyRadixCache(RadixCache):
     ) -> None:
         """Register the finished request as a donor while its KV is live."""
         if not self._fuzzy_cache_enabled or self.fuzzy_match_provider is None:
+            return
+        if insert_result.prefix_len > req.cache_protected_len:
+            # The insert deduplicated against existing tree content, so the
+            # kv indices captured here are freed right after this callback.
+            # Registering them would hand the provider dangling slots; the
+            # content is already in the tree from its first insertion.
+            logger.debug(
+                "[FUZZY RADIX] skipping donor registration for rid=%s: "
+                "insert deduplicated %d tokens",
+                req.rid,
+                insert_result.prefix_len,
+            )
             return
         try:
             self.fuzzy_match_provider.cache_on_request_finished(

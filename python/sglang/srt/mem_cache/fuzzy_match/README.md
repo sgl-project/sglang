@@ -67,7 +67,7 @@ ModelRunner._forward_raw                           (model_executor/model_runner.
        capture/replay (same placement as the deferred mamba COW hook).
        ROPE (owner: FuzzyKVRealizer): V copied; K = apply_rope(new_pos,
        reverse_rope(donor_pos, K_donor)). Layers flagged by
-       layer_recompute_mask are zeroed instead (drop, not recompute).
+       layer_zero_mask are zeroed instead (drop, not recompute).
        req_to_token[fuzzy span] repointed to the realized slots.
        Per-request state cleared in a finally block so chunked-prefill
        re-entry, decode, and retract-resume never re-trigger.
@@ -112,14 +112,18 @@ flags.
 ## Scope and guarantees
 
 - Exact prefix matching is untouched and always wins; fuzzy runs only on
-  the missed suffix. The default backend path is byte-identical when the
-  backend is not selected (two seams: one `MatchResult` field, one no-op
-  hook in `cache_finished_req`).
+  the missed suffix. When the backend is not selected the default path
+  keeps its existing behavior; the integration seams (a `MatchResult`
+  field, a `cache_finished_req` hook, per-batch realization plumbing, and
+  a metrics counter) are inert without it.
 - Reuse changes model outputs by construction: donor K/V attended to the
   donor's context. The provider's quality gates plus the per-layer
   zero-out mask are intended to reduce the drift, not eliminate it. Reuse is not
   lossless: measured per-workload quality deltas, the methodology, and
   the negative control are in the PR description.
-- Not yet supported: MLA-style KV pools, EAGLE speculative decoding,
-  multi-region (`|exact|miss|fuzzy|miss|...`) reuse, hierarchical (host)
-  cache interaction. Each is rejected explicitly rather than silently.
+- Not supported and rejected at startup: MLA-style KV pools and non-RoPE
+  models (model_runner), page_size > 1, tp_size > 1, pp_size > 1, and the
+  overlap scheduler (forced off with a warning). EAGLE speculative
+  decoding is rejected at backend registration. Multi-region
+  (`|exact|miss|fuzzy|miss|...`) reuse and hierarchical (host) cache
+  interaction are not implemented.

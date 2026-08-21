@@ -201,7 +201,6 @@ def _scripted_fuzzy_result(
 ) -> FuzzyMatchResult:
     return FuzzyMatchResult(
         cached_token_count=cached_token_count,
-        cached_token_ids=list(range(cached_token_count)),
         prompt_token_count=cached_token_count,
         kv_cache_indices=torch.tensor(kv_indices, dtype=torch.int64),
         position_offset=0,

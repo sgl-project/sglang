@@ -94,8 +94,13 @@ class FuzzyKVRealizer:
         if fuzzy_match_result is None or num_fuzzy <= 0:
             return
         if not self.pool_supported or self.rotary_emb is None:
-            self._free_realization_slots(req)
-            return
+            # Startup refuses the backend on unsupported stacks, so reaching
+            # this means donor slots are already mapped for the request and
+            # serving them uncorrected would silently corrupt outputs.
+            raise RuntimeError(
+                "[FUZZY] fuzzy match fired but realization is unavailable "
+                "(non-MHA pool or missing rotary_emb)"
+            )
 
         req_idx = req.req_pool_idx
         prefix_len = len(req.prefix_indices)
@@ -113,7 +118,7 @@ class FuzzyKVRealizer:
                 prefix_len=prefix_len,
                 num_fuzzy=num_fuzzy,
                 cached_start_pos=fuzzy_match_result.cached_start_pos,
-                layer_recompute_mask=fuzzy_match_result.layer_recompute_mask,
+                layer_zero_mask=fuzzy_match_result.layer_zero_mask,
             )
 
     def _realize_contiguous(
@@ -123,12 +128,12 @@ class FuzzyKVRealizer:
         prefix_len: int,
         num_fuzzy: int,
         cached_start_pos: int,
-        layer_recompute_mask: Optional[List[bool]],
+        layer_zero_mask: Optional[List[bool]],
     ) -> None:
         exact_matched_len = prefix_len - num_fuzzy
 
-        # No copy needed when donor positions already align with the target;
-        # match_prefix allocated no slots in that case.
+        # match_prefix drops aligned matches before committing request
+        # state, so this is a defensive guard, not a live path.
         if cached_start_pos == exact_matched_len:
             self._free_realization_slots(req)
             return
@@ -167,7 +172,7 @@ class FuzzyKVRealizer:
             new_locs=new_fuzzy_locs,
             old_positions=old_positions,
             new_positions=new_positions,
-            layer_recompute_mask=layer_recompute_mask,
+            layer_zero_mask=layer_zero_mask,
         )
 
         # Point req_to_token at the new recipient-owned slots. The donor's
@@ -249,7 +254,7 @@ class FuzzyKVRealizer:
                 new_locs=new_locs,
                 old_positions=donor_positions,
                 new_positions=target_positions,
-                layer_recompute_mask=seg.layer_recompute_mask,
+                layer_zero_mask=seg.layer_zero_mask,
             )
 
             req_to_token[req_idx, target_positions] = new_locs.to(req_to_token.dtype)

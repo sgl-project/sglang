@@ -3768,6 +3768,7 @@ class ServerArgs:
         self._disable_prefill_cuda_graph_for_deepseek_trtllm_mla()
         self._handle_mamba_backend()
         self._handle_int8_mamba_checkpoint()
+        self._handle_fuzzy_match_backend()
         self._handle_linear_attn_backend()
         self._handle_kv4_compatibility()
         self._handle_mxfp8_kv_cache_compatibility()
@@ -6317,6 +6318,45 @@ class ServerArgs:
                     raise ValueError(flashinfer_error)
             else:
                 raise ValueError(flashinfer_error)
+
+    def _handle_fuzzy_match_backend(self):
+        if self.radix_cache_backend != "fuzzy_match":
+            return
+        if not (0.0 <= self.fuzzy_semantic_threshold <= 1.0):
+            raise ValueError(
+                f"--fuzzy-semantic-threshold must be in [0.0, 1.0], got "
+                f"{self.fuzzy_semantic_threshold}"
+            )
+        if not (0.0 <= self.fuzzy_min_reuse_ratio <= 1.0):
+            raise ValueError(
+                f"--fuzzy-min-reuse-ratio must be in [0.0, 1.0], got "
+                f"{self.fuzzy_min_reuse_ratio}"
+            )
+        if self.fuzzy_min_match_length < 1:
+            raise ValueError(
+                f"--fuzzy-min-match-length must be >= 1, got "
+                f"{self.fuzzy_min_match_length}"
+            )
+        if self.page_size is not None and self.page_size != 1:
+            raise ValueError(
+                "--radix-cache-backend=fuzzy_match requires --page-size=1: "
+                "fuzzy spans are token-granular and do not respect page "
+                "alignment yet."
+            )
+        if self.tp_size > 1 or self.pp_size > 1:
+            raise ValueError(
+                "--radix-cache-backend=fuzzy_match currently supports "
+                "tp_size=1 and pp_size=1 only: per-rank schedulers could "
+                "diverge on fuzzy match decisions."
+            )
+        if not self.disable_overlap_schedule:
+            logger.warning(
+                "--radix-cache-backend=fuzzy_match forces "
+                "--disable-overlap-schedule: donor realization mutates "
+                "request KV state on the forward stream and is not ordered "
+                "against overlapped batch preparation."
+            )
+            self.disable_overlap_schedule = True
 
     def _handle_int8_mamba_checkpoint(self):
         # The int8 mamba checkpoint pool is only wired into the built-in

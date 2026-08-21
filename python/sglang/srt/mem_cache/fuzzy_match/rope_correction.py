@@ -26,7 +26,7 @@ Helpers:
 
 * ``copy_kv_with_rope_correction`` - per-layer K/V copy that reverses
   RoPE at the donor position and reapplies it at the target position.
-  When a ``layer_recompute_mask`` is provided, flagged layers are zeroed
+  When a ``layer_zero_mask`` is provided, flagged layers are zeroed
   instead of copied. Nothing refills the zeroed entries afterward.
 """
 
@@ -44,7 +44,7 @@ def copy_kv_with_rope_correction(
     new_locs: torch.Tensor,
     old_positions: torch.Tensor,
     new_positions: torch.Tensor,
-    layer_recompute_mask: Optional[List[bool]] = None,
+    layer_zero_mask: Optional[List[bool]] = None,
     *,
     apply_rotary_emb=None,
     reverse_rotary_emb=None,
@@ -72,7 +72,7 @@ def copy_kv_with_rope_correction(
             Used to invert RoPE from the donor's reference frame.
         new_positions: Target-side absolute positions for ``new_locs``.
             Used to apply RoPE in the recipient's reference frame.
-        layer_recompute_mask: Optional list of bools; when ``mask[i]`` is
+        layer_zero_mask: Optional list of bools; when ``mask[i]`` is
             True, layer ``i`` is zeroed instead of copied. Nothing refills
             the zeroed entries: the extend pass computes only the missed
             tokens, so the zeros survive the forward pass, and
@@ -113,9 +113,9 @@ def copy_kv_with_rope_correction(
     old_cos, old_sin = old_cos_sin.chunk(2, dim=-1)
     new_cos, new_sin = new_cos_sin.chunk(2, dim=-1)
 
-    mask_len = len(layer_recompute_mask) if layer_recompute_mask else 0
+    mask_len = len(layer_zero_mask) if layer_zero_mask else 0
     for layer_id in range(pool.layer_num):
-        if layer_id < mask_len and layer_recompute_mask[layer_id]:
+        if layer_id < mask_len and layer_zero_mask[layer_id]:
             pool.v_buffer[layer_id][new_locs] = 0
             pool.k_buffer[layer_id][new_locs] = 0
             continue

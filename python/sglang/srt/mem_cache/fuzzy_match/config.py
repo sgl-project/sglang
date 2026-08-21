@@ -52,6 +52,10 @@ class FuzzyMatchConfig(msgspec.Struct):
     # SemanticEmbedding-only: model architecture tag for SemBlend presets.
     model_arch: Optional[str] = None
 
+    # Served model path, for the provider's fallback tokenizer when a
+    # request arrives without decoded prompt text.
+    served_model_path: Optional[str] = None
+
     # SemanticEmbedding-only: minimum covered prompt fraction for a hit.
     fuzzy_min_reuse_ratio: float = 0.50
 
@@ -119,4 +123,5 @@ class FuzzyMatchConfig(msgspec.Struct):
             fuzzy_match_provider=server_args.fuzzy_match_provider,
             model_arch=server_args.fuzzy_model_arch,
             fuzzy_min_reuse_ratio=server_args.fuzzy_min_reuse_ratio,
+            served_model_path=server_args.model_path,
         )

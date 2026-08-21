@@ -11,16 +11,12 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-import math
 import unittest
 from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.layers.rotary_embedding.utils import (
-    apply_rotary_emb,
-    reverse_rotary_emb,
-)
+from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.mem_cache.fuzzy_match.rope_correction import (
     copy_kv_with_rope_correction,
 )
@@ -85,7 +81,7 @@ class TestLayerMaskZeroing(CustomTestCase):
             new_locs=new_locs,
             old_positions=old_pos,
             new_positions=new_pos,
-            layer_recompute_mask=[False, True, False],
+            layer_zero_mask=[False, True, False],
         )
 
         self.assertTrue(torch.all(pool.k_buffer[1][new_locs] == 0))
@@ -121,7 +117,7 @@ class TestLayerMaskZeroing(CustomTestCase):
             new_locs=new_locs,
             old_positions=pos,
             new_positions=pos,
-            layer_recompute_mask=[True],
+            layer_zero_mask=[True],
         )
 
         self.assertTrue(torch.all(pool.v_buffer[0][new_locs] == 0))

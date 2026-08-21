@@ -1356,6 +1356,16 @@ class ModelRunner:
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 model=self.model,
             )
+            if (
+                not self.fuzzy_kv_realizer.pool_supported
+                or self.fuzzy_kv_realizer.rotary_emb is None
+            ):
+                raise ValueError(
+                    "--radix-cache-backend=fuzzy_match requires a standard "
+                    "multi-head attention KV pool and a rotary embedding "
+                    "(MLA-style pools and non-RoPE models are not supported). "
+                    "Remove --radix-cache-backend to serve this model."
+                )
 
     def _decode_cuda_graph_runner_cls(self):
         """Decode CUDA-graph runner class to construct.

@@ -154,7 +154,9 @@ class TestSemanticEmbeddingProvider(CustomTestCase):
             provider.match_on_prefix_miss(
                 prompt_token_ids=[1, 2, 3, 4],
                 already_matched_len=1,
-                request=SimpleNamespace(tokenizer=_JoinTokenizer()),
+                request=SimpleNamespace(
+                    tokenizer=_JoinTokenizer(), cache_salt=None
+                ),
                 extra_key="tenant-a",
             )
         call = adapters[-1].match_calls[-1]
@@ -162,6 +164,30 @@ class TestSemanticEmbeddingProvider(CustomTestCase):
         self.assertEqual(call["already_matched_len"], 1)
         self.assertEqual(call["prompt_text"], "decoded:2,3,4")
         self.assertEqual(call["extra_key"], "tenant-a")
+
+    def test_cache_salt_namespaces_the_adapter_key(self):
+        """A donor registered under one cache salt must never serve a
+        request under another: the salt joins the adapter namespace, and
+        distinct salts produce distinct namespaces even with equal
+        extra_keys."""
+        patcher, adapters = _install_fake_semblend()
+        with patcher:
+            provider = SemanticEmbeddingProvider(
+                FuzzyMatchConfig(enable_fuzzy_match=True, fuzzy_min_match_length=1)
+            )
+            for salt in ("salt-a", "salt-b"):
+                provider.match_on_prefix_miss(
+                    prompt_token_ids=[1, 2, 3, 4],
+                    already_matched_len=1,
+                    request=SimpleNamespace(
+                        tokenizer=_JoinTokenizer(), cache_salt=salt
+                    ),
+                    extra_key="tenant-a",
+                )
+        keys = [c["extra_key"] for c in adapters[-1].match_calls]
+        self.assertNotEqual(keys[0], keys[1])
+        self.assertNotEqual(keys[0], "tenant-a")
+        self.assertIn("salt-a", keys[0])
 
     def test_adapter_config_receives_expected_semblend_keys(self):
         """SemBlend's ``from_dict`` filters unknown keys silently, so every
@@ -216,16 +242,14 @@ class TestSemanticEmbeddingProvider(CustomTestCase):
 
 
 class TestAdapterResultTranslation(CustomTestCase):
-    def test_translation_maps_fields_and_renames_match_entry(self):
-        """The semblend-side ``_match_entry`` handle must land on the
-        sglang-side ``match_entry`` field, index lists must be coerced to
-        int64 tensors, and segment/quality/donor fields must survive the
-        copy; a silent drop here loses donor addressing or the provider's
-        internal handle."""
-        sentinel = object()
+    def test_translation_maps_fields_and_coerces_tensors(self):
+        """Adapter-side fields must survive the copy with index lists
+        coerced to int64 tensors, the adapter's layer_recompute_mask must
+        land on the sglang-side layer_zero_mask, and an empty segment list
+        must normalize to None so consumers have one no-segments
+        sentinel."""
         adapter_result = SimpleNamespace(
             cached_token_count=2,
-            cached_token_ids=[7, 8],
             prompt_token_count=4,
             kv_cache_indices=[10, 11],
             position_offset=3,
@@ -234,11 +258,8 @@ class TestAdapterResultTranslation(CustomTestCase):
                 SimpleNamespace(
                     target_positions=[5, 6],
                     donor_positions=[2, 3],
-                    donor_node_id=42,
-                    donor_offset=1,
                     length=2,
                     donor_kv_indices=[8, 9],
-                    donor_req_id="donor-1",
                     layer_recompute_mask=[True, False],
                 )
             ],
@@ -248,25 +269,25 @@ class TestAdapterResultTranslation(CustomTestCase):
                 reuse_ratio=0.8,
                 confidence_tier="high",
                 passed_quality_gate=True,
-                rejection_reason=None,
             ),
             donor_last_node_id=42,
-            _match_entry=sentinel,
         )
 
         result = _adapter_to_sglang_result(adapter_result)
 
-        self.assertIs(result.match_entry, sentinel)
         self.assertEqual(result.donor_last_node_id, 42)
         self.assertEqual(result.kv_cache_indices.tolist(), [10, 11])
         self.assertEqual(result.kv_cache_indices.dtype, torch.int64)
         self.assertEqual(result.cached_start_pos, 1)
         segment = result.segments[0]
-        self.assertEqual(segment.donor_node_id, 42)
         self.assertEqual(segment.donor_kv_indices.tolist(), [8, 9])
         self.assertEqual(segment.target_positions.tolist(), [5, 6])
+        self.assertEqual(segment.layer_zero_mask, [True, False])
         self.assertEqual(result.quality_signals.confidence_tier, "high")
         self.assertTrue(result.quality_signals.passed_quality_gate)
+
+        adapter_result.segments = []
+        self.assertIsNone(_adapter_to_sglang_result(adapter_result).segments)
 
 
 class _DonorScriptedProvider(FuzzyMatchProvider):
@@ -340,7 +361,6 @@ class TestFuzzyDonorLockAccounting(CustomTestCase):
         )
         scripted = FuzzyMatchResult(
             cached_token_count=2,
-            cached_token_ids=[1, 2],
             prompt_token_count=3,
             kv_cache_indices=torch.tensor([10, 11], dtype=torch.int64),
             position_offset=0,

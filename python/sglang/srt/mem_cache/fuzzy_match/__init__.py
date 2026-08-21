@@ -21,6 +21,8 @@ from sglang.srt.mem_cache.fuzzy_match.config import FuzzyMatchConfig
 from sglang.srt.mem_cache.fuzzy_match.fuzzy_match_provider import (
     FuzzyMatchProvider,
     FuzzyMatchResult,
+    FuzzyMatchSegment,
+    QualitySignals,
     create_fuzzy_match_provider,
 )
 from sglang.srt.mem_cache.fuzzy_match.fuzzy_radix_cache import (
@@ -42,6 +44,8 @@ __all__ = [
     "FuzzyMatchConfig",
     "FuzzyMatchProvider",
     "FuzzyMatchResult",
+    "FuzzyMatchSegment",
+    "QualitySignals",
     "FuzzyRadixCache",
     "copy_kv_with_rope_correction",
     "create_fuzzy_match_provider",

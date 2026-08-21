@@ -15,7 +15,7 @@
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, List, Optional
+from typing import List, Optional
 
 import msgspec
 import torch
@@ -30,17 +30,9 @@ class FuzzyMatchSegment(msgspec.Struct):
 
     target_positions: torch.Tensor
     donor_positions: torch.Tensor
-
-    # NodeRef-based addressing (preferred for new providers).
-    donor_node_id: Optional[int] = None
-    donor_offset: Optional[int] = None
-    length: Optional[int] = None
-
-    # Legacy pool-indices tensor.
     donor_kv_indices: Optional[torch.Tensor] = None
-
-    donor_req_id: Optional[str] = None
-    layer_recompute_mask: Optional[List[bool]] = None
+    length: Optional[int] = None
+    layer_zero_mask: Optional[List[bool]] = None
 
 
 class QualitySignals(msgspec.Struct):
@@ -50,25 +42,21 @@ class QualitySignals(msgspec.Struct):
     reuse_ratio: float
     confidence_tier: str
     passed_quality_gate: bool
-    rejection_reason: Optional[str] = None
 
 
 class FuzzyMatchResult(msgspec.Struct):
     """Fuzzy match candidate returned to RadixCache."""
 
     cached_token_count: int
-    cached_token_ids: List[int]
     prompt_token_count: int
     kv_cache_indices: torch.Tensor
     position_offset: int
     cached_start_pos: int = 0
     # Optional fields used by SemanticEmbedding.
     segments: Optional[List[FuzzyMatchSegment]] = None
-    layer_recompute_mask: Optional[List[bool]] = None
+    layer_zero_mask: Optional[List[bool]] = None
     quality_signals: Optional[QualitySignals] = None
     donor_last_node_id: Optional[int] = None
-    # Provider-internal handle to the matched donor entry.
-    match_entry: Any = None
 
 
 class FuzzyMatchProvider(ABC):
@@ -76,11 +64,6 @@ class FuzzyMatchProvider(ABC):
 
     def __init__(self, config):
         self.config = config
-        self.min_match_length = config.fuzzy_min_match_length
-
-    def set_min_match_length(self, length: int) -> None:
-        """Set the minimum match length in tokens."""
-        self.min_match_length = length
 
     @abstractmethod
     def cache_on_request_finished(

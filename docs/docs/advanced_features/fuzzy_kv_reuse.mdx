@@ -45,7 +45,7 @@ The default provider is `SemanticEmbedding`, which finds donor candidates by emb
 | Argument | Default | Description |
 | --- | --- | --- |
 | `--fuzzy-match-provider` | `SemanticEmbedding` | `FuzzyMatchProvider` implementation used by the backend. |
-| `--fuzzy-min-match-length` | `16` | Minimum token span a fuzzy match may reuse. Prompts whose exact prefix anchor is shorter than this skip the fuzzy lookup. |
+| `--fuzzy-min-match-length` | `16` | Minimum token span a fuzzy match may reuse. A prompt with a short nonzero exact prefix anchor (between 1 and this value) skips the fuzzy lookup, while a prompt with no exact anchor stays eligible. |
 | `--fuzzy-semantic-threshold` | `0.60` | Cosine similarity threshold for `SemanticEmbedding` matches. Higher is stricter and yields fewer, higher-precision matches. |
 | `--fuzzy-min-reuse-ratio` | `0.50` | Minimum fraction of the prompt a donor must cover for a hit to be accepted. |
 | `--fuzzy-model-arch` | `None` | Architecture tag passed to the provider to select alignment presets, for example `qwen2.5-7b`. |
@@ -54,12 +54,12 @@ Very short uncovered suffixes also skip the lookup, since they cannot amortize t
 
 ## Observability
 
-Reuse is visible in the server log. `fuzzy match success` marks an accepted match with its similarity and reuse ratio, `Realized N fuzzy tokens` marks the position-corrected copy, and the prefill batch line reports the reused token count. Accepted mass is also reported to clients through the cached token details, so hit rates can be measured from responses.
+Reuse is visible in the server log. `fuzzy match success` marks an accepted match with its similarity and reuse ratio, `Realized N fuzzy tokens` marks the position-corrected copy, and the prefill batch line reports the reused token count. In client responses the reused tokens are folded into the generic cached token count, so per-mechanism hit rates should be measured from the server log.
 
 ## Limitations
 
-- Position-corrected realization currently supports standard multi-head attention KV layouts. Models with MLA-style pools fall back to exact-only matching.
-- The reused span is a single contiguous range per request in this version.
+- Position-corrected realization requires a standard multi-head attention KV layout and rotary position encoding. Models outside that (for example MLA-style pools) are rejected at startup with a clear error rather than served without correction. The backend also requires page size 1, a single GPU (tp_size 1, pp_size 1), and forces the overlap scheduler off.
+- A provider may return one contiguous reused span or a set of scattered segments. The default provider serves contiguous spans on this version.
 - Input token logprobs are not available for reused spans, matching the existing behavior of exact prefix caching.
 - Quality depends on the provider's gates. The defaults are conservative, and lowering the similarity threshold or reuse ratio trades precision for hit rate.
 - Reuse is not lossless. On requests where a fuzzy match fires, generated text can drift from what a cold run would produce, with the size of the drift depending on how the reused content overlaps the prompt. In the reference evaluation, workloads where reuse fired scored ROUGE-L 0.45 to 0.55 against cold outputs while an identical-prompt rerun control scored about 0.88.
