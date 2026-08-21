@@ -170,10 +170,9 @@ def test_condition_image_preserves_pixel_values_when_already_sized():
 
 
 def test_smart_resize_aligns_to_the_patch_factor():
-    height, width = smart_resize(480, 832, factor=VLM_PATCH_FACTOR)
+    height, width = smart_resize(468, 832, factor=VLM_PATCH_FACTOR)
     assert (height, width) == (480, 832)
 
-    # Below the four-patch minimum the frame is enlarged, still factor-aligned.
     height, width = smart_resize(30, 30, factor=VLM_PATCH_FACTOR)
     assert height % VLM_PATCH_FACTOR == 0 and width % VLM_PATCH_FACTOR == 0
     assert height * width >= 4 * VLM_PATCH_FACTOR**2

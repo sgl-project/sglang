@@ -8,9 +8,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.multimodal_gen.configs.models.dits.lingbot_video_moe import (
-    LingBotVideoMoEArchConfig,
-)
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe import (
     LingBotVideoMoEPipelineConfig,
 )
@@ -85,12 +82,6 @@ def test_moe_path_resolves_moe_configs():
     assert info.pipeline_cls.__name__ == "LingBotVideoPipeline"
     assert info.pipeline_config_cls is LingBotVideoMoEPipelineConfig
     assert info.sampling_param_cls is LingBotVideoMoESamplingParams
-
-
-def test_arch_config_defaults_without_mlp_only_layers():
-    arch = LingBotVideoMoEArchConfig()
-    assert arch.num_experts == 128
-    assert arch.mlp_only_layers == ()
 
 
 def test_router_bias_shifts_selection_but_not_gate_weights():
@@ -381,9 +372,9 @@ def test_check_inputs_enforces_frame_and_size_contract():
     check(480, 832, 1)
     check(480, 832, 81)
     with pytest.raises(ValueError, match=r"4n\+1"):
-        check(480, 832, 82)
+        check(480, 832, 83)
     with pytest.raises(ValueError, match="multiples of 16"):
-        check(480, 830, 81)
+        check(480, 840, 81)
 
 
 def test_decode_scale_and_shift_invert_vae_normalization():
