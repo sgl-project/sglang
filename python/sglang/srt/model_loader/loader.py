@@ -117,6 +117,7 @@ from sglang.srt.model_loader.weight_utils import (
     initialize_capture_safe_weights,
     initialize_dummy_weights,
     maybe_add_mtp_safetensors,
+    maybe_filter_nextn_shards,
     multi_thread_pt_weights_iterator,
     np_cache_weights_iterator,
     pt_weights_iterator,
@@ -599,6 +600,16 @@ class DefaultModelLoader(BaseModelLoader):
             )
             if use_safetensors and source.model_config is not None:
                 hf_weights_files = maybe_add_mtp_safetensors(
+                    hf_weights_files,
+                    hf_folder,
+                    "model.safetensors.index.json",
+                    source.model_config.hf_config,
+                )
+                # For an MTP/NextN draft loaded from the target's combined
+                # checkpoint, keep only the shard(s) holding the MTP head so we
+                # don't open the entire checkpoint (target body) just to read a
+                # small draft head.
+                hf_weights_files = maybe_filter_nextn_shards(
                     hf_weights_files,
                     hf_folder,
                     "model.safetensors.index.json",
