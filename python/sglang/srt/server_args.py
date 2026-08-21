@@ -9856,6 +9856,23 @@ def get_global_server_args() -> ServerArgs:
     return get_context().server_args
 
 
+def _normalize_config_flag(argv: List[str]) -> List[str]:
+    """Split ``--config=path.yaml`` into ``--config path.yaml``.
+
+    argparse accepts both spellings, but the YAML merge gate below matches the
+    exact ``--config`` token — without this, the equals form is silently
+    skipped and every setting from the file is dropped.
+    """
+    prefix = "--config="
+    normalized: List[str] = []
+    for arg in argv:
+        if arg.startswith(prefix):
+            normalized += ["--config", arg[len(prefix) :]]
+        else:
+            normalized.append(arg)
+    return normalized
+
+
 def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
     Prepare the server arguments from the command line arguments.
@@ -9869,6 +9886,8 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
     parser = argparse.ArgumentParser(prog="sglang serve")
     ServerArgs.add_cli_args(parser)
+
+    argv = _normalize_config_flag(argv)
 
     # Check for config file and merge arguments if present
     if "--config" in argv:

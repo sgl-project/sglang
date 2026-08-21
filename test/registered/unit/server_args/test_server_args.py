@@ -143,6 +143,35 @@ class TestPrepareServerArgs(CustomTestCase):
         finally:
             os.unlink(config_file)
 
+    def test_config_equals_form_is_merged(self):
+        # "--config=path" and "--config path" must resolve identically; the
+        # merge gate matches the exact token, so the equals form used to skip
+        # the YAML merge and silently drop every setting from the file.
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write("mem-fraction-static: 0.42\nmax-running-requests: 128\n")
+            config_file = f.name
+
+        try:
+            from_space_form = prepare_server_args(
+                ["--model-path", "dummy", "--config", config_file]
+            )
+            from_equals_form = prepare_server_args(
+                ["--model-path", "dummy", f"--config={config_file}"]
+            )
+
+            self.assertEqual(from_equals_form.mem_fraction_static, 0.42)
+            self.assertEqual(from_equals_form.max_running_requests, 128)
+            self.assertEqual(
+                from_equals_form.mem_fraction_static,
+                from_space_form.mem_fraction_static,
+            )
+            self.assertEqual(
+                from_equals_form.max_running_requests,
+                from_space_form.max_running_requests,
+            )
+        finally:
+            os.unlink(config_file)
+
 
 class TestMmEncoderDataParallelLogging(CustomTestCase):
     def test_logs_when_encoder_dp_has_no_parallelism(self):
