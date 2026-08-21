@@ -46,6 +46,7 @@ if _HAS_MLX:
         MlxPendingJob,
         SchedulerMlxOverlapMixin,
     )
+    from sglang.srt.hardware_backend.mlx.tp_worker import MlxLaunch
     from sglang.srt.managers.scheduler_components import (
         batch_result_processor as batch_result_processor_module,
     )
@@ -309,7 +310,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             new_slot_ids=[4],
             req_pool_idx=0,
         )
-        MlxModelRunner._eval_with_cache(pending.lazy_token, pending.cache)
+        runner.eval_pending(pending)
         mx.eval(*runner._attention_kv_pool.all_buffers())
         runner.prefill_finalize(pending)
 
@@ -350,7 +351,8 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
                     calls.append(
                         (len(caches), batched_input.tolist(), list(helper_req_ids))
                     )
-                    return mx.array(list(range(len(caches))), dtype=mx.int32)
+                    # Last-token logits whose argmax is the row index.
+                    return mx.eye(len(caches), 8, dtype=mx.float32)
 
                 def fail_native(*args, **kwargs):
                     raise AssertionError("dense decode should use batched attention")
@@ -386,7 +388,8 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
         def fake_batched(caches, batched_input, helper_req_ids):
             calls.append((len(caches), batched_input.tolist(), list(helper_req_ids)))
-            return mx.array([8], dtype=mx.int32)
+            # Last-token logits whose argmax is token 8.
+            return mx.arange(9, dtype=mx.float32)[None, :]
 
         def fail_native(*args, **kwargs):
             raise AssertionError("dense chained decode should use batched attention")
@@ -502,12 +505,13 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             ]
         ]
 
-        lazy_tokens = runner._decode_with_batched_attention(
+        lazy_logits = runner._decode_with_batched_attention(
             cache,
             mx.array([[7]], dtype=mx.int32),
             ["r0"],
         )
-        mx.eval(lazy_tokens, *MlxModelRunner._cache_state_arrays(cache))
+        lazy_tokens = mx.argmax(lazy_logits, axis=-1)
+        mx.eval(lazy_tokens, *MlxModelRunner.cache_state_arrays(cache))
 
         self.assertEqual(lazy_tokens.tolist(), [0])
         self.assertEqual(cache[0][0].offset, 1)
@@ -558,6 +562,9 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             req_pool_idx={"r0": 0, "r1": 1},
             req_to_token_pool=req_to_token_pool,
             attention_layer_indices=[0],
+            # The fused scatter addresses pool buffers by full-attention index,
+            # so the context requires the map whenever the RoPE kernel is live.
+            full_kv_pool_index_by_layer={0: 0},
         )
 
         self.assertEqual(ctx.seq_lens, [1, 2])
@@ -578,7 +585,8 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
         def fake_hybrid(caches, batched_input, helper_req_ids):
             calls.append((len(caches), batched_input.tolist(), list(helper_req_ids)))
-            return mx.array([4, 5], dtype=mx.int32)
+            # Last-token logits whose argmax is 4 for row 0, 5 for row 1.
+            return mx.eye(8, dtype=mx.float32)[4:6]
 
         def fail_batched(*args, **kwargs):
             raise AssertionError(
@@ -713,7 +721,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             new_slot_ids=[4],
             req_pool_idx=req.req_pool_idx,
         )
-        MlxModelRunner._eval_with_cache(pending.lazy_token, pending.cache)
+        runner.eval_pending(pending)
         runner.prefill_finalize(pending)
 
         self.assertEqual(runner.model.seen_inputs, [[[13]]])
@@ -770,7 +778,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             req_pool_idx=req.req_pool_idx,
             req=req,
         )
-        MlxModelRunner._eval_with_cache(pending.lazy_token, pending.cache)
+        runner.eval_pending(pending)
         runner.prefill_finalize(pending)
         tracked = [FakeNativeCache(), None]
         runner._req_to_token_pool.auxiliary_state_pool.restore_cache(
@@ -832,7 +840,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             req_pool_idx=req.req_pool_idx,
             req=req,
         )
-        MlxModelRunner._eval_with_cache(pending.lazy_token, pending.cache)
+        runner.eval_pending(pending)
         runner.prefill_finalize(pending)
         tracked = [FakeNativeCache(), None]
         runner._req_to_token_pool.auxiliary_state_pool.restore_cache(
@@ -901,7 +909,10 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         auxiliary_state_idx = pool.get_auxiliary_state_indices(req.req_pool_idx)
         pool.free(req)
 
-        self.assertEqual(req_indices, [1])
+        # Which free slot a fresh alloc gets is not semantically meaningful
+        # (see ReqToTokenPool.alloc); only pin that it's a real, valid slot.
+        self.assertEqual(len(req_indices), 1)
+        self.assertIn(req_indices[0], range(1, pool.size + 1))
         self.assertIsNotNone(auxiliary_state_idx)
         self.assertIsNone(req.req_pool_idx)
         self.assertIsNotNone(req.mamba_pool_idx)
@@ -1094,11 +1105,13 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         scheduler.last_batch = stale_batch
 
         pending = MlxPendingJob(
-            lazy_tokens=None,
-            prefills=["prefill"],
-            extends=[],
-            decode=None,
-            mode="extend",
+            launch=MlxLaunch(
+                lazy_tokens=None,
+                prefills=["prefill"],
+                extends=[],
+                decode=None,
+                mode="extend",
+            ),
             batch_copy=batch_copy,
             schedule_batch=schedule_batch,
             reqs=[SimpleNamespace(rid="r0")],

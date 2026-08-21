@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 import os
 import sys
 from contextlib import contextmanager
@@ -721,34 +722,6 @@ def _build_config_bags(server_args: Any) -> dict:
     return tops
 
 
-def _snapshot_bag_values(bags: dict | None) -> dict | None:
-    """Per-leaf value snapshot of a config-bag tree (bags are mutated in
-    place by ``override``, so reference snapshots alias live state)."""
-    if bags is None:
-        return None
-    snap: dict = {}
-
-    def walk(prefix: str, bag) -> None:
-        snap[prefix] = dict(object.__getattribute__(bag, "_fields"))
-        for name, sub in object.__getattribute__(bag, "_subs").items():
-            walk(f"{prefix}.{name}", sub)
-
-    for name, bag in bags.items():
-        walk(name, bag)
-    return snap
-
-
-def _restore_bag_values(bags: dict, snap: dict) -> None:
-    def walk(prefix: str, bag) -> None:
-        for key, value in snap[prefix].items():
-            bag._set(key, value)
-        for name, sub in object.__getattribute__(bag, "_subs").items():
-            walk(f"{prefix}.{name}", sub)
-
-    for name, bag in bags.items():
-        walk(name, bag)
-
-
 class RuntimeContext:
     """Container for the structured runtime accessors; exposes ``parallel``,
     ``server_args``, the resolved config namespace bags, ``flags``,
@@ -856,6 +829,11 @@ class RuntimeContext:
             self._check_role_namespace(name)
         return bags[name]
 
+    def is_config_namespace_published(self, name: str) -> bool:
+        """Return whether a config namespace exists in the current context."""
+        bags = self._config_bags
+        return bags is not None and name in bags
+
     def _check_role_namespace(self, name: str) -> None:
         # Out of line so the mode gate above stays one dead-branch-prunable
         # check under dynamo in the default "off" mode (config_bag runs inside
@@ -925,6 +903,29 @@ class RuntimeContext:
             bag._set(name, value)
         self._overrides_log.append((source, dict(fields)))
 
+    def config_leaf(self, name: str):
+        """One resolved config leaf by field name — the read side of ``override``.
+
+        Callers that hold a field name rather than a namespace (a readback
+        endpoint, a control-plane handler) would otherwise have to know which
+        bag it lives in.
+        """
+        bags = self._config_bags
+        if bags is None:
+            raise ValueError("config not published; cannot read a config leaf")
+        from sglang.srt.arg_groups.arg_utils import namespace_of
+
+        path = namespace_of(type(self._server_args)).get(name)
+        if path is None:
+            raise ValueError(f"{name!r} is not a config leaf (no NS namespace)")
+        parts = path.split(".")
+        bag = self.config_bag(parts[0])
+        for seg in parts[1:]:
+            bag = object.__getattribute__(bag, "_subs").get(seg)
+            if bag is None:
+                raise ValueError(f"subgroup {seg!r} missing under {path!r}")
+        return getattr(bag, name)
+
     def overrides_log(self) -> list:
         """Provenance of post-publish ``override`` calls: ``[(source, {field: value})]``.
 
@@ -947,12 +948,14 @@ class RuntimeContext:
         ``ServerArgs`` field names, so overlaying them onto the top level of
         either base is exact.
 
-        This covers the process-global bags only. Per-engine control-plane
-        changes (weight version, model path, the tokenizer's HiCache mirror)
-        live on the tokenizer manager — several ``Engine``s can share one
-        process — and ``TokenizerManager.resolved_config_dict`` overlays those
-        for the top-level ``/server_info`` body. The two are separate logs, not
-        one merged dict.
+        The log is per process: it carries what *this* process overrode. A
+        weight reload records ``model_path`` and ``load_format`` from the
+        scheduler process (``ModelRunner.update_model_fields``); the tokenizer
+        process records only ``load_format`` and keeps ``model_path`` /
+        ``served_model_name`` as ``TokenizerManager`` attributes, which
+        ``TokenizerManager.resolved_config_dict`` overlays on top of this dump.
+        The top-level ``/server_info`` fields are the startup record, not this
+        dump.
         """
         d = dict(vars(self.server_args)) if base is None else dict(base)
         for _source, fields in self._overrides_log:
@@ -980,33 +983,6 @@ class RuntimeContext:
         force one leaf.
         """
         return _ServerArgsOverride(self, fields)
-
-    @contextmanager
-    def preserve_config(self):
-        """Snapshot the full config lifecycle and reinstate it verbatim on exit.
-
-        For nested construction steps that publish a private ``ServerArgs``
-        copy (e.g. a draft-worker build) and must leave the enclosing
-        lifecycle — including its post-publish overrides — untouched.
-        """
-        prev_server_args = self._server_args
-        prev_bags = self._config_bags
-        prev_bag_values = _snapshot_bag_values(prev_bags)
-        prev_overrides_log = list(self._overrides_log)
-        prev_publish_role = self._publish_role
-        prev_parallel_config = self.parallel._config
-        prev_capture = self.flags.capture.enable_torch_compile
-        try:
-            yield
-        finally:
-            self._server_args = prev_server_args
-            self._config_bags = prev_bags
-            if prev_bags is not None:
-                _restore_bag_values(prev_bags, prev_bag_values)
-            self._overrides_log = prev_overrides_log
-            self._publish_role = prev_publish_role
-            self.parallel._config = prev_parallel_config
-            self.flags.capture.enable_torch_compile = prev_capture
 
 
 class _ServerArgsOverride:
@@ -1192,7 +1168,6 @@ def get_observability() -> _ConfigBag:
 ROLE_NAMESPACE_SETS: dict[str, frozenset[str] | None] = {
     # Reads (almost) everything by design — the model-executing process.
     "scheduler": None,
-    "launcher": None,
     "test": None,
     # Audited (record-mode smokes, plain + DP-attention): the DP controller
     # reads only the elastic-EP gate; its module's static read set agrees.
@@ -1205,6 +1180,7 @@ ROLE_NAMESPACE_SETS: dict[str, frozenset[str] | None] = {
     # a wrong set fails a request rather than a test.
     "tokenizer": None,
     # Deployment shapes not exercised locally; audit before restricting.
+    "detokenizer": None,
     "encoder": None,
     "expert_backup": None,
     "weight_cache_daemon": None,
@@ -1309,23 +1285,18 @@ def _dump_recorded_namespace_reads() -> None:
 def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
     """Install process-wide config for this OS process.
 
-    Records the process ``role`` (``tokenizer`` / ``scheduler`` /
-    ``dp_controller`` / ``encoder`` / ``expert_backup`` /
-    ``weight_cache_daemon`` / ``launcher`` / ``test``) and
+    Records the process ``role`` — one of the ``ROLE_NAMESPACE_SETS`` keys,
+    which is the one place the roles are enumerated — and
     projects the config bags. Draft workers skip publish (they must not clobber
     the target). ``role`` is provenance, and — when ``SGLANG_ROLE_NAMESPACES``
     is ``enforce`` — the key into ``ROLE_NAMESPACE_SETS`` for fail-closed
     namespace-read enforcement (``record`` audits the reads instead).
     ``hf_config`` is accepted for forward-compat and currently unused.
 
-    Normally one call per process, but re-publish is allowed and is
-    **last-publish-wins** (bags re-projected, provenance reset, role
-    overwritten). Two sanctioned multi-publish shapes exist: the in-process
-    Engine builds its ``TokenizerManager`` inside the launcher process (the
-    process ends up with the tokenizer publish), and multiple Engines in one
-    process publish in sequence — which is exactly why per-instance managers
-    must read ``self.server_args`` for anything engine-specific rather than
-    the process-global bags.
+    A process holds at most one live config: the bags always describe the
+    engine running now. Re-publish is allowed and is **last-publish-wins**
+    (bags re-projected, provenance reset, role overwritten), which is what
+    lets one process rebuild an engine after shutting the previous one down.
     """
     if _ROLE_NS_MODE == "enforce" and role not in ROLE_NAMESPACE_SETS:
         # Fail closed at publish time, not at the first stray read.
@@ -1419,6 +1390,82 @@ def mamba_extra_buffer_lazy_enabled() -> bool:
     )
 
 
+def remote_instance_transfer_engine_enabled(load_format: str | None = None) -> bool:
+    """Whether remote-instance weight loading runs over the transfer engine.
+
+    Every input is a ``model`` leaf, so this derives from the bags and follows a
+    post-publish override; ``ServerArgs.remote_instance_weight_loader_use_transfer_engine``
+    is the pre-publish equivalent, and both go through the same helper.
+    ``load_format`` is the caller's own (a draft runner loading under
+    ``--speculative-draft-load-format`` has one the process record does not).
+    """
+    from sglang.srt.arg_groups.overrides import remote_instance_transfer_engine_of
+
+    return remote_instance_transfer_engine_of(get_model(), load_format)
+
+
+def max_prefill_buffer_tokens() -> int:
+    """The prefill-buffer ceiling: ``chunked_prefill_size``, except PP dynamic
+    chunking can grow chunks toward ``max_prefill_tokens`` and probe at 1.25x.
+
+    Every input is a published leaf (``schedule`` plus the configured PP size),
+    so this derives from the bags and follows a post-publish override;
+    ``ServerArgs.max_prefill_buffer_tokens`` is the pre-publish equivalent and
+    ``TestDerivedPredicatesAgreeAcrossTiers`` pins the two equal.
+    """
+    import math
+
+    schedule = get_schedule()
+    chunked = (
+        schedule.chunked_prefill_size
+        if schedule.chunked_prefill_size and schedule.chunked_prefill_size > 0
+        else 0
+    )
+    tokens = chunked
+    if (
+        schedule.enable_dynamic_chunking
+        and _configured_parallel("pp_size") > 1
+        and chunked
+    ):
+        tokens = max(
+            tokens, schedule.max_prefill_tokens or 0, math.ceil(chunked * 1.25)
+        )
+    return tokens
+
+
+def pre_capture_activation_reserve_mb(gpu_mem: float | None) -> float:
+    """The activation working-set reserve held back before cuda-graph capture.
+
+    Derived from published leaves across four bags (``disagg`` / ``schedule`` /
+    ``exec.graph`` / ``spec``) plus the configured parallel sizes, so it follows
+    a post-publish override; ``ServerArgs.pre_capture_activation_reserve_mb`` is
+    the pre-publish equivalent and
+    ``TestDerivedPredicatesAgreeAcrossTiers`` pins the two equal.
+    """
+    schedule = get_schedule()
+    if get_disagg().disaggregation_mode == "decode":
+        running_requests = (
+            schedule.max_running_requests
+            or get_exec().graph.cuda_graph_config.decode.max_bs
+            or 1
+        )
+        activation_tokens = max(
+            running_requests * (get_spec().speculative_num_draft_tokens or 1), 2048
+        )
+    elif schedule.chunked_prefill_size > 0:
+        activation_tokens = max(schedule.chunked_prefill_size, 2048)
+    else:
+        activation_tokens = max(schedule.max_prefill_tokens, 2048)
+    reserved_mem = (
+        512
+        + activation_tokens * 1.5
+        + _configured_parallel("tp_size") * _configured_parallel("pp_size") / 8 * 1024
+    )
+    if gpu_mem is not None and gpu_mem > 60 * 1024:
+        reserved_mem = max(reserved_mem, 10 * 1024)
+    return reserved_mem
+
+
 # --- Derived config accessors ------------------------------------------------
 #
 # A few values are computed from several config fields plus the HF config, so
@@ -1433,6 +1480,22 @@ def mamba_cache_chunk_size() -> int:
     """The caching point granularity for mamba state: ``max(the model's mamba
     chunk size, page_size)``. Cached on the config after the first call."""
     return get_server_args().mamba_cache_chunk_size
+
+
+def mamba_checkpoint_grid(tree_page: int) -> int:
+    """The granularity a donated mamba checkpoint's depth must land on so the
+    radix tree can name it. Pass the page the tree actually allocates on: DCP
+    widens it past ``mamba_cache_chunk_size``, and deriving that here would be a
+    second copy of a predicate that already lives in the cache builder."""
+    return math.lcm(mamba_cache_chunk_size(), tree_page)
+
+
+def mamba_track_grid(tree_page: int) -> int:
+    """The same granularity for a decode-donated checkpoint, which additionally
+    has to land on the requested ``mamba_track_interval``."""
+    return math.lcm(
+        mamba_checkpoint_grid(tree_page), get_exec().mamba.mamba_track_interval
+    )
 
 
 def max_speculative_num_draft_tokens() -> int | None:

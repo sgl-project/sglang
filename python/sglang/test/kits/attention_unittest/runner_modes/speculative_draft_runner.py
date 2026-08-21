@@ -359,7 +359,6 @@ def _build_eagle_draft_fixture(
     )
     _configure_runner_for_eagle_draft(fixture.runner, case, settings)
     draft_attn_backend = DraftBackendFactory(
-        fixture.runner.server_args,
         fixture.runner,
         settings.topk,
         settings.speculative_num_steps,
