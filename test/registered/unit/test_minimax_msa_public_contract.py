@@ -111,9 +111,7 @@ def test_public_loader_rejects_missing_forwarded_abi_keywords(monkeypatch):
     monkeypatch.setitem(sys.modules, "flashinfer", fake_flashinfer)
     msa._load_flashinfer_msa.cache_clear()
     try:
-        with pytest.raises(
-            msa.MSAUnavailableError, match="causal.*softmax_scale"
-        ):
+        with pytest.raises(msa.MSAUnavailableError, match="causal.*softmax_scale"):
             msa._load_flashinfer_msa()
     finally:
         msa._load_flashinfer_msa.cache_clear()

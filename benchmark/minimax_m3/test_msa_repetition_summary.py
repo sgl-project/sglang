@@ -78,9 +78,7 @@ class MSARepetitionSummaryTest(unittest.TestCase):
             result = probe_blackwell_msa_route_manifest(root)
 
         self.assertEqual(result["path"], str(path.resolve()))
-        self.assertEqual(
-            result["required_routes"], sorted(REQUIRED_TP4_SM103_ROUTES)
-        )
+        self.assertEqual(result["required_routes"], sorted(REQUIRED_TP4_SM103_ROUTES))
 
     def test_route_manifest_rejects_missing_decode_source(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
