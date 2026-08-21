@@ -26,10 +26,16 @@ def validate_dsv4_dcp_topology(
     attn_tp_size: int,
     attn_tp_rank: int,
     attn_dp_size: int,
+    comm_backend: str = "ag_rs",
     disaggregation_mode: str = "null",
 ) -> None:
     if dcp_size <= 1:
         return
+    if comm_backend != "ag_rs":
+        raise NotImplementedError(
+            "DeepSeek V4 DCP currently supports only the ag_rs communication "
+            f"backend; got dcp_comm_backend={comm_backend!r}."
+        )
     if disaggregation_mode != "null":
         raise NotImplementedError(
             "DeepSeek V4 DCP does not support disaggregated serving yet; "

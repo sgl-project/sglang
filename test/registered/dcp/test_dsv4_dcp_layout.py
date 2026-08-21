@@ -42,6 +42,19 @@ class TestDSV4DCPLayout(CustomTestCase):
                 attn_dp_size=2,
             )
 
+    def test_topology_rejects_unvalidated_comm_backends(self):
+        for comm_backend in ("a2a", "fi_a2a"):
+            with self.subTest(comm_backend=comm_backend):
+                with self.assertRaisesRegex(NotImplementedError, "only the ag_rs"):
+                    validate_dsv4_dcp_topology(
+                        dcp_size=8,
+                        dcp_rank=0,
+                        attn_tp_size=8,
+                        attn_tp_rank=0,
+                        attn_dp_size=1,
+                        comm_backend=comm_backend,
+                    )
+
     def test_topology_rejects_disaggregation(self):
         with self.assertRaisesRegex(NotImplementedError, "disaggregated serving"):
             validate_dsv4_dcp_topology(
