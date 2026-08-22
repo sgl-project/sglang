@@ -25,6 +25,10 @@ pip install uv
 uv pip install --prerelease=allow sglang
 ```
 
+<Note>
+Some of SGLang's dependencies only publish pre-releases on PyPI, so without `--prerelease=allow` uv older than 0.12.0 silently installs SGLang 0.5.9. On [uv 0.12.0](https://github.com/astral-sh/uv/releases/tag/0.12.0) and newer the flag is a harmless no-op.
+</Note>
+
 The major version of Cuda is 13 by default. To install sglang under Cuda 12 with pip or uv, please try the following commands:
 ```bash Command
 pip install --upgrade pip
