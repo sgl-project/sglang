@@ -187,9 +187,30 @@ class TestTextEncoderQuantization(unittest.TestCase):
             TextEncoder,
             {},
             "/model/text_encoder",
+            "/model/text_encoder",
             "text_encoder",
         )
         self.assertIs(model_config.quant_config, self.serialized)
+
+    def test_weight_file_metadata_configures_native_encoder(self):
+        model_config = SimpleNamespace(quant_config=None)
+        self.get_quant_config.return_value = None
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.loader.component_loaders."
+            "text_encoder_loader.get_quant_config_from_safetensors_metadata",
+            return_value=self.serialized,
+        ) as get_file_quant_config:
+            _configure_encoder_quantization(
+                model_config,
+                TextEncoder,
+                {},
+                "/model/text_encoder",
+                "/weights/encoder.safetensors",
+                "text_encoder",
+            )
+
+        self.assertIs(model_config.quant_config, self.serialized)
+        get_file_quant_config.assert_called_once_with("/weights/encoder.safetensors")
 
     def test_encoder_must_use_native_loader(self):
         model_config = SimpleNamespace(quant_config=None)
@@ -200,6 +221,7 @@ class TestTextEncoderQuantization(unittest.TestCase):
                 model_config,
                 nn.Module,
                 {},
+                "/model/text_encoder",
                 "/model/text_encoder",
                 "text_encoder",
             )
@@ -225,6 +247,7 @@ class TestTextEncoderQuantization(unittest.TestCase):
                     SimpleNamespace(architectures=[architecture], quant_config=None),
                     component_config,
                     "/model/text_encoder",
+                    "/model/text_encoder",
                     "text_encoder",
                 )
         self.get_quant_config.assert_not_called()
@@ -243,6 +266,7 @@ class TestTextEncoderQuantization(unittest.TestCase):
                         "quant_method": "bitsandbytes",
                     }
                 },
+                "/model/text_encoder",
                 "/model/text_encoder",
                 "text_encoder",
             )
@@ -264,6 +288,7 @@ class TestTextEncoderQuantization(unittest.TestCase):
                     }
                 },
                 "/model/text_encoder",
+                "/model/text_encoder",
                 "text_encoder",
             )
 
@@ -283,6 +308,7 @@ class TestTextEncoderQuantization(unittest.TestCase):
                         "quant_method": "bitsandbytes",
                     }
                 },
+                "/model/text_encoder",
                 "/model/text_encoder",
                 "text_encoder",
             )
