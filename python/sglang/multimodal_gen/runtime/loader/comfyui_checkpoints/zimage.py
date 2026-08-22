@@ -5,7 +5,7 @@ import re
 from typing import Any
 
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
-from sglang.multimodal_gen.runtime.loader.comfyui_checkpoint import (
+from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints.spec import (
     ComfyUICheckpointSpec,
     WeightIterator,
     register_comfyui_checkpoint,
