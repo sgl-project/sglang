@@ -1217,6 +1217,11 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if io_backend not in ("kernel", "direct"):
+            raise ValueError(
+                f"Unsupported IO backend for models with head_dim != v_head_dim: "
+                f"{io_backend}; expected 'kernel' or 'direct'."
+            )
         (
             device_k_data_ptrs,
             device_v_data_ptrs,
