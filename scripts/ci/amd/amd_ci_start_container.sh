@@ -4,26 +4,32 @@ set -euo pipefail
 # Get version from git tags
 SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if git tags are found
 
-# Fetch tags from origin to ensure we have the latest
-if git fetch --tags origin; then
-  # Use the shared helper so stable/post releases sort above rc tags.
-  VERSION_FROM_TAG=$(python3 scripts/release/get_version_tag.py --tag-only || true)
-  if [ -n "$VERSION_FROM_TAG" ]; then
-    SGLANG_VERSION="$VERSION_FROM_TAG"
-    echo "Using SGLang version from git tags: $SGLANG_VERSION"
-  else
-    echo "Warning: No version tags found; using default $SGLANG_VERSION" >&2
-  fi
+# Read the tag name off the remote; the helper explains why this must not go
+# back to `git fetch --tags origin`. Nothing later in the job needs tag objects
+# in the checkout: the editable install already resolves to a tagless
+# 0.0.0.dev1+g<sha> either way, because a depth-1 HEAD cannot describe from a tag.
+VERSION_FROM_TAG=$(python3 scripts/ci/amd/amd_ci_latest_release_tag.py || true)
+if [ -n "$VERSION_FROM_TAG" ]; then
+  SGLANG_VERSION="$VERSION_FROM_TAG"
+  echo "Using SGLang version from git tags: $SGLANG_VERSION"
 else
-  echo "Warning: Failed to fetch tags from origin; using default $SGLANG_VERSION" >&2
+  echo "Warning: No version tags resolved; using default $SGLANG_VERSION" >&2
 fi
+VERSION_RESOLVE_SECONDS=$SECONDS
 
 
 # Default base tags (can be overridden by command line arguments)
 ROCM_VERSION="rocm700"
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
-LOCAL_DOCKER_REGISTRY="10.44.14.109:5000"
+# In-network mirror of rocm/sgl-dev, reachable from the mi30x fleet, so it is
+# enabled per architecture once the GPU arch is known below.
+# AMD_CI_DOCKER_REGISTRY_MIRROR overrides that either way: a host:port to
+# retarget it, or the empty string to always pull from Docker Hub.
+DEFAULT_DOCKER_REGISTRY_MIRROR="10.44.14.109:5000"
+# Cap the mirror attempt so a degraded registry cannot cost more than the
+# Docker Hub pull it is meant to replace.
+MIRROR_PULL_TIMEOUT="${AMD_CI_MIRROR_PULL_TIMEOUT:-900}"
 
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
@@ -58,6 +64,10 @@ while [[ $# -gt 0 ]]; do
       echo "Environment:"
       echo "  ENABLE_CACHE_HOST=1|0"
       echo "      Mount /home/runner/sglang-data to /sgl-data. Defaults to 1 when RUNNER_NAME contains 300 or 35x, otherwise 0. Missing host cache falls back to container-local /sgl-data."
+      echo "  AMD_CI_DOCKER_REGISTRY_MIRROR=HOST:PORT"
+      echo "      In-network registry to pull rocm/sgl-dev from before falling back to Docker Hub. Defaults to ${DEFAULT_DOCKER_REGISTRY_MIRROR} on mi30x and to none elsewhere. Set to the empty string to always use Docker Hub."
+      echo "  AMD_CI_IMAGE_TARBALL_CACHE=1|0"
+      echo "      Cache the image as a tarball on the persistent volume so later jobs load instead of pulling. Defaults to on for mi30x, off elsewhere."
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -92,6 +102,22 @@ case "${GPU_ARCH}" in
     GPU_ARCH="mi30x"
     ;;
 esac
+
+# The mirror lives in the mi30x fleet's network. Other pools sit in a different
+# CSP and cannot route to it, where the attempt only adds a 15s connect timeout
+# ahead of the Docker Hub pull that has to happen anyway.
+if [[ -n "${AMD_CI_DOCKER_REGISTRY_MIRROR+x}" ]]; then
+  LOCAL_DOCKER_REGISTRY="${AMD_CI_DOCKER_REGISTRY_MIRROR}"
+elif [[ "${GPU_ARCH}" == "mi30x" ]]; then
+  LOCAL_DOCKER_REGISTRY="${DEFAULT_DOCKER_REGISTRY_MIRROR}"
+else
+  LOCAL_DOCKER_REGISTRY=""
+fi
+if [[ -n "${LOCAL_DOCKER_REGISTRY}" ]]; then
+  echo "Registry mirror for ${GPU_ARCH}: ${LOCAL_DOCKER_REGISTRY}"
+else
+  echo "No registry mirror for ${GPU_ARCH}; pulling from Docker Hub."
+fi
 
 
 # Set up DEVICE_FLAG based on Kubernetes pod info
@@ -147,7 +173,10 @@ find_latest_image() {
       *)     echo "Error: unsupported GPU architecture '${gpu_arch}'" >&2; return 1 ;;
   esac
 
-  # First, check local cache on the runner.
+  # First, check local cache on the runner. Note that the CI runners are
+  # docker-in-docker with ephemeral storage and each job starts the container
+  # once, so in CI this store is always cold and these probes always miss --
+  # nothing downstream may assume an image survives from an earlier job.
   for days_back in {0..6}; do
     image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
     image_id=$(docker images -q "rocm/sgl-dev:${image_tag}")
@@ -233,60 +262,6 @@ find_latest_image() {
   esac
 }
 
-# Determine which image to use
-if [[ -n "${CUSTOM_IMAGE}" ]]; then
-  # Use explicitly provided custom image
-  IMAGE="${CUSTOM_IMAGE}"
-  echo "Using custom image: ${IMAGE}"
-  if [[ "${IMAGE}" == "${LOCAL_DOCKER_REGISTRY}/"* ]]; then
-    docker pull "${IMAGE}"
-  else
-    retry_with_backoff 6 docker pull "${IMAGE}"
-  fi
-elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
-  # Build image from Dockerfile
-  if [[ -z "${GPU_ARCH_BUILD}" ]]; then
-    echo "Error: --gpu-arch is required when using --build-from-dockerfile" >&2
-    exit 1
-  fi
-
-  DOCKERFILE_DIR="${GITHUB_WORKSPACE:-$PWD}/docker"
-  DOCKERFILE="${DOCKERFILE_DIR}/rocm.Dockerfile"
-
-  if [[ ! -f "${DOCKERFILE}" ]]; then
-    echo "Error: Dockerfile not found at ${DOCKERFILE}" >&2
-    exit 1
-  fi
-
-  IMAGE="sglang-ci:${GPU_ARCH_BUILD}-$(date +%Y%m%d)"
-  echo "Building Docker image from ${DOCKERFILE} with GPU_ARCH=${GPU_ARCH_BUILD}..."
-
-  # Pass full GPU_ARCH (e.g., gfx950-rocm720) - Dockerfile handles stripping suffix
-  docker build \
-    --build-arg GPU_ARCH="${GPU_ARCH_BUILD}" \
-    --build-arg SGL_BRANCH="main" \
-    -t "${IMAGE}" \
-    -f "${DOCKERFILE}" \
-    "${DOCKERFILE_DIR}"
-  echo "Successfully built image: ${IMAGE}"
-else
-  # Find the latest pre-built image
-  IMAGE=$(find_latest_image "${GPU_ARCH}")
-  # Try the local docker registry first (avoids Docker Hub rate limits and is
-  # faster on the LAN); if that fails for any reason, fall back to the
-  # public registry with exponential-backoff retries. Capture stderr so the
-  # real failure reason (TLS handshake, 404, connection refused, etc.) is
-  # visible in the job log instead of being silently swallowed.
-  if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
-    echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
-    docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
-  else
-    echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
-    printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
-    retry_with_backoff 6 docker pull "${IMAGE}"
-  fi
-fi
-
 CACHE_HOST=/home/runner/sglang-data
 if [[ -z "${ENABLE_CACHE_HOST:-}" ]]; then
   RUNNER_NAME_LOWER="${RUNNER_NAME:-}"
@@ -317,6 +292,104 @@ case "${ENABLE_CACHE_HOST,,}" in
     exit 1
     ;;
 esac
+
+# The image tarball cache lives on that same volume, so it has to be resolved
+# before the image is acquired rather than just before `docker run`.
+# shellcheck source=scripts/ci/amd/amd_ci_image_cache.sh
+source "$(dirname "${BASH_SOURCE[0]}")/amd_ci_image_cache.sh"
+if [[ "${AMD_CI_IMAGE_TARBALL_CACHE:-}" == "0" ]]; then
+  echo "Image tarball cache disabled by AMD_CI_IMAGE_TARBALL_CACHE=0"
+  image_cache_init ""
+elif [[ -z "${CACHE_VOLUME}" ]]; then
+  echo "No persistent volume mounted; image tarball cache unavailable."
+  image_cache_init ""
+elif [[ "${AMD_CI_IMAGE_TARBALL_CACHE:-}" == "1" || "${GPU_ARCH}" == "mi30x" ]]; then
+  image_cache_init "${CACHE_HOST}"
+else
+  echo "Image tarball cache is mi30x-only for now; set AMD_CI_IMAGE_TARBALL_CACHE=1 to opt ${GPU_ARCH} in."
+  image_cache_init ""
+fi
+
+# Determine which image to use
+IMAGE_SOURCE="unknown"
+if [[ -n "${CUSTOM_IMAGE}" ]]; then
+  # Use explicitly provided custom image
+  IMAGE="${CUSTOM_IMAGE}"
+  IMAGE_SOURCE="custom-image"
+  echo "Using custom image: ${IMAGE}"
+  if [[ -n "${LOCAL_DOCKER_REGISTRY}" && "${IMAGE}" == "${LOCAL_DOCKER_REGISTRY}/"* ]]; then
+    docker pull "${IMAGE}"
+  else
+    retry_with_backoff 6 docker pull "${IMAGE}"
+  fi
+elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
+  # Build image from Dockerfile
+  if [[ -z "${GPU_ARCH_BUILD}" ]]; then
+    echo "Error: --gpu-arch is required when using --build-from-dockerfile" >&2
+    exit 1
+  fi
+
+  DOCKERFILE_DIR="${GITHUB_WORKSPACE:-$PWD}/docker"
+  DOCKERFILE="${DOCKERFILE_DIR}/rocm.Dockerfile"
+
+  if [[ ! -f "${DOCKERFILE}" ]]; then
+    echo "Error: Dockerfile not found at ${DOCKERFILE}" >&2
+    exit 1
+  fi
+
+  IMAGE="sglang-ci:${GPU_ARCH_BUILD}-$(date +%Y%m%d)"
+  echo "Building Docker image from ${DOCKERFILE} with GPU_ARCH=${GPU_ARCH_BUILD}..."
+
+  # Pass full GPU_ARCH (e.g., gfx950-rocm720) - Dockerfile handles stripping suffix
+  docker build \
+    --build-arg GPU_ARCH="${GPU_ARCH_BUILD}" \
+    --build-arg SGL_BRANCH="main" \
+    -t "${IMAGE}" \
+    -f "${DOCKERFILE}" \
+    "${DOCKERFILE_DIR}"
+  IMAGE_SOURCE="dockerfile-build"
+  echo "Successfully built image: ${IMAGE}"
+else
+  # Find the latest pre-built image
+  IMAGE=$(find_latest_image "${GPU_ARCH}")
+  pulled_from_mirror=0
+  loaded_from_cache=0
+  # Cheapest source first: a tarball on the persistent volume, seeded by
+  # whichever job missed before this one.
+  if image_cache_load "${IMAGE}"; then
+    loaded_from_cache=1
+    IMAGE_SOURCE="local-tarball"
+  elif [[ -n "${LOCAL_DOCKER_REGISTRY}" ]]; then
+    # Try the in-network mirror before Docker Hub, but bounded: it is not
+    # reliably the faster source. In run 32437655302 this pull moved 68GB at
+    # 4.3 MB/s and took 4.4h, against a Docker Hub p50 of ~7min, and the output
+    # was streamed nowhere because it used to be captured into a variable.
+    mirror_started=$SECONDS
+    if timeout "${MIRROR_PULL_TIMEOUT}" docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}"; then
+      echo "Pulled from local docker registry in $(( SECONDS - mirror_started ))s: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
+      docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
+      pulled_from_mirror=1
+    else
+      echo "Local docker registry pull gave up after $(( SECONDS - mirror_started ))s (budget ${MIRROR_PULL_TIMEOUT}s); falling back to public registry: ${IMAGE}" >&2
+    fi
+  fi
+  if (( loaded_from_cache == 0 )); then
+    if (( pulled_from_mirror == 0 )); then
+      IMAGE_SOURCE="docker-hub"
+      retry_with_backoff 6 docker pull "${IMAGE}"
+    else
+      IMAGE_SOURCE="registry-mirror"
+    fi
+    # Whatever this job had to fetch, the next one on this volume should not.
+    image_cache_save "${IMAGE}"
+  fi
+fi
+
+# One greppable line per job so the nightly dashboard can track where setup time
+# goes and which source is actually serving the image.
+echo "[amd-ci-setup] image=${IMAGE} source=${IMAGE_SOURCE}" \
+     "version_resolve=${VERSION_RESOLVE_SECONDS}s" \
+     "image_acquire=$(( SECONDS - VERSION_RESOLVE_SECONDS ))s"
 
 echo "Launching container: ci_sglang"
 docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
