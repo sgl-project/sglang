@@ -111,6 +111,7 @@ del _mod, _fn
 # Generic attention kernels migrated in Phase 2.5 (RFC #29630).
 for _mod, _fn in [
     ("utils", "mla_quantize_and_rope_for_fp8"),
+    ("utils", "mla_split_quantize_and_rope_for_fp8"),
     ("utils", "launch_reshape_and_cache_flash"),
     ("utils", "launch_reshape_and_cache_shuffle_5d"),
     ("flash_mla_sm120", "flash_mla_with_kvcache_sm120"),
