@@ -42,6 +42,7 @@ from sglang.srt.layers.moe import should_skip_post_experts_all_reduce
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import has_replicated_shared_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -197,15 +198,21 @@ class LagunaMoE(nn.Module):
     def get_moe_weights(self):
         return [x.data for x in self.experts.parameters()]
 
+    def _forward_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.shared_expert(hidden_states)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
+        skip_shared_experts: bool = False,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
 
-        shared_out = self.shared_expert(hidden_states)
+        shared_out = (
+            None if skip_shared_experts else self._forward_shared_experts(hidden_states)
+        )
 
         router_logits = self.gate(hidden_states)
         if self.router_logit_softcapping > 0.0:
@@ -221,7 +228,7 @@ class LagunaMoE(nn.Module):
         # A TP1 (replicated) shared expert already holds the full result on
         # every rank, so it must be added after the all-reduce — adding before
         # would sum it once per TP rank.
-        if self._shared_expert_tp1:
+        if shared_out is None or self._shared_expert_tp1:
             final = routed_out
         else:
             final = routed_out + shared_out
@@ -230,7 +237,7 @@ class LagunaMoE(nn.Module):
             is_tp_path=True,
         ):
             final = tensor_model_parallel_all_reduce(final)
-        if self._shared_expert_tp1:
+        if shared_out is not None and self._shared_expert_tp1:
             final = final + shared_out
         return final
 
@@ -495,10 +502,24 @@ class LagunaDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
+        _has_tp1_shared = has_replicated_shared_expert(self.mlp)
+        _dp_hoist_shared = (
+            _has_tp1_shared
+            and self.layer_communicator.should_use_dp_reduce_scatter(forward_batch)
+        )
+        _shared_local = None
+        if _dp_hoist_shared:
+            _local_rows = self.layer_communicator.get_dp_local_hidden_states(
+                hidden_states
+            )
+            if _local_rows.shape[0] > 0:
+                _shared_local = self.mlp._forward_shared_experts(_local_rows)
+
         fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
+            and not has_replicated_shared_expert(self.mlp)
         )
         mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
@@ -508,10 +529,17 @@ class LagunaDecoderLayer(nn.Module):
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch=forward_batch,
-            )
+            if _dp_hoist_shared:
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch=forward_batch,
+                    skip_shared_experts=True,
+                )
+            else:
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch=forward_batch,
+                )
 
         if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -519,6 +547,8 @@ class LagunaDecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+        if _shared_local is not None:
+            hidden_states = hidden_states + _shared_local[: hidden_states.shape[0]]
         return hidden_states, residual
 
 
