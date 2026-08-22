@@ -119,6 +119,11 @@ class BaseTpWorker(ABC):
         runners = self.model_runner_list or [self.model_runner]
         return sum(runner.weight_load_time for runner in runners)
 
+    @property
+    def preloaded_weights_bytes(self) -> int:
+        runners = self.model_runner_list or [self.model_runner]
+        return sum(runner.preloaded_weights_bytes for runner in runners)
+
     def get_pad_input_ids_func(self):
         return getattr(self.model_runner.model, "pad_input_ids", None)
 
