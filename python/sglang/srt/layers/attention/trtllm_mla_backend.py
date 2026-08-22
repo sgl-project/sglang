@@ -53,6 +53,7 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
 from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.dcp.layout import get_dcp_lens
+from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
@@ -1200,6 +1201,28 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             dcp_rank=parallel.attn_dcp_rank,
         )
 
+    def _dummy_dcp_decode_for_autotune(
+        self, q: torch.Tensor, layer: RadixAttention
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Skip decode during FlashInfer MoE autotune dummy forwards.
+
+        That pass discards attention/logits. Under DCP the synthetic
+        full-head metadata can overflow the trtllm-gen workspace (and on
+        multi-node GB300 has also produced NVLink errors). Real requests
+        and CUDA-graph capture must not take this path.
+        """
+        output = torch.zeros(
+            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
+            dtype=self.q_data_type,
+            device=q.device,
+        )
+        lse = torch.zeros(
+            (q.shape[0], layer.tp_q_head_num),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        return output, lse
+
     def forward_decode(
         self,
         q: torch.Tensor,  # q_nope
@@ -1215,6 +1238,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MLA kernel."""
+        if get_parallel().dcp_enabled and get_in_autotune_dummy_run():
+            return self._dummy_dcp_decode_for_autotune(q, layer)
+
         merge_query = q_rope is not None
         fused_fp8_query = None
         if self.data_type == torch.float8_e4m3fn:

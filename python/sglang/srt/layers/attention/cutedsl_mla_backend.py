@@ -33,7 +33,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_flashinfer_available
 
@@ -42,6 +42,7 @@ if is_flashinfer_available():
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
@@ -91,7 +92,16 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         """
         if cp_world <= 1:
             return super()._run_decode_kernel(
-                query, kv_cache, block_tables, seq_lens, max_seq_len, layer
+                query,
+                kv_cache,
+                block_tables,
+                seq_lens,
+                max_seq_len,
+                layer,
+                causal_seqs=causal_seqs,
+                cp_world=cp_world,
+                cp_rank=cp_rank,
+                return_lse=return_lse,
             )
         if causal_seqs is None:
             raise ValueError(
@@ -141,6 +151,8 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         llama_4_scaling: Optional[torch.Tensor] = None,
     ):
         parallel = get_parallel()
+        if parallel.dcp_enabled and get_in_autotune_dummy_run():
+            return self._dummy_dcp_decode_for_autotune(q, layer)
         if not parallel.dcp_enabled:
             return super().forward_decode(
                 q,
