@@ -1907,6 +1907,57 @@ class AiterAttnBackend(AttentionBackend):
             and layer.qk_head_dim == layer.v_head_dim
         )
 
+    def _forward_extend_mha_chunk(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        qo_indptr: torch.Tensor,
+        max_q_len: int,
+    ):
+        """One slice of an AttnForwardMethod.MHA_CHUNKED_KV extend.
+
+        forward_normal_chunked_kv_core has already run kv_b_proj for this slice
+        alone -- either the new tokens or a single prefix chunk -- and merges the
+        per-slice LSEs itself, so we only attend the k/v we were handed. Falling
+        through to the unchunked path instead would re-gather and up-project the
+        whole prefix (~13.2 KiB/token/layer).
+        """
+        if forward_batch.attn_attend_prefix_cache:
+            chunk_idx = forward_batch.prefix_chunk_idx
+            assert chunk_idx >= 0
+            # The chunk lies entirely in the queries' past, so no causal mask.
+            kv_indptr = forward_batch.prefix_chunk_cu_seq_lens[chunk_idx]
+            max_kv_len = forward_batch.prefix_chunk_max_seq_lens[chunk_idx]
+            causal = False
+        else:
+            kv_indptr = qo_indptr
+            max_kv_len = max_q_len
+            causal = True
+
+        attn_out = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            qo_indptr,
+            kv_indptr,
+            max_q_len,
+            max_kv_len,
+            softmax_scale=layer.scaling,
+            causal=causal,
+            return_lse=forward_batch.mha_return_lse,
+        )
+        if not forward_batch.mha_return_lse:
+            return attn_out
+        # aiter returns the softmax lse heads-first [num_heads, num_tokens];
+        # merge_state sizes its grid off the output's token/head axes and so
+        # indexes [num_tokens, num_heads]. Transpose on the way out.
+        o, lse = attn_out
+        return o, lse.transpose(0, 1).contiguous()
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -2029,6 +2080,19 @@ class AiterAttnBackend(AttentionBackend):
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
+                if forward_batch.attn_attend_prefix_cache is not None and any(
+                    forward_batch.extend_prefix_lens_cpu
+                ):  # MHA Chunk
+                    return self._forward_extend_mha_chunk(
+                        q=q,
+                        k=k,
+                        v=v,
+                        layer=layer,
+                        forward_batch=forward_batch,
+                        qo_indptr=qo_indptr,
+                        max_q_len=max_q_len,
+                    )
+
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
                 if kv_indices.shape[0] == 0 or extend_no_prefix:
                     if _use_fp8_prefill_attn:
