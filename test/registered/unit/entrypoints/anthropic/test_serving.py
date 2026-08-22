@@ -196,6 +196,23 @@ class TestAnthropicServing(unittest.TestCase):
             overrides["tools"] = tools
         return self._anthropic_request(**overrides)
 
+    def test_pd_bootstrap_fields_are_preserved_during_conversion(self):
+        request = self._anthropic_request(
+            stream=False,
+            bootstrap_host="127.0.0.1",
+            bootstrap_port=9100,
+            bootstrap_room=123456789,
+        )
+
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+
+        self.assertEqual(request.bootstrap_host, "127.0.0.1")
+        self.assertEqual(request.bootstrap_port, 9100)
+        self.assertEqual(request.bootstrap_room, 123456789)
+        self.assertEqual(chat_request.bootstrap_host, "127.0.0.1")
+        self.assertEqual(chat_request.bootstrap_port, 9100)
+        self.assertEqual(chat_request.bootstrap_room, 123456789)
+
     def test_stream_closes_tool_block_before_text_delta(self):
         serving = self._serving(
             [
