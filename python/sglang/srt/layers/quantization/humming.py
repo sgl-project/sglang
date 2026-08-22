@@ -455,13 +455,16 @@ class HummingConfig(QuantizationConfig):
             from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 
             self._w4afp8_config = W4AFp8Config.from_config(self.full_config)
+            # W4AFp8Config.from_config() hardcodes group_size and
+            # weight_block_size; carry the declared values (including an
+            # explicit null) instead of silently quantizing with the defaults.
+            # Unsupported values are rejected by checkpoint schema validation.
             if "group_size" in self.full_config:
-                # W4AFp8Config.from_config() does not read group_size from the
-                # checkpoint config; carry the declared value (including an
-                # explicit null) instead of silently quantizing with the
-                # default. Unsupported values are rejected by
-                # _W4AFp8CheckpointWeightSchema validation.
                 self._w4afp8_config.group_size = self.full_config["group_size"]
+            if "weight_block_size" in self.full_config:
+                self._w4afp8_config.weight_block_size = self.full_config[
+                    "weight_block_size"
+                ]
         # DeepSeek's MLA weight post-processing reads the dense FP8 block size
         # from the model-level quantization config before per-layer Humming
         # post-processing runs. Keep that checkpoint metadata available here

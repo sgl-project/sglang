@@ -87,6 +87,25 @@ class TestW4AFp8CheckpointSchema(CustomTestCase):
         with self.assertRaises(ValueError):
             _W4AFp8CheckpointWeightSchema(group_size=weight_config["group_size"])
 
+    def test_config_carries_declared_weight_block_size(self):
+        """Checkpoint-declared block geometry must survive config translation.
+
+        Scale shapes and the MLA post-processing both read this value; losing a
+        non-default declaration quantizes with the wrong block layout.
+        """
+        config = HummingConfig(
+            {
+                "quant_method": "w4afp8",
+                "weight_block_size": [64, 64],
+            }
+        )
+        self.assertEqual(config.weight_block_size, [64, 64])
+        _, fp8_config = config.get_checkpoint_configs_for_layer("moe")
+        self.assertEqual(fp8_config["weight_block_size"], [64, 64])
+
+        default_config = HummingConfig({"quant_method": "w4afp8"})
+        self.assertEqual(default_config.weight_block_size, [128, 128])
+
 
 class TestStackedBlockFp8Schema(CustomTestCase):
     @staticmethod
