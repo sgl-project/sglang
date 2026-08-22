@@ -370,6 +370,7 @@ class _InsertWalkState(msgspec.Struct):
     value: torch.Tensor
     params: InsertParams
     priority: int
+    key_offset: int = 0
     total_prefix_length: int = 0
     is_new_leaf: bool = False
     target_node: Optional[UnifiedTreeNode] = None
@@ -677,7 +678,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # nodes can also match, so we separately track the best device-resident
         # match for scheduler prefix indices and locking.
         node = self.root_node
-        child_key = key.child_key(self.page_size)
+        key_len = len(key)
+        key_offset = 0
+        child_key = key.child_key(self.page_size, start=key_offset)
         value: list[torch.Tensor] = []
         best_match_node = node
         best_match_device_node = node
@@ -718,14 +721,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 best_match_device_value_len = len(value)
                 best_match_device_node = node
 
-        while len(key) > 0 and child_key in node.children:
+        while key_offset < key_len and child_key in node.children:
             child = node.children[child_key]
 
             # HiCache: dead node (evicted + not backuped) — stop traversal
             if child.evicted and not child.backuped:
                 break
 
-            prefix_len = child.key.match(key, page_size=self.page_size)
+            prefix_len = child.key.match(
+                key, page_size=self.page_size, other_start=key_offset
+            )
             full_kv_hit_length += prefix_len
             if prefix_len < len(child.key):
                 node, action = self._split_node(child.key, child, prefix_len)
@@ -738,9 +743,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 value.append(child.component_data[BASE_COMPONENT_TYPE].value)
             node = child
             _update_best_if_valid(node)
-            key = key[prefix_len:]
-            if len(key):
-                child_key = key.child_key(self.page_size)
+            key_offset += prefix_len
+            if key_offset < key_len:
+                child_key = key.child_key(self.page_size, start=key_offset)
 
         return (
             value,
@@ -944,14 +949,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _insert_walk_step(self, state: _InsertWalkState) -> None:
         """Process one walked node, appending its barrier actions to the state."""
         key = state.key
-        child_key = key.child_key(self.page_size) if len(key) else None
+        child_key = (
+            key.child_key(self.page_size, start=state.key_offset)
+            if state.key_offset < len(key)
+            else None
+        )
         if child_key not in state.node.children:
             state.phase = _InsertPhase.COMMIT
             return
         step_actions = state.pending_actions
         node = state.node.children[child_key]
         self._touch_node(node)
-        prefix_len = node.key.match(key, page_size=self.page_size)
+        prefix_len = node.key.match(
+            key, page_size=self.page_size, other_start=state.key_offset
+        )
         if prefix_len < len(node.key):
             node, action = self._split_node(node.key, node, prefix_len)
             if action is not None:
@@ -998,7 +1009,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             step_actions.append(self._build_backup_kv_action(node))
         state.node = node
         state.total_prefix_length += prefix_len
-        state.key = key[prefix_len:]
+        state.key_offset += prefix_len
         state.value = state.value[prefix_len:]
 
     def _insert_commit_step(self, state: _InsertWalkState) -> None:
@@ -1007,9 +1018,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # value alone; auxiliary components (SWA, Mamba) may legitimately hold
         # only a tombstone for this span (e.g. the whole leaf is outside the SWA
         # window). Materialize it anyway so the Full KV stays cacheable.
-        if len(state.key):
+        if state.key_offset < len(state.key):
             state.target_node = self._add_new_node(
-                state.node, state.key, state.value, priority=state.priority
+                state.node,
+                state.key[state.key_offset :],
+                state.value,
+                priority=state.priority,
             )
             state.is_new_leaf = True
         else:
@@ -1749,15 +1763,18 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if total_len == 0:
             return InsertResult(prefix_len=0, mamba_exist=True)
 
-        child_key = key.child_key(self.page_size)
+        key_offset = 0
+        child_key = key.child_key(self.page_size, start=key_offset)
         matched_length = 0
         cache_actions: list[CacheAction | ComponentAction] = []
-        while len(key) > 0 and child_key in node.children:
+        while key_offset < total_len and child_key in node.children:
             node = node.children[child_key]
             self._touch_node(node)
-            prefix_len = node.key.match(key, page_size=self.page_size)
+            prefix_len = node.key.match(
+                key, page_size=self.page_size, other_start=key_offset
+            )
 
-            key = key[prefix_len:]
+            key_offset += prefix_len
             host_value = host_value[prefix_len:]
             hash_value = hash_value[prefix_len // self.page_size :]
             matched_length += prefix_len
@@ -1767,15 +1784,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 if action is not None:
                     cache_actions.append(action)
 
-            if len(key):
-                child_key = key.child_key(self.page_size)
+            if key_offset < total_len:
+                child_key = key.child_key(self.page_size, start=key_offset)
 
         result = InsertResult(
             prefix_len=matched_length,
             total_len=total_len,
             cache_actions=cache_actions,
         )
-        if len(key) == 0:
+        if key_offset == total_len:
             if (
                 node is not self.root_node
                 and node.component_data[BASE_COMPONENT_TYPE].host_value is not None
@@ -1795,7 +1812,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         new_node = self._new_node(priority=node.priority)
         new_node.parent = node
-        new_node.key = key
+        new_node.key = key[key_offset:]
         new_node.hash_value = hash_value
         new_node.component_data[BASE_COMPONENT_TYPE].host_value = host_value.clone()
         node.children[child_key] = new_node

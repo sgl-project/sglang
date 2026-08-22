@@ -907,7 +907,9 @@ class SWARadixCache(BasePrefixCache):
         node is greater than or equal to the sliding window size.
         """
         node = self.root_node
-        child_key = key.child_key(self.page_size)
+        key_len = len(key)
+        key_offset = 0
+        child_key = key.child_key(self.page_size, start=key_offset)
 
         value = []
         # for path connected to root without tombstone, always match, so set to inf
@@ -915,7 +917,7 @@ class SWARadixCache(BasePrefixCache):
         best_value_len = 0
         best_last_node = node
         enable_compact = envs.SGLANG_OPT_SWA_RADIX_CACHE_COMPACT.get()
-        while len(key) > 0 and child_key in node.children.keys():
+        while key_offset < key_len and child_key in node.children.keys():
             child = node.children[child_key]
 
             if enable_compact:
@@ -929,7 +931,9 @@ class SWARadixCache(BasePrefixCache):
                 # reset match_len_since_tombstone if we hit a tombstone node
                 match_len_since_tombstone = 0
 
-            prefix_len = child.key.match(key, page_size=self.page_size)
+            prefix_len = child.key.match(
+                key, page_size=self.page_size, other_start=key_offset
+            )
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
@@ -942,10 +946,10 @@ class SWARadixCache(BasePrefixCache):
                 if not child.swa_tombstone:
                     match_len_since_tombstone += len(child.value)
                 node = child
-                key = key[prefix_len:]
+                key_offset += prefix_len
 
-                if len(key):
-                    child_key = key.child_key(self.page_size)
+                if key_offset < key_len:
+                    child_key = key.child_key(self.page_size, start=key_offset)
 
         # handle best_value_len and best_last_node, for the case that last node is fully matched
         if match_len_since_tombstone >= self.sliding_window_size:
@@ -1148,19 +1152,23 @@ class SWARadixCache(BasePrefixCache):
             self.full_lru_list.reset_node_mru(node)
             if not node.swa_tombstone:
                 self.swa_lru_list.reset_node_mru(node)
-        if len(key) == 0:
+        key_len = len(key)
+        if key_len == 0:
             return 0
 
-        child_key = key.child_key(self.page_size)
+        key_offset = 0
+        child_key = key.child_key(self.page_size, start=key_offset)
 
         total_prefix_length = 0
-        while len(key) > 0 and child_key in node.children.keys():
+        while key_offset < key_len and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = get_last_access_time()
             self.full_lru_list.reset_node_mru(node)
             if not node.swa_tombstone:
                 self.swa_lru_list.reset_node_mru(node)
-            prefix_len = node.key.match(key, page_size=self.page_size)
+            prefix_len = node.key.match(
+                key, page_size=self.page_size, other_start=key_offset
+            )
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
@@ -1234,13 +1242,14 @@ class SWARadixCache(BasePrefixCache):
                     self.token_to_kv_pool_allocator.free(value[:prefix_len])
 
             total_prefix_length += prefix_len
-            key = key[prefix_len:]
+            key_offset += prefix_len
             value = value[prefix_len:]
 
-            if len(key):
-                child_key = key.child_key(self.page_size)
+            if key_offset < key_len:
+                child_key = key.child_key(self.page_size, start=key_offset)
 
-        if len(key):
+        if key_offset < key_len:
+            key = key[key_offset:]
             # Layout: |--- total_prefix_length ---|--- len(key) ---|
             #         ^                           ^                ^
             #         0              total_prefix_length     total_length
