@@ -39,6 +39,7 @@ from sglang.multimodal_gen.runtime.ipc_array import (
 )
 from sglang.multimodal_gen.runtime.ipc_cuda import (
     materialize_cuda_refs,
+    release_retained_producer_tensors,
     spill_cuda_tensors,
 )
 from sglang.multimodal_gen.runtime.managers.cpu_worker import CPUWorker
@@ -740,6 +741,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 with self._record_return_stage(
                     output_batch, "Scheduler.return_result.spill_cuda"
                 ):
+                    # The previous reply has already been mapped: the client
+                    # only sends the next hop after materializing the last one.
+                    release_retained_producer_tensors()
                     spill_cuda_tensors(output_batch, in_place=True)
 
             with self._record_return_stage(
