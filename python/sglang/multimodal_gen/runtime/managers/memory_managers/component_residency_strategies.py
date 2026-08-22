@@ -174,7 +174,10 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
         self.wait_for_use(module, use, state)
         tensor = _module_reference_tensor(module)
         if tensor is not None and tensor.device.type != "cpu":
-            module.to("cpu", non_blocking=True)
+            module.to(
+                "cpu",
+                non_blocking=current_platform.is_cuda() or current_platform.is_rocm(),
+            )
         self._ready_events.pop(use.component_name, None)
 
     def finish_request(
