@@ -16,7 +16,7 @@ precision are resolved independently.
 Use these paths:
 
 - `--model-path`: the base or original model
-- `--component-paths.<component>` / `--<component>-path`: replace a component from `model_index.json` or a native registered module with an independent repo or local directory
+- `--component-paths.<component>` / `--<component>-path`: replace a component from `model_index.json` or a native registered module with an independent repo/local directory; for transformer and native encoder loaders, an explicit weight filename retains the base component config
 - `--transformer-path`: a quantized transformers-style transformer component directory that already contains its own `config.json`
 - `--transformer-weights-path`: replacement transformer weights in safetensors
   format (file, directory, or Hub repository/file) or a supported GGUF file
