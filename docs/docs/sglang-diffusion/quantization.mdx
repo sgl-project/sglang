@@ -423,6 +423,27 @@ the native encoder explicitly supports. Text-encoder FP8 is approximate, is
 not enabled by default, and is rejected by MiniMax-H3's strict
 `quality="high"` deployment contract.
 
+## Transformers Component BnB4
+
+Model components that already have a native Transformers loading path can load
+serialized BitsAndBytes 4-bit checkpoints with a standard top-level
+`quantization_config`. Plain checkpoints keep using an available native SGLang
+implementation. For example, replace FLUX's T5 component with the official
+Diffusers checkpoint:
+
+```bash Command
+sglang serve \
+  --model-path black-forest-labs/FLUX.1-dev \
+  --component-paths.text_encoder_2 \
+    diffusers/FLUX.1-dev-bnb-4bit/text_encoder_2
+```
+
+The quantized component must stay resident. SGLang rejects component or
+layerwise offload, nonstandard metadata locations, and native-only component
+fallbacks for this path instead of silently changing the checkpoint contract.
+Diffusion DiT components declared under the Diffusers library use the separate
+quantization backends documented above.
+
 ## Validated ModelOpt Checkpoints
 
 This section is the canonical support matrix for the thirteen published

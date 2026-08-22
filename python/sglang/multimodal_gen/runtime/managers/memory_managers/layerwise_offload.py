@@ -1,14 +1,17 @@
 import bisect
 import ctypes
+import queue
 import re
 import resource
+import threading
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 from torch.distributed.tensor import DTensor
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.loader.utils import MappedRegions
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
@@ -210,6 +213,147 @@ def _install_host_gather_hooks(
     module.register_forward_hook(_output_to_device)
 
 
+class MappedLayerCourier:
+    """Ships a mapped layer's weights to the device off the compute thread.
+
+    A copy whose source is a checkpoint mapping is synchronous however it is
+    requested -- the driver stages unpinned memory through its own buffer -- and
+    the prefetch hooks run on the compute thread, so every such copy stalls the
+    step. This worker thread reads the mapped bytes into a pinned slot (a plain
+    memcpy when the page cache holds them) and issues the device copy from
+    there on its own stream, where it is genuinely asynchronous. The compute
+    thread's large tensor copies release the GIL, so reading layer i+1 really
+    does overlap computing layer i.
+
+    The thread only prepares device tensors and records an event; parameters
+    are rebound on the compute thread at collect time, so module state is never
+    touched concurrently.
+    """
+
+    _NUM_SLOTS = 2
+
+    def __init__(
+        self,
+        *,
+        mapped_cpu_weights: Dict[int, Dict[str, torch.Tensor]],
+        weight_metadata: Dict[int, Dict[str, Dict[str, Any]]],
+        device: torch.device,
+        pin_slots: bool,
+    ) -> None:
+        self._mapped_cpu_weights = mapped_cpu_weights
+        self._weight_metadata = weight_metadata
+        self._device = device
+        slot_bytes = max(
+            (
+                sum(t.numel() * t.element_size() for t in weights.values())
+                for weights in mapped_cpu_weights.values()
+                if weights
+            ),
+            default=0,
+        )
+        if slot_bytes <= 0:
+            raise ValueError("no mapped weights to ship")
+        self._slots = [
+            torch.empty(slot_bytes, dtype=torch.uint8, pin_memory=pin_slots)
+            for _ in range(self._NUM_SLOTS)
+        ]
+        self._slot_events: List[Optional[Any]] = [None] * self._NUM_SLOTS
+        self._stream = torch.get_device_module().Stream()
+        self._tasks: queue.Queue[Optional[int]] = queue.Queue()
+        self._results: Dict[int, Any] = {}
+        self._ready = threading.Condition()
+        self._pending: Set[int] = set()
+        self._broken = False
+        self._thread = threading.Thread(
+            target=self._run, name="mapped-layer-courier", daemon=True
+        )
+        self._thread.start()
+
+    def submit(self, layer_idx: int) -> bool:
+        """Queue a layer. False when the courier is out of service."""
+        if self._broken:
+            return False
+        with self._ready:
+            if layer_idx in self._pending or layer_idx in self._results:
+                return True
+            self._pending.add(layer_idx)
+        self._tasks.put(layer_idx)
+        return True
+
+    def pending(self, layer_idx: int) -> bool:
+        with self._ready:
+            return layer_idx in self._pending or layer_idx in self._results
+
+    def collect(self, layer_idx: int):
+        """Block until the layer is shipped; (event, {name: gpu_tensor})."""
+        with self._ready:
+            while layer_idx not in self._results:
+                if self._broken and layer_idx not in self._results:
+                    raise RuntimeError("mapped-layer courier stopped")
+                self._ready.wait(timeout=1.0)
+            outcome = self._results.pop(layer_idx)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    def close(self) -> None:
+        self._tasks.put(None)
+        self._thread.join(timeout=5.0)
+
+    def _run(self) -> None:
+        slot_turn = 0
+        while True:
+            layer_idx = self._tasks.get()
+            if layer_idx is None:
+                return
+            try:
+                outcome = self._ship(layer_idx, slot_turn)
+                slot_turn = (slot_turn + 1) % self._NUM_SLOTS
+            except BaseException as exc:  # published, never swallowed
+                outcome = exc
+                self._broken = True
+            with self._ready:
+                self._pending.discard(layer_idx)
+                self._results[layer_idx] = outcome
+                self._ready.notify_all()
+            if self._broken:
+                return
+
+    def _ship(self, layer_idx: int, slot_turn: int):
+        slot = self._slots[slot_turn]
+        previous = self._slot_events[slot_turn]
+        if previous is not None:
+            # the previous transfer through this slot must land before reuse
+            previous.synchronize()
+        tensors: Dict[str, torch.Tensor] = {}
+        offset = 0
+        with torch.inference_mode(False), torch.no_grad():
+            staged = []
+            for name, cpu_tensor in self._mapped_cpu_weights[layer_idx].items():
+                width = cpu_tensor.element_size()
+                if offset % width:
+                    offset += width - (offset % width)
+                start = offset // width
+                window = slot.view(cpu_tensor.dtype)[
+                    start : start + cpu_tensor.numel()
+                ].view(cpu_tensor.shape)
+                window.copy_(cpu_tensor)
+                offset += cpu_tensor.numel() * width
+                staged.append((name, window))
+            event = torch.get_device_module().Event()
+            with torch.get_device_module().stream(self._stream):
+                for name, window in staged:
+                    meta = self._weight_metadata[layer_idx][name]
+                    gpu_tensor = torch.empty(
+                        meta["shape"], dtype=meta["dtype"], device=self._device
+                    )
+                    gpu_tensor.copy_(window, non_blocking=True)
+                    tensors[name] = gpu_tensor
+                event.record(self._stream)
+        self._slot_events[slot_turn] = event
+        return event, tensors
+
+
 class LayerwiseOffloadManager:
     """A lightweight layerwise CPU offload manager.
 
@@ -324,6 +468,9 @@ class LayerwiseOffloadManager:
         self._weight_metadata: Dict[int, Dict[str, Dict[str, Any]]] = {}
         # layer indices that are already in gpu
         self._gpu_layers: Set[int] = set()
+        # mapped layers handed to the courier and not yet collected
+        self._mapped_courier: Optional[MappedLayerCourier] = None
+        self._courier_inflight: Set[int] = set()
         # layer_idx -> torch.get_device_module().Event for fine-grained sync, to make sure the weight is resident in pre-hook
         self._prefetch_events: Dict[int, torch.get_device_module().Event] = {}
 
@@ -855,6 +1002,11 @@ class LayerwiseOffloadManager:
             return
         if layer_idx in self._gpu_layers:
             return
+        if layer_idx in self._courier_inflight:
+            if non_blocking:
+                return
+            self._collect_mapped_layer(layer_idx)
+            return
         if self._synchronous_mps:
             cpu_weights = self._mps_cpu_weights.get(layer_idx)
             if not cpu_weights:
@@ -879,6 +1031,17 @@ class LayerwiseOffloadManager:
             # the device has no CUDA-like stream or pinned-memory support
             non_blocking = False
             stream_context = nullcontext()
+
+        # A mapped source is synchronous on this thread however the copy is
+        # requested, so hand those weights to the courier and let it overlap
+        # this layer's transfer with the previous layer's compute. Blocking
+        # callers keep the direct path: they need the weights now.
+        ship_mapped = False
+        if non_blocking and self._mapped_cpu_weights.get(layer_idx):
+            courier = self._ensure_mapped_courier()
+            if courier is not None and courier.submit(layer_idx):
+                self._courier_inflight.add(layer_idx)
+                ship_mapped = True
 
         # create gpu buffer and load from CPU buffer
         gpu_buffers: Dict[torch.dtype, torch.Tensor] = {}
@@ -908,8 +1071,11 @@ class LayerwiseOffloadManager:
             for name, meta in self._weight_metadata[layer_idx].items():
                 target = self.get_target_with_name(name)
                 if meta.get("mapped", False):
+                    if ship_mapped:
+                        # the courier stages and ships these; bound at collect
+                        continue
                     # Straight from the mapping. Not pinned, so this copy runs
-                    # on the compute stream rather than ahead of it, and a page
+                    # on the compute thread rather than ahead of it, and a page
                     # the kernel has reclaimed is faulted back in here.
                     cpu_tensor = self._mapped_cpu_weights[layer_idx][name]
                     gpu_tensor = torch.empty(
@@ -950,6 +1116,67 @@ class LayerwiseOffloadManager:
             event.record(self.copy_stream)
             self._prefetch_events[layer_idx] = event
 
+        if not ship_mapped:
+            self._gpu_layers.add(layer_idx)
+
+    def _ensure_mapped_courier(self) -> Optional[MappedLayerCourier]:
+        """The courier, built on first use; None where it cannot help."""
+        if self._mapped_courier is not None:
+            return self._mapped_courier
+        if envs.SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER:
+            return None
+        if self.copy_stream is None or self._synchronous_mps:
+            return None
+        if not self._mapped_bytes:
+            return None
+        try:
+            self._mapped_courier = MappedLayerCourier(
+                mapped_cpu_weights=self._mapped_cpu_weights,
+                weight_metadata=self._weight_metadata,
+                device=self.device,
+                pin_slots=current_platform.is_cuda(),
+            )
+            logger.info(
+                "Layerwise offload: %s ships mapped layers through a courier "
+                "thread with %d pinned slots, so their device copies overlap "
+                "compute instead of stalling it.",
+                self.layers_attr_str,
+                MappedLayerCourier._NUM_SLOTS,
+            )
+        except (RuntimeError, MemoryError, ValueError) as exc:
+            logger.info(
+                "Layerwise offload: no courier for mapped layers (%s); they "
+                "keep the synchronous copy.",
+                exc,
+            )
+            self._mapped_courier = None
+            self._mapped_bytes = self._mapped_bytes  # unchanged; direct path
+        return self._mapped_courier
+
+    def _collect_mapped_layer(self, layer_idx: int) -> None:
+        """Bind a shipped layer's tensors on the compute thread."""
+        courier = self._mapped_courier
+        try:
+            event, tensors = courier.collect(layer_idx)
+        except BaseException as exc:
+            # The courier is out of service: fall back to the direct
+            # synchronous path for this and every later layer.
+            logger.warning(
+                "Layerwise offload: courier failed for layer %d (%s); mapped "
+                "layers return to the synchronous copy.",
+                layer_idx,
+                exc,
+            )
+            self._mapped_courier = None
+            self._courier_inflight.discard(layer_idx)
+            self.prefetch_layer(layer_idx, non_blocking=False)
+            return
+        with torch.inference_mode(False), torch.no_grad():
+            for name, gpu_tensor in tensors.items():
+                target = self.get_target_with_name(name)
+                target.data = self._wrap_for_target(target, gpu_tensor)
+        torch.get_device_module().current_stream().wait_event(event)
+        self._courier_inflight.discard(layer_idx)
         self._gpu_layers.add(layer_idx)
 
     @torch.compiler.disable
@@ -995,6 +1222,11 @@ class LayerwiseOffloadManager:
             return
         if self.copy_stream is not None:
             torch.get_device_module().current_stream().wait_stream(self.copy_stream)
+
+        # A layer still in flight holds device tensors inside the courier;
+        # collecting binds and accounts for them so the release below sees them.
+        for layer_idx in list(self._courier_inflight):
+            self._collect_mapped_layer(layer_idx)
 
         for layer_idx in list(self._gpu_layers):
             self.release_layer(layer_idx, force=True)

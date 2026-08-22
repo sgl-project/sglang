@@ -10,11 +10,13 @@ from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
+    NativeComponentLoaderRequired,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
     TextEncoderLoader,
     _configure_encoder_quantization,
     _process_quantized_encoder_weights,
+    _resolve_and_configure_encoder_quantization,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     CheckpointQuantizationCapability,
@@ -33,18 +35,11 @@ class TestTextEncoderClassResolution(unittest.TestCase):
     module is used purely as a text encoder.
     """
 
-    server_args = SimpleNamespace(trust_remote_code=False, revision=None)
-
     def _resolve(self, is_encoder_decoder, architectures):
         config = SimpleNamespace(
             is_encoder_decoder=is_encoder_decoder, architectures=architectures
         )
-        with mock.patch.object(
-            transformers.AutoConfig, "from_pretrained", return_value=config
-        ):
-            return TextEncoderLoader._resolve_transformers_text_encoder_class(
-                "dummy/path", self.server_args
-            )
+        return TextEncoderLoader().resolve_native_transformers_model_class(config)
 
     def test_umt5_encoder_decoder_uses_encoder_only_class(self):
         self.assertIs(
@@ -83,16 +78,52 @@ class TestTextEncoderClassResolution(unittest.TestCase):
     def test_unknown_architecture_falls_back_to_automodel(self):
         self.assertIs(self._resolve(True, ["NotARealClass"]), transformers.AutoModel)
 
-    def test_config_load_failure_falls_back_to_automodel(self):
+    def test_bitsandbytes_native_load_requires_resident_encoder(self):
+        loaded_encoder = nn.Linear(1, 1)
+        transformers_model_class = SimpleNamespace(
+            from_pretrained=mock.Mock(return_value=loaded_encoder)
+        )
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(text_encoder_precisions=["bf16"]),
+            require_component_resident=mock.Mock(),
+            revision=None,
+            trust_remote_code=False,
+        )
+        component_config = {
+            "quantization_config": {
+                "load_in_4bit": True,
+                "quant_method": "bitsandbytes",
+            }
+        }
+
         with mock.patch.object(
-            transformers.AutoConfig,
-            "from_pretrained",
-            side_effect=OSError("no config"),
+            TextEncoderLoader,
+            "resolve_native_transformers_model_class",
+            return_value=transformers_model_class,
+        ), mock.patch(
+            "sglang.multimodal_gen.runtime.loader.component_loaders."
+            "component_loader.get_hf_config",
+            return_value=component_config,
         ):
-            cls = TextEncoderLoader._resolve_transformers_text_encoder_class(
-                "dummy/path", self.server_args
+            encoder = TextEncoderLoader().load_native(
+                "/model/text_encoder",
+                server_args,
+                "transformers",
+                "text_encoder",
             )
-        self.assertIs(cls, transformers.AutoModel)
+
+        self.assertIs(encoder, loaded_encoder)
+        server_args.require_component_resident.assert_called_once_with(
+            "text_encoder",
+            feature_name="Transformers bitsandbytes component",
+        )
+        transformers_model_class.from_pretrained.assert_called_once_with(
+            "/model/text_encoder",
+            config=component_config,
+            trust_remote_code=False,
+            revision=None,
+            torch_dtype=torch.bfloat16,
+        )
 
 
 class TestMiniMaxH3CheckpointFilter(unittest.TestCase):
@@ -175,6 +206,69 @@ class TestTextEncoderQuantization(unittest.TestCase):
                 "text_encoder",
             )
 
+    def test_standard_bitsandbytes_delegates_to_transformers(self):
+        component_config = {
+            "quantization_config": {
+                "load_in_4bit": True,
+                "quant_method": "bitsandbytes",
+            }
+        }
+
+        for architecture in (
+            "T5EncoderModel",
+            "CLIPTextModel",
+            "ThirdPartyTextEncoder",
+        ):
+            with self.subTest(architecture=architecture), self.assertRaisesRegex(
+                NativeComponentLoaderRequired,
+                "delegates serialized bitsandbytes checkpoint loading to Transformers",
+            ):
+                _resolve_and_configure_encoder_quantization(
+                    SimpleNamespace(architectures=[architecture], quant_config=None),
+                    component_config,
+                    "/model/text_encoder",
+                    "text_encoder",
+                )
+        self.get_quant_config.assert_not_called()
+
+    def test_rejects_nonstandard_bitsandbytes_metadata_location(self):
+        with self.assertRaisesRegex(
+            ComponentCheckpointUnsupportedError,
+            "requires a top-level quantization_config",
+        ):
+            _configure_encoder_quantization(
+                SimpleNamespace(quant_config=None),
+                TextEncoder,
+                {
+                    "compression_config": {
+                        "load_in_4bit": True,
+                        "quant_method": "bitsandbytes",
+                    }
+                },
+                "/model/text_encoder",
+                "text_encoder",
+            )
+
+    def test_rejects_bitsandbytes_8bit(self):
+        with self.assertRaisesRegex(
+            ComponentCheckpointUnsupportedError,
+            "supports only serialized BitsAndBytes 4-bit checkpoints",
+        ):
+            _resolve_and_configure_encoder_quantization(
+                SimpleNamespace(
+                    architectures=["ThirdPartyTextEncoder"], quant_config=None
+                ),
+                {
+                    "quantization_config": {
+                        "load_in_4bit": False,
+                        "load_in_8bit": True,
+                        "quant_method": "bitsandbytes",
+                    }
+                },
+                "/model/text_encoder",
+                "text_encoder",
+            )
+
     def test_srt_backend_is_not_admitted_without_an_adapter(self):
         model_config = SimpleNamespace(quant_config=None)
         capability = CheckpointQuantizationCapability(
@@ -207,7 +301,12 @@ class TestTextEncoderQuantization(unittest.TestCase):
             _configure_encoder_quantization(
                 model_config,
                 TextEncoder,
-                {},
+                {
+                    "quantization_config": {
+                        "load_in_4bit": True,
+                        "quant_method": "bitsandbytes",
+                    }
+                },
                 "/model/text_encoder",
                 "text_encoder",
             )
