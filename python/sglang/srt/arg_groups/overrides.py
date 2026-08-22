@@ -1650,6 +1650,41 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     return {}
 
 
+def _check_dsa_backend_constraints(
+    kv_cache_dtype: str,
+    prefill_backend: Optional[str],
+    decode_backend: Optional[str],
+    *,
+    hip: bool,
+) -> None:
+    """Validate DSA backend / platform / kv-cache-dtype constraints."""
+    chosen = {prefill_backend, decode_backend}
+
+    rocm_only = {"triton"} & chosen
+    if not hip and rocm_only:
+        raise ValueError(
+            f"The {'/'.join(sorted(rocm_only))} DSA backend is only supported on "
+            "ROCm/HIP. Pick an alternative DSA backend for CUDA "
+            "(flashmla_kv on Hopper, trtllm on Blackwell)."
+        )
+
+    cuda_fp8_unsupported = {"tilelang"} & chosen
+    if not hip and kv_cache_dtype == "fp8_e4m3" and cuda_fp8_unsupported:
+        raise ValueError(
+            f"The {'/'.join(sorted(cuda_fp8_unsupported))} DSA prefill/decode kernels "
+            "only support an fp8_e4m3 KV cache on ROCm/HIP; on CUDA they require "
+            "a bfloat16 KV cache. Use --kv-cache-dtype bfloat16, or keep "
+            "--kv-cache-dtype fp8_e4m3 and pick an fp8-capable DSA backend "
+            "(flashmla_kv on Hopper, trtllm on Blackwell)."
+        )
+
+    if hip and kv_cache_dtype != "fp8_e4m3" and rocm_only:
+        raise ValueError(
+            f"The {'/'.join(sorted(rocm_only))} DSA kernels on ROCm require "
+            "fp8_e4m3 KV cache. Use --kv-cache-dtype fp8_e4m3."
+        )
+
+
 def _check_tilelang_dsa_fp8_kv(
     kv_cache_dtype: str,
     prefill_backend: Optional[str],
@@ -1657,20 +1692,10 @@ def _check_tilelang_dsa_fp8_kv(
     *,
     hip: bool,
 ) -> None:
-    """tilelang's fp8 KV path is ROCm-only; the CUDA kernel hardcodes bfloat16.
-    Reject here instead of crashing at decode CUDA-graph capture."""
-    if (
-        not hip
-        and kv_cache_dtype == "fp8_e4m3"
-        and "tilelang" in {prefill_backend, decode_backend}
-    ):
-        raise ValueError(
-            "The tilelang DSA prefill/decode kernels only support an fp8_e4m3 KV "
-            "cache on ROCm/HIP; on CUDA they require a bfloat16 KV cache. Use "
-            "--kv-cache-dtype bfloat16 with the tilelang backend, or keep "
-            "--kv-cache-dtype fp8_e4m3 and pick an fp8-capable DSA backend "
-            "(flashmla_kv on Hopper, trtllm on Blackwell)."
-        )
+    """Backward-compatible entry point for the TileLang DSA validation."""
+    _check_dsa_backend_constraints(
+        kv_cache_dtype, prefill_backend, decode_backend, hip=hip
+    )
 
 
 @register_post_process
@@ -1732,8 +1757,9 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         return declared
 
     if not user_set_prefill and not user_set_decode and is_hip():
-        declared["dsa_prefill_backend"] = "tilelang"
-        declared["dsa_decode_backend"] = "tilelang"
+        default = "triton" if kv_cache_dtype == "fp8_e4m3" else "tilelang"
+        declared["dsa_prefill_backend"] = default
+        declared["dsa_decode_backend"] = default
     elif kv_cache_dtype == "fp8_e4m3":
         # Blackwell FP8 defaults to trtllm; Hopper FP8 to flashmla_kv.
         default = "trtllm" if major >= 10 else "flashmla_kv"
@@ -1750,7 +1776,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
-    _check_tilelang_dsa_fp8_kv(kv_cache_dtype, prefill, decode, hip=is_hip())
+    _check_dsa_backend_constraints(kv_cache_dtype, prefill, decode, hip=is_hip())
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "
         f"prefill={prefill}, decode={decode}."
