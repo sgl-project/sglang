@@ -3203,6 +3203,79 @@ class TestGlm4MoeDetector(unittest.TestCase):
         self.assertIsInstance(value, dict)
         self.assertEqual(value, {"pattern": "\\d+"})
 
+    # -- Streaming: normal text coalesced with the tool-call opener --
+
+    def _stream_collect(self, chunks):
+        """Feed chunks to a fresh detector; return (normal_text, calls by index)."""
+        detector = type(self.detector)()
+        normal_text = ""
+        tool_calls_by_index = {}
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            normal_text += result.normal_text
+            for call in result.calls:
+                if call.tool_index is not None:
+                    entry = tool_calls_by_index.setdefault(
+                        call.tool_index, {"name": "", "parameters": ""}
+                    )
+                    if call.name:
+                        entry["name"] = call.name
+                    if call.parameters:
+                        entry["parameters"] += call.parameters
+        return normal_text, tool_calls_by_index
+
+    def test_streaming_normal_text_in_same_chunk_as_tool_call_start(self):
+        """Normal text sharing an increment with the bot_token must survive.
+
+        Coalesced deltas (--stream-interval > 1, speculative decoding, or the
+        final flush) can carry "Sure, ...\n<tool_call>get_weather\n..." in one
+        chunk; the text before the bot_token used to be silently dropped.
+        """
+        chunks = [
+            "Sure, let me check the weather.\n<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n</tool_call>",
+            "",
+        ]
+        normal_text, tool_calls = self._stream_collect(chunks)
+        self.assertIn("Sure, let me check the weather.", normal_text)
+        self.assertNotIn("<tool_call>", normal_text)
+        self.assertNotIn("<arg_key>", normal_text)
+        self.assertEqual(normal_text.count("Sure"), 1)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(json.loads(tool_calls[0]["parameters"]), {"city": "Beijing"})
+
+    def test_streaming_normal_text_char_by_char(self):
+        """Control: the same prose+tool stream fed one character at a time."""
+        text = (
+            "Sure, let me check the weather.\n"
+            "<tool_call>get_weather\n<arg_key>city</arg_key>\n"
+            "<arg_value>Beijing</arg_value>\n</tool_call>"
+        )
+        normal_text, tool_calls = self._stream_collect(list(text) + ["", ""])
+        self.assertIn("Sure, let me check the weather.", normal_text)
+        self.assertNotIn("<tool_call>", normal_text)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(json.loads(tool_calls[0]["parameters"]), {"city": "Beijing"})
+
+    def test_streaming_partial_bot_token_is_held_back(self):
+        """A partial bot_token at a chunk boundary must not leak as normal text."""
+        text = (
+            "Sure, let me check the weather.\n"
+            "<tool_call>get_weather\n<arg_key>city</arg_key>\n"
+            "<arg_value>Beijing</arg_value>\n</tool_call>"
+        )
+        split = text.find("<tool_call>") + len("<tool_call")
+        normal_text, _ = self._stream_collect([text[:split], ""])
+        self.assertNotIn("<tool_call", normal_text)
+        normal_text, tool_calls = self._stream_collect(
+            [text[:split], text[split:], "", ""]
+        )
+        self.assertIn("Sure, let me check the weather.", normal_text)
+        self.assertNotIn("<tool_call>", normal_text)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+
 
 class TestGlm47MoeDetector(unittest.TestCase):
     def setUp(self):
@@ -4863,6 +4936,83 @@ class TestQwen25Detector(unittest.TestCase):
         self.assertEqual(len(result), 2, f"Expected 2 tool calls, got {len(result)}")
         cities = [json.loads(result[i]["parameters"])["city"] for i in sorted(result)]
         self.assertEqual(cities, ["NYC", "LA"])
+
+    # -- Streaming: normal text coalesced with the tool-call opener --
+
+    def _stream_collect(self, chunks):
+        """Feed chunks to a fresh detector; return (normal_text, calls by index)."""
+        detector = type(self.detector)()
+        normal_text = ""
+        tool_calls_by_index = {}
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            normal_text += result.normal_text
+            for call in result.calls:
+                if call.tool_index is not None:
+                    entry = tool_calls_by_index.setdefault(
+                        call.tool_index, {"name": "", "parameters": ""}
+                    )
+                    if call.name:
+                        entry["name"] = call.name
+                    if call.parameters:
+                        entry["parameters"] += call.parameters
+        return normal_text, tool_calls_by_index
+
+    def test_streaming_normal_text_in_same_chunk_as_tool_call_start(self):
+        """Normal text sharing an increment with the bot_token must survive.
+
+        Coalesced deltas (--stream-interval > 1, speculative decoding, or the
+        final flush) can carry "Sure, ...\n<tool_call>\n{...}" in one chunk;
+        the text before the bot_token used to be silently dropped.
+        """
+        chunks = [
+            'Sure, let me check the weather.\n<tool_call>\n{"name": "get_current_weather", "arguments": {"city": "NYC", "state": "NY", "unit": "fahrenheit"}}\n</tool_call>',
+            "",
+            "",
+        ]
+        normal_text, tool_calls = self._stream_collect(chunks)
+        self.assertIn("Sure, let me check the weather.", normal_text)
+        self.assertNotIn("<tool_call>", normal_text)
+        self.assertEqual(normal_text.count("Sure"), 1)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_current_weather")
+        self.assertEqual(
+            json.loads(tool_calls[0]["parameters"]),
+            {"city": "NYC", "state": "NY", "unit": "fahrenheit"},
+        )
+
+    def test_streaming_normal_text_char_by_char(self):
+        """Control: the same prose+tool stream fed one character at a time."""
+        text = (
+            "Sure, let me check the weather.\n"
+            '<tool_call>\n{"name": "get_current_weather", "arguments": {"city": "NYC", "state": "NY", "unit": "fahrenheit"}}\n</tool_call>'
+        )
+        normal_text, tool_calls = self._stream_collect(list(text) + ["", ""])
+        self.assertIn("Sure, let me check the weather.", normal_text)
+        self.assertNotIn("<tool_call>", normal_text)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_current_weather")
+        self.assertEqual(
+            json.loads(tool_calls[0]["parameters"]),
+            {"city": "NYC", "state": "NY", "unit": "fahrenheit"},
+        )
+
+    def test_streaming_partial_bot_token_is_held_back(self):
+        """A partial bot_token at a chunk boundary must not leak as normal text."""
+        text = (
+            "Sure, let me check the weather.\n"
+            '<tool_call>\n{"name": "get_current_weather", "arguments": {"city": "NYC", "state": "NY", "unit": "fahrenheit"}}\n</tool_call>'
+        )
+        split = text.find("<tool_call>") + len("<tool_call")
+        normal_text, _ = self._stream_collect([text[:split], ""])
+        self.assertNotIn("<tool_call", normal_text)
+        normal_text, tool_calls = self._stream_collect(
+            [text[:split], text[split:], "", ""]
+        )
+        self.assertIn("Sure, let me check the weather.", normal_text)
+        self.assertNotIn("<tool_call>", normal_text)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_current_weather")
 
 
 class TestGemma4Detector(unittest.TestCase):
