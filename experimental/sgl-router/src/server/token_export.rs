@@ -342,13 +342,6 @@ impl Uploader {
             Self::Gcs { .. } => ExportBackend::Gcs,
         }
     }
-    async fn preflight(&self) -> anyhow::Result<()> {
-        if let Self::Gcs { auth, .. } = self {
-            auth.bearer_token().await?;
-        }
-        Ok(())
-    }
-
     async fn put(&self, key: &str, body: Vec<u8>) -> anyhow::Result<()> {
         match self {
             Uploader::S3 {
@@ -510,7 +503,6 @@ pub struct TokenExportSink {
     tx: mpsc::Sender<PumpMsg>,
     metrics: Arc<MetricsRegistry>,
     backend: ExportBackend,
-    uploader: Arc<Uploader>,
     join: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
     capture_sem: Arc<tokio::sync::Semaphore>,
 }
@@ -649,10 +641,6 @@ impl TokenExportSink {
         self.backend.as_str()
     }
 
-    pub async fn preflight(&self) -> anyhow::Result<()> {
-        self.uploader.preflight().await
-    }
-
     /// Try to acquire one capture permit. Returns `None` when the pool is
     /// exhausted. Mirrors `CacheSimTee::try_acquire_capture_permit` so the
     /// same backpressure logic applies whether cache-sim is on or off.
@@ -680,7 +668,6 @@ impl TokenExportSink {
             tx,
             metrics,
             backend,
-            uploader,
             join: AsyncMutex::new(Some(join)),
             capture_sem: Arc::new(tokio::sync::Semaphore::new(max_captures.max(1))),
         })

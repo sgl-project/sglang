@@ -260,11 +260,6 @@ async fn main() -> Result<()> {
     // `/readyz` needs the index to know whether peer bootstrap has settled, and
     // `/internal/kv_snapshot` needs it to serve siblings.
     ctx.attach_kv_index(Arc::clone(&kv_index));
-    if let Some(sink) = ctx.token_export_sink.as_ref() {
-        sink.preflight()
-            .await
-            .context("initialize token export credentials")?;
-    }
     ctx.mark_ready();
 
     let app = sgl_router::server::app::build_router(ctx.clone());

@@ -53,8 +53,9 @@ with `--prefill-selector` and `--decode-selector`.
 ## Token dataset export
 
 The optional token-export tee writes gzipped NDJSON batches without blocking
-request serving. A full queue or upload backlog drops export records and
-increments `sgl_router_token_export_total`.
+request serving. Credential and upload failures do not affect router readiness.
+A full queue or upload backlog drops export records and increments
+`sgl_router_token_export_total`.
 
 Amazon S3 uses static SigV4 credentials:
 
