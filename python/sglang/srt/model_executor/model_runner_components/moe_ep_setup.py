@@ -58,8 +58,12 @@ def prepare_moe_topk(
         )
         if isinstance(module, TopK):
             routed_scaling_factor = module.topk_config.routed_scaling_factor
+            rsf_prefolded_in_topk = (
+                module.topk_config.apply_routed_scaling_factor_on_output
+            )
         else:
             routed_scaling_factor = module.routed_scaling_factor
+            rsf_prefolded_in_topk = module.apply_routed_scaling_factor_on_output
         module.waterfill_balancer = balancer_cls(
             num_routed_experts=num_physical_routed_experts,
             world_size=moe_ep_size,
@@ -68,6 +72,11 @@ def prepare_moe_topk(
             routed_scaling_factor=(
                 routed_scaling_factor if routed_scaling_factor is not None else 1.0
             ),
+            # Mirrors remap_topk_for_per_rank_shared_slots: forward_deepep
+            # skips the post-MoE rsf multiply whenever _use_aiter (aiter
+            # folds rsf into the TopK weights), so the shared-slot weight is
+            # 1.0 exactly when either signal holds.
+            rsf_prefolded_in_topk=rsf_prefolded_in_topk or _use_aiter,
         )
         num_prepared += 1
     if num_prepared:
