@@ -1,7 +1,17 @@
 """Flux adapter for the ComfyUI DiT-forward contract."""
 
+import torch
+
 from .adapter import ComfyUIModelAdapter, PackedForward
 from .base import SGLDiffusionExecutor
+
+
+def _flux_guidance_scale(guidance) -> float:
+    if guidance is None:
+        return 3.5
+    if torch.is_tensor(guidance):
+        return float(guidance.detach().reshape(-1)[0].item())
+    return float(guidance)
 
 
 class FluxAdapter(ComfyUIModelAdapter):
@@ -20,7 +30,7 @@ class FluxAdapter(ComfyUIModelAdapter):
             pooled_embeds=[y],
             height=x.shape[-2] * 8,
             width=x.shape[-1] * 8,
-            guidance_scale=3.5,
+            guidance_scale=_flux_guidance_scale(guidance),
             unpack_ctx={"height": x.shape[-2], "width": x.shape[-1], "channels": x.shape[1]},
         )
 

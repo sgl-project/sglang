@@ -46,10 +46,13 @@ def test_flux_pack_and_unpack_roundtrip() -> None:
     timestep = torch.tensor([0.5])
     context = torch.ones(1, 8, 4096)
     y = torch.ones(1, 768)
-    packed = adapter.pack(x, timestep, context, y=y, guidance=torch.tensor([3.5]))
+    packed = adapter.pack(x, timestep, context, y=y, guidance=torch.tensor([1.0]))
     assert packed.latents.ndim == 3
     assert packed.pooled_embeds[0] is y
-    assert packed.guidance_scale == 3.5
+    assert packed.guidance_scale == 1.0
     out = adapter.unpack(packed.latents, packed, x)
     assert out.shape == x.shape
     assert torch.equal(out, x)
+
+    default = adapter.pack(x, timestep, context, y=y)
+    assert default.guidance_scale == 3.5
