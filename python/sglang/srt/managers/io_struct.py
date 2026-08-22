@@ -1826,6 +1826,9 @@ class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     weight_version: Optional[str] = None
     # Optional format specification for loading
     load_format: Optional[str] = None
+    # Which model runners to update: "target" (target model only), "draft" (draft
+    # worker(s) only), or "all" (default).
+    selector: Literal["target", "draft", "all"] = "all"
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
 
@@ -1852,8 +1855,9 @@ class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
-    # Optional: Determine whether to disable updating the draft model
-    disable_draft_model: Optional[bool] = None
+    # Which model runners to update: "target" (target model only), "draft" (draft
+    # worker(s) only), or "all" (default).
+    selector: Literal["target", "draft", "all"] = "all"
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
 
@@ -2005,9 +2009,35 @@ class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
     pass
 
 
+class BeginWeightUpdateReqInput(BaseReq, kw_only=True):
+    """Open a weight-update session: unpack in-place-quantized weights on the
+    selected runners so fresh weights can be loaded into them."""
+
+    selector: Literal["target", "draft", "all"] = "all"
+
+
+class BeginWeightUpdateReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
+class EndWeightUpdateReqInput(BaseReq, kw_only=True):
+    """Close the weight-update session opened by BeginWeightUpdateReqInput."""
+
+
+class EndWeightUpdateReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
 class CheckWeightsReqInput(BaseReq, kw_only=True):
     action: str = "checksum"
     allow_quant_error: bool = False
+    # Substrings of tensor names to exclude from reset/compare/checksum.
+    skip_tensor_list: Optional[List[str]] = None
+    # Which model runners to update: "target" (target model only), "draft" (draft
+    # worker(s) only), or "all" (default).
+    selector: Literal["target", "draft", "all"] = "all"
 
 
 # Wire versions of the pydantic ParallelismInfo/ChecksumInfo in

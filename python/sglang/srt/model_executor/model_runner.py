@@ -20,7 +20,7 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -167,6 +167,11 @@ from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
+)
+from sglang.srt.model_loader.loader import (
+    post_load_weights,
+    postprocess_weight,
+    restore_weight,
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
@@ -2006,9 +2011,29 @@ class ModelRunner:
             forward_batch.token_ids_logprobs,
         )
 
-    def check_weights(self, action: str, allow_quant_error: bool = False):
+    def begin_weight_update(self) -> None:
+        """Begin a weight-update session: restore in-place-packed weights to a
+        loadable state (no-op for schemes that don't repack)."""
+        restore_weight(self.model, torch.device(self.device))
+
+    def end_weight_update(self, run_post_load: bool) -> None:
+        """End the weight-update session: optionally run model.post_load_weights
+        (when load_weights was bypassed this session, e.g. P2P/RDMA), then finalize
+        quantized weights into kernel layout."""
+        if run_post_load:
+            post_load_weights(self.model)
+        postprocess_weight(self.model, torch.device(self.device))
+
+    def check_weights(
+        self,
+        action: str,
+        allow_quant_error: bool = False,
+        skip_tensor_list: Optional[List[str]] = None,
+    ):
         return self._weight_checker.handle(
-            action=action, allow_quant_error=allow_quant_error
+            action=action,
+            allow_quant_error=allow_quant_error,
+            skip_tensor_list=skip_tensor_list,
         )
 
     def _expand_eplb_metadata_for_scale(

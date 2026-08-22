@@ -66,9 +66,11 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
+    BeginWeightUpdateReqInput,
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
+    EndWeightUpdateReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -1423,6 +1425,23 @@ class Engine(EngineScoreMixin, EngineBase):
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.destroy_weights_update_group(obj, None)
+        )
+
+    def begin_weight_update(self, selector: str = "all"):
+        """Open a weight-update session: unpack in-place-quantized weights on the
+        selected runners so update_weights_from_{distributed,tensor} can load into
+        them. Must be closed with end_weight_update()."""
+        obj = BeginWeightUpdateReqInput(selector=selector)
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.begin_weight_update(obj, None)
+        )
+
+    def end_weight_update(self):
+        """Close the session opened by begin_weight_update() and finalize quantized
+        weights into kernel layout."""
+        obj = EndWeightUpdateReqInput()
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.end_weight_update(obj, None)
         )
 
     def update_weights_from_distributed(
