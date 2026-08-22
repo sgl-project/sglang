@@ -159,6 +159,26 @@ class TestPrebuiltInputIds(unittest.TestCase):
         self.assertFalse(reqs[0].is_retracted)
         self.assertFalse(reqs[1].is_retracted)
 
+    def test_prepare_stage_markers_follow_work_order(self):
+        batch = _make_batch([])
+        markers = []
+        with patch(
+            "sglang.srt.disaggregation.decode_schedule_batch_mixin."
+            "SamplingBatchInfo.from_schedule_batch",
+            return_value=object(),
+        ):
+            ScheduleBatchDisaggregationDecodeMixin.prepare_for_prebuilt(
+                batch, stage_marker=markers.append
+            )
+        self.assertEqual(
+            markers,
+            [
+                "after_prebuilt_request_metadata_ns",
+                "after_prebuilt_tensor_metadata_ns",
+                "after_prebuilt_sampling_info_ns",
+            ],
+        )
+
     def test_spec_relay_consumes_metadata_without_input_ids(self):
         req = _PrebuiltReq(
             req_pool_idx=2,

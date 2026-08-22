@@ -2562,7 +2562,12 @@ class SchedulerDisaggregationDecodeMixin:
         self._mark_symm_dp_scheduler_stage("after_prebuilt_batch_init_ns")
 
         # construct fake completed prefill
-        new_batch.prepare_for_prebuilt()
+        stage_marker = (
+            self._mark_symm_dp_scheduler_stage
+            if self._symm_dp_scheduler_stage_timing is not None
+            else None
+        )
+        new_batch.prepare_for_prebuilt(stage_marker=stage_marker)
         self._mark_symm_dp_scheduler_stage("after_prepare_for_prebuilt_ns")
         new_batch.process_prebuilt(self.server_args, self.future_map)
         self._mark_symm_dp_scheduler_stage("after_process_prebuilt_ns")
@@ -2573,6 +2578,9 @@ class SchedulerDisaggregationDecodeMixin:
         for name in (
             "after_prebuilt_request_init_ns",
             "after_prebuilt_batch_init_ns",
+            "after_prebuilt_request_metadata_ns",
+            "after_prebuilt_tensor_metadata_ns",
+            "after_prebuilt_sampling_info_ns",
             "after_prepare_for_prebuilt_ns",
             "after_process_prebuilt_ns",
         ):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 
@@ -21,7 +21,10 @@ if TYPE_CHECKING:
 
 class ScheduleBatchDisaggregationDecodeMixin:
 
-    def prepare_for_prebuilt(self: ScheduleBatch):
+    def prepare_for_prebuilt(
+        self: ScheduleBatch,
+        stage_marker: Optional[Callable[[str], None]] = None,
+    ):
         """
         Prepare a prebuilt extend by populate metadata
         Adapted from .prepare_for_extend().
@@ -77,6 +80,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 req.pd_rebootstrap_in_progress = False
             pre_lens.append(pre_len)
 
+        if stage_marker is not None:
+            stage_marker("after_prebuilt_request_metadata_ns")
+
         # Set fields
         # The first decode input and speculative extras are seeded by
         # process_prebuilt through FutureMap, so merge/forward-entry rebuilds
@@ -105,11 +111,16 @@ class ScheduleBatchDisaggregationDecodeMixin:
         self.extend_input_logprob_token_ids = None
         self.multimodal_inputs = [r.multimodal_inputs for r in reqs]
 
+        if stage_marker is not None:
+            stage_marker("after_prebuilt_tensor_metadata_ns")
+
         # Build sampling info
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,
             self.model_config.vocab_size,
         )
+        if stage_marker is not None:
+            stage_marker("after_prebuilt_sampling_info_ns")
 
     def process_prebuilt(
         self: ScheduleBatch,

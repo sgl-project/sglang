@@ -160,6 +160,16 @@
     "change": "Split the opt-in Layer-3 transfer-admission interval at request initialization, ScheduleBatch construction, PREBUILT preparation, result processing, filtering, merge, and running-batch update boundaries.",
     "scope": "Diagnostic source only; default-off execution does not sample the host clock, and no production optimization or performance claim is attached."
   },
+  "layer3_pd_prepare_substage_telemetry": {
+    "parent_commit": "0817a250f72fc362aec84e386d4ad15cb98e9e5a",
+    "files": {
+      "python/sglang/srt/disaggregation/decode.py": "e76c914e827467961c3f2ddfc4734badf66536861363fee4befed749dba7fa69",
+      "python/sglang/srt/disaggregation/decode_schedule_batch_mixin.py": "bebdbee044ba79b130a230c378793912957053e3a476d2e59793fcecc0cf9bf6",
+      "test/registered/unit/disaggregation/test_prebuilt_input_ids.py": "b4f9dba330b2d84955bcf3c5986e535d6397738cd54d12caa8d4026f24ca3bbf"
+    },
+    "change": "When Layer-3 host telemetry is explicitly enabled, split PREBUILT preparation at request metadata, device tensor metadata, and sampling metadata boundaries.",
+    "scope": "Diagnostic source only; default-off execution passes no callback and retains the original work and ordering."
+  },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
     "tree": "b0161fbca98775c0f79999f4970de1f14a4426fb"
