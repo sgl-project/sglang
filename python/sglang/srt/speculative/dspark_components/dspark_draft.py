@@ -11,6 +11,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     SampleStepTokens,
 )
 from sglang.srt.environ import envs
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -201,7 +202,7 @@ class DraftBlockProposer:
         target_model,
         sampling_info,
     ) -> DraftProposal:
-        embed_module = target_model.get_input_embeddings()
+        embed_module = unwrap_lora_layer(target_model.get_input_embeddings())
         draft_sampler = self._draft_sampler
         all_greedy = sampling_info is None or sampling_info.is_all_greedy
         fwd = self._run_forward(

@@ -25,7 +25,10 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
     KVTransferError,
 )
-from sglang.srt.disaggregation.common.staging_handler import STAGING_WATERMARK_WAIT_S
+from sglang.srt.disaggregation.common.staging_handler import (
+    STAGING_WATERMARK_WAIT_S,
+    StagingManagerMixin,
+)
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
@@ -390,7 +393,7 @@ class TransferStatus:
         return True
 
 
-class NixlKVManager(CommonKVManager):
+class NixlKVManager(StagingManagerMixin, CommonKVManager):
     def __init__(
         self,
         args: KVArgs,
@@ -617,40 +620,6 @@ class NixlKVManager(CommonKVManager):
                 )
 
         threading.Thread(target=decode_listener_thread, daemon=True).start()
-
-    def _handle_staging_req(self, msg):
-        from sglang.srt.disaggregation.common.staging_handler import (
-            handle_staging_req,
-        )
-
-        room = int(msg[1].decode("ascii"))
-        session_id = msg[4].decode("ascii")
-        handler = self._staging_handler
-        assert (
-            handler is not None
-        ), "STAGING_REQ received before staging handler initialized"
-        decode_req = handler._room_to_decode_req.get(room)
-        if decode_req is None:
-            logger.warning(
-                "STAGING_REQ received for unregistered room=%s, skipping",
-                room,
-            )
-            return
-        prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
-        handle_staging_req(
-            msg,
-            self._staging_ctx.allocator,
-            self.kv_args,
-            self.attn_tp_size,
-            prefill_tp,
-            getattr(self, "kv_buffer_tensors", None),
-            self._staging_ctx.room_receivers,
-            self._staging_ctx.room_bootstrap,
-        )
-
-        receiver = self._staging_ctx.room_receivers.get(room)
-        if receiver is not None:
-            handler.register_wm_subscriber(receiver, session_id)
 
     def _prefetch_staging_reqs(self, room: int):
         """Send STAGING_REQ for all chunks before the prefill forward starts.
