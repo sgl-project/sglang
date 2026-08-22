@@ -69,7 +69,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     scaled_fp8_quant,
 )
-from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.configs.model_config import AttentionArch, is_qwen3_5
 from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
@@ -267,6 +267,11 @@ class AiterAttnBackend(AttentionBackend):
             and not self.use_mla
             and self.topk == 1
             and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
+        )
+        self._use_verify_gqa_packing = (
+            self._use_unified_verify
+            and is_gfx95_supported()
+            and is_qwen3_5(model_runner.model_config.hf_config)
         )
 
         # aiter kernel related initialization
@@ -2285,10 +2290,12 @@ class AiterAttnBackend(AttentionBackend):
                     v_unified = v_cache.view(
                         -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                     )
-                    if layer.tp_k_head_num == 1 and layer.tp_q_head_num > 1:
-                        # Qwen3.5 can replicate one KV head across multiple TP ranks.
-                        # Present the local KV head as per-Q-head stride-0 views so
-                        # target_verify uses the same local head mapping as the model.
+                    if (
+                        not self._use_verify_gqa_packing
+                        and layer.tp_k_head_num == 1
+                        and layer.tp_q_head_num > 1
+                    ):
+                        # Keep the legacy MHA layout outside the validated path.
                         k_unified = k_unified.expand(-1, -1, layer.tp_q_head_num, -1)
                         v_unified = v_unified.expand(-1, -1, layer.tp_q_head_num, -1)
 
