@@ -234,9 +234,11 @@ sglang serve --model-path meituan-longcat/LongCat-Image \
   --port 30010
 ```
 
-SANA-Video supports the same path for fixed-resolution serving. Its default
-text stage emits a fixed 300-token prompt shape, so the runtime reuses one
-graph across prompt lengths without padding it to a generic text bucket:
+SANA-Video supports the same path for fixed-shape serving. Its default text
+stage emits a fixed 300-token prompt shape, so the runtime reuses one graph
+across prompt lengths without padding it to a generic text bucket. BCG also
+requires the serving frame count to match warmup; the example captures the
+model's default 81-frame signature:
 
 ```bash Command
 sglang serve \

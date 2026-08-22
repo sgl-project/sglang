@@ -147,9 +147,8 @@ Kernels are written against a specific eager chain in a specific model, so cover
 | LTX-2 | QK-norm + split RoPE, ada-values split, RMSNorm+modulate, modulate, residual-gate add, linear+GELU |
 | LTX-2.5 decoder | paired 3D RoPE with shared axis-table cache |
 | HunyuanVideo | QKV+RoPE pack, strided QK RMSNorm, linear+GELU |
-| SANA-Video | paired fp64 interleaved RoPE |
 | Sana | LN+modulate, GLUMB bias+SiLU / bias+GLU, residual-gate add |
-| SANA-Video | Packed QKV/KV; BF16-input linear attention at `quality=high` |
+| SANA-Video | Packed QKV/KV; paired fp64 interleaved RoPE; LN+modulate, GLUMB bias+SiLU / bias+GLU, and residual-gate add during BCG; BF16-input linear attention at `quality=high` |
 | Sana-WM | bidirectional gated delta-net, fused QK inverse-RMS |
 | Wan | temb table slices; VAE cat+pad and DupUp3D add, `channels_last_3d` RMSNorm+SiLU |
 | Cosmos3 / Krea2 / MiniMax-H3 | QK-norm + RoPE (Krea2 also CuTe-DSL norm+scale/shift; MiniMax-H3 also indexed modulation) |
