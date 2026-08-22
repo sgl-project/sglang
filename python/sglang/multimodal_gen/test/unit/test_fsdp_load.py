@@ -387,6 +387,46 @@ class TestRankLocalSafetensorsRead(unittest.TestCase):
                 rank_local_checkpoint.tp_local_shape(sources, 0, 2), (4, 4)
             )
 
+    def test_reads_tp_local_fused_merged_column_per_logical_matrix(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            file_path = str(Path(temp_dir) / "model.safetensors")
+            q = torch.arange(16, dtype=torch.bfloat16).reshape(4, 4)
+            k = torch.arange(16, 32, dtype=torch.bfloat16).reshape(4, 4)
+            v = torch.arange(32, 48, dtype=torch.bfloat16).reshape(4, 4)
+            fused = torch.cat((q, k, v), dim=0)
+            save_file({"qkv": fused}, file_path)
+            sources = [self._source(file_path, "qkv", (12, 4))]
+
+            with safe_open(file_path, framework="pt", device="cpu") as handle:
+                naive = rank_local_checkpoint.read_tp_local_tensor(
+                    sources,
+                    {file_path: handle},
+                    shard_dim=0,
+                    tp_rank=0,
+                    tp_size=2,
+                )
+                rank0 = rank_local_checkpoint.read_tp_local_tensor(
+                    sources,
+                    {file_path: handle},
+                    shard_dim=0,
+                    tp_rank=0,
+                    tp_size=2,
+                    output_sizes=[4, 4, 4],
+                )
+                rank1 = rank_local_checkpoint.read_tp_local_tensor(
+                    sources,
+                    {file_path: handle},
+                    shard_dim=0,
+                    tp_rank=1,
+                    tp_size=2,
+                    output_sizes=[4, 4, 4],
+                )
+
+            torch.testing.assert_close(naive, fused[:6])
+            torch.testing.assert_close(rank0, torch.cat((q[:2], k[:2], v[:2])))
+            torch.testing.assert_close(rank1, torch.cat((q[2:], k[2:], v[2:])))
+            self.assertFalse(torch.equal(rank0, naive))
+
     def test_reads_tp_local_merged_row_slice(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             file_path = str(Path(temp_dir) / "model.safetensors")
