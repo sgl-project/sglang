@@ -34,11 +34,11 @@ import warnings
 import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import timedelta
 from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.distributed
@@ -3428,6 +3428,157 @@ def monkey_patch_vllm_parallel_state(reverse: bool = False):
         setattr(vllm_parallel_state, "get_pp_group", get_pp_group)
         setattr(vllm_parallel_state, "get_tp_group", get_tp_group)
         setattr(vllm_parallel_state, "get_world_group", get_world_group)
+
+
+@dataclass
+class RankParallelismConfig:
+    """
+    Complete parallelism configuration for a single inference rank.
+
+    This configuration captures all the parallelism settings needed to recreate
+    a model shard outside of sglang. It supports:
+    - TP/PP/EP for model parallelism
+    - MoE-TP/Attn-TP/Attn-DP for MoE and DP attention.
+    """
+
+    tp_size: int = 1
+    tp_rank: int = 0
+    pp_size: int = 1
+    pp_rank: int = 0
+    ep_size: int = 1
+    ep_rank: int = 0
+    moe_tp_size: int = 1
+    moe_tp_rank: int = 0
+    attn_tp_size: int = 1
+    attn_tp_rank: int = 0
+    attn_dp_size: int = 1
+    attn_dp_rank: int = 0
+    attn_cp_size: int = 1
+    attn_cp_rank: int = 0
+    moe_dp_size: int = 1
+    moe_dp_rank: int = 0
+
+    world_size: int = 1
+    global_rank: int = 0
+    local_rank: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "RankParallelismConfig":
+        """Create from dictionary, filtering unknown fields."""
+        import dataclasses
+
+        valid_fields = {f.name for f in dataclasses.fields(cls)}
+        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered_data)
+
+    @classmethod
+    def from_parallel_state(cls, local_rank: int = 0) -> "RankParallelismConfig":
+        """Extract current parallelism settings from the global parallel state."""
+        parallel = get_parallel()
+        return cls(
+            tp_size=parallel.tp_size,
+            tp_rank=parallel.tp_rank,
+            pp_size=parallel.pp_size,
+            pp_rank=parallel.pp_rank,
+            moe_tp_size=parallel.moe_tp_size,
+            moe_tp_rank=parallel.moe_tp_rank,
+            attn_tp_size=parallel.attn_tp_size,
+            attn_tp_rank=parallel.attn_tp_rank,
+            attn_dp_size=parallel.attn_dp_size,
+            attn_dp_rank=parallel.attn_dp_rank,
+            attn_cp_size=parallel.attn_cp_size,
+            attn_cp_rank=parallel.attn_cp_rank,
+            moe_dp_size=parallel.moe_dp_size,
+            moe_dp_rank=parallel.moe_dp_rank,
+            ep_size=parallel.moe_ep_size,
+            ep_rank=parallel.moe_ep_rank,
+            world_size=parallel.launch_world_size,
+            global_rank=parallel.launch_world_rank,
+            local_rank=local_rank,
+        )
+
+
+class ParallelismContext:
+    """
+    Context manager for creating model replicas with specific parallelism settings.
+
+    Temporarily overrides runtime parallel context to create model shards outside of a
+    real distributed environment.
+    Usage:
+        with ParallelismContext(RankParallelismConfig.from_dict(parallelism_info)):
+            model = get_model(...)
+    """
+
+    def __init__(self, parallelism_config: RankParallelismConfig):
+        self.config = parallelism_config
+        self._parallel_scope = None
+
+    def _create_mock_group(self, world_size: int, rank_in_group: int):
+        """Create a mock group coordinator with all necessary properties."""
+        mock_group = MagicMock()
+        mock_group.world_size = world_size
+        mock_group.rank_in_group = rank_in_group
+        mock_group.rank = rank_in_group
+        mock_group.local_rank = rank_in_group
+        mock_group.ranks = list(range(world_size))
+        mock_group.first_rank = 0
+        mock_group.last_rank = world_size - 1
+        mock_group.is_first_rank = rank_in_group == 0
+        mock_group.is_last_rank = rank_in_group == world_size - 1
+        mock_group.next_rank = mock_group.ranks[(rank_in_group + 1) % world_size]
+        mock_group.prev_rank = mock_group.ranks[(rank_in_group - 1) % world_size]
+        return mock_group
+
+    def __enter__(self):
+        conf = self.config
+        self._parallel_scope = get_parallel().override(
+            tp_size=conf.tp_size,
+            tp_rank=conf.tp_rank,
+            pp_size=conf.pp_size,
+            pp_rank=conf.pp_rank,
+            moe_tp_size=conf.moe_tp_size,
+            moe_tp_rank=conf.moe_tp_rank,
+            attn_tp_size=conf.attn_tp_size,
+            attn_tp_rank=conf.attn_tp_rank,
+            attn_dp_size=conf.attn_dp_size,
+            attn_dp_rank=conf.attn_dp_rank,
+            attn_cp_size=conf.attn_cp_size,
+            attn_cp_rank=conf.attn_cp_rank,
+            moe_dp_size=conf.moe_dp_size,
+            moe_dp_rank=conf.moe_dp_rank,
+            ep_size=conf.ep_size,
+            moe_ep_size=conf.ep_size,
+            moe_ep_rank=conf.ep_rank,
+            enable_dp_attention=conf.attn_dp_size > 1,
+            dp_size=conf.attn_dp_size,
+            dp_rank=conf.attn_dp_rank,
+            launch_world_size=conf.world_size,
+            launch_world_rank=conf.global_rank,
+            attn_dcp_size=1,
+            attn_dcp_rank=0,
+            dcp_size=1,
+            dcp_rank=0,
+            shared_experts_tp_size=conf.tp_size,
+            world_group=self._create_mock_group(conf.world_size, conf.global_rank),
+            tp_group=self._create_mock_group(conf.tp_size, conf.tp_rank),
+            pp_group=self._create_mock_group(conf.pp_size, conf.pp_rank),
+            moe_ep_group=self._create_mock_group(conf.ep_size, conf.ep_rank),
+            moe_tp_group=self._create_mock_group(conf.moe_tp_size, conf.moe_tp_rank),
+            moe_dp_group=self._create_mock_group(conf.moe_dp_size, conf.moe_dp_rank),
+            attn_tp_group=self._create_mock_group(conf.attn_tp_size, conf.attn_tp_rank),
+            attn_cp_group=self._create_mock_group(conf.attn_cp_size, conf.attn_cp_rank),
+            shared_experts_tp_group=self._create_mock_group(conf.tp_size, conf.tp_rank),
+            dcp_group=self._create_mock_group(1, 0),
+        )
+        self._parallel_scope.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        return self._parallel_scope.__exit__(*args)
 
 
 # Use `get_parallel()` outside this package. Warn once per deprecated getter.
