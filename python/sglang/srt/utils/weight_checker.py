@@ -323,7 +323,11 @@ def _build_check_entries(
             continue  # compared via its weight's comparable
         if name in quantized_set:
             qw = quantized_set[name]
-            yield CheckEntry(name, True, qw.comparable_cls(tensor, raw[qw.scale_name]))
+            yield CheckEntry(
+                name,
+                name not in skip_compare_names,
+                qw.comparable_cls(tensor, raw[qw.scale_name]),
+            )
         else:
             should_compare = name not in skip_compare_names and (
                 not _is_non_persistent_buffer_name(name)
