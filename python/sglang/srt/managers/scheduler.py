@@ -178,6 +178,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    UpdateWeightVersionReqInput,
+    UpdateWeightVersionReqOutput,
     sock_send,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
@@ -1602,6 +1604,10 @@ class Scheduler(
                 (
                     UpdateWeightsFromIPCReqInput,
                     self.weight_updater.update_weights_from_ipc,
+                ),
+                (
+                    UpdateWeightVersionReqInput,
+                    self.handle_update_weight_version,
                 ),
                 (
                     GetWeightsByNameReqInput,
@@ -4561,6 +4567,20 @@ class Scheduler(
 
         barrier(group=self.tp_group.cpu_group)
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
+
+    def handle_update_weight_version(
+        self, recv_req: UpdateWeightVersionReqInput
+    ) -> UpdateWeightVersionReqOutput:
+        self.record_weight_version_change(new_version=recv_req.new_version)
+        return UpdateWeightVersionReqOutput()
+
+    def record_weight_version_change(self, new_version: Optional[str]) -> None:
+        if new_version is None or new_version == get_serving().weight_version:
+            return
+
+        old_version = get_serving().weight_version
+        get_context().override("scheduler.weight_version", weight_version=new_version)
+        logger.info(f"Weight version changed. {old_version=} {new_version=}")
 
     def collect_inflight_reqs(self) -> Set[Req]:
         if self.ps.pp_size == 1:
