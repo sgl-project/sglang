@@ -18,6 +18,7 @@ CI test (reduced):
 
 import dataclasses
 import gc
+import sys
 from typing import Dict, List, Tuple
 
 import pytest
@@ -272,4 +273,4 @@ class TestParallelismContextIntegration:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -4,7 +4,7 @@ import concurrent.futures
 import functools
 import logging
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -58,7 +58,6 @@ from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_gather_hidden_states,
     dsa_cp_reduce_scatter_hidden_states,
 )
-from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
     cp_materialize_global_token_order,
     cp_round_robin_input_ids_v2,
@@ -1678,7 +1677,7 @@ class MQALayer(MqaAttentionBase):
                     o,
                     self.attn_mqa.layer_id,
                     self.compress_ratio,
-                    attn_sink,
+                    self._attn_sink_local,
                     save_kv_cache,
                 )
             else:
@@ -1689,7 +1688,7 @@ class MQALayer(MqaAttentionBase):
                     layer=self.attn_mqa,
                     forward_batch=forward_batch,
                     compress_ratio=self.compress_ratio,
-                    attn_sink=attn_sink,
+                    attn_sink=self._attn_sink_local,
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
