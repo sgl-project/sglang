@@ -1809,8 +1809,9 @@ def uninstall_fake_smg():
 
 @pytest.fixture
 def isolate_sidecar(monkeypatch):
-    """Provide the production-ready context while isolating reporter wiring."""
+    """Isolate sidecar I/O and leave runtime config unpublished."""
     from sglang.srt.entrypoints import grpc_server
+    from sglang.srt.runtime_context import reset_context
 
     async def _noop_sidecar(host, port, app):
         return types.SimpleNamespace(cleanup=_acleanup)
@@ -1818,12 +1819,11 @@ def isolate_sidecar(monkeypatch):
     async def _acleanup():
         return None
 
+    reset_context()
     monkeypatch.setattr(grpc_server, "_start_sidecar_server", _noop_sidecar)
     monkeypatch.setattr(grpc_server, "_add_admin_routes", lambda app, rm: None)
-    monkeypatch.setattr(
-        grpc_server, "get_parallel", lambda: types.SimpleNamespace(dp_size=1)
-    )
     yield
+    reset_context()
 
 
 class TestReporterEnabledWithCapability:

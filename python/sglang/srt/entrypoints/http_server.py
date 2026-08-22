@@ -399,7 +399,7 @@ async def lifespan(fast_api_app: FastAPI):
         # Only the single-tokenizer process owns the reporter port and runtime.
         if single_tokenizer:
             snapshot_source = ManagerLoadSnapshotSource(
-                _global_state.tokenizer_manager, range(get_parallel().dp_size)
+                _global_state.tokenizer_manager, range(server_args.dp_size)
             )
             reporter_handle = await start_load_reporter(
                 server_args,
