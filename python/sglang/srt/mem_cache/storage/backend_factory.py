@@ -13,6 +13,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _get_hf3fs_bytes_per_page(mem_pool_host: Any) -> int:
+    """Return the HF3FS page size for a host pool.
+
+    DeepSeek-V4 uses a logical KV anchor for the primary pool.  The anchor
+    owns page indices but no KV buffer, so its per-token size is zero.  HF3FS
+    still needs a non-zero page size to initialize its metadata/file client;
+    the actual KV data is registered later through the hybrid pool v2 paths.
+    """
+    if getattr(mem_pool_host, "kv_buffer", None) is None:
+        return 4096 if mem_pool_host.layout in ["page_first", "page_first_direct"] else 1
+
+    if mem_pool_host.layout in ["page_first", "page_first_direct"]:
+        return mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
+    if mem_pool_host.layout == "layer_first":
+        return mem_pool_host.get_size_per_token() * mem_pool_host.page_size
+    raise ValueError(f"Unsupported host pool layout: {mem_pool_host.layout!r}")
+
+
 class StorageBackendFactory:
     """Factory for creating storage backend instances with support for dynamic loading."""
 
@@ -170,14 +188,7 @@ class StorageBackendFactory:
             return backend
         elif backend_name == "hf3fs":
             # Calculate bytes_per_page based on memory pool layout
-            if mem_pool_host.layout in ["page_first", "page_first_direct"]:
-                bytes_per_page = (
-                    mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
-                )
-            elif mem_pool_host.layout == "layer_first":
-                bytes_per_page = (
-                    mem_pool_host.get_size_per_token() * mem_pool_host.page_size
-                )
+            bytes_per_page = _get_hf3fs_bytes_per_page(mem_pool_host)
 
             dtype = mem_pool_host.dtype
             return backend_class.from_env_config(bytes_per_page, dtype, storage_config)
