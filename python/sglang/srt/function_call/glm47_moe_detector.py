@@ -96,13 +96,29 @@ def get_argument_type(
 def _argument_schema_allows_null(
     func_name: str, arg_key: str, defined_tools: List[Tool]
 ) -> bool:
-    """Return whether an argument's JSON Schema type explicitly allows null."""
-    arg_spec = _get_argument_schema(func_name, arg_key, defined_tools)
-    if arg_spec is None:
+    """Return whether an argument's JSON Schema explicitly allows null."""
+    return _schema_allows_null(_get_argument_schema(func_name, arg_key, defined_tools))
+
+
+def _schema_allows_null(schema: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(schema, dict):
         return False
 
-    argument_types = arg_spec.get("type")
-    return isinstance(argument_types, list) and "null" in argument_types
+    argument_types = schema.get("type")
+    if argument_types == "null" or (
+        isinstance(argument_types, list) and "null" in argument_types
+    ):
+        return True
+
+    # pydantic/OpenAPI emit Optional[X] as anyOf/oneOf with a null branch
+    for keyword in ("anyOf", "oneOf"):
+        sub_schemas = schema.get(keyword)
+        if isinstance(sub_schemas, list) and any(
+            _schema_allows_null(sub) for sub in sub_schemas
+        ):
+            return True
+
+    return False
 
 
 def _convert_to_number(value: str) -> Any:
