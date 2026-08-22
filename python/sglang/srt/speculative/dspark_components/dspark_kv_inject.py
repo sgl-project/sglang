@@ -105,7 +105,9 @@ class TargetHiddenKvInjector:
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
     ) -> None:
-        if is_unified_kv_triton():
+        if is_unified_kv_triton() and not getattr(
+            pool, "unified_swa_is_sidecar", False
+        ):
             swa_loc = self._unified_inject_loc(
                 pool=pool,
                 positions=positions,
@@ -115,8 +117,10 @@ class TargetHiddenKvInjector:
                 final_pos=final_pos,
             )
         else:
-            swa_loc = pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)
+            swa_loc = pool.translate_draft_committed_loc(cache_loc).to(torch.int32)
             if commit_lens is not None and cache_loc_2d is not None:
+                # Verify candidates are step-scoped. Only the committed prefix
+                # is materialized into the content-scoped draft SWA sidecar.
                 bs, verify_len = cache_loc_2d.shape
                 col = torch.arange(verify_len, device=cache_loc.device).view(1, -1)
                 committed_mask = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(
@@ -188,7 +192,9 @@ class TargetHiddenKvInjector:
         if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
             if hidden_strided.numel() == 0:
                 return
-            if is_unified_kv_triton():
+            if is_unified_kv_triton() and not getattr(
+                pool, "unified_swa_is_sidecar", False
+            ):
                 inject_layout = build_unified_commit_inject_layout(
                     req_pool_indices=batch.req_pool_indices,
                     prefix_lens=prefix_lens,

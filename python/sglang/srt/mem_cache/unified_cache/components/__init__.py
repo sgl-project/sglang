@@ -1,3 +1,6 @@
+from sglang.srt.mem_cache.unified_cache.components.draft_swa_sidecar_component import (
+    DraftSWASidecarComponent,
+)
 from sglang.srt.mem_cache.unified_cache.components.full_component import FullComponent
 from sglang.srt.mem_cache.unified_cache.components.mamba_component import MambaComponent
 from sglang.srt.mem_cache.unified_cache.components.swa_component import SWAComponent
@@ -20,6 +23,7 @@ __all__ = [
     "BASE_COMPONENT_TYPE",
     "ComponentData",
     "ComponentType",
+    "DraftSWASidecarComponent",
     "EvictLayer",
     "FullComponent",
     "CacheTransferPhase",

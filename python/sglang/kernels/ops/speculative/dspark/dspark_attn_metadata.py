@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import msgspec
 import torch
@@ -81,6 +81,7 @@ class BuildDsparkSwaPageIndices:
         block_size: int,
         swa_window: int,
         page_index_aligned_size: int,
+        block_swa_locs: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return build_dspark_swa_page_indices(
             req_to_token=req_to_token,
@@ -93,6 +94,7 @@ class BuildDsparkSwaPageIndices:
             block_size=block_size,
             swa_window=swa_window,
             page_index_aligned_size=page_index_aligned_size,
+            block_swa_locs=block_swa_locs,
         )
 
     @classmethod
@@ -109,6 +111,7 @@ class BuildDsparkSwaPageIndices:
         block_size: int,
         swa_window: int,
         page_index_aligned_size: int,
+        block_swa_locs: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return build_dspark_swa_page_indices_triton(
             req_to_token=req_to_token,
@@ -120,6 +123,7 @@ class BuildDsparkSwaPageIndices:
             block_size=block_size,
             swa_window=swa_window,
             page_index_aligned_size=page_index_aligned_size,
+            block_swa_locs=block_swa_locs,
         )
 
 
@@ -240,6 +244,7 @@ def build_dspark_swa_page_indices(
     block_size: int,
     swa_window: int,
     page_index_aligned_size: int,
+    block_swa_locs: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if offsets.ndim != 2 or offsets.shape[1] != swa_window:
         raise ValueError(
@@ -257,8 +262,13 @@ def build_dspark_swa_page_indices(
     window_swa_locs = full_to_swa_mapping[window_full_locs].to(torch.int32)
     window_swa_locs = window_swa_locs.masked_fill(invalid, -1)
 
-    block_full_locs = out_loc[: bs * block_size].view(bs, block_size)
-    block_swa_locs = full_to_swa_mapping[block_full_locs].to(torch.int32)
+    if block_swa_locs is None:
+        block_full_locs = out_loc[: bs * block_size].view(bs, block_size)
+        block_swa_locs = full_to_swa_mapping[block_full_locs].to(torch.int32)
+    else:
+        block_swa_locs = block_swa_locs[: bs * block_size].view(
+            bs, block_size
+        ).to(torch.int32)
 
     target_width = ceil_align(swa_window + block_size, page_index_aligned_size)
 
@@ -330,6 +340,7 @@ def _swa_page_indices_kernel(
     swa_window,
     block_size,
     target_width,
+    block_locs_are_swa: tl.constexpr,
     TW_BLOCK: tl.constexpr,
 ):
     q = tl.program_id(0)
@@ -355,7 +366,12 @@ def _swa_page_indices_kernel(
     blk_full = tl.load(out_loc_ptr + i * block_size + bcol, mask=bmask, other=0).to(
         tl.int64
     )
-    blk_swa = tl.load(full_to_swa_ptr + blk_full, mask=bmask, other=-1).to(tl.int32)
+    if block_locs_are_swa:
+        blk_swa = blk_full.to(tl.int32)
+    else:
+        blk_swa = tl.load(full_to_swa_ptr + blk_full, mask=bmask, other=-1).to(
+            tl.int32
+        )
 
     val = tl.where(in_window, win_swa, tl.where(in_block, blk_swa, -1))
     tl.store(out_ptr + q * target_width + k, val.to(tl.int32), mask=kmask)
@@ -373,6 +389,7 @@ def build_dspark_swa_page_indices_triton(
     block_size: int,
     swa_window: int,
     page_index_aligned_size: int,
+    block_swa_locs: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if offsets.ndim != 2 or offsets.shape[1] != swa_window:
         raise ValueError(
@@ -383,7 +400,9 @@ def build_dspark_swa_page_indices_triton(
     device = offsets.device
     req_pool = req_pool_indices_per_request.to(device=device).contiguous()
     offsets = offsets.to(torch.int64).contiguous()
-    out_loc = out_loc[: bs * block_size].contiguous()
+    block_locs_are_swa = block_swa_locs is not None
+    block_locs = block_swa_locs if block_locs_are_swa else out_loc
+    block_locs = block_locs[: bs * block_size].contiguous()
     context_lens = context_lens.to(device=device, dtype=torch.int32).contiguous()
     rt_stride = req_to_token.stride(0)
     target_width = ceil_align(swa_window + block_size, page_index_aligned_size)
@@ -398,7 +417,7 @@ def build_dspark_swa_page_indices_triton(
         full_to_swa_mapping,
         req_pool,
         offsets,
-        out_loc,
+        block_locs,
         context_lens,
         swa_page_indices,
         swa_topk_lengths,
@@ -406,6 +425,7 @@ def build_dspark_swa_page_indices_triton(
         swa_window,
         block_size,
         target_width,
+        block_locs_are_swa=block_locs_are_swa,
         TW_BLOCK=TW_BLOCK,
     )
     return swa_page_indices, swa_topk_lengths

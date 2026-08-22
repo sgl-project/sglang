@@ -1157,12 +1157,40 @@ class DeepseekV4HipRadixBackend(
             ring_stride=pool.unified_swa_ring_size,
             swa_pages=pool.unified_swa_pages,
         )
-        # SWA ring write target, same value for every layer this forward.
         req_slot = state_slot.to(torch.int64)
-        core.unified.swa_loc = (
-            req_slot * pool.unified_swa_ring_size
-            + core.positions_casual.to(torch.int64) % pool.unified_swa_ring_size
-        ).to(torch.int32)
+        if pool.unified_swa_is_sidecar:
+            if not self.is_dspark_draft:
+                raise RuntimeError(
+                    "Unified draft SWA sidecar is only valid on a DSpark draft worker."
+                )
+            chunk_start = core.unified.pf_chunk_start
+            final_pos = core.unified.pf_final_pos
+            if chunk_start is None or final_pos is None:
+                raise RuntimeError(
+                    "Unified draft SWA sidecar requires verify chunk boundaries."
+                )
+            (
+                core.unified.swa_indices,
+                core.unified.swa_indptr,
+            ) = runtime.build_dspark_sidecar_decode_stream(
+                req_to_token=self.req_to_token,
+                full_to_swa_mapping=pool.full_to_swa_index_mapping,
+                state_slot=req_slot,
+                chunk_start=chunk_start,
+                final_pos=final_pos,
+                win=pool.unified_swa_window,
+                scratch_base=pool.draft_swa_layout.scratch_base,
+                scratch_width=pool.draft_swa_layout.scratch_width,
+            )
+            core.unified.swa_loc = pool.get_draft_swa_scratch_locs_for_tokens(
+                req_slot, core.positions_casual.to(torch.int64) - chunk_start
+            ).to(torch.int32)
+        else:
+            # Target unified SWA keeps its original request-slot ring.
+            core.unified.swa_loc = (
+                req_slot * pool.unified_swa_ring_size
+                + core.positions_casual.to(torch.int64) % pool.unified_swa_ring_size
+            ).to(torch.int32)
         # Per-token req-slot map for the SWA ring store, read directly by the
         # forward store (target-verify) instead of recomputing a repeat_interleave
         # per layer. Harmless for plain decode (its store reads req_pool_indices).
@@ -1255,15 +1283,22 @@ class DeepseekV4HipRadixBackend(
             else:
                 state_slot = forward_batch.req_pool_indices[:T]
             if save_kv_cache:
-                runtime.store_swa_into_unified(
-                    kv=kv,
-                    state_slot=state_slot,
-                    positions=positions,
-                    unified_kv=unified,
-                    win=win,
-                    ring_stride=ring_stride,
-                    final_pos=positions,
-                )
+                if pool.unified_swa_is_sidecar:
+                    runtime.scatter_bf16_into_unified(
+                        kv=kv,
+                        loc=core_attn_metadata.unified.swa_loc[:T],
+                        unified_kv=unified,
+                    )
+                else:
+                    runtime.store_swa_into_unified(
+                        kv=kv,
+                        state_slot=state_slot,
+                        positions=positions,
+                        unified_kv=unified,
+                        win=win,
+                        ring_stride=ring_stride,
+                        final_pos=positions,
+                    )
             unified_metadata = core_attn_metadata.unified
             if compress_ratio == 0:
                 kv_indices = unified_metadata.swa_indices
@@ -1443,10 +1478,24 @@ class DeepseekV4HipRadixBackend(
             cached is not None
             and not forward_batch.forward_mode.is_idle()
             and cached.shape[0] == positions.shape[0]
-            and not is_multistep_draft_decode
+            and (
+                self.token_to_kv_pool.unified_swa_is_sidecar
+                or not is_multistep_draft_decode
+            )
         ):
             result = cached
         else:
+            if self.token_to_kv_pool.unified_swa_is_sidecar:
+                if forward_batch.forward_mode.is_idle():
+                    return torch.full_like(
+                        positions,
+                        self.token_to_kv_pool.draft_swa_layout.scratch_base,
+                        dtype=torch.int32,
+                    )
+                raise RuntimeError(
+                    "Unified draft SWA scratch locations were not prepared for "
+                    "this forward."
+                )
             ring = self.token_to_kv_pool.unified_swa_ring_size
             req_slot = forward_batch.req_pool_indices.to(torch.int64)
             if req_slot.shape[0] != positions.shape[0]:

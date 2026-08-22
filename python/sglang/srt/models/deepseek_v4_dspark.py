@@ -153,9 +153,8 @@ class DSparkAttention(MqaAttentionBase):
         pool: DeepSeekV4TokenToKVPool,
     ) -> None:
         if is_unified_kv_triton():
-            # unified_kv: SWA K lives in the shared bf16 ring (swa_kv_pool is
-            # None). Use the unified ring write target -- get_unified_swa_loc
-            # recomputes it from live positions for multi-step draft decode.
+            # unified_kv stores draft proposal K in the step scratch when the
+            # sidecar layout is enabled, otherwise in the legacy request ring.
             pool.set_unified_key_buffer_radix_fused_norm_rope(
                 layer_id=self.layer_id,
                 swa_loc=attn_backend.get_unified_swa_loc(forward_batch),
@@ -795,10 +794,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             main_x=main_x,
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],
         )
-        # Under unified_kv the swa_kv_pool is None; the caller passes a unified
-        # ring loc (state_slot * ring + pos % ring, -1 for uncommitted) so the
-        # store just needs to target the bf16 ring instead of the fp8 flashmla
-        # buffer. Same swa_loc/positions contract either way.
+        # Under unified_kv the swa_kv_pool is None. The caller passes either a
+        # legacy ring row or a content-sidecar row, with -1 for uncommitted
+        # candidates. The store contract is otherwise identical.
         store_kv = (
             pool.set_unified_key_buffer_radix_fused_norm_rope
             if is_unified_kv_triton()

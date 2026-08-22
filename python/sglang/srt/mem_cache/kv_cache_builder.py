@@ -30,11 +30,14 @@ from sglang.srt.configs.hybrid_arch import (
     linear_attn_model_spec,
     mamba2_config,
 )
-from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
+from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa, is_deepseek_v4
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    use_dsv4_dspark_draft_swa_sidecar,
+)
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -248,6 +251,7 @@ def build_kv_cache(
 
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
     mtp_draft_device_pools = tp_worker.model_runner.mtp_draft_device_pools
+    target_kv_pool = token_to_kv_pool_allocator.get_kvcache()
 
     retraction_backup = resolve_decode_retraction_backup(tp_worker=tp_worker)
 
@@ -331,6 +335,13 @@ def build_kv_cache(
         pp_size=ps.pp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
+        enable_draft_swa_sidecar=(
+            is_deepseek_v4(model_config.hf_config)
+            and use_dsv4_dspark_draft_swa_sidecar(server_args, spec_algorithm)
+            # With unified_kv, the logical SWA component itself owns the draft
+            # committed sidecar. Paged target SWA needs the dependent tracker.
+            and not getattr(target_kv_pool, "_unified_kv", False)
+        ),
         mtp_draft_device_pools=mtp_draft_device_pools,
     )
 

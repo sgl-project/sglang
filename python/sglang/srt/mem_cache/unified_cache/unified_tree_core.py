@@ -685,17 +685,31 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         full_kv_hit_length = 0
         action: Optional[CacheAction | ComponentAction] = None
         separate_device_match = self.enable_hicache
+
+        def _validator(component, *, match_device_only: bool):
+            keyed_factory = getattr(
+                component, "create_match_validator_for_key", None
+            )
+            if keyed_factory is not None:
+                return keyed_factory(
+                    match_device_only=match_device_only,
+                    match_key_len=len(key),
+                )
+            return component.create_match_validator(
+                match_device_only=match_device_only
+            )
+
         if separate_device_match:
             validators = tuple(
-                comp.create_match_validator() for comp in self.components
+                _validator(comp, match_device_only=False) for comp in self.components
             )
             device_validators = tuple(
-                comp.create_match_validator(match_device_only=True)
+                _validator(comp, match_device_only=True)
                 for comp in self.components
             )
         else:
             validators = tuple(
-                comp.create_match_validator(match_device_only=True)
+                _validator(comp, match_device_only=True)
                 for comp in self.components
             )
 

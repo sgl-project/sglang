@@ -36,6 +36,8 @@ from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_ring_size,
     get_compress_state_write_pad,
+    get_dsv4_packed_kv_bytes_per_token,
+    use_dsv4_dspark_draft_swa_sidecar,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import (
@@ -757,8 +759,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     """Configurator for DSV4 compressed-attention models.
 
     Splits available memory across full / swa / c4 / c128 + c4_state / c128_state
-    pools. coeff is bytes_per_full_token (inflated by (T+D)/T when speculative
-    decode reserves a draft worker, mirroring dflash's cell_size scaling); bias = 0.
+    pools. A DSpark draft owns a content-scoped SWA sidecar, priced from its
+    packed SWA geometry rather than the target's average layer cost.
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
@@ -767,6 +769,20 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
+        self.swa_kv_bytes_per_token = get_dsv4_packed_kv_bytes_per_token(
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+        )
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        self.draft_swa_kv_bytes_per_token = (
+            (self.qk_nope_head_dim + self.qk_rope_head_dim)
+            * torch.bfloat16.itemsize
+            if is_unified_kv_triton()
+            else self.swa_kv_bytes_per_token
+        )
         self.context_len = kvc.model_config.context_len
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
         self.compression_ratios = cfg.compress_ratios[
@@ -793,6 +809,19 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.disaggregation_decode_extra_slots = (
             kvc.server_args.disaggregation_decode_extra_slots or 0
         )
+        self.use_draft_swa_scratch = (
+            not kvc.is_draft_worker
+            and use_dsv4_dspark_draft_swa_sidecar(
+                kvc.server_args, kvc.spec_algorithm
+            )
+        )
+        self.draft_swa_scratch_width = max(
+            (kvc.server_args.max_speculative_num_draft_tokens or 0) - 1, 0
+        )
+        self.draft_swa_num_layers = int(
+            kvc.spec_aux_config.dflash_draft_num_layers or 0
+        )
+        self.draft_swa_storage_page_size = kvc.page_size
         if kvc.server_args.enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
@@ -820,13 +849,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         self.bytes_per_full_token = self._get_bytes_per_full_token()
         if self.is_speculative:
-            # Reserve memory for the speculative draft worker by inflating
-            # per-token bytes by (target+draft)/target. Equivalent to dflash's
-            # scale_kv_cell_size_per_token_for_dflash but applied to
-            # bytes_per_full_token: tokens = avail / (bpft * (T+D)/T).
-            draft_layers = 1
-            target_layers = self.num_layers_total
-            self.bytes_per_full_token *= (target_layers + draft_layers) / target_layers
+            self.bytes_per_full_token += self._get_draft_bytes_per_full_token(kvc)
 
         # Online c128 keeps a single in-progress (max, sum, kv) state per index
         # and assumes a strict forward-only schedule. Speculative decode (MTP)
@@ -858,6 +881,25 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                     "DSV4 compressed attention: online c128 enabled (ring_size=1)"
                 )
 
+    def _get_draft_bytes_per_full_token(self, kvc: KVCacheConfigurator) -> float:
+        if kvc.spec_algorithm.is_dspark():
+            draft_layers = int(kvc.spec_aux_config.dflash_draft_num_layers or 0)
+            if draft_layers <= 0:
+                raise ValueError(
+                    "DSV4 DSpark draft SWA budgeting requires a positive stage count."
+                )
+            # Only committed draft KV enters the persistent sidecar. Verify
+            # candidates remain step-scoped until commit_lens gates the write.
+            return (
+                self.swa_ratio
+                * self.draft_swa_kv_bytes_per_token
+                * draft_layers
+            )
+
+        # Preserve the existing single-average-layer reservation for other
+        # speculative algorithms until their draft pool geometry is explicit.
+        return self.bytes_per_full_token / self.num_layers_total
+
     def _assert_ring_serves_draft_tokens(self, num_draft_tokens: int) -> None:
         """A verify batch writes its whole optimistic tail into the ring, so ring
         capacity bounds the draft count."""
@@ -879,7 +921,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
 
     def _get_bytes_per_full_token(self) -> float:
-        kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        kv_bytes = self.swa_kv_bytes_per_token
 
         quant_block_size = 128
         indexer_bytes = (
@@ -972,6 +1014,42 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         max_running_requests = min(estimated, token_capacity // 2)
         return self._get_c128_state_fixed_bytes(max_running_requests)
 
+    def _get_draft_swa_scratch_fixed_bytes(
+        self, max_running_requests: int
+    ) -> int:
+        if (
+            not self.use_draft_swa_scratch
+            or self.draft_swa_scratch_width == 0
+            or self.draft_swa_num_layers == 0
+        ):
+            return 0
+        num_req_slots = self._get_num_req_slots(max_running_requests)
+        scratch_rows = num_req_slots * self.draft_swa_scratch_width
+        scratch_pages = ceil_div(scratch_rows, self.draft_swa_storage_page_size)
+        if self.draft_swa_kv_bytes_per_token == self.swa_kv_bytes_per_token:
+            bytes_per_page = ceil_align(
+                self.draft_swa_storage_page_size * self.swa_kv_bytes_per_token,
+                576,
+            )
+        else:
+            bytes_per_page = (
+                self.draft_swa_storage_page_size
+                * self.draft_swa_kv_bytes_per_token
+            )
+        return scratch_pages * bytes_per_page * self.draft_swa_num_layers
+
+    def _get_draft_swa_scratch_fixed_bytes_for_token_capacity(
+        self, token_capacity: int
+    ) -> int:
+        if self.requested_max_running_requests_per_worker is not None:
+            return self._get_draft_swa_scratch_fixed_bytes(
+                self.requested_max_running_requests_per_worker
+            )
+        estimated = int(token_capacity / self.context_len * 512)
+        estimated = max(min(estimated, 4096), 2048)
+        max_running_requests = min(estimated, token_capacity // 2)
+        return self._get_draft_swa_scratch_fixed_bytes(max_running_requests)
+
     def _to_config(self, sizes: _DSV4PoolSizes) -> MemoryPoolConfig:
         full = sizes.full_max_total_num_tokens
         swa = sizes.swa_max_total_num_tokens
@@ -1014,13 +1092,26 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             c128_state_fixed_bytes = self._get_c128_state_fixed_bytes(
                 self.requested_max_running_requests_per_worker
             )
+            draft_swa_scratch_fixed_bytes = (
+                self._get_draft_swa_scratch_fixed_bytes(
+                    self.requested_max_running_requests_per_worker
+                )
+            )
         else:
             full_token = int(available_bytes / self.bytes_per_full_token)
             c128_state_fixed_bytes = (
                 self._get_c128_state_fixed_bytes_for_token_capacity(full_token)
             )
+            draft_swa_scratch_fixed_bytes = (
+                self._get_draft_swa_scratch_fixed_bytes_for_token_capacity(full_token)
+            )
 
-        available_bytes_for_tokens = max(available_bytes - c128_state_fixed_bytes, 0)
+        available_bytes_for_tokens = max(
+            available_bytes
+            - c128_state_fixed_bytes
+            - draft_swa_scratch_fixed_bytes,
+            0,
+        )
         full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
 
         sizes = self._compute_dsv4_sizes(full_token, page_size)
@@ -1029,6 +1120,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             f"bytes_per_full_token={self.bytes_per_full_token:.2f}, "
             f"available_bytes={available_bytes / (1 << 30):.2f} GB, "
             f"c128_state_fixed={c128_state_fixed_bytes / (1 << 30):.2f} GB, "
+            f"draft_swa_scratch_fixed="
+            f"{draft_swa_scratch_fixed_bytes / (1 << 30):.2f} GB, "
             f"full_token={sizes.full_max_total_num_tokens}"
         )
         return self._to_config(sizes)

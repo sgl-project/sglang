@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    resolve_pool_hit_boundary,
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -837,6 +838,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         final_pages = kv_pages
+        recompute_tail_pages = 0
 
         for transfer in pool_transfers or []:
             if final_pages == 0:
@@ -856,26 +858,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 ]
             else:
                 page_exists = [False] * kv_pages
-            boundary = 0
-            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
-                try:
-                    boundary = page_exists.index(False)
-                except ValueError:
-                    boundary = kv_pages
-            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
-                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-                for prefix_len in range(kv_pages, 0, -1):
-                    if all(
-                        page_exists[i]
-                        for i in range(max(0, prefix_len - trailing), prefix_len)
-                    ):
-                        boundary = prefix_len
-                        break
-            if boundary:
+            boundary, sidecar_hit = resolve_pool_hit_boundary(
+                kv_pages=kv_pages,
+                transfer=transfer,
+                has_component=lambda i: page_exists[i],
+            )
+            if sidecar_hit:
                 hit_count[transfer.name] = boundary
+            elif transfer.hit_policy == PoolHitPolicy.RECOMPUTE_TRAILING:
+                recompute_tail_pages = max(
+                    recompute_tail_pages, kv_pages - boundary
+                )
             final_pages = min(final_pages, boundary)
 
-        return PoolTransferResult(final_pages, hit_count)
+        return PoolTransferResult(final_pages, hit_count, recompute_tail_pages)
 
     def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
         # Unified v2 I/O path: each PoolTransfer can expand to one or more
