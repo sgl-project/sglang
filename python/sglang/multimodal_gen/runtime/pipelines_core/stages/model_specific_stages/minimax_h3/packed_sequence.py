@@ -207,6 +207,19 @@ def minimax_h3_packed_sequence(
     token_tags[img_pos] = 0  # VIDEO
 
     cu = torch.tensor([0, used, seq_len], dtype=torch.int32)
+    # Cube-sparse-attention segment shapes; every other field is per-token.
+    stream_layout = {
+        "target_shape": (latent_t, ph, pw),
+        "cond_image_shapes": tuple((1, ph, pw) for _ in resolved_cond_frame_indices),
+        # FL2VA keyframes live on the target timeline.  The attention
+        # metadata builder must fold them into the target's 3D cube grid
+        # instead of inferring a dense image role from their T=1 shape.
+        "cond_image_roles": tuple("joint_cube" for _ in resolved_cond_frame_indices),
+        "cond_event_orders": tuple(
+            ("imgvid", index) for index in range(len(resolved_cond_frame_indices))
+        ),
+        "cond_audio_stream_lens": (),
+    }
     return {
         "seq_len": seq_len,
         "img_pos": img_pos,
@@ -216,6 +229,7 @@ def minimax_h3_packed_sequence(
         "img_position_ids": g,
         "token_tags": token_tags,
         "cu_seqlens": cu,
+        "stream_layout": stream_layout,
     }
 
 
@@ -483,6 +497,47 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     token_tags[img_pos] = 0  # VIDEO (refs + target)
 
     cu = torch.tensor([0, used, seq_len], dtype=torch.int32)
+    # Cube-sparse-attention segment shapes; streams listed in ref-block order,
+    # matching the img_pos/audio_pos concatenation above (audio rows precede
+    # video rows within a video-bearing block).
+    cond_image_shapes: list[tuple[int, int, int]] = []
+    cond_image_roles: list[str] = []
+    cond_event_orders: list[tuple[str, int]] = []
+    cond_audio_stream_lens: list[int] = []
+    for item in parsed:
+        kind = str(item["kind"])
+        if kind == "image":
+            cond_event_orders.append(("imgvid", len(cond_image_shapes)))
+            cond_image_shapes.append(
+                (
+                    1,
+                    int(item["latent_h"]) // _PATCH_H,
+                    int(item["latent_w"]) // _PATCH_W,
+                )
+            )
+            cond_image_roles.append("dense_prefix")
+        elif kind == "audio":
+            cond_event_orders.append(("audio", len(cond_audio_stream_lens)))
+            cond_audio_stream_lens.append(int(item["audio_rows"]))
+        else:
+            cond_event_orders.append(("audio", len(cond_audio_stream_lens)))
+            cond_audio_stream_lens.append(int(item["audio_rows"]))
+            cond_event_orders.append(("imgvid", len(cond_image_shapes)))
+            cond_image_shapes.append(
+                (
+                    int(item["latent_t"]),
+                    int(item["latent_h"]) // _PATCH_H,
+                    int(item["latent_w"]) // _PATCH_W,
+                )
+            )
+            cond_image_roles.append("independent_cube")
+    stream_layout = {
+        "target_shape": (latent_t, ph, pw),
+        "cond_image_shapes": tuple(cond_image_shapes),
+        "cond_image_roles": tuple(cond_image_roles),
+        "cond_event_orders": tuple(cond_event_orders),
+        "cond_audio_stream_lens": tuple(cond_audio_stream_lens),
+    }
     return {
         "seq_len": seq_len,
         "img_pos": img_pos,
@@ -493,6 +548,7 @@ def minimax_h3_packed_sequence_ref2va_blocks(
         "img_position_ids": g,
         "token_tags": token_tags,
         "cu_seqlens": cu,
+        "stream_layout": stream_layout,
     }
 
 

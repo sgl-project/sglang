@@ -887,9 +887,13 @@ def prepare_request(
     """
     Create a Req object with sampling_params as a parameter.
     """
+    attention_backend_config = server_args.attention_backend_config or {}
+    vsa_sparsity = attention_backend_config.get(
+        "VSA_sparsity", attention_backend_config.get("sparsity", 0.0)
+    )
     req = Req(
         sampling_params=sampling_params,
-        VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
+        VSA_sparsity=vsa_sparsity,
     )
     sampling_params.apply_request_extra(req)
     if getattr(sampling_params, "max_sequence_length", None) is not None:

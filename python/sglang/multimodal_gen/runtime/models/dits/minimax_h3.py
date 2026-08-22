@@ -48,7 +48,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
-from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    get_attn_backend,
+    get_component_forced_attn_backend,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -535,6 +538,7 @@ def _minimax_h3_attention_core_impl(
             get_attn_backend(
                 attention.head_dim,
                 q.dtype,
+                selected_attention_backend=attention._selected_attention_backend,
                 attention_requirements=AttentionRequirements(packed_varlen=True),
             )
         )
@@ -581,6 +585,7 @@ class MiniMaxH3Attention(nn.Module):
         *,
         prefix: str,
         bcg_breakpoint: bool = True,
+        cube_sparse_capable: bool = True,
     ) -> None:
         super().__init__()
         self.bcg_breakpoint = bcg_breakpoint
@@ -599,6 +604,13 @@ class MiniMaxH3Attention(nn.Module):
         self.prefix = prefix
         self._attention_impl = None
         self._attention_backend_enum: AttentionBackendEnum | None = None
+        # attention initializes on the first real QKV tensors, after the
+        # component-loading context has ended; retain the transformer-scoped
+        # selection so a component override is not silently lost at runtime
+        self._selected_attention_backend = get_component_forced_attn_backend()
+        # Cube metadata describes only the packed multimodal sequence. The
+        # text-only token refiner must preserve the exact dense FA baseline.
+        self._cube_sparse_capable = cube_sparse_capable
         # The checkpoint stores one fused qkv tensor. Each logical Q/K/V
         # matrix must be sharded independently; a plain ColumnParallelLinear
         # would instead slice across the concatenated tensor and is incorrect
@@ -643,6 +655,15 @@ class MiniMaxH3Attention(nn.Module):
         )
 
     def _set_attention_backend(self, backend) -> None:
+        if (
+            backend.get_enum() is AttentionBackendEnum.CUBE_SPARSE_ATTN
+            and not self._cube_sparse_capable
+        ):
+            backend = get_attn_backend(
+                self.head_dim,
+                _BF16_DTYPE,
+                selected_attention_backend=AttentionBackendEnum.FA,
+            )
         impl_cls = backend.get_impl_cls()
         self._attention_impl = impl_cls(
             num_heads=self.num_heads,
@@ -1330,6 +1351,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             quant_config,
             prefix=f"{prefix}.attn",
             bcg_breakpoint=False,
+            cube_sparse_capable=False,
         )
         self.mlp = MiniMaxH3MLP(arch, quant_config, prefix=f"{prefix}.mlp")
 
@@ -1715,6 +1737,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
         arch = self.config
+        # The first real QKV tensors arrive after component loading. Preserve
+        # the transformer-scoped selection for the model-wide lazy resolver.
+        self._selected_attention_backend = get_component_forced_attn_backend()
         if (
             adaln_cache_path is not None or adaln_weight_files is not None
         ) and quant_config is not None:
@@ -1851,6 +1876,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         backend = get_attn_backend(
             self.arch.attention_head_dim,
             _BF16_DTYPE,
+            selected_attention_backend=self._selected_attention_backend,
             attention_requirements=AttentionRequirements(packed_varlen=True),
         )
         for module in self.modules():

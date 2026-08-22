@@ -910,3 +910,9 @@ The entries below simply reflect configurations that have been manually validate
 ### Sliding Tile Attention
 
 - Currently, only Hopper GPUs (H100s) are supported.
+
+### Cube Sparse Attention
+
+- Available only for MiniMax-H3 (`--component-attention-backends transformer=cube_sparse_attn`). It sparsifies only the packed sequence's 3D visual streams; text, audio, standalone reference images, and the text-only token refiner remain dense.
+- Requires `--attention-backend-config` with both `local_cube_size` and `topk_ratio_list`. `topk_ratio_list` must have one entry per denoise step, each in `(0, 1]`. See the [MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3) for a worked example.
+- Runs on pure PyTorch plus FlexAttention, so it has no third-party kernel dependency.
