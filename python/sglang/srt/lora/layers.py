@@ -56,6 +56,13 @@ class BaseLayerWithLoRA(nn.Module):
         # LoRA-wrapped.
         if hasattr(self.base_layer, "reduce_results"):
             self.reduce_results = self.base_layer.reduce_results
+        # Alias remaining base-layer parameters onto the wrapper so
+        # `named_parameters(remove_duplicate=True)` yields them at the outer
+        # path — weight loaders (e.g. FusedMoE's `w13_weight_packed`) lookup
+        # names without the `.base_layer.` segment.
+        for _name, _param in base_layer.named_parameters(recurse=False):
+            if not hasattr(self, _name):
+                setattr(self, _name, _param)
 
     def forward(self, x: torch.Tensor):
         return self.base_layer.forward(x)
@@ -957,6 +964,13 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         self.experts_shared_outer_loras: bool = False
         self.lora_use_virtual_experts: bool = False
+        # Forward for the model's own forward-path dispatch — the outer model
+        # reads several FusedMoE attributes (e.g. `self.experts.moe_runner_config`,
+        # `self.experts.dispatcher`, `self.experts.num_local_experts`,
+        # `self.experts.quant_method`) directly on the wrapper. Quant
+        # post-processing iterators skip LoRA wrappers via
+        # `isinstance(module, BaseLayerWithLoRA)` so the packed params on the
+        # inner FusedMoE get processed there, not here.
         self.quant_method = base_layer.quant_method
         self.moe_runner_config = base_layer.moe_runner_config
         # Don't let the MoE runner overwrite hidden_states with its output:
@@ -969,6 +983,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.should_fuse_routed_scaling_factor_in_topk = (
             base_layer.should_fuse_routed_scaling_factor_in_topk
         )
+        if hasattr(base_layer, "scheme"):
+            self.scheme = base_layer.scheme
 
         self.tp_size = base_layer.moe_tp_size
         self.tp_rank = base_layer.moe_tp_rank
@@ -1155,6 +1171,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         # Use pre-computed quant info (doesn't change so not sure why we need to pass it in every time)
         quant_info = self._quant_info
+        quant_info.expert_map = getattr(
+            base_layer.dispatcher, "local_expert_mapping", None
+        )
 
         # ===== TO BE REFACTORED ====
         if self._lora_runner_backend.is_experimental_sgl_trtllm():

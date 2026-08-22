@@ -867,8 +867,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
+            # Under --enable-dp-attention an IDLE rank still runs its local experts over
+            # the DP-GATHERED tokens of the other ranks, so MoE-LoRA batch info has to be
+            # re-prepared for THIS batch — sized to the gathered length and stamped via the
+            # idle-rank path — rather than cleared: clearing leaves those experts reading the
+            # previous batch's token_lora_mapping, which is undersized (OOB in the MoE-LoRA
+            # kernels) and points foreign tokens at the wrong adapter. Non-MoE LoRA does no
+            # such cross-rank work on an idle rank, so it takes the base path.
             if model_runner.lora_manager is not None:
-                model_runner.lora_manager.reset_lora_batch()
+                if model_runner.lora_manager.lora_backend.is_moe_lora:
+                    model_runner.lora_manager.prepare_lora_batch(ret)
+                else:
+                    model_runner.lora_manager.reset_lora_batch()
             return ret
 
         # Override the positions with diffusion LLM or spec_info
