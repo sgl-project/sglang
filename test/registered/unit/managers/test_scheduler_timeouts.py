@@ -29,6 +29,8 @@ class _FakeReq:
         self.rid = rid
         self.to_finish = None
         self._finished = is_finished
+        self.multimodal_inputs = None
+        self.session = None
         self.time_stats = SimpleNamespace(
             wait_queue_entry_time=wait_entry,
             forward_entry_time=forward_entry,
@@ -65,6 +67,18 @@ class TestWaitingTimeout(CustomTestCase):
 
         self.assertEqual([r.rid for r in s.waiting_queue], ["fresh"])
         self.assertEqual(s.ipc_channels.send_to_tokenizer.send_output.call_count, 1)
+
+    def test_dropped_request_releases_multimodal_lease(self):
+        stale = _req("stale", wait_entry=time.perf_counter() - 10)
+        mm_inputs = MagicMock()
+        stale.multimodal_inputs = mm_inputs
+        s = _scheduler([stale])
+
+        with envs.SGLANG_REQ_WAITING_TIMEOUT.override(1.0):
+            s._abort_on_waiting_timeout()
+
+        mm_inputs.release_features.assert_called_once_with()
+        self.assertIsNone(stale.multimodal_inputs)
 
     def test_unset_entry_time_is_never_dropped(self):
         # 0 is the "not yet stamped" sentinel; the guard is `0 < entry_time`.

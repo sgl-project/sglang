@@ -32,6 +32,31 @@ SGLang supports three ways to pass visual data, each optimized for different sce
 
 **Key Rule**: Within a single request, use only one format for all images. Don't mix formats.
 
+### Reusing Kimi-K3 media across calls
+
+Kimi-K3 can reuse prompt-independent work when later calls resend the same raw
+image. Pass one `mm_content_hashes` value per image, in request order. By
+default, SGLang still reads the image and verifies the SHA-256; only
+`--trust-mm-content-hashes` permits a hot metadata hit to skip that read.
+
+```python
+import hashlib
+
+image_bytes = open("receipt.jpg", "rb").read()
+digest = "sha256:" + hashlib.sha256(image_bytes).hexdigest()
+
+out = llm.generate(
+    prompt="<|media_pad|>Read the total.",
+    image_data=[image_bytes],
+    mm_content_hashes=[digest],
+)
+```
+
+`mm_content_hashes` describes input content. It is not interchangeable with
+legacy `mm_hashes`, which controls the external-router and pad sentinel rather
+than the processor-derived embedding identity. See
+[VLM preprocessing and caching](../advanced_features/vlm_preprocessing_cache).
+
 The examples below demonstrate all three approaches with both Qwen2.5-VL and Llama 4 models.
 
 ## Querying Qwen2.5-VL Model

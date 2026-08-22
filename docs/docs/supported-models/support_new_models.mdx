@@ -43,6 +43,21 @@ standard LLM support:
 6. **Adapt to Vision Attention**:
    Adapt the multi-headed `Attention` of ViT with SGLang’s `VisionAttention`.
 
+7. **Declare per-media cache separability (optional)**:
+   Only opt into early preprocessing reuse when one media item's processor
+   artifact is independent of the prompt and of neighboring media. Set
+   `supports_early_mm_cache`, implement `lookup_preprocess_cache`, and keep
+   model-specific typed artifact metadata in the processor module. Recompose
+   prompt tokens and offsets on every request; never use a raw content hash as
+   the feature/embedding hash.
+
+   Tests must cover cache-off equivalence, different prompts, reordered and
+   repeated media, partial hits, mutable paths/URLs, processor-fingerprint
+   changes, single-flight, and every supported serving and transport mode. See
+   [VLM preprocessing and caching](../advanced_features/vlm_preprocessing_cache)
+   for the contract. Kimi-K3 image is the reference implementation; do not mark
+   a new image or video processor supported until this separability is verified.
+
 You can refer to [Qwen2VL](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/models/qwen2_vl.py) or
 other mllm implementations. These models demonstrate how to correctly handle both multimodal and textual inputs.
 
