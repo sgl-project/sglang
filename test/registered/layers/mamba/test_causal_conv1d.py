@@ -119,6 +119,63 @@ def causal_conv1d_update_ref(
     return (out if activation is None else F.silu(out)).to(dtype=dtype_in)
 
 
+def test_causal_conv1d_branches_from_cloned_query_state():
+    device = get_device()
+    dtype = torch.bfloat16
+    torch.manual_seed(7)
+    dim, width = 96, 4
+    item_lens = [2, 5, 7]
+    total_tokens = sum(item_lens)
+
+    source_state = torch.randn(1, dim, width - 1, device=device, dtype=dtype)
+    source_state_before = source_state.clone()
+    branch_states = source_state.expand(len(item_lens), -1, -1).contiguous().clone()
+    x = torch.randn(dim, total_tokens, device=device, dtype=dtype)
+    weight = torch.randn(dim, width, device=device, dtype=dtype)
+    bias = torch.randn(dim, device=device, dtype=dtype)
+    query_start_loc = torch.tensor(
+        [0, *torch.tensor(item_lens).cumsum(0).tolist()],
+        dtype=torch.int32,
+        device=device,
+    )
+    cache_indices = torch.arange(len(item_lens), dtype=torch.int32, device=device)
+
+    actual = causal_conv1d_fn(
+        x,
+        weight,
+        bias=bias,
+        conv_states=branch_states,
+        query_start_loc=query_start_loc,
+        seq_lens_cpu=torch.tensor(item_lens),
+        cache_indices=cache_indices,
+        has_initial_state=torch.ones(len(item_lens), dtype=torch.bool, device=device),
+        activation="silu",
+        pad_slot_id=PAD_SLOT_ID,
+    )
+
+    expected_outputs = []
+    expected_states = []
+    for item in torch.split(x, item_lens, dim=-1):
+        item_output, item_state = causal_conv1d_ref(
+            item.unsqueeze(0),
+            weight,
+            bias,
+            initial_states=source_state,
+            return_final_states=True,
+            activation="silu",
+        )
+        expected_outputs.append(item_output.squeeze(0))
+        expected_states.append(item_state.squeeze(0))
+
+    torch.testing.assert_close(
+        actual, torch.cat(expected_outputs, dim=-1), atol=5e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        branch_states, torch.stack(expected_states), atol=5e-2, rtol=1e-2
+    )
+    assert torch.equal(source_state, source_state_before)
+
+
 @pytest.mark.parametrize("itype", [torch.bfloat16, torch.float])
 @pytest.mark.parametrize("silu_activation", [True])
 @pytest.mark.parametrize("has_bias", [True])
