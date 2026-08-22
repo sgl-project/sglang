@@ -36,7 +36,7 @@ def startup_phase(
         @startup_phase("load_weight")                     # measure a function
 
     ``draft`` names the model the enclosed work belongs to, covering ``phase``
-    itself and every phase recorded inside it at any depth. A target scope inside 
+    itself and every phase recorded inside it at any depth. A target scope inside
     a draft one attributes to the target.
     """
     token = None if draft is None else _prefix.set("draft_" if draft else "")
