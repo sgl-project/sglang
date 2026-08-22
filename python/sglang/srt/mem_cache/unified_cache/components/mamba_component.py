@@ -83,15 +83,19 @@ class MambaComponent(TreeComponent):
 
     def _inc_session_coverage(self, session_id: str, leaf: UnifiedTreeNode) -> None:
         cd = leaf.component_data[self.component_type]
-        cd.session_ref += 1
-        if cd.session_ref == 1:
+        new_ref = self.tree_core._adjust_component_session_ref(
+            leaf, self.component_type, 1
+        )
+        if new_ref == 1:
             self._refresh_session_partition(leaf)
 
     def _dec_session_coverage(self, session_id: str, leaf: UnifiedTreeNode) -> None:
         cd = leaf.component_data[self.component_type]
         assert cd.session_ref > 0
-        cd.session_ref -= 1
-        if cd.session_ref == 0:
+        new_ref = self.tree_core._adjust_component_session_ref(
+            leaf, self.component_type, -1
+        )
+        if new_ref == 0:
             self._refresh_session_partition(leaf)
 
     def _advance_session_coverage(
@@ -226,8 +230,8 @@ class MambaComponent(TreeComponent):
         if is_new_leaf:
             node.component_data[self.component_type].value = params.mamba_value
             self.tree_core.lru_lists[self.component_type].insert_mru(node)
-            self.tree_core.component_evictable_size_[self.component_type] += len(
-                params.mamba_value
+            self.tree_core._adjust_component_evictable_size(
+                node, self.component_type, len(params.mamba_value)
             )
             self._emit_excess_path_states_eviction(node, cache_actions)
             return
@@ -238,8 +242,8 @@ class MambaComponent(TreeComponent):
             if host_lru.in_list(node):
                 host_lru.remove_node(node)
             self.tree_core.lru_lists[self.component_type].insert_mru(node)
-            self.tree_core.component_evictable_size_[self.component_type] += len(
-                params.mamba_value
+            self.tree_core._adjust_component_evictable_size(
+                node, self.component_type, len(params.mamba_value)
             )
             node.last_access_time = get_and_increase_time_counter()
             self._emit_excess_path_states_eviction(node, cache_actions)
@@ -333,7 +337,9 @@ class MambaComponent(TreeComponent):
         if EvictLayer.DEVICE in target and cd.value is not None:
             device_frees[self.component_type].append(cd.value)
             freed = len(cd.value)
-            self.tree_core.component_evictable_size_[self.component_type] -= freed
+            self.tree_core._adjust_component_evictable_size(
+                node, self.component_type, -freed
+            )
             cd.value = None
 
         # Host layer
@@ -448,7 +454,7 @@ class MambaComponent(TreeComponent):
         else:
             if cd.lock_ref == 0:
                 vlen = len(value)
-                self.tree_core.component_evictable_size_[ct] -= vlen
+                self.tree_core._adjust_component_evictable_size(node, ct, -vlen)
                 self.tree_core.component_protected_size_[ct] += vlen
             cd.lock_ref += 1
         return result
@@ -479,7 +485,7 @@ class MambaComponent(TreeComponent):
         if cd.lock_ref > 0:
             if cd.lock_ref == 1:
                 vlen = len(value)
-                self.tree_core.component_evictable_size_[ct] += vlen
+                self.tree_core._adjust_component_evictable_size(node, ct, vlen)
                 self.tree_core.component_protected_size_[ct] -= vlen
             cd.lock_ref -= 1
 
@@ -799,7 +805,7 @@ class MambaComponent(TreeComponent):
                 if host_lru.in_list(node):
                     host_lru.remove_node(node)
                 self.tree_core.lru_lists[ct].insert_mru(node)
-                self.tree_core.component_evictable_size_[ct] += count
+                self.tree_core._adjust_component_evictable_size(node, ct, count)
 
         elif phase == CacheTransferPhase.PREFETCH:
             if not transfers:

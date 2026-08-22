@@ -96,6 +96,12 @@ class UnifiedSessionRefTracker:
             generation = self.open_radix_session(session_id)
         return generation
 
+    def active_radix_session_count(self) -> int:
+        """Number of opened/implicitly-created sessions not closed yet."""
+        if not self.enable_session_radix_cache:
+            return 0
+        return len(self._session_generations)
+
     def release_radix_session(self, session_id: str) -> int:
         if not self.enable_session_radix_cache or session_id is None:
             return 0

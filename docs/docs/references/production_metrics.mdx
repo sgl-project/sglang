@@ -240,6 +240,21 @@ to generate some requests.
 
 Then you should be able to see the metrics in the Grafana dashboard.
 
+## Session radix cache pressure metrics
+
+When you enable both `--enable-metrics` and `--enable-session-radix-cache`,
+SGLang exports these gauges for radix-native sessions:
+
+- `sglang:session_radix_active_sessions`: Open sessions that have not been closed.
+- `sglang:session_radix_full_referenced_evictable_tokens`: Device-evictable Full KV tokens referenced by at least one active session.
+- `sglang:session_radix_swa_referenced_evictable_tokens`: Device-evictable sliding-window attention KV tokens referenced by at least one active session.
+- `sglang:session_radix_mamba_referenced_evictable_slots`: Device-evictable Mamba state slots referenced by at least one active session.
+
+The referenced values are subsets of the corresponding evictable capacity.
+They identify cache entries whose eviction would discard reusable session state;
+they do not reserve or pin that capacity. Backends without radix-native session
+tracking report zero for these gauges.
+
 ## Estimated Performance Metrics (MFU-related)
 
 SGLang exports the following estimated per-GPU counters that can be used to derive

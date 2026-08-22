@@ -99,7 +99,9 @@ class SWAComponent(TreeComponent):
             if delta < 0:
                 assert cd.session_ref > 0
             prev_ref = cd.session_ref
-            cd.session_ref += delta
+            self.tree_core._adjust_component_session_ref(
+                node, self.component_type, delta
+            )
             if (prev_ref == 0) != (cd.session_ref == 0):
                 self._refresh_session_partition(node)
             covered += len(node.key)
@@ -438,6 +440,12 @@ class SWAComponent(TreeComponent):
         child_swa_value = child.component_data[self.component_type].value
         if child_swa_value is not None:
             split_len = len(new_parent.key)
+            child_cd = child.component_data[self.component_type]
+            parent_evictable_size = min(split_len, child_cd.device_evictable_size)
+            new_parent.component_data[self.component_type].device_evictable_size = (
+                parent_evictable_size
+            )
+            child_cd.device_evictable_size -= parent_evictable_size
             new_parent.component_data[self.component_type].value = child_swa_value[
                 :split_len
             ].clone()
@@ -491,7 +499,7 @@ class SWAComponent(TreeComponent):
                 node.component_data[BASE_COMPONENT_TYPE].value
             )
             freed = len(cd.value)
-            self.tree_core.component_evictable_size_[ct] -= freed
+            self.tree_core._adjust_component_evictable_size(node, ct, -freed)
             cd.value = None
 
         # Host layer
@@ -621,7 +629,7 @@ class SWAComponent(TreeComponent):
                         lru.remove_node(cur)
                 else:
                     key_len = len(cur.key)
-                    self.tree_core.component_evictable_size_[ct] -= key_len
+                    self.tree_core._adjust_component_evictable_size(cur, ct, -key_len)
                     self.tree_core.component_protected_size_[ct] += key_len
             if lock_host:
                 comp.host_lock_ref = ref + 1
@@ -676,7 +684,7 @@ class SWAComponent(TreeComponent):
                             host_lru.insert_mru(cur)
                 else:
                     key_len = len(comp.value)
-                    self.tree_core.component_evictable_size_[ct] += key_len
+                    self.tree_core._adjust_component_evictable_size(cur, ct, key_len)
                     self.tree_core.component_protected_size_[ct] -= key_len
             if lock_host:
                 comp.host_lock_ref = ref - 1
@@ -721,7 +729,7 @@ class SWAComponent(TreeComponent):
             if cd.lock_ref == 0:
                 key_len = len(cur.key)
                 self.tree_core.component_protected_size_[ct] -= key_len
-                self.tree_core.component_evictable_size_[ct] += key_len
+                self.tree_core._adjust_component_evictable_size(cur, ct, key_len)
                 if self.tree_core._is_device_leaf(cur):
                     self.tree_core._evict_component_and_detach_lru(
                         cur,

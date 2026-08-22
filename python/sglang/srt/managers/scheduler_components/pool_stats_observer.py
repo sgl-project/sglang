@@ -28,6 +28,11 @@ class PoolStats:
     full_available_size: int
     full_evictable_size: int
 
+    session_radix_active_sessions: int = 0
+    session_radix_full_referenced_evictable_size: int = 0
+    session_radix_swa_referenced_evictable_size: int = 0
+    session_radix_mamba_referenced_evictable_size: int = 0
+
     is_hybrid_swa: bool = False
     is_hybrid_ssm: bool = False
     is_hisparse: bool = False
@@ -136,6 +141,16 @@ class PoolStats:
         stats.kv_available_tokens = self.full_available_size
         stats.kv_evictable_tokens = self.full_evictable_size
         stats.kv_used_tokens = self.full_num_used
+        stats.session_radix_active_sessions = self.session_radix_active_sessions
+        stats.session_radix_full_referenced_evictable_tokens = (
+            self.session_radix_full_referenced_evictable_size
+        )
+        stats.session_radix_swa_referenced_evictable_tokens = (
+            self.session_radix_swa_referenced_evictable_size
+        )
+        stats.session_radix_mamba_referenced_evictable_slots = (
+            self.session_radix_mamba_referenced_evictable_size
+        )
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -210,6 +225,19 @@ class SchedulerPoolStatsObserver:
             pool_stats.mamba_usage = mamba_stats.mamba_usage
             pool_stats.mamba_available_size = mamba_stats.mamba_available_size
             pool_stats.mamba_evictable_size = mamba_stats.mamba_evictable_size
+
+        pool_stats.session_radix_active_sessions = (
+            self.tree_cache.active_radix_session_count()
+        )
+        pool_stats.session_radix_full_referenced_evictable_size = (
+            self.tree_cache.full_session_referenced_evictable_size()
+        )
+        pool_stats.session_radix_swa_referenced_evictable_size = (
+            self.tree_cache.swa_session_referenced_evictable_size()
+        )
+        pool_stats.session_radix_mamba_referenced_evictable_size = (
+            self.tree_cache.mamba_session_referenced_evictable_size()
+        )
 
         return pool_stats
 
