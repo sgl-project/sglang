@@ -55,6 +55,10 @@ class Llama32Detector(BaseFormatDetector):
         if "<|python_tag|>" not in text and not text.startswith("{"):
             return StreamingParseResult(normal_text=text, calls=[])
 
+        # Remember if the text started with a raw JSON object so we can fall
+        # back to preserving it when no actual tool call is found.
+        starts_with_json = text.startswith("{")
+
         if "<|python_tag|>" in text:
             normal_text, action_text = text.split("<|python_tag|>", maxsplit=1)
         else:
@@ -104,6 +108,13 @@ class Llama32Detector(BaseFormatDetector):
 
         # Only process if we found valid JSON objects
         calls = self.parse_base_json(all_actions, tools) if all_actions else []
+
+        # If the input began with a plain JSON object but we did not extract any
+        # actual tool call, preserve the original text instead of silently
+        # dropping the leading JSON object.
+        if starts_with_json and not calls:
+            return StreamingParseResult(normal_text=text, calls=[])
+
         # Use safe_idx to avoid idx containing the last part of an invalid JSON object
         trailing_text = (
             action_text[safe_idx:].strip() if safe_idx < action_text_len else ""
