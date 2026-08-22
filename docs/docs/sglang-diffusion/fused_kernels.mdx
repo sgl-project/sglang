@@ -57,6 +57,7 @@ These fusion families mount under `quality="high"`:
 | LTX-2 RMSNorm + modulate | `rms_norm(x) * (1 + scale) + shift` in one launch |
 | Gate RMSNorm (BF16-native) | `RMSNorm + tanh + mul + add` in one pass |
 | HunyuanVideo strided QK RMSNorm | Per-head QK RMSNorm over the packed QKV layout |
+| SANA-Video BF16-input linear attention | Keeps the first linear-attention GEMM's inputs in BF16 with FP32 accumulation/output; the second GEMM remains FP32 |
 
 ## Kernel inventory
 
@@ -97,7 +98,9 @@ These fusion families mount under `quality="high"`:
 | --- | --- | --- | --- |
 | `fused_inplace_qknorm_rope` | JIT CUDA | one bf16 rounding step vs the split baseline; exact with `round_norm_before_rope=True` | separate QK-norm kernel + RoPE |
 | `rope_rotate_half` | Triton | bit-exact | `chunk` → `cat(-x2, x1)` → two muls + add → `cat(tail)`, about 7 kernels per projection |
+| `interleaved_rope_fp64` | JIT CUDA | bit-exact | paired SANA-Video Q/K RoPE with fp64 tables, about 14 eager kernels |
 | `ltx2_qknorm_split_rope` | JIT CUDA | close (validated on B200) | LTX-2 QK-norm + split RoPE |
+| `ltx25_decoder_rope` | JIT CUDA | bit-exact | paired LTX-2.5 decoder 3D RoPE from cached compact axis tables |
 | `hunyuan_qkv_rope_pack` | Triton | bit-exact | QKV pack and RoPE in one pass |
 
 ### Activation
@@ -142,8 +145,11 @@ Kernels are written against a specific eager chain in a specific model, so cover
 | Z-Image | BF16-native RMSNorm scale / tanh-residual, per-head QK RMSNorm |
 | Ideogram 4 | gate RMSNorm, SwiGLU, rotate-half RoPE, modulate, residual-gate add |
 | LTX-2 | QK-norm + split RoPE, ada-values split, RMSNorm+modulate, modulate, residual-gate add, linear+GELU |
+| LTX-2.5 decoder | paired 3D RoPE with shared axis-table cache |
 | HunyuanVideo | QKV+RoPE pack, strided QK RMSNorm, linear+GELU |
+| SANA-Video | paired fp64 interleaved RoPE |
 | Sana | LN+modulate, GLUMB bias+SiLU / bias+GLU, residual-gate add |
+| SANA-Video | Packed QKV/KV; BF16-input linear attention at `quality=high` |
 | Sana-WM | bidirectional gated delta-net, fused QK inverse-RMS |
 | Wan | temb table slices; VAE cat+pad and DupUp3D add, `channels_last_3d` RMSNorm+SiLU |
 | Cosmos3 / Krea2 / MiniMax-H3 | QK-norm + RoPE (Krea2 also CuTe-DSL norm+scale/shift; MiniMax-H3 also indexed modulation) |
@@ -179,7 +185,7 @@ Runtime code imports from the package, never from a submodule:
 from sglang.kernels.ops.diffusion import fused_rmsnorm_scale_shift_bitexact
 ```
 
-Resolution is lazy: the backends have disjoint, heavy dependencies (Triton, CUTLASS/CuTe-DSL, FlyDSL on ROCm, MLX on Apple), so an eager re-export would make every one of them an import-time requirement on every platform. Each public kernel is a predicate-plus-kernel pair — call `can_use_<op>(...)` first and fall back to the reference chain when it returns `False`; the kernel raises on an unsupported input rather than silently returning `None`.
+Resolution is lazy: the backends have disjoint, heavy dependencies (Triton, CUTLASS/CuTe-DSL, and FlyDSL on ROCm), so an eager re-export would make every one of them an import-time requirement on every platform. Each public kernel is a predicate-plus-kernel pair — call `can_use_<op>(...)` first and fall back to the reference chain when it returns `False`; the kernel raises on an unsupported input rather than silently returning `None`.
 
 The package `README.md` carries a selection matrix for the cases where several kernels look interchangeable and are not. The normalization domain alone holds more than a dozen implementations that differ by numerical contract, activation layout, and backend rather than by speed.
 
