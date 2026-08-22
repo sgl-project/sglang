@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union
 
 import torch
+
+# Opt-in: fold the prefill compress and ring-buffer write kernels into a single
+# grid-concatenated launch (currently ratio=4 / indexer path only). Off by
+# default so behavior matches upstream unless explicitly enabled.
+_MERGE_COMPRESS_WRITE = os.environ.get("SGLANG_OPT_MERGE_COMPRESS_WRITE", "0") == "1"
 
 from sglang.kernels.jit.utils import (
     cache_once,
@@ -84,14 +90,18 @@ def _jit_compress_module(
         head_dim, dtype_buffer, dtype_in, dtype_out, is_arch_support_pdl()
     )
     kernel_class = f"FlashCompress{ratio}Kernel<{args}>"
+    cuda_wrappers = [
+        ("decode", f"{kernel_class}::run_decode"),
+        ("prefill", f"{kernel_class}::run_prefill"),
+    ]
+    # Merged compress+write single launch is implemented for the ratio=4 path.
+    if ratio == 4:
+        cuda_wrappers.append(("prefill_merged", f"{kernel_class}::run_prefill_merged"))
     return load_jit(
         make_name(f"compress_{ratio}_v2"),
         *args,
         cuda_files=[f"deepseek_v4/c{ratio}_v2.cuh"],
-        cuda_wrappers=[
-            ("decode", f"{kernel_class}::run_decode"),
-            ("prefill", f"{kernel_class}::run_prefill"),
-        ],
+        cuda_wrappers=cuda_wrappers,
         extra_cuda_cflags=["-use_fast_math"],
     )
 
@@ -407,7 +417,13 @@ def compress_forward(
     if _is_xpu:
         fn = decode_fn if plan.is_decode else prefill_fn
     else:
-        fn = module.decode if plan.is_decode else module.prefill
+        if plan.is_decode:
+            fn = module.decode
+        elif _MERGE_COMPRESS_WRITE and compress_ratio == 4 and not is_online:
+            # Single grid-concatenated compress+write launch (ratio=4 path).
+            fn = module.prefill_merged
+        else:
+            fn = module.prefill
 
     fn(kv_score_buffer, kv_score_input, out, ape, *plan[1:3])
     return out

@@ -286,12 +286,15 @@ C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams par
   }
 }
 
+// Compress body factored out so it can be driven by an explicit `block_idx`
+// (used both by the standalone `flash_c4_prefill` wrapper and by the merged
+// compress+write kernel). `blockDim.x` is kBlockSize (128) in both callers.
 template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
-C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams params) {
+SGL_DEVICE void c4_prefill_impl(const Compress4PrefillParams& params, const uint32_t block_idx) {
   using namespace device;
   using Trait = C4Trait<kHeadDim>;
 
-  const uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint32_t global_tid = block_idx * blockDim.x + threadIdx.x;
   const uint32_t global_wid = global_tid / kWarpThreads;      // warp id
   const uint32_t global_pid = global_wid / Trait::kNumSplit;  // plan id
   const uint32_t global_sid = global_wid % Trait::kNumSplit;  // split id
@@ -317,12 +320,20 @@ C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams p
 }
 
 template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
-WRITE_KERNEL void write_c4_prefill(const __grid_constant__ Compress4PrefillParams params) {
+C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams params) {
+  c4_prefill_impl<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>(params, blockIdx.x);
+}
+
+// Write body factored out so it can be driven by an explicit `block_idx`
+// (used both by the standalone `write_c4_prefill` wrapper and by the merged
+// compress+write kernel). `blockDim.x` is kBlockSize (128) in both callers.
+template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
+SGL_DEVICE void c4_write_impl(const Compress4PrefillParams& params, const uint32_t block_idx) {
   using namespace device;
   using Trait = C4Trait<kHeadDim>;
   using StorageInput = AlignedVector<InputFloat, kTileElements>;
 
-  const uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint32_t global_tid = block_idx * blockDim.x + threadIdx.x;
   const uint32_t global_wid = global_tid / kWarpThreads;      // warp id
   const uint32_t global_pid = global_wid / Trait::kNumSplit;  // plan id
   const uint32_t global_sid = global_wid % Trait::kNumSplit;  // split id
@@ -375,10 +386,33 @@ WRITE_KERNEL void write_c4_prefill(const __grid_constant__ Compress4PrefillParam
 }
 
 template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
+WRITE_KERNEL void write_c4_prefill(const __grid_constant__ Compress4PrefillParams params) {
+  c4_write_impl<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>(params, blockIdx.x);
+}
+
+// Merged compress+write: grid-concatenation of the two independent prefill
+// domains into a single launch. Blocks [0, num_c_blocks) run the compress
+// epilogue; the trailing blocks run the ring-buffer write. Both sub-kernels use
+// the same 128-thread block, so a single blockDim works for both. There is no
+// cross-block dependency (compress reads prior-step overlap; write stages the
+// current tokens for future steps), so no grid-wide sync is required.
+template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
+C4_KERNEL void flash_c4_prefill_merged(
+    const __grid_constant__ Compress4PrefillParams params, const uint32_t num_c_blocks) {
+  if (blockIdx.x < num_c_blocks) {
+    c4_prefill_impl<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>(params, blockIdx.x);
+  } else {
+    c4_write_impl<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>(params, blockIdx.x - num_c_blocks);
+  }
+}
+
+template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
 struct FlashCompress4Kernel {
   static constexpr auto decode_kernel = flash_c4_decode<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
   static constexpr auto prefill_c_kernel = flash_c4_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
   static constexpr auto prefill_w_kernel = write_c4_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
+  static constexpr auto prefill_merged_kernel =
+      flash_c4_prefill_merged<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
   static constexpr uint32_t kBlockSize = 128;
   static constexpr uint32_t kTileDim = kTileElements * device::kWarpThreads;
   static constexpr uint32_t kNumSplit = kHeadDim / kTileDim;
@@ -484,6 +518,65 @@ struct FlashCompress4Kernel {
     if (const auto num_w_blocks = div_ceil(num_w * kNumSplit, kWarpsPerBlock)) {
       LaunchKernel(num_w_blocks, kBlockSize, device)  //
           .enable_pdl(kUsePDL)(prefill_w_kernel, params);
+    }
+  }
+
+  // Single-launch variant: grid-concatenate the compress and write domains so
+  // the whole prefill compress region fires as one kernel (compress blocks
+  // followed by write blocks). Same 128-thread block for both.
+  static void run_prefill_merged(
+      const tvm::ffi::TensorView kv_buffer,
+      const tvm::ffi::TensorView kv_input,
+      const tvm::ffi::TensorView kv_output,
+      const tvm::ffi::TensorView ape,
+      const tvm::ffi::TensorView plan_c_,
+      const tvm::ffi::TensorView plan_w_) {
+    using namespace host;
+
+    auto N = SymbolicSize{"num_q_tokens"};
+    auto C = SymbolicSize{"num_c_plans"};
+    auto W = SymbolicSize{"num_w_plans"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLGPU>();
+
+    TensorMatcher({-1, 4, Trait::kElementSize})  // kv score
+        .with_dtype<BufferFloat>()
+        .with_device(device_)
+        .verify(kv_buffer);
+    TensorMatcher({N, Trait::kElementSize})  // kv score input (ragged)
+        .with_dtype<InputFloat>()
+        .with_device(device_)
+        .verify(kv_input);
+    TensorMatcher({C, kHeadDim})  // kv compressed output (compact)
+        .with_dtype<OutFloat>()
+        .with_device(device_)
+        .verify(kv_output);
+    TensorMatcher({8, kHeadDim})  // ape
+        .with_dtype<InputFloat>()
+        .with_device(device_)
+        .verify(ape);
+    const auto plan_c = compress::verify_plan_c(plan_c_, C, device_);
+    const auto plan_w = compress::verify_plan_w(plan_w_, W, device_);
+    const auto device = device_.unwrap();
+    const auto num_q_tokens = static_cast<uint32_t>(N.unwrap());
+    const auto num_c = static_cast<uint32_t>(C.unwrap());
+    const auto num_w = static_cast<uint32_t>(W.unwrap());
+    const auto params = Compress4PrefillParams{
+        .kv_buffer = kv_buffer.data_ptr(),
+        .kv_input = kv_input.data_ptr(),
+        .kv_output = kv_output.data_ptr(),
+        .score_bias = ape.data_ptr(),
+        .plan_c = plan_c,
+        .plan_w = plan_w,
+        .num_compress = num_c,
+        .num_write = num_w,
+    };
+    RuntimeCheck(num_q_tokens >= num_w, "invalid prefill plan: num_q < num_w");
+    const uint32_t num_c_blocks = div_ceil(num_c * kNumSplit, kWarpsPerBlock);
+    const uint32_t num_w_blocks = div_ceil(num_w * kNumSplit, kWarpsPerBlock);
+    if (const auto total_blocks = num_c_blocks + num_w_blocks) {
+      LaunchKernel(total_blocks, kBlockSize, device)  //
+          .enable_pdl(kUsePDL)(prefill_merged_kernel, params, num_c_blocks);
     }
   }
 };
