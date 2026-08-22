@@ -5105,9 +5105,7 @@ class UnifiedRadixCacheSuite:
             ) as evict_for_alloc,
         ):
             prep = comp.prepare_load_back(leaf.id, req=req)
-        evict_for_alloc.assert_called_once_with(
-            EvictParams(num_tokens=0, mamba_num=1)
-        )
+        evict_for_alloc.assert_called_once_with(EvictParams(num_tokens=0, mamba_num=1))
         self.assertIs(prep.allocated_mamba_slot, retry_slot)
         self.assertEqual(int(req.mamba_pool_idx), int(retry_slot[0]))
 
