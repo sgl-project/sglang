@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.ipc_array import (
 )
 from sglang.multimodal_gen.runtime.ipc_cuda import (
     materialize_cuda_refs,
+    release_retained_producer_tensors,
     spill_cuda_tensors,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import Req
@@ -349,6 +350,8 @@ def _prepare_local_payload(endpoint: str, batch: Any) -> Any:
 def _materialize_local_cuda_refs(endpoint: str, output_batch: Any) -> None:
     if is_local_endpoint(endpoint):
         materialize_cuda_refs(output_batch)
+        # Request-side IPC retains are no longer needed after the round-trip.
+        release_retained_producer_tensors()
 
 
 def _materialize_output_batch_file_refs(output_batch: Any) -> None:

@@ -19,10 +19,16 @@ from typing import Any
 
 import torch
 
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
 # Producer-side retain: CUDA IPC cannot open a handle in the same process,
 # and the allocation must stay alive until the consumer maps it.
+# Do not LRU-evict: a live handle that is dropped before the peer maps it
+# silently corrupts the hop.
 _PRODUCER_TENSORS: OrderedDict[tuple[bytes, int], torch.Tensor] = OrderedDict()
-_MAX_PRODUCER_TENSORS = 64
+_WARNED_ASYNC_ALLOC = False
 
 
 def _producer_key(handle: bytes, storage_offset_bytes: int) -> tuple[bytes, int]:
@@ -35,8 +41,11 @@ def _retain_producer_tensor(
     key = _producer_key(handle, storage_offset_bytes)
     _PRODUCER_TENSORS[key] = tensor
     _PRODUCER_TENSORS.move_to_end(key)
-    while len(_PRODUCER_TENSORS) > _MAX_PRODUCER_TENSORS:
-        _PRODUCER_TENSORS.popitem(last=False)
+
+
+def release_retained_producer_tensors() -> None:
+    """Drop producer-side IPC retains after the peer has mapped them."""
+    _PRODUCER_TENSORS.clear()
 
 
 @dataclass
@@ -93,8 +102,8 @@ class CudaIpcRef:
         if self.handle is None or self.storage_size_bytes == 0:
             return torch.empty(self.shape, dtype=dtype, device=f"cuda:{self.device_index}")
 
-        local = _PRODUCER_TENSORS.get(
-            _producer_key(self.handle, self.storage_offset_bytes)
+        local = _PRODUCER_TENSORS.pop(
+            _producer_key(self.handle, self.storage_offset_bytes), None
         )
         if local is not None:
             return local.detach().clone()
@@ -142,8 +151,18 @@ def _spill_one(value: Any) -> Any:
         except RuntimeError as exc:
             # cudaMallocAsync (ComfyUI default) cannot export IPC handles.
             # Leave the tensor in place so pickle falls back to a host copy.
-            if "shareIpcHandle" not in str(exc) and "cudaMallocAsync" not in str(exc):
+            msg = str(exc)
+            if "shareIpcHandle" not in msg and "cudaMallocAsync" not in msg:
                 raise
+            global _WARNED_ASYNC_ALLOC
+            if not _WARNED_ASYNC_ALLOC:
+                _WARNED_ASYNC_ALLOC = True
+                logger.warning(
+                    "CUDA IPC export failed (%s); falling back to a host pickle "
+                    "copy. ComfyUI's default cudaMallocAsync pool cannot export "
+                    "IPC handles.",
+                    exc,
+                )
     return value
 
 
