@@ -1994,23 +1994,19 @@ def _fp8_per_token_quant_to_per_tensor_quant_kernel(
             tl.store(output_ptrs + tok_idx * k, quantized)
 
 
-# Hidden elements per program.  This is the tuned quantity -- 1024 elements over 4
-# warps is 8 B/thread, which is where Triton starts emitting vector accesses (8
-# warps, the historical value, drop to 4 B/thread and scalar b32) -- so it is kept
-# in elements rather than scale groups, and a different group width still gets the
-# tile that was measured.  2048 pays off once there are enough experts to fill the
-# machine on the expert axis alone.
+# Hidden elements per program, kept in elements rather than scale groups: 1024
+# over 4 warps is 8 B/thread, where Triton starts emitting vector accesses (8
+# warps give 4 B/thread and scalar b32).  2048 wins once there are enough experts
+# to fill the machine on the expert axis alone.
 _REQUANT_TILE_ELEMS = 1024
 _REQUANT_TILE_ELEMS_MANY_EXPERTS = 2048
 _REQUANT_MANY_EXPERTS = 32
 _REQUANT_NUM_WARPS = 4
 _REQUANT_M_GRID_MAX = 32
 _REQUANT_M_GRID_MIN = 4
-# Programs to aim for on the (m-grid x expert) plane while each expert holds
-# fewer rows than the grid would serve.  Hundreds of local experts saturate the
-# grid on the expert axis alone, where 32 programs per expert is oversubscription
-# (measured 15-30% at >= 64 experts on H200 and B200); past this many rows the
-# extra programs carry real work again and the cap costs a few percent.
+# Target programs on the (m-grid x expert) plane while rows are scarce: 32 per
+# expert oversubscribes at >= 64 experts (measured 15-30%), but past this many
+# rows per expert the extra programs carry real work.
 _REQUANT_TARGET_PROGRAMS = 1024
 _REQUANT_ROWS_SATURATED = 64
 
