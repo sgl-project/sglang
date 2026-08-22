@@ -256,6 +256,49 @@ class TestRadixKey(unittest.TestCase):
         long_b[70] = -1
         self._assert_match(long_a, long_b, 64, 64, is_bigram=True)
 
+    def test_match_mixed_container_types(self):
+        """match() tolerates mixed list/array token_ids.
+
+        Previously ``RadixKey.match`` asserted ``type(t0) is type(t1)``, so a
+        plain-list query key compared against an array-backed tree node (or vice
+        versa) crashed even though the contents were identical. The patched
+        method converts only the list side (and only when the types differ),
+        keeping the hot array/array compare on the C-level memcmp path.
+        """
+        a = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        b = [1, 2, 3, 9, 9, 9]
+        expected = 3
+        combos = [
+            (RadixKey(a), RadixKey(b)),  # list / list (backward compatible)
+            (RadixKey(a), RadixKey(array("q", b))),  # list / array
+            (RadixKey(array("q", a)), RadixKey(b)),  # array / list
+            (RadixKey(array("q", a)), RadixKey(array("q", b))),  # array / array
+        ]
+        for k1, k2 in combos:
+            with self.subTest(t0=type(k1.token_ids).__name__, t1=type(k2.token_ids).__name__):
+                self.assertEqual(k1.match(k2), expected)
+        # Mixed types must agree bit-for-bit with the all-array result.
+        self.assertEqual(
+            RadixKey(a).match(RadixKey(array("q", b))),
+            RadixKey(array("q", a)).match(RadixKey(array("q", b))),
+        )
+
+    def test_match_list_input_page_and_bigram(self):
+        """List-backed keys still honor page_size rounding and bigram mode."""
+        # page_size > 1 rounds the shared length down to a page boundary.
+        ka = RadixKey([1, 2, 3, 4, 5, 6, 7, 8])
+        kb = RadixKey([1, 2, 3, 4, 9, 9, 9, 9])
+        self.assertEqual(ka.match(kb, page_size=4), 4)
+        # bigram mode with list input agrees with the array-backed result.
+        la = RadixKey([1, 2, 3, 4, 5], is_bigram=True)
+        aa = RadixKey(array("q", [1, 2, 3, 4, 5]), is_bigram=True)
+        other = [1, 2, 3, 9, 5]
+        self.assertEqual(
+            la.match(RadixKey(other, is_bigram=True)),
+            aa.match(RadixKey(array("q", other), is_bigram=True)),
+        )
+        self.assertEqual(la.match(RadixKey(other, is_bigram=True)), 2)
+
 
 class TestTreeNode(unittest.TestCase):
     """Test cases for TreeNode class."""
