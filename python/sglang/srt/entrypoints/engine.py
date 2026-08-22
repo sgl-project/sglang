@@ -28,7 +28,6 @@ import multiprocessing as mp
 import os
 import random
 import signal
-import subprocess
 import tempfile
 import threading
 import time
