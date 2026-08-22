@@ -567,6 +567,11 @@ class AnthropicServing:
             "model": anthropic_request.model,
             "max_tokens": anthropic_request.max_tokens,
             "stream": anthropic_request.stream or False,
+            "bootstrap_host": anthropic_request.bootstrap_host,
+            "bootstrap_port": anthropic_request.bootstrap_port,
+            "bootstrap_room": anthropic_request.bootstrap_room,
+            "routed_dp_rank": anthropic_request.routed_dp_rank,
+            "disagg_prefill_dp_rank": anthropic_request.disagg_prefill_dp_rank,
         }
 
         if anthropic_request.temperature is not None:
