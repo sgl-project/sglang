@@ -382,7 +382,7 @@ When using multiple LoRAs:
 Manually merges the currently set LoRA weights into the base model.
 
 <Note>
-With FSDP-sharded weights, manual merge may require a full-gather and can OOM. Use `set_lora` with `merge_mode="auto"` or `"dynamic"` for the lower-peak path.
+Manual merge rejects quantized runtime weights; use `set_lora` with `merge_mode="auto"` or `"dynamic"` instead. With FSDP-sharded weights, manual merge may require a full-gather and can OOM, so the same modes provide the lower-peak path.
 </Note>
 
 **Endpoint:** `POST /v1/merge_lora_weights`

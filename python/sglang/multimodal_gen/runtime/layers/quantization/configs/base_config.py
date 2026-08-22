@@ -19,6 +19,8 @@ else:
 class QuantizeMethodBase(ABC):
     """Base class for different quantized methods."""
 
+    supports_direct_lora_merge = False
+
     @abstractmethod
     def create_weights(
         self, layer: torch.nn.Module, *weight_args, **extra_weight_attrs

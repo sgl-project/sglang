@@ -3,9 +3,13 @@ from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
+from torch.nn import Parameter
 
+from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 
@@ -210,3 +214,98 @@ def test_lora_exact_file_url_needs_no_weight_name(tmp_path):
         "*.json",
         "adapter.safetensors",
     ]
+
+
+def _fp8_runtime_layer() -> BaseLayerWithLoRA:
+    base_layer = ReplicatedLinear(2, 3, bias=False)
+    # reproduce the post-load [input, output] storage boundary without CUDA kernels
+    base_layer.weight = Parameter(torch.zeros(2, 3))
+    base_layer.register_parameter("weight_scale", Parameter(torch.ones(3)))
+    base_layer.quant_method = object.__new__(Fp8LinearMethod)
+    return BaseLayerWithLoRA(base_layer)
+
+
+def _make_fp8_pipeline(layer: BaseLayerWithLoRA) -> _TestLoRAPipeline:
+    pipeline = _make_pipeline(layer)
+    pipeline.lora_adapters["adapter"]["linear.lora_B"] = torch.ones(3, 1)
+    return pipeline
+
+
+def test_auto_applies_fp8_lora_dynamically():
+    layer = _fp8_runtime_layer()
+    pipeline = _make_fp8_pipeline(layer)
+    original = layer.base_layer.weight.detach().clone()
+
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline.set_lora("adapter", None, target="transformer", merge_mode="auto")
+
+    assert not layer.merged
+    assert not layer.disable_lora
+    assert layer.lora_A is not None
+    assert layer.lora_B is not None
+    assert torch.equal(layer.base_layer.weight, original)
+    assert not pipeline.is_lora_merged["transformer"]
+
+
+def test_auto_still_merges_unquantized_linear():
+    layer = _make_layer()
+    pipeline = _make_pipeline(layer)
+
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline.set_lora("adapter", None, target="transformer", merge_mode="auto")
+
+    assert layer.merged
+    assert pipeline.is_lora_merged["transformer"]
+
+
+def test_explicit_merge_rejects_mixed_layers_before_applying_lora():
+    unquantized_layer = _make_layer()
+    fp8_layer = _fp8_runtime_layer()
+    pipeline = _make_pipeline(unquantized_layer)
+    pipeline._get_target_lora_layers = lambda target: (
+        [
+            (
+                target,
+                {
+                    "linear": (
+                        unquantized_layer if target == "transformer" else fp8_layer
+                    )
+                },
+            )
+        ],
+        None,
+    )
+    original_unquantized = unquantized_layer.base_layer.weight.detach().clone()
+    original_fp8 = fp8_layer.base_layer.weight.detach().clone()
+
+    def fail_apply(*args, **kwargs):
+        raise AssertionError("LoRA application must not start before admission")
+
+    pipeline._apply_lora_to_layers = fail_apply
+
+    with patch(_RANK_PATCH, return_value=0):
+        with pytest.raises(ValueError, match="dynamic"):
+            pipeline.set_lora(
+                ["adapter", "adapter"],
+                [None, None],
+                target=["transformer", "transformer_2"],
+                merge_mode="merge",
+            )
+
+    assert torch.equal(unquantized_layer.base_layer.weight, original_unquantized)
+    assert torch.equal(fp8_layer.base_layer.weight, original_fp8)
+    assert not pipeline.is_lora_merged
+
+
+def test_manual_merge_rejects_fp8_before_materializing_offloaded_layers():
+    layer = _fp8_runtime_layer()
+    pipeline = _make_fp8_pipeline(layer)
+    layer.set_lora_weights(torch.ones(1, 2), torch.ones(3, 1), merge_weights=False)
+
+    def fail_offload_context(*args, **kwargs):
+        raise AssertionError("unsupported merge must fail before materialization")
+
+    pipeline._temporarily_disable_offload = fail_offload_context
+
+    with pytest.raises(ValueError, match="dynamic"):
+        pipeline.merge_lora_weights("transformer")
