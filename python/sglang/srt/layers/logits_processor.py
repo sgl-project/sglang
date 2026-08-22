@@ -52,7 +52,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.true_on_policy import should_force_bfloat16_lm_head
 from sglang.srt.utils.common import (
     is_cpu,

@@ -100,7 +100,7 @@ def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
     return (
         num_tokens <= 32
         and not is_batch_invariant_mode_enabled()
-        and not get_server_args().enable_deterministic_inference
+        and not get_exec().deterministic.enable_deterministic_inference
     )
 
 

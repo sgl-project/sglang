@@ -39,7 +39,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     MmItemMemoryPool,
     get_mm_feature_pool_size_per_worker,
 )
-from sglang.srt.runtime_context import get_mm, get_server_args
+from sglang.srt.runtime_context import get_mm
 from sglang.srt.true_on_policy import is_true_on_policy_enabled
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,

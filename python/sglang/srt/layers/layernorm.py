@@ -32,7 +32,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.true_on_policy import (
     get_on_policy_rms_norm_kwargs,
     is_true_on_policy_enabled,

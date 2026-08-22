@@ -237,10 +237,16 @@ class Mamba2Metadata(ForwardMetadata):
             num_prefill_tokens = int(sum(extend_seq_lens_cpu))
         else:
             num_prefill_tokens = int(forward_batch.extend_num_tokens)
-        batch_size = getattr(forward_batch, "_original_batch_size", None)
-        if batch_size is None:
-            batch_size = len(forward_batch.seq_lens)
-        num_decodes = max(0, batch_size - num_prefills)
+        if forward_batch._original_forward_mode is not None:
+            # mlp-sync converted the whole batch to EXTEND, so there are no decode
+            # rows; on an idle rank _original_batch_size is 0 and subtracting here
+            # would go negative.
+            num_decodes = 0
+        else:
+            batch_size = forward_batch._original_batch_size
+            if batch_size is None:
+                batch_size = len(forward_batch.seq_lens)
+            num_decodes = batch_size - num_prefills
         context_lens_tensor = forward_batch.extend_prefix_lens
         assert context_lens_tensor is not None
         has_initial_states = context_lens_tensor > 0

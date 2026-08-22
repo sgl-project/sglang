@@ -78,7 +78,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
     get_parallel,
-    get_server_args,
     get_stream,
 )
 from sglang.srt.true_on_policy import (

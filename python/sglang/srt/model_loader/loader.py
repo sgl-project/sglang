@@ -384,6 +384,15 @@ def postprocess_weight(model: nn.Module, target_device) -> None:
     _apply_quant_method_hook(model, target_device, "process_weights_after_loading")
 
 
+def _post_load_weights(model: nn.Module) -> None:
+    # Loaders that bypass `model.load_weights()` (dummy / sharded state / remote instance /
+    # remote fs) must trigger the model's post-load fixup explicitly; `model.load_weights()`
+    # would normally do it internally. NextN subclasses override the method to fill in
+    # `is_nextn=True`, so the loader doesn't need to know.
+    if hasattr(model, "post_load_weights"):
+        model.post_load_weights()
+
+
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 

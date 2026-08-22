@@ -18,7 +18,7 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_get_mscale_simple,
     yarn_linear_ramp_mask,
 )
-from sglang.srt.runtime_context import attention_backends, get_exec, get_server_args
+from sglang.srt.runtime_context import attention_backends
 from sglang.srt.true_on_policy import is_true_on_policy_enabled
 from sglang.srt.utils import (
     cpu_has_amx_support,

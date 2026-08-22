@@ -34,9 +34,7 @@ from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import (
-    get_exec,
     get_parallel,
-    get_server_args,
     get_stream,
 )
 from sglang.srt.true_on_policy import (

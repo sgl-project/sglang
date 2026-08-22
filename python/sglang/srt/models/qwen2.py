@@ -50,7 +50,7 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.true_on_policy import (
     get_on_policy_rms_norm_kwargs,
     is_true_on_policy_enabled,

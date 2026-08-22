@@ -17,6 +17,7 @@ import torch
 
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
+from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
 from sglang.srt.runtime_context import get_parallel, get_spec
 
 logger = logging.getLogger(__name__)
