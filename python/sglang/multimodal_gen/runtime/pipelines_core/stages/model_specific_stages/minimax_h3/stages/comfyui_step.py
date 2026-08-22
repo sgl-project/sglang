@@ -9,15 +9,12 @@ via ``MiniMaxH3DenoiseBranch.forward_kwargs`` and writes unpacked
 from __future__ import annotations
 
 import logging
-import os
-import time
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 
 _logger = logging.getLogger(__name__)
-_STEP_PROFILE = os.environ.get("SGLANG_H3_STEP_PROFILE", "0") == "1"
 
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     _FORWARD_SUPPORTED_KWARGS,
@@ -721,7 +718,6 @@ class MiniMaxH3ComfyUIStepStage(PipelineStage):
         return state
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        t0 = time.perf_counter()
         bind_comfyui_session(batch)
         extra = getattr(batch, "extra", None) or {}
         video_x, audio_x, context = self._read_step_tensors(batch)
@@ -750,31 +746,11 @@ class MiniMaxH3ComfyUIStepStage(PipelineStage):
         )
         state = self._bind_run_state(batch, inputs, sample_sigmas, video_x.device)
         self._maybe_mount_cache_dit(batch, state)
-        t1 = time.perf_counter()
         fk, _branch = build_step_forward_kwargs(
             inputs, branch=state.branch, device=video_x.device
         )
-        t2 = time.perf_counter()
-        if video_x.is_cuda:
-            torch.cuda.synchronize(video_x.device)
-        t3 = time.perf_counter()
         v_video, v_audio = self.transformer(**fk)
-        if video_x.is_cuda:
-            torch.cuda.synchronize(video_x.device)
-        t4 = time.perf_counter()
         batch.noise_pred = pack_comfy_output(v_video, v_audio, state)
-        t5 = time.perf_counter()
-        if _STEP_PROFILE:
-            _logger.info(
-                "[h3-step-profile] worker prep=%.2fms fk=%.2fms sync=%.2fms "
-                "dit=%.2fms pack=%.2fms total=%.2fms",
-                (t1 - t0) * 1e3,
-                (t2 - t1) * 1e3,
-                (t3 - t2) * 1e3,
-                (t4 - t3) * 1e3,
-                (t5 - t4) * 1e3,
-                (t5 - t0) * 1e3,
-            )
         state.steps_done += 1
         n_sigmas = _sample_sigmas_len(sample_sigmas)
         if n_sigmas is not None and n_sigmas >= 2 and state.steps_done >= n_sigmas - 1:

@@ -83,6 +83,11 @@ Reference workflow files are provided in the `workflows/` directory:
 - **`z-image_sgld.json`**: High-speed image generation using Z-Image.
 - **`sgld_text2img.json`**: Server-mode text-to-image generation with LoRA support.
 - **`sgld_image2video.json`**: Server-mode image-to-video generation.
+- **`minimax_h3_t2v_sgld.json`**: MiniMax-H3 text-to-video (SGLD DiT-forward).
+- **`minimax_h3_r2v_sgld.json`**: MiniMax-H3 reference-to-video.
+- **`minimax_h3_t2v_sgld_upscaler.json`**: H3 two-pass latent upscale (low-res then 3D ×2 refine).
+
+LoRA / GGUF / Cache-DiT / attention-backend / FaceRefine graphs used for support-matrix runs live under `scripts/comfyui_h3_workflows/` in the sglang tree, not in this plugin folder.
 
 For other workflows supporting the models, you can easily use SGLang by replacing the official `UNET Loader` node with the `SGLDUNETLoader` node. Similarly, for LoRA support, replace the official LoRA loader with the `SGLDiffusion LoRA Loader`.
 
