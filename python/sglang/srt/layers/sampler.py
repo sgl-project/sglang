@@ -564,6 +564,22 @@ def create_sampler(backend: Optional[str] = None) -> "Sampler":
     )
 
 
+def _seeded_sample_from_masked_sorted(
+    probs: torch.Tensor,
+    probs_sort: torch.Tensor,
+    probs_idx: torch.Tensor,
+    sampling_seed: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    # murmur_hash32 keys noise by column index; scatter so column j is token j,
+    # otherwise a seeded row's token changes when a batchmate triggers this path.
+    weights = torch.zeros_like(probs).scatter_(-1, probs_idx, probs_sort)
+    # Masked entries are 0; log_softmax on the unmasked logits would revive them.
+    return multinomial_with_seed(
+        logprobs=torch.log(weights), seed=sampling_seed, positions=positions
+    )
+
+
 def top_k_top_p_min_p_sampling_from_probs_torch(
     probs: torch.Tensor,
     top_ks: torch.Tensor,
@@ -596,20 +612,20 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
 
     if sampling_seed is None:
         sampled_index = torch.multinomial(probs_sort, num_samples=1)
-    else:
-        # NOTE: when using top-k/top-p/min-p sampling, we need to modify probs before we
-        # apply log to get logprobs. Therefore, we cannot use log_softmax directly.
-        # For now, we use log to the modified probs to get logprobs, but for numerical
-        # stability, we'd better come up with a solution to use log_softmax.
-        logprobs = probs_sort.to(torch.float64)  # Using float64 for numerical stability
-        del probs_sort
-        logprobs.log_()
-        sampled_index = multinomial_with_seed(logprobs, sampling_seed, positions)
+        probs_idx = probs_idx.to(torch.int32)
+        return torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
 
-    # int32 range is enough to represent the token ids
-    probs_idx = probs_idx.to(torch.int32)
-    batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
-    return batch_next_token_ids
+    return (
+        _seeded_sample_from_masked_sorted(
+            probs=probs,
+            probs_sort=probs_sort,
+            probs_idx=probs_idx,
+            sampling_seed=sampling_seed,
+            positions=positions,
+        )
+        .view(-1)
+        .to(torch.int32)
+    )
 
 
 def top_k_top_p_min_p_sampling_from_logits_ascend(
@@ -671,15 +687,16 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
 
         if sampling_seed is None:
             sampled_index = torch.multinomial(probs_sort, num_samples=1)
+            probs_idx = probs_idx.to(torch.int32)
+            batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index)
         else:
-            logprobs = probs_sort.to(
-                torch.float64
-            )  # Using float64 for numerical stability
-            del probs_sort
-            logprobs.log_()
-            sampled_index = multinomial_with_seed(logprobs, sampling_seed, positions)
-        probs_idx = probs_idx.to(torch.int32)
-        batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index)
+            batch_next_token_ids = _seeded_sample_from_masked_sorted(
+                probs=probs,
+                probs_sort=probs_sort,
+                probs_idx=probs_idx,
+                sampling_seed=sampling_seed,
+                positions=positions,
+            )
 
     return batch_next_token_ids.view(-1)
 
