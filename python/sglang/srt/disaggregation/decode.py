@@ -2539,6 +2539,12 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
+        # No waiting abort on the decode side: by the time a request reaches
+        # this waiting queue its prefill and KV transfer are already paid for.
+        # Load shedding happens on the prefill side; transfer stalls are owned
+        # by SGLANG_DISAGGREGATION_WAITING_TIMEOUT.
+        self._abort_on_running_timeout(running_batch)
+
         # Process pending prebuilt batch: output processing + filter + merge
         new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
         if new_prebuilt_batch:
