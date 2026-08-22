@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Optional, Set, Union
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -14,6 +15,9 @@ from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import get_exec, get_schedule
 
 logger = logging.getLogger(__name__)
+
+_DLLM_STAGING_PHASES = (DllmReqPhase.STAGING_PREFILL, DllmReqPhase.STAGING_DECODE)
+_DLLM_INCOMING_PHASES = (DllmReqPhase.INCOMING_PREFILL, DllmReqPhase.INCOMING_DECODE)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
@@ -27,6 +31,25 @@ class SchedulerDllmMixin:
             else None
         )
         self.dllm_manager = DllmManager(dllm_config=self.dllm_config)
+        # Counted unconditionally so the disabled case reports a real zero
+        # rather than a missing field in get_internal_state.
+        self.dllm_num_rounds = 0
+        self.dllm_num_mixed_rounds = 0
+        self.dllm_mixed_batch_enabled = False
+        if self.dllm_config is not None and envs.SGLANG_ENABLE_DLLM_MIXED_BATCH.get():
+            # FDFO only: a round is one denoise step, so a prompt-only row
+            # self-finishes on it. The synchronous loop forwards until every
+            # block resolves, which a prompt row would ride for no reason.
+            self.dllm_mixed_batch_enabled = self.dllm_config.first_done_first_out_mode
+            if self.dllm_mixed_batch_enabled:
+                logger.info(
+                    "dLLM prefill and decode rows are scheduled into one round."
+                )
+            else:
+                logger.warning(
+                    "SGLANG_ENABLE_DLLM_MIXED_BATCH needs --dllm-fdfo; "
+                    "keeping the prefill-first dLLM rounds."
+                )
 
     def get_new_batch_dllm(
         self: Scheduler, running_batch: ScheduleBatch
@@ -211,8 +234,19 @@ class SchedulerDllmMixin:
         """Process prefill or decode batches for DLLM."""
         forward_mode = ForwardMode.DLLM_EXTEND
 
-        # Try prefill batch first
         prefill_reqs = self.dllm_manager.get_prefill_requests()
+        if self.dllm_mixed_batch_enabled and self._should_mix_dllm_batches(
+            num_prefill_reqs=len(prefill_reqs),
+            num_decode_reqs=len(self.dllm_manager.get_decode_requests()),
+            round_capacity=max(
+                self.dllm_manager.max_running_reqs - len(running_batch.reqs), 0
+            ),
+            priority_preemption_enabled=self.enable_priority_preemption,
+        ):
+            self._process_dllm_batches_mixed(adder, running_batch=running_batch)
+            return forward_mode
+
+        # Try prefill batch first
         if prefill_reqs:
             self._process_batch_by_phase(
                 adder,
@@ -233,6 +267,98 @@ class SchedulerDllmMixin:
             )
 
         return forward_mode
+
+    @staticmethod
+    def _should_mix_dllm_batches(
+        *,
+        num_prefill_reqs: int,
+        num_decode_reqs: int,
+        round_capacity: int,
+        priority_preemption_enabled: bool,
+    ) -> bool:
+        """Whether this round has decode work that would otherwise sit behind a
+        partially filled prefill round.
+
+        The mixed path is a restriction of the either/or path, not a
+        replacement: it walks the waiting queue in arrival order rather than
+        prefill-first, and it does not attempt preemption when the round fills.
+
+        Priority preemption is the one difference that is not just a
+        trade-off: taking the mixed path would silently drop it. Until it is
+        wired there, a scheduler running with it enabled keeps every round on
+        the either/or path.
+        """
+        if priority_preemption_enabled:
+            return False
+        return (
+            num_prefill_reqs > 0
+            and num_decode_reqs > 0
+            and num_prefill_reqs < round_capacity
+        )
+
+    def _process_dllm_batches_mixed(
+        self: Scheduler, adder: PrefillAdder, running_batch: ScheduleBatch
+    ) -> None:
+        """Build one mixed round from all phases: staging rows first (they
+        already hold KV/slots and must keep progressing), then incoming rows
+        up to the allocatable-request cap. Per-request treatment is identical
+        to the either/or path; only the round composition changes.
+        """
+        reqs = self.dllm_manager.waiting_queue
+
+        staging_reqs = [req for req in reqs if req.dllm_phase in _DLLM_STAGING_PHASES]
+        if staging_reqs:
+            staging_result = self.process_dllm_staging_reqs(adder, staging_reqs)
+            if staging_result != AddReqResult.CONTINUE:
+                return
+
+        incoming_reqs = [req for req in reqs if req.dllm_phase in _DLLM_INCOMING_PHASES]
+        if incoming_reqs:
+            self._process_dllm_incoming_reqs_mixed(
+                adder, incoming_reqs, running_batch=running_batch
+            )
+
+    def _process_dllm_incoming_reqs_mixed(
+        self: Scheduler,
+        adder: PrefillAdder,
+        reqs: List[Req],
+        running_batch: ScheduleBatch,
+    ) -> None:
+        """Admission gate for mixed rounds. The either/or gate compares
+        len(can_run_list) against free req slots, which starves incoming rows
+        here: can_run_list already carries every staging row, and incomplete
+        staging rows hold their req slot across FDFO rounds without drawing on
+        the free pool. Charge the row cap for every scheduled row but the slot
+        pool only for the rows that still need a fresh slot -- the same split
+        req_to_token_pool.alloc() makes. Priority preemption is not wired for
+        mixed rounds.
+        """
+        running_bs = len(running_batch.reqs)
+        new_slots_needed = sum(
+            1 for req in adder.can_run_list if req.req_pool_idx is None
+        )
+        admission_budget = min(
+            self.get_num_allocatable_reqs(running_bs + len(adder.can_run_list)),
+            self.req_to_token_pool.available_size() - new_slots_needed,
+        )
+
+        for req in reqs:
+            if admission_budget <= 0:
+                running_batch.batch_is_full = True
+                break
+
+            req.init_next_round_input(self.tree_cache)
+            res = adder.add_one_req(
+                req,
+                has_chunked_req=True,
+                truncation_align_size=self.truncation_align_size,
+            )
+
+            if res != AddReqResult.CONTINUE:
+                if res == AddReqResult.NO_TOKEN:
+                    running_batch.batch_is_full = True
+                break
+            admission_budget -= 1
 
     def _process_batch_by_phase(
         self,
@@ -265,6 +391,10 @@ class SchedulerDllmMixin:
                 self._add_request_to_queue(req)
 
         if can_run_list:
+            self.dllm_num_rounds += 1
+            num_prefill_rows = sum(req.is_dllm_prefill() for req in can_run_list)
+            if 0 < num_prefill_rows < len(can_run_list):
+                self.dllm_num_mixed_rounds += 1
             self.dllm_manager.add_staging_reqs(can_run_list)
             self.dllm_manager.increment_inflight_middle_chunks()
 
