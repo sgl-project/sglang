@@ -92,6 +92,10 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.true_on_policy import (
+    should_disable_mlp_allreduce_fusion_for_on_policy,
+    should_disable_reduce_scatter_for_on_policy,
+)
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
@@ -1144,6 +1148,9 @@ class LayerCommunicator:
         return reduce_output(hidden_states), residual
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
+        if should_disable_reduce_scatter_for_on_policy():
+            return False
+
         if not self.allow_reduce_scatter:
             return False
         if (
@@ -1173,6 +1180,9 @@ class LayerCommunicator:
         return False
 
     def _ffn_sum_can_move_to_next_layer(self) -> bool:
+        if should_disable_mlp_allreduce_fusion_for_on_policy():
+            return False
+
         # When MOE_FULL is active (moe_cp allgather), fusion must be disabled because
         # the fusion path skips postprocess_layer which contains the moe_cp scatter.
         # Without scatter, hidden_states remain at MOE_FULL size while residual is at
