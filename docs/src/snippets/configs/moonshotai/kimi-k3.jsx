@@ -234,7 +234,9 @@ export const config = {
       title: "Spec Decode",
       default: "dspark",
       options: [
-        { id: "none", label: "Non-Spec" },
+        { id: "none", label: "Non-Spec",
+          env: (s) => (["mi350x", "mi355x"].includes(s.hw) ? ["SGLANG_MLA_DECODE_TUNE=1"] : []),
+        },
         {
           id: "dspark",
           label: "DSPARK",
@@ -411,8 +413,8 @@ export const config = {
     gb300:  "lmsysorg/sglang:kimi-k3",
     b200:   "lmsysorg/sglang:kimi-k3",
     gb200:  "lmsysorg/sglang:kimi-k3",
-    mi350x: "lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727",
-    mi355x: "lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727",
+    mi350x: "lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260817",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260817",
     // NVFP4 needs a build with sgl-project/sglang#35077; the purpose-built dev
     // image is cut from that PR's head (CUDA 13).
     "b300|nvfp4":  "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
@@ -511,11 +513,8 @@ export const config = {
           { id: "w4a8", label: "W4A8",
             env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"] },
           { id: "w4a4", label: "W4A4",
-            env: [
-              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
-              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
-              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
-            ] },
+            flags: ["--enable-w4a4-mxfp4-megamoe"],
+            env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"] },
         ],
       },
       ep: { label: "EP", values: [

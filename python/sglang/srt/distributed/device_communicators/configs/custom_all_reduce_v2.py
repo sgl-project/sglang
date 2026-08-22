@@ -112,65 +112,137 @@ def _pack_heuristic(*args) -> Heuristic:
     return Heuristic(*arg_list)
 
 
-def _sm100_config(world_size: int, num_sm: int) -> AllReduceConfig:
-    # SM100 (Blackwell, B200/B300/GB200). Tuned on B200 (148 SMs); world 16 on GB200.
-    graph_map = {
-        2: (8.000 * MB, 32.00 * MB, 128.0 * MB),
-        3: (4.000 * MB, 4.000 * MB, 128.0 * MB),
-        4: (2.250 * MB, 2.250 * MB, 128.0 * MB),
-        5: (1.500 * MB, 1.500 * MB, 128.0 * MB),
-        6: (1.000 * MB, 1.000 * MB, 128.0 * MB),
-        7: (0.625 * MB, 0.625 * MB, 128.0 * MB),
-        8: (0.500 * MB, 0.500 * MB, 128.0 * MB, Range(8 * MB, 128 * MB)),
-        16: (0.250 * MB, 0.250 * MB, 128.0 * MB, Range(256 * KB, 128 * MB)),
+# SM100 (Blackwell, B200/B300/GB200). Tuned on B200 (148 SMs); world 16 on GB200.
+@cache
+def _sm100_configs(num_sm: int) -> dict[int, AllReduceConfig]:
+    mc_blocks = {5: 64, 6: 48, 7: 48, 8: 32, 16: 32}
+
+    def config(world_size: int, *, graph: tuple, eager: tuple) -> AllReduceConfig:
+        return AllReduceConfig(
+            graph=_pack_heuristic(*graph),
+            eager=_pack_heuristic(*eager),
+            num_push_blocks=num_sm,
+            num_pull_blocks=num_sm if world_size == 2 else 96,
+            num_mc_blocks=mc_blocks.get(world_size),
+        )
+
+    return {
+        2: config(
+            2,
+            graph=(8.000 * MB, 32.00 * MB, 128.0 * MB),
+            eager=(16.00 * MB, 128.0 * MB, 128.0 * MB),
+        ),
+        3: config(
+            3,
+            graph=(4.000 * MB, 4.000 * MB, 128.0 * MB),
+            eager=(8.000 * MB, 8.000 * MB, 32.00 * MB),
+        ),
+        4: config(
+            4,
+            graph=(2.250 * MB, 2.250 * MB, 128.0 * MB),
+            eager=(3.000 * MB, 3.000 * MB, 32.00 * MB),
+        ),
+        5: config(
+            5,
+            graph=(1.500 * MB, 1.500 * MB, 128.0 * MB),
+            eager=(2.000 * MB, 2.000 * MB, 32.00 * MB, Range(0, 32 * MB)),
+        ),
+        6: config(
+            6,
+            graph=(1.000 * MB, 1.000 * MB, 128.0 * MB),
+            eager=(1.250 * MB, 1.250 * MB, 64.00 * MB, Range(0, 64 * MB)),
+        ),
+        7: config(
+            7,
+            graph=(0.625 * MB, 0.625 * MB, 128.0 * MB),
+            eager=(1.000 * MB, 1.000 * MB, 64.00 * MB, Range(0, 64 * MB)),
+        ),
+        8: config(
+            8,
+            graph=(0.500 * MB, 0.500 * MB, 128.0 * MB, Range(8 * MB, 128 * MB)),
+            eager=(0.750 * MB, 0.750 * MB, 128.0 * MB, Range(0, 128 * MB)),
+        ),
+        16: config(
+            16,
+            graph=(0.250 * MB, 0.250 * MB, 128.0 * MB, Range(256 * KB, 128 * MB)),
+            eager=(0.250 * MB, 0.250 * MB, 128.0 * MB, Range(256 * KB, 128 * MB)),
+        ),
     }
-    eager_map = {
-        2: (16.00 * MB, 128.0 * MB, 128.0 * MB),
-        3: (8.000 * MB, 8.000 * MB, 32.00 * MB),
-        4: (3.000 * MB, 3.000 * MB, 32.00 * MB),
-        5: (2.000 * MB, 2.000 * MB, 32.00 * MB, Range(0, 32 * MB)),
-        6: (1.250 * MB, 1.250 * MB, 64.00 * MB, Range(0, 64 * MB)),
-        7: (1.000 * MB, 1.000 * MB, 64.00 * MB, Range(0, 64 * MB)),
-        8: (0.750 * MB, 0.750 * MB, 128.0 * MB, Range(0, 128 * MB)),
-        16: (0.250 * MB, 0.250 * MB, 128.0 * MB, Range(256 * KB, 128 * MB)),
-    }
-    mc_blocks_map = {5: 64, 6: 48, 7: 48, 8: 32, 16: 32}
-    return AllReduceConfig(
-        graph=_pack_heuristic(*graph_map[world_size]),
-        eager=_pack_heuristic(*eager_map[world_size]),
-        num_push_blocks=num_sm,
-        num_pull_blocks=num_sm if world_size == 2 else 96,
-        num_mc_blocks=mc_blocks_map.get(world_size, None),
-    )
 
 
-def _sm90_config(world_size: int, num_sm: int) -> AllReduceConfig:
-    # SM90 (Hopper, H100/H200). Tuned on H200.
-    graph_map = {
-        2: (16.00 * MB, 128.0 * MB, 128.0 * MB),
-        3: (1.250 * MB, 1.250 * MB, 128.0 * MB),
-        4: (384.0 * KB, 384.0 * KB, 128.0 * MB),
-        5: (192.0 * KB, 192.0 * KB, 32.00 * MB),
-        6: (128.0 * KB, 128.0 * KB, 32.00 * MB, Range(8 * MB, 32 * MB)),
-        7: (128.0 * KB, 128.0 * KB, 32.00 * MB, Range(1 * MB, 32 * MB)),
-        8: (128.0 * KB, 128.0 * KB, 32.00 * MB, Range(512 * KB, 128 * MB)),
+# SM90 (Hopper, H100/H200). Tuned on H200.
+@cache
+def _sm90_configs(num_sm: int) -> dict[int, AllReduceConfig]:
+    def config(world_size: int, *, graph: tuple, eager: tuple) -> AllReduceConfig:
+        return AllReduceConfig(
+            graph=_pack_heuristic(*graph),
+            eager=_pack_heuristic(*eager),
+            num_push_blocks=num_sm,
+            num_pull_blocks=64,
+            num_mc_blocks=None if world_size < 4 else 128 // world_size,
+        )
+
+    return {
+        2: config(
+            2,
+            graph=(16.00 * MB, 128.0 * MB, 128.0 * MB),
+            eager=(32.00 * MB, 128.0 * MB, 128.0 * MB),
+        ),
+        3: config(
+            3,
+            graph=(1.250 * MB, 1.250 * MB, 128.0 * MB),
+            eager=(3.000 * MB, 3.000 * MB, 16.00 * MB),
+        ),
+        4: config(
+            4,
+            graph=(384.0 * KB, 384.0 * KB, 128.0 * MB),
+            eager=(896.0 * KB, 896.0 * KB, 32.00 * MB, Range(0, 32 * MB)),
+        ),
+        5: config(
+            5,
+            graph=(192.0 * KB, 192.0 * KB, 32.00 * MB),
+            eager=(384.0 * KB, 384.0 * KB, 32.00 * MB, Range(0, 32 * MB)),
+        ),
+        6: config(
+            6,
+            graph=(128.0 * KB, 128.0 * KB, 32.00 * MB, Range(8 * MB, 32 * MB)),
+            eager=(192.0 * KB, 192.0 * KB, 32.00 * MB, Range(0, 32 * MB)),
+        ),
+        7: config(
+            7,
+            graph=(128.0 * KB, 128.0 * KB, 32.00 * MB, Range(1 * MB, 32 * MB)),
+            eager=(128.0 * KB, 128.0 * KB, 32.00 * MB, Range(0, 32 * MB)),
+        ),
+        8: config(
+            8,
+            graph=(128.0 * KB, 128.0 * KB, 32.00 * MB, Range(512 * KB, 128 * MB)),
+            eager=(128.0 * KB, 128.0 * KB, 128.0 * MB, Range(0, 128 * MB)),
+        ),
     }
-    eager_map = {
-        2: (32.00 * MB, 128.0 * MB, 128.0 * MB),
-        3: (3.000 * MB, 3.000 * MB, 16.00 * MB),
-        4: (896.0 * KB, 896.0 * KB, 32.00 * MB, Range(0, 32 * MB)),
-        5: (384.0 * KB, 384.0 * KB, 32.00 * MB, Range(0, 32 * MB)),
-        6: (192.0 * KB, 192.0 * KB, 32.00 * MB, Range(0, 32 * MB)),
-        7: (128.0 * KB, 128.0 * KB, 32.00 * MB, Range(0, 32 * MB)),
-        8: (128.0 * KB, 128.0 * KB, 128.0 * MB, Range(0, 128 * MB)),
-    }
-    return AllReduceConfig(
-        graph=_pack_heuristic(*graph_map[world_size]),
-        eager=_pack_heuristic(*eager_map[world_size]),
+
+
+@cache
+def _get_all_reduce_configs() -> dict[int, AllReduceConfig]:
+    cuda_major, _ = torch.cuda.get_device_capability()
+    num_sm = torch.cuda.get_device_properties().multi_processor_count
+    if cuda_major == 9:
+        return _sm90_configs(num_sm)
+    if cuda_major == 10:
+        return _sm100_configs(num_sm)
+
+    default = AllReduceConfig(
+        graph=Heuristic(1 * MB, 1 * MB, 16 * MB),
+        eager=Heuristic(1 * MB, 1 * MB, 16 * MB),
         num_push_blocks=num_sm,
-        num_pull_blocks=64,
-        num_mc_blocks=None if world_size < 4 else 128 // world_size,
+        num_pull_blocks=num_sm,
+        num_mc_blocks=None,
     )
+    return {world_size: default for world_size in range(2, 17)}
+
+
+@cache
+def get_supported_world_sizes() -> tuple[int, ...]:
+    return tuple(_get_all_reduce_configs())
 
 
 @cache
@@ -180,17 +252,4 @@ def get_all_reduce_config(world_size: int) -> AllReduceConfig:
     Only SM90 and SM100 are benchmarked so far; other archs get a
     conservative default (1 MB one-shot crossovers, no multicast).
     """
-    cuda_major, _ = torch.cuda.get_device_capability()
-    num_sm = torch.cuda.get_device_properties().multi_processor_count
-    if cuda_major == 9:
-        return _sm90_config(world_size, num_sm)
-    if cuda_major == 10:
-        return _sm100_config(world_size, num_sm)
-    default = Heuristic(1 * MB, 1 * MB, 16 * MB)
-    return AllReduceConfig(
-        graph=default,
-        eager=default,
-        num_push_blocks=num_sm,
-        num_pull_blocks=num_sm,
-        num_mc_blocks=None,
-    )
+    return _get_all_reduce_configs()[world_size]
