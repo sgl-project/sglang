@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum, auto
 from typing import Any, NamedTuple, NoReturn, Optional
 
 import torch
@@ -15,10 +16,8 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.topk import TopKOutput
-from sglang.srt.layers.moe.topk import TopKOutputChecker
+from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.utils import DeepEPMode
-
 
 _MOONEP_UNSUPPORTED_MESSAGE = (
     "MoonEP MoE A2A is recognized by SGLang, but the runtime dispatcher is not "
@@ -97,6 +96,30 @@ class MoonEPBufferKey:
     num_sms: int
 
 
+class _MoonEPFlightStage(Enum):
+    IDLE = auto()
+    DISPATCHED = auto()
+    PREFETCHED = auto()
+    POISONED = auto()
+
+
+@dataclass
+class _MoonEPFlightState:
+    stage: _MoonEPFlightStage = _MoonEPFlightStage.IDLE
+    plan: Any = None
+    poisoned_by: str | None = None
+
+    def transition(self, stage: _MoonEPFlightStage, plan: Any = None) -> None:
+        self.stage = stage
+        self.plan = plan
+        self.poisoned_by = None
+
+    def poison(self, operation: str) -> None:
+        self.stage = _MoonEPFlightStage.POISONED
+        self.plan = None
+        self.poisoned_by = operation
+
+
 class MoonEPBuffer:
     """Process-wide facade for MoonEP communication buffers.
 
@@ -117,6 +140,7 @@ class MoonEPBuffer:
         if state is None:
             state = SimpleNamespace(
                 buffers={},
+                flight_states={},
                 active_key=None,
             )
             buffers["moonep_ep_state"] = state
@@ -226,6 +250,20 @@ class MoonEPBuffer:
         return state.buffers.get(key)
 
     @classmethod
+    def get_flight_state(cls, buffer) -> _MoonEPFlightState:
+        state = cls._state()
+        for key, cached_buffer in state.buffers.items():
+            if cached_buffer is buffer:
+                flight_state = state.flight_states.get(key)
+                if flight_state is None:
+                    flight_state = _MoonEPFlightState()
+                    state.flight_states[key] = flight_state
+                return flight_state
+        raise RuntimeError(
+            "MoonEP buffer is not registered with the process-wide facade."
+        )
+
+    @classmethod
     def get_moonep_buffer(
         cls,
         group: dist.ProcessGroup,
@@ -286,6 +324,7 @@ class MoonEPBuffer:
             return
 
         buffer = state.buffers.pop(key, None)
+        state.flight_states.pop(key, None)
         destroy = getattr(buffer, "destroy", None)
         if callable(destroy):
             destroy()
@@ -451,9 +490,7 @@ def run_moonep_bf16_expert(
             f"shape {cu_seqlens.shape}"
         )
     if route_weights_nvs is not None and route_weights_nvs.ndim != 1:
-        raise ValueError(
-            f"route_weights_nvs must be 1D, got {route_weights_nvs.shape}"
-        )
+        raise ValueError(f"route_weights_nvs must be 1D, got {route_weights_nvs.shape}")
 
     output = torch.empty_like(hidden_states)
     prev = 0
@@ -554,6 +591,36 @@ class MoonEPDispatcher(BaseDispatcher):
         except (AssertionError, RuntimeError, TypeError, ValueError):
             return 0
 
+    @staticmethod
+    def _require_flight_stage(
+        flight_state: _MoonEPFlightState,
+        required_stage: _MoonEPFlightStage,
+        operation: str,
+    ) -> None:
+        if flight_state.stage is _MoonEPFlightStage.POISONED:
+            raise RuntimeError(
+                "MoonEP buffer is poisoned after "
+                f"{flight_state.poisoned_by or 'an unknown operation'} failed; "
+                "tear down the buffer before reuse."
+            )
+        if flight_state.stage is not required_stage:
+            raise RuntimeError(
+                f"MoonEP {operation} requires {required_stage.name}, "
+                f"but the shared buffer is {flight_state.stage.name}."
+            )
+
+    @staticmethod
+    def _require_same_plan(
+        flight_state: _MoonEPFlightState,
+        plan: Any,
+        operation: str,
+    ) -> None:
+        if flight_state.plan is not plan:
+            raise RuntimeError(
+                f"MoonEP {operation} requires the same MoonEP plan returned by "
+                "the active dispatch."
+            )
+
     def _pad_to_capacity(
         self,
         hidden_states: torch.Tensor,
@@ -639,19 +706,44 @@ class MoonEPDispatcher(BaseDispatcher):
         )
         tokens_per_expert = self._tokens_per_expert(topk_ids)
         buffer = self._get_buffer()
-        hidden_nvsh, route_weights_nvs, cu_seqlens, plan = buffer.dispatch(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            tokens_per_expert,
-            async_finish=False,
+        flight_state = MoonEPBuffer.get_flight_state(buffer)
+        self._require_flight_stage(
+            flight_state,
+            _MoonEPFlightStage.IDLE,
+            "dispatch",
         )
+        try:
+            dispatch_result = buffer.dispatch(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                tokens_per_expert,
+                async_finish=self.async_finish,
+                zero_copy=False,
+            )
+            if self.async_finish:
+                (
+                    hidden_nvsh,
+                    route_weights_nvs,
+                    cu_seqlens,
+                    plan,
+                    dispatch_event,
+                ) = dispatch_result
+                dispatch_event.wait(torch.cuda.current_stream())
+            else:
+                hidden_nvsh, route_weights_nvs, cu_seqlens, plan = dispatch_result
+            expert_ids = self._expert_ids_from_plan(cu_seqlens, plan)
+        except Exception:
+            flight_state.poison("dispatch")
+            raise
+
+        flight_state.transition(_MoonEPFlightStage.DISPATCHED, plan)
         return MoonEPDispatchOutput(
             hidden_states=hidden_nvsh,
             route_weights_nvs=route_weights_nvs,
             cu_seqlens=cu_seqlens,
             plan=plan,
-            expert_ids=self._expert_ids_from_plan(cu_seqlens, plan),
+            expert_ids=expert_ids,
             num_tokens=num_tokens,
         )
 
@@ -674,12 +766,29 @@ class MoonEPDispatcher(BaseDispatcher):
                 f"MoonEPDispatcher.combine expected MOONEP input, got "
                 f"{combine_input.format}"
             )
-        hidden_states, _route_weights_sk, _event = self._get_buffer().combine(
-            plan=combine_input.plan,
-            hidden_nvsh=combine_input.hidden_states,
-            route_weights_nvs=None,
-            async_finish=False,
+        buffer = self._get_buffer()
+        flight_state = MoonEPBuffer.get_flight_state(buffer)
+        self._require_flight_stage(
+            flight_state,
+            _MoonEPFlightStage.PREFETCHED,
+            "combine",
         )
+        self._require_same_plan(flight_state, combine_input.plan, "combine")
+        try:
+            hidden_states, _route_weights_sk, combine_event = buffer.combine(
+                plan=combine_input.plan,
+                hidden_nvsh=combine_input.hidden_states,
+                route_weights_nvs=None,
+                async_finish=self.async_finish,
+                zero_copy=False,
+            )
+            if self.async_finish:
+                combine_event.wait(torch.cuda.current_stream())
+        except Exception:
+            flight_state.poison("combine")
+            raise
+
+        flight_state.transition(_MoonEPFlightStage.IDLE)
         return hidden_states[: combine_input.num_tokens].contiguous()
 
     def combine_a(
@@ -696,13 +805,29 @@ class MoonEPDispatcher(BaseDispatcher):
         plan: Any,
         weight_layout: MoonEPExpertWeightLayout,
     ) -> None:
-        self._get_buffer().prefetch_weight(
-            plan=plan,
-            async_finish=False,
-            full_gate_weight=weight_layout.full_gate_weight,
-            full_up_weight=weight_layout.full_up_weight,
-            full_down_weight=weight_layout.full_down_weight,
+        buffer = self._get_buffer()
+        flight_state = MoonEPBuffer.get_flight_state(buffer)
+        self._require_flight_stage(
+            flight_state,
+            _MoonEPFlightStage.DISPATCHED,
+            "prefetch_weight",
         )
+        self._require_same_plan(flight_state, plan, "prefetch_weight")
+        try:
+            prefetch_event = buffer.prefetch_weight(
+                plan=plan,
+                async_finish=self.async_finish,
+                full_gate_weight=weight_layout.full_gate_weight,
+                full_up_weight=weight_layout.full_up_weight,
+                full_down_weight=weight_layout.full_down_weight,
+            )
+            if self.async_finish:
+                prefetch_event.wait(torch.cuda.current_stream())
+        except Exception:
+            flight_state.poison("prefetch_weight")
+            raise
+
+        flight_state.transition(_MoonEPFlightStage.PREFETCHED, plan)
 
     def register_deepep_dispatch_hook(self, hook):
         self._raise_unimplemented()

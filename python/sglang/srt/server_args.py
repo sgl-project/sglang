@@ -6862,6 +6862,25 @@ class ServerArgs:
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
         if a2a_backend == "moonep":
+            unsupported_overlap_flags = [
+                flag
+                for enabled, flag in (
+                    (
+                        self.enable_two_batch_overlap,
+                        "--enable-two-batch-overlap",
+                    ),
+                    (
+                        self.enable_single_batch_overlap,
+                        "--enable-single-batch-overlap",
+                    ),
+                )
+                if enabled
+            ]
+            if unsupported_overlap_flags:
+                raise ValueError(
+                    "MoonEP supports single-flight operation only and is "
+                    "incompatible with " + " and ".join(unsupported_overlap_flags) + "."
+                )
             logger.warning(
                 "MoonEP MoE is enabled in experimental BF16 PoC mode. "
                 "Cuda graph is disabled while the eager MoonEP dispatch/"
