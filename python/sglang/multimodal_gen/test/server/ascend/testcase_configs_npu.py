@@ -27,7 +27,7 @@ JOYAI_IMAGE_EDIT_WEIGHTS_PATH = use_modelscope(
 )
 LTX_2_WEIGHTS_PATH = use_modelscope("Lightricks/LTX-2")
 MOVA_360_WEIGHTS_PATH = use_modelscope("openmoss/MOVA-360p")
-MINIMAX_H3_WEIGHTS_PATH = use_modelscope("MiniMaxAI/MiniMax-H3")
+MINIMAX_H3_WEIGHTS_PATH = use_modelscope("MiniMax/MiniMax-H3")
 QWEN_IMAGE_WEIGHTS_PATH = use_modelscope("Qwen/Qwen-Image")
 WAN2_1_T2V_1_3B_DIFFUSERS_WEIGHTS_PATH = use_modelscope(
     "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
