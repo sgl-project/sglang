@@ -31,7 +31,8 @@ class EngineInfoBootstrapServer:
     accesses the collected info directly in-process; external consumers can
     query via HTTP GET.
 
-    Currently supports transfer engine memory registration info.
+    Currently supports transfer engine memory registration info and
+    per-rank parallelism configuration.
     """
 
     def __init__(self, host: str, port: int):
@@ -40,6 +41,8 @@ class EngineInfoBootstrapServer:
 
         # Storage: {tp_rank: (session_id, weights_info_dict)}
         self.transfer_engine_info: Dict[int, Tuple] = {}
+        # Storage: {tp_rank: parallelism_config_dict}
+        self.parallelism_config: Dict[int, dict] = {}
         self.lock = threading.Lock()
 
         app = FastAPI()
@@ -89,6 +92,38 @@ class EngineInfoBootstrapServer:
 
         config = uvicorn.Config(app, host=host, port=port, log_level="warning")
         self._server = uvicorn.Server(config)
+
+        @app.put("/register_parallelism_config")
+        def register_parallelism_config(data: dict):
+            try:
+                tp_rank = data["tp_rank"]
+                config = data["parallelism_config"]
+
+                with self.lock:
+                    self.parallelism_config[tp_rank] = config
+
+                logger.info(f"Registered parallelism config for tp_rank={tp_rank}")
+                return PlainTextResponse("OK")
+            except Exception as e:
+                logger.error(f"Failed to register parallelism config: {e}")
+                raise HTTPException(status_code=400, detail=str(e))
+
+        @app.get("/get_parallelism_config")
+        def get_parallelism_config(rank: int):
+            if rank < 0:
+                raise HTTPException(status_code=400, detail="Invalid rank parameter")
+
+            with self.lock:
+                config = self.parallelism_config.get(rank)
+
+            if config is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No parallelism config for rank {rank}",
+                )
+
+            return config
+
         self._thread = threading.Thread(
             target=self._server.run,
             daemon=True,
@@ -103,3 +138,7 @@ class EngineInfoBootstrapServer:
     def get_transfer_engine_info(self, rank: int) -> Optional[Tuple]:
         """Direct in-process access for co-located HTTP server (no HTTP round-trip)."""
         return self.transfer_engine_info.get(rank)
+
+    def get_parallelism_config_info(self, rank: int) -> Optional[dict]:
+        """Direct in-process access for parallelism config (no HTTP round-trip)."""
+        return self.parallelism_config.get(rank)
