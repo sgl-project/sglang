@@ -3161,15 +3161,12 @@ class RankParallelismConfig:
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
 
-        # Import dp_attention lazily to avoid circular imports
-        from sglang.srt.layers.dp_attention import (
-            get_attention_cp_rank,
-            get_attention_cp_size,
-            get_attention_dp_rank,
-            get_attention_dp_size,
-            get_attention_tp_rank,
-            get_attention_tp_size,
-        )
+        # v0.5.16 retired the get_attention_{tp,dp,cp}_* helpers from dp_attention;
+        # the attention-side ranks/sizes now live on the runtime ParallelState.
+        # Imported lazily to avoid a circular import.
+        from sglang.srt.runtime_context import get_parallel
+
+        ps = get_parallel()
 
         return cls(
             tp_size=tp_size,
@@ -3180,12 +3177,12 @@ class RankParallelismConfig:
             ep_rank=get_moe_expert_parallel_rank(),
             moe_tp_size=get_moe_tensor_parallel_world_size(),
             moe_tp_rank=get_moe_tensor_parallel_rank(),
-            attn_tp_size=get_attention_tp_size(),
-            attn_tp_rank=get_attention_tp_rank(),
-            attn_dp_size=get_attention_dp_size(),
-            attn_dp_rank=get_attention_dp_rank(),
-            attn_cp_size=get_attention_cp_size(),
-            attn_cp_rank=get_attention_cp_rank(),
+            attn_tp_size=ps.attn_tp_size,
+            attn_tp_rank=ps.attn_tp_rank,
+            attn_dp_size=ps.attn_dp_size,
+            attn_dp_rank=ps.attn_dp_rank,
+            attn_cp_size=ps.attn_cp_size,
+            attn_cp_rank=ps.attn_cp_rank,
             moe_dp_size=get_moe_data_parallel_world_size(),
             moe_dp_rank=get_moe_data_parallel_rank(),
             world_size=(
@@ -3204,8 +3201,10 @@ class RankParallelismConfig:
 
 # Globals on parallel_state module to save/restore
 _PS_GLOBALS = ("_TP", "_PP", "_MOE_EP", "_MOE_TP", "_ATTN_TP", "_ATTN_CP", "_MOE_DP")
-# Globals on dp_attention module to save/restore
-_DA_GLOBALS = ("_ATTN_DP_RANK", "_ATTN_DP_SIZE", "_ENABLE_DP_ATTENTION_FLAG")
+# Globals on dp_attention module to save/restore. v0.5.16 moved the dp-attention
+# enable flag out of this module onto the runtime flags (get_flags().dp.enabled),
+# so it is saved/restored separately below rather than as a module attribute.
+_DA_GLOBALS = ("_ATTN_DP_RANK", "_ATTN_DP_SIZE")
 
 
 class ParallelismContext:
@@ -3244,6 +3243,7 @@ class ParallelismContext:
 
         from sglang.srt.distributed import parallel_state
         from sglang.srt.layers import dp_attention
+        from sglang.srt.runtime_context import get_flags
 
         # Save original globals
         for name in _PS_GLOBALS:
@@ -3267,7 +3267,10 @@ class ParallelismContext:
         # Set dp_attention scalar globals
         dp_attention._ATTN_DP_RANK = conf.attn_dp_rank
         dp_attention._ATTN_DP_SIZE = conf.attn_dp_size
-        dp_attention._ENABLE_DP_ATTENTION_FLAG = conf.attn_dp_size > 1
+        # is_dp_attention_enabled() reads this, not a dp_attention module global.
+        dp_flags = get_flags().dp
+        self._original_dp_enabled = dp_flags.enabled
+        dp_flags.enabled = conf.attn_dp_size > 1
 
         logger.info(f"[ParallelismContext] Activated: {conf}")
         return self
@@ -3275,12 +3278,14 @@ class ParallelismContext:
     def __exit__(self, *args):
         from sglang.srt.distributed import parallel_state
         from sglang.srt.layers import dp_attention
+        from sglang.srt.runtime_context import get_flags
 
         # Restore original globals
         for name in _PS_GLOBALS:
             setattr(parallel_state, name, self._original_globals.get(name))
         for name in _DA_GLOBALS:
             setattr(dp_attention, name, self._original_globals.get(name))
+        get_flags().dp.enabled = self._original_dp_enabled
 
         logger.info("[ParallelismContext] Deactivated")
         return False
