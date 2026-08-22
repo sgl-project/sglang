@@ -10,19 +10,28 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install).
+For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install). The two paths below match the **Python / Docker** toggle in the command panel.
 
 <Tabs>
+
+<Tab title="Python (pip / uv)">
+
+```bash Command
+pip install --upgrade pip
+pip install uv
+uv pip install --prerelease=allow sglang
+```
+
+Then run the **Python** output of the command panel below in that environment.
+
+</Tab>
 
 <Tab title="Docker">
 
 ```bash Command
-docker pull lmsysorg/sglang:kimi-k3 # CUDA13
-docker pull lmsysorg/sglang:kimi-k3-cu12 # CUDA12
-docker pull lmsysorg/sglang-rocm:v0.5.16-rocm720-mi35x-20260805 # ROCM daily image
+docker pull lmsysorg/sglang:latest                                  # NVIDIA (CUDA)
+docker pull lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260817     # AMD MI350X / MI355X (ROCm)
 ```
-
-These tags publish with the public K3 launch; until then, build from the Dockerfiles linked below.
 
 For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
 
@@ -30,11 +39,9 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 </Tabs>
 
-If you do not want to use a Docker image, reproduce the dependency installation steps from the [CUDA 13 Dockerfile](https://github.com/sgl-project/sglang/blob/kimi-k3/docker/kimi_k3/kimi_k3_cu13.Dockerfile) or [CUDA 12 Dockerfile](https://github.com/sgl-project/sglang/blob/kimi-k3/docker/kimi_k3/kimi_k3_cu12.Dockerfile).
-
 </Accordion>
 
-Pick your hardware, then the deployment shape and operating point. Node count follows the hardware recipe (B200 2×8, GB200 4×4, H100 4×8, B300 1×8, H200 2×8 — 4×8 on Unified High-Throughput, GB300 2×4, MI350X/MI355X 1×8), so it is not a separate choice.
+Pick your hardware, then the deployment shape and operating point. Node count follows the hardware recipe (B200 2×8, GB200 4×4, H100 4×8, B300 1×8, H200 2×8 — 4×8 on Unified High-Throughput, GB300 2×4, MI350X/MI355X 1×8), so it is not a separate choice. If you serve the NVFP4 checkpoint (`nvidia/Kimi-K3-NVFP4`, the **Quantization** row in the panel below), use the `lmsysorg/sglang:dev-dev-kimi-k3-nvfp4` image.
 
 **PD Mode** — `Unified` serves prefill and decode together. `Prefill` / `Decode` split them into dedicated pools (see [PD disaggregation](#3-4-pd-disaggregation)); `Prefill` ships two strategies, both chunked at 16k. On the 8-GPU platforms (B300 1×8, GB300 2×4), `Default` is TP8 and `Long-Context` is `--pp-size 8 --tp-size 1`. On the 16-GPU platforms (B200 2×8, GB200 4×4), both are `--pp-size 16 --tp-size 1` and differ only in `--mem-fraction-static` (0.85 vs 0.90) — deep PP is the throughput shape there, not just the long-context one (see [Deep PP](#deep-pp-for-prefill)).
 
@@ -145,7 +152,7 @@ Speculation: DSPARK holds block size + 1 (= 8) intermediate states per request �
 | GB200 4×4 | TP16/DCP16 | MNNVL auto-detected |
 | H200 2×8 (4×8 on Unified High-Throughput) | TP16/EP16 + symm-mem, Marlin + FlashMLA; High-Throughput widens to TP32/EP32 over 4 nodes at mem-frac 0.90 with `extra_buffer_lazy` | same block on every node; export the cross-node NIC (`GLOO_SOCKET_IFNAME` / `NCCL_SOCKET_IFNAME`, `SGLANG_HOST_IP`); keep `NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1` |
 | H100 4×8 | TP32/EP32, Marlin + FlashMLA | SM90a build of the K3 image; pin NCCL/Gloo to the same NIC on all nodes; least post-weight headroom (80 GB) |
-| MI350X/MI355X 1×8 | TP8 ROCm/AITER | AITER A8W4 FlyDSL MoE, Triton attention, graph bs up to 256, fp8 kvcache; DSPARK supported |
+| MI350X/MI355X 1×8 | TP8 ROCm/AITER | AITER A8W4 FlyDSL MoE, Triton attention (`SGLANG_MLA_DECODE_TUNE=1` for gfx950 MLA decode geometry), graph bs up to 256, fp8 kvcache; DSPARK supported |
 
 **DCP notes** — the DCP cells are Balanced and High-Throughput on every Blackwell platform, in both the `Unified` and `Decode` roles:
 
@@ -154,7 +161,7 @@ Speculation: DSPARK holds block size + 1 (= 8) intermediate states per request �
 - No `--enable-symm-mem` under DCP (force-disabled for decode-graph correctness).
 - Explicit `tokenspeed_mla` force-rewrites `--kv-cache-dtype` to fp8; the default `cutedsl_mla` serves either dtype.
 - Calculator ratios run well above 1 here (`r > 1` is legal): `bfloat16` state buys admission, `fp8` KV buys context.
-- Don't use EP with an a2a backend: a2a buffers reclaim the KV that DCP buys. Compose only to measure. a2a backend is set when `SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1` or `--moe-a2a-backend` is set.
+- Don't use EP with an a2a backend: a2a buffers reclaim the KV that DCP buys. Compose only to measure. a2a backend is set when `--moe-a2a-backend` is set.
 
 No cell has a serving round in this exact shape — treat them as starting points to verify.
 

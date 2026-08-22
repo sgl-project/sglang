@@ -171,11 +171,19 @@ export const Playground = ({ config }) => {
     return null;
   };
 
-  // hw|variant|quant → variant|quant → "".
+  // hw|variant|quant → variant|quant → hw|quant → quant → "".
   const resolveModelName = (sel) => {
-    const triple = `${sel.hw}|${sel.variant}|${sel.quant}`;
-    const pair = `${sel.variant}|${sel.quant}`;
-    return config.modelNames[triple] ?? config.modelNames[pair] ?? "";
+    const keys = [
+      `${sel.hw}|${sel.variant}|${sel.quant}`,
+      `${sel.variant}|${sel.quant}`,
+      `${sel.hw}|${sel.quant}`,
+      sel.quant,
+    ];
+    for (const k of keys) {
+      const hit = config.modelNames[k];
+      if (hit) return hit;
+    }
+    return "";
   };
 
   const interpolate = (text, env, modelName) =>
@@ -603,23 +611,21 @@ export const Playground = ({ config }) => {
     // ---- Axis: MoE Parallelism ----------------------------------------------
     // Backend single-select + EP numeric knob; either is optional. Picking the
     // "megamoe" backend reveals a Quantization sub-select (W4A8 / W4A4) in the same
-    // row — W4A4 adds the FP4-activations env vars.
+    // row — W4A4 adds the FP4-activations server flag.
     moe: {
       initState: () => ({ backend: null, ep: null, mmQuant: null }),
 
       // Prefer --moe-a2a-backend over --moe-runner-backend when both present.
-      // mmQuant is derived from the base env (FP4 activations present → W4A4).
+      // mmQuant is derived from the base flag (FP4 activations present → W4A4).
       deriveFromBase: (cell, fc, h) => {
         const flags = (cell && cell.flags) || [];
-        const baseEnv = (cell && cell.env) || [];
         const a2a    = h.findFlagArg(flags, "--moe-a2a-backend");
         const runner = h.findFlagArg(flags, "--moe-runner-backend");
-        const fp4Acts = baseEnv.some(
-          (e) => e.startsWith("SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS"));
+        const w4a4 = h.hasFlag(flags, "--enable-w4a4-mxfp4-megamoe");
         return {
           backend: a2a || runner || null,
           ep: h.parseIntFlagAny(flags, h.EP_HEADS),
-          mmQuant: fp4Acts ? "w4a4" : "w4a8",
+          mmQuant: w4a4 ? "w4a4" : "w4a8",
         };
       },
 
@@ -643,15 +649,19 @@ export const Playground = ({ config }) => {
           if (opt?.env?.length) env = [...env, ...opt.env];
         }
         // MegaMoE owns the MoE path: when the effective backend is megamoe, strip the
-        // DeepEP dispatch + any prior megamoe env, then re-add the selected quant's
-        // env. When the backend is explicitly switched away from megamoe, only drop
-        // the megamoe quant env (leave DeepEP dispatch intact).
+        // DeepEP dispatch + any prior MegaMoE quant settings, then re-add the
+        // selected quant's flags/env. When the backend is explicitly switched
+        // away from MegaMoE, only drop the MegaMoE quant settings (leave DeepEP
+        // dispatch intact).
         const mq = fc.megamoeQuant;
         if (mq) {
           const quantKeys = [];
+          const quantFlagHeads = [];
           for (const o of (mq.options || [])) {
             for (const e of (o.env || [])) quantKeys.push(e.split("=")[0]);
+            for (const f of (o.flags || [])) quantFlagHeads.push(f.split(/[\s=]/)[0]);
           }
+          flags = h.stripFlagsByFirstToken(flags, quantFlagHeads);
           const effBackend = value.backend !== null
             ? value.backend : (derived && derived.backend);
           if (effBackend === "megamoe") {
@@ -659,6 +669,9 @@ export const Playground = ({ config }) => {
             const quant = value.mmQuant != null
               ? value.mmQuant : ((derived && derived.mmQuant) || "w4a8");
             const opt = (mq.options || []).find((o) => o.id === quant);
+            if (opt?.flags?.length) {
+              flags = h.insertAfter(flags, h.ANCHOR_NEAR_MOE, opt.flags);
+            }
             if (opt?.env?.length) env = [...env, ...opt.env];
           } else if (value.backend !== null) {
             env = h.stripEnvByPrefix(env, quantKeys);
@@ -817,6 +830,8 @@ export const Playground = ({ config }) => {
               || head === "--speculative-eagle-topk"
               || head === "--speculative-num-draft-tokens"
               || head === "--speculative-dspark-block-size"
+              || head === "--enable-linear-replayssm-spec"
+              || head === "--linear-replayssm-cache-len"
               || head === "--speculative-ngram-max-bfs-breadth";
         });
         if (baseSpec.length === 0) return "off";
@@ -842,7 +857,8 @@ export const Playground = ({ config }) => {
         flags = h.stripFlagsByFirstToken(flags, [
           "--speculative-algorithm", "--speculative-num-steps",
           "--speculative-eagle-topk", "--speculative-num-draft-tokens",
-          "--speculative-dspark-block-size",
+          "--speculative-dspark-block-size", "--enable-linear-replayssm-spec",
+          "--linear-replayssm-cache-len",
           "--speculative-ngram-max-bfs-breadth",
         ]);
         const preset = (fc.options || []).find((p) => p.id === value);
@@ -901,10 +917,6 @@ export const Playground = ({ config }) => {
           "--disaggregation-mode", "--disaggregation-transfer-backend",
           "--disaggregation-ib-device", "--disaggregation-bootstrap-port",
         ]);
-        const specAlgorithm = (h.findFlagArg(flags, "--speculative-algorithm") || "").toUpperCase();
-        if ((fc.incompatibleSpeculativeAlgorithms || []).includes(specAlgorithm)) {
-          return { flags, env };
-        }
         const backends = fc.transferBackends || [];
         // A config that omits `modes` has the role on the Deploy panel instead;
         // this card then only tunes the transport for whatever role is selected.
@@ -913,6 +925,16 @@ export const Playground = ({ config }) => {
           : ((sel && sel.pdMode) || "off");
 
         if (mode === "prefill" || mode === "decode") {
+          // PD and some speculative algorithms cannot run together. Keep the
+          // PD card reachable for a speculative base recipe, then make the
+          // user's explicit PD-role selection win by removing the whole
+          // speculative flag family before composing the role command.
+          const specAlgorithm = (h.findFlagArg(
+            flags, "--speculative-algorithm") || "").toUpperCase();
+          if ((fc.incompatibleSpeculativeAlgorithms || []).includes(specAlgorithm)) {
+            flags = flags.filter((flag) =>
+              !flag.split(/[\s=]/)[0].startsWith("--speculative-"));
+          }
           const backend = value.transferBackend || (backends[0] || {}).id || "mooncake";
           const adds = [
             `--disaggregation-mode ${mode}`,

@@ -1,5 +1,6 @@
 import copy
 import logging
+from collections.abc import Callable
 from contextlib import nullcontext
 from typing import Any
 
@@ -15,8 +16,16 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     ComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
+from sglang.multimodal_gen.runtime.loader.gguf_weights import gguf_weights_iterator
+from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
+    comfy_quant_key_filter,
+    inspect_minimax_h3_safetensors,
+    resolve_minimax_h3_checkpoint_quantization,
+    validate_minimax_h3_checkpoint_variant,
+)
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     TransformerQuantLoadSpec,
+    resolve_transformer_gguf_to_load,
     resolve_transformer_quant_load_spec,
     resolve_transformer_safetensors_to_load,
 )
@@ -42,12 +51,19 @@ logger = init_logger(__name__)
 def _resolve_checkpoint_load_device(
     runtime_device: torch.device,
     *,
-    component_cpu_offload: bool,
+    component_starts_on_cpu: bool,
     runtime_quant_config: object | None,
+    quantized_cpu_load_supported: bool = False,
 ) -> torch.device:
-    if component_cpu_offload and runtime_quant_config is None:
+    if component_starts_on_cpu and (
+        runtime_quant_config is None or quantized_cpu_load_supported
+    ):
         return torch.device("cpu")
     return runtime_device
+
+
+def _minimax_h3_adaln_cache_key_filter(name: str) -> bool:
+    return ".adaln_proj.linear." not in name
 
 
 def _default_quantized_attention_backend(
@@ -123,6 +139,8 @@ def _server_args_for_transformer_component(
 class TransformerLoader(ComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
 
+    allow_global_attention_backend_fallback = False
+
     component_names = [
         "transformer",
         "unconditional_transformer",
@@ -130,6 +148,21 @@ class TransformerLoader(ComponentLoader):
         "video_dit",
     ]
     expected_library = "diffusers"
+
+    def customized_load_kwargs_for_component(
+        self, server_args: ServerArgs, component_name: str
+    ) -> dict[str, bool]:
+        if (
+            current_platform.is_mps()
+            and server_args.should_configure_layerwise_offload_for_lazy_component(
+                component_name
+            )
+        ):
+            logger.info(
+                "Loading %s on CPU first for MPS layerwise offload", component_name
+            )
+            return {"cpu_offload_flag": True}
+        return {}
 
     def should_raise_customized_load_error(
         self, server_args: ServerArgs, component_name: str
@@ -146,32 +179,43 @@ class TransformerLoader(ComponentLoader):
         )
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, component_name: str
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        cpu_offload_flag: bool = False,
     ):
         """Load the transformer based on the model path, and inference args."""
         component_server_args = _server_args_for_transformer_component(
             server_args, component_name
         )
-        if server_args.cpu_offload_components is not None:
-            component_server_args = copy.copy(component_server_args)
-            component_server_args.dit_cpu_offload = (
-                server_args.should_cpu_offload_component(component_name)
-            )
 
         # 1. hf config
         config = get_diffusers_component_config(component_path=component_model_path)
 
-        safetensors_list = resolve_transformer_safetensors_to_load(
-            component_server_args, component_model_path
+        gguf_file = resolve_transformer_gguf_to_load(
+            component_server_args, component_name
         )
+        if gguf_file is not None:
+            # A GGUF file holds the whole transformer; the remaining components
+            # still load from the base model path.
+            safetensors_list = []
+        else:
+            safetensors_list = resolve_transformer_safetensors_to_load(
+                component_server_args, component_model_path
+            )
 
         # 2. dit config
         # Config from Diffusers supersedes sgl_diffusion's model config
-        component_name = _normalize_component_type(component_name)
+        component_type = _normalize_component_type(component_name)
         server_args.model_paths[component_name] = component_model_path
-        if component_name in ("transformer", "unconditional_transformer", "video_dit"):
+        if component_type in (
+            "transformer",
+            "unconditional_transformer",
+            "video_dit",
+        ):
             pipeline_dit_config_attr = "dit_config"
-        elif component_name in ("audio_dit",):
+        elif component_type == "audio_dit":
             pipeline_dit_config_attr = "audio_dit_config"
         else:
             raise ValueError(f"Invalid module name: {component_name}")
@@ -181,6 +225,35 @@ class TransformerLoader(ComponentLoader):
         cls_name = config.pop("_class_name")
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
+        checkpoint_quant_config = None
+        if cls_name == "MiniMaxH3DiTModel":
+            selected_variant = str(component_server_args.model_variant or "fl2va")
+            if gguf_file is not None:
+                validate_minimax_h3_checkpoint_variant([gguf_file], selected_variant)
+            elif component_server_args.transformer_weights_path is not None:
+                validate_minimax_h3_checkpoint_variant(
+                    safetensors_list, selected_variant
+                )
+                adaln_curve_shape, layer_markers = inspect_minimax_h3_safetensors(
+                    safetensors_list
+                )
+                checkpoint_quant_config = resolve_minimax_h3_checkpoint_quantization(
+                    layer_markers
+                )
+                if adaln_curve_shape is not None:
+                    (
+                        dit_config.arch_config.adaln_curve_grid,
+                        dit_config.arch_config.time_embed_dim,
+                    ) = adaln_curve_shape
+                    if (
+                        component_server_args.minimax_h3_adaln_cache_path is not None
+                        or component_server_args.minimax_h3_adaln_online
+                    ):
+                        raise ValueError(
+                            "MiniMax-H3 pruned curve checkpoints cannot use a "
+                            "separate AdaLN cache or online AdaLN rebuild"
+                        )
+
         quant_spec = resolve_transformer_quant_load_spec(
             hf_config=config,
             server_args=component_server_args,
@@ -188,36 +261,114 @@ class TransformerLoader(ComponentLoader):
             component_model_path=component_model_path,
             model_cls=model_cls,
             cls_name=cls_name,
+            component_name=component_name,
+            gguf_file=gguf_file,
+            checkpoint_quant_config=checkpoint_quant_config,
         )
+        if quant_spec.gguf_file is not None and cls_name == "MiniMaxH3DiTModel":
+            assert quant_spec.quant_config is not None
+            curve = quant_spec.quant_config.tensor_meta.get("adaln_t_table")
+            if curve is not None:
+                if curve.is_quantized or len(curve.logical_shape) != 2:
+                    raise ValueError(
+                        "MiniMax-H3 adaln_t_table must be an unquantized 2D tensor"
+                    )
+                curve_grid, time_embed_dim = curve.logical_shape
+                if curve_grid < 2:
+                    raise ValueError("MiniMax-H3 adaln_t_table needs at least two rows")
+                dit_config.arch_config.adaln_curve_grid = curve_grid
+                dit_config.arch_config.time_embed_dim = time_embed_dim
+        # Quantization adapters may require resident weights, so placement must
+        # be resolved after they have validated the component configuration.
+        component_starts_on_cpu = (
+            server_args.should_start_component_on_cpu(component_name)
+            or cpu_offload_flag
+        )
+        use_fsdp = server_args.should_use_fsdp_for_component(component_name)
+        if quant_spec.is_comfy_fp8 and use_fsdp:
+            raise ValueError(
+                "MiniMax-H3 Comfy FP8 does not support FSDP inference; use TP "
+                "and/or sequence parallelism instead"
+            )
 
-        logger.info(
-            "Loading %s from %s safetensors file(s) %s, param_dtype: %s",
-            cls_name,
-            len(safetensors_list),
-            f": {safetensors_list}" if get_log_level() == logging.DEBUG else "",
-            quant_spec.param_dtype,
-        )
+        if quant_spec.gguf_file is not None:
+            logger.info(
+                "Loading %s from GGUF file %s, param_dtype: %s",
+                cls_name,
+                quant_spec.gguf_file,
+                quant_spec.param_dtype,
+            )
+        else:
+            logger.info(
+                "Loading %s from %s safetensors file(s) %s, param_dtype: %s",
+                cls_name,
+                len(safetensors_list),
+                f": {safetensors_list}" if get_log_level() == logging.DEBUG else "",
+                quant_spec.param_dtype,
+            )
         # prepare init_param
         init_params: dict[str, Any] = {
             "config": dit_config,
             "hf_config": config,
             "quant_config": quant_spec.runtime_quant_config,
         }
+        checkpoint_key_filter: Callable[[str], bool] | None = (
+            comfy_quant_key_filter if quant_spec.is_comfy_fp8 else None
+        )
+        adaln_cache_path = component_server_args.minimax_h3_adaln_cache_path
+        if adaln_cache_path is not None:
+            if cls_name != "MiniMaxH3DiTModel":
+                raise ValueError(
+                    "--minimax-h3-adaln-cache-path is only supported by MiniMax H3"
+                )
+            if component_server_args.model_variant not in ("fl2va", "ref2va"):
+                raise ValueError(
+                    "MiniMax H3 AdaLN cache requires --model-variant fl2va or ref2va"
+                )
+            init_params["adaln_cache_path"] = adaln_cache_path
+            init_params["adaln_cache_model_variant"] = (
+                component_server_args.model_variant
+            )
+            checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
+        if component_server_args.minimax_h3_adaln_online:
+            if cls_name != "MiniMaxH3DiTModel":
+                raise ValueError(
+                    "--minimax-h3-adaln-online is only supported by MiniMax H3"
+                )
+            if adaln_cache_path is not None:
+                raise ValueError(
+                    "--minimax-h3-adaln-online and --minimax-h3-adaln-cache-path "
+                    "are mutually exclusive"
+                )
+            # Keep the weights off-device; the model rebuilds the AdaLN
+            # outputs from the checkpoint for each request's timestep plan.
+            init_params["adaln_weight_files"] = safetensors_list
+            init_params["adaln_plan_width"] = (
+                component_server_args.minimax_h3_adaln_plan_width
+            )
+            checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
+
         if (
             init_params["quant_config"] is None
             and component_server_args.transformer_weights_path is not None
         ):
-            logger.warning(
-                "transformer_weights_path provided, but quantization config not resolved, which is unexpected and likely to cause errors"
+            logger.info(
+                "Using an unquantized transformer weight override from %s",
+                component_server_args.transformer_weights_path,
             )
         else:
             logger.debug("quantization config: %s", init_params["quant_config"])
 
         local_torch_device = get_local_torch_device()
-        checkpoint_load_device = _resolve_checkpoint_load_device(
-            local_torch_device,
-            component_cpu_offload=bool(component_server_args.dit_cpu_offload),
-            runtime_quant_config=quant_spec.runtime_quant_config,
+        checkpoint_load_device = (
+            torch.device("cpu")
+            if cpu_offload_flag
+            else _resolve_checkpoint_load_device(
+                local_torch_device,
+                component_starts_on_cpu=component_starts_on_cpu,
+                runtime_quant_config=quant_spec.runtime_quant_config,
+                quantized_cpu_load_supported=quant_spec.gguf_file is not None,
+            )
         )
         direct_gpu_weight_loading = bool(
             component_server_args.direct_gpu_weight_loading
@@ -229,8 +380,11 @@ class TransformerLoader(ComponentLoader):
         weight_load_plan = WeightLoadPlan.for_component(
             checkpoint_load_device=checkpoint_load_device,
             needs_device_weight_postprocess=quant_spec.needs_device_weight_postprocess,
-            component_cpu_offload=bool(component_server_args.dit_cpu_offload),
+            component_starts_on_cpu=component_starts_on_cpu,
             load_full_state_dict_on_device=direct_gpu_weight_loading,
+            mps_layerwise_cpu_staging=bool(
+                cpu_offload_flag and current_platform.is_mps()
+            ),
         )
         if direct_gpu_weight_loading:
             logger.warning(
@@ -265,14 +419,24 @@ class TransformerLoader(ComponentLoader):
                 device=local_torch_device,
                 hsdp_replicate_dim=server_args.hsdp_replicate_dim,
                 hsdp_shard_dim=server_args.hsdp_shard_dim,
-                cpu_offload=component_server_args.dit_cpu_offload,
+                component_starts_on_cpu=component_starts_on_cpu,
                 pin_cpu_memory=component_server_args.pin_cpu_memory,
-                fsdp_inference=component_server_args.use_fsdp_inference,
+                fsdp_inference=use_fsdp,
                 param_dtype=quant_spec.param_dtype,
                 reduce_dtype=torch.float32,
                 output_dtype=None,
                 strict=False,
                 weight_load_plan=weight_load_plan,
+                checkpoint_key_filter=checkpoint_key_filter,
+                weights_iterator=(
+                    gguf_weights_iterator(
+                        quant_spec.gguf_file,
+                        quant_spec.quant_config.tensor_meta,
+                        key_filter=checkpoint_key_filter,
+                    )
+                    if quant_spec.gguf_file is not None
+                    else None
+                ),
             )
 
         # post-hooks (e.g., patch scales (nunchaku))

@@ -43,6 +43,64 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_enable_w4a4_mxfp4_megamoe_sets_deepgemm_env(self):
+        deepgemm_env = {
+            "DG_USE_FP4_ACTS": "0",
+            "DG_USE_MXF4_KIND": "0",
+        }
+        with patch.dict(os.environ, deepgemm_env, clear=False):
+            try:
+                args = prepare_server_args(
+                    ["--model-path", "dummy", "--enable-w4a4-mxfp4-megamoe"]
+                )
+            except SystemExit as exc:
+                self.fail(
+                    "--enable-w4a4-mxfp4-megamoe must be accepted by the CLI "
+                    f"parser, got SystemExit({exc.code})"
+                )
+
+            self.assertTrue(args.enable_w4a4_mxfp4_megamoe)
+            self.assertEqual(os.environ["DG_USE_FP4_ACTS"], "1")
+            self.assertEqual(os.environ["DG_USE_MXF4_KIND"], "1")
+
+    def test_w4a4_mxfp4_megamoe_disabled_preserves_deepgemm_env(self):
+        deepgemm_env = {
+            "DG_USE_FP4_ACTS": "0",
+            "DG_USE_MXF4_KIND": "0",
+        }
+        with patch.dict(os.environ, deepgemm_env, clear=False):
+            args = prepare_server_args(["--model-path", "dummy"])
+
+            self.assertFalse(args.enable_w4a4_mxfp4_megamoe)
+            self.assertEqual(os.environ["DG_USE_FP4_ACTS"], "0")
+            self.assertEqual(os.environ["DG_USE_MXF4_KIND"], "0")
+
+    def test_prefill_decode_interval(self):
+        args = ServerArgs(model_path="dummy", prefill_decode_interval=16)
+        self.assertEqual(args.prefill_decode_interval, 16)
+
+        with self.assertRaisesRegex(
+            ValueError, "--prefill-decode-interval must be non-negative"
+        ):
+            ServerArgs(model_path="dummy", prefill_decode_interval=-1)
+
+    def test_dsv4_prefill_backend_cli_choices(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        base_args = ["--model-path", "dummy-model"]
+
+        default_args = parser.parse_args(base_args)
+        self.assertEqual(default_args.dsv4_prefill_backend, "auto")
+
+        q8_args = parser.parse_args(
+            base_args + ["--dsv4-prefill-backend", "flashmla_sparse_q8"]
+        )
+        self.assertEqual(q8_args.dsv4_prefill_backend, "flashmla_sparse_q8")
+
+        with self.assertRaises(SystemExit):
+            parser.parse_args(base_args + ["--dsv4-prefill-backend", "flashmla_kv"])
+
     def test_return_hidden_states_mode_configuration(self):
         disabled = ServerArgs(model_path="dummy")
         self.assertFalse(disabled.enable_return_hidden_states)
@@ -516,11 +574,21 @@ class TestLoadBalanceMethod(unittest.TestCase):
         server_args = ServerArgs(
             model_path="dummy",
             disaggregation_mode="decode",
+            disaggregation_transfer_backend="mori",
+            dcp_size=4,
+        )
+        with self.assertRaisesRegex(
+            ValueError, "mooncake, nixl, or fake for synthetic benchmarking"
+        ):
+            server_args._handle_pd_disaggregation()
+
+    def test_pd_decode_dcp_allows_fake_transfer_backend(self):
+        server_args = self._load_balance_args(
+            disaggregation_mode="decode",
             disaggregation_transfer_backend="fake",
             dcp_size=4,
         )
-        with self.assertRaisesRegex(ValueError, "mooncake or nixl"):
-            server_args._handle_pd_disaggregation()
+        self.assertTrue(server_args.disable_radix_cache)
 
     def test_pd_decode_dcp_rejects_radix_cache(self):
         server_args = ServerArgs(
@@ -1331,6 +1399,27 @@ class TestHiCacheArgs(unittest.TestCase):
         self.assertEqual(args.hicache_mem_layout, "page_first")
         self.assertIsNone(args.decode_attention_backend)
 
+    def test_decode_offload_rejects_host_pool_retraction(self):
+        args = self._make_args(
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_offload_kvcache=True,
+            hicache_storage_backend="file",
+            disaggregation_decode_retraction_backup="host_pool",
+        )
+
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            args._handle_cache_compatibility()
+
+    def test_decode_offload_allows_cpu_tensor_retraction(self):
+        args = self._make_args(
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_offload_kvcache=True,
+            hicache_storage_backend="file",
+            disaggregation_decode_retraction_backup="cpu_tensor",
+        )
+
+        args._handle_cache_compatibility()
+
 
 class TestNgramExternalSamArgs(CustomTestCase):
     def _make_dummy_ngram_args(self, **overrides):
@@ -2119,8 +2208,6 @@ class TestGrpcServerArgs(CustomTestCase):
         arg-parsing tests above never call start_server, so a stray kwarg (e.g.
         the removed max_prefill_tokens) would only surface as a TypeError at
         launch. This mocks the native extension and locks the kwarg set."""
-        import sys
-
         from sglang.srt.entrypoints import http_server
 
         fake_core = SimpleNamespace(start_server=MagicMock(return_value="handle"))
@@ -2128,22 +2215,25 @@ class TestGrpcServerArgs(CustomTestCase):
         server_args = SimpleNamespace(
             host="127.0.0.1", grpc_port=50051, grpc_worker_threads=4
         )
-        with patch.dict(
-            sys.modules,
-            {
-                "sglang.srt.grpc": SimpleNamespace(_core=fake_core),
-                "sglang.srt.grpc._core": fake_core,
-                "sglang.srt.entrypoints.grpc_bridge": fake_bridge,
-            },
+        with (
+            patch(
+                "sglang.srt.rust_extensions.load_rust_extension",
+                return_value=fake_core,
+            ) as load_rust_extension,
+            patch.dict(
+                "sys.modules", {"sglang.srt.entrypoints.grpc_bridge": fake_bridge}
+            ),
         ):
             handle = http_server._start_native_grpc_server_for_runtime(
                 server_args=server_args,
                 tokenizer_manager=MagicMock(),
                 template_manager=MagicMock(),
                 scheduler_info={},
+                grpc_port=server_args.grpc_port,
             )
 
         self.assertEqual(handle, "handle")
+        load_rust_extension.assert_called_once_with("sglang.srt.rust_extensions._grpc")
         _, kwargs = fake_core.start_server.call_args
         self.assertEqual(
             set(kwargs), {"host", "port", "runtime_handle", "worker_threads"}
@@ -2188,6 +2278,36 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         # require dp-attention there.
         args = self._args(moe_a2a_backend="deepep", enable_dp_attention=False)
         args._check_two_batch_overlap()
+
+
+class TestDcpKvEventContract(CustomTestCase):
+    """DCP widens the radix-tree page to page_size * dcp_size, which the
+    advertised KV-event block size must reflect."""
+
+    KV_EVENTS = '{"publisher":"zmq","topic":"kv","endpoint":"tcp://*:5557"}'
+
+    def test_kv_events_descriptor_reports_logical_block_size(self):
+        """Advertising the physical page_size made every KV-aware router hash
+        prompts at a width no emitted block can match, silently pinning its
+        hit rate to zero while stores kept applying cleanly."""
+        args = ServerArgs(
+            model_path="dummy",
+            tp_size=4,
+            dcp_size=4,
+            page_size=64,
+            kv_events_config=self.KV_EVENTS,
+        )
+        self.assertEqual(args.describe_kv_events_publisher()["block_size"], 256)
+        args = ServerArgs(
+            model_path="dummy", page_size=64, kv_events_config=self.KV_EVENTS
+        )
+        self.assertEqual(args.describe_kv_events_publisher()["block_size"], 64)
+
+    def test_kv_event_block_size_widens_a_single_token_page(self):
+        # page_size=1 + DCP is a real deployment shape: the allocator is still
+        # paged, at dcp_size.
+        args = ServerArgs(model_path="dummy", tp_size=8, dcp_size=8, page_size=1)
+        self.assertEqual(args.kv_event_block_size, 8)
 
 
 if __name__ == "__main__":

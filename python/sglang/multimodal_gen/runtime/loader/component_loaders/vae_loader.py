@@ -11,10 +11,14 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    ComponentCheckpointUnsupportedError,
     ComponentLoader,
+    NativeComponentLoaderRequired,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
+    checkpoint_bytes,
+    keep_checkpoint_mapped,
     set_default_torch_dtype,
     skip_init_modules,
 )
@@ -28,9 +32,39 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.srt.model_loader.checkpoint_quantization import (
+    resolve_checkpoint_quant_spec,
+)
 
 logger = init_logger(__name__)
 VAE_CHANNELS_LAST_3D_ENV = "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D"
+
+
+def _require_native_loader_for_quantized_vae(
+    config: dict, component_name: str, *, native_only: bool = False
+) -> None:
+    quant_spec = resolve_checkpoint_quant_spec(config)
+    if quant_spec is None:
+        return
+
+    method = quant_spec.declared_method or "unspecified"
+    if native_only:
+        raise ComponentCheckpointUnsupportedError(
+            f"{component_name} uses a native-only SGLang implementation that "
+            f"cannot restore quant_method={method!r}; Diffusers fallback is disabled."
+        )
+    if quant_spec.source != "quantization_config":
+        raise ComponentCheckpointUnsupportedError(
+            f"{component_name} checkpoint declares quantization metadata in "
+            f"{quant_spec.source} (quant_method={method!r}), which the Diffusers "
+            "component loader does not restore automatically."
+        )
+
+    raise NativeComponentLoaderRequired(
+        f"{component_name} checkpoint declares quant_method={method!r}; routing "
+        "through Diffusers from_pretrained because the SGLang VAE loader cannot "
+        "restore serialized quantized state."
+    )
 
 
 def _backfill_ltx2_audio_vae_latent_stats(
@@ -92,23 +126,63 @@ def _should_use_channels_last_3d(
     return False
 
 
+def _match_checkpoint_dtypes(loaded: dict, target_state: dict) -> dict:
+    """Convert checkpoint tensors whose dtype differs from their parameter's.
+
+    Assignment replaces the parameter rather than writing through it, so a
+    mismatched dtype would silently change the module's. Converting makes a
+    copy, which is the point: only the tensors that already match can stay on
+    the mapping.
+    """
+    for name, tensor in list(loaded.items()):
+        param = target_state.get(name)
+        if param is not None and param.dtype != tensor.dtype:
+            loaded[name] = tensor.to(dtype=param.dtype)
+    return loaded
+
+
 class VAELoader(ComponentLoader):
     """Shared loader for (video/audio) VAE modules."""
 
     component_names = ["vae", "audio_vae", "video_vae"]
     expected_library = "diffusers"
 
+    def customized_load_kwargs_for_component(
+        self, server_args: ServerArgs, component_name: str
+    ) -> dict[str, bool]:
+        if (
+            current_platform.is_mps()
+            and server_args.should_configure_layerwise_offload_for_lazy_component(
+                component_name
+            )
+        ):
+            logger.info(
+                "Loading %s on CPU first for MPS layerwise offload", component_name
+            )
+            return {"cpu_offload_flag": True}
+        return {}
+
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, component_name: str
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        cpu_offload_flag: bool = False,
     ):
         """Load the VAE based on the model path, and inference args."""
         config = get_diffusers_component_config(component_path=component_model_path)
+        server_args.model_paths[component_name] = component_model_path
+        native_only = component_name in getattr(
+            server_args.pipeline_config, "native_only_components", ()
+        )
+        _require_native_loader_for_quantized_vae(
+            config, component_name, native_only=native_only
+        )
+
         class_name = config.pop("_class_name", None)
         assert (
             class_name is not None
         ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
-
-        server_args.model_paths[component_name] = component_model_path
 
         if component_name in ("vae", "video_vae"):
             pipeline_vae_config_attr = "vae_config"
@@ -133,12 +207,12 @@ class VAELoader(ComponentLoader):
             # NOTE: some post init logics are only available after updated with config
             vae_config.post_init()
 
-        should_offload = server_args.should_cpu_offload_component(component_name)
-        target_device = self.target_device(should_offload)
-
-        native_only = component_name in getattr(
-            server_args.pipeline_config, "native_only_components", ()
+        component_starts_on_cpu = (
+            server_args.should_start_component_on_cpu(component_name)
+            or cpu_offload_flag
         )
+        target_device = self.target_device(component_starts_on_cpu)
+
         auto_map = config.get("auto_map", {})
         auto_model_map = auto_map.get("AutoModel")
         if auto_model_map and not native_only:
@@ -188,7 +262,31 @@ class VAELoader(ComponentLoader):
             loaded.update(safetensors_load_file(sf_path))
         _backfill_ltx2_audio_vae_latent_stats(loaded, component_name)
         strict_load = native_only
-        vae.load_state_dict(loaded, strict=strict_load)
+        # `loaded` holds views into the safetensors mapping. When the component
+        # starts on the CPU and the host cannot afford copies of the whole
+        # deployment, assigning them keeps the weights file-backed instead of
+        # copying them into anonymous host memory: the page cache can drop and
+        # refetch file-backed bytes, and every anonymous byte here is a byte
+        # the stepped components' pin budget loses -- MiniMax-H3's video VAE is
+        # 9.70 GiB of a 32 GiB budget. On a host with room the copy stays the
+        # default, because its pages are resident where a mapping's first use
+        # pays a fault. MPS always assigns; the memory is unified. A tensor
+        # whose dtype differs from its parameter's is converted, which copies
+        # exactly the tensors that cannot stay.
+        keep_mapping = component_starts_on_cpu and (
+            current_platform.is_mps()
+            or keep_checkpoint_mapped(
+                weight_bytes=checkpoint_bytes(server_args.model_path),
+                component=f"{component_name or 'vae'} (VAE)",
+            )
+        )
+        if keep_mapping:
+            _match_checkpoint_dtypes(loaded, vae.state_dict())
+        vae.load_state_dict(
+            loaded,
+            strict=strict_load,
+            assign=keep_mapping,
+        )
 
         if not strict_load:
             state_keys = set(vae.state_dict().keys())

@@ -18,14 +18,33 @@
 //                      `single` or `multi-N` → --nnodes N)
 //   matchDims          optional — replaces the legacy four. {id, title, options}[]
 //                      where each option is {id, label, showWhen?(sel), disabled?,
-//                      disableReason?}. `hw` is always the implicit first dim.
-//                      Cells are then keyed on (hw × <these ids>).
+//                      disableReason?, soft?, softReason?}. `hw` is always the
+//                      implicit first dim. Cells are then keyed on (hw × <these
+//                      ids>). `disabled` is for combinations that cannot work;
+//                      an option that runs but sits outside the verified matrix
+//                      should declare `soft` instead — it stays selectable and
+//                      announces itself as unverified (tooltip + in-cell note).
+//                      Blocked options flash their disableReason under the row
+//                      when tapped, so the reason also reaches touch readers.
 //   overlayDims        optional — rows that do NOT participate in cell lookup; the
 //                      picked option layers onto the matched cell, so an orthogonal
 //                      knob does not multiply the cell count. Same option shape plus
 //                      `flags` / `env` / `hints` (each a literal array or a function
 //                      of the whole selection), and a row-level `default` / `showWhen`.
 //                      `hints` render as `# ...` lines above the command.
+//                      Builder-aware dimensions may additionally declare
+//                      `scope: "base" | "serve" | "request"`, `description`,
+//                      `quality`, `verifiedWhen`, and `learnMore`. Legacy configs
+//                      omit these fields and keep the original renderer.
+//   commandBuilder     optional — opts this config into the responsive diffusion
+//                      builder while reusing this engine's overlay composition and
+//                      command rendering. Shape:
+//                      {defaultSelection, resource: {limits, verifiedRecipes,
+//                      autoTopology(sel), validateTopology(sel)},
+//                      resolveDeployment(sel)}. The resolver returns a cell plus
+//                      `builder` metadata (topologySummary, errors, warnings,
+//                      verification, resolvedSettings). UI-only scope/expand and
+//                      local head-address/rank state never enter the URL hash.
 //   cells              {match, verified?, verificationStatus?, nnodes?, warn?, redirect?,
 //                      env, flags}[] — one per
 //                      (hw × match dims); env/flags are flat literals, only
@@ -38,8 +57,12 @@
 //                      `verified` is the boolean badge baseline.
 //                      `verificationStatus` overrides it with a third state —
 //                      "verified" | "in-progress" | "unverified" — for a recipe
-//                      whose verification round is open rather than absent.
-//   modelNames         HF slug lookup, `hw|variant|quant` then `variant|quant`
+//                      whose verification round is open rather than absent. It
+//                      may also be a function of the selection, for a cell whose
+//                      verification depends on an overlay pick (e.g. one
+//                      speculative option still being validated).
+//   modelNames         HF slug lookup, `hw|variant|quant`, `variant|quant`,
+//                      `hw|quant`, `quant`, `hw`, then `default`
 //   placeholders       {{KEY}} → {target: 'command'|'curl', label, default?}
 //   curl               cURL template (uses {{MODEL_NAME}} + placeholders), or
 //                      `(selection, cell) => template` when the request payload
@@ -442,8 +465,14 @@ export const Deployment = ({ config, benchmarks }) => {
     typeof v === "string"
       ? (VERIFY_LABEL[v] ? v : "unverified")
       : (v ? "verified" : "unverified");
-  const cellVerifyStatus = (c) =>
-    c ? verifyStatusOf(c.verificationStatus ?? c.verified) : "unverified";
+  const cellVerifyStatus = (c, sel) => {
+    if (!c) return "unverified";
+    const v =
+      typeof c.verificationStatus === "function"
+        ? c.verificationStatus(sel)
+        : c.verificationStatus;
+    return verifyStatusOf(v ?? c.verified);
+  };
 
   // Two kinds of selector row:
   //   match dims    participate in cell lookup (cell.match[dim] === sel[dim])
@@ -464,6 +493,7 @@ export const Deployment = ({ config, benchmarks }) => {
     options: d.options || config[d.optionsKey] || [],
   }));
   const overlayDimSpecs = config.overlayDims || [];
+  const commandBuilder = config.commandBuilder || null;
   // DIMENSIONS is ordered by priority — higher-index dims adapt to lower-index
   // picks, never the reverse. Drives the grey-out/snap logic below.
   const DIMENSIONS = ["hw", ...matchDimSpecs.map((d) => d.id)];
@@ -535,6 +565,11 @@ export const Deployment = ({ config, benchmarks }) => {
     return out;
   };
   // ==== end MIRROR ====
+  // `soft` marks an option that is plausible but outside the verified matrix:
+  // it stays selectable (the status badge reports verification separately),
+  // where `disabled` is reserved for combinations that cannot work at all.
+  const optionSoft = (opt, sel) =>
+    typeof opt.soft === "function" ? opt.soft(sel) : !!opt.soft;
   const findCell = (cells, sel) =>
     cells.find((c) => DIMENSIONS.every((d) => c.match[d] === sel[d]));
 
@@ -643,10 +678,15 @@ export const Deployment = ({ config, benchmarks }) => {
 
   // Lookup walks most-specific to least so a config that drops the variant/quant
   // dims can key its HF slug on `hw` alone, or on the single "default" entry.
+  // The `hw|quant` and bare `quant` rungs cover a `matchDims` config that declares
+  // no variant dim at all — there `sel.variant` is undefined, so the two leading
+  // keys can never hit.
   const resolveModelName = (sel) => {
     const keys = [
       `${sel.hw}|${sel.variant}|${sel.quant}`,
       `${sel.variant}|${sel.quant}`,
+      `${sel.hw}|${sel.quant}`,
+      sel.quant,
       sel.hw,
       "default",
     ];
@@ -665,6 +705,8 @@ export const Deployment = ({ config, benchmarks }) => {
   // dim it is a property of the cell itself (`nnodes`), since the deployment
   // shape is then fixed by the hardware rather than picked by the reader.
   const parseNnodes = (id) => {
+    if (Number.isInteger(id)) return id;
+    if (/^\d+$/.test(id || "")) return parseInt(id, 10);
     if (id === "single") return 1;
     const m = /^multi-(\d+)$/.exec(id || "");
     return m ? parseInt(m[1], 10) : 1;
@@ -694,12 +736,14 @@ export const Deployment = ({ config, benchmarks }) => {
     if (multinode) {
       // Insert the multi-node trio after the last parallelism flag,
       // falling back to right after --model-path.
-      const PARALLELISM_ANCHORS = ["--enable-dp-attention", "--dp", "--tp-size", "--tp"];
-      let i = -1;
-      for (const anchor of PARALLELISM_ANCHORS) {
-        i = flags.findIndex((f) => f.split(/[\s=]/)[0] === anchor);
-        if (i !== -1) break;
-      }
+      const PARALLELISM_ANCHORS = new Set([
+        "--enable-dp-attention", "--dp", "--tp-size", "--tp",
+        "--sp-degree", "--ulysses-degree", "--ring-degree",
+      ]);
+      let i = flags.reduce(
+        (last, flag, index) => PARALLELISM_ANCHORS.has(flag.split(/[\s=]/)[0]) ? index : last,
+        -1,
+      );
       if (i === -1) i = flags.findIndex((f) => f.startsWith("--model-path"));
       flags.splice(i + 1, 0,
         `--nnodes ${nnodes}`,
@@ -1081,7 +1125,7 @@ export const Deployment = ({ config, benchmarks }) => {
   // verified cell first). Overlay dims seed from their own `default`, or the
   // first option, since no cell carries them.
   const initialSelectionFromCells = () => {
-    const first = config.cells[0];
+    const first = (config.cells || [])[0];
     const sel = Object.fromEntries(
       DIMENSIONS.map((d) => [d, first ? first.match[d] : ""]),
     );
@@ -1089,7 +1133,48 @@ export const Deployment = ({ config, benchmarks }) => {
       const opts = spec.options || [];
       sel[spec.id] = spec.default ?? (opts[0] && opts[0].id) ?? "";
     }
-    return sel;
+    if (!commandBuilder) return sel;
+    return {
+      ...sel,
+      hw: commandBuilder.defaultSelection?.hw || config.supportedHardware?.[0] || "",
+      ...(commandBuilder.defaultSelection || {}),
+    };
+  };
+
+  // Builder hashes are semantic rather than cell ids. Keep known dimension
+  // values, clamp bounded resources, and discard stale topology overrides.
+  // UI state (active scope, expanded cards, head IP, node rank) is deliberately
+  // absent from this object, so shared links stay portable and credential-free.
+  const normalizeBuilderSelection = (parsed) => {
+    const out = { ...initialSelectionFromCells(), ...parsed };
+    if (!(config.supportedHardware || []).includes(out.hw)) {
+      out.hw = commandBuilder.defaultSelection?.hw || config.supportedHardware?.[0] || "";
+    }
+    for (const spec of overlayDimSpecs) {
+      if (spec.kind === "number") {
+        const value = Number.parseInt(out[spec.id], 10);
+        out[spec.id] = Math.min(
+          spec.max,
+          Math.max(spec.min, Number.isFinite(value) ? value : Number(spec.default ?? spec.min)),
+        );
+        continue;
+      }
+      const options = spec.options || [];
+      if (!options.some((option) => option.id === out[spec.id])) {
+        out[spec.id] = spec.default ?? options[0]?.id ?? "";
+      }
+    }
+    for (const [key, bounds] of Object.entries(commandBuilder.resource?.limits || {})) {
+      const fallback = Number(commandBuilder.defaultSelection?.[key] ?? bounds.min ?? 1);
+      const value = Number.parseInt(out[key], 10);
+      out[key] = Math.min(bounds.max, Math.max(bounds.min, Number.isFinite(value) ? value : fallback));
+    }
+    for (const key of ["tp_size", "ulysses_degree", "ring_degree"]) {
+      const value = Number.parseInt(out[key], 10);
+      out[key] = Number.isFinite(value) && value > 0 ? value : 1;
+    }
+    out.topology_mode = out.topology_mode === "manual" ? "manual" : "auto";
+    return out;
   };
 
   const placeholderDefaults = (schema) => {
@@ -1149,8 +1234,13 @@ export const Deployment = ({ config, benchmarks }) => {
         if (key in parsed) { parsed[key] = value; touched = true; }
       });
       if (!touched) return;
-      // Snap to a real cell if the hash named an impossible combo (stale link).
-      setSel(validateSelection(config.cells, parsed));
+      // Cell configs snap to a real recipe; builders normalize their semantic
+      // resource state without forcing a custom-but-valid topology to a preset.
+      setSel(
+        commandBuilder
+          ? normalizeBuilderSelection(parsed)
+          : validateSelection(config.cells, parsed),
+      );
       const historyState = window.history.state;
       const isInternalHash =
         historyState &&
@@ -1210,6 +1300,25 @@ export const Deployment = ({ config, benchmarks }) => {
     : config.runModes;
   const runModes = configuredRunModes || ["python", "docker"];
   const [runMode, setRunMode] = useState(runModes[0]); // "python" | "docker"
+  const [builderScope, setBuilderScope] = useState("base");
+  const [builderServerSetting, setBuilderServerSetting] = useState(null);
+  const [builderAdvanced, setBuilderAdvanced] = useState(false);
+  const [serveExpanded, setServeExpanded] = useState(false);
+  const [requestExpanded, setRequestExpanded] = useState(false);
+  const [builderHeadAddress, setBuilderHeadAddress] = useState("<head-node-ip>");
+  const [builderNodeRank, setBuilderNodeRank] = useState(0);
+  // Tapping a disabled option surfaces its reason under the row — hover-only
+  // tooltips never reach touch readers. {dim, reason}; each note clears only
+  // itself, so a newer note is never cut short by an older timer.
+  const [blockedNote, setBlockedNote] = useState(null);
+  const flashBlockedNote = (dim, reason) => {
+    const note = { dim, reason };
+    setBlockedNote(note);
+    setTimeout(() => setBlockedNote((cur) => (cur === note ? null : cur)), 4000);
+  };
+  useEffect(() => {
+    if (builderNodeRank >= Number(sel.nodes || 1)) setBuilderNodeRank(0);
+  }, [sel.nodes, builderNodeRank]);
   const hasRunMode = runModes.includes(runMode);
   const fallbackRunMode = runModes[0];
   const activeRunMode = hasRunMode ? runMode : fallbackRunMode;
@@ -1233,8 +1342,11 @@ export const Deployment = ({ config, benchmarks }) => {
 
   // ==== 5. Derived values ====
   const s = makeStyles(isDark);
-  const cell = findCell(config.cells, sel);
-  const verifyStatus = cellVerifyStatus(cell);
+  const cell = commandBuilder
+    ? commandBuilder.resolveDeployment(sel)
+    : findCell(config.cells, sel);
+  const builderMeta = (cell && cell.builder) || {};
+  const verifyStatus = cellVerifyStatus(cell, sel);
   // Pin the calculator-computed ratio into the rendered command (before the
   // host/port tail); cells themselves stay ratio-free.
   const cellWithRatio = (() => {
@@ -1247,7 +1359,14 @@ export const Deployment = ({ config, benchmarks }) => {
     else flags.push(line);
     return { ...cell, flags };
   })();
-  const command = renderCommand(cellWithRatio, sel, env, activeRunMode);
+  const commandEnv = commandBuilder
+    ? {
+        ...env,
+        NODE_RANK: String(builderNodeRank),
+        NODE0_IP: builderHeadAddress || "<head-node-ip>",
+      }
+    : env;
+  const command = renderCommand(cellWithRatio, sel, commandEnv, activeRunMode);
   // Speculative-decoding hint on the EFFECTIVE flags — speculation can arrive via
   // the Spec Decode overlay as well as the cell. SGLang resets
   // --max-running-requests to 48 when spec is on and it's unset; verified for both
@@ -1332,7 +1451,8 @@ export const Deployment = ({ config, benchmarks }) => {
   const isEnabled = (dim, value) => {
     const opt = findOption(dim, value);
     if (opt && optionDisabled(opt, sel)) return false;
-    return isOverlayDim(dim) || isOptionAvailable(config.cells, sel, dim, value);
+    if (commandBuilder && dim === "hw") return true;
+    return isOverlayDim(dim) || isOptionAvailable(config.cells || [], sel, dim, value);
   };
 
   // Switching a match dim can hide the option a dependent row currently holds
@@ -1350,7 +1470,46 @@ export const Deployment = ({ config, benchmarks }) => {
     return out;
   };
 
+  const recommendedBuilderRecipe = (hw) => {
+    const recipes = commandBuilder.resource?.verifiedRecipes || [];
+    return recipes.find((entry) => entry.hw === hw && entry.default)
+      || recipes.find((entry) => entry.hw === hw);
+  };
+
   const handleSelect = (dim, value) => {
+    if (commandBuilder) {
+      setSel((prev) => {
+        let next = { ...prev, [dim]: value };
+        if (dim === "hw") {
+          const currentRecipe = recommendedBuilderRecipe(prev.hw);
+          const nextRecipe = recommendedBuilderRecipe(value);
+          const resourcesFollowPlatformDefault = !!currentRecipe
+            && Number(prev.nodes) === Number(currentRecipe.nodes)
+            && Number(prev.gpus_per_node) === Number(currentRecipe.gpus_per_node);
+          next = {
+            ...next,
+            nodes: resourcesFollowPlatformDefault
+              ? (nextRecipe?.nodes ?? next.nodes)
+              : next.nodes,
+            gpus_per_node: resourcesFollowPlatformDefault
+              ? (nextRecipe?.gpus_per_node ?? next.gpus_per_node)
+              : next.gpus_per_node,
+            topology_mode: "auto",
+            tp_size: resourcesFollowPlatformDefault
+              ? (nextRecipe?.tp_size ?? 1)
+              : next.tp_size,
+            ulysses_degree: resourcesFollowPlatformDefault
+              ? (nextRecipe?.ulysses_degree ?? 1)
+              : next.ulysses_degree,
+            ring_degree: resourcesFollowPlatformDefault
+              ? (nextRecipe?.ring_degree ?? 1)
+              : next.ring_degree,
+          };
+        }
+        return reseatHiddenPicks(normalizeBuilderSelection(next));
+      });
+      return;
+    }
     setSel((prev) =>
       reseatHiddenPicks(
         isOverlayDim(dim)
@@ -1358,6 +1517,70 @@ export const Deployment = ({ config, benchmarks }) => {
           : snapToValidCell(config.cells, prev, dim, value),
       ),
     );
+  };
+
+  const commitBuilderNumber = (event, currentValue, bounds, commit) => {
+    const parsed = Number(event.currentTarget.value);
+    if (!Number.isInteger(parsed)) {
+      event.currentTarget.value = String(currentValue);
+      return;
+    }
+    const value = Math.min(bounds.max, Math.max(bounds.min, parsed));
+    event.currentTarget.value = String(value);
+    commit(value);
+  };
+
+  const renderBuilderNumberInput = ({ identity, value, min, max, label, onCommit }) => (
+    <input
+      key={identity}
+      type="number"
+      inputMode="numeric"
+      min={min}
+      max={max}
+      step="1"
+      defaultValue={value}
+      aria-label={label}
+      onFocus={(event) => event.currentTarget.select()}
+      onBlur={(event) => commitBuilderNumber(
+        event,
+        value,
+        { min, max },
+        onCommit,
+      )}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") event.currentTarget.blur();
+      }}
+    />
+  );
+
+  const updateBuilderResource = (key, delta) => {
+    if (!commandBuilder) return;
+    const bounds = commandBuilder.resource?.limits?.[key] || { min: 1, max: 8 };
+    setSel((prev) => {
+      const value = Math.min(bounds.max, Math.max(bounds.min, Number(prev[key]) + delta));
+      return normalizeBuilderSelection({ ...prev, [key]: value, topology_mode: "auto" });
+    });
+  };
+
+  const setBuilderResource = (key, rawValue) => {
+    if (!commandBuilder) return;
+    const value = Number.parseInt(rawValue, 10);
+    if (!Number.isFinite(value)) return;
+    const bounds = commandBuilder.resource?.limits?.[key] || { min: 1, max: 8 };
+    setSel((prev) => normalizeBuilderSelection({
+      ...prev,
+      [key]: Math.min(bounds.max, Math.max(bounds.min, value)),
+      topology_mode: "auto",
+    }));
+  };
+
+  const editBuilderTopology = (key, value) => {
+    if (!commandBuilder) return;
+    setSel((prev) => normalizeBuilderSelection({
+      ...prev,
+      topology_mode: "manual",
+      [key]: Number.parseInt(value, 10) || 1,
+    }));
   };
 
   const handleCopy = () => {
@@ -1393,6 +1616,11 @@ export const Deployment = ({ config, benchmarks }) => {
     return (
       <label
         key={item.id}
+        className="sg-command-visualizer-choice"
+        role="radio"
+        aria-checked={checked}
+        aria-disabled={disabled}
+        tabIndex={disabled ? -1 : 0}
         style={{
           ...s.labelBase,
           ...(checked ? s.checked : {}),
@@ -1405,6 +1633,11 @@ export const Deployment = ({ config, benchmarks }) => {
         }
         onClick={(e) => {
           if (disabled) { e.preventDefault(); return; }
+          handleSelect(dim, item.id);
+        }}
+        onKeyDown={(e) => {
+          if (disabled || (e.key !== "Enter" && e.key !== " ")) return;
+          e.preventDefault();
           handleSelect(dim, item.id);
         }}
       >
@@ -1430,11 +1663,573 @@ export const Deployment = ({ config, benchmarks }) => {
 
   const maxHwCols = Math.max(...hwGroups.map((x) => x.items.length));
 
+  if (commandBuilder) {
+    const scopeLabel = { base: "Setup", serve: "Server", request: "Request" };
+    const scopedDims = (scope) => overlayDimSpecs.filter((dim) => {
+      if ((dim.scope || "base") !== scope) return false;
+      if (dim.kind === "number") {
+        return typeof dim.showWhen !== "function" || dim.showWhen(sel);
+      }
+      return rowVisible(dim, sel);
+    });
+    const baseDims = scopedDims("base");
+    const serveDims = scopedDims("serve");
+    const requestDims = scopedDims("request");
+    const errors = builderMeta.errors || [];
+    const warnings = builderMeta.warnings || [];
+    const invalid = errors.length > 0;
+    const totalGpus = Number(sel.nodes) * Number(sel.gpus_per_node);
+    const topology = builderMeta.topology || {};
+    const verification = builderMeta.verification || {};
+    const scopeIsVerified = (scope) => scopedDims(scope).every((dim) => {
+      const option = (dim.options || []).find((entry) => entry.id === sel[dim.id]);
+      // A pick whose `soft` predicate is active is by definition outside the
+      // verified matrix — the scope badge must not keep reading Verified.
+      if (option && optionSoft(option, sel)) return false;
+      const predicate = option?.verifiedWhen ?? dim.verifiedWhen;
+      return typeof predicate === "function" ? !!predicate(sel) : predicate !== false;
+    });
+    const serveStatus = invalid
+      ? "error"
+      : (scopeIsVerified("serve") ? (verification.serve || verifyStatus) : "unverified");
+    const requestStatus = invalid
+      ? "error"
+      : (scopeIsVerified("request") ? (verification.request || verifyStatus) : "unverified");
+    const statusText = (status) => ({
+      verified: "Verified",
+      unverified: "Unverified",
+      "in-progress": "Verification in progress",
+      error: "Invalid configuration",
+    }[status] || "Unverified");
+    const activeServerSetting = serveDims.find((dim) => dim.id === builderServerSetting) || serveDims[0];
+    const selectedOption = (dim) => (dim.options || []).find((option) => option.id === sel[dim.id]);
+    const effectiveSetting = (dim) =>
+      builderMeta.resolvedSettings?.[dim.id]
+      || selectedOption(dim)?.label
+      || sel[dim.id]
+      || "—";
+    const recommendedRecipe = recommendedBuilderRecipe(sel.hw);
+    const recommendedInUse = !!recommendedRecipe
+      && Number(sel.nodes) === recommendedRecipe.nodes
+      && Number(sel.gpus_per_node) === recommendedRecipe.gpus_per_node
+      && sel.topology_mode === "auto"
+      && ["auto", recommendedRecipe.placement].includes(sel.placement)
+      && sel.attention === "platform"
+      && sel.precision === "native"
+      && ["auto", recommendedRecipe.encoder].includes(sel.encoder)
+      && sel.execution === "eager";
+
+    const restoreRecommendedRecipe = () => {
+      if (!recommendedRecipe) return;
+      setSel((prev) => reseatHiddenPicks(normalizeBuilderSelection({
+        ...prev,
+        nodes: recommendedRecipe.nodes,
+        gpus_per_node: recommendedRecipe.gpus_per_node,
+        topology_mode: "auto",
+        tp_size: recommendedRecipe.tp_size,
+        ulysses_degree: recommendedRecipe.ulysses_degree,
+        ring_degree: recommendedRecipe.ring_degree,
+        placement: recommendedRecipe.placement || "auto",
+        attention: "platform",
+        precision: "native",
+        encoder: recommendedRecipe.encoder || "auto",
+        execution: "eager",
+      })));
+    };
+
+    const renderBuilderChoice = (item, dim) => {
+      const checked = sel[dim.id] === item.id;
+      const disabled = !isEnabled(dim.id, item.id);
+      const soft = !disabled && optionSoft(item, sel);
+      const reason = disabled
+        ? item.disableReason || "Not available for this configuration"
+        : soft
+          ? item.softReason || "Runs, but this combination is not a verified recipe yet."
+          : "";
+      // aria-disabled instead of the disabled attribute: the control stays
+      // focusable and hoverable, so the reason is reachable by tooltip, by
+      // keyboard, and by the tap-feedback note below the row.
+      return (
+        <button
+          key={item.id}
+          type="button"
+          className="sgd-builder-choice"
+          data-selected={checked ? "true" : "false"}
+          data-blocked={disabled ? "true" : undefined}
+          data-soft={soft ? "true" : undefined}
+          aria-disabled={disabled}
+          aria-pressed={checked}
+          title={reason}
+          onClick={() => {
+            if (disabled) { flashBlockedNote(dim.id, reason); return; }
+            handleSelect(dim.id, item.id);
+          }}
+        >
+          <span className="sgd-builder-choice-dot" aria-hidden="true" />
+          <span>{item.label}</span>
+          {item.subtitle && <small>{item.subtitle}</small>}
+        </button>
+      );
+    };
+
+    const renderBuilderDimension = (dim) => (
+      <section className="sgd-builder-section" key={dim.id}>
+        <div className="sgd-builder-section-heading">
+          <span>{dim.title}</span>
+          {dim.description && <small>{dim.description}</small>}
+        </div>
+        <div className="sgd-builder-choice-grid" data-density={(dim.options || []).length > 5 ? "compact" : "normal"}>
+          {visibleOptions(dim, sel).map((option) => renderBuilderChoice(option, dim))}
+        </div>
+        {blockedNote && blockedNote.dim === dim.id && (
+          <p className="sgd-builder-blocked-note" role="status">{blockedNote.reason}</p>
+        )}
+      </section>
+    );
+
+    const renderStepper = (key, label, detail) => {
+      const bounds = commandBuilder.resource?.limits?.[key] || { min: 1, max: 8 };
+      return (
+        <div className="sgd-builder-stepper-field">
+          <div>
+            <span>{label}</span>
+            {detail && <small>{detail}</small>}
+          </div>
+          <div className="sgd-builder-stepper" aria-label={label}>
+            <button
+              type="button"
+              aria-label={`Decrease ${label}`}
+              disabled={Number(sel[key]) <= bounds.min}
+              onClick={() => updateBuilderResource(key, -1)}
+            >−</button>
+            {renderBuilderNumberInput({
+              identity: `${key}-${sel[key]}`,
+              value: sel[key],
+              min: bounds.min,
+              max: bounds.max,
+              label,
+              onCommit: (value) => setBuilderResource(key, value),
+            })}
+            <button
+              type="button"
+              aria-label={`Increase ${label}`}
+              disabled={Number(sel[key]) >= bounds.max}
+              onClick={() => updateBuilderResource(key, 1)}
+            >+</button>
+          </div>
+        </div>
+      );
+    };
+
+    const renderBaseScope = () => (
+      <div className="sgd-builder-scope-panel" data-scope="base">
+        {recommendedRecipe && (
+          <section className="sgd-builder-recipe">
+            <div>
+              {/* This is the verified operating point, not sizing advice — a
+                  hardware whose validation ran on 8 GPUs is not "recommending"
+                  8 over a smaller deployment. */}
+              <span>Verified recipe · {sel.hw.toUpperCase()}</span>
+              <strong>
+                {[
+                  `${recommendedRecipe.nodes * recommendedRecipe.gpus_per_node} GPUs`,
+                  recommendedRecipe.tp_size > 1 && `TP ${recommendedRecipe.tp_size}`,
+                  `Ulysses ${recommendedRecipe.ulysses_degree}`,
+                  recommendedRecipe.ring_degree > 1 && `Ring ${recommendedRecipe.ring_degree}`,
+                  { resident: "Resident", fsdp: "FSDP", offload: "Layerwise offload" }[recommendedRecipe.placement],
+                ].filter(Boolean).join(" · ")}
+              </strong>
+            </div>
+            <div>
+              {renderStatus("verified")}
+              {recommendedInUse
+                ? <small>In use</small>
+                : <button type="button" className="sgd-builder-text-action" onClick={restoreRecommendedRecipe}>Use verified recipe</button>}
+            </div>
+          </section>
+        )}
+        <section className="sgd-builder-section">
+          <div className="sgd-builder-section-heading"><span>Hardware</span></div>
+          <div className="sgd-builder-hardware-grid">
+            {hwGroups.flatMap((group) => group.items).map((item) => {
+              const selected = sel.hw === item.id;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  className="sgd-builder-hardware"
+                  data-selected={selected ? "true" : "false"}
+                  aria-pressed={selected}
+                  onClick={() => handleSelect("hw", item.id)}
+                >
+                  <span className="sgd-builder-choice-dot" aria-hidden="true" />
+                  <strong>{item.label}</strong>
+                  <small>{item.subtitle}</small>
+                </button>
+              );
+            })}
+          </div>
+        </section>
+
+        {/* Topology lives with Resources: its summary is the heading's detail
+            line, so the two rows that used to repeat each other are one
+            section. The advanced editor and its messages stay here too. */}
+        <section className="sgd-builder-section">
+          <div className="sgd-builder-section-heading">
+            <span>Resources</span>
+            <small>{builderMeta.topologySummary || "No valid topology"}</small>
+          </div>
+          <div className="sgd-builder-resource-grid">
+            {renderStepper("nodes", "Nodes")}
+            {renderStepper("gpus_per_node", "GPUs / node")}
+          </div>
+          {Number(sel.nodes) > 1 && (
+            <p className="sgd-builder-resource-summary">
+              {sel.nodes} nodes × {sel.gpus_per_node} {sel.hw.toUpperCase()} = {totalGpus} GPUs
+            </p>
+          )}
+          <button
+            type="button"
+            className="sgd-builder-text-action sgd-builder-topology-toggle"
+            aria-expanded={builderAdvanced}
+            onClick={() => setBuilderAdvanced((open) => !open)}
+          >
+            Advanced topology <span aria-hidden="true">{builderAdvanced ? "↗" : "↘"}</span>
+          </button>
+          {builderAdvanced && (
+            <div className="sgd-builder-advanced">
+              <p>Auto uses an exact verified recipe when one exists; manual values are allowed when the model constraints remain valid.</p>
+              <div className="sgd-builder-topology-inputs">
+                {[
+                  ["tp_size", "Tensor parallel", [1, 2, 4, 8]],
+                  ["ulysses_degree", "Ulysses", [1, 2, 4, 8, 16]],
+                  ["ring_degree", "Ring", [1, 2, 4, 8]],
+                ].map(([key, label, values]) => (
+                  <label key={key}>
+                    <span>{label}</span>
+                    <select
+                      value={sel.topology_mode === "manual" ? sel[key] : (topology[key] || 1)}
+                      onChange={(event) => editBuilderTopology(key, event.target.value)}
+                    >
+                      {values.map((value) => <option value={value} key={value}>{value}</option>)}
+                    </select>
+                  </label>
+                ))}
+              </div>
+              <button
+                type="button"
+                className="sgd-builder-text-action"
+                disabled={sel.topology_mode === "auto"}
+                onClick={() => setSel((prev) => normalizeBuilderSelection({ ...prev, topology_mode: "auto" }))}
+              >Use automatic topology</button>
+            </div>
+          )}
+          {(errors.length > 0 || warnings.length > 0) && (
+            <div className="sgd-builder-messages" data-state={errors.length ? "error" : "warning"}>
+              {(errors.length ? errors : warnings).map((message, index) => <p key={index}>{message}</p>)}
+            </div>
+          )}
+        </section>
+
+        {baseDims.map(renderBuilderDimension)}
+      </div>
+    );
+
+    const renderSettingEditor = (dim, className = "", direct = false) => {
+      if (!dim) return null;
+      const options = visibleOptions(dim, sel);
+      const currentOption = selectedOption(dim);
+      return (
+        <section className={`sgd-builder-context ${className}`} aria-live={direct ? undefined : "polite"}>
+          <div className="sgd-builder-context-heading">
+            <div>
+              <span>{direct ? dim.title : `${dim.title} options`}</span>
+              {dim.description && <p>{dim.description}</p>}
+            </div>
+            {dim.quality && <small>{dim.quality}</small>}
+          </div>
+          {dim.kind === "number" ? (
+            <div className="sgd-builder-request-stepper">
+              <button
+                type="button"
+                aria-label={`Decrease ${dim.title}`}
+                disabled={Number(sel[dim.id]) <= dim.min}
+                onClick={() => setSel((prev) => ({
+                  ...prev,
+                  [dim.id]: Math.max(dim.min, Number(prev[dim.id]) - 1),
+                }))}
+              >−</button>
+              {renderBuilderNumberInput({
+                identity: `${dim.id}-${sel[dim.id]}`,
+                value: sel[dim.id],
+                min: dim.min,
+                max: dim.max,
+                label: dim.title,
+                onCommit: (value) => setSel((prev) => ({ ...prev, [dim.id]: value })),
+              })}
+              <button
+                type="button"
+                aria-label={`Increase ${dim.title}`}
+                disabled={Number(sel[dim.id]) >= dim.max}
+                onClick={() => setSel((prev) => ({
+                  ...prev,
+                  [dim.id]: Math.min(dim.max, Number(prev[dim.id]) + 1),
+                }))}
+              >+</button>
+              <span>{dim.unit || "outputs"}</span>
+            </div>
+          ) : (
+            <div className="sgd-builder-context-options">
+              {options.map((option) => renderBuilderChoice(option, dim))}
+            </div>
+          )}
+          {blockedNote && blockedNote.dim === dim.id && (
+            <p className="sgd-builder-blocked-note" role="status">{blockedNote.reason}</p>
+          )}
+          {(currentOption?.description || dim.learnMore) && (
+            <div className="sgd-builder-context-note">
+              {currentOption?.description && <p>{currentOption.description}</p>}
+              {/* Icons name the destination: section lines = an anchor on
+                  this page, book = the runtime documentation. */}
+              {dim.learnMore && (
+                <a href={dim.learnMore}>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true"><line x1="4" y1="6" x2="20" y2="6" /><line x1="4" y1="12" x2="16" y2="12" /><line x1="4" y1="18" x2="11" y2="18" /></svg>
+                  Learn more
+                </a>
+              )}
+              {dim.docsHref && (
+                <a href={dim.docsHref}>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" /><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" /></svg>
+                  SGLang docs
+                </a>
+              )}
+            </div>
+          )}
+        </section>
+      );
+    };
+
+    const renderServerScope = () => (
+      <div className="sgd-builder-scope-panel" data-scope="serve">
+        <div className="sgd-builder-setting-layout">
+          <div className="sgd-builder-setting-list">
+            {serveDims.map((dim) => {
+              const isActive = dim.id === activeServerSetting?.id;
+              const option = selectedOption(dim);
+              const recommended = typeof option?.recommendedWhen === "function"
+                ? option.recommendedWhen(sel)
+                : !!option?.recommended;
+              return (
+                <div className="sgd-builder-setting-item" key={dim.id}>
+                  <button
+                    type="button"
+                    className="sgd-builder-setting-row"
+                    data-active={isActive ? "true" : "false"}
+                    aria-expanded={isActive}
+                    onClick={() => setBuilderServerSetting(dim.id)}
+                  >
+                    <span>{dim.title}</span>
+                    <strong>{effectiveSetting(dim)}</strong>
+                    {recommended && <small>Recommended</small>}
+                    <span aria-hidden="true">{isActive ? "⌄" : "›"}</span>
+                  </button>
+                  {isActive && renderSettingEditor(dim, "sgd-builder-context--inline")}
+                </div>
+              );
+            })}
+          </div>
+          {renderSettingEditor(activeServerSetting, "sgd-builder-context--rail")}
+        </div>
+      </div>
+    );
+
+    const renderRequestScope = () => (
+      <div className="sgd-builder-scope-panel sgd-builder-request-direct" data-scope="request">
+        {requestDims.map((dim) => (
+          <div className="sgd-builder-request-setting" key={dim.id}>
+            {renderSettingEditor(dim, "", true)}
+          </div>
+        ))}
+      </div>
+    );
+
+    const renderScopeControls = () => {
+      if (builderScope === "base") return renderBaseScope();
+      if (builderScope === "serve") return renderServerScope();
+      return renderRequestScope();
+    };
+
+    const renderStatus = (status) => (
+      <span className="sgd-builder-status" data-status={status}>
+        <span aria-hidden="true" />{statusText(status)}
+      </span>
+    );
+
+    const renderOutputCard = (type) => {
+      const serve = type === "serve";
+      const text = serve ? command : curlText;
+      const canExpand = text.split("\n").length > 9;
+      const expanded = serve ? serveExpanded : requestExpanded;
+      const setExpanded = serve ? setServeExpanded : setRequestExpanded;
+      const status = serve ? serveStatus : requestStatus;
+      const emphasized = builderScope === "base" || builderScope === type;
+      return (
+        <section
+          className="sgd-builder-output"
+          data-output={type}
+          data-emphasized={emphasized ? "true" : "false"}
+        >
+          <header>
+            <div className="sgd-builder-output-index">{serve ? "1" : "2"}</div>
+            <div className="sgd-builder-output-title">
+              <strong>{serve ? "Serve" : "Request"}</strong>
+              <span>
+                {serve
+                  ? `${sel.hw.toUpperCase()} · ${activeRunMode === "docker" ? "Docker" : "Python"}`
+                  : "cURL"}
+              </span>
+            </div>
+            {renderStatus(status)}
+          </header>
+          {serve && runModes.length > 1 && (
+            <div className="sgd-builder-output-tabs" role="tablist" aria-label="Serve command format">
+              {runModes.map((mode) => (
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={activeRunMode === mode}
+                  data-selected={activeRunMode === mode ? "true" : "false"}
+                  key={mode}
+                  onClick={() => setRunMode(mode)}
+                >{mode === "docker" ? "Docker" : "Python"}</button>
+              ))}
+            </div>
+          )}
+          {serve && Number(sel.nodes) > 1 && (
+            <div className="sgd-builder-node-fields">
+              <label>
+                <span>Head address</span>
+                <input value={builderHeadAddress} onChange={(event) => setBuilderHeadAddress(event.target.value)} />
+              </label>
+              <label>
+                <span>Node rank</span>
+                {renderBuilderNumberInput({
+                  identity: `node-rank-${builderNodeRank}-${sel.nodes}`,
+                  value: builderNodeRank,
+                  min: 0,
+                  max: Number(sel.nodes) - 1,
+                  label: "Node rank",
+                  onCommit: setBuilderNodeRank,
+                })}
+              </label>
+            </div>
+          )}
+          <div className="sgd-builder-code">
+            <pre className={expanded ? "is-expanded" : ""}><code>{text}</code></pre>
+            <button
+              type="button"
+              className="sgd-builder-copy"
+              disabled={invalid}
+              aria-label={(serve ? copied : curlCopied) ? "Copied" : "Copy command"}
+              data-copied={(serve ? copied : curlCopied) ? "true" : undefined}
+              onClick={serve ? handleCopy : copyCurl}
+            >
+              <svg className="sgd-builder-copy-glyph" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2.5" /><path d="M15 5v-.25A2.75 2.75 0 0 0 12.25 2h-7.5A2.75 2.75 0 0 0 2 4.75v7.5A2.75 2.75 0 0 0 4.75 15H5" /></svg>
+              <svg className="sgd-builder-copy-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5" /></svg>
+            </button>
+          </div>
+          {invalid && <div className="sgd-builder-output-error">{errors[0]}</div>}
+          <footer>
+            {canExpand && (
+              <button type="button" className="sgd-builder-text-action" onClick={() => setExpanded(!expanded)}>
+                {expanded ? "Collapse" : "Expand"}
+              </button>
+            )}
+            <div>
+              <button type="button" className="sgd-builder-text-action" onClick={() => setModal("env")}>Variables</button>
+            </div>
+          </footer>
+        </section>
+      );
+    };
+
+    return (
+      <section
+        id={DEPLOYMENT_COMPONENT_ID}
+        className="not-prose sg-command-visualizer sgd-command-builder"
+        style={{ scrollMarginTop: "104px" }}
+        aria-label={`${config.modelName} command builder`}
+      >
+        <nav className="sgd-builder-scope-tabs" role="tablist" aria-label="Command builder scope">
+          {["base", "serve", "request"].map((scope) => (
+            <button
+              type="button"
+              role="tab"
+              key={scope}
+              aria-label={scopeLabel[scope]}
+              aria-selected={builderScope === scope}
+              aria-controls={`${DEPLOYMENT_COMPONENT_ID}-controls`}
+              data-active={builderScope === scope ? "true" : "false"}
+              onClick={() => setBuilderScope(scope)}
+            >
+              {scopeLabel[scope]}
+            </button>
+          ))}
+        </nav>
+
+        <div className="sgd-builder-main" data-scope={builderScope}>
+          <div
+            id={`${DEPLOYMENT_COMPONENT_ID}-controls`}
+            className="sgd-builder-controls"
+            role="tabpanel"
+            aria-label={`${scopeLabel[builderScope]} settings`}
+          >
+            {renderScopeControls()}
+          </div>
+          <div className="sgd-builder-output-rail">
+            {builderScope !== "request" && renderOutputCard("serve")}
+            {builderScope !== "serve" && renderOutputCard("request")}
+          </div>
+        </div>
+
+        {modal === "env" && (
+          <div style={s.modalBackdrop} onClick={() => setModal(null)}>
+            <div style={s.modalBox} onClick={(event) => event.stopPropagation()}>
+              <div style={s.modalHeader}>
+                <div style={s.modalTitle}>Command variables</div>
+                <button style={s.modalCloseBtn} onClick={() => setModal(null)} aria-label="Close">×</button>
+              </div>
+              {["command", "curl"].map((target) => placeholderGroups[target].length > 0 && (
+                <div key={target}>
+                  <div style={s.sectionHeading}>{target === "command" ? "Serve" : "Request"}</div>
+                  {placeholderGroups[target].map(({ key, label }) => (
+                    <div key={key} style={s.formField}>
+                      <label style={s.formLabel}>{label}</label>
+                      <input
+                        style={s.formInput}
+                        value={envDraft[key] ?? ""}
+                        onChange={(event) => setEnvDraft({ ...envDraft, [key]: event.target.value })}
+                      />
+                    </div>
+                  ))}
+                </div>
+              ))}
+              <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+                <button style={{ ...s.iconButton, padding: "6px 14px" }} onClick={() => setModal(null)}>Cancel</button>
+                <button style={s.primaryBtn} onClick={() => { saveEnv(envDraft); setModal(null); }}>Save</button>
+              </div>
+            </div>
+          </div>
+        )}
+      </section>
+    );
+  }
+
   return (
     <div
       id={DEPLOYMENT_COMPONENT_ID}
       style={{ ...s.container, scrollMarginTop: "104px" }}
-      className="not-prose"
+      className="not-prose sg-command-visualizer"
     >
       {/* Hardware section (2 vendor rows in one card, equal-width grid) */}
       <div style={s.cardColumn}>
@@ -1484,6 +2279,7 @@ export const Deployment = ({ config, benchmarks }) => {
                   {runModes.map((mode, index) => (
                     <span
                       key={mode}
+                      className="sg-command-visualizer-tab"
                       style={{
                         ...(index === runModes.length - 1
                           ? s.runModeChipLast(activeRunMode === mode)
@@ -1491,7 +2287,13 @@ export const Deployment = ({ config, benchmarks }) => {
                         ...(runModes.length === 1 ? { borderRadius: 7 } : {}),
                       }}
                       onClick={() => setRunMode(mode)}
+                      onKeyDown={(e) => {
+                        if (e.key !== "Enter" && e.key !== " ") return;
+                        e.preventDefault();
+                        setRunMode(mode);
+                      }}
                       role="tab"
+                      tabIndex={0}
                       aria-selected={activeRunMode === mode}
                     >
                       {mode === "docker" ? "Docker" : "Python"}

@@ -2,29 +2,6 @@
 //! (python/sglang/srt/sampling/sampling_params.py): every field, plus its
 //! `__post_init__` → `normalize` → `verify` pipeline (run in that order, as
 //! `TokenizerManager._create_tokenized_object` does).
-//!
-//! The embedded Rust server replaces the Python `TokenizerManager`, which is the
-//! only place those three run on the normal (zmq) path. Running them here, in the
-//! ingress `Normalizing` FSM step, keeps the per-request CPU (notably the
-//! stop-string work) off the scheduler's latency-critical loop. We set
-//! `is_normalized=true` on the wire so the scheduler's `__post_init__` and
-//! `normalize` early-return; its `verify` is likewise skipped (we did it here).
-//!
-//! KEEP IN SYNC with `sampling_params.py`: the field list, defaults and ranges
-//! below mirror that file, and the struct is serialized by field name into the
-//! `TokenizedGenerateReqInput` header, so a renamed/added Python field must be
-//! mirrored here (an unknown key would be silently dropped by msgspec).
-//!
-//! Two deliberate deviations, both safe over-estimates or stricter:
-//!   * `stop_str_max_len` is the stop string's **UTF-8 byte length** — a provably
-//!     safe over-estimate of its token length (a token spans ≥ 1 byte, so
-//!     `bytes ≥ tokens`; `chars` is *not* a bound — one char can be several
-//!     tokens, e.g. `𓀀` → 3). The scheduler uses it only as a match-window
-//!     *size* (capped at the output length), so an over-estimate matches the same
-//!     stops — only an under-estimate misses. Python encodes each stop with the
-//!     tokenizer for the exact count; the byte bound avoids needing it here.
-//!   * `n > 1` (parallel sampling) is rejected — the rust egress maps one rid to
-//!     one response, so every sample past the first would be dropped.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -33,9 +10,8 @@ use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::OneOrMany;
-use crate::error::Error;
-use crate::utils::regex::RegexPattern;
+use super::types::OneOrMany;
+use crate::utils::{error::Error, regex::RegexPattern};
 
 /// `_SAMPLING_EPS` — temperatures in `[0, eps)` mean greedy decoding.
 const SAMPLING_EPS: f64 = 1e-6;
@@ -495,7 +471,7 @@ impl SamplingParams {
                 "Only one of regex, json_schema, or ebnf can be set".into()
             ));
         }
-        // Not a Python restriction: the rust egress maps one rid to one response,
+        // Not a Python restriction: the rust from_scheduler maps one rid to one response,
         // so parallel sampling would drop all but the first sample. This is the
         // only place it is rejected — `n` lives in `sampling_params`, where
         // Python reads it, and the `/generate` body has no `n` of its own.

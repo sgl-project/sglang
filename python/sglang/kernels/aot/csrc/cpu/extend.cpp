@@ -63,6 +63,7 @@ void extend_attention_kernel_impl(
     int64_t sliding_window_size,
     bool is_prefix_skipped,
     bool is_cross_attn,
+    bool kv_from_cache,
     bool has_encoder_lens,
     bool has_sink) {
   // strides
@@ -148,8 +149,9 @@ void extend_attention_kernel_impl(
       fill_stub(s_prime, 0.f, m_size);
       fill_stub(m_prime, -std::numeric_limits<scalar_t>::infinity(), m_size);
       // stage 1: compute scores with prefix
+      // kv_from_cache has no stage 2, so cover the extend range and stop at the diagonal
       int kv_start = 0;
-      int kv_end = is_cross_attn ? encoder_lens[bs] : seq_len_prefix;
+      int kv_end = is_cross_attn ? encoder_lens[bs] : (kv_from_cache ? seq_len_prefix + m + m_size : seq_len_prefix);
       for (int n = kv_start; n < kv_end; n += BLOCK_N) {
         int n_size = std::min(BLOCK_N, kv_end - n);
 
@@ -180,12 +182,31 @@ void extend_attention_kernel_impl(
             /* C     */ s_i);
 
         for (int row = 0; row < m_size; ++row) {
-          if (sliding_window_size > 0) {
+          bool row_is_empty = false;
+          if (kv_from_cache) {
+            int first_future_col = seq_len_prefix + m + row + 1;
+            if (n >= first_future_col) {
+              row_is_empty = true;
+            } else if (first_future_col < n + n_size) {
+              fill_stub(
+                  s_i + row * BLOCK_N + (first_future_col - n),
+                  -std::numeric_limits<float>::infinity(),
+                  n + n_size - first_future_col);
+            }
+          }
+          if (!row_is_empty && sliding_window_size > 0) {
             int last_col = seq_len_prefix + row + m - sliding_window_size + 1;
             if (last_col >= n + n_size) {
-              continue;
+              row_is_empty = true;
+            } else {
+              fill_stub(s_i + row * BLOCK_N, -std::numeric_limits<float>::infinity(), last_col - n);
             }
-            fill_stub(s_i + row * BLOCK_N, -std::numeric_limits<float>::infinity(), last_col - n);
+          }
+          if (row_is_empty) {
+            // s_delta is reused across blocks - zero an empty row rather than
+            // skip it, or P @ V below applies the previous block's weights here
+            fill_stub(s_delta + row * BLOCK_N, 0.f, padded_n_size);
+            continue;
           }
           flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
               s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale, row);
@@ -214,7 +235,7 @@ void extend_attention_kernel_impl(
             /* B     */ Btmp,
             /* C     */ v_prime);
       }  // loop with seq_len_prefix
-      if (!is_cross_attn) {
+      if (!is_cross_attn && !kv_from_cache) {
         // stage 2: compute the triangle part
         int num_keys = std::min(seq_len_extend, m + BLOCK_M);
         for (int n = 0; n < num_keys; n += BLOCK_N) {
@@ -400,6 +421,7 @@ inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int
         sliding_window_size,                                                               \
         is_prefix_skipped,                                                                 \
         is_cross_attn,                                                                     \
+        kv_from_cache,                                                                     \
         has_encoder_lens,                                                                  \
         has_sink);                                                                         \
   } while (0)
@@ -442,13 +464,13 @@ void extend_attention_cpu(
     std::optional<at::Tensor> encoder_lens,
     std::optional<at::Tensor> sinks,
     std::optional<at::Tensor> tree_mask) {
-  if (!is_cross_attn) {
-    TORCH_CHECK(
-        k_extend_opt.has_value() && v_extend_opt.has_value(),
-        "k_extend and v_extend are required for non-cross attention");
-  }
-  // Since k_extend and v_extend are not used for cross attention, they can be initialized as k_buffer and v_buffer
-  // here.
+  TORCH_CHECK(k_extend_opt.has_value() == v_extend_opt.has_value(), "k_extend and v_extend must be given together");
+  // A KV-shared layer (Gemma 4) passes no extend K/V - the layer it shares with
+  // already wrote them to the cache, so this kernel masks causally itself. Cross
+  // attention can also arrive without K/V but reads an encoder sequence that
+  // carries no causal order, so it keeps its own path.
+  const bool kv_from_cache = !is_cross_attn && !k_extend_opt.has_value();
+  // unused when the range comes from the cache - bind them to the buffers
   auto k_extend = k_extend_opt.has_value() ? k_extend_opt.value() : k_buffer;
   auto v_extend = v_extend_opt.has_value() ? v_extend_opt.value() : v_buffer;
 
@@ -540,6 +562,7 @@ void extend_attention_cpu(
         ", got ",
         tree_mask_t.numel());
     TORCH_CHECK(!is_cross_attn, "extend: tree_mask is not supported for cross attention");
+    TORCH_CHECK(!kv_from_cache, "extend: tree_mask is not supported for KV-shared layers");
     // The window mask derives query positions from the row index
     // (seq_len_prefix + m + row), but tree-mask rows sit at their tree depth,
     // which is <= the row index; combining the two would over-mask the prefix.
