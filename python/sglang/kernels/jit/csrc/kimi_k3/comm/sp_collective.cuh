@@ -326,7 +326,6 @@ struct SPCollectiveKernel {
     CHECK_HOST(local_elems.unwrap() > 0);
     CHECK_HOST(input_elems.unwrap() == local_elems.unwrap() * kWorldSize);
     CHECK_HOST(local_elems.unwrap() % 8 == 0) << "local shard bytes must be 16B aligned";
-    CHECK_HOST(local_elems.unwrap() * sizeof(bf16_t) <= data.push_bytes) << "local shard exceeds a push slot";
 
     sp_collective::Params params{
         .input = static_cast<const uint8_t*>(input.data_ptr()),
@@ -369,6 +368,7 @@ struct SPCollectiveKernel {
     const auto& data = *ref.get();
     check_launch(data, num_blocks, block_size);
     auto params = make_params(data, input, output, residual, residual_is_local, 0);
+    CHECK_HOST(params.local_vecs * 16 <= data.push_bytes) << "local shard exceeds a push slot";
     const auto kernel = residual.has_value() ? sp_collective::reduce_scatter_res_kernel<kWorldSize, true, kUsePDL>
                                              : sp_collective::reduce_scatter_res_kernel<kWorldSize, false, kUsePDL>;
     host::LaunchKernel(num_blocks + 1, block_size, input.device()).enable_pdl(kUsePDL)(kernel, params);
@@ -386,6 +386,7 @@ struct SPCollectiveKernel {
     check_launch(data, num_blocks, block_size);
     // Reuse the RS matcher by swapping input/output roles conceptually.
     auto params = make_params(data, output, input, std::nullopt, false, ws_mc_base);
+    CHECK_HOST(params.local_vecs * 16 <= data.push_bytes) << "local shard exceeds a push slot";
     params.input = static_cast<const uint8_t*>(input.data_ptr());
     params.output = static_cast<uint8_t*>(output.data_ptr());
     host::LaunchKernel(num_blocks + 1, block_size, input.device())
