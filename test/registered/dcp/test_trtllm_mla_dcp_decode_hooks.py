@@ -10,6 +10,7 @@ Covers two traps that only show up at the family boundary:
    autotune pass under DCP overflowed the trtllm-gen workspace.
 """
 
+import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -93,9 +94,7 @@ class TestDcpDecodeAutotuneDummySkip(CustomTestCase):
                 side_effect=AssertionError("dummy run must not reach the kernel"),
             ),
         ):
-            out, lse = backend.forward_decode(
-                q, sentinel, sentinel, layer, sentinel
-            )
+            out, lse = backend.forward_decode(q, sentinel, sentinel, layer, sentinel)
 
         self.assertEqual(tuple(out.shape), (3, 4 * 128))
         self.assertEqual(tuple(lse.shape), (3, 4))
@@ -110,3 +109,7 @@ class TestDcpDecodeAutotuneDummySkip(CustomTestCase):
 
     def test_tokenspeed_mla_skips_kernel_in_autotune_dummy_run(self):
         self._assert_dummy_skip(TokenspeedMLABackend)
+
+
+if __name__ == "__main__":
+    unittest.main()
