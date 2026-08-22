@@ -276,7 +276,12 @@ class VAELoader(ComponentLoader):
         keep_mapping = component_starts_on_cpu and (
             current_platform.is_mps()
             or keep_checkpoint_mapped(
-                weight_bytes=checkpoint_bytes(server_args.model_path),
+                # server_args.model_path can be a hub repo id, which is not a
+                # directory anywhere; the component path is always local, and
+                # its parent holds the rest of the variant being deployed.
+                weight_bytes=checkpoint_bytes(
+                    os.path.dirname(str(component_model_path))
+                ),
                 component=f"{component_name or 'vae'} (VAE)",
             )
         )
