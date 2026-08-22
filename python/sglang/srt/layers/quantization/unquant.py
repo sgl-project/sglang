@@ -214,6 +214,8 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
 
+    _prepare_flashinfer_bf16_swiglu_weight = False
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -239,6 +241,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
+
+        if self._prepare_flashinfer_bf16_swiglu_weight:
+            from flashinfer import prepare_bf16_swiglu_weight
+
+            layer.register_buffer(
+                "flashinfer_bf16_swiglu_weight",
+                prepare_bf16_swiglu_weight(layer.weight, input_order="gate_up"),
+                persistent=False,
+            )
 
     def apply(
         self,

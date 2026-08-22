@@ -68,10 +68,11 @@ class StandardDispatchOutput(NamedTuple):
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
     topk_output: TopKOutput
-    # SGLANG_OPT_MOE_QUANT_ONCE: optional pre-quantized (q, scale) pair for
-    # ``hidden_states`` (per-token-group-128 fp8, q rows possibly padded to a
-    # multiple of 4). Consumed by the standard->triton fused runner so it can
-    # skip its own activation quant; ``hidden_states`` itself stays bf16.
+    # Optional pre-quantized (q, scale) pair for ``hidden_states``. This carries
+    # either per-token-group FP8 from SGLANG_OPT_MOE_QUANT_ONCE (whose rows may
+    # be padded) or packed NVFP4 with linear scales from a fused collective.
+    # The selected fused runner consumes it to skip activation quantization;
+    # ``hidden_states`` itself remains in its original dtype.
     hidden_states_pre_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     @property
