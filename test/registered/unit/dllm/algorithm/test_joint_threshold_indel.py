@@ -106,11 +106,15 @@ class TestJointThresholdInDelInitialization(CustomTestCase):
             state["prompt_index"].tolist(), [True, False, False, False, False]
         )
 
-    def test_negative_max_post_edit_steps_is_rejected(self):
-        with self.assertRaisesRegex(
-            ValueError, "max_post_edit_steps must be non-negative, got -34"
-        ):
-            JointThresholdInDel(make_config(block_size=32, max_post_edit_steps=-34))
+    def test_invalid_max_post_edit_steps_is_rejected(self):
+        for value in (-34, 1.5, True):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValueError, "max_post_edit_steps must be a non-negative integer"
+                ):
+                    JointThresholdInDel(
+                        make_config(block_size=32, max_post_edit_steps=value)
+                    )
 
     def test_missing_edit_token_ids_preserves_constructor_error(self):
         config = make_config(delete_token_id=None, split_token_id=None)
