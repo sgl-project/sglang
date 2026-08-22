@@ -2458,12 +2458,15 @@ class SchedulerDisaggregationDecodeMixin:
         # Process pending prebuilt batch: output processing + filter + merge
         with scheduler_nvtx_range("scheduler.pd.get_new_prebuilt_batch"):
             new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
+        self._mark_symm_dp_scheduler_stage("after_get_new_prebuilt_batch_ns")
         if new_prebuilt_batch:
             assert self.chunked_req is None
             self.batch_result_processor.process_batch_result_prebuilt(
                 new_prebuilt_batch
             )
+            self._mark_symm_dp_scheduler_stage("after_process_prebuilt_result_ns")
             new_prebuilt_batch.filter_batch()
+            self._mark_symm_dp_scheduler_stage("after_filter_prebuilt_batch_ns")
             if not new_prebuilt_batch.is_empty():
                 if running_batch.is_empty():
                     running_batch = new_prebuilt_batch
@@ -2471,6 +2474,10 @@ class SchedulerDisaggregationDecodeMixin:
                         running_batch.hisparse_coordinator = self.hisparse_coordinator
                 else:
                     running_batch.merge_batch(new_prebuilt_batch)
+        else:
+            self._mark_symm_dp_scheduler_stage("after_process_prebuilt_result_ns")
+            self._mark_symm_dp_scheduler_stage("after_filter_prebuilt_batch_ns")
+        self._mark_symm_dp_scheduler_stage("after_merge_prebuilt_batch_ns")
 
         # Schedule decode batch
         if running_batch.is_empty():
@@ -2479,6 +2486,7 @@ class SchedulerDisaggregationDecodeMixin:
             with scheduler_nvtx_range("scheduler.pd.update_running_batch"):
                 running_batch = self.update_running_batch(running_batch)
             ret = running_batch if not running_batch.is_empty() else None
+        self._mark_symm_dp_scheduler_stage("after_update_running_batch_ns")
 
         with scheduler_nvtx_range("scheduler.pd.dp_sync"):
             ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
@@ -2496,6 +2504,7 @@ class SchedulerDisaggregationDecodeMixin:
                 self._add_request_to_queue(req)
 
         if len(self.waiting_queue) == 0:
+            self._mark_empty_prebuilt_stages()
             return None
 
         if self.enable_priority_scheduling:
@@ -2534,9 +2543,11 @@ class SchedulerDisaggregationDecodeMixin:
 
         self.waiting_queue = waiting_queue
         if len(can_run_list) == 0:
+            self._mark_empty_prebuilt_stages()
             return None
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+        self._mark_symm_dp_scheduler_stage("after_prebuilt_request_init_ns")
 
         # construct a schedule batch with those requests and mark as decode
         new_batch = ScheduleBatch.init_new(
@@ -2548,12 +2559,24 @@ class SchedulerDisaggregationDecodeMixin:
             self.enable_overlap,
             self.spec_algorithm,
         )
+        self._mark_symm_dp_scheduler_stage("after_prebuilt_batch_init_ns")
 
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()
+        self._mark_symm_dp_scheduler_stage("after_prepare_for_prebuilt_ns")
         new_batch.process_prebuilt(self.server_args, self.future_map)
+        self._mark_symm_dp_scheduler_stage("after_process_prebuilt_ns")
 
         return new_batch
+
+    def _mark_empty_prebuilt_stages(self: Scheduler) -> None:
+        for name in (
+            "after_prebuilt_request_init_ns",
+            "after_prebuilt_batch_init_ns",
+            "after_prepare_for_prebuilt_ns",
+            "after_process_prebuilt_ns",
+        ):
+            self._mark_symm_dp_scheduler_stage(name)
 
     @scheduler_nvtx_method("scheduler.pd.process_decode_queue")
     def process_decode_queue(self: Scheduler):

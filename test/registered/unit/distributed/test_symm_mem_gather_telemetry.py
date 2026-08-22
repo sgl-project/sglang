@@ -216,6 +216,18 @@ def test_scheduler_loop_entry_clock_is_enabled(monkeypatch):
     assert dp_attn.symm_dp_scheduler_loop_entry_ns() == 654_321
 
 
+def test_disagg_decode_stage_marker_is_default_off(monkeypatch):
+    scheduler = type("Scheduler", (), {"_symm_dp_scheduler_stage_timing": None})()
+
+    def fail_if_called():
+        raise AssertionError("default-off stage marker sampled perf_counter_ns")
+
+    monkeypatch.setattr(disagg_decode.time, "perf_counter_ns", fail_if_called)
+    disagg_decode.SchedulerDisaggregationDecodeMixin._mark_symm_dp_scheduler_stage(
+        scheduler, "after_get_new_prebuilt_batch_ns"
+    )
+
+
 @pytest.mark.parametrize(
     "event_loop_name",
     ("event_loop_normal_disagg_decode", "event_loop_overlap_disagg_decode"),

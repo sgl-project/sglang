@@ -151,6 +151,15 @@
     "change": "Add opt-in host-only timestamps for the disaggregated decode loop, prefill-DP lookup, request intake, transfer/admission polling, DP adapter entry, and generation-exact symmetric-memory peer readiness. Normal execution remains on the original gather implementation when telemetry is disabled.",
     "scope": "Diagnostic source only; no performance or production optimization claim."
   },
+  "layer3_pd_admission_substage_telemetry": {
+    "parent_commit": "c5b7a8726714fd3d3eb947dd0d0e677db0048b8a",
+    "files": {
+      "python/sglang/srt/disaggregation/decode.py": "0e33e29836a318bb5a7b1283ee9c66cf16895e0a472e04c7746687117c3bcb23",
+      "test/registered/unit/distributed/test_symm_mem_gather_telemetry.py": "f968fe3762f5b514e4744302d9c5f9e09d56035c99920fac26754d276ae6be9f"
+    },
+    "change": "Split the opt-in Layer-3 transfer-admission interval at request initialization, ScheduleBatch construction, PREBUILT preparation, result processing, filtering, merge, and running-batch update boundaries.",
+    "scope": "Diagnostic source only; default-off execution does not sample the host clock, and no production optimization or performance claim is attached."
+  },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
     "tree": "b0161fbca98775c0f79999f4970de1f14a4426fb"
