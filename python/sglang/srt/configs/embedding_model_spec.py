@@ -117,6 +117,11 @@ class EmbeddingModelSpec:
 
 _EMBEDDING_ARCHITECTURES = {
     "BertModel": ("bert", EmbeddingExecution.ENCODER_ONLY, PoolingStrategy.CLS),
+    "DeepseekV3BidirectionalModel": (
+        "deepseek_v3_bidirectional",
+        EmbeddingExecution.ENCODER_ONLY,
+        PoolingStrategy.MEAN,
+    ),
     "CLIPModel": ("clip", EmbeddingExecution.MULTIMODAL, PoolingStrategy.LAST),
     "Contriever": (
         "contriever",
