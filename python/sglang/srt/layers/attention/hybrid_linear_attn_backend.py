@@ -365,7 +365,11 @@ class MambaAttnBackendBase(AttentionBackend):
             lens_masked[not_aligned] // chunk_size
         )
         if is_npu():
-            track_ssm_h_src = offset_masked[not_aligned] + ((lens_masked[not_aligned] // chunk_size) * chunk_size) // h_chunk_size
+            track_ssm_h_src = (
+                offset_masked[not_aligned]
+                + ((lens_masked[not_aligned] // chunk_size) * chunk_size)
+                // h_chunk_size
+            )
         track_ssm_h_dst = dst_masked[not_aligned]
 
         return (
