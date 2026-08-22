@@ -265,7 +265,8 @@ def _make_flashinfer_dflash_swa_builtin_masks(
     *,
     device: str,
 ) -> list[torch.Tensor]:
-    """Mirror FlashInfer DFLASH verify's production no-custom-mask path."""
+    """Each query sees the sliding window ending at its own position, so the
+    window is per query and not per request."""
     draft_token_num = _check_target_verify_case(case)
     window = int(case.sliding_window_size)
     masks_by_req = []
@@ -276,9 +277,10 @@ def _make_flashinfer_dflash_swa_builtin_masks(
     ).unsqueeze(1)
     for prefix_len in case.prefix_lens:
         seq_len = prefix_len + draft_token_num
-        prefix_start = max(0, int(prefix_len) - window)
         k_idx = torch.arange(seq_len, dtype=torch.int32, device=device).unsqueeze(0)
-        masks_by_req.append((k_idx >= prefix_start) & (k_idx <= prefix_len + q_idx))
+        q_pos = int(prefix_len) + q_idx
+        lower = torch.clamp(q_pos - window, min=0)
+        masks_by_req.append((k_idx >= lower) & (k_idx <= q_pos))
 
     return masks_by_req
 
