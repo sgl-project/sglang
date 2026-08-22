@@ -6,6 +6,7 @@ pub mod cache_aware_zmq;
 pub mod factory;
 pub mod kv_events;
 pub mod load_based;
+pub mod load_scoring;
 pub mod power_of_two;
 pub mod random;
 pub mod registry;
