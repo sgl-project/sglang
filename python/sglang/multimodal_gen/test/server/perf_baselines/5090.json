@@ -141,20 +141,20 @@
                 "MiniMaxH3DecodingStage": 26550.0
             },
             "denoise_step_ms": {
-                "0": 12000.0,
-                "1": 12000.0,
-                "2": 12000.0,
-                "3": 12000.0,
-                "4": 12000.0,
-                "5": 12000.0,
-                "6": 12000.0,
-                "7": 12000.0
+                "0": 14000.0,
+                "1": 14000.0,
+                "2": 14000.0,
+                "3": 14000.0,
+                "4": 14000.0,
+                "5": 14000.0,
+                "6": 14000.0,
+                "7": 14000.0
             },
-            "expected_e2e_ms": 115000.0,
-            "expected_avg_denoise_ms": 9600.0,
+            "expected_e2e_ms": 125000.0,
+            "expected_avg_denoise_ms": 12000.0,
             "expected_median_denoise_ms": 11000.0,
-            "load_peak_vram_mb": 5172.0,
-            "runtime_peak_vram_mb": 15776.0,
+            "load_peak_vram_mb": 6000.0,
+            "runtime_peak_vram_mb": 12288.0,
             "estimated_full_test_time_s": 900.0
         }
     }

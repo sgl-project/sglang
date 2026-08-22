@@ -1153,15 +1153,16 @@ def _make_5090_flux_layerwise_cpu_offload_case() -> DiffusionTestCase:
 
 
 def _make_5090_h3_consumer_budget_case() -> DiffusionTestCase:
-    """MiniMax-H3 on an RTX 5090 with a simulated 32 GiB host budget.
+    """MiniMax-H3 on a pretend 12 GiB card with a pretend 32 GiB host.
 
     This is the cookbook's consumer recipe, and it guards the whole constrained
     placement stack at once: the deployment-size gate that keeps the VAE on its
     checkpoint mapping, per-layer pinning under a small budget, the courier
     thread that ships still-mapped layers, and the decode-scoped VAE residency
-    that decodes inside the VRAM the denoise just vacated. The runner's host is
-    never short of memory, so the simulated host size routes the run onto those
-    paths; the VRAM baseline records the physical 5090 measurement.
+    that decodes inside the VRAM the denoise just vacated. The runner's real
+    card and host are never short, so the pretend sizes are what route the run
+    onto those paths: the allocator cap makes "fits 12 GiB" enforced rather
+    than inferred, and the runtime peak baseline is that budget.
     """
     return DiffusionTestCase(
         "minimax_h3_t2va_consumer_budget_1gpu_5090",
@@ -1182,8 +1183,10 @@ def _make_5090_h3_consumer_budget_case() -> DiffusionTestCase:
             ],
             env_vars={
                 "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": "32",
-                # Avoid allocator fragmentation while decoder residency
-                # overlaps the streamed layer working set.
+                "SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB": "12",
+                # the decode holds two thirds of the decoder against the 12 GiB
+                # cap; without expandable segments, fragmentation tips the
+                # last hundred MiB over
                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
             },
         ),

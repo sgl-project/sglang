@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
     SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER: bool = False
     SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB: float | None = None
+    SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB: float | None = None
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
@@ -245,6 +246,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # real hosts are never short of memory.
     "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": _lazy_optional_float(
         "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB"
+    ),
+    # Test-only: cap the CUDA caching allocator at this many GiB, so a large
+    # CI card behaves like the consumer card a case is written for. Without
+    # the cap the allocator is free to reserve past the pretended budget and
+    # a peak-VRAM baseline stops meaning "fits the card".
+    "SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB": _lazy_optional_float(
+        "SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB"
     ),
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
