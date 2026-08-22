@@ -2023,6 +2023,9 @@ class CheckWeightsReqInput(BaseReq, kw_only=True):
 # sglang.srt.utils.weight_checker. Not array_like: the payload is read by field
 # name and re-serialized to JSON, so it must stay a {field: value} map.
 class ParallelismInfo(msgspec.Struct, kw_only=True):
+    # Which runner this describes: "target", or a draft role such as "draft" /
+    # "draft_step_0". One entry per runner the checksum covers.
+    role: str
     tp_rank: int
     tp_size: int
     dp_rank: int
@@ -2036,7 +2039,10 @@ class ParallelismInfo(msgspec.Struct, kw_only=True):
 class ChecksumInfo(msgspec.Struct, kw_only=True):
     checksums: Dict[str, str]
     per_gpu_checksum: str
-    parallelism_info: ParallelismInfo
+    # One entry per role the checksum covers: the target model plus, under
+    # speculative decoding, each draft runner. All roles on a rank share the GPU
+    # rank; consumers key off it to merge the shards.
+    parallelism_info: List[ParallelismInfo]
 
 
 class CheckWeightsReqOutput(BaseReq, kw_only=True):
