@@ -578,8 +578,35 @@ class CLIPModel(nn.Module):
             return EmbeddingPoolerOutput(embeddings=image_embeds)
 
         else:
-            text_outputs = self.text_model(input_ids, position_ids=positions)
-            pooled_output = self.pooler(text_outputs[0], forward_batch)
+            extend_seq_lens = forward_batch.extend_seq_lens_cpu
+            seq_lens = (
+                [int(x) for x in extend_seq_lens]
+                if extend_seq_lens is not None
+                else None
+            )
+            if seq_lens is not None and len(seq_lens) > 1:
+                batch_input_ids = torch.nn.utils.rnn.pad_sequence(
+                    input_ids.split(seq_lens), batch_first=True
+                )
+                batch_positions = torch.nn.utils.rnn.pad_sequence(
+                    positions.split(seq_lens), batch_first=True
+                )
+                text_outputs = self.text_model(
+                    batch_input_ids, position_ids=batch_positions
+                )
+                text_outputs = torch.cat(
+                    torch.nn.utils.rnn.unpad_sequence(
+                        text_outputs,
+                        torch.tensor(seq_lens, device=text_outputs.device),
+                        batch_first=True,
+                    ),
+                    dim=0,
+                )
+            else:
+                text_outputs = self.text_model(input_ids, position_ids=positions)
+            if text_outputs.dim() == 3:
+                text_outputs = text_outputs[0]
+            pooled_output = self.pooler(text_outputs, forward_batch)
             return EmbeddingPoolerOutput(
                 embeddings=self.text_projection(pooled_output.embeddings)
             )
