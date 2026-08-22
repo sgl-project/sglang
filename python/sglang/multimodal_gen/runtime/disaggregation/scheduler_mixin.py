@@ -55,6 +55,10 @@ from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     clone_scheduler_runtime,
 )
+from sglang.multimodal_gen.runtime.ipc_cuda import (
+    attach_cuda_tensors,
+    detach_cuda_tensors,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
@@ -802,54 +806,29 @@ class SchedulerDisaggMixin:
         return data
 
     def _broadcast_recv_reqs(self: Scheduler, recv_reqs):
-        """Share the rank-0 ZMQ poll result with the other ranks.
+        """ComfyUI multi-rank recv: pickle the Req skeleton, NCCL the CUDA tensors.
 
-        Control messages still go through CPU ``broadcast_pyobj``. ``Req``
-        tensors go through NCCL via ``_broadcast_req_to_all_ranks`` so the
-        ComfyUI / SP path no longer pickles GPU latents onto the gloo group.
+        The general SP/CFG/TP path stays in ``Scheduler.recv_reqs`` as the
+        original whole-list ``broadcast_pyobj``. This helper is only the
+        ComfyUI overlay and does not use disagg extract.
         """
-        if not self._is_multi_rank():
-            return recv_reqs if recv_reqs is not None else []
-
         is_rank0 = self.gpu_id == 0
         if is_rank0:
-            envelope = []
-            for identity, payload in recv_reqs:
-                if isinstance(payload, Req):
-                    envelope.append((identity, "req", 1))
-                elif (
-                    isinstance(payload, list)
-                    and payload
-                    and all(isinstance(item, Req) for item in payload)
-                ):
-                    envelope.append((identity, "req_list", len(payload)))
-                else:
-                    envelope.append((identity, "other", 1))
+            assert recv_reqs is not None, "rank 0 must pass the ZMQ poll result"
+            skeleton, tensors = detach_cuda_tensors(recv_reqs)
         else:
-            envelope = None
+            skeleton, tensors = None, None
 
-        envelope = self._broadcast_to_all_ranks(envelope)
-        if not envelope:
+        skeleton = self._broadcast_to_all_ranks(skeleton)
+        tensors = self._broadcast_tensor_dict_to_all_ranks(tensors)
+        if is_rank0:
+            return recv_reqs
+        if not skeleton:
             return []
-
-        out = []
-        src_idx = 0
-        for identity, kind, count in envelope:
-            if kind == "req":
-                src = recv_reqs[src_idx][1] if is_rank0 else None
-                out.append((identity, self._broadcast_req_to_all_ranks(src)))
-            elif kind == "req_list":
-                src_list = recv_reqs[src_idx][1] if is_rank0 else [None] * count
-                synced = [
-                    self._broadcast_req_to_all_ranks(src_list[i] if is_rank0 else None)
-                    for i in range(count)
-                ]
-                out.append((identity, synced))
-            else:
-                other = recv_reqs[src_idx][1] if is_rank0 else None
-                out.append((identity, self._broadcast_to_all_ranks(other)))
-            src_idx += 1
-        return out
+        local_device = torch.device(
+            f"{current_platform.device_type}:{self.worker.local_rank}"
+        )
+        return attach_cuda_tensors(skeleton, tensors or {}, device=local_device)
 
     def _is_multi_rank(self: Scheduler) -> bool:
         sa = self.server_args

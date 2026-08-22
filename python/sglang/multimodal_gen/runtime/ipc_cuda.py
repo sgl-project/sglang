@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CUDA IPC for local ComfyUI / DiffGenerator ↔ rank-0 scheduler hops.
+"""Keep CUDA tensors off the pickle path for local scheduler hops.
 
-Standard ``pickle.dumps`` copies CUDA tensors through host memory. This module
-replaces those tensors with a handle before pickle, and rebuilds them on the
-other process with ``UntypedStorage._new_shared_cuda`` so the bytes stay on GPU.
+Two hops share the same tree walk:
+
+- ComfyUI / DiffGenerator ↔ rank-0: replace tensors with ``CudaIpcRef``
+  handles before pickle, rebuild with ``UntypedStorage._new_shared_cuda``
+- ComfyUI multi-rank recv: detach tensors for NCCL, pickle the skeleton,
+  attach them again (not the disagg extract path)
 """
 
 from __future__ import annotations
@@ -168,6 +171,92 @@ def _map_tree(value: Any, fn, copy_dataclasses: bool) -> Any:
         for field in dataclasses.fields(value):
             current = getattr(value, field.name, None)
             updated = _map_tree(current, fn, copy_dataclasses)
+            if updated is not current:
+                setattr(value, field.name, updated)
+        return value
+    return value
+
+
+_SEP = "\x1f"
+
+
+def detach_cuda_tensors(value: Any) -> tuple[Any, dict[str, torch.Tensor]]:
+    """Copy the tree, replace CUDA tensors with ``None``, collect them by path."""
+    tensors: dict[str, torch.Tensor] = {}
+    skeleton = _detach(value, "", tensors)
+    return skeleton, tensors
+
+
+def attach_cuda_tensors(
+    value: Any,
+    tensors: dict[str, torch.Tensor],
+    device: torch.device | None = None,
+) -> Any:
+    """Put detached CUDA tensors back onto the skeleton."""
+    if device is not None:
+        moved: dict[str, torch.Tensor] = {}
+        for key, tensor in tensors.items():
+            moved[key] = (
+                tensor
+                if tensor.device == device
+                else tensor.to(device, non_blocking=True)
+            )
+        tensors = moved
+    return _attach(value, "", tensors)
+
+
+def _join(prefix: str, part: str) -> str:
+    return part if not prefix else f"{prefix}{_SEP}{part}"
+
+
+def _detach(value: Any, prefix: str, tensors: dict[str, torch.Tensor]) -> Any:
+    if isinstance(value, torch.Tensor) and value.is_cuda:
+        tensors[prefix] = value
+        return None
+    if isinstance(value, list):
+        return [
+            _detach(item, _join(prefix, str(i)), tensors) for i, item in enumerate(value)
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _detach(item, _join(prefix, str(i)), tensors) for i, item in enumerate(value)
+        )
+    if isinstance(value, dict):
+        return {
+            key: _detach(item, _join(prefix, str(key)), tensors)
+            for key, item in value.items()
+        }
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        value = copy.copy(value)
+        for field in dataclasses.fields(value):
+            current = getattr(value, field.name, None)
+            updated = _detach(current, _join(prefix, field.name), tensors)
+            if updated is not current:
+                setattr(value, field.name, updated)
+        return value
+    return value
+
+
+def _attach(value: Any, prefix: str, tensors: dict[str, torch.Tensor]) -> Any:
+    if prefix in tensors:
+        return tensors[prefix]
+    if isinstance(value, list):
+        return [
+            _attach(item, _join(prefix, str(i)), tensors) for i, item in enumerate(value)
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _attach(item, _join(prefix, str(i)), tensors) for i, item in enumerate(value)
+        )
+    if isinstance(value, dict):
+        return {
+            key: _attach(item, _join(prefix, str(key)), tensors)
+            for key, item in value.items()
+        }
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        for field in dataclasses.fields(value):
+            current = getattr(value, field.name, None)
+            updated = _attach(current, _join(prefix, field.name), tensors)
             if updated is not current:
                 setattr(value, field.name, updated)
         return value
