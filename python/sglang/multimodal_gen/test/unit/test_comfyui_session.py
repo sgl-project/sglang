@@ -4,7 +4,10 @@ import torch
 
 from sglang.multimodal_gen.runtime.pipelines_core.comfyui_mode import (
     bind_comfyui_session,
+    get_run_state,
     release_comfyui_session,
+    release_run_state,
+    set_run_state,
 )
 
 
@@ -81,3 +84,42 @@ def test_session_restores_conditioning_on_later_steps() -> None:
     third.extra["comfyui_session_id"] = sid
     bind_comfyui_session(third)
     assert third.prompt_embeds == []
+
+
+def test_release_run_state_keeps_conditioning():
+    sid = "run-keep-cond"
+    first = _Req()
+    first.extra = {"comfyui_session_id": sid, "model_payload": {"audio_scale": 0.5}}
+    first.prompt_embeds = [torch.ones(2, 4)]
+    bind_comfyui_session(first)
+    set_run_state(first, {"branch": "alive"})
+    release_run_state(sid)
+    assert get_run_state(first) is None
+    second = _Req()
+    second.extra = {"comfyui_session_id": sid}
+    bind_comfyui_session(second)
+    assert torch.equal(second.prompt_embeds[0], first.prompt_embeds[0])
+    assert second.extra["model_payload"]["audio_scale"] == 0.5
+    release_comfyui_session(sid)
+
+
+def test_session_restores_extra_keys_on_later_steps() -> None:
+    sid = "run-extra"
+    payload = {"audio_scale": 0.5}
+    sigmas = torch.tensor([1.0, 0.5, 0.0])
+    first = _Req()
+    first.extra = {
+        "comfyui_session_id": sid,
+        "model_payload": payload,
+        "sample_sigmas": sigmas,
+    }
+    first.prompt_embeds = [torch.ones(3, 4)]
+    bind_comfyui_session(first)
+
+    second = _Req()
+    second.extra = {"comfyui_session_id": sid}
+    bind_comfyui_session(second)
+    assert second.extra["model_payload"] is payload
+    assert torch.equal(second.extra["sample_sigmas"], sigmas)
+    assert torch.equal(second.prompt_embeds[0], first.prompt_embeds[0])
+    release_comfyui_session(sid)

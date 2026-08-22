@@ -6,16 +6,16 @@ module covers both halves of that contract:
 
 - pipeline assembly: drop every module except the transformer, install a
   pass-through scheduler, keep only the stages needed for one forward
-- run cache: after the first step, text embeddings stay on the worker;
-  later steps send latents and the timestep
+- run cache: after the first step, text embeddings and packed extras stay
+  on the worker; later steps send latents and the timestep
 
-Single-file DiT loading lives in
+Single-file / GGUF DiT loading lives in
 ``sglang.multimodal_gen.runtime.loader.comfyui_checkpoints``.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_comfyui_passthrough import (
     ComfyUIPassThroughScheduler,
@@ -45,9 +45,11 @@ _CONDITIONING_FIELDS = (
     "negative_attention_mask",
     "prompt_embeds_mask",
     "negative_prompt_embeds_mask",
+    "sigmas",
 )
-
+_SESSION_SKIP_EXTRA = frozenset({"comfyui_session_id"})
 _SESSIONS: dict[str, dict[str, Any]] = {}
+_RUNS: dict[str, Any] = {}
 
 
 def is_comfyui_mode(server_args: ServerArgs) -> bool:
@@ -72,12 +74,22 @@ def initialize_comfyui_pipeline(
         and hasattr(vae_config, "post_init")
         and not hasattr(vae_config, "_post_init_called")
     ):
-        vae_config.post_init()
+        arch = getattr(vae_config, "arch_config", None)
+        if arch is not None and getattr(arch, "latents_mean", None) is None:
+            logger.info(
+                "Skipping VAE post_init in comfyui_mode; checkpoint has no VAE stats"
+            )
+        else:
+            vae_config.post_init()
 
 
 def create_comfyui_pipeline_stages(
     pipeline: ComposedPipelineBase, server_args: ServerArgs
 ) -> None:
+    if hasattr(pipeline, "create_comfyui_stages"):
+        pipeline.create_comfyui_stages(server_args)
+        return
+
     from sglang.multimodal_gen.runtime.pipelines_core.stages import (
         ComfyUILatentPreparationStage,
         DenoisingStage,
@@ -106,26 +118,82 @@ def bind_comfyui_session(req):
         return req
 
     cached = _SESSIONS.get(sid)
+    extra = dict(getattr(req, "extra", None) or {})
     if cached:
         for name, value in cached.items():
+            if name == "_extra":
+                continue
             current = getattr(req, name, None)
             if _is_empty(current):
                 setattr(req, name, value)
+        for key, value in (cached.get("_extra") or {}).items():
+            if _is_empty(extra.get(key)):
+                extra[key] = value
+        req.extra = extra
 
     snapshot = {}
     for name in _CONDITIONING_FIELDS:
         value = getattr(req, name, None)
         if not _is_empty(value):
             snapshot[name] = value
+    extra_snapshot = {}
+    extra = getattr(req, "extra", None) or {}
+    for key, value in extra.items():
+        if key in _SESSION_SKIP_EXTRA or _is_empty(value):
+            continue
+        extra_snapshot[key] = value
+    if extra_snapshot:
+        snapshot["_extra"] = extra_snapshot
     if snapshot:
         _SESSIONS[sid] = snapshot
     return req
 
 
+def get_run_state(req):
+    sid = session_id_from_req(req)
+    if sid:
+        return _RUNS.get(sid)
+    return None
+
+
+def set_run_state(req, state: Any) -> None:
+    sid = session_id_from_req(req)
+    if sid:
+        _RUNS[sid] = state
+
+
+def pop_run_state(req):
+    sid = session_id_from_req(req)
+    if sid:
+        return _RUNS.pop(sid, None)
+    return None
+
+
+def get_or_create_run_state(req, factory: Callable[[], Any]):
+    """Session-scoped opaque state. Created once per run."""
+    existing = get_run_state(req)
+    if existing is not None:
+        return existing
+    state = factory()
+    set_run_state(req, state)
+    return state
+
+
+def release_run_state(session_id: str | None) -> None:
+    """Drop per-run objects; keep cached conditioning for the next step."""
+    if session_id:
+        _RUNS.pop(session_id, None)
+
+
 def release_comfyui_session(session_id: str | None) -> None:
     if session_id:
         _SESSIONS.pop(session_id, None)
+        _RUNS.pop(session_id, None)
 
 
 def _is_empty(value) -> bool:
-    return value is None or value == [] or value == ()
+    if value is None:
+        return True
+    if isinstance(value, (list, tuple)):
+        return len(value) == 0
+    return False

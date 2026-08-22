@@ -697,8 +697,9 @@ class MiniMaxH3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
-        # Official safetensors interleave Q/K/V by head. Comfy and GGUF
-        # checkpoints already store [q_all, k_all, v_all].
+        # Official safetensors interleave Q/K/V by head. Comfy BF16, Comfy
+        # convrot int8, and GGUF already store [q_all, k_all, v_all].
+        skip_grouped_reorder = not getattr(arch, "qkv_checkpoint_grouped", True)
         checkpoint_qkv_is_native = quant_config is not None and (
             quant_config.get_name() == "gguf"
             or quant_config.checkpoint_uses_native_qkv_layout
@@ -706,7 +707,7 @@ class MiniMaxH3Attention(nn.Module):
         checkpoint_qkv_is_native = (
             checkpoint_qkv_is_native or arch.checkpoint_uses_diffusers_layout
         )
-        if not checkpoint_qkv_is_native:
+        if not skip_grouped_reorder and not checkpoint_qkv_is_native:
             self._install_qkv_weight_loader(arch)
         self.q_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         self.k_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)

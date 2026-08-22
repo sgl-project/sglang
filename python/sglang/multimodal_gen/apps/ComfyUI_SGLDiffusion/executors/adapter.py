@@ -67,6 +67,12 @@ class ComfyUIModelAdapter:
         for key, value in packed.extra_req.items():
             setattr(req, key, value)
 
+    def drop_cached_fields(self, packed: PackedForward) -> None:
+        packed.prompt_embeds = []
+        packed.prompt_seq_lens = None
+        packed.pooled_embeds = None
+        packed.extra_req.pop("image_latent", None)
+
 
 def get_adapter_class(model_type: str) -> type[ComfyUIModelAdapter]:
     if model_type not in _ADAPTERS:

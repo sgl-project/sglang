@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """ComfyUI single-file DiT checkpoints: spec, registry, and load.
 
-ComfyUI ships a DiT as one ``.safetensors`` file with no ``model_index.json``
-and its own parameter names. A spec supplies what the shared loader cannot
-infer: which DiT config to build, how names map onto SGLang, and how to
-reshape tensors whose layout differs. Per-model specs live in the sibling
-modules of this package.
+ComfyUI ships a DiT as one ``.safetensors`` (or a GGUF override) with no
+``model_index.json`` and its own parameter names. A spec supplies what the
+shared loader cannot infer: which DiT config to build, how names map onto
+SGLang, and how to reshape tensors whose layout differs. Per-model specs live
+in the sibling modules of this package.
 
 Everything else -- meta-device init, FSDP sharding, quantization, CPU
 offload -- goes through the regular transformer load path.
@@ -83,6 +83,7 @@ def _discover_checkpoint_specs() -> None:
     _SPECS_DISCOVERED = True
     from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (  # noqa: F401
         flux,
+        minimax_h3,
         qwen_image,
         zimage,
     )
@@ -103,6 +104,81 @@ def is_comfyui_single_file(model_path: str) -> bool:
     return os.path.isfile(model_path) and model_path.endswith(".safetensors")
 
 
+def _load_comfyui_gguf_transformer(
+    *,
+    model_cls,
+    dit_config,
+    gguf_file: str,
+    server_args: ServerArgs,
+    mapping: dict[str, Any],
+    spec,
+):
+    from sglang.multimodal_gen.runtime.layers.quantization.gguf import GGUFConfig
+    from sglang.multimodal_gen.runtime.loader.gguf_weights import (
+        gguf_weights_iterator,
+        read_gguf_tensor_meta,
+    )
+    from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
+        validate_minimax_h3_checkpoint_variant,
+    )
+    from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+        _validate_gguf_runtime_support,
+    )
+
+    _validate_gguf_runtime_support(server_args, "transformer")
+    if spec.dit_cls_name == "MiniMaxH3DiTModel":
+        validate_minimax_h3_checkpoint_variant(
+            [gguf_file], str(server_args.model_variant or "fl2va")
+        )
+
+    tensor_meta = read_gguf_tensor_meta(gguf_file)
+    curve = tensor_meta.get("adaln_t_table")
+    if curve is not None:
+        if curve.is_quantized or len(curve.logical_shape) != 2:
+            raise ValueError(
+                "MiniMax-H3 adaln_t_table must be an unquantized 2D tensor"
+            )
+        curve_grid, time_embed_dim = curve.logical_shape
+        if curve_grid < 2:
+            raise ValueError("MiniMax-H3 adaln_t_table needs at least two rows")
+        dit_config.arch_config.adaln_curve_grid = curve_grid
+        dit_config.arch_config.time_embed_dim = time_embed_dim
+
+    quant_config = GGUFConfig(gguf_file=gguf_file, tensor_meta=tensor_meta)
+    packed = getattr(model_cls, "packed_modules_mapping", None)
+    if packed:
+        quant_config.packed_modules_mapping = packed
+
+    logger.info("Loading %s from GGUF file %s", spec.dit_cls_name, gguf_file)
+    original_mapping = model_cls.param_names_mapping
+    model_cls.param_names_mapping = mapping
+    try:
+        return maybe_load_fsdp_model(
+            model_cls=model_cls,
+            init_params={
+                "config": dit_config,
+                "hf_config": {},
+                "quant_config": quant_config,
+            },
+            weight_dir_list=[],
+            device=get_local_torch_device(),
+            hsdp_replicate_dim=server_args.hsdp_replicate_dim,
+            hsdp_shard_dim=server_args.hsdp_shard_dim,
+            component_starts_on_cpu=server_args.should_start_component_on_cpu(
+                "transformer"
+            ),
+            pin_cpu_memory=server_args.pin_cpu_memory,
+            fsdp_inference=server_args.should_use_fsdp_for_component("transformer"),
+            param_dtype=None,
+            reduce_dtype=torch.float32,
+            output_dtype=None,
+            strict=False,
+            weights_iterator=gguf_weights_iterator(gguf_file, tensor_meta),
+        )
+    finally:
+        model_cls.param_names_mapping = original_mapping
+
+
 def load_comfyui_transformer(
     pipeline: ComposedPipelineBase,
     server_args: ServerArgs,
@@ -111,7 +187,8 @@ def load_comfyui_transformer(
     """Load the DiT from a single ComfyUI safetensors file.
 
     Reuses the shared FSDP-aware transformer load path; the spec only supplies
-    what the file itself cannot describe.
+    what the file itself cannot describe. A GGUF
+    ``--transformer-weights-path`` replaces only the DiT weights.
     """
     if loaded_modules is not None and "transformer" in loaded_modules:
         return {
@@ -141,46 +218,61 @@ def load_comfyui_transformer(
     param_dtype = resolve_precision(server_args, "dit", precision_attr="dit_precision")
     server_args.model_paths["transformer"] = os.path.dirname(model_path) or "."
 
-    # Only override the iterator when tensors need reshaping; leaving it None
-    # keeps the rank-local checkpoint fast path available.
-    weights_iterator = None
-    if spec.convert_weights is not None:
-        weights_iterator = spec.convert_weights(
-            safetensors_weights_iterator([model_path]), dit_config
-        )
-
-    logger.info(
-        "Loading %s from ComfyUI checkpoint %s, param_dtype: %s",
-        spec.dit_cls_name,
-        model_path,
-        param_dtype,
+    from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+        resolve_transformer_gguf_to_load,
     )
 
-    # Weight loading reads param_names_mapping off the model, which inherits it
-    # from the class, so the ComfyUI names have to be visible for the whole load.
-    original_mapping = model_cls.param_names_mapping
-    model_cls.param_names_mapping = mapping
-    try:
-        model = maybe_load_fsdp_model(
+    gguf_file = resolve_transformer_gguf_to_load(server_args, "transformer")
+    if gguf_file is not None:
+        model = _load_comfyui_gguf_transformer(
             model_cls=model_cls,
-            init_params={"config": dit_config, "hf_config": {}},
-            weight_dir_list=[model_path],
-            device=get_local_torch_device(),
-            hsdp_replicate_dim=server_args.hsdp_replicate_dim,
-            hsdp_shard_dim=server_args.hsdp_shard_dim,
-            component_starts_on_cpu=server_args.should_start_component_on_cpu(
-                "transformer"
-            ),
-            pin_cpu_memory=server_args.pin_cpu_memory,
-            fsdp_inference=server_args.should_use_fsdp_for_component("transformer"),
-            param_dtype=param_dtype,
-            reduce_dtype=torch.float32,
-            output_dtype=None,
-            strict=spec.strict,
-            weights_iterator=weights_iterator,
+            dit_config=dit_config,
+            gguf_file=gguf_file,
+            server_args=server_args,
+            mapping=mapping,
+            spec=spec,
         )
-    finally:
-        model_cls.param_names_mapping = original_mapping
+    else:
+        # Only override the iterator when tensors need reshaping; leaving it None
+        # keeps the rank-local checkpoint fast path available.
+        weights_iterator = None
+        if spec.convert_weights is not None:
+            weights_iterator = spec.convert_weights(
+                safetensors_weights_iterator([model_path]), dit_config
+            )
+
+        logger.info(
+            "Loading %s from ComfyUI checkpoint %s, param_dtype: %s",
+            spec.dit_cls_name,
+            model_path,
+            param_dtype,
+        )
+
+        # Weight loading reads param_names_mapping off the model, which inherits it
+        # from the class, so the ComfyUI names have to be visible for the whole load.
+        original_mapping = model_cls.param_names_mapping
+        model_cls.param_names_mapping = mapping
+        try:
+            model = maybe_load_fsdp_model(
+                model_cls=model_cls,
+                init_params={"config": dit_config, "hf_config": {}},
+                weight_dir_list=[model_path],
+                device=get_local_torch_device(),
+                hsdp_replicate_dim=server_args.hsdp_replicate_dim,
+                hsdp_shard_dim=server_args.hsdp_shard_dim,
+                component_starts_on_cpu=server_args.should_start_component_on_cpu(
+                    "transformer"
+                ),
+                pin_cpu_memory=server_args.pin_cpu_memory,
+                fsdp_inference=server_args.should_use_fsdp_for_component("transformer"),
+                param_dtype=param_dtype,
+                reduce_dtype=torch.float32,
+                output_dtype=None,
+                strict=spec.strict,
+                weights_iterator=weights_iterator,
+            )
+        finally:
+            model_cls.param_names_mapping = original_mapping
 
     for param in model.parameters():
         param.requires_grad = False

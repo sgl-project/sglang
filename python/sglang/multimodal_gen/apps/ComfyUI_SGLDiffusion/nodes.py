@@ -10,6 +10,16 @@ import folder_paths
 import torch
 
 from .core import SGLDiffusionGenerator, SGLDiffusionServerAPI
+
+
+def _enable_gguf_in_diffusion_models() -> None:
+    """Let SGLDUNETLoader list ``.gguf`` DiTs. Quantization lives in the file."""
+    entry = folder_paths.folder_names_and_paths.get("diffusion_models")
+    if entry is not None and len(entry) >= 2 and isinstance(entry[1], set):
+        entry[1].add(".gguf")
+
+
+_enable_gguf_in_diffusion_models()
 from .utils import (
     convert_b64_to_tensor_image,
     convert_video_to_comfy_video,
@@ -25,7 +35,14 @@ class SGLDOptions:
             "required": {},
             "optional": {
                 "model_type": (
-                    ["auto-detect", "qwen_image", "qwen_image_edit", "flux", "lumina2"],
+                    [
+                        "auto-detect",
+                        "qwen_image",
+                        "qwen_image_edit",
+                        "flux",
+                        "lumina2",
+                        "minimax_h3",
+                    ],
                     {"default": "auto-detect"},
                 ),
                 "enable_torch_compile": (
@@ -61,6 +78,25 @@ class SGLDOptions:
                     "STRING",
                     {"default": ""},
                 ),
+                "dit_layerwise_offload": (
+                    "BOOLEAN",
+                    {"default": False},
+                ),
+                "enable_cache_dit": (
+                    "BOOLEAN",
+                    {"default": False},
+                ),
+                "quantization": (
+                    "STRING",
+                    {"default": ""},
+                ),
+                "transformer_weights_path": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                    },
+                ),
             },
         }
 
@@ -82,6 +118,10 @@ class SGLDOptions:
         dp_degree: int = 1,
         enable_cfg_parallel: bool = False,
         attention_backend: str = "",
+        dit_layerwise_offload: bool = False,
+        enable_cache_dit: bool = False,
+        quantization: str = "",
+        transformer_weights_path: str = "",
     ):
         """
         Build a dictionary of SGLang Diffusion runtime options.
@@ -107,7 +147,18 @@ class SGLDOptions:
             "dp_size": dp_size,
             "enable_cfg_parallel": enable_cfg_parallel,
             "attention_backend": attention_backend,
+            "dit_layerwise_offload": dit_layerwise_offload,
         }
+        if enable_cache_dit:
+            options["enable_cache_dit"] = True
+        quantization = (quantization or "").strip()
+        if quantization:
+            options["quantization"] = quantization
+        transformer_weights_path = (transformer_weights_path or "").strip()
+        if transformer_weights_path:
+            # Same selector as `sglang serve --transformer-weights-path`:
+            # local .gguf, owner/repo/path/file.gguf, or owner/repo:QUANT.
+            options["transformer_weights_path"] = transformer_weights_path
 
         # Strip None to keep payload clean
         options = {k: v for k, v in options.items() if v is not None}

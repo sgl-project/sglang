@@ -16,6 +16,87 @@ from comfy.utils import (
 
 logger = logging.getLogger(__name__)
 
+
+class _HeaderTensor:
+    """Shape-only stand-in so detect_unet_config does not load 66GB weights."""
+
+    def __init__(self, shape):
+        import torch
+
+        self.shape = torch.Size(shape)
+
+    def numel(self):
+        n = 1
+        for dim in self.shape:
+            n *= int(dim)
+        return n
+
+    nelement = numel
+
+
+def _looks_like_gguf(path: str) -> bool:
+    if not path:
+        return False
+    return path.lower().endswith(".gguf") or (
+        ":" in path and path.count("/") == 1 and not os.path.isabs(path)
+    )
+
+
+def _h3_detect_companion(gguf_ref: str) -> str:
+    """ComfyUI detect needs H3 safetensors keys; GGUF only overrides the DiT."""
+    name = os.path.basename(gguf_ref).lower()
+    prefer = []
+    if "ref2va" in name:
+        prefer.append("minimax_h3_ref2va_bf16.safetensors")
+    prefer.extend(
+        [
+            "minimax_h3_fl2va_bf16.safetensors",
+            "minimax_h3_ref2va_bf16.safetensors",
+        ]
+    )
+    folders = [os.path.dirname(os.path.abspath(gguf_ref))] if os.path.dirname(gguf_ref) else []
+    try:
+        import folder_paths
+
+        folders.extend(folder_paths.get_folder_paths("diffusion_models"))
+    except Exception:
+        pass
+    seen: set[str] = set()
+    for folder in folders:
+        if not folder:
+            continue
+        for candidate in prefer:
+            path = os.path.join(folder, candidate)
+            if path in seen:
+                continue
+            seen.add(path)
+            if os.path.isfile(path):
+                return path
+    raise ValueError(
+        "GGUF transformer needs a MiniMax-H3 BF16 safetensors in "
+        "models/diffusion_models for ComfyUI architecture detect "
+        f"(looked for {prefer}). Keep --model-path / unet_name on the "
+        "BF16 file and pass the GGUF via transformer_weights_path."
+    )
+
+
+def _load_state_dict_for_detection(model_path: str):
+    if _looks_like_gguf(model_path):
+        raise ValueError(
+            f"Cannot detect architecture from GGUF {model_path!r}. "
+            "Use a MiniMax-H3 BF16 safetensors for detect."
+        )
+    if model_path.endswith(".safetensors"):
+        from safetensors import safe_open
+
+        sd = {}
+        with safe_open(model_path, framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                sd[key] = _HeaderTensor(handle.get_slice(key).get_shape())
+        return sd
+    return load_torch_file(model_path)
+
+
 try:
     from sglang.multimodal_gen import DiffGenerator
 except ImportError:
@@ -25,6 +106,7 @@ except ImportError:
 
 from ..executors import (
     FluxExecutor,
+    MiniMaxH3Executor,
     QwenImageEditExecutor,
     QwenImageExecutor,
     ZImageExecutor,
@@ -36,6 +118,7 @@ _EXECUTOR_CLASSES = (
     ZImageExecutor,
     QwenImageExecutor,
     QwenImageEditExecutor,
+    MiniMaxH3Executor,
 )
 
 
@@ -149,14 +232,16 @@ class SGLDiffusionGenerator:
             self.model_path = None
             self.generator = None
             self.executor = None
+            self._patcher = None
 
     def get_comfyui_model(self, model_path: str, model_options: dict = None):
         """Get ComfyUI model from model path."""
         if model_options is None:
             model_options = {}
         dtype = model_options.get("dtype", None)
-        # Allow loading unets from checkpoint files
-        sd = load_torch_file(model_path)
+        # Header-only read: H3 BF16 is ~66GB and we only need keys + shapes
+        # for detect_unet_config. SGLD loads the real weights later.
+        sd = _load_state_dict_for_detection(model_path)
         diffusion_model_prefix = model_detection.unet_prefix_from_state_dict(sd)
         temp_sd = state_dict_prefix_replace(
             sd, {diffusion_model_prefix: ""}, filter_keys=True
@@ -212,47 +297,68 @@ class SGLDiffusionGenerator:
         self, model_path: str, model_options: dict = None, sgld_options: dict = None
     ):
         """Load model and return model patcher."""
+        sgld_options = dict(sgld_options) if sgld_options else {}
+        model_options = dict(model_options) if model_options else {}
+        plugin_flags = {}
+        if "enable_cache_dit" in sgld_options:
+            plugin_flags["enable_cache_dit"] = sgld_options.pop("enable_cache_dit")
+        set_model_type = sgld_options.pop("model_type", None)
+        override = (sgld_options.get("transformer_weights_path") or "").strip()
+        if override:
+            sgld_options["transformer_weights_path"] = override
+        elif _looks_like_gguf(model_path):
+            sgld_options["transformer_weights_path"] = model_path
+        else:
+            sgld_options.pop("transformer_weights_path", None)
+        detect_path = model_path
+        if _looks_like_gguf(model_path):
+            detect_path = _h3_detect_companion(
+                sgld_options["transformer_weights_path"]
+            )
         gather_options = {
-            "model_path": model_path,
+            "model_path": detect_path,
             "model_options": model_options,
             "sgld_options": sgld_options,
+            "set_model_type": set_model_type,
         }
         if (
             self.last_options is not None
             and self.last_options == gather_options
             and self.generator is not None
+            and getattr(self, "_patcher", None) is not None
+            and self.executor is not None
         ):
-            return self.generator
-        else:
-            self.close_generator()
+            self.executor.enable_cache_dit = plugin_flags.get("enable_cache_dit")
+            return self._patcher
 
+        self.close_generator()
         self.last_options = gather_options
-        self.model_path = model_path
+        self.model_path = detect_path
 
         comfyui_model, model_config, model_type = self.get_comfyui_model(
-            model_path, model_options
+            detect_path, model_options
         )
         if model_type is None or model_type not in self.pipeline_class_dict:
             raise ValueError(f"Unsupported model type: {model_type}")
-
-        set_model_type = sgld_options.pop("model_type", None) if sgld_options else None
         if set_model_type is not None and set_model_type in self.pipeline_class_dict:
             model_type = set_model_type
 
         pipeline_class_name = self.pipeline_class_dict[model_type]
         self.generator = self.init_generator(
-            model_path, pipeline_class_name, sgld_options
+            detect_path, pipeline_class_name, sgld_options
         )
 
         executor_class = self.executor_class_dict[model_type]
         self.executor = executor_class(
-            self.generator, model_path, comfyui_model, model_config
+            self.generator, detect_path, comfyui_model, model_config
         )
+        self.executor.enable_cache_dit = plugin_flags.get("enable_cache_dit")
         comfyui_model.diffusion_model = self.executor
 
         load_device = model_management.get_torch_device()
         offload_device = model_management.unet_offload_device()
 
-        return SGLDModelPatcher(
+        self._patcher = SGLDModelPatcher(
             comfyui_model, load_device, offload_device, model_type=model_type
         )
+        return self._patcher
