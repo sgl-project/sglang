@@ -3009,6 +3009,7 @@ class MultiHeadCrossAttention(nn.Module):
         self.attn = LocalAttention(
             num_heads=num_heads,
             head_size=self.head_dim,
+            is_cross_attention=True,
         )
 
     def forward(
