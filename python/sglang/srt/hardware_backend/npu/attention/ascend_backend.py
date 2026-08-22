@@ -443,7 +443,14 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        seq_lens_max = forward_batch.seq_lens.max()
+        # dLLM has no overlap schedule, so these two D2H syncs are exposed as
+        # device idle. Take them from the host mirrors instead. Gated on dLLM so
+        # the decode/prefill path stays byte-identical.
+        is_dllm = forward_batch.forward_mode.is_dllm_extend()
+        if is_dllm:
+            seq_lens_max = int(forward_batch.seq_lens_cpu.max())
+        else:
+            seq_lens_max = forward_batch.seq_lens.max()
         if forward_batch.forward_mode.is_target_verify():
             spec_tokens_per_req = int(forward_batch.spec_info.draft_token_num)
             # Overlap scheduling can publish the CPU sequence length one step
@@ -480,9 +487,14 @@ class AscendAttnBackend(AttentionBackend):
             )
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
-            self.forward_metadata.extend_seq_lens_cpu_int = (
-                forward_batch.extend_seq_lens.cpu().int()
-            )
+            if is_dllm and forward_batch.extend_seq_lens_cpu is not None:
+                self.forward_metadata.extend_seq_lens_cpu_int = torch.tensor(
+                    forward_batch.extend_seq_lens_cpu, dtype=torch.int32
+                )
+            else:
+                self.forward_metadata.extend_seq_lens_cpu_int = (
+                    forward_batch.extend_seq_lens.cpu().int()
+                )
         if forward_batch.seq_lens is not None:
             self.forward_metadata.seq_lens = forward_batch.seq_lens.int()
         else:
