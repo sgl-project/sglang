@@ -329,7 +329,7 @@ def _build_check_entries(
             qw = quantized_set[name]
             yield CheckEntry(
                 name,
-                True,
+                name not in skip_compare_names,
                 qw.comparable_cls(
                     tensor, raw[qw.scale_name], is_shuffled=qw.is_shuffled
                 ),
