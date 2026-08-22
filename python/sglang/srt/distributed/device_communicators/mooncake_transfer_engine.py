@@ -13,8 +13,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Module-level shared engine instance, set by init_mooncake_transfer_engine().
-_mooncake_transfer_engine: Optional[MooncakeTransferEngine] = None
+# Per-rank engine cache, keyed by gpu_id, so each rank can bind its own IB device.
+_mooncake_transfer_engines: Dict[int, "MooncakeTransferEngine"] = {}
 
 
 def parse_ib_device_config(
@@ -282,24 +282,24 @@ def init_mooncake_transfer_engine(
     gpu_id: Optional[int] = None,
     ib_device: Optional[str] = None,
 ) -> MooncakeTransferEngine:
-    """
-    Initialize the shared MooncakeTransferEngine. Note: if already
-    initialized with the same (hostname, gpu_id, ib_device), returns existing
-    instance. Call from parallel_state when model parallel is set up and
-    mooncake transfer is needed.
-    """
-    global _mooncake_transfer_engine
-    if _mooncake_transfer_engine is not None:
-        return _mooncake_transfer_engine
-    _mooncake_transfer_engine = MooncakeTransferEngine(
+    """Initialize (or return cached) MooncakeTransferEngine for ``gpu_id``."""
+    rank = gpu_id if gpu_id is not None else 0
+    engine = _mooncake_transfer_engines.get(rank)
+    if engine is not None:
+        return engine
+    engine = MooncakeTransferEngine(
         hostname=hostname, gpu_id=gpu_id, ib_device=ib_device
     )
-    return _mooncake_transfer_engine
+    _mooncake_transfer_engines[rank] = engine
+    return engine
 
 
-def get_mooncake_transfer_engine() -> Optional[MooncakeTransferEngine]:
-    """Return the shared MooncakeTransferEngine if initialized, else None."""
-    return _mooncake_transfer_engine
+def get_mooncake_transfer_engine(
+    gpu_id: Optional[int] = None,
+) -> Optional[MooncakeTransferEngine]:
+    """Return the per-rank engine for ``gpu_id``; ``None`` falls back to rank 0."""
+    rank = gpu_id if gpu_id is not None else 0
+    return _mooncake_transfer_engines.get(rank)
 
 
 def maybe_init_shared_mooncake_transfer_engine(
