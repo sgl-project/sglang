@@ -194,10 +194,12 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
 
         if self.quant_config.group_size != -1:
             scales_size13 = hidden_size // self.quant_config.group_size
+            # Act-order needs the full down-projection scale table. Without
+            # act-order, each TP rank stores only its local K groups.
             if self.quant_config.desc_act:
-                w2_scales_size = intermediate_size_per_partition
-            else:
                 w2_scales_size = intermediate_size_per_partition * layer.moe_tp_size
+            else:
+                w2_scales_size = intermediate_size_per_partition
             scales_size2 = w2_scales_size // self.quant_config.group_size
             strategy = FusedMoeWeightScaleSupported.GROUP.value
         else:
@@ -246,9 +248,7 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
         set_weight_attrs(w13_scales, extra_weight_attrs)
 
         w2_scales = torch.nn.Parameter(
-            torch.empty(
-                num_experts, scales_size2, hidden_size, dtype=params_dtype
-            ),
+            torch.empty(num_experts, scales_size2, hidden_size, dtype=params_dtype),
             requires_grad=False,
         )
         layer.register_parameter("w2_scales", w2_scales)
