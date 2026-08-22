@@ -10,6 +10,7 @@ import torch
 from huggingface_hub import snapshot_download
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -141,6 +142,14 @@ class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBas
             group_size=group_size,  # type: ignore[reportArgumentType]
             exclude_modules=exclude_modules,  # type: ignore[reportArgumentType]
             packed_modules_mapping=packed_modules_mapping,
+            # Inkling's validated NVFP4 serving recipe uses per-token
+            # activation scaling. Preserve the upstream environment variable
+            # as an explicit override, including `0` for static scaling.
+            use_per_token_activation=(
+                None
+                if envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.is_set()
+                else True
+            ),
         )
         if group_size != 16:
             raise ValueError("Inkling only supports group size 16 for NVFP4")
