@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import functools
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -73,6 +74,7 @@ from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
+    compute_ragged_extend_lengths,
     compute_target_verify_graph_key,
     compute_uniform_extend_lengths,
     read_ragged_verify_mode,
@@ -190,6 +192,25 @@ class DSV4AttnMetadata:
     c128_page_indices: Optional[torch.Tensor] = None
     c128_topk_lengths_clamp1: Optional[torch.Tensor] = None
 
+    # trtllm decode: per-ratio combined sparse tables [num_tokens, 128 + w]
+    # and lens [num_tokens]. Layer-invariant content (SWA columns, the whole
+    # c128 table, the c0 lens) is written once per step by
+    # init_trtllm_sparse_buffers; the per-layer forward only writes the c4
+    # tail + lens (indexer top-k). c0 layers pass swa_page_indices itself as
+    # the table. None for prefill-style metadata and when trtllm is off.
+    trtllm_swa_lens: Optional[torch.Tensor] = None
+    trtllm_c4_indices: Optional[torch.Tensor] = None
+    trtllm_c4_lens: Optional[torch.Tensor] = None
+    trtllm_c128_indices: Optional[torch.Tensor] = None
+    trtllm_c128_lens: Optional[torch.Tensor] = None
+    # trtllm prefill: per-chunk caches built lazily by _forward_trtllm_prefill
+    # (prefill runs eagerly). qmeta = (cum_seq_lens_q, max_q_len, sum_q,
+    # seq_lens_int32); c128 = (table, lens).
+    trtllm_prefill_qmeta: Optional[tuple] = None
+    trtllm_prefill_swa_lens: Optional[torch.Tensor] = None
+    trtllm_prefill_c4_indices: Optional[torch.Tensor] = None
+    trtllm_prefill_c128: Optional[tuple] = None
+
     c1_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
     c4_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
     c128_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
@@ -233,6 +254,11 @@ class DSV4AttnMetadata:
                 "c4_sparse_topk_lengths",
                 "c4_sparse_page_indices",
                 "c4_sparse_raw_indices",
+                "trtllm_swa_lens",
+                "trtllm_c4_indices",
+                "trtllm_c4_lens",
+                "trtllm_c128_indices",
+                "trtllm_c128_lens",
             ],
             assign_fields=[
                 # Recomputed by the recorded init_forward_metadata_in_graph op
@@ -241,6 +267,13 @@ class DSV4AttnMetadata:
                 "c1_flashmla_metadata",
                 "c4_flashmla_metadata",
                 "c128_flashmla_metadata",
+                # Built lazily by the eager _forward_trtllm_prefill, so they
+                # are None on every metadata that reaches a graph replay; two
+                # of them are tuples, which content-copy cannot handle.
+                "trtllm_prefill_qmeta",
+                "trtllm_prefill_swa_lens",
+                "trtllm_prefill_c4_indices",
+                "trtllm_prefill_c128",
             ],
         )
 
@@ -258,6 +291,14 @@ class DSV4AttnMetadata:
             "c4_topk_lengths_raw",
             "c4_topk_lengths_clamp1",
             "c4_sparse_topk_lengths",
+            # trtllm tables: static parts are rebuilt per step by the host
+            # metadata; content-copy keeps the captured tensor objects alive
+            # (the c4 tail is refilled in place by the per-layer forward).
+            "trtllm_swa_lens",
+            "trtllm_c4_indices",
+            "trtllm_c4_lens",
+            "trtllm_c128_indices",
+            "trtllm_c128_lens",
         ]
         reference_assign_fields = [
             "page_table",
@@ -268,6 +309,14 @@ class DSV4AttnMetadata:
             "c1_flashmla_metadata",
             "c4_flashmla_metadata",
             "c128_flashmla_metadata",
+            # Per-chunk lazy caches built by the eager _forward_trtllm_prefill;
+            # MUST be reset from the fresh metadata (None) on every breakable
+            # replay refresh, or a reused metadata object serves stale
+            # sum_q/tables to a different batch shape.
+            "trtllm_prefill_qmeta",
+            "trtllm_prefill_swa_lens",
+            "trtllm_prefill_c4_indices",
+            "trtllm_prefill_c128",
         ]
         # Keep graph-captured tensor objects alive for fields that captured
         # kernels read by address; overwrite only their contents.
@@ -396,6 +445,66 @@ class DSV4AttnMetadata:
         self.c4_flashmla_metadata = _create_flashmla_metadata()
         self.c128_flashmla_metadata = _create_flashmla_metadata()
 
+    def init_trtllm_sparse_buffers(self) -> None:
+        """Build the trtllm per-ratio combined sparse tables (decode).
+
+        Kernel contract per row: columns [0:128) SWA physical token indices,
+        [128:) compressed-tier indices, -1 invalid, capacity % 4 == 0; lens
+        include the 128 SWA slots. Everything layer-invariant is written here,
+        once per step: the SWA columns of both tables, the ENTIRE c128 table
+        and lens (its page list is metadata-level), and the constant SWA-only
+        lens (c0 layers pass swa_page_indices itself as the table). The
+        per-layer decode forward only writes the c4 tail + lens.
+        """
+
+        num_tokens = self.seq_lens_casual.shape[0]
+        assert self.swa_page_indices.shape == (num_tokens, SWA_WINDOW)
+
+        # TILE OVERRUN GUARD: the trtllm-gen VarSeq kernel processes query
+        # rows in 64-token tiles and reads per-token table rows up to the
+        # tile boundary, i.e. up to 63 rows past num_tokens. Allocate every
+        # per-token tensor it reads as a 64-row-aligned parent filled with
+        # INERT values (-1 indices, SWA-only lens, seq_len 1) and keep
+        # [:num_tokens] views, so over-reads land in mapped inert memory
+        # instead of past the allocation (observed as segment-boundary MMU
+        # faults / silent garbage depending on allocator layout).
+        n_pad = (num_tokens + 63) // 64 * 64
+
+        def _tile_padded(fill, src=None, width=None):
+            shape = (n_pad,) if width is None else (n_pad, width)
+            buf = torch.full(shape, fill, **self.cuda_int32_kwargs)
+            if src is not None:
+                buf[:num_tokens].copy_(src)
+            return buf[:num_tokens]
+
+        if n_pad != num_tokens:
+            self.seq_lens_casual = _tile_padded(1, self.seq_lens_casual)
+            self.swa_page_indices = _tile_padded(
+                -1, self.swa_page_indices, width=SWA_WINDOW
+            )
+        self.trtllm_swa_lens = _tile_padded(SWA_WINDOW)
+        if self.c4_sparse_page_indices is not None:
+            w4 = self.c4_sparse_page_indices.shape[-1]
+            assert w4 % 4 == 0, f"{w4=}"
+            # The c4 tail + lens are per-layer values written by the decode
+            # forward. Initialize them INERT (-1 = invalid index, lens =
+            # SWA-only) rather than torch.empty: any row the per-layer fill
+            # does not cover must not hand the kernel allocator garbage as
+            # indices/lengths.
+            self.trtllm_c4_indices = _tile_padded(-1, width=SWA_WINDOW + w4)
+            self.trtllm_c4_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
+            self.trtllm_c4_lens = _tile_padded(SWA_WINDOW)
+        if self.c128_page_indices is not None:
+            w128 = self.c128_page_indices.shape[-1]
+            assert w128 % 4 == 0, f"{w128=}"
+            self.trtllm_c128_indices = _tile_padded(-1, width=SWA_WINDOW + w128)
+            self.trtllm_c128_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
+            self.trtllm_c128_indices[:, SWA_WINDOW:].copy_(self.c128_page_indices)
+            self.trtllm_c128_lens = _tile_padded(
+                SWA_WINDOW,
+                (self.c128_topk_lengths_clamp1 + SWA_WINDOW).to(torch.int32),
+            )
+
 
 @dataclass
 class DSV4Metadata:
@@ -507,6 +616,9 @@ class DeepseekV4AttnBackend(
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
     supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False
+    # True on DeepseekV4TrtllmAttnBackend (deepseek_v4_trtllm_backend.py),
+    # which dispatches attention through the trtllm-gen sparse MLA kernel.
+    trtllm_attn: bool = False
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Breakable-graph verify rereads shared state across segments.
@@ -605,14 +717,33 @@ class DeepseekV4AttnBackend(
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
         spec_alg = model_runner.spec_algorithm
+        self._prep_in_cuda_graph: bool = self._compute_prep_in_cuda_graph(model_runner)
         self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
-            not _is_cuda or self.online_c128_mtp.enabled()
+            not _is_cuda
+            or not self._prep_in_cuda_graph
+            or self.online_c128_mtp.enabled()
         )
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
+        # Pinned compress-plan staging buffers whose owning metadata was
+        # dropped by replay_cuda_graph_metadata_from (see
+        # _keep_plan_staging_alive).
+        self._plan_staging_keepalive: deque = deque(maxlen=8)
         self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
+
+        # Pins the metadata built inside each CUDA-graph capture; see the
+        # comment in init_forward_metadata_in_graph.
+        self._captured_full_metadata_refs: List[DSV4Metadata] = []
+
+    def _compute_prep_in_cuda_graph(self, model_runner: ModelRunner) -> bool:
+        """Whether attention metadata is prepared inside CUDA-graph capture.
+
+        The trtllm subclass (deepseek_v4_trtllm_backend.py) overrides this to
+        prepare on the host for trtllm + speculative + DP attention.
+        """
+        return True
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -714,10 +845,38 @@ class DeepseekV4AttnBackend(
             req_pool_indices.shape[0] == seq_lens.shape[0] == out_cache_loc.shape[0]
         ), f"{req_pool_indices.shape=} {seq_lens.shape=} {out_cache_loc.shape=}"
 
-        return DSV4RawDecodeMetadata(
+        if self._prep_in_cuda_graph:
+            return DSV4RawDecodeMetadata(
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                out_cache_loc=out_cache_loc,
+            )
+
+        core_attn_metadata = self.make_core_attn_metadata(
+            req_to_token=self.req_to_token,
+            req_pool_indices_repeated=req_pool_indices,
+            seq_lens_casual=seq_lens,
+            max_seq_len=max_seq_len,
+            out_loc=out_cache_loc,
+            need_compress=True,
+        )
+
+        indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
+
+        create = functools.partial(
+            create_paged_compressor_data,
+            is_prefill=False,
+            token_to_kv_pool=self.token_to_kv_pool,
+            req_to_token=self.req_to_token,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            out_cache_loc=out_cache_loc,
+        )
+
+        return DSV4Metadata(
+            core_attn_metadata,
+            indexer_metadata,
+            c4_compress_metadata=create(compress_ratio=4),
+            c128_compress_metadata=create(compress_ratio=128),
         )
 
     def init_forward_metadata_prefill(
@@ -836,44 +995,108 @@ class DeepseekV4AttnBackend(
         online_c128_state_slot_offset: int = 0,
         ragged_layout: Optional[RaggedVerifyLayout] = None,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
-        assert out_cache_loc is not None
-        bs = len(seq_lens)
-        if self.needs_cpu_seq_lens:
-            assert seq_lens_cpu is not None
-            seq_lens_cpu_list = seq_lens_cpu.tolist()
-        else:
-            seq_lens_cpu_list = None
-        if ragged_layout is None:
-            self.extend_seq_lens_buffer[:bs].fill_(self.speculative_num_draft_tokens)
-            extend_seq_lens = self.extend_seq_lens_buffer[:bs]
-            extend_start_loc = None
-            verify_lens = None
-            total_verify_tokens = self.speculative_num_draft_tokens * bs
-        else:
-            self.extend_seq_lens_buffer[:bs].copy_(ragged_layout.verify_lens)
-            self.extend_start_loc_buffer[:bs].copy_(ragged_layout.extend_start_loc)
-            extend_seq_lens = self.extend_seq_lens_buffer[:bs]
-            extend_start_loc = self.extend_start_loc_buffer[:bs]
-            verify_lens = self.extend_seq_lens_buffer[:bs]
-            total_verify_tokens = ragged_layout.graph_num_tokens
+        if self._prep_in_cuda_graph:
+            assert out_cache_loc is not None
+            bs = len(seq_lens)
+            if self.needs_cpu_seq_lens:
+                assert seq_lens_cpu is not None
+                seq_lens_cpu_list = seq_lens_cpu.tolist()
+            else:
+                seq_lens_cpu_list = None
+            if ragged_layout is None:
+                self.extend_seq_lens_buffer[:bs].fill_(
+                    self.speculative_num_draft_tokens
+                )
+                extend_seq_lens = self.extend_seq_lens_buffer[:bs]
+                extend_start_loc = None
+                verify_lens = None
+                total_verify_tokens = self.speculative_num_draft_tokens * bs
+            else:
+                self.extend_seq_lens_buffer[:bs].copy_(ragged_layout.verify_lens)
+                self.extend_start_loc_buffer[:bs].copy_(ragged_layout.extend_start_loc)
+                extend_seq_lens = self.extend_seq_lens_buffer[:bs]
+                extend_start_loc = self.extend_start_loc_buffer[:bs]
+                verify_lens = self.extend_seq_lens_buffer[:bs]
+                total_verify_tokens = ragged_layout.graph_num_tokens
 
-        return DSV4RawVerifyMetadata(
+            return DSV4RawVerifyMetadata(
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                out_cache_loc=out_cache_loc,
+                extend_seq_lens=extend_seq_lens,
+                seq_lens_cpu=seq_lens_cpu_list,
+                c128_compress_metadata=self._make_target_verify_c128_metadata(
+                    req_pool_indices,
+                    seq_lens,
+                    seq_lens_cpu_list,
+                    extend_seq_lens,
+                    use_prefill_cuda_graph,
+                    online_c128_state_slot_offset,
+                ),
+                extend_start_loc=extend_start_loc,
+                verify_lens=verify_lens,
+                total_verify_tokens=total_verify_tokens,
+            )
+        else:
+            seq_lens_cpu_list = (
+                seq_lens_cpu.tolist() if seq_lens_cpu is not None else seq_lens.tolist()
+            )
+            return self.init_forward_metadata_target_verify_old(
+                max_seq_len=max_seq_len,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu_list,
+                out_cache_loc=out_cache_loc,
+                use_prefill_cuda_graph=use_prefill_cuda_graph,
+                online_c128_state_slot_offset=online_c128_state_slot_offset,
+                ragged_layout=ragged_layout,
+            )
+
+    def init_forward_metadata_target_verify_old(
+        self,
+        max_seq_len: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: Optional[List[int]] = None,
+        out_cache_loc: Optional[torch.Tensor] = None,
+        use_prefill_cuda_graph: bool = False,
+        online_c128_state_slot_offset: int = 0,
+        ragged_layout: Optional[RaggedVerifyLayout] = None,
+    ) -> DSV4Metadata:
+        if ragged_layout is None:
+            lengths = compute_uniform_extend_lengths(
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                extend_len=self.speculative_num_draft_tokens,
+            )
+            extend_seq_lens = self._move_to_device(lengths.extend_seq_lens_cpu)
+        else:
+            lengths = compute_ragged_extend_lengths(
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                ragged_layout=ragged_layout,
+            )
+            extend_seq_lens = ragged_layout.verify_lens
+        seq_lens = lengths.seq_lens_extended
+        seq_lens_cpu = lengths.seq_lens_cpu_extended
+        extend_seq_lens_cpu = lengths.extend_seq_lens_cpu
+        num_tokens = lengths.num_tokens
+        extend_start_loc = lengths.extend_start_loc
+        if out_cache_loc is None:
+            out_cache_loc = seq_lens.new_zeros(num_tokens)
+        return self.init_forward_metadata_prefill(
+            max_seq_len=max_seq_len,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
             out_cache_loc=out_cache_loc,
+            num_tokens=num_tokens,
             extend_seq_lens=extend_seq_lens,
-            seq_lens_cpu=seq_lens_cpu_list,
-            c128_compress_metadata=self._make_target_verify_c128_metadata(
-                req_pool_indices,
-                seq_lens,
-                seq_lens_cpu_list,
-                extend_seq_lens,
-                use_prefill_cuda_graph,
-                online_c128_state_slot_offset,
-            ),
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
             extend_start_loc=extend_start_loc,
-            verify_lens=verify_lens,
-            total_verify_tokens=total_verify_tokens,
+            need_compress=True,
+            use_prefill_cuda_graph=use_prefill_cuda_graph,
+            online_c128_state_slot_offset=online_c128_state_slot_offset,
         )
 
     def init_forward_metadata_dspark_draft_block(
@@ -1043,6 +1266,12 @@ class DeepseekV4AttnBackend(
                 req_pool_indices=req_pool_indices,
             )
         )
+        # DP-padded rows carry the graph seq-len fill value (1); expanding a
+        # 1-length row over num_tokens_per_req query tokens yields 0 (or
+        # negative) per-token lens for its leading tokens. Keep the >=1 floor
+        # kernels assume (same convention as *_topk_lengths_clamp1) -- real
+        # rows are unaffected (their first token's KV length is >= 1).
+        seq_lens_casual = seq_lens_casual.clamp(min=1)
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
@@ -1086,8 +1315,8 @@ class DeepseekV4AttnBackend(
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         # Upgrade Raw->Full so the c4/c128 compress + core_attn + indexer
-        # materialization is recorded inside the cuda graph; a no-op (Full
-        # already) when PREP_IN_CUDA_GRAPH=0.
+        # materialization is recorded inside the cuda graph; this is a no-op
+        # when the trtllm+MTP+DP exception prepared Full metadata on the host.
         if isinstance(self.forward_metadata, DSV4RawVerifyMetadata):
             self.forward_metadata = self.make_forward_metadata_from_raw_verify(
                 raw_metadata=self.forward_metadata,
@@ -1097,6 +1326,21 @@ class DeepseekV4AttnBackend(
             self.forward_metadata = self.make_forward_metadata_from_raw_decode(
                 raw_metadata=self.forward_metadata,
             )
+        # Tensors created while capturing a CUDA graph come from the memory
+        # pool shared by all captured graphs. If the last reference is
+        # dropped after capture, the pool hands the block to the next
+        # graph's capture, and two graphs' recorded kernels then address the
+        # same memory -- replaying one bucket's graph can overwrite metadata
+        # another bucket's graph reads on its next replay (observed victim:
+        # page_table, which also feeds the indexer, turning the corruption
+        # into silently wrong top-k KV selection). Holding one reference per
+        # captured graph prevents the pool from ever reusing these blocks.
+        # Under the trtllm+MTP+DP host-side exception, the metadata reaching capture is
+        # already Full, but tensors created below (swa_out_cache_loc) still
+        # come from the capture pool and are reference-replaced on the pinned
+        # object by copy_'s assign_fields on every replay-prep.
+        if torch.cuda.is_current_stream_capturing():
+            self._captured_full_metadata_refs.append(self.forward_metadata)
 
         # Compute the SWA KV-store write target once per forward and cache it on
         # the metadata for every layer's store. This is recorded inside the cuda
@@ -1127,6 +1371,17 @@ class DeepseekV4AttnBackend(
                     torch.int32
                 )
             )
+            if torch.cuda.is_current_stream_capturing():
+                # The recorded translate/store ops address THIS tensor at
+                # every replay, but copy_'s assign_fields replace the field
+                # on the (pinned) captured metadata each replay-prep,
+                # dropping the only python reference. Pin the tensor itself
+                # so the capture pool can never release its block (a released
+                # block unmaps -> replay MMU-faults at the baked address;
+                # a recycled block silently corrupts).
+                self._captured_full_metadata_refs.append(
+                    metadata.core_attn_metadata.swa_out_cache_loc
+                )
 
             if self.is_dspark_draft and forward_batch.forward_mode.is_target_verify():
                 block_size = int(forward_batch.spec_info.draft_token_num)
@@ -1541,7 +1796,35 @@ class DeepseekV4AttnBackend(
             self.forward_metadata = temp_metadata
             return
         chosen_metadata.copy_(temp_metadata)
+        # temp_metadata is dropped after the content copy above, and it is
+        # the only owner of the compress planner's pinned staging buffer.
+        # That buffer was filled on the CPU and pushed with a raw
+        # cudaMemcpyAsync (no CachingHostAllocator event, see
+        # CompressorPrefillPlan.generate), so freeing it here lets the block
+        # be recycled and rewritten while the DMA is still in flight --
+        # poisoned plan entries under overlap-scheduler CPU run-ahead. Retain
+        # the pinned blocks for a few iterations to outlive any run-ahead.
+        self._keep_plan_staging_alive(temp_metadata)
         self.forward_metadata = chosen_metadata
+
+    def _keep_plan_staging_alive(
+        self,
+        metadata: Union[
+            DSV4Metadata,
+            DSV4RawVerifyMetadata,
+            DSV4RawDecodeMetadata,
+        ],
+    ) -> None:
+        if not isinstance(metadata, DSV4Metadata):
+            return
+        core = metadata.core_attn_metadata
+        for fused in (
+            getattr(core, "c4_compress_metadata", None),
+            getattr(core, "c128_compress_metadata", None),
+        ):
+            pin = getattr(getattr(fused, "plan", None), "pin_buffer", None)
+            if pin is not None and pin.numel() > 0:
+                self._plan_staging_keepalive.append(pin)
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
@@ -1556,8 +1839,8 @@ class DeepseekV4AttnBackend(
             core.c4_flashmla_metadata = _create_flashmla_metadata()
             core.c128_flashmla_metadata = _create_flashmla_metadata()
 
-        # PREP_IN_CUDA_GRAPH=True: warmup upgraded raw->full on the host;
-        # restore raw so capture re-runs the upgrade inside the graph.
+        # If warmup upgraded raw->full on the host, restore raw so capture
+        # re-runs the upgrade inside the graph.
         current_raw = getattr(self, "_current_capture_raw", None)
         if current_raw is not None:
             self.forward_metadata = current_raw
@@ -1668,6 +1951,22 @@ class DeepseekV4AttnBackend(
             swa_topk_lengths = match_num_queries(swa_topk_lengths, value=1)
             extra_indices = match_num_queries(extra_indices, value=-1)
             extra_topk_lengths = match_num_queries(extra_topk_lengths, value=1)
+
+            if self.trtllm_attn:
+                # The uniform-FP8 pool is only readable by the trtllm-gen
+                # kernel; the subclass owns the whole dispatch
+                # (deepseek_v4_trtllm_backend.DeepseekV4TrtllmAttnBackend).
+                return self._forward_trtllm(
+                    q=q,
+                    layer=layer,
+                    compress_ratio=compress_ratio,
+                    core_attn_metadata=core_attn_metadata,
+                    forward_batch=forward_batch,
+                    attn_sink=attn_sink,
+                    swa_page_indices=swa_page_indices,
+                    extra_indices=extra_indices,
+                    extra_topk_lengths=extra_topk_lengths,
+                )
 
             if q.ndim == 3:
                 q = q.unsqueeze(1)
@@ -2223,6 +2522,8 @@ class DeepseekV4AttnBackend(
         if need_compress:
             core_attn_metadata.init_compression_metadata(num_tokens)
             core_attn_metadata.init_flashmla_related(is_prefill=is_prefill)
+            if self.trtllm_attn:
+                core_attn_metadata.init_trtllm_sparse_buffers()
         else:
             core_attn_metadata.c4_sparse_topk_lengths = None
             core_attn_metadata.c4_sparse_page_indices = None
@@ -2230,6 +2531,9 @@ class DeepseekV4AttnBackend(
             core_attn_metadata.c1_flashmla_metadata = _create_flashmla_metadata()
             core_attn_metadata.c4_flashmla_metadata = None
             core_attn_metadata.c128_flashmla_metadata = None
+            if self.trtllm_attn:
+                # SWA-only capacity (draft-extend metadata skips compression).
+                core_attn_metadata.init_trtllm_sparse_buffers()
         return core_attn_metadata
 
     def get_dspark_swa_page_indices(
@@ -2272,14 +2576,19 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         self.speculative_num_steps = speculative_num_steps
         self.attn_backends: List[DeepseekV4AttnBackend] = []
         for i in range(self.speculative_num_steps):
-            self.attn_backends.append(
-                DeepseekV4AttnBackend(
-                    model_runner,
-                    speculative_step_id=i,
-                    topk=self.topk,
-                    speculative_num_steps=self.speculative_num_steps,
-                )
-            )
+            self.attn_backends.append(self._make_step_backend(model_runner, i))
+
+    def _make_step_backend(
+        self, model_runner: ModelRunner, step_id: int
+    ) -> DeepseekV4AttnBackend:
+        # Overridden by DeepseekV4TrtllmMultiStepBackend
+        # (deepseek_v4_trtllm_backend.py) to build trtllm per-step backends.
+        return DeepseekV4AttnBackend(
+            model_runner,
+            speculative_step_id=step_id,
+            topk=self.topk,
+            speculative_num_steps=self.speculative_num_steps,
+        )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         for attn_backend in self.attn_backends:
