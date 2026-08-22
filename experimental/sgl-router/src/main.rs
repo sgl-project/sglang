@@ -246,17 +246,32 @@ async fn main() -> Result<()> {
         std::time::Duration::from_secs(60),
     );
 
-    let ctx = Arc::new(
-        sgl_router::server::app_context::AppContext::with_active_load_and_itl(
-            cfg.clone(),
-            tokenizers,
-            proxy,
-            registry,
-            policies,
-            active_load,
-            itl,
-        ),
+    let mut ctx = sgl_router::server::app_context::AppContext::with_active_load_and_itl(
+        cfg.clone(),
+        tokenizers,
+        proxy,
+        registry,
+        policies,
+        active_load,
+        itl,
     );
+    if let Some(sink) = ctx.token_export_sink.take() {
+        match sink.preflight().await {
+            Ok(()) => {
+                tracing::info!(backend = sink.backend(), "token export enabled");
+                ctx.token_export_sink = Some(sink);
+            }
+            Err(error) => {
+                tracing::error!(
+                    backend = sink.backend(),
+                    %error,
+                    "token export credentials unavailable; disabling export"
+                );
+                sink.drain().await;
+            }
+        }
+    }
+    let ctx = Arc::new(ctx);
     // `/readyz` needs the index to know whether peer bootstrap has settled, and
     // `/internal/kv_snapshot` needs it to serve siblings.
     ctx.attach_kv_index(Arc::clone(&kv_index));
