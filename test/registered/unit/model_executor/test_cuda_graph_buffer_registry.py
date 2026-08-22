@@ -26,6 +26,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     GraphSlot,
     PaddingPolicy,
 )
+from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -57,6 +58,12 @@ class _MiniForwardBatch:
     mamba_track_seqlens: Optional[torch.Tensor] = None
     forward_mode: Optional[str] = None
     spec_info: Optional[object] = None
+
+
+@dataclasses.dataclass
+class _PoolInputBuffers(ForwardInputBuffers):
+    input_ids: torch.Tensor
+    select_index: torch.Tensor
 
 
 def _make_registry(max_bs: int = 8, max_num_tokens: int = 16):
@@ -641,6 +648,27 @@ class TestPoolBackedAlloc(unittest.TestCase):
         self.assertNotEqual(big_first.data_ptr(), small_after.data_ptr())
         small_first, big_after = _ptrs(16, 32)
         self.assertNotEqual(small_first.data_ptr(), big_after.data_ptr())
+
+    def test_forward_input_buffers_can_exclude_width_specific_fields(self):
+        first = _PoolInputBuffers(
+            input_ids=torch.zeros(4, dtype=torch.int64),
+            select_index=torch.tensor([1, 3], dtype=torch.int64),
+        )
+        second = _PoolInputBuffers(
+            input_ids=torch.ones(4, dtype=torch.int64),
+            select_index=torch.tensor([3, 7], dtype=torch.int64),
+        )
+
+        first.share_buffers()
+        second.share_buffers(exclude={"select_index"})
+
+        self.assertEqual(first.input_ids.data_ptr(), second.input_ids.data_ptr())
+        self.assertNotEqual(
+            first.select_index.data_ptr(), second.select_index.data_ptr()
+        )
+        torch.testing.assert_close(
+            second.select_index, torch.tensor([3, 7], dtype=torch.int64)
+        )
 
 
 class TestBuildDecodeRegistry(unittest.TestCase):
