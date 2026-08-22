@@ -38,6 +38,7 @@ class _StubReq:
         self.best_match_node = None
         self.host_hit_length = None
         self.num_matched_prefix_tokens = 0
+        self.swa_branching_seqlen = None
         self.mamba_branching_seqlen = None
         self.cache_protected_len = None
 

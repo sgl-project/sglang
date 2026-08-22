@@ -76,6 +76,7 @@ class _FakeReq:
         self.mamba_next_track_idx = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
+        self.swa_branching_seqlen = None
         self.to_finish = None
         self.finished_reason = None
         self.finished_len = None
