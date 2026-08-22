@@ -1035,6 +1035,11 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = None
+    gated_launch_port: A[
+        Optional[int],
+        "The port of the gated launch control server. When set, every rank blocks right after the distributed environment is initialized, before any sizable GPU allocation, until `POST /gate/activate` is sent to this port on the host of the first rank. This lets an external orchestrator defer the memory hungry part of startup to a safe window. Defaults to None, which disables the gate.",
+        NS("parallel"),
+    ] = None
     nnodes: A[int, "The number of nodes.", NS("parallel")] = 1
     node_rank: A[int, "The node rank.", NS("parallel")] = 0
     tp_size: A[
