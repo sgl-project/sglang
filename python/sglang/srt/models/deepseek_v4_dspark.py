@@ -142,6 +142,18 @@ class DSparkAttention(MqaAttentionBase):
         kv, _ = self.wkv(x)
         return kv
 
+    def _attn_sink_pad_width(self) -> int:
+        # DSpark pads q to _PAD_NUM_HEADS only when the rank has fewer heads than
+        # that, so the sink follows the same width rather than padded_num_heads.
+        return max(self.n_local_heads, _PAD_NUM_HEADS)
+
+    def _local_attn_sink(self) -> torch.Tensor:
+        if self.attn_tp_size == 1:
+            return self.attn_sink
+        if self._attn_sink_local is None:
+            self.refresh_attn_sink_cache()
+        return self._attn_sink_local
+
     def _store_block_kv(
         self,
         *,
@@ -979,6 +991,14 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self._assert_confidence_head_loaded(
             params_dict=params_dict, loaded_params=loaded_params
         )
+
+    def post_load_weights(self):
+        # The per-rank attn_sink slice is cached on first use; an RL weight update
+        # rewrites attn_sink in place, so re-slice it here or decode keeps serving
+        # the pre-update sink.
+        for module in self.modules():
+            if isinstance(module, DSparkAttention):
+                module.refresh_attn_sink_cache()
 
     def _assert_confidence_head_loaded(
         self, *, params_dict: dict, loaded_params: set
