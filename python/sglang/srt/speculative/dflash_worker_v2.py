@@ -2,7 +2,7 @@ import logging
 import math
 import os
 from dataclasses import replace
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -92,6 +92,9 @@ from sglang.srt.utils.common import empty_context
 
 _is_npu = is_npu()
 
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
 
@@ -358,6 +361,9 @@ class DFlashWorkerV2(BaseSpecWorker):
     Drives both overlap and non-overlap scheduling, same as EAGLE: the
     scheduler runs it synchronously when overlap is disabled.
     """
+
+    def iter_runners(self) -> List[Tuple[str, "ModelRunner"]]:
+        return [("draft", self.draft_model_runner)]
 
     def __init__(
         self,
