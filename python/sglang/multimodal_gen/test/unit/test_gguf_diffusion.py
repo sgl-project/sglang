@@ -702,7 +702,7 @@ class TestGGUFRejectsLoraConversion(unittest.TestCase):
     """The dynamic set_lora path must refuse before replacing any layer."""
 
     def _pipeline_with(self, layer):
-        from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
+        from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
             LoRAPipeline,
         )
 

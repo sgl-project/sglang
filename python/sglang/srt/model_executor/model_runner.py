@@ -319,6 +319,9 @@ class ModelRunner:
         # earlier publish.
         if not is_draft_worker:
             set_global_server_args_for_scheduler(server_args)
+        # Set by maybe_init_lora_manager; stays None when LoRA is off and on
+        # draft runners, which serve adapters' target model unadapted.
+        self.lora_manager: Optional[LoRAManager] = None
         self.draft_attention_backend = resolve_draft_attention_backend(
             draft_attention_backend=draft_attention_backend,
             server_args=server_args,
@@ -751,7 +754,8 @@ class ModelRunner:
             self.apply_torch_tp()
 
     def maybe_init_lora_manager(self):
-        if get_lora().enable_lora:
+        # Adapters apply to the target model only; the draft runs unadapted.
+        if get_lora().enable_lora and not self.is_draft_worker:
             self.init_lora_manager()
 
     def maybe_enable_batch_invariant_mode(self):
