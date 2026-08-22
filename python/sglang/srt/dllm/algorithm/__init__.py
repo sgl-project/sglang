@@ -28,12 +28,15 @@ def import_algorithms():
     return mapping
 
 
-def get_algorithm(config: DllmConfig):
+def get_algorithm_cls(name: str):
     try:
-        name = config.algorithm
-        return algo_name_to_cls[name](config)
-    except:
-        raise RuntimeError(f"Unknown diffusion LLM algorithm: {name}")
+        return algo_name_to_cls[name]
+    except KeyError as exc:
+        raise RuntimeError(f"Unknown diffusion LLM algorithm: {name}") from exc
+
+
+def get_algorithm(config: DllmConfig):
+    return get_algorithm_cls(config.algorithm)(config)
 
 
 algo_name_to_cls = import_algorithms()
