@@ -212,8 +212,7 @@ class HashTopK(nn.Module):
         log2phy_prob = None
         if (
             expert_location_dispatch_info is not None
-            and getattr(expert_location_dispatch_info, "ep_dispatch_algorithm", None)
-            == "lp"
+            and expert_location_dispatch_info.ep_dispatch_algorithm == "lp"
         ):
             if self.layer_id is None:
                 raise RuntimeError("HashTopK LP dispatch requires layer_id.")
