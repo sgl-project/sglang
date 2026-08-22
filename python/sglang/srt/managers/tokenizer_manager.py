@@ -53,6 +53,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.dllm.config import get_dllm_model_params
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
@@ -434,6 +435,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Initialize tokenizer and multimodalprocessor
         self.init_tokenizer_and_processor()
+        self._init_dllm_prompt_handling()
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
@@ -536,6 +538,58 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         else:
             self.async_dynamic_batch_tokenizer = None
+
+    def _init_dllm_prompt_handling(self) -> None:
+        self.dllm_mask_id = None
+        self.dllm_literal_mask_token_ids = ()
+        if self.server_args.dllm_algorithm is None:
+            return
+
+        self.dllm_mask_id = get_dllm_model_params(self.model_config)["mask_id"]
+        if self.tokenizer is None:
+            return
+
+        mask_token = self.tokenizer.convert_ids_to_tokens(self.dllm_mask_id)
+        if not isinstance(mask_token, str):
+            raise RuntimeError(
+                f"Could not resolve the reserved dLLM mask token ID {self.dllm_mask_id}"
+            )
+
+        backend_tokenizer = getattr(self.tokenizer, "backend_tokenizer", None)
+        missing = object()
+        encode_special_tokens = getattr(
+            backend_tokenizer, "encode_special_tokens", missing
+        )
+        try:
+            literal_mask_token_ids = self.tokenizer.encode(
+                mask_token,
+                add_special_tokens=False,
+                split_special_tokens=True,
+            )
+        finally:
+            if encode_special_tokens is not missing:
+                backend_tokenizer.encode_special_tokens = encode_special_tokens
+
+        if not literal_mask_token_ids or self.dllm_mask_id in literal_mask_token_ids:
+            raise RuntimeError(
+                "The tokenizer could not encode the reserved dLLM mask token "
+                f"{mask_token!r} as ordinary text"
+            )
+        self.dllm_literal_mask_token_ids = tuple(literal_mask_token_ids)
+
+    def expand_dllm_literal_mask_tokens(self, input_ids: List[int]) -> List[int]:
+        """Expand reserved mask IDs in a text-derived prompt as ordinary text."""
+        mask_id = self.dllm_mask_id
+        if mask_id is None or mask_id not in input_ids:
+            return input_ids
+
+        return [
+            replacement_id
+            for token_id in input_ids
+            for replacement_id in (
+                self.dllm_literal_mask_token_ids if token_id == mask_id else (token_id,)
+            )
+        ]
 
     def _validate_cuda_vmm_feature_transport_support(self) -> None:
         if get_mm().mm_feature_transport != "cuda_vmm":
@@ -953,6 +1007,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for ids in input_ids
             ]
 
+        if getattr(self, "dllm_mask_id", None) is not None:
+            input_ids = [self.expand_dllm_literal_mask_tokens(ids) for ids in input_ids]
+
         # Step 4: Extract results based on input format
         return self._extract_tokenizer_results(
             input_ids, token_type_ids, input_format, original_batch_size
@@ -1163,6 +1220,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
+        dllm_mask_id = getattr(self, "dllm_mask_id", None)
+        if (
+            dllm_mask_id is not None
+            and input_ids is not None
+            and dllm_mask_id in input_ids
+        ):
+            raise ValueError(
+                "dLLM prompt input_ids must not contain the reserved mask token ID "
+                f"{dllm_mask_id}. Pass the mask token as text if it should be "
+                "treated as literal prompt content."
+            )
+
         # FIXME: unify the length validation logic with the one in the scheduler.
         _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0
