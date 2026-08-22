@@ -273,6 +273,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
+    "flashinfer_cutedsl_sm120",
     "cutlass",
     "aiter",
     "marlin",
@@ -6843,6 +6844,22 @@ class ServerArgs:
                     "moe_a2a_backend='none' or 'flashinfer'."
                 )
 
+        if view.moe_runner_backend == "flashinfer_cutedsl_sm120":
+            assert view.quantization in [
+                "modelopt_fp4"
+            ], f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4'."
+            assert view.ep_size in [
+                1,
+                self.tp_size,
+            ], "The expert parallel size must be 1 or the same as the tensor parallel size"
+            assert view.moe_a2a_backend in [
+                "none",
+                "flashinfer",
+            ], (
+                "flashinfer_cutedsl_sm120 supports moe_a2a_backend='none' or "
+                f"'flashinfer', got '{view.moe_a2a_backend}'."
+            )
+
         if view.moe_runner_backend in ["flashinfer_trtllm", "experimental_sgl_trtllm"]:
             assert view.quantization in [
                 "modelopt_fp4",
@@ -7022,8 +7039,9 @@ class ServerArgs:
             assert resolved_view(self).moe_runner_backend in [
                 "flashinfer_cutlass",
                 "flashinfer_cutedsl",
+                "flashinfer_cutedsl_sm120",
                 "flashinfer_trtllm_routed",
-            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass, flashinfer_cutedsl or flashinfer_trtllm_routed moe runner backend"
+            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass, flashinfer_cutedsl, flashinfer_cutedsl_sm120, or flashinfer_trtllm_routed moe runner backend"
 
         if a2a_backend == "mori":
             if self.deepep_mode == "auto":
