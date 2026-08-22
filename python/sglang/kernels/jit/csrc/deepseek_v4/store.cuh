@@ -47,6 +47,12 @@ __global__ void fused_store_flashmla_cache(const __grid_constant__ FusedStoreCac
   // prefetch the index
   const auto index = static_cast<const IndicesT*>(indices)[bid];
   // always load the value from input (don't store if invalid)
+  // Invalid rows must skip the store: CUDA-graph padding rows carry index 0
+  // (the allocator's reserved slot; real allocations start at 1) and the SWA
+  // page LUT ends with a -1 ("no page") entry, which unguarded becomes a
+  // negative-page out-of-bounds write. Uniform per block, so no divergence;
+  // the PDL trigger below still fires.
+  const bool store_valid = index > 0;
   using Float2 = packed_t<Float>;
   const auto elems = static_cast<const Float2*>(input)[tid + bid * 256];
   if (wid != 7) {
@@ -61,15 +67,19 @@ __global__ void fused_store_flashmla_cache(const __grid_constant__ FusedStoreCac
     const auto page_ptr = pointer::offset(cache, page * kPageBytes);
     const auto value_ptr = pointer::offset(page_ptr, offset * 576);
     const auto scale_ptr = pointer::offset(page_ptr, 576 << kPageBits, offset * 8);
-    static_cast<fp8x2_e4m3_t*>(value_ptr)[tid] = result;
-    static_cast<uint8_t*>(scale_ptr)[wid] = scale_ue8m0;
+    if (store_valid) {
+      static_cast<fp8x2_e4m3_t*>(value_ptr)[tid] = result;
+      static_cast<uint8_t*>(scale_ptr)[wid] = scale_ue8m0;
+    }
   } else {
     const auto result = cast<bf16x2_t>(elems);
     const int32_t page = index >> kPageBits;
     const int32_t offset = index & ((1 << kPageBits) - 1);
     const auto page_ptr = pointer::offset(cache, page * kPageBytes);
     const auto value_ptr = pointer::offset(page_ptr, offset * 576, 448);
-    static_cast<bf16x2_t*>(value_ptr)[tid - 7 * 32] = result;
+    if (store_valid) {
+      static_cast<bf16x2_t*>(value_ptr)[tid - 7 * 32] = result;
+    }
   }
 
   PDLTriggerSecondary<kUsePDL>();
@@ -95,6 +105,8 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
   // prefetch the index
   const auto index = static_cast<const IndicesT*>(indices)[global_wid];
   // always load the value from input (don't store if invalid)
+  // Same guard as fused_store_flashmla_cache above; uniform per warp.
+  const bool store_valid = index > 0;
   using Float2 = packed_t<Float>;
   using InStorage = AlignedVector<Float2, 2>;
   using OutStorage = AlignedVector<fp8x2_e4m3_t, 2>;
@@ -114,8 +126,10 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
   OutStorage result;
   result[0] = pack_fp8(x0 * inv_scale, x1 * inv_scale);
   result[1] = pack_fp8(y0 * inv_scale, y1 * inv_scale);
-  static_cast<OutStorage*>(value_ptr)[lane_id] = result;
-  static_cast<float*>(scale_ptr)[0] = scale;
+  if (store_valid) {
+    static_cast<OutStorage*>(value_ptr)[lane_id] = result;
+    static_cast<float*>(scale_ptr)[0] = scale;
+  }
 
   PDLTriggerSecondary<kUsePDL>();
 }
