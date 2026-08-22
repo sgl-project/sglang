@@ -5038,6 +5038,16 @@ class ServerArgs:
             ):
                 self.adjust_mem_fraction_for_vlm(model_config)
 
+        # NCCL symmetric memory needs a CUDA/HIP device: the allocator compiles a
+        # CUDA plugin and links -lnccl. Disable it elsewhere (e.g. Ascend NPU) so
+        # non-CUDA backends never reach that path and fail deep in a build step.
+        if self.enable_symm_mem and not (is_cuda() or is_hip()):
+            logger.warning(
+                "--enable-symm-mem is not supported on non CUDA/HIP devices "
+                "(NCCL symmetric memory is unavailable). Disabling symmetric memory."
+            )
+            self.enable_symm_mem = False
+
         # If symm mem is enabled and prealloc size is not set, set it to 4GB
         if self.enable_symm_mem and not envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.is_set():
             envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.set(4)
