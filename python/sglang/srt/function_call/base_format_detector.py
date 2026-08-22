@@ -89,7 +89,9 @@ class BaseFormatDetector(ABC):
 
             results.append(
                 ToolCallItem(
-                    tool_index=tool_indices.get(name, -1),
+                    # The OpenAI `index` field: the call's position in the
+                    # response, not the tool's in the tools list. Ids derive from it.
+                    tool_index=len(results) if name in tool_indices else -1,
                     name=name,
                     parameters=json.dumps(
                         act.get("parameters") or act.get("arguments", {}),
@@ -153,8 +155,19 @@ class BaseFormatDetector(ABC):
                 and current_text.startswith(self.tool_call_separator)
             )
         ):
-            # Only clear buffer if we're sure no tool call is starting
-            if not self._ends_with_partial_token(self._buffer, self.bot_token):
+            # Only clear buffer if we're sure no tool call is starting.
+            # Mid-sequence the separator introduces the next call, so a buffer
+            # holding just a prefix of it -- "," before " " -- is not prose.
+            partial_bot_token = self._ends_with_partial_token(
+                self._buffer, self.bot_token
+            )
+            partial_separator = (
+                self.current_tool_id > 0
+                and self._ends_with_partial_token(
+                    self._buffer, self.tool_call_separator
+                )
+            )
+            if not partial_bot_token and not partial_separator:
                 normal_text = self._buffer
                 self._buffer = ""
                 if self.eot_token in normal_text:
