@@ -150,19 +150,48 @@ class SchedulerWeightUpdaterManager:
                 success=success, message=message
             )
 
-    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+    def update_weights_from_tensor(
+        self, recv_req: UpdateWeightsFromTensorReqInput
+    ) -> UpdateWeightsFromTensorReqOutput:
         """Update the online model parameter from tensors."""
         with self._observe_weight_load("tensor"):
             if recv_req.disable_draft_model:
                 worker = self.tp_worker
             else:
                 worker = self.draft_worker or self.tp_worker
-            success, message = worker.update_weights_from_tensor(recv_req)
-            if success:
-                self.flush_cache_after_weight_update(recv_req)
-            else:
+
+            try:
+                success, message = worker.update_weights_from_tensor(recv_req)
+                if success:
+                    # Keep cleanup local: a rank may already have changed its weights even
+                    # when a peer fails, so it must not skip its requested cache flush.
+                    self.flush_cache_after_weight_update(recv_req)
+            except Exception:
+                success = False
+                message = traceback.format_exc()
+
+            # This must be the terminal synchronization point. Every rank participates
+            # even if its local update or cache flush raised, so peers do not wait in an
+            # unobservable barrier until the process-group timeout.
+            tp_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
+            if tp_size > 1:
+                statuses: list[tuple[bool, str] | None] = [None] * tp_size
+                torch.distributed.all_gather_object(
+                    statuses, (success, message), group=self.tp_cpu_group
+                )
+                failures = [
+                    f"TP rank {rank}: {rank_message}"
+                    for rank, status in enumerate(statuses)
+                    if status is not None
+                    for rank_success, rank_message in [status]
+                    if not rank_success
+                ]
+                if failures:
+                    success = False
+                    message = "Weight update failed on " + "; ".join(failures)
+
+            if not success:
                 logger.error(message)
-            torch.distributed.barrier(group=self.tp_cpu_group)
             return UpdateWeightsFromTensorReqOutput(success=success, message=message)
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
