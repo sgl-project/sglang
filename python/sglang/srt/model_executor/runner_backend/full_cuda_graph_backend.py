@@ -121,6 +121,10 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             graph_ctx = partial(
                 self._memory_saver_adapter.cuda_graph,
                 tag=GPU_MEMORY_TYPE_CUDA_GRAPH,
+                # The pool holds capture-time-initialized device state that replays
+                # read but never rewrite, so pausing must preserve the pool contents
+                # instead of discarding them.
+                enable_cpu_backup=True,
             )
         else:
             graph_ctx = self._device_module.graph
