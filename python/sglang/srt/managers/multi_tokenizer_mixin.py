@@ -124,7 +124,8 @@ def _extract_field_by_index(
     if field is None:
         return None
 
-    should_wrap_result = field_name in ("customized_info", "time_stats")
+    is_customized_info = field_name == "customized_info"
+    should_wrap_result = field_name == "time_stats"
     if should_wrap_result:
         field = unwrap_from_pickle(field)
         if field is None:
@@ -134,11 +135,17 @@ def _extract_field_by_index(
         new_field = {}
         for k, v in field.items():
             if len(v) > index:
-                new_field[k] = [v[index]] if should_wrap_result else v[index]
+                new_field[k] = (
+                    [v[index]] if is_customized_info or should_wrap_result else v[index]
+                )
+            elif is_customized_info:
+                new_field[k] = [[]]
             else:
                 new_field[k] = [None] if should_wrap_result else None
         if should_wrap_result:
             return wrap_as_pickle(new_field) if new_field else None
+        if is_customized_info:
+            return new_field if new_field else None
         return new_field
 
     if check_length:

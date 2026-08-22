@@ -2,7 +2,6 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.io_struct import unwrap_from_pickle
 from sglang.srt.managers.scheduler_components.output_streamer import (
     _GenerationStreamAccumulator,
 )
@@ -10,6 +9,20 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+def _make_accumulator():
+    return _GenerationStreamAccumulator(
+        return_logprob=False,
+        return_hidden_states=False,
+        return_routed_experts=False,
+        return_indexer_topk=False,
+        spec_algorithm=SpeculativeAlgorithm.NONE,
+        disaggregation_mode=DisaggregationMode.NULL,
+        default_stream_interval=1,
+        default_force_stream_interval=1,
+        get_cached_tokens_details=lambda req: None,
+    )
 
 
 class _FakeReq:
@@ -55,17 +68,7 @@ class _FakeReq:
 
 class TestOutputStreamerCustomizedInfo(unittest.TestCase):
     def test_customized_info_is_padded_for_mixed_batches(self):
-        accumulator = _GenerationStreamAccumulator(
-            return_logprob=False,
-            return_hidden_states=False,
-            return_routed_experts=False,
-            return_indexer_topk=False,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
-            default_stream_interval=1,
-            default_force_stream_interval=1,
-            get_cached_tokens_details=lambda req: None,
-        )
+        accumulator = _make_accumulator()
 
         accumulator.accept(req=_FakeReq("r0", [10, 11]))
         accumulator.accept(
@@ -78,7 +81,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         accumulator.accept(req=_FakeReq("r2", [30], customized_info={"other": [300]}))
 
         payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
-        customized_info = unwrap_from_pickle(payload.customized_info)
+        customized_info = payload.customized_info
 
         self.assertEqual(payload.output_ids, [[10, 11], [20, 21, 22], [30]])
         self.assertEqual(
@@ -88,6 +91,25 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         self.assertEqual(
             customized_info["other"],
             [[None, None], [None, None, None], [300]],
+        )
+
+    def test_payload_accepts_native_container_values(self):
+        accumulator = _make_accumulator()
+        accumulator.accept(
+            req=_FakeReq(
+                "r0",
+                [10, 11],
+                customized_info={
+                    "probe": [[1, "tag"], {"ok": True}],
+                },
+            )
+        )
+
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertEqual(
+            payload.customized_info,
+            {"probe": [[[1, "tag"], {"ok": True}]]},
         )
 
 
