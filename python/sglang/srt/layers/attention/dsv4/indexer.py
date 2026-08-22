@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -19,6 +20,7 @@ import torch.nn.functional as F
 from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
+    plan_topk_v2,
     topk_transform_512,
     topk_transform_512_v2,
 )
@@ -29,6 +31,7 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import (
+    _LARGE_INDEXER_QUERY_THRESHOLD,
     NonPagedIndexerPlan,
     PagedIndexerMetadata,
 )
@@ -62,6 +65,115 @@ IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
 
 _arange_cache = {}
+
+
+# DeepGEMM pads the fp32 logits row stride to
+# max(block_kv, 1024B / elementSize(fp32)) = 256 columns; budget with the
+# padded width so the estimate matches the real allocation.
+_MQA_LOGITS_ROW_ALIGN = 256
+_MQA_LOGITS_BYTES_PER_ELEM = 4
+_MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3
+_MQA_LOGITS_MIN_CHUNK_ROWS = 128
+# Allocations under this never threaten the free remainder, so normal batches
+# take the fast path without the mem_get_info host sync.
+_MQA_LOGITS_STATIC_SKIP_BYTES = 64 << 20
+_MQA_LOGITS_FREE_MEM_FRACTION_ENV = "SGLANG_DSV4_MQA_LOGITS_FREE_MEM_FRACTION"
+
+
+def _mqa_logits_free_mem_fraction() -> float:
+    knob = getattr(envs, _MQA_LOGITS_FREE_MEM_FRACTION_ENV, None)
+    if knob is not None:
+        return knob.get()
+    # Overlay deployments may run this file against an environ.py that
+    # predates the knob declaration; read the environment directly.
+    try:
+        return float(os.getenv(_MQA_LOGITS_FREE_MEM_FRACTION_ENV, "0.2"))
+    except ValueError:
+        return 0.2
+
+
+def _mqa_logits_row_bytes(max_seq_len: int) -> int:
+    aligned_len = (
+        (max_seq_len + _MQA_LOGITS_ROW_ALIGN - 1)
+        // _MQA_LOGITS_ROW_ALIGN
+        * _MQA_LOGITS_ROW_ALIGN
+    )
+    return aligned_len * _MQA_LOGITS_BYTES_PER_ELEM
+
+
+def _mqa_logits_budget_bytes(device: torch.device) -> Optional[int]:
+    """Transient-memory budget for the indexer logits tensor.
+
+    The [query_rows, max_c4_seq_len] fp32 logits allocation is not part of any
+    pool sized by mem_fraction_static, so it must fit in the free remainder.
+    Returns None when the budget cannot be measured (CUDA graph capture before
+    any eager forward), in which case callers keep the unchunked behavior.
+    """
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    # Measured per call, never cached: the free remainder shrinks as the KV
+    # pool fills and fragments, and a budget sampled when the server was idle
+    # sizes slices that no longer fit. Callers reach this only once the static
+    # estimate is already in the multi-hundred-MiB regime, where one
+    # mem_get_info host sync is immaterial next to the allocation itself.
+    free_mem, total_mem = torch.cuda.mem_get_info(device_index)
+    budget = min(
+        int(free_mem * _mqa_logits_free_mem_fraction()),
+        int(total_mem * _MQA_LOGITS_TOTAL_MEM_FRACTION),
+    )
+    return max(1, budget)
+
+
+def _mqa_logits_chunk_rows(
+    query_rows: int, max_seq_len: int, device: torch.device
+) -> Optional[int]:
+    """Query-row slice size keeping [rows, max_seq_len] fp32 logits in budget.
+
+    Returns None when no chunking is needed (single-call fast path).
+    """
+    row_bytes = _mqa_logits_row_bytes(max_seq_len)
+    logits_bytes = query_rows * row_bytes
+    if logits_bytes <= _MQA_LOGITS_STATIC_SKIP_BYTES:
+        return None
+    budget = _mqa_logits_budget_bytes(device)
+    if budget is None or logits_bytes <= budget:
+        return None
+    chunk_rows = max(int(budget // row_bytes), _MQA_LOGITS_MIN_CHUNK_ROWS)
+    return chunk_rows if chunk_rows < query_rows else None
+
+
+def _paged_mqa_logits_metadata_slice(
+    indexer_metadata: PagedIndexerMetadata, c4_seq_lens_slice: torch.Tensor
+) -> Any:
+    """Rebuild the DeepGEMM schedule metadata for a query-row slice.
+
+    Mirrors PagedIndexerMetadata.__post_init__: the schedule depends on the
+    per-row context lengths, so a row slice needs its own plan.
+    """
+    if indexer_metadata.deep_gemm_metadata is None:
+        return None
+    import deep_gemm
+
+    use_jit_indexer = not indexer_metadata.force_deep_gemm_metadata and (
+        envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
+        or c4_seq_lens_slice.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
+    )
+    if use_jit_indexer:
+        from sglang.kernels.ops.attention.dsv4 import get_paged_mqa_logits_metadata
+    else:
+        from deep_gemm import get_paged_mqa_logits_metadata
+
+    _c4 = c4_seq_lens_slice.to(torch.int32)
+    if _c4.dim() == 1:
+        _c4 = _c4.unsqueeze(-1)
+    return get_paged_mqa_logits_metadata(
+        _c4,
+        indexer_metadata.c4_page_size,
+        deep_gemm.get_num_sms(),
+    )
 
 
 def fp8_paged_mqa_logits_torch(
@@ -527,6 +639,16 @@ class C4IndexerBackendMixin:
     ) -> Optional[NonPagedIndexerPlan]:
         if query_rows < envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS.get():
             return None
+        # This path materializes [query_rows, max_seq_len] fp32 logits in one
+        # call with no row slicing available; hand oversized prefills to the
+        # paged path, which chunks them.
+        if (
+            _mqa_logits_chunk_rows(
+                query_rows, indexer_metadata.max_c4_seq_len, page_table.device
+            )
+            is not None
+        ):
+            return None
         if not self._can_use_nonpaged_indexer(
             c4_indexer=c4_indexer,
             forward_batch=forward_batch,
@@ -579,6 +701,21 @@ class C4IndexerBackendMixin:
 
         final_c4_len = seq_lens_cpu[0] // 4
         if final_c4_len <= 0:
+            return None
+
+        # fp8_mqa_logits allocates the [query_rows, max_seqlen_k] fp32 logits
+        # in one piece; oversized prefills must fall through to the paged
+        # path, which slices the same computation under the budget.
+        nonpaged_width = (
+            (final_c4_len + indexer_metadata.c4_page_size - 1)
+            // indexer_metadata.c4_page_size
+            * indexer_metadata.c4_page_size
+        )
+        budget = _mqa_logits_budget_bytes(page_table.device)
+        if (
+            budget is not None
+            and query_rows * _mqa_logits_row_bytes(nonpaged_width) > budget
+        ):
             return None
 
         request_page_table = page_table[:1].contiguous()
@@ -757,6 +894,7 @@ class C4IndexerBackendMixin:
             c4_seq_lens=c4_seq_lens,
             query_rows=query_rows,
         )
+        chunk_rows: Optional[int] = None
         if nonpaged_plan is not None:
             assert isinstance(q_indexer, torch.Tensor)
             logits = self._forward_nonpaged_indexer(
@@ -775,16 +913,25 @@ class C4IndexerBackendMixin:
             c4_indexer_kv_cache = c4_indexer_kv_cache.view(
                 c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
             )
-            logits = fn(
-                q,
-                c4_indexer_kv_cache,
-                weights,
-                _c4sl,
-                page_table,
-                indexer_metadata.deep_gemm_metadata,
-                indexer_metadata.max_c4_seq_len,
-                False,
-            )
+            if not is_xpu() and not torch.cuda.is_current_stream_capturing():
+                chunk_rows = _mqa_logits_chunk_rows(
+                    query_rows, indexer_metadata.max_c4_seq_len, page_table.device
+                )
+            if chunk_rows is None:
+                logits = fn(
+                    q,
+                    c4_indexer_kv_cache,
+                    weights,
+                    _c4sl,
+                    page_table,
+                    indexer_metadata.deep_gemm_metadata,
+                    indexer_metadata.max_c4_seq_len,
+                    False,
+                )
+            else:
+                # Computed slice-by-slice fused with top-k below, so at most
+                # one [chunk_rows, max_c4_seq_len] logits slice is live.
+                logits = None
 
         assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
@@ -808,42 +955,95 @@ class C4IndexerBackendMixin:
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
-        if self.dsa_topk_backend.is_torch():
-            topk_transform_512_pytorch_vectorized(
+        def run_topk_transform(
+            logits_part: torch.Tensor,
+            seq_lens_part: torch.Tensor,
+            page_table_part: torch.Tensor,
+            page_indices_part: torch.Tensor,
+            raw_indices_part: Optional[torch.Tensor],
+            topk_metadata_part: Optional[torch.Tensor],
+        ) -> None:
+            if self.dsa_topk_backend.is_torch():
+                topk_transform_512_pytorch_vectorized(
+                    logits_part,
+                    seq_lens_part,
+                    page_table_part,
+                    page_indices_part,
+                    indexer_metadata.c4_page_size,
+                    raw_indices_part,
+                )
+            elif self.dsa_topk_backend.is_flashinfer():
+                topk_transform_512_flashinfer_unfused(
+                    logits_part,
+                    seq_lens_part,
+                    page_table_part,
+                    page_indices_part,
+                    indexer_metadata.c4_page_size,
+                    raw_indices_part,
+                )
+            elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices_part is None:
+                if topk_metadata_part is None:
+                    # Row-sliced call: the precomputed plan routes the full
+                    # batch, so re-plan over the slice's own lengths. Top-k is
+                    # row-independent, so slicing preserves the result.
+                    topk_metadata_part = plan_topk_v2(seq_lens_part)
+                topk_transform_512_v2(
+                    logits_part,
+                    seq_lens_part,
+                    page_table_part,
+                    page_indices_part,
+                    indexer_metadata.c4_page_size,
+                    topk_metadata_part,
+                )
+            else:
+                topk_transform_512(
+                    logits_part,
+                    seq_lens_part,
+                    page_table_part,
+                    page_indices_part,
+                    indexer_metadata.c4_page_size,
+                    raw_indices_part,
+                )
+
+        if logits is not None:
+            run_topk_transform(
                 logits,
                 c4_seq_lens,
                 page_table,
                 c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
                 raw_indices,
-            )
-        elif self.dsa_topk_backend.is_flashinfer():
-            topk_transform_512_flashinfer_unfused(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
-            )
-        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
-            topk_transform_512_v2(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
                 indexer_metadata.topk_metadata,
             )
         else:
-            topk_transform_512(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
-            )
+            assert chunk_rows is not None
+            for start in range(0, query_rows, chunk_rows):
+                end = min(start + chunk_rows, query_rows)
+                if use_fp4_indexer:
+                    q_part = (q[0][start:end], q[1][start:end])
+                else:
+                    q_part = q[start:end]
+                # max_c4_seq_len stays full-width: logits columns are absolute
+                # c4 positions, so narrowing the row would drop context.
+                logits_part = fn(
+                    q_part,
+                    c4_indexer_kv_cache,
+                    weights[start:end],
+                    _c4sl[start:end],
+                    page_table[start:end],
+                    _paged_mqa_logits_metadata_slice(
+                        indexer_metadata, c4_seq_lens[start:end]
+                    ),
+                    indexer_metadata.max_c4_seq_len,
+                    False,
+                )
+                run_topk_transform(
+                    logits_part,
+                    c4_seq_lens[start:end],
+                    page_table[start:end],
+                    c4_sparse_page_indices[start:end],
+                    raw_indices[start:end] if raw_indices is not None else None,
+                    None,
+                )
         if hisparse_coordinator is not None:
             if hisparse_decode:
                 compress_layer_id = token_to_kv_pool.layer_mapping[
