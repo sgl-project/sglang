@@ -85,7 +85,7 @@ class FeedForward(nn.Module):
         if self.use_gated:
             if (
                 isinstance(self.act_fn, nn.SiLU)
-                and (current_platform.is_cuda() or current_platform.is_rocm())
+                and hidden_states.is_cuda
                 and hidden_states.dtype in (torch.float16, torch.bfloat16)
                 and hidden_states.is_contiguous()
                 and hidden_states.shape[-1] % 32 == 0
