@@ -577,8 +577,8 @@ struct FusedNormRopeKernel {
   static constexpr int64_t kIndexerBytes = 132 * kPageSize;
   static constexpr int64_t kFlashMLABytes = host::div_ceil(584 * kPageSize, 576) * 576;
   static constexpr int64_t kBf16Bytes = kHeadDim * 2 * kPageSize;  // plain bf16 cache
-  static constexpr int64_t kUniformBytes = kHeadDim * kPageSize;  // uniform e4m3, 512 B/token
-  static constexpr int64_t kPageBytes = kBf16Store        ? kBf16Bytes
+  static constexpr int64_t kUniformBytes = kHeadDim * kPageSize;   // uniform e4m3, 512 B/token
+  static constexpr int64_t kPageBytes = kBf16Store         ? kBf16Bytes
                                         : kUniformFp8Store ? kUniformBytes
                                                            : (kIsIndexer ? kIndexerBytes : kFlashMLABytes);
 
