@@ -1008,6 +1008,11 @@ class ServerArgs:
         "The interval to poll requests in scheduler. Can be set to >1 to reduce the overhead of this.",
         NS("schedule"),
     ] = 1
+    enable_dp_prefill_load_aware_routing: A[
+        bool,
+        "Let cache-disabled disaggregated prefill route by SGLang worker token load instead of an external DP-rank hint.",
+        NS("schedule"),
+    ] = False
     enable_mixed_chunk: A[
         bool,
         "Enabling mixing prefill and decode in a batch when using chunked prefill.",
@@ -8631,6 +8636,24 @@ class ServerArgs:
             raise ValueError("--prefill-decode-interval must be non-negative.")
 
     def _handle_other_validations(self):
+        if self.enable_dp_prefill_load_aware_routing:
+            unsupported = []
+            if not self.enable_dp_attention:
+                unsupported.append("--enable-dp-attention")
+            if self.disaggregation_mode != "prefill":
+                unsupported.append("--disaggregation-mode prefill")
+            if self.dp_size <= 1:
+                unsupported.append("--dp-size > 1")
+            if not self.disable_radix_cache:
+                unsupported.append("--disable-radix-cache")
+            if self.load_balance_method != "total_tokens":
+                unsupported.append("--load-balance-method total_tokens")
+            if unsupported:
+                raise ValueError(
+                    "--enable-dp-prefill-load-aware-routing requires "
+                    + ", ".join(unsupported)
+                )
+
         if self.default_chat_template_kwargs is not None and not isinstance(
             self.default_chat_template_kwargs, dict
         ):
