@@ -3250,6 +3250,10 @@ class ServerArgs:
         ),
         NS("model"),
     ] = None
+    custom_pull_weights_pre_read_hook: A[
+        Optional[str],
+        "Import path of a hook(source_dir, target_version) that /pull_weights calls before reading the published weights. POSIX shared filesystems need no hook; object-store-backed mounts often lack cross-host read-after-write consistency, so another host's writes only become visible after an explicit refresh.",
+    ] = None
     weight_loader_disable_mmap: A[
         bool, "Disable mmap while loading weight using safetensors.", NS("model")
     ] = False
