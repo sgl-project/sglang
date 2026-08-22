@@ -738,6 +738,8 @@ class KVCacheConfigurator:
             get_exec().kernel.attention_backend == "ascend" and not self.mambaish_config
         ):
             unsupported_pool_family = "NPU/Ascend KV pool"
+        elif self.use_mla_backend and self.is_hybrid_swa:
+            unsupported_pool_family = "hybrid DSA/MLA-SWA KV pool"
         elif self.use_mla_backend and is_dsa_model:
             unsupported_pool_family = "DSA/MLA KV pool"
         elif self.use_mla_backend and not self.mambaish_config:
@@ -1013,6 +1015,12 @@ class KVCacheConfigurator:
                 token_to_kv_pool = self._build_ascend_mha_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
                 )
+        elif self.use_mla_backend and self.is_hybrid_swa:
+            token_to_kv_pool = self._build_hybrid_mla_swa_kv_pool(
+                full_max_total_num_tokens=sizes.full_max_total_num_tokens,
+                swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+                is_dsa_model=is_dsa_model,
+            )
         elif self.use_mla_backend and is_dsa_model:
             token_to_kv_pool = self._build_dsa_kv_pool(
                 max_total_num_tokens=sizes.max_total_num_tokens,
@@ -1357,6 +1365,60 @@ class KVCacheConfigurator:
             **pool_kwargs,
         )
         return token_to_kv_pool
+
+    def _build_hybrid_mla_swa_kv_pool(
+        self,
+        *,
+        full_max_total_num_tokens: int,
+        swa_max_total_num_tokens: int,
+        is_dsa_model: bool,
+    ) -> KVCache:
+        """Build a hybrid MLA pool with independent full/SWA cache geometries.
+
+        Full-attention layers may use either MLA or DSA storage, while sliding
+        layers use MLA storage. The returned ``SWAKVPool`` exposes the common
+        MLA and optional DSA-index interfaces independent of model type.
+        """
+        full_pool_class = DSATokenToKVPool if is_dsa_model else MLATokenToKVPool
+        common = {
+            "page_size": self.server_args.page_size,
+            "device": self.device,
+            "enable_memory_saver": False,
+        }
+        full_pool_kwargs = {
+            **common,
+            "kv_lora_rank": self.model_config.kv_lora_rank,
+            "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
+        }
+        if is_dsa_model:
+            full_pool_kwargs.update(
+                index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
+                kv_cache_dim=calculate_mla_kv_cache_dim(
+                    model_config=self.model_config,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    server_args=self.server_args,
+                ),
+            )
+
+        return SWAKVPool(
+            size=full_max_total_num_tokens,
+            size_swa=swa_max_total_num_tokens,
+            page_size=self.server_args.page_size,
+            dtype=self.kv_cache_dtype,
+            head_num=0,
+            head_dim=0,
+            swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
+            full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+            device=self.device,
+            full_kv_pool_class=full_pool_class,
+            swa_kv_pool_class=MLATokenToKVPool,
+            full_kv_pool_kwargs=full_pool_kwargs,
+            swa_kv_pool_kwargs={
+                **common,
+                "kv_lora_rank": self.model_config.swa_kv_lora_rank,
+                "qk_rope_head_dim": self.model_config.swa_qk_rope_head_dim,
+            },
+        )
 
     def _build_mla_fp4_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
         token_to_kv_pool = MLATokenToKVPoolFP4(

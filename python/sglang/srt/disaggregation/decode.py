@@ -2632,6 +2632,10 @@ class SchedulerDisaggregationDecodeMixin:
 
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()
+        if self.enable_overlap:
+            # A finished request can still have one redundant forward in flight.
+            # Drain it before a prebuilt request seeds a potentially reused row.
+            self.schedule_stream.wait_stream(self.forward_stream)
         new_batch.process_prebuilt(self.future_map)
 
         return new_batch

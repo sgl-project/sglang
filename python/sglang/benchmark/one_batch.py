@@ -71,6 +71,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.entrypoints.engine import _set_envs_and_config
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -96,7 +97,6 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.srt.utils.tensor_bridge import use_mlx
 
 
 def start_profile(

@@ -2552,14 +2552,6 @@ class MMReceiverGrpc(MMReceiverBase):
             encode_urls=encode_urls,
         )
 
-    def build_and_send_encode_request(self, image_urls, rid):
-        encode_req = GenerateReqInput(
-            image_data=[ImageData(url=url) for url in image_urls],
-            rid=rid,
-        )
-        self.send_encode_request(encode_req)
-        return encode_req
-
     # For zmq_to_scheduler
     def process_waiting_requests(self, recv_reqs):
         return self._process_waiting_requests(recv_reqs, WaitingZmqRequestGrpc)

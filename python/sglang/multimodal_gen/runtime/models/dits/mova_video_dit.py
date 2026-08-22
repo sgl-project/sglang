@@ -236,6 +236,7 @@ class CrossAttention(nn.Module):
             head_size=self.head_dim,
             causal=False,
             softmax_scale=None,
+            is_cross_attention=True,
         )
 
     def forward(self, x: torch.Tensor, y: torch.Tensor):
