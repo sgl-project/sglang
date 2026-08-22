@@ -1507,6 +1507,7 @@ class TestMoonEPArgs(CustomTestCase):
             moe_a2a_backend="moonep",
         )
 
+        server_args.cuda_graph_config = CudaGraphConfig()
         server_args._handle_a2a_moe()
 
         from sglang.srt.arg_groups.overrides import resolved_view
@@ -1514,7 +1515,20 @@ class TestMoonEPArgs(CustomTestCase):
         self.assertEqual(resolved_view(server_args).moe_a2a_backend, "moonep")
         self.assertEqual(resolved_view(server_args).ep_size, server_args.tp_size)
         self.assertEqual(server_args.cuda_graph_config.decode.backend, Backend.DISABLED)
-        self.assertEqual(server_args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+        self.assertEqual(
+            server_args.cuda_graph_config.prefill.backend, Backend.DISABLED
+        )
+
+    def test_moonep_rejects_single_and_two_batch_overlap(self):
+        for field in ("enable_single_batch_overlap", "enable_two_batch_overlap"):
+            with self.subTest(field=field):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    moe_a2a_backend="moonep",
+                )
+                setattr(server_args, field, True)
+                with self.assertRaisesRegex(ValueError, "MoonEP.*overlap"):
+                    server_args._handle_a2a_moe()
 
 
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):

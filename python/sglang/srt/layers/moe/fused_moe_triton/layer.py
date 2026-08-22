@@ -397,7 +397,11 @@ class FusedMoE(torch.nn.Module):
                 f"quant_method={type(self.quant_method).__name__})."
             )
 
-        moonep_global_weight_storage = get_moe_a2a_backend().is_moonep()
+        is_moonep = get_moe_a2a_backend().is_moonep()
+        if is_moonep and with_bias:
+            raise NotImplementedError("MoonEP does not support expert bias yet.")
+
+        moonep_global_weight_storage = is_moonep
         if moonep_global_weight_storage:
             if quant_config is not None:
                 raise NotImplementedError(
