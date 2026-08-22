@@ -19,6 +19,7 @@ HW_MAPPING = {
     "cpu": HWBackend.CPU,
     "cuda": HWBackend.CUDA,
     "amd": HWBackend.AMD,
+    "hcu": HWBackend.HCU,
     "musa": HWBackend.MUSA,
     "npu": HWBackend.NPU,
     "xpu": HWBackend.XPU,
@@ -64,6 +65,9 @@ PER_COMMIT_SUITES = {
         "extra-a-test-1-gpu-small-amd",
         "extra-a-test-1-gpu-large-amd",
         "extra-a-test-2-gpu-large-amd",
+    ],
+    HWBackend.HCU: [
+        "stage-a-test-1-hcu",
     ],
     HWBackend.MUSA: [],
     HWBackend.CUDA: [
@@ -198,6 +202,7 @@ OTHER_SUITES = {
 _SUITE_CHECKED_BACKENDS = {
     HWBackend.CUDA,
     HWBackend.CPU,
+    HWBackend.HCU,
     HWBackend.MUSA,
     HWBackend.XPU,
     HWBackend.MLX,
