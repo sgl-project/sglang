@@ -32,6 +32,15 @@ _MODEL_CACHE: dict[str, "Model"] = {}
 _MAX_RIFE_BATCH_PAIRS = 16
 
 
+def _load_rife_state_dict(flownet_path: str) -> dict[str, torch.Tensor]:
+    state = torch.load(flownet_path, map_location="cpu", weights_only=True)
+    if not isinstance(state, dict):
+        raise ValueError(
+            f"RIFE weights must deserialize to a state_dict mapping, got {type(state)}"
+        )
+    return state
+
+
 # ---------------------------------------------------------------------------
 # Vendored RIFE 4.22.lite model code
 # (IFBlock, IFNet_HDv3 backbone, Model wrapper)
@@ -300,7 +309,7 @@ class Model:
             else:
                 return {k: v for k, v in param.items() if "module." not in k}
 
-        state = torch.load(flownet_path, map_location="cpu", weights_only=False)
+        state = _load_rife_state_dict(flownet_path)
         self.flownet.load_state_dict(convert(state), strict=False)
         logger.info("Loaded RIFE weights from %s", flownet_path)
 
