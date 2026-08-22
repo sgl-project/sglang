@@ -241,6 +241,51 @@ def test_rope_mixed_q_dtype(is_neox: bool, rope_dim: int) -> None:
     assert torch.equal(k_mixed, k_ref)
 
 
+@pytest.mark.parametrize("batch_size", [1, 8])
+@pytest.mark.parametrize("is_neox", IS_NEOX_LIST)
+@pytest.mark.parametrize("dtype", DTYPE_LIST)
+@pytest.mark.parametrize("q_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_rope_quantized_query(
+    batch_size: int,
+    is_neox: bool,
+    dtype: torch.dtype,
+    q_dtype: torch.dtype,
+) -> None:
+    from sglang.kernels.ops.attention.rope_quant import (
+        apply_rope_and_quantize_query,
+    )
+
+    num_q_heads, num_k_heads, head_dim = 14, 2, 64
+    qkv = torch.randn(
+        batch_size,
+        (num_q_heads + 2 * num_k_heads) * head_dim,
+        device=DEVICE,
+        dtype=dtype,
+    )
+    q = qkv[:, : num_q_heads * head_dim].view(batch_size, num_q_heads, head_dim)
+    k = qkv[:, num_q_heads * head_dim : (num_q_heads + num_k_heads) * head_dim].view(
+        batch_size, num_k_heads, head_dim
+    )
+    positions = torch.randint(
+        0, MAX_SEQ_LEN, (batch_size,), device=DEVICE, dtype=torch.int64
+    )
+    cos_sin_cache = create_cos_sin_cache(head_dim)
+
+    q_ref, k_ref = q.clone(), k.clone()
+    reference_rope(q_ref, k_ref, cos_sin_cache, positions, is_neox)
+
+    q_out = torch.empty(q.shape, device=DEVICE, dtype=q_dtype)
+    k_out = k.clone()
+    apply_rope_and_quantize_query(
+        q, k_out, q_out, cos_sin_cache, positions, is_neox=is_neox
+    )
+
+    triton.testing.assert_close(
+        q_ref.to(q_dtype).float(), q_out.float(), atol=0.25, rtol=0.125
+    )
+    triton.testing.assert_close(k_ref, k_out, atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("is_neox", IS_NEOX_LIST)
 def test_rope_store_mixed_q_dtype(is_neox: bool) -> None:
     """Fused RoPE + KV store with fp16 q + bf16 k: q bitwise vs the all-fp16

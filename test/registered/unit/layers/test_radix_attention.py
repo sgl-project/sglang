@@ -48,6 +48,17 @@ class _RecordingAttentionBackend:
         return (output, lse) if self.return_lse else output
 
 
+class _QueryQuantizingAttentionBackend(_RecordingAttentionBackend):
+    def __init__(self, dtype):
+        super().__init__()
+        self.dtype = dtype
+        self.capability_calls = []
+
+    def get_query_quantization_dtype(self, layer, forward_mode):
+        self.capability_calls.append((layer, forward_mode))
+        return self.dtype
+
+
 class TestRadixAttentionGraphInterface(CustomTestCase):
     @staticmethod
     def _new_layer() -> RadixAttention:
@@ -173,6 +184,38 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
                         output = result
                     self.assertEqual(output.shape, query.shape)
                     self.assertTrue(torch.all(output == 5))
+
+    def test_forward_quantizes_query_from_backend_capability(self):
+        layer = self._new_layer()
+        backend = _QueryQuantizingAttentionBackend(torch.float16)
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            _attn_output=None,
+            out_cache_loc=torch.arange(2, dtype=torch.int64),
+        )
+        query = torch.zeros((2, 2, 3), dtype=torch.float32)
+        key = torch.zeros_like(query)
+        value = torch.zeros_like(query)
+        q_rope = torch.zeros((2, 2, 1), dtype=torch.float32)
+        layer.configure_query_quantization(backend)
+
+        with patch.object(
+            radix_attention_module, "get_attn_backend", return_value=backend
+        ):
+            layer(query, key, value, forward_batch, q_rope=q_rope)
+
+        self.assertEqual(
+            backend.capability_calls,
+            [
+                (layer, ForwardMode.DECODE),
+                (layer, ForwardMode.EXTEND),
+                (layer, ForwardMode.TARGET_VERIFY),
+            ],
+        )
+        call_record = backend.calls[-1]
+        self.assertEqual(call_record.query.dtype, torch.float16)
+        # Q-only centralization must not change backend-owned MLA rope inputs.
+        self.assertEqual(call_record.kwargs["q_rope"].dtype, torch.float32)
 
     def test_impl_preserves_attention_identity_and_lse(self):
         mqa = SimpleNamespace()

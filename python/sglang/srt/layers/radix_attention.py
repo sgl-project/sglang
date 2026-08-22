@@ -24,6 +24,7 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -146,6 +147,35 @@ class RadixAttention(nn.Module):
         self.pos_encoding_mode = pos_encoding_mode
         self.logit_capping_method = logit_capping_method
         self.xai_temperature_len = -1
+        # Stamped by ModelRunner after it resolves the active attention backend.
+        # Keeping these on the layer leaves the model hot path independent of
+        # the Python backend object and visible to torch.compile.
+        self._query_quantization_dtype_decode = None
+        self._query_quantization_dtype_extend = None
+        self._query_quantization_dtype_target_verify = None
+
+    def configure_query_quantization(self, attn_backend) -> None:
+        """Stamp this layer with the resolved backend's per-mode Q dtype."""
+        self._query_quantization_dtype_decode = (
+            attn_backend.get_query_quantization_dtype(self, ForwardMode.DECODE)
+        )
+        self._query_quantization_dtype_extend = (
+            attn_backend.get_query_quantization_dtype(self, ForwardMode.EXTEND)
+        )
+        self._query_quantization_dtype_target_verify = (
+            attn_backend.get_query_quantization_dtype(self, ForwardMode.TARGET_VERIFY)
+        )
+
+    def get_query_quantization_dtype(
+        self, forward_mode: ForwardMode
+    ) -> Optional[torch.dtype]:
+        if forward_mode.is_decode():
+            return self._query_quantization_dtype_decode
+        if forward_mode.is_target_verify():
+            return self._query_quantization_dtype_target_verify
+        if forward_mode.is_idle():
+            return None
+        return self._query_quantization_dtype_extend
 
     def forward(
         self,
@@ -165,6 +195,15 @@ class RadixAttention(nn.Module):
                 v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
             else:
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
+
+        # Keep query quantization as an explicit model-layer op. FA3's FP8
+        # KV-cache path previously cast Q inside backend forward methods,
+        # hiding it from torch.compile and preventing fusion with preceding ops.
+        query_quantization_dtype = self.get_query_quantization_dtype(
+            forward_batch.forward_mode
+        )
+        if query_quantization_dtype is not None and q.dtype != query_quantization_dtype:
+            q = q.to(query_quantization_dtype)
 
         context = get_tc_piecewise_forward_context()
         if (
