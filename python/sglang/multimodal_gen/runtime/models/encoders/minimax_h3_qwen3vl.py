@@ -17,10 +17,7 @@ from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
-from sglang.multimodal_gen.runtime.models.encoders.base import (
-    CheckpointQuantizationCapability,
-    TextEncoder,
-)
+from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLModel
 
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
@@ -49,10 +46,6 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
     layer_names = [*TextEncoder.layer_names, "model.visual.blocks"]
 
     supports_dp_encode = True
-    checkpoint_quantization_capability = CheckpointQuantizationCapability(
-        backend="diffusion",
-        methods=frozenset({"fp8"}),
-    )
 
     @staticmethod
     def should_materialize_checkpoint_weight(name: str) -> bool:
