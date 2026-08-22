@@ -19,6 +19,7 @@ register_amd_ci(est_time=320, suite="stage-b-test-1-gpu-small-amd")
 _MAX_NEW_TOKENS = 4
 _TOP_P = 0.99
 _TOP_K = 10
+_TOP_LOGPROBS_NUM = 128
 _SAMPLING_SEED = 1234
 _SERVER_ARGS = (
     "--mem-fraction-static",
@@ -79,6 +80,7 @@ class SamplingMaskTestMixin:
         self.assertEqual(len(sampling_masks), len(output_ids))
         for output_id, sampling_mask in zip(output_ids, sampling_masks):
             self.assertIn(output_id, sampling_mask)
+            self.assertEqual(len(sampling_mask), len(set(sampling_mask)))
         return sampling_masks
 
     def _assert_rejects_unbounded_sampling_mask(self, sampling_params):
@@ -88,6 +90,8 @@ class SamplingMaskTestMixin:
 
 
 class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
+    _sampling_backend = "flashinfer"
+
     @classmethod
     def setUpClass(cls):
         cls._launch_server()
@@ -102,12 +106,8 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
                 "ignore_eos": True,
             }
         )
-        # The mask keeps at most top_k tokens, plus possibly the actually
-        # sampled token when the sampling kernel picks one just outside the
-        # mask's topk reconstruction (fp cumsum divergence); see
-        # Sampler._attach_sampling_mask_to_output.
         for sampling_mask in top_p_sampling_masks:
-            self.assertLessEqual(len(sampling_mask), _TOP_K + 1)
+            self.assertGreater(len(sampling_mask), 0)
 
         top_k_sampling_masks = self._generate_sampling_masks(
             {
@@ -118,7 +118,7 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
             }
         )
         for sampling_mask in top_k_sampling_masks:
-            self.assertIn(len(sampling_mask), (_TOP_K, _TOP_K + 1))
+            self.assertGreaterEqual(len(sampling_mask), _TOP_K)
 
         top_k_top_p_one_sampling_masks = self._generate_sampling_masks(
             {
@@ -130,15 +130,15 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
             }
         )
         for sampling_mask in top_k_top_p_one_sampling_masks:
-            self.assertIn(len(sampling_mask), (_TOP_K, _TOP_K + 1))
+            self.assertGreaterEqual(len(sampling_mask), _TOP_K)
 
     def test_sampling_mask_matches_topk_logprobs(self):
         """Check the returned mask and its renormalized logprobs.
 
-        We get the per-token full-vocab logprobs via ``return_logprob`` with
-        ``top_logprobs_num == top_k``, which covers every token the mask can
-        contain. With ``temperature=1.0`` these are the sampler's distribution,
-        so ``p = exp(logprob)`` are the exact probabilities. For each token, we check:
+        We get a wide prefix of full-vocab logprobs via ``return_logprob`` so
+        cutoff ties that extend beyond ``top_k`` are visible. With
+        ``temperature=1.0`` these are the sampler's distribution, so
+        ``p = exp(logprob)`` are the exact probabilities. For each token, we check:
 
         1. the returned mask matches the nucleus reconstructed from those probs,
         2. sampling_logprob == log(p[sampled] / sum(p[t] for t in mask)).
@@ -153,7 +153,7 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
                 "ignore_eos": True,
             },
             return_logprob=True,
-            top_logprobs_num=top_k,
+            top_logprobs_num=_TOP_LOGPROBS_NUM,
         )
         self.assertEqual(response.status_code, 200, response.text)
 
@@ -175,17 +175,25 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
                 int(tid): math.exp(logprob) for logprob, tid, _ in step_top_logprobs
             }
 
-            reconstructed = []
             mass_before = 0.0
-            for logprob, tid, _ in step_top_logprobs:
-                if mass_before <= top_p:
-                    reconstructed.append(int(tid))
+            positional_support = []
+            for position, (logprob, tid, _) in enumerate(step_top_logprobs):
+                if position < top_k and mass_before <= top_p:
+                    positional_support.append((math.exp(logprob), int(tid)))
                 mass_before += math.exp(logprob)
-            if output_id not in reconstructed:
-                reconstructed.append(output_id)
-            # ``<= 1``: fp32 (server) and fp64 (here) cumsums may split on the
-            # single token straddling the top_p cut.
-            self.assertLessEqual(len(set(mask) ^ set(reconstructed)), 1)
+
+            if self._sampling_backend == "flashinfer":
+                # FlashInfer applies threshold filters, so cutoff ties survive.
+                cutoff = positional_support[-1][0]
+                reconstructed = {
+                    int(tid)
+                    for logprob, tid, _ in step_top_logprobs
+                    if math.exp(logprob) >= cutoff
+                }
+            else:
+                # PyTorch filters its sorted tensor by position.
+                reconstructed = {tid for _, tid in positional_support}
+            self.assertEqual(set(mask), reconstructed)
 
             support_mass = sum(probs[tid] for tid in mask)
             expected_logprob = math.log(probs[output_id] / support_mass)
@@ -278,6 +286,14 @@ class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):
             with_mask_output["output_ids"], without_mask_output["output_ids"]
         )
         self.assertEqual(with_mask_output["text"], without_mask_output["text"])
+
+
+class TestSamplingMaskPytorch(TestSamplingMask):
+    _sampling_backend = "pytorch"
+
+    @classmethod
+    def setUpClass(cls):
+        cls._launch_server(("--sampling-backend", "pytorch"))
 
 
 if __name__ == "__main__":
