@@ -1,14 +1,15 @@
 """Ratchet guards for runtime_context / ServerArgs adoption.
 
-These used to live as four tiny one-concern files at ``test/registered/unit/``.
+These used to live as several tiny one-concern files at ``test/registered/unit/``.
 Each pin is still an exact count: a grown number means new code bypassed the
 runtime_context accessors, a shrunk number means a removal forgot to lower the
-baseline.
+baseline. The accessor-shadowing scan is here too: a local that binds the same
+name as an imported ``runtime_context`` accessor raises ``UnboundLocalError``.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 import ast
 import re
@@ -184,6 +185,127 @@ class TestServerArgsMutationRatchet(CustomTestCase):
                 f"shrank: {count} < baseline {_MUTATION_BASELINE}. Lower the baseline "
                 "in this file to lock in the progress."
             )
+
+
+_CONTEXT_MODULE = "sglang.srt.runtime_context"
+
+
+def _module_level_accessor_imports(tree: ast.AST) -> set[str]:
+    names: set[str] = set()
+    stack = list(tree.body)
+    while stack:
+        stmt = stack.pop()
+        if isinstance(
+            stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+        ):
+            continue
+        if isinstance(stmt, ast.ImportFrom) and stmt.module == _CONTEXT_MODULE:
+            for alias in stmt.names:
+                names.add(alias.asname or alias.name)
+        stack.extend(ast.iter_child_nodes(stmt))
+    return names
+
+
+def _bound_names(target):
+    if isinstance(target, ast.Name):
+        yield target.id
+    elif isinstance(target, ast.Starred):
+        yield from _bound_names(target.value)
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for element in target.elts:
+            yield from _bound_names(element)
+
+
+def _own_scope_statements(node) -> tuple:
+    own_scope = []
+    nested_def_bindings = []
+    pending = list(node.body)
+    while pending:
+        stmt = pending.pop()
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            nested_def_bindings.append((stmt.name, stmt.lineno))
+            continue
+        if isinstance(stmt, ast.Lambda):
+            continue
+        own_scope.append(stmt)
+        pending.extend(ast.iter_child_nodes(stmt))
+    return own_scope, nested_def_bindings
+
+
+def _child_functions(body) -> list:
+    funcs = []
+    pending = list(body)
+    while pending:
+        stmt = pending.pop()
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            funcs.append(stmt)
+            continue
+        if isinstance(stmt, ast.Lambda):
+            continue
+        pending.extend(ast.iter_child_nodes(stmt))
+    return funcs
+
+
+def _shadowing_assignments(tree: ast.AST, module_accessors: set[str]):
+    stack = [(fn, module_accessors) for fn in _child_functions(tree.body)]
+    while stack:
+        node, inherited = stack.pop()
+        own_scope, nested_def_bindings = _own_scope_statements(node)
+        local_imports = {
+            alias.asname or alias.name
+            for stmt in own_scope
+            if isinstance(stmt, ast.ImportFrom) and stmt.module == _CONTEXT_MODULE
+            for alias in stmt.names
+        }
+        visible = inherited | local_imports
+        for name, lineno in nested_def_bindings:
+            if name in visible:
+                yield node.name, name, lineno
+        for inner in own_scope:
+            targets = []
+            if isinstance(inner, ast.Assign):
+                targets = inner.targets
+            elif isinstance(inner, (ast.AnnAssign, ast.AugAssign)):
+                targets = [inner.target]
+            elif isinstance(inner, (ast.For, ast.AsyncFor, ast.comprehension)):
+                targets = [inner.target]
+            elif isinstance(inner, ast.NamedExpr):
+                targets = [inner.target]
+            elif isinstance(inner, (ast.With, ast.AsyncWith)):
+                targets = [i.optional_vars for i in inner.items if i.optional_vars]
+            elif isinstance(inner, ast.ExceptHandler) and inner.name:
+                targets = [ast.Name(id=inner.name, ctx=ast.Store())]
+            for target in targets:
+                for name in _bound_names(target):
+                    if name in visible:
+                        yield node.name, name, getattr(inner, "lineno", node.lineno)
+        for nested in _child_functions(node.body):
+            stack.append((nested, visible))
+
+
+class TestNoAccessorShadowing(CustomTestCase):
+    def test_no_local_shadows_a_context_accessor(self):
+        offenders = []
+        for path in sorted(_SGLANG_ROOT.rglob("*.py")):
+            rel = path.relative_to(_SGLANG_ROOT).as_posix()
+            if rel.startswith("srt/runtime_context.py"):
+                continue
+            source = path.read_text()
+            if _CONTEXT_MODULE not in source:
+                continue
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
+                continue
+            module_accessors = _module_level_accessor_imports(tree)
+            for func, name, lineno in _shadowing_assignments(tree, module_accessors):
+                offenders.append(f"{rel}:{lineno}: {func}() binds {name!r}")
+        self.assertFalse(
+            offenders,
+            "locals shadow a runtime_context accessor imported in the same "
+            "module; the name is local for the whole function, so any call to "
+            "the accessor there raises UnboundLocalError:\n" + "\n".join(offenders),
+        )
 
 
 if __name__ == "__main__":

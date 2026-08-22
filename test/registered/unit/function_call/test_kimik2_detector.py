@@ -165,6 +165,26 @@ class TestKimiK2DetectorBasic(unittest.TestCase):
         )
         self.assertFalse(self.detector.has_tool_call("no markers here"))
 
+    def test_invalid_tool_call(self):
+        text = (
+            "invalid_tool:0<|tool_call_argument_begin|>"
+            '{"path": "/tmp"}<|tool_call_end|><|tool_calls_section_end|>'
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 0)
+        self.assertEqual(result.normal_text, text)
+
+    def test_partial_tool_call_keeps_incomplete_json(self):
+        chunks = [
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.ReadFile:0"
+            '<|tool_call_argument_begin|>{',
+            '"path": "/tmp"',
+        ]
+        tool_calls, _ = _collect_streaming_tool_calls(self.detector, chunks, self.tools)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "ReadFile")
+        self.assertEqual(tool_calls[0]["parameters"], '{"path": "/tmp"')
+
 
 class TestKimiK2DetectorHyphenatedNames(unittest.TestCase):
     """Test support for hyphenated function names (common in MCP tools)."""
