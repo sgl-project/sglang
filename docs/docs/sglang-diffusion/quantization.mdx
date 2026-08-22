@@ -169,10 +169,10 @@ backend.
     <tr>
       <td><code>comfy-int8-convrot</code></td>
       <td>One selected safetensors file with per-layer <code>int8_tensorwise</code> and ConvRot metadata</td>
-      <td><code>--transformer-weights-path</code></td>
-      <td>MiniMax-H3 native DiT; pruned FL2VA is E2E-verified and Ref2VA has the same validated tensor contract</td>
+      <td><code>--transformer-weights-path</code>, or an explicit weight file through <code>--component-paths.&lt;component&gt;</code></td>
+      <td>Native DiTs and encoders whose parameter mappings preserve each marked linear; MiniMax-H3 DiT and Qwen3-VL encoder checkpoints have validated tensor contracts</td>
       <td><code>comfy-kitchen</code></td>
-      <td>CUDA; auto-detected; uses the fused Kitchen INT8 kernel and validates weight/scale layout before model construction. TP requires every row-parallel input shard to preserve the checkpoint's ConvRot group boundary; the H3 256-group checkpoint supports TP1/2/4, not TP8. Offload is supported; FSDP is not.</td>
+      <td>CUDA; auto-detected; uses the fused Kitchen INT8 kernel and validates weight/scale layout before model construction. TP requires every row-parallel input shard to preserve the checkpoint's ConvRot group boundary. The H3 256-group DiT supports TP1/2/4, not TP8; its Qwen3-VL encoder keeps TP8 by replicating only incompatible row projections. Offload is supported; FSDP is not.</td>
     </tr>
     <tr>
       <td><code>qvg-kv</code></td>
@@ -345,9 +345,10 @@ sglang generate \
 
 ### Kitchen INT8
 
-Serialized Comfy ConvRot INT8 DiTs are selected through
-`--transformer-weights-path` and auto-detected from their per-layer markers.
-They load INT8 weights and row scales directly; omit `--quantization`.
+Serialized Comfy ConvRot INT8 DiTs use `--transformer-weights-path`; compatible
+native encoders use an explicit file through `--component-paths.<component>` or
+its component alias. Both are auto-detected from per-layer markers and load
+INT8 weights and row scales directly; omit `--quantization`.
 
 For a BF16 checkpoint, `--quantization kitchen_int8` instead performs online
 quantization after loading:

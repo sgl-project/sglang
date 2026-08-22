@@ -154,3 +154,9 @@ class QuantizationConfig(ABC):
 
     def get_cache_scale(self, name: str) -> str | None:
         return None
+
+    def supports_input_partition(
+        self, prefix: str, input_size_per_partition: int
+    ) -> bool:
+        """Whether a row-parallel shard preserves this format's input layout."""
+        return True

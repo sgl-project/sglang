@@ -310,6 +310,8 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertTrue(config.checkpoint_uses_native_qkv_layout)
         self.assertFalse(KitchenInt8Config().checkpoint_uses_native_qkv_layout)
         self.assertFalse(_needs_device_weight_postprocess(config))
+        self.assertTrue(config.supports_input_partition("blocks.0.mlp.fc1", 6400))
+        self.assertFalse(config.supports_input_partition("blocks.0.mlp.fc1", 3200))
 
     @patch(
         "sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8."

@@ -93,6 +93,7 @@ class ComfyFp8Config(QuantizationConfig):
     def __init__(self, layer_markers: dict[str, dict[str, Any]]) -> None:
         super().__init__()
         self.layer_markers = layer_markers
+        self.selected: list[str] = []
         self._fp8_config = Fp8Config(
             is_checkpoint_fp8_serialized=True,
             activation_scheme="static",
@@ -136,6 +137,7 @@ class ComfyFp8Config(QuantizationConfig):
         marker = self.layer_markers.get(prefix)
         if marker is None:
             return UnquantizedLinearMethod()
+        self.selected.append(prefix)
         if marker.get("full_precision_matrix_mult", False):
             return ComfyFullPrecisionFp8LinearMethod()
         return Fp8LinearMethod(self._fp8_config)
