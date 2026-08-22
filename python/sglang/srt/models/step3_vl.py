@@ -435,7 +435,9 @@ class Step3TextModel(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.padding_idx = config.pad_token_id
+        # Step3TextConfig defines only bos/eos, not pad_token_id; padding_idx is
+        # unused here, so default to None.
+        self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
