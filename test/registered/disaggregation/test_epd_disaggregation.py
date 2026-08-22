@@ -68,9 +68,17 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
             "zmq_to_scheduler",
             "zmq_to_tokenizer",
         ), f"Invalid EPD_ENCODER_TRANSFER_BACKEND: {cls.encoder_transfer_backend}"
-        cls.enable_global_cache = (
+        mooncake_cache_enabled = (
             os.environ.get("MOONCAKE_MASTER") is not None
             or os.environ.get("MOONCAKE_CLIENT") is not None
+        )
+        cls.mm_global_cache_backend = os.environ.get(
+            "EPD_MM_GLOBAL_CACHE_BACKEND",
+            "mooncake" if mooncake_cache_enabled else None,
+        )
+        cls.enable_global_cache = (
+            os.environ.get("EPD_ENABLE_MM_GLOBAL_CACHE") == "1"
+            or cls.mm_global_cache_backend is not None
         )
         if cls.server_type == "grpc":
             cls.encode_port = f"{int(cls.lb_port) + 305}"
@@ -153,6 +161,10 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
             ]
             if cls.enable_global_cache:
                 encode_args.append("--enable-mm-global-cache")
+            if cls.mm_global_cache_backend is not None:
+                encode_args.extend(
+                    ["--mm-global-cache-backend", cls.mm_global_cache_backend]
+                )
             cls.encode_stdout = io.StringIO()
             cls.encode_stderr = io.StringIO()
             cls.process_encode = popen_launch_server(
