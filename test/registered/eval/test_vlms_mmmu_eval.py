@@ -26,12 +26,19 @@ MODEL_THRESHOLDS = {
     # 30 output tokens and are not comparable.
     ModelLaunchSettings("deepseek-ai/deepseek-vl2-small"): (0.320, 56.1),
     ModelLaunchSettings("deepseek-ai/Janus-Pro-7B"): (0.285, 40.3),
-    ModelLaunchSettings("google/gemma-4-E4B-it"): (0.26, 24.0),
-    ModelLaunchSettings("google/gemma-4-26B-A4B-it", extra_args=["--tp=2"]): (
+    ModelLaunchSettings("google/gemma-4-E4B-it", extra_args=["--enable-multimodal"]): (
+        0.26,
+        24.0,
+    ),
+    ModelLaunchSettings(
+        "google/gemma-4-26B-A4B-it", extra_args=["--tp=2", "--enable-multimodal"]
+    ): (
         0.27,
         32.0,
     ),
-    ModelLaunchSettings("google/gemma-4-31B-it", extra_args=["--tp=2"]): (0.28, 42.0),
+    ModelLaunchSettings(
+        "google/gemma-4-31B-it", extra_args=["--tp=2", "--enable-multimodal"]
+    ): (0.28, 42.0),
     # This 100-sample score has ranged from 0.33 to 0.37 since #27327.
     ModelLaunchSettings("mistral-community/pixtral-12b"): (0.320, 28.0),
     ModelLaunchSettings("moonshotai/Kimi-VL-A3B-Instruct"): (0.330, 23.5),
