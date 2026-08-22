@@ -24,6 +24,174 @@ class ExpandPrefillCausallyResult(msgspec.Struct):
     req_pool_indices_repeated: torch.Tensor
 
 
+class ExpandUniformVerifyResult(msgspec.Struct, frozen=True):
+    seq_lens_extended: torch.Tensor
+    seq_lens_casual: torch.Tensor
+    req_pool_indices_repeated: torch.Tensor
+
+
+class ExpandUniformVerify:
+    """Build fixed-width target-verify rows and planner inputs in one launch."""
+
+    @classmethod
+    def execute(cls, *args, **kwargs) -> ExpandUniformVerifyResult:
+        if _inputs_on_cuda(*args, **kwargs):
+            return cls.triton(*args, **kwargs)
+        return cls.torch(*args, **kwargs)
+
+    @classmethod
+    def torch(
+        cls,
+        *,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        num_draft_tokens: int,
+    ) -> ExpandUniformVerifyResult:
+        return expand_uniform_verify(
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            num_draft_tokens=num_draft_tokens,
+        )
+
+    @classmethod
+    def triton(
+        cls,
+        *,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        num_draft_tokens: int,
+    ) -> ExpandUniformVerifyResult:
+        return expand_uniform_verify_triton(
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            num_draft_tokens=num_draft_tokens,
+        )
+
+
+def _validate_uniform_verify_inputs(
+    *,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_draft_tokens: int,
+) -> None:
+    assert num_draft_tokens > 0
+    assert req_pool_indices.dim() == seq_lens.dim() == 1
+    assert req_pool_indices.shape == seq_lens.shape
+    assert req_pool_indices.device == seq_lens.device
+    assert req_pool_indices.dtype in (torch.int32, torch.int64)
+    assert seq_lens.dtype in (torch.int32, torch.int64)
+
+
+def expand_uniform_verify(
+    *,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_draft_tokens: int,
+) -> ExpandUniformVerifyResult:
+    _validate_uniform_verify_inputs(
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        num_draft_tokens=num_draft_tokens,
+    )
+    offsets = torch.arange(
+        1,
+        num_draft_tokens + 1,
+        dtype=torch.int32,
+        device=seq_lens.device,
+    )
+    return ExpandUniformVerifyResult(
+        seq_lens_extended=seq_lens.to(torch.int64) + num_draft_tokens,
+        seq_lens_casual=(
+            seq_lens.to(torch.int32)[:, None] + offsets[None, :]
+        ).flatten(),
+        req_pool_indices_repeated=req_pool_indices.repeat_interleave(num_draft_tokens),
+    )
+
+
+@triton.jit
+def _expand_uniform_verify_kernel(
+    req_pool_indices_ptr,
+    seq_lens_ptr,
+    seq_lens_out_ptr,
+    seq_lens_casual_ptr,
+    req_pool_indices_repeated_ptr,
+    req_pool_indices_stride,
+    seq_lens_stride,
+    num_tokens,
+    NUM_DRAFT_TOKENS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token_idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    token_mask = token_idx < num_tokens
+    req_idx = token_idx // NUM_DRAFT_TOKENS
+    token_offset = token_idx % NUM_DRAFT_TOKENS
+
+    seq_len = tl.load(seq_lens_ptr + req_idx * seq_lens_stride, mask=token_mask)
+    req_pool_idx = tl.load(
+        req_pool_indices_ptr + req_idx * req_pool_indices_stride,
+        mask=token_mask,
+    )
+
+    tl.store(
+        seq_lens_casual_ptr + token_idx,
+        seq_len + token_offset + 1,
+        mask=token_mask,
+    )
+    tl.store(
+        req_pool_indices_repeated_ptr + token_idx,
+        req_pool_idx,
+        mask=token_mask,
+    )
+
+    first_token = token_mask & (token_offset == 0)
+    tl.store(
+        seq_lens_out_ptr + req_idx,
+        seq_len.to(tl.int64) + NUM_DRAFT_TOKENS,
+        mask=first_token,
+    )
+
+
+def expand_uniform_verify_triton(
+    *,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_draft_tokens: int,
+) -> ExpandUniformVerifyResult:
+    _validate_uniform_verify_inputs(
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        num_draft_tokens=num_draft_tokens,
+    )
+    bs = seq_lens.shape[0]
+    num_tokens = bs * num_draft_tokens
+    device = seq_lens.device
+
+    seq_lens_out = torch.empty(bs, dtype=torch.int64, device=device)
+    seq_lens_casual = torch.empty(num_tokens, dtype=torch.int32, device=device)
+    req_pool_indices_repeated = torch.empty(
+        num_tokens, dtype=req_pool_indices.dtype, device=device
+    )
+
+    BLOCK = 256
+    _expand_uniform_verify_kernel[(triton.cdiv(num_tokens, BLOCK),)](
+        req_pool_indices,
+        seq_lens,
+        seq_lens_out,
+        seq_lens_casual,
+        req_pool_indices_repeated,
+        req_pool_indices.stride(0),
+        seq_lens.stride(0),
+        num_tokens,
+        NUM_DRAFT_TOKENS=num_draft_tokens,
+        BLOCK=BLOCK,
+    )
+    return ExpandUniformVerifyResult(
+        seq_lens_extended=seq_lens_out,
+        seq_lens_casual=seq_lens_casual,
+        req_pool_indices_repeated=req_pool_indices_repeated,
+    )
+
+
 class ExpandPrefillCausally:
     @classmethod
     def execute(cls, *args, **kwargs) -> ExpandPrefillCausallyResult:
