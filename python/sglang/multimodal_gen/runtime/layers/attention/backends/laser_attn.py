@@ -15,7 +15,7 @@ logger = init_logger(__name__)
 try:
     import attentions  # noqa: F401
 except ImportError as e:
-    logger.warning(
+    logger.warning_once(
         "The 'attentions' library is not installed. Laser Attention is unavailable. "
         "Installing this library may improve performance on NPU. "
         "See: sgl-project/sgl-kernel-npu"
