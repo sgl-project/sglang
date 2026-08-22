@@ -181,11 +181,16 @@ def make_paged_context(
     )
 
 
-def make_state_pool(num_pages: int, compress_ratio: int, head_dim: int) -> torch.Tensor:
+def make_state_pool(
+    num_pages: int,
+    compress_ratio: int,
+    head_dim: int,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
     last_dim = head_dim * (4 if compress_ratio == 4 else 2)
     return torch.zeros(
         (num_pages, compress_ratio, last_dim),
-        dtype=torch.float32,
+        dtype=dtype,
         device=get_device(),
     )
 
