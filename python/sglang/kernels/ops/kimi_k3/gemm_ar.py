@@ -35,6 +35,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.ops.memory.ptr_table import make_ptr_table
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -128,7 +129,7 @@ def init(
     # explicit cpu: model build may run under a cuda default-device context,
     # and a silently-cuda tensor here means the host-side deref in set_bases
     # reads a device pointer (segfault)
-    uc_bases = torch.tensor(ptrs, dtype=torch.int64, device="cpu")
+    uc_bases = make_ptr_table(ptrs, device="cpu")
     gather = torch.zeros(int(mod.gather_words()), dtype=torch.int32, device=device)
     epochs = torch.zeros(int(mod.num_fams()), dtype=torch.int32, device=device)
     torch.cuda.synchronize()
