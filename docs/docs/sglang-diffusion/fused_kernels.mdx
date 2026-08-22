@@ -183,7 +183,7 @@ Runtime code imports from the package, never from a submodule:
 from sglang.kernels.ops.diffusion import fused_rmsnorm_scale_shift_bitexact
 ```
 
-Resolution is lazy: the backends have disjoint, heavy dependencies (Triton, CUTLASS/CuTe-DSL, FlyDSL on ROCm, MLX on Apple), so an eager re-export would make every one of them an import-time requirement on every platform. Each public kernel is a predicate-plus-kernel pair — call `can_use_<op>(...)` first and fall back to the reference chain when it returns `False`; the kernel raises on an unsupported input rather than silently returning `None`.
+Resolution is lazy: the backends have disjoint, heavy dependencies (Triton, CUTLASS/CuTe-DSL, and FlyDSL on ROCm), so an eager re-export would make every one of them an import-time requirement on every platform. Each public kernel is a predicate-plus-kernel pair — call `can_use_<op>(...)` first and fall back to the reference chain when it returns `False`; the kernel raises on an unsupported input rather than silently returning `None`.
 
 The package `README.md` carries a selection matrix for the cases where several kernels look interchangeable and are not. The normalization domain alone holds more than a dozen implementations that differ by numerical contract, activation layout, and backend rather than by speed.
 
