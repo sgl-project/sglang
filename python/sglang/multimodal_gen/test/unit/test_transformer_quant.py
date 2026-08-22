@@ -67,6 +67,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders import transformer_loader
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
+    TransformerLoader,
     _default_quantized_attention_backend,
     _resolve_checkpoint_load_device,
     _warn_if_expected_param_dtype_missing,
@@ -121,6 +122,29 @@ def _make_quant_config(name: str, **attrs):
 
 
 class TestTransformerQuantHelpers(unittest.TestCase):
+    def test_mps_layerwise_load_uses_residency_api(self):
+        server_args = SimpleNamespace(
+            should_configure_layerwise_offload_for_lazy_component=lambda name: (
+                name == "transformer"
+            )
+        )
+
+        with patch.object(
+            transformer_loader.current_platform, "is_mps", return_value=True
+        ):
+            self.assertEqual(
+                TransformerLoader().customized_load_kwargs_for_component(
+                    server_args, "transformer"
+                ),
+                {"cpu_offload_flag": True},
+            )
+            self.assertEqual(
+                TransformerLoader().customized_load_kwargs_for_component(
+                    server_args, "audio_dit"
+                ),
+                {},
+            )
+
     def _make_server_args(self, **overrides):
         defaults = dict(
             transformer_weights_path=None,
