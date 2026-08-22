@@ -1575,17 +1575,33 @@ def biased_grouped_topk_gpu(
         assert (
             hidden_states.shape[0] == gating_output.shape[0]
         ), f"Number of tokens mismatch: hidden_states.shape[0] = {hidden_states.shape[0]}, gating_output.shape[0] = {gating_output.shape[0]}"
+        bias = correction_bias.to(dtype=gating_output.dtype)
+        scaling = routed_scaling_factor if routed_scaling_factor is not None else 1.0
+
+        if envs.SGLANG_K3_RADIX4_TOPK.get():
+            from sglang.kernels.ops.moe import moe_route_radix4
+
+            # Gated on the routing shape. Kimi-K3 (896 experts, top-16,
+            # ungrouped) is the only config covered for now; anything else
+            # falls back to aiter.
+            if moe_route_radix4.available() and moe_route_radix4.covered(
+                gating_output, bias, topk, num_expert_group, topk_group
+            ):
+                return moe_route_radix4.route_radix4(
+                    gating_output, bias, topk, renormalize, scaling
+                )
+
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         aiter_biased_grouped_topk(
             gating_output,
-            correction_bias.to(dtype=gating_output.dtype),
+            bias,
             topk_weights,
             topk_ids,
             num_expert_group,
             topk_group,
             renormalize,
-            routed_scaling_factor if routed_scaling_factor is not None else 1.0,
+            scaling,
         )
         return topk_weights, topk_ids
     elif _is_musa and (
