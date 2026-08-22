@@ -102,21 +102,35 @@ def build_ragged_verify_window(
         prefix_lens.to(torch.int64)[safe_req] + within,
         torch.zeros_like(within),
     )
-    real_cache_loc = assign_extend_cache_locs_func(
-        req_pool_indices=batch.req_pool_indices,
-        req_to_token=model_runner.req_to_token_pool.req_to_token,
-        start_offset=prefix_lens,
-        end_offset=prefix_lens + verify_lens.to(prefix_lens.dtype),
-        batch_size=bs,
-        draft_token_num=verify_num_draft_tokens,
-        device=device,
-    )
-    verify_cache_loc = torch.nn.functional.pad(
-        real_cache_loc, (0, padded_total - real_cache_loc.shape[0])
-    )
-    verify_cache_loc = torch.where(
-        valid, verify_cache_loc, torch.zeros_like(verify_cache_loc)
-    )
+    if _is_npu:
+        # npu.cache_loc_update always materializes bs * draft_token_num slots,
+        # which is the uniform verify shape. Compact verify needs exactly the
+        # packed rows described by (req_id, within), so gather them directly
+        # from req_to_token instead.
+        req_to_token = model_runner.req_to_token_pool.req_to_token
+        logical_pos = prefix_lens.to(torch.int64)[safe_req] + within
+        verify_cache_loc = req_to_token[
+            batch.req_pool_indices.to(torch.int64)[safe_req], logical_pos
+        ].to(torch.int32)
+        verify_cache_loc = torch.where(
+            valid, verify_cache_loc, torch.zeros_like(verify_cache_loc)
+        )
+    else:
+        real_cache_loc = assign_extend_cache_locs_func(
+            req_pool_indices=batch.req_pool_indices,
+            req_to_token=model_runner.req_to_token_pool.req_to_token,
+            start_offset=prefix_lens,
+            end_offset=prefix_lens + verify_lens.to(prefix_lens.dtype),
+            batch_size=bs,
+            draft_token_num=verify_num_draft_tokens,
+            device=device,
+        )
+        verify_cache_loc = torch.nn.functional.pad(
+            real_cache_loc, (0, padded_total - real_cache_loc.shape[0])
+        )
+        verify_cache_loc = torch.where(
+            valid, verify_cache_loc, torch.zeros_like(verify_cache_loc)
+        )
 
     verify_ids = compact_verify_ids(
         draft_block_ids=draft_block_ids,
@@ -179,15 +193,24 @@ def build_ragged_verify_window_triton(
     req_id, within, _valid = compact_row_index_triton(
         verify_lens=verify_lens, padded_total=padded_total, device=device
     )
-    real_cache_loc = assign_extend_cache_locs_func(
-        req_pool_indices=batch.req_pool_indices,
-        req_to_token=model_runner.req_to_token_pool.req_to_token,
-        start_offset=prefix_lens,
-        end_offset=prefix_lens + verify_lens.to(prefix_lens.dtype),
-        batch_size=bs,
-        draft_token_num=verify_num_draft_tokens,
-        device=device,
-    )
+    if _is_npu:
+        # npu.cache_loc_update always returns the uniform bs * gamma shape.
+        # Gather the packed ragged rows directly instead.
+        safe_req = req_id.clamp(max=bs - 1)
+        logical_pos = prefix_lens.to(torch.int64)[safe_req] + within
+        real_cache_loc = model_runner.req_to_token_pool.req_to_token[
+            batch.req_pool_indices.to(torch.int64)[safe_req], logical_pos
+        ].to(torch.int32)
+    else:
+        real_cache_loc = assign_extend_cache_locs_func(
+            req_pool_indices=batch.req_pool_indices,
+            req_to_token=model_runner.req_to_token_pool.req_to_token,
+            start_offset=prefix_lens,
+            end_offset=prefix_lens + verify_lens.to(prefix_lens.dtype),
+            batch_size=bs,
+            draft_token_num=verify_num_draft_tokens,
+            device=device,
+        )
     prefix_i64 = prefix_lens.to(device=device, dtype=torch.int64).contiguous()
     positions = torch.empty(padded_total, dtype=torch.int64, device=device)
     verify_cache_loc = torch.empty(
@@ -802,7 +825,7 @@ def build_commit_inject_layout_triton(
 class BuildOutTokens:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
-        if inputs_on_cuda(*args, **kwargs) and not _is_npu:
+        if inputs_on_cuda(*args, **kwargs):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
 
@@ -887,6 +910,37 @@ def _build_out_tokens_kernel(
     tl.store(out_ptr + offs, val.to(tl.int64), mask=mask)
 
 
+@triton.jit
+def _build_out_tokens_npu_kernel(
+    draft_tokens_ptr,
+    correct_len_ptr,
+    bonus_ptr,
+    out_ptr,
+    gamma,
+    T,
+    n_out,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n_out
+    b = offs // T
+    k = offs % T
+
+    # Keep the whole selection path in int64 on Ascend. Mixing the int32
+    # predicate/index path with int64 token values can be lowered to an i8/i1
+    # predicate mismatch by Triton-Ascend and produce incorrect output tokens.
+    cl = tl.load(correct_len_ptr + b, mask=mask, other=0).to(tl.int64)
+    bonus = tl.load(bonus_ptr + b, mask=mask, other=0).to(tl.int64)
+    draft_mask = mask & (k < gamma)
+    draft = tl.load(draft_tokens_ptr + b * gamma + k, mask=draft_mask, other=0).to(
+        tl.int64
+    )
+    k64 = k.to(tl.int64)
+    val = tl.where(k64 == cl, bonus, tl.where(k64 < gamma, draft, 0))
+    tl.store(out_ptr + offs, val.to(tl.int64), mask=mask)
+
+
 def build_out_tokens_triton(
     *,
     draft_tokens: torch.Tensor,
@@ -905,7 +959,8 @@ def build_out_tokens_triton(
     n_out = bs * T
     BLOCK = 256
     grid = (triton.cdiv(n_out, BLOCK),)
-    _build_out_tokens_kernel[grid](
+    kernel = _build_out_tokens_npu_kernel if _is_npu else _build_out_tokens_kernel
+    kernel[grid](
         draft_tokens, correct_len_i, bonus_i, out, gamma, T, n_out, BLOCK=BLOCK
     )
     return out

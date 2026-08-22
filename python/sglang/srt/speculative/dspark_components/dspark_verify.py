@@ -573,7 +573,7 @@ class DsparkVerifyEpilogue:
             and buf.shape[1] == compact.shape[1]
         ):
             return buf
-        assert not torch.cuda.is_current_stream_capturing(), (
+        assert not torch.get_device_module().is_current_stream_capturing(), (
             "DsparkVerifyEpilogue output buffers must be allocated during "
             "warmup, not inside graph capture (pool memory is unreadable "
             "post-replay)."

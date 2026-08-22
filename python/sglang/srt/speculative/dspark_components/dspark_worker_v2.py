@@ -60,6 +60,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     alloc_verify_window,
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
+    ragged_capture_num_tokens,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
@@ -241,11 +242,19 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_block_spec_info=self._draft_block_spec_info,
             dp_moe_sync=self._draft_is_moe and get_parallel().enable_dp_attention,
         )
+        use_npu_dsv4_epilogue_hook = False
+        if _is_npu:
+            _, target_decode_attention_backend = (
+                server_args._resolved_attention_backends()
+            )
+            use_npu_dsv4_epilogue_hook = (
+                target_decode_attention_backend == "dsv4"
+            )
         self._verify_epilogue = None
         if (
             self._verify_planner.is_compact_mode
             and self._decode_graph_allowed
-            and is_cuda()
+            and (is_cuda() or _is_npu)
         ):
             self._verify_epilogue = DsparkVerifyEpilogue(
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
@@ -260,8 +269,18 @@ class DSparkWorkerV2(BaseSpecWorker):
                     ),
                 ),
             )
+            if use_npu_dsv4_epilogue_hook:
+                from sglang.srt.hardware_backend.npu.dsv4.dspark_graph_hooks import (
+                    make_dspark_verify_epilogue_capture_hook,
+                )
+
+                verify_epilogue_capture_hook = (
+                    make_dspark_verify_epilogue_capture_hook(self._verify_epilogue)
+                )
+            else:
+                verify_epilogue_capture_hook = self._verify_epilogue.capture_hook
             self.model_runner.capture_tail_hooks.append(
-                self._verify_epilogue.capture_hook
+                verify_epilogue_capture_hook
             )
 
         self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
@@ -348,12 +367,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         with self._draft_context():
-            if _is_npu:
-                from sglang.srt.hardware_backend.npu.extra_ops_loader import (
-                    initialize_dspark_sparse_attn_ops,
-                )
-
-                initialize_dspark_sparse_attn_ops()
             self._draft_worker.init_attention_backends()
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
@@ -517,7 +530,18 @@ class DSparkWorkerV2(BaseSpecWorker):
         return batch_output
 
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
-        if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:
+        # An idle rank only needs fabricated compact rows to replay the same
+        # token-keyed graph as busy ranks.  In eager mode it must keep zero
+        # local tokens and merely participate in the DP/EP collectives.  If we
+        # build a uniform layout without a ragged graph runner, the verify path
+        # creates ``verify_num_draft_tokens`` dummy inputs while DP padding
+        # still assigns this rank zero tokens, which results in negative
+        # padding (for example, ``0 - 6``).
+        if (
+            batch.global_num_tokens is None
+            or not self._verify_planner.is_compact_mode
+            or ragged_capture_num_tokens(model_runner=self.model_runner) is None
+        ):
             return None
         global_bs = max(batch.global_num_tokens)
         if global_bs <= 0:
