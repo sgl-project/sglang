@@ -446,6 +446,23 @@ MODELS = {
             "--guidance-scale=3.0",
         ],
     },
+    "wan21-t2v-14b": {
+        "path": "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+        "prompt": "A curious raccoon",
+        "extra_args": [
+            "--width=832",
+            "--height=480",
+            "--num-frames=81",
+            "--fps=16",
+            "--num-inference-steps=50",
+            "--guidance-scale=5.0",
+            "--num-gpus=4",
+            "--enable-cfg-parallel",
+            "--ulysses-degree=2",
+            "--text-encoder-cpu-offload",
+            "--pin-cpu-memory",
+        ],
+    },
     "krea2-turbo": {
         "path": "krea/Krea-2-Turbo",
         "prompt": "A red fox sitting in fresh snow, golden hour, photorealistic.",
