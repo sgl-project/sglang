@@ -258,6 +258,16 @@ Minimal end-to-end validation flow:
 A reusable local validation script is available at `~/TestEnv/nixl_hicache_hybrid_e2e.py`; it starts this server, sends a long request, and checks both NIXL backend selection and Mamba sidecar storage files.
 
 
+## Prometheus storage metrics
+
+Add `--enable-metrics` to the SGLang command line expose these values at `/metrics`:
+
+- `sglang:prefetch_pgs`
+- `sglang:backup_pgs`
+- `sglang:prefetch_bandwidth`
+- `sglang:backup_bandwidth`
+
+Prefetch is a storage-to-host READ, and backup is a host-to-storage WRITE. Page values are logical HiCache pages per completed NIXL batch; bandwidth values are effective batch bandwidth in GiB/s. The series use `storage_backend="nixl"`. Failed batches are not recorded.
 
 ## Running Unit Tests
 
