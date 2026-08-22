@@ -126,7 +126,55 @@ set(FlashMLA_SOURCES
 )
 
 if(FLASHMLA_ENABLE_SM100)
+    # Extend the pinned open-source FlashMLA V32 producer with the GLM-5.2
+    # 416-byte NVFP4/BF16 cache. The packed E2M1 producer materializes the
+    # same BF16 tiles consumed by the stock FlashMLA QK/PV pipeline.
+    set(FLASHMLA_NVFP4_PATCH
+        "${CMAKE_CURRENT_LIST_DIR}/../patches/flashmla_sm100_nvfp4.patch")
+    set(FLASHMLA_SM100_HEAD64_KERNEL_FILE
+        "${repo-flashmla_SOURCE_DIR}/csrc/sm100/decode/head64/kernel.cuh")
+    set(FLASHMLA_NVFP4_MARKER
+        "SGLANG_SM100_GLM52_NVFP4_BF16_V1")
+
+    file(READ "${FLASHMLA_SM100_HEAD64_KERNEL_FILE}"
+        FLASHMLA_SM100_HEAD64_KERNEL_CONTENT)
+    string(FIND "${FLASHMLA_SM100_HEAD64_KERNEL_CONTENT}"
+        "${FLASHMLA_NVFP4_MARKER}" FLASHMLA_NVFP4_PATCHED)
+    if(FLASHMLA_NVFP4_PATCHED EQUAL -1)
+        find_program(FLASHMLA_PATCH_EXECUTABLE patch REQUIRED)
+        execute_process(
+            COMMAND "${FLASHMLA_PATCH_EXECUTABLE}" --batch --forward
+                    --ignore-whitespace -p1
+                    -i "${FLASHMLA_NVFP4_PATCH}"
+            WORKING_DIRECTORY "${repo-flashmla_SOURCE_DIR}"
+            RESULT_VARIABLE FLASHMLA_NVFP4_PATCH_RESULT
+            OUTPUT_VARIABLE FLASHMLA_NVFP4_PATCH_STDOUT
+            ERROR_VARIABLE FLASHMLA_NVFP4_PATCH_STDERR)
+        if(NOT FLASHMLA_NVFP4_PATCH_RESULT EQUAL 0)
+            message(FATAL_ERROR
+                "Failed to apply ${FLASHMLA_NVFP4_PATCH}:\n"
+                "${FLASHMLA_NVFP4_PATCH_STDOUT}\n"
+                "${FLASHMLA_NVFP4_PATCH_STDERR}")
+        endif()
+
+        file(READ "${FLASHMLA_SM100_HEAD64_KERNEL_FILE}"
+            FLASHMLA_SM100_HEAD64_KERNEL_CONTENT)
+        string(FIND "${FLASHMLA_SM100_HEAD64_KERNEL_CONTENT}"
+            "${FLASHMLA_NVFP4_MARKER}" FLASHMLA_NVFP4_PATCHED)
+        if(FLASHMLA_NVFP4_PATCHED EQUAL -1)
+            message(FATAL_ERROR
+                "FlashMLA NVFP4 patch completed without expected marker "
+                "${FLASHMLA_NVFP4_MARKER}")
+        endif()
+        message(STATUS "Applied SM100 GLM-5.2 NVFP4/BF16 FlashMLA patch")
+    else()
+        message(STATUS "SM100 GLM-5.2 NVFP4/BF16 FlashMLA patch already applied")
+    endif()
+
     list(APPEND FlashMLA_SOURCES
+        # GLM-5.2 416-byte NVFP4/BF16 DSA producer.
+        csrc/flashmla_nvfp4_sm100.cu
+
         # sm100 dense prefill/bwd.
         ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu
         ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu

@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from typing import List, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
@@ -1124,6 +1125,128 @@ class TestDSAIndexer(CustomTestCase):
                     backend.decode_cuda_graph_metadata["page_table"] is None,
                     should_use_topk_v2,
                 )
+
+    def test_nvfp4_prefill_uses_ragged_indices_for_materialized_prefix(self):
+        backend = object.__new__(DeepseekSparseAttnBackend)
+        backend.dsa_kv_cache_store_fp8 = False
+        backend.dsa_kv_cache_store_nvfp4 = True
+        backend.dsa_kv_cache_store_packed_fp4 = True
+        backend.dsa_prefill_impl = "flashmla_sparse"
+        self.assertEqual(
+            backend.get_topk_transform_method(ForwardMode.EXTEND),
+            TopkTransformMethod.RAGGED,
+        )
+
+        # The legacy FP8 sparse-prefill fallback materializes a logical
+        # contiguous cache and therefore still requires RAGGED offsets.
+        backend.dsa_kv_cache_store_fp8 = True
+        backend.dsa_kv_cache_store_nvfp4 = False
+        backend.dsa_kv_cache_store_packed_fp4 = False
+        self.assertEqual(
+            backend.get_topk_transform_method(ForwardMode.EXTEND),
+            TopkTransformMethod.RAGGED,
+        )
+
+    def test_nvfp4_flashmla_dispatch_keeps_packed_cache(self):
+        backend = object.__new__(DeepseekSparseAttnBackend)
+        backend.dsa_kv_cache_store_nvfp4 = True
+        backend.real_page_size = 64
+        backend.kv_cache_dim = 416
+        global_scale = torch.tensor([1.375], device=self.device)
+        backend.token_to_kv_pool = MagicMock()
+        backend.token_to_kv_pool.get_mla_kv_global_scale.return_value = global_scale
+
+        q = torch.randn(2, 64, 576, dtype=torch.bfloat16, device=self.device)
+        packed_kv = torch.zeros(64, 1, 416, dtype=torch.uint8, device=self.device)
+        indices = torch.zeros(2, 2048, dtype=torch.int32, device=self.device)
+        lengths = torch.full((2,), 2048, dtype=torch.int32, device=self.device)
+        scheduler_metadata = torch.zeros(1, 8, dtype=torch.int32, device=self.device)
+        num_splits = torch.ones(3, dtype=torch.int32, device=self.device)
+        metadata = SimpleNamespace(
+            dsa_cache_seqlens_int32=lengths,
+            flashmla_metadata=SimpleNamespace(
+                flashmla_metadata=scheduler_metadata,
+                num_splits=num_splits,
+            ),
+        )
+        layer = SimpleNamespace(
+            tp_q_head_num=64,
+            head_dim=576,
+            layer_id=0,
+        )
+        output = torch.zeros(2, 1, 64, 512, dtype=torch.bfloat16, device=self.device)
+
+        with patch(
+            "sgl_kernel.flash_mla.flash_mla_with_kvcache_nvfp4",
+            return_value=(output, None, None, None),
+            create=True,
+        ) as fused:
+            actual = backend._forward_flashmla_kv(
+                q_all=q,
+                kv_cache=packed_kv,
+                v_head_dim=512,
+                sm_scale=1.0,
+                layer=layer,
+                metadata=metadata,
+                page_table_1=indices,
+            )
+
+        self.assertIs(actual, output)
+        kwargs = fused.call_args.kwargs
+        self.assertEqual(kwargs["q"].dtype, torch.bfloat16)
+        self.assertEqual(kwargs["q"].shape, (2, 1, 64, 576))
+        self.assertEqual(kwargs["k_cache"].shape, (1, 64, 1, 416))
+        self.assertEqual(kwargs["k_cache"].data_ptr(), packed_kv.data_ptr())
+        self.assertEqual(kwargs["indices"].shape, (2, 1, 2048))
+        self.assertIsNone(kwargs["topk_length"])
+        self.assertIs(kwargs["kv_global_scale"], global_scale)
+
+    def test_nvfp4_dsa_pool_moves_main_and_index_cache_together(self):
+        fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+        if fp4_dtype is None:
+            self.skipTest("torch build does not expose float4_e2m1fn_x2")
+        pool = DSATokenToKVPool(
+            size=128,
+            page_size=64,
+            kv_lora_rank=512,
+            dtype=fp4_dtype,
+            qk_rope_head_dim=64,
+            layer_num=2,
+            device=self.device,
+            index_head_dim=128,
+            enable_memory_saver=False,
+            kv_cache_dim=416,
+        )
+        source = torch.tensor([3, 7], dtype=torch.int64, device=self.device)
+        target = torch.tensor([9, 11], dtype=torch.int64, device=self.device)
+        for layer in range(pool.layer_num):
+            pool.kv_buffer[layer][source] = layer + 17
+            index_buffer = pool.index_k_with_scale_buffer[layer]
+            row_bytes = index_buffer.shape[1] // pool.page_size
+            index_rows = index_buffer.view(-1, row_bytes)
+            index_rows[source] = layer + 29
+        expected_main = [buffer[source].clone() for buffer in pool.kv_buffer]
+        expected_index = [
+            buffer.view(-1, buffer.shape[1] // pool.page_size)[source].clone()
+            for buffer in pool.index_k_with_scale_buffer
+        ]
+
+        pool.move_kv_cache(target, source)
+
+        for layer in range(pool.layer_num):
+            self.assertTrue(
+                torch.equal(pool.kv_buffer[layer][target], expected_main[layer])
+            )
+            self.assertTrue(
+                torch.equal(
+                    pool.index_k_with_scale_buffer[layer].view(
+                        -1,
+                        pool.index_k_with_scale_buffer[layer].shape[1]
+                        // pool.page_size,
+                    )[target],
+                    expected_index[layer],
+                )
+            )
 
     # TODO: enable this test after indexer accuracy aligned
     # @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")

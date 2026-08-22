@@ -433,11 +433,16 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         remote_kv_updatable = self.remote_kv_layer_id == layer_id
         if remote_kv_updatable:
             self._write_mla_kv_buffer(
-                self.remote_kv_buffer, loc, cache_k_nope, cache_k_rope
+                layer_id,
+                self.remote_kv_buffer,
+                loc,
+                cache_k_nope,
+                cache_k_rope,
             )
         if not self._is_layer_owned(layer_id):
             return
         self._write_mla_kv_buffer(
+            layer_id,
             self.kv_buffer[layer_id - self.start_layer],
             loc,
             cache_k_nope,
