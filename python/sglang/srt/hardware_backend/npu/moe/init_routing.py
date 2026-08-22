@@ -103,8 +103,8 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
         if self.quant_mode == -1:
             pertoken_scale = None
         elif self.quant_mode == MXFP8_QUANT_MODE:
-            pertoken_scale = (
-                get_device_operator().normalize_mxfp_scale_layout(pertoken_scale)
+            pertoken_scale = get_device_operator().normalize_mxfp_scale_layout(
+                pertoken_scale
             )
         expert_tokens = expert_tokens.to(torch.int64)
         return hidden_states, expanded_row_idx, expert_tokens, pertoken_scale

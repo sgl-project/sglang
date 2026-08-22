@@ -53,9 +53,7 @@ def _fake_torch_npu(device_name, current_device=0):
 class TestDeviceGenerationDetection(_CacheClearingTestCase):
     def test_non_npu_environment_returns_legacy(self):
         with patch("sglang.srt.utils.is_npu", return_value=False):
-            self.assertEqual(
-                get_npu_device_generation(), AscendDeviceGeneration.LEGACY
-            )
+            self.assertEqual(get_npu_device_generation(), AscendDeviceGeneration.LEGACY)
             self.assertIsInstance(get_device_operator(), BaseDeviceOperator)
 
     def test_ascend950_detected_as_a5(self):
@@ -72,9 +70,7 @@ class TestDeviceGenerationDetection(_CacheClearingTestCase):
         with patch("sglang.srt.utils.is_npu", return_value=True), patch.object(
             torch, "npu", fake_npu, create=True
         ):
-            self.assertEqual(
-                get_npu_device_generation(), AscendDeviceGeneration.A5
-            )
+            self.assertEqual(get_npu_device_generation(), AscendDeviceGeneration.A5)
             self.assertIsInstance(get_device_operator(), A5DeviceOperator)
         # The current device is probed, never a hardcoded device 0.
         self.assertEqual(probed["device_id"], 3)
@@ -84,9 +80,7 @@ class TestDeviceGenerationDetection(_CacheClearingTestCase):
         with patch("sglang.srt.utils.is_npu", return_value=True), patch.object(
             torch, "npu", fake_npu, create=True
         ):
-            self.assertEqual(
-                get_npu_device_generation(), AscendDeviceGeneration.LEGACY
-            )
+            self.assertEqual(get_npu_device_generation(), AscendDeviceGeneration.LEGACY)
             self.assertIsInstance(get_device_operator(), BaseDeviceOperator)
 
     def test_explicit_device_id_is_forwarded(self):
@@ -113,9 +107,7 @@ class TestDeviceGenerationDetection(_CacheClearingTestCase):
 class TestNormalizeMxfpScaleLayout(unittest.TestCase):
     def test_base_returns_identity(self):
         scale = torch.empty(4, 16)
-        self.assertIs(
-            BaseDeviceOperator.normalize_mxfp_scale_layout(scale), scale
-        )
+        self.assertIs(BaseDeviceOperator.normalize_mxfp_scale_layout(scale), scale)
 
     def test_base_passes_none(self):
         self.assertIsNone(BaseDeviceOperator.normalize_mxfp_scale_layout(None))
@@ -180,7 +172,9 @@ class TestInitRoutingMxfpScale(unittest.TestCase):
         ):
             _, _, _, scale = self._run_routing(MXFP8_QUANT_MODE)
         self.assertEqual(scale.shape, (self.NUM_TOKENS, self.SCALE_COLS // 2, 2))
-        self.assertTrue(torch.equal(scale.reshape(self.NUM_TOKENS, -1), self._flat_scale()))
+        self.assertTrue(
+            torch.equal(scale.reshape(self.NUM_TOKENS, -1), self._flat_scale())
+        )
 
     def test_legacy_operator_keeps_native_scale_layout(self):
         # Legacy devices keep the producer's native representation.
