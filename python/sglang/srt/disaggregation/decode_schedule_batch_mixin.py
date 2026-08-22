@@ -163,8 +163,10 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     )
                 req.grammar.finished = req.finished()
         last_tokens_tensor = torch.tensor(
-            last_tokens, dtype=torch.int64, device=self.device
-        )
+            last_tokens,
+            dtype=torch.int64,
+            pin_memory=is_pin_memory_available(self.device),
+        ).to(self.device, non_blocking=True)
 
         spec_info = self.spec_algorithm.build_disagg_draft_input(
             self,

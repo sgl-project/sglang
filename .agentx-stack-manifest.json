@@ -180,6 +180,17 @@
     "targeted_validation": "CMH job 3233760: 5 existing PREBUILT metadata tests pass; identical production transformation reduces host enqueue from 38.710445 to 0.032832 ms behind controlled prior GPU work. Same-source 3P2D C704 service A/B is pending.",
     "scope": "Diagnostic A/B source only; final production source remains the top-only branch."
   },
+  "layer3_prebuilt_full_relay_async_h2d_ab": {
+    "parent_commit": "eea5ca49a6b87b1bfd45164c366714172a5ed07a",
+    "files": {
+      "python/sglang/srt/disaggregation/decode_schedule_batch_mixin.py": "4b347d266507e217e2032b3bf54d823beaf1056ac1dc60c8746c059bf68282aa",
+      "python/sglang/srt/speculative/eagle_disaggregation.py": "954881514b69bba661156ed44cdf4f9f80cf8a14b1d17f16c27e3f681e4fb11b"
+    },
+    "change": "Apply the complete production PREBUILT relay pinned-host/non-blocking H2D transformation on top of the existing Layer-3 prepare-substage telemetry.",
+    "source_evidence": "Job 3233840 showed that the partial metadata candidate moved the 14-16 ms wait into process_prebuilt, so this A/B source also stages last-token and EAGLE relay tensors.",
+    "targeted_validation": "Existing PREBUILT and EAGLE disaggregation units, complete-relay CUDA enqueue mechanism gate, and same-source 3P2D C704 service A/B pending.",
+    "scope": "Diagnostic A/B source only; final production source remains the top-only branch."
+  },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
     "tree": "b0161fbca98775c0f79999f4970de1f14a4426fb"
