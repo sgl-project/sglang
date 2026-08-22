@@ -171,7 +171,7 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
 
 @contextlib.contextmanager
 def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool):
-    from flashinfer.autotuner import autotune
+    from flashinfer.autotuner import autotune, set_autotune_process_group
 
     mr = model_runner
     cache_path = flashinfer_autotune_cache_path(mr)
@@ -189,21 +189,31 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
             autotune_cache,
         )
 
-    # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
-    # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
-    mr.forward_stream.wait_stream(torch.cuda.current_stream())
-    with torch.get_device_module(mr.device).stream(mr.forward_stream):
-        from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
+    # flashinfer #3186/#3187: pin every TP rank to the same autotune tactic so their
+    # symm-mem scratch sizes match; divergent tactics deadlock ncclCommWindowRegister
+    # during CUDA-graph capture under --enable-symm-mem (e.g. Qwen3-235B TP=8).
+    sync_autotune_group = mr.ps.tp_size > 1
+    try:
+        if sync_autotune_group:
+            set_autotune_process_group(mr.tp_group.cpu_group)
+        # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
+        # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
+        mr.forward_stream.wait_stream(torch.cuda.current_stream())
+        with torch.get_device_module(mr.device).stream(mr.forward_stream):
+            from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 
-        skip_ops = get_flashinfer_autotune_skip_ops(mr)
-        with autotune(
-            True,
-            cache=str(autotune_cache),
-            skip_ops=skip_ops,
-        ), autotune_dummy_run_mode(run_lm_head=run_lm_head):
-            yield
-    torch.cuda.current_stream().wait_stream(mr.forward_stream)
-    logger.info("FlashInfer autotune completed.")
+            skip_ops = get_flashinfer_autotune_skip_ops(mr)
+            with autotune(
+                True,
+                cache=str(autotune_cache),
+                skip_ops=skip_ops,
+            ), autotune_dummy_run_mode(run_lm_head=run_lm_head):
+                yield
+        torch.cuda.current_stream().wait_stream(mr.forward_stream)
+        logger.info("FlashInfer autotune completed.")
+    finally:
+        if sync_autotune_group:
+            set_autotune_process_group(None)
 
 
 def run_flashinfer_autotune_forward(
