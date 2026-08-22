@@ -544,10 +544,6 @@ def generate_metrics_json(metrics_data_file, test_case, status):
         json.dump(output, f, indent=2)
     logger.info(f"Metrics JSON written to {output_path}")
 
-    with open("/tmp/metrics.json", "w") as f:
-        json.dump(output, f, indent=2)
-    logger.info("Metrics JSON written to /tmp/metrics.json")
-
 
 def run_npu_e2e_test_case(
     docker_image_url: str,

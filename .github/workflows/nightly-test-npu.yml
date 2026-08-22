@@ -1,4 +1,4 @@
-﻿name: Nightly Test (NPU)
+name: Nightly Test (NPU)
 on:
   schedule:
     - cron: '0 16 * * *'  # Execute at 0:00 a.m. Beijing Time every day
@@ -434,13 +434,6 @@ jobs:
       - nightly-poc-multi-node-mix-tests
     runs-on: ubuntu-latest
     steps:
-      - name: Download all metrics
-        uses: actions/download-artifact@v4
-        with:
-          pattern: metrics-*
-          path: /tmp/metrics
-          merge-multiple: false
-
       - name: Generate results table
         run: |
           single_result_a2="${{ needs.nightly-1-npu-a2.result }}"
