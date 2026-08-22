@@ -917,7 +917,10 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
 class MultiLayerEagleWorkerV2(BaseSpecWorker):
     def iter_runners(self) -> List[Tuple[str, ModelRunner]]:
-        return [(f"draft_step_{i}", r) for i, r in enumerate(self.draft_runner_list)]
+        return [
+            (f"draft_step_{i}", r)
+            for i, r in enumerate(self.draft_worker.draft_runner_list)
+        ]
 
     def __init__(
         self,
