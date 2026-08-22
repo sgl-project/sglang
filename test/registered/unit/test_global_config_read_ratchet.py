@@ -104,6 +104,54 @@ _CONFIGURED_SIZE_CALL_SITES = {
     ("srt/managers/scheduler.py", "configured_attn_cp_size"): (
         "same pre-distributed-init arithmetic in configure_scheduler_process"
     ),
+    ("srt/managers/scheduler.py", "configured_dcp_size"): (
+        "same pre-distributed-init arithmetic in configure_scheduler_process"
+    ),
+    ("srt/disaggregation/common/conn.py", "configured_pp_size"): (
+        "the bootstrap connection is built by the KV manager on the transfer "
+        "path, which the CPU-only conn tests exercise without ever starting "
+        "torch.distributed"
+    ),
+    ("srt/elastic_ep/elastic_ep.py", "configured_tp_size"): (
+        "the joiner's rank window is computed against the size the process was "
+        "configured with, not the size of the group it is about to join"
+    ),
+    ("srt/elastic_ep/expert_backup_manager.py", "configured_tp_size"): (
+        "the backup server counts the clients it expects to report in, which "
+        "is how many the launch configured -- the live group is what they are "
+        "still joining"
+    ),
+    (
+        "srt/model_executor/model_runner_components/startup_weight_load.py",
+        "configured_tp_size",
+    ): (
+        "the load options are assembled in ModelRunner.__init__ for a runner "
+        "that may be a draft, whose groups are the target's; the configured "
+        "sizes are what the record answered before"
+    ),
+    (
+        "srt/model_executor/model_runner_components/startup_weight_load.py",
+        "configured_pp_size",
+    ): ("same options object, same reason"),
+    (
+        "srt/model_executor/model_runner_components/startup_weight_load.py",
+        "configured_attn_cp_size",
+    ): ("same options object, same reason"),
+    (
+        "srt/model_executor/model_runner_components/startup_weight_load.py",
+        "configured_dcp_size",
+    ): ("same options object, same reason"),
+    (
+        "srt/model_executor/model_runner_components/spec_aux_hidden_state.py",
+        "configured_tp_size",
+    ): (
+        "the draft KV bytes/token estimate sizes the memory pool before the "
+        "draft runner exists, so its shard count is configuration"
+    ),
+    ("srt/eplb/expert_location.py", "configured_tp_size"): (
+        "the elastic-EP joiner window, used to size the expert layout: the "
+        "size the process was configured with, not the group it is joining"
+    ),
     ("srt/utils/cuda_vmm_transport_utils.py", "configured_tp_size"): (
         "the consumer count is configured fan-out arithmetic (tp_size // "
         "dp_size), which is what the record answered before"

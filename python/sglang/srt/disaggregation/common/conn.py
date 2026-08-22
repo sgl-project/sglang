@@ -36,7 +36,12 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
 )
-from sglang.srt.runtime_context import get_parallel, get_serving
+from sglang.srt.runtime_context import (
+    configured_pp_size,
+    get_disagg,
+    get_parallel,
+    get_serving,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -164,9 +169,9 @@ class CommonKVManager(BaseKVManager):
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
         )
         # for p/d multi node infer
-        self.bootstrap_host = server_args.host
-        self.bootstrap_port = server_args.disaggregation_bootstrap_port
-        self.dist_init_addr = server_args.dist_init_addr
+        self.bootstrap_host = get_serving().host
+        self.bootstrap_port = get_disagg().disaggregation_bootstrap_port
+        self.dist_init_addr = get_parallel().dist_init_addr
         parallel = get_parallel()
         self.attn_tp_size = parallel.attn_tp_size
         self.attn_tp_rank = parallel.attn_tp_rank
@@ -182,7 +187,7 @@ class CommonKVManager(BaseKVManager):
         self.system_dp_rank = (
             self.kv_args.system_dp_rank if self.kv_args.system_dp_rank else 0
         )
-        self.pp_size = server_args.pp_size
+        self.pp_size = configured_pp_size()
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
         cp_sharded_prefill = self.attn_cp_size > 1 and (

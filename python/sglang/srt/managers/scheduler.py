@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, 
 from sglang.srt.runtime_context import (
     attention_backends,
     configured_attn_cp_size,
+    configured_dcp_size,
     configured_moe_dp_size,
     configured_pp_size,
     configured_tp_size,
@@ -417,71 +418,75 @@ class Scheduler(
         # Parse args
         self.server_args = server_args
         self.nccl_port = port_args.nccl_port
-        self.schedule_policy = server_args.schedule_policy
-        self.enable_priority_scheduling = server_args.enable_priority_scheduling
+        self.schedule_policy = get_schedule().schedule_policy
+        self.enable_priority_scheduling = get_schedule().enable_priority_scheduling
         self.abort_on_priority_when_disabled = (
-            server_args.abort_on_priority_when_disabled
+            get_schedule().abort_on_priority_when_disabled
         )
         self.schedule_low_priority_values_first = (
-            server_args.schedule_low_priority_values_first
+            get_schedule().schedule_low_priority_values_first
         )
         self.priority_scheduling_preemption_threshold = (
-            server_args.priority_scheduling_preemption_threshold
+            get_schedule().priority_scheduling_preemption_threshold
         )
-        self.enable_lora = server_args.enable_lora
-        self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
-        self.max_loras_per_batch = server_args.max_loras_per_batch
-        self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
-        self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
-        self.enable_pdmux = server_args.enable_pdmux
+        self.enable_lora = get_lora().enable_lora
+        self.enable_lora_overlap_loading = get_lora().enable_lora_overlap_loading
+        self.max_loras_per_batch = get_lora().max_loras_per_batch
+        self.enable_overlap = (
+            not get_schedule().disable_overlap_schedule and not use_mlx()
+        )
+        self.enable_overlap_mlx = (
+            not get_schedule().disable_overlap_schedule and use_mlx()
+        )
+        self.enable_pdmux = get_disagg().enable_pdmux
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
-        self.stream_interval = server_args.stream_interval
+        self.stream_interval = get_serving().stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
+            get_spec().speculative_algorithm
         )
         self.page_size = get_schedule().page_size
-        self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
-        self.enable_session_radix_cache = server_args.enable_session_radix_cache
-        self.enable_hicache_storage = server_args.hicache_storage_backend is not None
+        self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
+        self.enable_session_radix_cache = get_memory().enable_session_radix_cache
+        self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
         self.enable_decode_hicache = (
-            server_args.disaggregation_decode_enable_radix_cache
+            get_disagg().disaggregation_decode_enable_radix_cache
             and self.enable_hierarchical_cache
         )
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
-        self.enable_hisparse = server_args.enable_hisparse
+        self.enable_hisparse = get_memory().enable_hisparse
         self.enable_dp_attention = get_parallel().enable_dp_attention
-        self.enable_unified_memory = server_args.enable_unified_memory
+        self.enable_unified_memory = get_memory().enable_unified_memory
 
         # Distributed rank info
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
             compute_dp_attention_world_info(
                 get_parallel().enable_dp_attention,
                 tp_rank,
-                server_args.tp_size,
+                configured_tp_size(),
                 get_parallel().dp_size,
-                server_args.attn_cp_size,
+                configured_attn_cp_size(),
             )
         )
         self.ps = ParallelState(
             tp_rank=tp_rank,
-            tp_size=server_args.tp_size,
+            tp_size=configured_tp_size(),
             pp_rank=pp_rank,
-            pp_size=server_args.pp_size,
+            pp_size=configured_pp_size(),
             dp_rank=dp_rank,
             dp_size=get_parallel().dp_size,
             attn_tp_rank=attn_tp_rank,
             attn_tp_size=attn_tp_size,
             attn_cp_rank=attn_cp_rank,
-            attn_cp_size=server_args.attn_cp_size,
-            attn_dcp_rank=tp_rank % server_args.dcp_size,
-            attn_dcp_size=server_args.dcp_size,
+            attn_cp_size=configured_attn_cp_size(),
+            attn_dcp_rank=tp_rank % configured_dcp_size(),
+            attn_dcp_size=configured_dcp_size(),
             attn_dp_rank=attn_dp_rank,
             attn_dp_size=attn_dp_size,
             moe_ep_rank=moe_ep_rank,
             moe_ep_size=get_parallel().ep_size,
             moe_dp_rank=moe_dp_rank,
-            moe_dp_size=server_args.moe_dp_size,
+            moe_dp_size=configured_moe_dp_size(),
             gpu_id=gpu_id,
         )
 
@@ -839,7 +844,7 @@ class Scheduler(
         if (
             self.model_config.is_multimodal
             and self.processor is not None
-            and not server_args.language_model_only
+            and not get_disagg().language_model_only
         ):
             try:
                 import_processors("sglang.srt.multimodal.processors")
@@ -1282,7 +1287,7 @@ class Scheduler(
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
 
     def init_soft_watchdog(self, server_args: ServerArgs):
-        if (x := server_args.soft_watchdog_timeout) is not None:
+        if (x := get_device().soft_watchdog_timeout) is not None:
             self.soft_watchdog = create_scheduler_watchdog(
                 self, watchdog_timeout=x, soft=True
             )
@@ -5172,16 +5177,16 @@ def run_scheduler_process(
     parent_process = psutil.Process().parent()
 
     # Set up tracing
-    if server_args.enable_trace:
+    if get_observability().enable_trace:
         process_tracing_init(
-            server_args.otlp_traces_endpoint,
+            get_observability().otlp_traces_endpoint,
             "sglang",
-            trace_modules=server_args.trace_modules,
+            trace_modules=get_observability().trace_modules,
         )
         thread_label = "Scheduler"
-        if server_args.disaggregation_mode == "prefill":
+        if get_disagg().disaggregation_mode == "prefill":
             thread_label = "Prefill Scheduler"
-        elif server_args.disaggregation_mode == "decode":
+        elif get_disagg().disaggregation_mode == "decode":
             thread_label = "Decode Scheduler"
         trace_set_thread_info(thread_label, tp_rank, dp_rank, pp_rank)
 
