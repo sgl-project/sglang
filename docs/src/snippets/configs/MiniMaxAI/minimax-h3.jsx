@@ -12,8 +12,16 @@
 // on one RTX 4090 (denoise medians across interleaved runs, outputs verified
 // end to end); 48-64 GB hosts sit between the measured points.
 export const config = (() => {
-const CONSUMER_SINGLE = ["rtx4070", "rtx4080", "rtx4090"];
-const CONSUMER_VRAM_16_PLUS = ["rtx4080", "rtx4090"];
+// One recipe per VRAM tier, measured under a hard allocator cap of that
+// size: the figures were taken at 12/16/24 GiB caps, so every card of a
+// tier shares them. 30-series cards run the same recipe; their step times
+// land above the measured 40/50-series figures.
+const CONSUMER_12G = ["rtx4070", "rtx5070", "rtx3060"];
+const CONSUMER_16G = ["rtx4080", "rtx5080", "rtx5070ti", "rtx4060ti"];
+const CONSUMER_24G = ["rtx4090", "rtx3090"];
+const CONSUMER_SINGLE = [...CONSUMER_12G, ...CONSUMER_16G, ...CONSUMER_24G];
+const CONSUMER_VRAM_16_PLUS = [...CONSUMER_16G, ...CONSUMER_24G];
+const CONSUMER_AMPERE = ["rtx3060", "rtx3090"];
 
 function consumerFlags(s) {
   // The whole video decoder held for the decode only: residency arms at the
@@ -34,7 +42,7 @@ function consumerFlags(s) {
   // layers resident (measured 10.4 vs 11.6 s/step); a 16 GB card does not --
   // there even four resident layers measured slower than none, so it keeps
   // the plain recipe.
-  if (s.hw === "rtx4090" && s.host_ram === "ram32") {
+  if (CONSUMER_24G.includes(s.hw) && s.host_ram === "ram32") {
     flags.push("--dit-layerwise-resident-layers 10");
   }
   return flags;
@@ -52,12 +60,15 @@ function consumerHints(s) {
     }
     return hints;
   }
-  if (s.hw === "rtx4090") {
+  if (CONSUMER_24G.includes(s.hw)) {
     hints.push("measured at 32 GB host: ~10.4 s per denoise step with ten resident layers, ~9.6 s decode, ~230 s per request -- ahead of ComfyUI (249-260 s) under the same hard 24 GiB cap");
-  } else if (s.hw === "rtx4080") {
+  } else if (CONSUMER_16G.includes(s.hw)) {
     hints.push("measured at 32 GB host: ~11.9 s per denoise step, ~11 s decode, ~250 s per request -- ahead of ComfyUI (292-301 s) under the same hard 16 GiB cap");
   } else {
     hints.push("measured at 32 GB host: ~10.6 s per denoise step, ~9.4 s decode, ~235 s per request -- ahead of ComfyUI (276-302 s) on the same weights under the same hard 12 GiB cap, output bit-identical");
+  }
+  if (CONSUMER_AMPERE.includes(s.hw)) {
+    hints.push("the recipe and its memory behavior are tier-exact for this card; the step times above were measured on 40-series compute, and Ampere lands above them");
   }
   hints.push("run with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -- the decode sits close enough to the cap that fragmentation otherwise tips it over");
   if (midHost) {
@@ -81,14 +92,26 @@ return {
     "mi355x",
     "rtx5090",
     "rtx4090",
+    "rtx3090",
+    "rtx5080",
+    "rtx5070ti",
     "rtx4080",
+    "rtx4060ti",
+    "rtx5070",
     "rtx4070",
+    "rtx3060",
   ],
   hardware: [
     { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "consumer" },
     { id: "rtx4090", label: "RTX 4090", vram: "24GB", vendor: "consumer" },
+    { id: "rtx3090", label: "RTX 3090", vram: "24GB", vendor: "consumer" },
+    { id: "rtx5080", label: "RTX 5080", vram: "16GB", vendor: "consumer" },
+    { id: "rtx5070ti", label: "RTX 5070 Ti", vram: "16GB", vendor: "consumer" },
     { id: "rtx4080", label: "RTX 4080", vram: "16GB", vendor: "consumer" },
+    { id: "rtx4060ti", label: "RTX 4060 Ti", vram: "16GB", vendor: "consumer" },
+    { id: "rtx5070", label: "RTX 5070", vram: "12GB", vendor: "consumer" },
     { id: "rtx4070", label: "RTX 4070", vram: "12GB", vendor: "consumer" },
+    { id: "rtx3060", label: "RTX 3060", vram: "12GB", vendor: "consumer" },
   ],
   groupHardware: false,
 
@@ -472,6 +495,12 @@ return {
         { id: "rtx5090-offload-2", hw: "rtx5090", nodes: 1, gpus_per_node: 2, placement: "offload", tp_size: 2, ulysses_degree: 1, ring_degree: 1, encoder: "auto" },
         { id: "rtx4090-offload-1", hw: "rtx4090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
         { id: "rtx4080-offload-1", hw: "rtx4080", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
+        { id: "rtx3090-offload-1", hw: "rtx3090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
+        { id: "rtx5080-offload-1", hw: "rtx5080", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
+        { id: "rtx5070ti-offload-1", hw: "rtx5070ti", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
+        { id: "rtx4060ti-offload-1", hw: "rtx4060ti", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
+        { id: "rtx5070-offload-1", hw: "rtx5070", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
+        { id: "rtx3060-offload-1", hw: "rtx3060", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
         { id: "rtx4070-offload-1", hw: "rtx4070", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
       ],
       autoTopology: (s) => {
