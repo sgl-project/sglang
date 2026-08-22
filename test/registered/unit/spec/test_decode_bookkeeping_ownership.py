@@ -91,6 +91,19 @@ _OWNER_SITES = {
         "alloc_for_decode_prealloc_hisparse",
         "kv_allocated_len",
     ): 1,
+    # Beam member rows alias the leader's decode region, so releasing them
+    # rewinds the leader's watermarks to keep its own per-Req release from
+    # freeing that region twice.
+    (
+        "beam_search/fork.py",
+        "free_member_rows",
+        "kv_committed_len",
+    ): 1,
+    (
+        "beam_search/fork.py",
+        "free_member_rows",
+        "kv_allocated_len",
+    ): 1,
     # streaming session slot save/restore and tail trimming
     (_SS, "SessionSlot.save_from_req", "kv_committed_len"): 1,
     (_SS, "SessionSlot.restore_to_req", "kv_committed_len"): 1,
