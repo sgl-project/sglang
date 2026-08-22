@@ -514,7 +514,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
-
     # For padding
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
     num_token_non_padded_cpu: int = None
@@ -1535,9 +1534,35 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 dim=1,
             )
 
-        # TODO: check if we need to pad other tensors
+        # Draft-extend padding uses the fixed per-request token width.
+        dummy_extend_len = 0
+        if (
+            self.spec_info is not None
+            and self.forward_mode.is_draft_extend_v2()
+            and self.spec_info.num_tokens_per_req > 0
+        ):
+            dummy_extend_len = self.spec_info.num_tokens_per_req
+
         if self.extend_seq_lens is not None:
-            self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
+            self.extend_seq_lens = self._pad_tensor_to_size(
+                self.extend_seq_lens, bs, value=dummy_extend_len
+            )
+        if self.extend_prefix_lens is not None:
+            self.extend_prefix_lens = self._pad_tensor_to_size(
+                self.extend_prefix_lens, bs
+            )
+        if self.extend_seq_lens_cpu is not None:
+            self.extend_seq_lens_cpu.extend(
+                [dummy_extend_len] * (bs - len(self.extend_seq_lens_cpu))
+            )
+        if self.extend_prefix_lens_cpu is not None:
+            self.extend_prefix_lens_cpu.extend(
+                [0] * (bs - len(self.extend_prefix_lens_cpu))
+            )
+        if self.extend_logprob_start_lens_cpu is not None:
+            self.extend_logprob_start_lens_cpu.extend(
+                [0] * (bs - len(self.extend_logprob_start_lens_cpu))
+            )
 
         if self.rids_int is not None:
             self.rids_int = self._pad_tensor_to_size(self.rids_int, bs)
