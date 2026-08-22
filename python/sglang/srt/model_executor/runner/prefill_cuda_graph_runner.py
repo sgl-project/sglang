@@ -109,7 +109,9 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     TCPCG_FAILURE_HINT,
     set_tc_piecewise_forward_context,
 )
-from sglang.srt.model_executor.runner_utils import maybe_publish_prefill_war_read_done
+from sglang.srt.model_executor.runner_utils import (
+    maybe_publish_prefill_shared_read_done,
+)
 from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
@@ -254,7 +256,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- model flags ----------------------------------------------
         self.quant_config = getattr(model_runner.model, "quant_config", None)
         self.is_multimodal = model_runner.model_config.is_multimodal
-        self.enable_lora = model_runner.server_args.enable_lora
+        self.enable_lora = model_runner.lora_manager is not None
         # Classification/reward forwards branch on return_pooled_hidden_states;
         # capture must use the same flag value as replay for those models.
         self.capture_return_pooled_hidden_states = not model_runner.is_generation
@@ -294,13 +296,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.mamba_track_enabled = self._is_mamba_track_enabled()
 
         # --- buffers ---------------------------------------------------
+        # `hidden_size` here sizes only the multimodal `input_embeds` buffer,
+        # which `general_mm_embed_routine` copies the merged text+media
+        # embeddings into. A model whose merge happens above the embedding width
+        # (e.g. a residual-stream merge) writes a wider tensor than
+        # `config.hidden_size`, so let it declare that width.
+        input_embeds_hidden_size = self._input_embeds_hidden_size()
         self.buffers: PrefillInputBuffers = PrefillInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
             max_num_tokens=self.max_num_tokens,
             cache_loc_dtype=self._cache_loc_dtype(),
             is_multimodal=self.is_multimodal,
-            hidden_size=self.model_runner.model_config.hidden_size,
+            hidden_size=input_embeds_hidden_size,
             dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
         )
@@ -314,7 +322,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             max_num_token=self.max_num_tokens,
             cache_loc_dtype=self._cache_loc_dtype(),
             is_multimodal=self.is_multimodal,
-            hidden_size=self.model_runner.model_config.hidden_size,
+            hidden_size=input_embeds_hidden_size,
             embed_dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
             enable_num_token_non_padded=enable_num_token_non_padded(),
@@ -528,6 +536,25 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
+
+    def _input_embeds_hidden_size(self) -> int:
+        """Width of the `input_embeds` the model writes inside the graph.
+
+        Defaults to `config.hidden_size`; a model that merges multimodal
+        embeddings at a wider width declares it via `input_embeds_hidden_size`.
+
+        `getattr` with a default rather than an always-present field: the
+        property exists only on the handful of model classes whose merge width
+        differs, and adding it to every model in the registry to satisfy a
+        `None` check is not worth it. Same shape as the `hc_hidden_size`
+        opt-in already threaded through `base_runner` and
+        `decode_cuda_graph_runner`.
+        """
+        return getattr(
+            self.model_runner.model,
+            "input_embeds_hidden_size",
+            self.model_runner.model_config.hidden_size,
+        )
 
     def _next_token_logits_buffer(self, rows: int) -> Optional[torch.Tensor]:
         if not self.model_runner.pp_group.is_last_rank:
@@ -1758,7 +1785,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self._prepare_chunked_prefix_replay(shape_key, forward_batch)
             # Replay prep, including the optional chunked-prefix gather above,
             # has finished every scheduler-shared read.
-            maybe_publish_prefill_war_read_done(
+            maybe_publish_prefill_shared_read_done(
                 self.model_runner, forward_batch, self.device_module
             )
 

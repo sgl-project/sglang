@@ -13,10 +13,26 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_MUSE_LAYER_OUTPUT_DRAFT_ARCHITECTURES = frozenset(
+    {"DFlash2DraftModel", "MuseGlimmerAssistantModel"}
+)
+
+
+def _map_muse_target_layer_ids(*, target_hf_config, draft_hf_config, layer_ids):
+    architectures = getattr(draft_hf_config, "architectures", None) or []
+    uses_layer_outputs = getattr(
+        target_hf_config, "model_type", None
+    ) == "muse_glimmer" and bool(
+        _MUSE_LAYER_OUTPUT_DRAFT_ARCHITECTURES.intersection(architectures)
+    )
+    return [i + 1 for i in layer_ids] if uses_layer_outputs else layer_ids
+
 
 class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     eagle_use_aux_hidden_state: bool = False
     eagle_draft_num_layers: Optional[int] = None
+    # Draft layers whose KV cache uses the target SWA pool capacity.
+    eagle_draft_swa_num_layers: Optional[int] = None
     eagle_aux_hidden_state_layer_ids: Any = None
     dflash_use_aux_hidden_state: bool = False
     dflash_draft_num_layers: Optional[int] = None
@@ -77,6 +93,14 @@ def _resolve_eagle_aux_hidden_state(
                     draft_model_config.num_hidden_layers,
                     draft_model_config.num_attention_layers,
                 )
+            )
+
+        if (
+            draft_model_config.is_hybrid_swa
+            and not draft_model_config.is_deepseek_v4_arch
+        ):
+            config.eagle_draft_swa_num_layers = len(
+                draft_model_config.swa_attention_layer_ids
             )
 
         if spec_algorithm.is_eagle3():
@@ -146,6 +170,14 @@ def _resolve_dflash_aux_hidden_state(
             draft_num_layers=int(draft_num_layers),
         )
 
+        # These Muse drafts use HF layer-output ids, while the Muse target captures
+        # before each layer. Legacy Muse drafts already store layer-input ids.
+        target_layer_ids = _map_muse_target_layer_ids(
+            target_hf_config=model_config.hf_config,
+            draft_hf_config=draft_model_config.hf_config,
+            layer_ids=target_layer_ids,
+        )
+
         if spec_algorithm.is_dspark():
             from sglang.srt.speculative.dspark_components.dspark_config import (
                 parse_dspark_draft_config,
@@ -190,6 +222,9 @@ def _resolve_dflash_draft_cell_size(
     try:
         _, draft_kv_cache_dtype = configure_kv_cache_dtype(
             server_args_kv_cache_dtype=server_args.kv_cache_dtype,
+            speculative_draft_kv_cache_dtype=(
+                server_args.speculative_draft_kv_cache_dtype
+            ),
             model=None,
             model_dtype=draft_model_config.dtype,
             is_draft_worker=True,
