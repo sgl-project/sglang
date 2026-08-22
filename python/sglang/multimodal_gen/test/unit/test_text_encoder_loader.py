@@ -10,11 +10,13 @@ from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
+    NativeComponentLoaderRequired,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
     TextEncoderLoader,
     _configure_encoder_quantization,
     _process_quantized_encoder_weights,
+    _resolve_and_configure_encoder_quantization,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     CheckpointQuantizationCapability,
@@ -23,6 +25,7 @@ from sglang.multimodal_gen.runtime.models.encoders.base import (
 from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLEncoder,
 )
+from sglang.multimodal_gen.runtime.models.encoders.t5 import T5EncoderModel
 
 
 class TestTextEncoderClassResolution(unittest.TestCase):
@@ -93,6 +96,52 @@ class TestTextEncoderClassResolution(unittest.TestCase):
                 "dummy/path", self.server_args
             )
         self.assertIs(cls, transformers.AutoModel)
+
+    def test_bitsandbytes_native_load_requires_resident_encoder(self):
+        loaded_encoder = nn.Linear(1, 1)
+        transformers_model_class = SimpleNamespace(
+            from_pretrained=mock.Mock(return_value=loaded_encoder)
+        )
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(text_encoder_precisions=["bf16"]),
+            require_component_resident=mock.Mock(),
+            revision=None,
+            trust_remote_code=False,
+        )
+        component_config = {
+            "quantization_config": {
+                "load_in_4bit": True,
+                "quant_method": "bitsandbytes",
+            }
+        }
+
+        with mock.patch.object(
+            TextEncoderLoader,
+            "_resolve_transformers_text_encoder_class",
+            return_value=transformers_model_class,
+        ), mock.patch(
+            "sglang.multimodal_gen.runtime.loader.component_loaders."
+            "text_encoder_loader.get_diffusers_component_config",
+            return_value=component_config,
+        ):
+            encoder = TextEncoderLoader().load_native(
+                "/model/text_encoder",
+                server_args,
+                "transformers",
+                "text_encoder",
+            )
+
+        self.assertIs(encoder, loaded_encoder)
+        server_args.require_component_resident.assert_called_once_with(
+            "text_encoder",
+            feature_name="Transformers bitsandbytes text encoder",
+        )
+        transformers_model_class.from_pretrained.assert_called_once_with(
+            "/model/text_encoder",
+            trust_remote_code=False,
+            revision=None,
+            torch_dtype=torch.bfloat16,
+        )
 
 
 class TestMiniMaxH3CheckpointFilter(unittest.TestCase):
@@ -171,6 +220,54 @@ class TestTextEncoderQuantization(unittest.TestCase):
                 model_config,
                 TextEncoder,
                 {},
+                "/model/text_encoder",
+                "text_encoder",
+            )
+
+    def test_t5_bitsandbytes_delegates_to_transformers(self):
+        bitsandbytes = mock.Mock()
+        bitsandbytes.get_name.return_value = "bitsandbytes"
+        self.get_quant_config.return_value = bitsandbytes
+        component_config = {"quantization_config": {"quant_method": "bitsandbytes"}}
+
+        for architecture in ("T5EncoderModel", "UMT5ForConditionalGeneration"):
+            with self.subTest(architecture=architecture), self.assertRaisesRegex(
+                NativeComponentLoaderRequired,
+                "delegates 'bitsandbytes' checkpoint loading to Transformers",
+            ):
+                _resolve_and_configure_encoder_quantization(
+                    SimpleNamespace(architectures=[architecture], quant_config=None),
+                    component_config,
+                    "/model/text_encoder",
+                    "text_encoder",
+                )
+
+    def test_t5_rejects_unlisted_quantization_method(self):
+        with self.assertRaisesRegex(
+            ComponentCheckpointUnsupportedError,
+            "supported methods.*bitsandbytes",
+        ):
+            _configure_encoder_quantization(
+                SimpleNamespace(quant_config=None),
+                T5EncoderModel,
+                {},
+                "/model/text_encoder",
+                "text_encoder",
+            )
+
+    def test_t5_rejects_nonstandard_bitsandbytes_metadata_location(self):
+        bitsandbytes = mock.Mock()
+        bitsandbytes.get_name.return_value = "bitsandbytes"
+        self.get_quant_config.return_value = bitsandbytes
+
+        with self.assertRaisesRegex(
+            ComponentCheckpointUnsupportedError,
+            "requires a top-level quantization_config",
+        ):
+            _configure_encoder_quantization(
+                SimpleNamespace(quant_config=None),
+                T5EncoderModel,
+                {"compression_config": {"quant_method": "bitsandbytes"}},
                 "/model/text_encoder",
                 "text_encoder",
             )

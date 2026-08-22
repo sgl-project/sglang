@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
     ComponentLoader,
+    NativeComponentLoaderRequired,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     set_default_torch_dtype,
@@ -58,12 +59,24 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     load_dict,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.precision import precision_to_dtype
+from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
 from sglang.multimodal_gen.runtime.utils.quantization_utils import get_quant_config
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.environ import envs
+from sglang.srt.model_loader.checkpoint_quantization import (
+    resolve_checkpoint_quant_spec,
+)
 
 logger = init_logger(__name__)
+
+_TRANSFORMERS_ENCODER_ONLY_ARCHITECTURES = {
+    "T5Model": "T5EncoderModel",
+    "T5ForConditionalGeneration": "T5EncoderModel",
+    "UMT5Model": "UMT5EncoderModel",
+    "UMT5ForConditionalGeneration": "UMT5EncoderModel",
+    "MT5Model": "MT5EncoderModel",
+    "MT5ForConditionalGeneration": "MT5EncoderModel",
+}
 
 
 def _configure_encoder_quantization(
@@ -84,12 +97,12 @@ def _configure_encoder_quantization(
             component_config,
             component_model_path,
         )
-    except (KeyError, ValueError) as error:
+    except (KeyError, TypeError, ValueError) as error:
         raise ComponentCheckpointUnsupportedError(
             f"Cannot configure checkpoint quantization for {component_name!r}: {error}"
         ) from error
-    model_config.quant_config = quant_config
     if quant_config is None:
+        model_config.quant_config = None
         return
     if not issubclass(model_cls, EncoderTensorParallelMixin):
         raise ComponentCheckpointUnsupportedError(
@@ -104,13 +117,6 @@ def _configure_encoder_quantization(
             f"{model_cls.__name__} does not support quantized checkpoints for "
             f"{component_name!r}: no checkpoint quantization capability is declared"
         )
-    if capability.backend != "diffusion":
-        raise ComponentCheckpointUnsupportedError(
-            f"{model_cls.__name__} declares the {capability.backend!r} checkpoint "
-            f"quantization backend for {component_name!r}, but the native encoder "
-            "loader currently supports only the 'diffusion' backend"
-        )
-
     quant_method = quant_config.get_name()
     if quant_method not in capability.methods:
         raise ComponentCheckpointUnsupportedError(
@@ -118,6 +124,26 @@ def _configure_encoder_quantization(
             f"quantized with {quant_method!r}; supported methods for the "
             f"{capability.backend!r} backend: {sorted(capability.methods)}"
         )
+    if capability.backend == "transformers":
+        quant_spec = resolve_checkpoint_quant_spec(component_config)
+        if quant_spec is None or quant_spec.source != "quantization_config":
+            source = quant_spec.source if quant_spec is not None else "unknown"
+            raise ComponentCheckpointUnsupportedError(
+                f"Transformers-managed {component_name!r} quantization requires "
+                "a top-level quantization_config; "
+                f"got metadata from {source!r}"
+            )
+        raise NativeComponentLoaderRequired(
+            f"{model_cls.__name__} delegates {quant_method!r} checkpoint loading "
+            "to Transformers"
+        )
+    if capability.backend != "diffusion":
+        raise ComponentCheckpointUnsupportedError(
+            f"{model_cls.__name__} declares the {capability.backend!r} checkpoint "
+            f"quantization backend for {component_name!r}, but the native encoder "
+            "loader currently supports only the 'diffusion' backend"
+        )
+    model_config.quant_config = quant_config
 
 
 def _resolve_and_configure_encoder_quantization(
@@ -127,6 +153,17 @@ def _resolve_and_configure_encoder_quantization(
     component_name: str,
 ) -> type[nn.Module]:
     architectures = getattr(model_config, "architectures", [])
+    try:
+        quant_spec = resolve_checkpoint_quant_spec(component_config)
+    except (TypeError, ValueError) as error:
+        raise ComponentCheckpointUnsupportedError(
+            f"Cannot parse checkpoint quantization for {component_name!r}: {error}"
+        ) from error
+    if quant_spec is not None:
+        architectures = [
+            _TRANSFORMERS_ENCODER_ONLY_ARCHITECTURES.get(arch, arch)
+            for arch in architectures
+        ]
     try:
         model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
     except Exception as resolution_error:
@@ -274,19 +311,27 @@ class TextEncoderLoader(ComponentLoader):
                 component_name,
             )
 
-        encoder_idx = (
-            self._extract_encoder_index(component_name or "text_encoder_2")
-            if component_name
-            else 1 if component_model_path.rstrip("/").endswith("text_encoder_2") else 0
+        resolved_component_name = component_name or (
+            "text_encoder_2"
+            if component_model_path.rstrip("/").endswith("text_encoder_2")
+            else "text_encoder"
         )
-        encoder_dtype = server_args.pipeline_config.text_encoder_precisions[encoder_idx]
-        dtype = precision_to_dtype(
-            encoder_dtype,
-            f"text_encoder_precisions[{encoder_idx}]",
+        dtype = resolve_component_precision(
+            server_args,
+            resolved_component_name,
         )
         transformers_model_class = self._resolve_transformers_text_encoder_class(
             component_model_path, server_args
         )
+        component_config = get_diffusers_component_config(
+            component_path=component_model_path
+        )
+        quant_spec = resolve_checkpoint_quant_spec(component_config)
+        if quant_spec is not None and quant_spec.declared_method == "bitsandbytes":
+            server_args.require_component_resident(
+                resolved_component_name,
+                feature_name="Transformers bitsandbytes text encoder",
+            )
         return transformers_model_class.from_pretrained(
             component_model_path,
             trust_remote_code=server_args.trust_remote_code,
@@ -317,16 +362,8 @@ class TextEncoderLoader(ComponentLoader):
         except Exception:
             return AutoModel
         if getattr(config, "is_encoder_decoder", False):
-            encoder_only_map = {
-                "T5Model": "T5EncoderModel",
-                "T5ForConditionalGeneration": "T5EncoderModel",
-                "UMT5Model": "UMT5EncoderModel",
-                "UMT5ForConditionalGeneration": "UMT5EncoderModel",
-                "MT5Model": "MT5EncoderModel",
-                "MT5ForConditionalGeneration": "MT5EncoderModel",
-            }
             for arch in getattr(config, "architectures", None) or []:
-                encoder_arch = encoder_only_map.get(arch, arch)
+                encoder_arch = _TRANSFORMERS_ENCODER_ONLY_ARCHITECTURES.get(arch, arch)
                 transformers_model_class = getattr(transformers, encoder_arch, None)
                 if isinstance(transformers_model_class, type):
                     return transformers_model_class
