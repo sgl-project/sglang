@@ -295,6 +295,9 @@ Use the preset categories this way:
 | `fastwan21-t2v-1.3b` | `FastVideo/FastWan2.1-T2V-1.3B-Diffusers` | No | One-GPU 832x480, 61-frame, 3-step DMD baseline. The preset pins manual mode with a resident DiT so lossless/high comparisons do not measure an offload-policy change. |
 | `wan21-t2v-1.3b` | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | No | Registered one-GPU 832x480, 81-frame Wan2.1 baseline at 50 steps and guidance 3.0. Keep it separate from FastWan and TurboWan because the longer schedule changes the end-to-end weight of VAE optimizations. |
 | `wan21-t2v-14b` | `Wan-AI/Wan2.1-T2V-14B-Diffusers` | No | Cookbook-aligned four-GPU CFG/Ulysses baseline at 832x480, 81 frames, 50 steps, and guidance 5.0. Text encoding stays CPU-offloaded as in the documented deployment command. |
+| `wan21-i2v-14b-480p` | `Wan-AI/Wan2.1-I2V-14B-480P-Diffusers` | No | Four-GPU CFG/Ulysses image-conditioned baseline at 832x480, 81 frames, 50 steps, and guidance 5.0. Uses the shared cat fixture and its motion prompt. |
+| `wan21-i2v-14b-720p` | `Wan-AI/Wan2.1-I2V-14B-720P-Diffusers` | No | Four-GPU CFG/Ulysses image-conditioned baseline at 1280x720, 81 frames, 50 steps, and guidance 5.0. Keep it separate from 480P because it is a distinct checkpoint and attention shape. |
+| `wan21-fun-inp-1.3b` | `weizhou03/Wan2.1-Fun-1.3B-InP-Diffusers` | No | Registered one-GPU Wan2.1 Fun image-conditioned path at 832x480, 81 frames, 50 steps, and guidance 6.0. Uses the shared cat fixture and motion prompt. |
 | `krea2-turbo` | `krea/Krea-2-Turbo` | No | Recent T2I checkpoint at 1024x1024, 8 steps, guidance 1.0. |
 | `krea2-raw` | `krea/Krea-2-Raw` | No | Recent T2I checkpoint at 1024x1024, 50 steps, guidance 4.5; keep separate from Turbo because CFG and the longer schedule change the hotspot mix. |
 | `ideogram4-fast` | `fal/ideogram-v4-fast` | No | Recent distilled T2I checkpoint at 1024x1024; the registered sampling class owns its step and guidance defaults. |
@@ -303,6 +306,8 @@ Use the preset categories this way:
 | `longlive2-i2v` | `Rabinovich/LongLive-2.0-5B-Diffusers` | No | CI-aligned 960x928, 61-frame causal DMD I2V baseline using the cat image. |
 | `fast-hunyuan` | `FastVideo/FastHunyuan-diffusers` | No | Validated one-H200 832x480, 61-frame FastHunyuan baseline using its registered 6-step schedule. |
 | `turbowan21-t2v-1.3b` | `IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers` | No | Registered one-GPU TurboWan path at 832x480, 81 frames, and 4 steps. |
+| `turbowan21-t2v-14b-480p` | `IPostYellow/TurboWan2.1-T2V-14B-Diffusers` | No | One-H200 TurboWan 14B path at 832x480, 81 frames, and its 4-step DMD schedule. |
+| `turbowan21-t2v-14b-720p` | `IPostYellow/TurboWan2.1-T2V-14B-720P-Diffusers` | No | One-H200 high-resolution TurboWan 14B path at 1280x720, 81 frames, and its 4-step DMD schedule. Keep it separate because it is a distinct checkpoint. |
 | `helios-mid` | `BestWishYsh/Helios-Mid` | No | CI-sized 640x384, 33-frame pyramid-SR baseline using Helios-Mid's 20-step schedule. |
 | `helios-distilled` | `BestWishYsh/Helios-Distilled` | No | CI-sized 640x384, 33-frame DMD baseline at 10 steps and guidance 1.0. |
 | `joy-echo` | `jdopensource/JoyAI-Echo` | No | CI-aligned two-GPU Ulysses baseline at 640x384, 33 frames, 8 steps, with the cross-request memory bank disabled for isolated single-request timing. |
