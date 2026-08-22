@@ -2981,36 +2981,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
 
-        # Stacked params mapping for unified weight loading API
-        self.stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-        # Add A-proj fusion mapping when q_lora_rank is enabled
-        # q_a_proj + kv_a_proj_with_mqa -> fused_qkv_a_proj_with_mqa
-        if self.fuse_qkv_a_proj:
-            self.stacked_params_mapping.extend(
-                [
-                    ("fused_qkv_a_proj_with_mqa", "q_a_proj", 0),
-                    ("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa", 1),
-                ]
-            )
-        self.expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
-        )
-        # Params for special naming rules in mixed-precision models, for example:
-        # model.layers.xx.mlp.experts.xx.w1.input_scale. For details,
-        # see https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main.
-        if is_wint4afp8_or_wint4a16_config(self.quant_config):
-            self.expert_params_mapping += (
-                FusedMoE.make_expert_input_scale_params_mapping(
-                    num_experts=self.config.n_routed_experts
-                )
-            )
+        self.init_unified_loader_mappings()
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
@@ -3058,6 +3029,51 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     # checkpoint reports a different name (the NextN drafts, GLM's DSA variant)
     # overrides it.
     fused_shared_experts_architecture = "DeepseekV3ForCausalLM"
+
+    def init_unified_loader_mappings(self):
+        """Mappings the unified weight loading API reads off the model.
+
+        Call after determine_num_fused_shared_experts(); subclasses that build
+        their own __init__ must call this or weight loading fails on the
+        missing attributes.
+        """
+        self.fuse_qkv_a_proj = (
+            hasattr(self.config, "q_lora_rank") and self.config.q_lora_rank is not None
+        )
+        self.stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+        # q_a_proj + kv_a_proj_with_mqa -> fused_qkv_a_proj_with_mqa
+        if self.fuse_qkv_a_proj:
+            self.stacked_params_mapping.extend(
+                [
+                    ("fused_qkv_a_proj_with_mqa", "q_a_proj", 0),
+                    ("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa", 1),
+                ]
+            )
+        self.expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
+        )
+        # Params for special naming rules in mixed-precision models, for example:
+        # model.layers.xx.mlp.experts.xx.w1.input_scale. For details,
+        # see https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main.
+        if is_wint4afp8_or_wint4a16_config(self.quant_config):
+            self.expert_params_mapping += (
+                FusedMoE.make_expert_input_scale_params_mapping(
+                    num_experts=self.config.n_routed_experts
+                )
+            )
+
+    def determine_num_fused_shared_experts(
+        self, architecture: str = "DeepseekV3ForCausalLM"
+    ):
+        self.num_fused_shared_experts = 0
+        server_args = get_server_args()
 
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
