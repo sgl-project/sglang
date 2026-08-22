@@ -51,6 +51,11 @@ def align_entry_bytes(num_bytes: int) -> int:
     return -(-num_bytes // ENTRY_ALIGN_BYTES) * ENTRY_ALIGN_BYTES
 
 
+def align_part_offset(num_bytes: int) -> int:
+    """Round a part's byte offset inside the entry up to the row alignment."""
+    return -(-num_bytes // ROW_ALIGN_BYTES) * ROW_ALIGN_BYTES
+
+
 def paged_view(flat: torch.Tensor, page_size: int) -> torch.Tensor:
     """``[slots, ...]`` -> ``[slots // page_size, page_size, ...]``, as a view.
 

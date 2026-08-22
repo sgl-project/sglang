@@ -36,10 +36,12 @@ from torch.profiler import record_function
 from sglang.kernels.ops.kvcache.zero_pages import zero_pages
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.layout.fused_draft import DenseDraftRegion
 from sglang.srt.mem_cache.layout.page_major import (
     DenseEntryLayout,
     DensePart,
     align_entry_bytes,
+    align_part_offset,
     build_dense_views,
     build_page_major_mamba_views,
 )
@@ -113,12 +115,23 @@ class SubPoolSpec(ABC):
 
 @dataclass(frozen=True, kw_only=True)
 class MHASubPoolSpec(SubPoolSpec):
-    """Per-slot layout of one MHA-shaped sub-pool. `v_head_dim` defaults to `head_dim`."""
+    """Per-slot layout of one MHA-shaped sub-pool. `v_head_dim` defaults to `head_dim`.
+
+    With `draft_region` set, the draft model's K and V rows are two more
+    parts of every slot's entry, after the host parts:
+
+        [ K_0 | V_0 | ... | K_{Lh-1} | V_{Lh-1} | dK_0 | dV_0 | ... | pad ]
+
+    The slot stride stays the one entry, so host and draft views are indexed
+    by the same physical token id; only their offsets differ. `draft_region
+    is None` keeps the layout byte-identical to the unfused one.
+    """
 
     head_num: int
     head_dim: int
     store_dtype: torch.dtype
     v_head_dim: Optional[int] = None
+    draft_region: Optional[DenseDraftRegion] = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -129,6 +142,8 @@ class MHASubPoolSpec(SubPoolSpec):
         assert self.v_head_dim > 0, (
             f"v_head_dim must be positive; got {self.v_head_dim}"
         )
+        if self.draft_region is not None:
+            self.draft_region.validate()
 
     def k_row_bytes(self) -> int:
         return self.head_num * self.head_dim * self.store_dtype.itemsize
@@ -136,9 +151,20 @@ class MHASubPoolSpec(SubPoolSpec):
     def v_row_bytes(self) -> int:
         return self.head_num * self.v_head_dim * self.store_dtype.itemsize
 
+    def host_entry_bytes(self) -> int:
+        """Host (target-only) bytes for one slot, before any draft parts."""
+        return self.layer_num * (self.k_row_bytes() + self.v_row_bytes())
+
+    def draft_offset_in_entry(self) -> int:
+        """Byte offset of the fused draft parts inside one slot's entry."""
+        assert self.draft_region is not None
+        return align_part_offset(self.host_entry_bytes())
+
     def entry_bytes(self) -> int:
+        if self.draft_region is None:
+            return align_entry_bytes(self.host_entry_bytes())
         return align_entry_bytes(
-            self.layer_num * (self.k_row_bytes() + self.v_row_bytes())
+            self.draft_offset_in_entry() + self.draft_region.entry_bytes()
         )
 
     # Token-major entry: [K_0 | V_0 | K_1 | V_1 | ...] per slot; a page is
@@ -149,27 +175,27 @@ class MHASubPoolSpec(SubPoolSpec):
 
     def layout(self) -> DenseEntryLayout:
         layer_stride = self.k_row_bytes() + self.v_row_bytes()
-        return DenseEntryLayout(
-            entry_bytes=self.entry_bytes(),
-            parts=(
-                DensePart(
-                    name="k",
-                    offset_bytes=0,
-                    layer_stride_bytes=layer_stride,
-                    layer_num=self.layer_num,
-                    row_shape=(self.head_num, self.head_dim),
-                    dtype=self.store_dtype,
-                ),
-                DensePart(
-                    name="v",
-                    offset_bytes=self.k_row_bytes(),
-                    layer_stride_bytes=layer_stride,
-                    layer_num=self.layer_num,
-                    row_shape=(self.head_num, self.v_head_dim),
-                    dtype=self.store_dtype,
-                ),
+        parts = (
+            DensePart(
+                name="k",
+                offset_bytes=0,
+                layer_stride_bytes=layer_stride,
+                layer_num=self.layer_num,
+                row_shape=(self.head_num, self.head_dim),
+                dtype=self.store_dtype,
+            ),
+            DensePart(
+                name="v",
+                offset_bytes=self.k_row_bytes(),
+                layer_stride_bytes=layer_stride,
+                layer_num=self.layer_num,
+                row_shape=(self.head_num, self.v_head_dim),
+                dtype=self.store_dtype,
             ),
         )
+        if self.draft_region is not None:
+            parts += self.draft_region.parts(self.draft_offset_in_entry())
+        return DenseEntryLayout(entry_bytes=self.entry_bytes(), parts=parts)
 
     def get_dtype(self) -> torch.dtype:
         return self.store_dtype
@@ -505,6 +531,31 @@ class UnifiedKVPool:
                 anchor_bytes=anchor_bytes,
             )
             for name in ("k", "v")
+        )
+        return k_views, v_views
+
+    def build_dense_draft_views(
+        self, sub_pool_name: str
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """Per-layer K/V views of the DRAFT parts fused into ``sub_pool_name``'s
+        entries: same pages, same slot ids, same v2p table as the host."""
+        spec = self._specs_by_name[sub_pool_name]
+        assert isinstance(spec, MHASubPoolSpec) and spec.draft_region is not None, (
+            f"sub-pool {sub_pool_name!r} carries no fused draft region"
+        )
+        layout = spec.layout()
+        page_size = self._page_size
+        num_pages = self.max_slots(sub_pool_name) // page_size
+        k_views, v_views = (
+            build_dense_views(
+                self._raw,
+                layout=layout,
+                part=layout.part(name),
+                page_size=page_size,
+                num_pages=num_pages,
+                anchor_bytes=self._anchor_bytes[sub_pool_name],
+            )
+            for name in ("draft_k", "draft_v")
         )
         return k_views, v_views
 
