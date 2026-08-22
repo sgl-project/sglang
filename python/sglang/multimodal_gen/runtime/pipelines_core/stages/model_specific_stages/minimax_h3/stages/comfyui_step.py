@@ -16,12 +16,12 @@ import torch
 
 _logger = logging.getLogger(__name__)
 
-from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
-    _FORWARD_SUPPORTED_KWARGS,
-)
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
     MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT,
+)
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+    _FORWARD_SUPPORTED_KWARGS,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.comfyui_mode import (
     bind_comfyui_session,
@@ -250,8 +250,12 @@ def _assemble_media_rows(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     video_target = patchify_video(video, _PATCH_SIZE)
     audio_target = pack_audio(audio)
-    vis_aug = float(payload.get("visual_cond_noise_aug", MINIMAX_H3_IMGVID_COND_TIMESTEP))
-    aud_aug = float(payload.get("audio_cond_noise_aug", MINIMAX_H3_AUDIO_REF_COND_TIMESTEP))
+    vis_aug = float(
+        payload.get("visual_cond_noise_aug", MINIMAX_H3_IMGVID_COND_TIMESTEP)
+    )
+    aud_aug = float(
+        payload.get("audio_cond_noise_aug", MINIMAX_H3_AUDIO_REF_COND_TIMESTEP)
+    )
     seed = int(payload.get("seed", 0))
 
     cond_video_src = list(_latent_items(payload, "cond_video_latents"))
@@ -462,8 +466,10 @@ def comfyui_payload_to_branch_inputs(
             "MiniMaxH3 ComfyUI step needs a serialized PackedLayout for fl2va keyframes"
         )
     text_len = int(text.shape[0])
-    latent_t, latent_h, latent_w = int(video.shape[2]), int(video.shape[3]), int(
-        video.shape[4]
+    latent_t, latent_h, latent_w = (
+        int(video.shape[2]),
+        int(video.shape[3]),
+        int(video.shape[4]),
     )
     audio_t = int(audio.shape[-1])
     refs = _payload_refs(payload)
@@ -574,7 +580,7 @@ def build_step_forward_kwargs(
 def pack_comfy_output(
     v_video: torch.Tensor,
     v_audio: torch.Tensor,
-    state: "MiniMaxH3ComfyUIRunState",
+    state: MiniMaxH3ComfyUIRunState,
 ) -> list[torch.Tensor]:
     _b, _c, orig_t, orig_h, orig_w = state.orig_video_shape
     _pb, _pc, padded_t, padded_h, padded_w = state.padded_video_shape
@@ -634,7 +640,9 @@ class MiniMaxH3ComfyUIStepStage(PipelineStage):
             self._cache_stage = MiniMaxH3DenoisingStage(transformer=self.transformer)
         return self._cache_stage
 
-    def _maybe_mount_cache_dit(self, batch: Req, state: MiniMaxH3ComfyUIRunState) -> None:
+    def _maybe_mount_cache_dit(
+        self, batch: Req, state: MiniMaxH3ComfyUIRunState
+    ) -> None:
         if state.cache_mounted:
             return
         n_sigmas = _sample_sigmas_len(state.sample_sigmas)
@@ -651,7 +659,9 @@ class MiniMaxH3ComfyUIStepStage(PipelineStage):
             state.cache_mounted = False
         state.branch = None
 
-    def _read_step_tensors(self, batch: Req) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _read_step_tensors(
+        self, batch: Req
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         extra = getattr(batch, "extra", None) or {}
         video = batch.latents
         audio = batch.audio_latents
@@ -715,8 +725,10 @@ class MiniMaxH3ComfyUIStepStage(PipelineStage):
                 signature=signature,
             )
 
-        state = existing if existing is not None else get_or_create_run_state(
-            batch, _factory
+        state = (
+            existing
+            if existing is not None
+            else get_or_create_run_state(batch, _factory)
         )
         if not state.refined:
             _precompute_refined_prompt_embeds(

@@ -9,7 +9,6 @@ from typing import Any
 import torch
 
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
-
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.comfyui_step import (
     DEFAULT_SIGMA_SHIFT_AUDIO,
     DEFAULT_SIGMA_SHIFT_VIDEO,
@@ -55,8 +54,7 @@ def _split_av(x) -> tuple[torch.Tensor, torch.Tensor]:
         if len(parts) >= 2:
             return parts[0], parts[1]
     raise TypeError(
-        "MiniMax H3 ComfyUI forward expects x to be [video, audio], "
-        f"got {type(x)!r}"
+        "MiniMax H3 ComfyUI forward expects x to be [video, audio], " f"got {type(x)!r}"
     )
 
 
@@ -171,7 +169,8 @@ class MiniMaxH3Adapter(ComfyUIModelAdapter):
                 1.0 + (scale - 1.0) * sigma_a
             ).to(v_audio.dtype) * v_audio
         slope_a = time_shift_slope(
-            ctx["sigma_v"], ctx.get("shift_v", DEFAULT_SIGMA_SHIFT_VIDEO),
+            ctx["sigma_v"],
+            ctx.get("shift_v", DEFAULT_SIGMA_SHIFT_VIDEO),
             ctx.get("shift_a", DEFAULT_SIGMA_SHIFT_AUDIO),
         ).to(device=v_audio.device, dtype=v_audio.dtype)
         v_audio = slope_a * v_audio

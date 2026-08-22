@@ -22,6 +22,10 @@ from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (
     is_comfyui_single_file,
     load_comfyui_transformer,
 )
+from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (
+    is_comfyui_single_file,
+    load_comfyui_transformer,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
 )
