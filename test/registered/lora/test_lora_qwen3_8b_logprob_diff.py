@@ -50,6 +50,25 @@ DECODE_ATTENTION_BACKEND = "fa4"
 KL_THRESHOLD = 5e-3
 
 
+def attention_backend_kwargs():
+    """Engine attention-backend kwargs for the current platform.
+
+    fa4 and flashinfer are CUDA-only: fa4 dispatches into the CUTLASS CUTE DSL
+    kernel, which cannot import off CUDA. On XPU the equivalent fused path is
+    the intel_xpu backend, so select it there instead of forcing a backend the
+    device has no kernels for.
+    """
+    from sglang.srt.utils import is_xpu
+
+    if is_xpu():
+        return {"attention_backend": "intel_xpu"}
+    return {
+        "attention_backend": "flashinfer",
+        "prefill_attention_backend": PREFILL_ATTENTION_BACKEND,
+        "decode_attention_backend": DECODE_ATTENTION_BACKEND,
+    }
+
+
 def kl_v2(a, b):
     a = torch.tensor(a) if not torch.is_tensor(a) else a
     b = torch.tensor(b) if not torch.is_tensor(b) else b
@@ -138,9 +157,7 @@ class TestLoRAQwen3_8BLogprobDiff(CustomTestCase):
             max_lora_rank=MAX_LORA_RANK,
             lora_paths={"my_lora": adapter_path},
             lora_backend=LORA_BACKEND,
-            attention_backend="flashinfer",
-            prefill_attention_backend=PREFILL_ATTENTION_BACKEND,
-            decode_attention_backend=DECODE_ATTENTION_BACKEND,
+            **attention_backend_kwargs(),
         )
 
         try:

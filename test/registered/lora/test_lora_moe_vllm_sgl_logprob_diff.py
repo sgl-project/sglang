@@ -285,7 +285,29 @@ REFERENCE_STATS = {
 
 class TestMoELoraRegression(unittest.TestCase):
 
-    def test_sglang_moe_parity_strict(self):
+    def test_sglang_moe_parity_flashinfer(self):
+        # flashinfer is CUDA-only.
+        from sglang.srt.utils import is_cuda
+
+        if not is_cuda():
+            self.skipTest("flashinfer backend requires CUDA")
+        self._run_parity_strict(attention_backend="flashinfer")
+
+    def test_sglang_moe_parity_intel_xpu(self):
+        from sglang.srt.utils import is_xpu
+
+        if not is_xpu():
+            self.skipTest("intel_xpu backend requires XPU")
+        self._run_parity_strict(attention_backend="intel_xpu")
+
+    def test_sglang_moe_parity_triton(self):
+        from sglang.srt.utils import is_cuda, is_xpu
+
+        if is_cuda() or is_xpu():
+            self.skipTest("triton backend is the fallback for non-CUDA/non-XPU")
+        self._run_parity_strict(attention_backend="triton")
+
+    def _run_parity_strict(self, *, attention_backend, **runner_kwargs):
 
         with SRTRunner(
             model_path=MOE_BASE_MODEL_PATH,
@@ -296,8 +318,9 @@ class TestMoELoraRegression(unittest.TestCase):
             tp_size=1,
             trust_remote_code=True,
             disable_radix_cache=True,
-            attention_backend="flashinfer",
+            attention_backend=attention_backend,
             mem_fraction_static=0.80,
+            **runner_kwargs,
         ) as srt_runner:
 
             srt_outputs = srt_runner.forward(
