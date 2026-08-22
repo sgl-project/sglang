@@ -15,6 +15,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import (
     BaseModelLoader,
@@ -175,30 +176,10 @@ class IpcModelLoader(BaseModelLoader):
 
     def _start_daemon_liveness_watchdog(
         self,
-        daemon_pid: Optional[int],
-        process_start_time: Optional[float],
+        daemon_pid: int,
+        process_start_time: float,
     ) -> None:
-        """Enforce today's producer-lifetime policy for imported weights.
-
-        PyTorch's documented CUDA-sharing contract requires the producer to stay
-        alive until consumers release their tensors, and the CUDA driver API does
-        not define continued use after the exporter frees the allocation. The
-        roadmap proposes future daemon re-adoption from live clients, but that
-        behavior is not implemented or proven for this transport yet. Until it
-        is, a background thread treats daemon exit as a policy violation and
-        terminates instead of continuing on an unverified mapping lifetime.
-        """
-        if (
-            not daemon_pid
-            or daemon_pid <= 0
-            or process_start_time is None
-            or process_start_time <= 0
-        ):
-            logger.warning(
-                "[IpcModelLoader] Daemon did not report a PID; skipping the "
-                "daemon-liveness watchdog. A daemon crash will not be detected."
-            )
-            return
+        """Terminate if the producer dies while this process holds its tensors."""
 
         if not process_identity_is_alive(daemon_pid, process_start_time):
             raise RuntimeError(
@@ -534,7 +515,6 @@ class IpcModelLoader(BaseModelLoader):
 
         from sglang.srt.platforms import current_platform
 
-        device_id = int(getattr(device_config, "gpu_id", 0))
         socket_path = self.socket_path
 
         # Preserve the explicit-override fast miss: it bypasses both registry
@@ -556,6 +536,9 @@ class IpcModelLoader(BaseModelLoader):
                     f"a socket owned by this user."
                 )
 
+        # DeviceConfig is required for every real load path. Do not silently
+        # substitute GPU 0: physical-device identity is the cache key.
+        device_id = int(device_config.gpu_id)
         engine_config = self._build_engine_config(model_config, device_id)
         device_uuid = current_platform.get_device_uuid(device_id)
         registration = None

@@ -804,9 +804,10 @@ class Engine(EngineScoreMixin, EngineBase):
         start_time = time.time()
         try:
             for proc, child_daemon_id in daemon_launches:
-                while registry.find_registration(
-                    daemon_id=child_daemon_id, pid=proc.pid
-                ) is None:
+                while (
+                    registry.find_registration(daemon_id=child_daemon_id, pid=proc.pid)
+                    is None
+                ):
                     time.sleep(check_interval)
                     if time.time() - start_time > timeout:
                         raise TimeoutError(
@@ -835,21 +836,12 @@ class Engine(EngineScoreMixin, EngineBase):
 
     @staticmethod
     def _terminate_weight_cache_daemons(procs, timeout: float = 10.0):
-        """Gracefully stop engine-spawned weight cache daemons.
-
-        Send SIGTERM first so each daemon's signal handler can release its
-        socket, claim, and registration, then SIGKILL any straggler. This matters
-        because ``shutdown()`` otherwise reaps children via
-        ``kill_process_tree`` (SIGKILL), which would skip graceful cleanup
-        and leave stale state that makes the next client-mode boot fail with a
-        confusing "socket exists but connection refused" instead of a clean
-        "no daemon" path.
-        """
+        """Stop engine-spawned daemons and reap every child."""
         if not procs:
             return
         for p in procs:
             if p.poll() is None:
-                p.terminate()  # SIGTERM -> daemon cleanup handler runs
+                p.terminate()  # Let the daemon unpublish before exit.
         killed = []
         for p in procs:
             try:

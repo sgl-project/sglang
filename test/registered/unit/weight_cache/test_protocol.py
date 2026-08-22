@@ -127,9 +127,7 @@ class TestCacheConfig(CustomTestCase):
                 normalize_model_path_for_cache(model_dir + "/"),
                 os.path.realpath(model_dir),
             )
-        self.assertEqual(
-            normalize_model_path_for_cache("org/model-id"), "org/model-id"
-        )
+        self.assertEqual(normalize_model_path_for_cache("org/model-id"), "org/model-id")
 
     def test_identical_configs_match(self):
         self.assertTrue(_make_cache_config().matches(_make_cache_config()))
@@ -420,6 +418,29 @@ class TestExplicitSocketBypass(CustomTestCase):
         fallback.assert_called_once()
         self.assertIs(result, fallback_model)
 
+    def test_daemon_mode_missing_socket_never_loads_from_disk(self):
+        from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+        missing_socket = f"/tmp/sglang-weight-cache-missing-{os.getpid()}.sock"
+        if os.path.exists(missing_socket):
+            os.unlink(missing_socket)
+
+        loader = IpcModelLoader(
+            load_config=LoadConfig(load_format=LoadFormat.IPC_CACHE),
+            socket_path=missing_socket,
+            weight_cache_mode="daemon",
+            fallback_load_format="auto",
+        )
+        with (
+            mock.patch.object(loader, "_fallback_load") as fallback,
+            self.assertRaisesRegex(
+                RuntimeError, "fallback to disk loading is disabled"
+            ),
+        ):
+            loader.load_model(model_config=self._model_config(), device_config=None)
+        fallback.assert_not_called()
+
 
 class TestClientResponseIdentity(CustomTestCase):
     def _registration(self, config):
@@ -531,7 +552,7 @@ class TestClientResponseIdentity(CustomTestCase):
             mock.patch(
                 "sglang.srt.platforms.current_platform.get_device_uuid",
                 return_value="GPU-0000",
-            ),
+            ) as get_device_uuid,
             mock.patch(
                 "sglang.srt.weight_cache.ipc_loader.os.lstat",
                 side_effect=FileNotFoundError,
@@ -544,8 +565,9 @@ class TestClientResponseIdentity(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "refusing disk fallback"):
                 loader._fetch_from_cache(
                     model_config=SimpleNamespace(),
-                    device_config=SimpleNamespace(gpu_id=0),
+                    device_config=SimpleNamespace(gpu_id=3),
                 )
+        get_device_uuid.assert_called_once_with(3)
 
     def test_refused_connection_falls_back_only_for_provably_dead_registration(self):
         from types import SimpleNamespace
@@ -575,9 +597,7 @@ class TestClientResponseIdentity(CustomTestCase):
             ),
             mock.patch(
                 "sglang.srt.weight_cache.ipc_loader.os.lstat",
-                return_value=SimpleNamespace(
-                    st_mode=stat.S_IFSOCK, st_uid=os.getuid()
-                ),
+                return_value=SimpleNamespace(st_mode=stat.S_IFSOCK, st_uid=os.getuid()),
             ),
             mock.patch("socket.socket", return_value=fake_socket),
         )

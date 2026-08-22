@@ -13,6 +13,7 @@ import struct
 from typing import Any, Dict, Optional
 
 import msgspec
+
 from sglang.srt.utils.common import safe_pickle_loads
 
 logger = logging.getLogger(__name__)
@@ -153,7 +154,7 @@ def check_ipc_parallelism(dp_size: int, ep_size: int, *, where: str) -> None:
         f"[weight_cache:{where}] data/expert parallelism is not supported yet "
         f"(dp_size={dp_size}, ep_size={ep_size}). CacheConfig does not yet "
         "distinguish content-partitioning ranks from requester-only ranks, so "
-        "enabling the cache here could select the wrong shard or defeat "
+        "colocated ranks could collapse onto one cache identity or defeat "
         "per-GPU sharing. Disable the weight cache for this configuration."
     )
 

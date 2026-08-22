@@ -23,7 +23,7 @@ from sglang.srt.weight_cache.registry import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 
 def _make_cache_config(**overrides) -> CacheConfig:
@@ -148,9 +148,7 @@ class TestFileWeightCacheRegistry(CustomTestCase):
         self.assertEqual(registration.socket_path, self.socket_path)
         self.assertEqual(registration.daemon_id, self.daemon_id)
         self.assertIsNotNone(
-            self.registry.find_registration(
-                daemon_id=self.daemon_id, pid=os.getpid()
-            )
+            self.registry.find_registration(daemon_id=self.daemon_id, pid=os.getpid())
         )
 
         self.registry.release(self.identity, daemon_id=self.daemon_id)
@@ -237,13 +235,9 @@ class TestFileWeightCacheRegistry(CustomTestCase):
             self.registry.claim(self.identity, pid=os.getpid(), daemon_id="daemon-b")
 
     def test_force_replaces_live_exact_owner(self):
-        child = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(60)"]
-        )
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
         try:
-            self.registry.claim(
-                self.identity, pid=child.pid, daemon_id="old-daemon"
-            )
+            self.registry.claim(self.identity, pid=child.pid, daemon_id="old-daemon")
             self.registry.claim(
                 self.identity,
                 pid=os.getpid(),
@@ -279,9 +273,7 @@ class TestFileWeightCacheRegistry(CustomTestCase):
     def test_incompatible_live_claim_on_same_gpu_blocks_fallback(self):
         other_config = _make_cache_config(tp_rank=1)
         other_identity = self.registry.identity_for(other_config, "GPU-0000")
-        self.registry.claim(
-            other_identity, pid=os.getpid(), daemon_id="other-daemon"
-        )
+        self.registry.claim(other_identity, pid=os.getpid(), daemon_id="other-daemon")
         try:
             with self.assertRaisesRegex(RuntimeError, "refusing disk fallback"):
                 self.registry.discover(self.config, device_uuid="GPU-0000")

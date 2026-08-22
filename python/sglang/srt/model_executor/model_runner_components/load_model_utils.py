@@ -254,7 +254,6 @@ def maybe_enable_ipc_weight_cache(
         load_config.load_format = LoadFormat.IPC_CACHE
 
 
-
 def load_model_with_memory_saver(
     *,
     server_args: ServerArgs,

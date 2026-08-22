@@ -43,6 +43,7 @@ from typing import Any, Dict, Optional
 
 import torch
 import torch.distributed as dist
+
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import publish
@@ -386,7 +387,12 @@ class WeightCacheDaemon:
                     )
 
     def _export_state(self):
-        """Export model parameters and buffers as CUDA IPC handles."""
+        """Export model parameters and buffers as CUDA IPC handles.
+
+        This includes both persistent buffers (in state_dict) and non-persistent
+        buffers (e.g. rotary embedding cos_sin_cache) so the engine can fully
+        reconstruct the model state via zero-copy IPC.
+        """
         self.state_entries.clear()
 
         # remove_duplicate=False so tied weights are recognized as parameters
@@ -397,12 +403,14 @@ class WeightCacheDaemon:
             name for name, _ in self.model.named_parameters(remove_duplicate=False)
         )
         state_dict_names = set(self.model.state_dict().keys())
+
         # Export all items from state_dict (parameters + persistent buffers)
         for name, tensor in self.model.state_dict().items():
+            ipc_handle = MultiprocessingSerializer.serialize(
+                tensor.data, output_str=True
+            )
             self.state_entries[name] = {
-                "handle": MultiprocessingSerializer.serialize(
-                    tensor.data, output_str=True
-                ),
+                "handle": ipc_handle,
                 "shape": list(tensor.shape),
                 "dtype": str(tensor.dtype).replace("torch.", ""),
                 "is_param": name in param_names,
@@ -413,22 +421,21 @@ class WeightCacheDaemon:
         non_persistent_count = 0
         for name, buf in self.model.named_buffers():
             if name not in state_dict_names:
+                ipc_handle = MultiprocessingSerializer.serialize(
+                    buf.data, output_str=True
+                )
                 self.state_entries[name] = {
-                    "handle": MultiprocessingSerializer.serialize(
-                        buf.data, output_str=True
-                    ),
+                    "handle": ipc_handle,
                     "shape": list(buf.shape),
                     "dtype": str(buf.dtype).replace("torch.", ""),
                     "is_param": False,
                 }
                 non_persistent_count += 1
 
-        # Only handle blobs carry real weight here. Avoid stringifying entries,
-        # which would allocate copies of all serialized handles.
+        # Log total size
         total_bytes = sum(
-            len(handle)
-            for handle in (entry.get("handle") for entry in self.state_entries.values())
-            if isinstance(handle, (str, bytes, bytearray))
+            entry["handle"].__len__() if hasattr(entry["handle"], "__len__") else 0
+            for entry in self.state_entries.values()
         )
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id}] "

@@ -27,6 +27,7 @@ from .protocol import CacheConfig
 
 logger = logging.getLogger(__name__)
 
+# Define mixed-version behavior before changing the on-disk format.
 REGISTRY_VERSION = 1
 DEFAULT_NAMESPACE = "default"
 UNIX_SOCKET_PATH_MAX_BYTES = 103
@@ -190,9 +191,11 @@ class FileWeightCacheRegistry:
         return os.path.join(self.registrations_dir, f"{identity.key}.json")
 
     def socket_path(self, identity: CacheIdentity) -> str:
-        socket_key = base64.urlsafe_b64encode(
-            bytes.fromhex(identity.key)[:SOCKET_KEY_BYTES]
-        ).decode("ascii").rstrip("=")
+        socket_key = (
+            base64.urlsafe_b64encode(bytes.fromhex(identity.key)[:SOCKET_KEY_BYTES])
+            .decode("ascii")
+            .rstrip("=")
+        )
         path = os.path.join(self.sockets_dir, f"{socket_key}.sock")
         path_bytes = len(os.fsencode(path))
         if path_bytes > UNIX_SOCKET_PATH_MAX_BYTES:
@@ -543,7 +546,8 @@ class FileWeightCacheRegistry:
                         state = "live" if liveness else "indeterminate"
                         raise RuntimeError(
                             f"a {state} weight cache daemon owns the requested "
-                            "identity and is still loading; refusing disk fallback "
+                            "identity and is still loading or shutting down; "
+                            "refusing disk fallback "
                             "while it may be allocating weights on this GPU"
                         )
                     self._remove_identity_files_locked(
@@ -572,8 +576,7 @@ class FileWeightCacheRegistry:
                         or claim.daemon_id != registration.daemon_id
                         or claim.pid != registration.pid
                         or abs(
-                            claim.process_start_time
-                            - registration.process_start_time
+                            claim.process_start_time - registration.process_start_time
                         )
                         >= 1e-3
                     ):
@@ -581,9 +584,10 @@ class FileWeightCacheRegistry:
                             "weight cache claim and dead registration disagree on "
                             "owner identity; refusing automatic cleanup"
                         )
-                    if _probe_process_identity(
-                        claim.pid, claim.process_start_time
-                    ) is not False:
+                    if (
+                        _probe_process_identity(claim.pid, claim.process_start_time)
+                        is not False
+                    ):
                         raise RuntimeError(
                             "weight cache claim may still be live even though its "
                             "registration owner appears dead; refusing fallback"
@@ -726,11 +730,7 @@ class FileWeightCacheRegistry:
         # A release with no matching records has no proof that it owns the
         # shared socket slot. The claim path probes stale sockets before it
         # calls this helper with expected_daemon_id=None.
-        if (
-            claim is None
-            and registration is None
-            and expected_daemon_id is not None
-        ):
+        if claim is None and registration is None and expected_daemon_id is not None:
             return
 
         for path in (registration_path, claim_path):
