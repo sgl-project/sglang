@@ -6,6 +6,10 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.attention.dsa.transform_index import (
+    write_dsa_only_k_topk_paged,
+)
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     compute_cu_seqlens,
 )
@@ -13,6 +17,9 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
 )
+from sglang.srt.utils import is_cuda
+
+_is_cuda = is_cuda()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa_backend import DSAMetadata
@@ -65,10 +72,49 @@ class BaseIndexerMetadata(ABC):
         Return: extend seq lens for each batch.
         """
 
-    def get_token_to_batch_idx(self) -> torch.Tensor:
+    def get_token_to_batch_idx(self) -> Optional[torch.Tensor]:
         """
         Return: batch idx for each token.
         """
+
+    def try_only_k_topk_paged_fused(
+        self,
+        topk: int,
+        *,
+        output: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """
+        Fill the K-only top-k result directly when the metadata/backend supports it.
+
+        Return None to make the caller fall back to the generic dummy-logits path.
+        """
+        if (
+            not _is_cuda
+            or not envs.SGLANG_DSA_FUSE_TOPK.get()
+            or getattr(self, "force_unfused_topk", False)
+            or getattr(self, "topk_transform_method", None) != TopkTransformMethod.PAGED
+        ):
+            return None
+
+        token_to_batch_idx = self.get_token_to_batch_idx()
+        if token_to_batch_idx is None:
+            return None
+
+        seq_lens_expanded = self.get_seqlens_expanded()
+        if output is None:
+            output = torch.empty(
+                (seq_lens_expanded.shape[0], topk),
+                dtype=torch.int32,
+                device=seq_lens_expanded.device,
+            )
+        write_dsa_only_k_topk_paged(
+            page_table=self.get_page_table_1(),
+            lengths=seq_lens_expanded,
+            token_to_batch_idx=token_to_batch_idx,
+            output=output,
+            topk=topk,
+        )
+        return output
 
     @abstractmethod
     def topk_transform(
