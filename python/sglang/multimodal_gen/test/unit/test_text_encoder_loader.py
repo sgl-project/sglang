@@ -35,18 +35,11 @@ class TestTextEncoderClassResolution(unittest.TestCase):
     module is used purely as a text encoder.
     """
 
-    server_args = SimpleNamespace(trust_remote_code=False, revision=None)
-
     def _resolve(self, is_encoder_decoder, architectures):
         config = SimpleNamespace(
             is_encoder_decoder=is_encoder_decoder, architectures=architectures
         )
-        with mock.patch.object(
-            transformers.AutoConfig, "from_pretrained", return_value=config
-        ):
-            return TextEncoderLoader._resolve_transformers_text_encoder_class(
-                "dummy/path", self.server_args
-            )
+        return TextEncoderLoader().resolve_native_transformers_model_class(config)
 
     def test_umt5_encoder_decoder_uses_encoder_only_class(self):
         self.assertIs(
@@ -85,17 +78,6 @@ class TestTextEncoderClassResolution(unittest.TestCase):
     def test_unknown_architecture_falls_back_to_automodel(self):
         self.assertIs(self._resolve(True, ["NotARealClass"]), transformers.AutoModel)
 
-    def test_config_load_failure_falls_back_to_automodel(self):
-        with mock.patch.object(
-            transformers.AutoConfig,
-            "from_pretrained",
-            side_effect=OSError("no config"),
-        ):
-            cls = TextEncoderLoader._resolve_transformers_text_encoder_class(
-                "dummy/path", self.server_args
-            )
-        self.assertIs(cls, transformers.AutoModel)
-
     def test_bitsandbytes_native_load_requires_resident_encoder(self):
         loaded_encoder = nn.Linear(1, 1)
         transformers_model_class = SimpleNamespace(
@@ -116,11 +98,11 @@ class TestTextEncoderClassResolution(unittest.TestCase):
 
         with mock.patch.object(
             TextEncoderLoader,
-            "_resolve_transformers_text_encoder_class",
+            "resolve_native_transformers_model_class",
             return_value=transformers_model_class,
         ), mock.patch(
             "sglang.multimodal_gen.runtime.loader.component_loaders."
-            "text_encoder_loader.get_diffusers_component_config",
+            "component_loader.get_hf_config",
             return_value=component_config,
         ):
             encoder = TextEncoderLoader().load_native(
@@ -133,10 +115,11 @@ class TestTextEncoderClassResolution(unittest.TestCase):
         self.assertIs(encoder, loaded_encoder)
         server_args.require_component_resident.assert_called_once_with(
             "text_encoder",
-            feature_name="Transformers bitsandbytes text encoder",
+            feature_name="Transformers bitsandbytes component",
         )
         transformers_model_class.from_pretrained.assert_called_once_with(
             "/model/text_encoder",
+            config=component_config,
             trust_remote_code=False,
             revision=None,
             torch_dtype=torch.bfloat16,
