@@ -1729,9 +1729,7 @@ class TestCloseCancellationSafety:
 # ---------------------------------------------------------------------------
 
 
-def make_standalone_server_args(
-    *, port: Optional[int], sidecar_port: int
-) -> Any:
+def make_standalone_server_args(*, port: Optional[int], sidecar_port: int) -> Any:
     """Build resolved standalone gRPC arguments for runtime-context tests.
 
     Args:
