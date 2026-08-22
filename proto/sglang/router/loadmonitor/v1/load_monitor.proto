@@ -1,0 +1,124 @@
+syntax = "proto3";
+
+// This is the single canonical wire-contract input for the external Router.
+// The external Router dials INTO the Worker's fixed reporter port; the Worker
+// runs the gRPC server and the Router is the client.
+// Do NOT copy this file or its generated artifacts as fixtures into Router tests.
+// Reference the generated Python bindings from this source.
+
+package sglang.router.loadmonitor.v1;
+
+service LoadMonitorService {
+  // Bidirectional stream: Router sends control frames, Worker sends load reports.
+  // The first RouterFrame MUST be a RegisterRequest.
+  rpc Monitor(stream RouterFrame) returns (stream WorkerFrame);
+}
+
+// ---------------------------------------------------------------------------
+// Preserved messages — field numbers MUST NOT change.
+// ---------------------------------------------------------------------------
+
+enum WorkerType {
+  WORKER_TYPE_UNSPECIFIED = 0;
+  WORKER_TYPE_REGULAR = 1;
+  WORKER_TYPE_PREFILL = 2;
+  WORKER_TYPE_DECODE = 3;
+}
+
+enum ReportStatus {
+  REPORT_STATUS_UNSPECIFIED = 0;
+  REPORT_STATUS_HEALTHY = 1;
+  REPORT_STATUS_STALE = 2;
+  REPORT_STATUS_UNREACHABLE = 3;
+}
+
+message Worker {
+  string worker_addr = 1;
+  WorkerType worker_type = 2;
+  optional string model = 3;
+  optional string zone = 4;
+}
+
+message RankLoad {
+  int32 dp_rank = 1;
+  int64 snapshot_time_unix_ms = 2;
+  int64 num_running_reqs = 3;
+  int64 num_waiting_reqs = 4;
+  int64 num_waiting_uncached_tokens = 5;
+  int64 num_used_tokens = 6;
+  int64 num_total_tokens = 7;
+  int64 max_total_num_tokens = 8;
+  int64 max_running_requests = 9;
+  double token_usage = 10;
+  double gen_throughput = 11;
+  double cache_hit_rate = 12;
+  double utilization = 13;
+}
+
+message LoadReport {
+  string source_instance_id = 1;
+  uint64 sequence_id = 2;
+  int64 report_time_unix_ms = 3;
+  Worker worker = 4;        // compat metadata; not a trust boundary
+  ReportStatus status = 5;
+  optional string last_error = 6;
+  repeated RankLoad ranks = 7;
+}
+
+// ---------------------------------------------------------------------------
+// Bidi stream frame envelopes
+// ---------------------------------------------------------------------------
+
+message RouterFrame {
+  oneof payload {
+    RegisterRequest register = 1;
+    UpdateConfigRequest update_config = 2;
+    KeepAlive keep_alive = 3;
+    StopRequest stop = 4;
+  }
+}
+
+message WorkerFrame {
+  oneof payload {
+    RegisterResponse registered = 1;
+    LoadReport report = 2;
+    StreamError error = 3;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Control frames
+// ---------------------------------------------------------------------------
+
+// First RouterFrame MUST be a register. Mirrors the old StartReportingRequest
+// timing fields; drops ip/port because the Router now dials in, not out.
+// router_id lets a reconnecting Router replace its prior stream.
+message RegisterRequest {
+  string router_id = 1;           // stable Router-chosen session identity
+  int64 report_interval_ms = 2;   // > 0
+  int64 lease_ttl_ms = 3;         // > 0
+}
+
+// Worker ack for RegisterRequest.
+message RegisterResponse {
+  int64 lease_ttl_ms = 1;         // lease the Worker granted (echo/clamp of requested)
+  int64 renew_after_ms = 2;       // Router should send KeepAlive before this elapses
+}
+
+// Optional mid-stream reconfig. Absent field = unchanged.
+message UpdateConfigRequest {
+  optional int64 report_interval_ms = 1;
+  optional int64 lease_ttl_ms = 2;
+}
+
+// Lease refresh heartbeat. No payload needed today.
+message KeepAlive {}
+
+// Router asks the Worker to end this session gracefully.
+message StopRequest {}
+
+// Worker -> Router terminal or soft error frame.
+message StreamError {
+  string code = 1;      // stable machine string, e.g. "INVALID_FIRST_FRAME"
+  string message = 2;   // human-readable detail
+}
