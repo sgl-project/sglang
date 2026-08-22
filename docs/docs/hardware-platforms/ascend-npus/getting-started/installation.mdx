@@ -168,6 +168,16 @@ For installation of Triton on Ascend nightly builds or from sources, follow [ins
 
 We provide SGL kernels for Ascend NPU, check [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/README.md).
 
+<Note>
+Released packages are built for the `910` target only. Gemma-family models
+(including Qwen3.5) call `sgl_kernel_npu.norm.gemma_rmsnorm`, whose
+implementation is chosen when the wheel is built — the native `torch_npu`
+operator on Ascend 910B/910C, and ACLNN RMSNorm on Ascend 950, which does not
+register that operator. **Ascend 950 (A5) users must therefore build the wheel
+from source** with `bash build.sh -a kernels 950`; a `910` wheel fails on the
+first Gemma forward.
+</Note>
+
 #### DeepEP-compatible Library
 
 We provide a DeepEP-compatible Library as a drop-in replacement of deepseek-ai's DeepEP library, check the [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md).
