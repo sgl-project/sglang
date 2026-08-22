@@ -719,6 +719,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     ca-certificates \
     netcat-openbsd \
     curl \
+    ffmpeg \
     git \
     # Runtime libraries
     libopenmpi3 \
