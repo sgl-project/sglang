@@ -401,6 +401,7 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "nvidia_kda",
     "ptx_kda",
     "helion",
+    "intel_xpu",
 ]
 
 
