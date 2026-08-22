@@ -129,7 +129,7 @@ def test_plan_then_io_dsv4_matches_sync_swap_in() -> None:
         host_cache=replay_host,
         device_buffer=replay_dev,
         item_size_bytes=DSV4_ITEM_BYTES,
-        num_blocks=4,
+        num_blocks=1,
         is_dsv4_layout=True,
     )
     torch.cuda.synchronize()
@@ -177,7 +177,7 @@ def test_skip_io_probe_plans_without_moving_bytes() -> None:
         host_cache=probe["host_cache"],
         device_buffer=probe["device_buffer"],
         item_size_bytes=ITEM_SIZE_BYTES,
-        num_blocks=4,
+        num_blocks=nr,
     )
     torch.cuda.synchronize()
     assert torch.equal(probe["device_buffer"].cpu(), ref["device_buffer"].cpu())
@@ -261,7 +261,7 @@ def _pio_prefetch_step(
                 host_cache=host,
                 device_buffer=buffers[layer],
                 item_size_bytes=ITEM_SIZE_BYTES,
-                num_blocks=4,
+                num_blocks=_PIO_REQS,
             )
             events[layer].record(side)
     for layer in range(1, _PIO_LAYERS):
