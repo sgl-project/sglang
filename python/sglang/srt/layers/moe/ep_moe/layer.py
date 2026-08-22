@@ -307,7 +307,7 @@ class DeepEPMoE(FusedMoE):
             weight_layout = get_moonep_expert_weight_layout(
                 self,
                 num_prefetch_slots=(
-                    int(dispatch_output.expert_ids.numel()) - self.num_experts
+                    int(dispatch_output.cu_seqlens.numel()) - self.num_experts
                 ),
             )
             self.dispatcher.prefetch_weight(

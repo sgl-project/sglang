@@ -15,10 +15,8 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.topk import TopKOutput
-from sglang.srt.layers.moe.topk import TopKOutputChecker
+from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.utils import DeepEPMode
-
 
 _MOONEP_UNSUPPORTED_MESSAGE = (
     "MoonEP MoE A2A is recognized by SGLang, but the runtime dispatcher is not "
@@ -34,6 +32,10 @@ class MoonEPDispatchOutput(NamedTuple):
     ``plan`` is intentionally typed as ``Any`` so this module can define the
     SGLang-side contract without importing the optional ``moonep`` package at
     module import time.
+
+    ``expert_ids[g]`` is the logical expert represented by physical VM group
+    ``g``. It is metadata for consumers such as DeepGEMM, not a BF16 weight
+    row index.
     """
 
     hidden_states: torch.Tensor
@@ -437,7 +439,6 @@ def run_moonep_bf16_expert(
     hidden_states = dispatch_output.hidden_states
     route_weights_nvs = dispatch_output.route_weights_nvs
     cu_seqlens = dispatch_output.cu_seqlens
-    expert_ids = dispatch_output.expert_ids
 
     if hidden_states.ndim != 2:
         raise ValueError(
@@ -445,15 +446,13 @@ def run_moonep_bf16_expert(
         )
     if cu_seqlens.ndim != 1:
         raise ValueError(f"cu_seqlens must be 1D, got {cu_seqlens.shape}")
-    if expert_ids.shape != cu_seqlens.shape:
+    if cu_seqlens.numel() != weight_layout.full_gate_weight.shape[0]:
         raise ValueError(
-            f"expert_ids shape {expert_ids.shape} must match cu_seqlens "
-            f"shape {cu_seqlens.shape}"
+            "MoonEP cu_seqlens group count must match physical weight rows: "
+            f"{cu_seqlens.numel()} != {weight_layout.full_gate_weight.shape[0]}"
         )
     if route_weights_nvs is not None and route_weights_nvs.ndim != 1:
-        raise ValueError(
-            f"route_weights_nvs must be 1D, got {route_weights_nvs.shape}"
-        )
+        raise ValueError(f"route_weights_nvs must be 1D, got {route_weights_nvs.shape}")
 
     output = torch.empty_like(hidden_states)
     prev = 0
@@ -464,22 +463,11 @@ def run_moonep_bf16_expert(
         if cur == prev:
             continue
 
-        expert_id = int(expert_ids[group_id].item())
-        if expert_id < 0:
-            output[prev:cur].zero_()
-            prev = cur
-            continue
-        if expert_id >= weight_layout.full_gate_weight.shape[0]:
-            raise ValueError(
-                f"expert_id {expert_id} exceeds MoonEP weight rows "
-                f"{weight_layout.full_gate_weight.shape[0]}"
-            )
-
         x = hidden_states[prev:cur]
-        gate = F.linear(x, weight_layout.full_gate_weight[expert_id])
-        up = F.linear(x, weight_layout.full_up_weight[expert_id])
+        gate = F.linear(x, weight_layout.full_gate_weight[group_id])
+        up = F.linear(x, weight_layout.full_up_weight[group_id])
         activated = F.silu(gate) * up
-        y = F.linear(activated, weight_layout.full_down_weight[expert_id])
+        y = F.linear(activated, weight_layout.full_down_weight[group_id])
         if route_weights_nvs is not None:
             y = y * route_weights_nvs[prev:cur].to(dtype=y.dtype).unsqueeze(-1)
         output[prev:cur].copy_(y)
@@ -548,12 +536,6 @@ class MoonEPDispatcher(BaseDispatcher):
             num_prefetch_slots=self.num_prefetch_slots,
         )
 
-    def _get_rank(self) -> int:
-        try:
-            return dist.get_rank(group=self.group)
-        except (AssertionError, RuntimeError, TypeError, ValueError):
-            return 0
-
     def _pad_to_capacity(
         self,
         hidden_states: torch.Tensor,
@@ -599,14 +581,12 @@ class MoonEPDispatcher(BaseDispatcher):
         plan: Any,
     ) -> torch.Tensor:
         assert self.num_experts is not None
-        num_groups = int(cu_seqlens.numel())
         expert_ids = torch.full_like(cu_seqlens, -1)
-        experts_to_copy = plan.experts_to_copy
-        if experts_to_copy.ndim == 2:
-            experts_to_copy = experts_to_copy[self._get_rank()]
+        rank = dist.get_rank(group=self.group)
+        experts_to_copy = plan.experts_to_copy[rank]
 
         prev = 0
-        for group_id in range(num_groups):
+        for group_id in range(cu_seqlens.numel()):
             cur = int(cu_seqlens[group_id].item())
             if cur > prev:
                 if group_id < self.num_experts:

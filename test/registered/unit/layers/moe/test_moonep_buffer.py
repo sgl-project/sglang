@@ -9,6 +9,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.token_dispatcher.moonep import (
     MoonEPBuffer,
+    MoonEPDispatcher,
     MoonEPDispatchOutput,
     MoonEPExpertWeightLayout,
     get_moonep_expert_weight_layout,
@@ -242,64 +243,128 @@ class TestMoonEPExpertWeightLayout(unittest.TestCase):
 
 
 class TestMoonEPBf16ExpertRunner(unittest.TestCase):
-    def test_segment_runner_applies_expert_weights_and_route_weights(self):
+    def test_segment_runner_uses_physical_vm_group_weight_rows(self):
         hidden_states = torch.tensor(
-            [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
-            dtype=torch.float32,
+            [[1.0, 2.0], [5.0, 6.0]],
+            dtype=torch.bfloat16,
         )
-        route_weights = torch.tensor([1.0, 0.5, 2.0], dtype=torch.float32)
-        cu_seqlens = torch.tensor([2, 3], dtype=torch.int32)
-        expert_ids = torch.tensor([0, 1], dtype=torch.int32)
+        route_weights = torch.tensor([1.0, 1.5], dtype=torch.float32)
+        # E=2 source rows plus B=1 physical prefetch slot. Group 1 is empty;
+        # group 2 must use physical weight row 2 directly.
+        cu_seqlens = torch.tensor([1, 1, 2], dtype=torch.int32)
         gate = torch.tensor(
             [
                 [[1.0, 0.0], [0.0, 1.0]],
                 [[0.5, 0.0], [0.0, 0.5]],
-            ]
+                [[3.0, 0.0], [0.0, 3.0]],
+            ],
+            dtype=torch.bfloat16,
         )
         up = torch.tensor(
             [
                 [[2.0, 0.0], [0.0, 2.0]],
                 [[1.5, 0.0], [0.0, 1.5]],
-            ]
+                [[4.0, 0.0], [0.0, 4.0]],
+            ],
+            dtype=torch.bfloat16,
         )
         down = torch.tensor(
             [
                 [[1.0, 0.0], [0.0, 1.0]],
                 [[2.0, 0.0], [0.0, 2.0]],
-            ]
+                [[5.0, 0.0], [0.0, 5.0]],
+            ],
+            dtype=torch.bfloat16,
         )
         layout = MoonEPExpertWeightLayout(
             full_gate_weight=gate,
             full_up_weight=up,
             full_down_weight=down,
-            num_prefetch_slots=0,
+            num_prefetch_slots=1,
         )
         dispatch_output = MoonEPDispatchOutput(
             hidden_states=hidden_states,
             route_weights_nvs=route_weights,
             cu_seqlens=cu_seqlens,
             plan=object(),
-            expert_ids=expert_ids,
+            expert_ids=torch.tensor([0, -1, 1], dtype=torch.int32),
             num_tokens=2,
         )
 
         combine_input = run_moonep_bf16_expert(dispatch_output, layout)
 
         expected = torch.empty_like(hidden_states)
-        for start, end, expert in [(0, 2, 0), (2, 3, 1)]:
+        for start, end, physical_row in [(0, 1, 0), (1, 2, 2)]:
             x = hidden_states[start:end]
             y = torch.nn.functional.linear(
                 torch.nn.functional.silu(
-                    torch.nn.functional.linear(x, gate[expert])
+                    torch.nn.functional.linear(x, gate[physical_row])
                 )
-                * torch.nn.functional.linear(x, up[expert]),
-                down[expert],
+                * torch.nn.functional.linear(x, up[physical_row]),
+                down[physical_row],
             )
             expected[start:end] = y * route_weights[start:end, None]
 
         torch.testing.assert_close(combine_input.hidden_states, expected)
         self.assertIs(combine_input.plan, dispatch_output.plan)
         self.assertEqual(combine_input.num_tokens, 2)
+
+
+class TestMoonEPLogicalExpertMetadata(unittest.TestCase):
+    def test_expert_ids_map_physical_groups_to_logical_experts(self):
+        dispatcher = MoonEPDispatcher(
+            group=object(),
+            router_topk=1,
+            num_experts=2,
+        )
+        cu_seqlens = torch.tensor([1, 1, 2], dtype=torch.int32)
+        plan = SimpleNamespace(
+            experts_to_copy=torch.tensor([[1], [0]], dtype=torch.int32)
+        )
+
+        with patch(
+            "sglang.srt.layers.moe.token_dispatcher.moonep.dist.get_rank",
+            return_value=0,
+        ):
+            expert_ids = dispatcher._expert_ids_from_plan(cu_seqlens, plan)
+
+        torch.testing.assert_close(
+            expert_ids,
+            torch.tensor([0, -1, 1], dtype=torch.int32),
+        )
+
+
+class TestMoonEPConfigContract(unittest.TestCase):
+    def test_moonep_rejects_expert_bias(self):
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+        from sglang.srt.layers.moe.utils import MoeA2ABackend
+        from sglang.srt.runtime_context import get_context, get_parallel
+
+        with (
+            get_context().override_server_args(model_path="dummy"),
+            get_parallel().override(
+                moe_ep_size=1,
+                moe_ep_rank=0,
+                moe_tp_size=1,
+                moe_tp_rank=0,
+                tp_size=1,
+                tp_rank=0,
+            ),
+            patch(
+                "sglang.srt.layers.moe.fused_moe_triton.layer.get_moe_a2a_backend",
+                return_value=MoeA2ABackend.MOONEP,
+            ),
+        ):
+            with self.assertRaisesRegex(NotImplementedError, "expert bias"):
+                FusedMoE(
+                    num_experts=2,
+                    hidden_size=4,
+                    intermediate_size=4,
+                    layer_id=0,
+                    top_k=1,
+                    params_dtype=torch.bfloat16,
+                    with_bias=True,
+                )
 
 
 if __name__ == "__main__":
