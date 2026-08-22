@@ -121,7 +121,7 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
 
     def test_invalid_backend_raises(self):
         with self.assertRaisesRegex(ValueError, "Invalid attention backend"):
-            self.resolve(AttentionBackendEnum.AITER_SAGE)
+            self.resolve(AttentionBackendEnum.AITER_QUANT)
 
     def test_hopper_sage_attention_without_sm90_fix_falls_back(self):
         FakeCudaPlatform.is_hopper_device = True
