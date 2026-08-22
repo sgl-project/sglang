@@ -6995,9 +6995,22 @@ class ServerArgs:
             ), "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
             if self.deepep_mode != "auto":
                 logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
-            if not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set() and (
-                resolved_view(self).quantization == "modelopt_fp4"
-                or self.get_model_config().nvfp4_moe_meta is not None
+            use_cutedsl_w4a16 = (
+                resolved_view(self).moe_runner_backend == "flashinfer_cutedsl"
+                and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+            )
+            if use_cutedsl_w4a16 and envs.SGLANG_MOE_NVFP4_DISPATCH.get():
+                raise ValueError(
+                    "CuTe DSL NVFP4 W4A16 requires BF16 FlashInfer MoE "
+                    "dispatch; unset SGLANG_MOE_NVFP4_DISPATCH."
+                )
+            if (
+                not use_cutedsl_w4a16
+                and not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set()
+                and (
+                    resolved_view(self).quantization == "modelopt_fp4"
+                    or self.get_model_config().nvfp4_moe_meta is not None
+                )
             ):
                 envs.SGLANG_MOE_NVFP4_DISPATCH.set(True)
                 logger.warning(
