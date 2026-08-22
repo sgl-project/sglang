@@ -34,28 +34,21 @@ ARG DEBIAN_VERSION=bookworm
 ######################## STAGE 1 — chef recipe ##########################
 FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS chef
 RUN cargo install cargo-chef --locked --version ^0.1
-WORKDIR /work/sgl-router
+WORKDIR /work
 COPY experimental/sgl-router/Cargo.toml ./
-COPY experimental/sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
+COPY experimental/sgl-router/rust-toolchain.toml ./
 # Stub a minimal src tree so cargo can resolve the workspace, generate
 # the lockfile (gitignored upstream), then prepare the chef recipe.
-RUN mkdir -p src sgl-kv-indexer/src/bin \
-    && echo "fn main() {}" > src/main.rs \
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
-    && echo "" > sgl-kv-indexer/src/lib.rs \
-    && echo "fn main() {}" > sgl-kv-indexer/src/bin/kv-indexer-server.rs \
-    && echo "fn main() {}" > sgl-kv-indexer/src/bin/kv-indexer-bridge.rs \
     && cargo generate-lockfile \
     && cargo chef prepare --recipe-path recipe.json \
-    && rm -rf src sgl-kv-indexer/src
+    && rm -rf src
 
 ######################## STAGE 2 — builder ##############################
 FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends protobuf-compiler \
-    && rm -rf /var/lib/apt/lists/* \
-    && cargo install cargo-chef --locked --version ^0.1
-WORKDIR /work/sgl-router
+RUN cargo install cargo-chef --locked --version ^0.1
+WORKDIR /work
 
 # `dynamo-tokenizers` pulls in `pcre2-sys`, whose build.rs links the SYSTEM
 # libpcre2-8 whenever pkg-config finds it (it does here — the rust:bookworm
@@ -65,33 +58,29 @@ WORKDIR /work/sgl-router
 # it statically, keeping the runtime self-contained.
 ENV PCRE2_SYS_STATIC=1
 
-COPY --from=chef /work/sgl-router/recipe.json ./recipe.json
-COPY --from=chef /work/sgl-router/Cargo.lock ./Cargo.lock
-COPY experimental/sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
+COPY --from=chef /work/recipe.json ./recipe.json
+COPY --from=chef /work/Cargo.lock ./Cargo.lock
+COPY experimental/sgl-router/rust-toolchain.toml ./
 
-# Cook (compile + cache) the dep graph from the recipe. The recipe carries every
-# workspace member's manifest, so chef recreates the Indexer's source stubs itself.
+# Cook (compile + cache) the dep graph from the recipe. This layer's
+# inputs are recipe.json + the toolchain — code changes in src/ do NOT
+# invalidate it.
 RUN cargo chef cook --release --recipe-path recipe.json
 
 # Now bring in the real sources and the manifest they need.
 COPY experimental/sgl-router/Cargo.toml ./
 COPY experimental/sgl-router/src ./src
-COPY experimental/sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
-COPY experimental/sgl-router/sgl-kv-indexer/build.rs sgl-kv-indexer/build.rs
-COPY experimental/sgl-router/sgl-kv-indexer/proto sgl-kv-indexer/proto
-COPY experimental/sgl-router/sgl-kv-indexer/src sgl-kv-indexer/src
 
 # --locked is intentionally omitted: the lockfile is generated in-container
 # (gitignored upstream) and `cargo chef cook` may have mutated it during the
 # dep-cook step, so a strict --locked check would spuriously fail.
-RUN touch sgl-kv-indexer/build.rs \
-    && cargo build --release --bin sgl-router \
+RUN cargo build --release --bin sgl-router \
     && strip target/release/sgl-router
 
 ######################## STAGE 3 — runtime ##############################
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
-COPY --from=builder /work/sgl-router/target/release/sgl-router /usr/local/bin/sgl-router
+COPY --from=builder /work/target/release/sgl-router /usr/local/bin/sgl-router
 
 # Default config path; mount your own via `-v <host-path>:/etc/sgl-router`.
 ENV SGL_ROUTER_CONFIG=/etc/sgl-router/sgl-router.yaml

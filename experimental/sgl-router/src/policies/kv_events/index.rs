@@ -65,7 +65,6 @@ struct WorkerEntry {
 /// routing path entirely.
 pub struct KvEventIndex {
     tree: Arc<HashTree>,
-    maintain_tree: bool,
     subscribers: Arc<KvEventSubscriberRegistry>,
     pump: Mutex<Option<JoinHandle<()>>>,
     pump_cancel: CancellationToken,
@@ -116,24 +115,6 @@ impl KvEventIndex {
         http: reqwest::Client,
         block_size_oracle: Arc<BlockSizeOracle>,
     ) -> Arc<Self> {
-        Self::new_with_mode(http, block_size_oracle, true)
-    }
-
-    /// Discovers worker hash metadata only: seeds the shared [`BlockSizeOracle`]
-    /// but neither subscribes to KV events nor maintains the local tree, because
-    /// an external Indexer is the routing signal.
-    pub fn new_metadata_only_with_http_and_oracle(
-        http: reqwest::Client,
-        block_size_oracle: Arc<BlockSizeOracle>,
-    ) -> Arc<Self> {
-        Self::new_with_mode(http, block_size_oracle, false)
-    }
-
-    fn new_with_mode(
-        http: reqwest::Client,
-        block_size_oracle: Arc<BlockSizeOracle>,
-        maintain_tree: bool,
-    ) -> Arc<Self> {
         let tree = Arc::new(HashTree::new());
         let (tx, rx) = mpsc::channel::<WorkerEvent>(EVENT_CHANNEL_BUFFER);
         let subscribers = Arc::new(KvEventSubscriberRegistry::new(tx));
@@ -149,7 +130,6 @@ impl KvEventIndex {
         ));
         Arc::new(Self {
             tree,
-            maintain_tree,
             subscribers,
             pump: Mutex::new(Some(pump)),
             pump_cancel,
@@ -228,15 +208,6 @@ impl KvEventIndex {
         // hash KV blocks over token bigrams, so the policy must use the bigram
         // hasher for its query hashes to match the worker's stored hashes.
         self.block_size_oracle.set_bigram(cfg.is_bigram);
-        if !self.maintain_tree {
-            info!(
-                worker_url = %worker_url,
-                block_size = cfg.block_size,
-                is_bigram = cfg.is_bigram,
-                "kv-events: external Indexer configured; discovered hash metadata without subscribing"
-            );
-            return;
-        }
         info!(
             worker_url = %worker_url,
             dp_size = cfg.dp_size,
@@ -737,30 +708,6 @@ mod tests {
             index.block_size_oracle().is_bigram(),
             "add_worker must seed the bigram flag from EventConfig"
         );
-        index.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn metadata_only_mode_seeds_oracle_without_registering_subscribers() {
-        let oracle = BlockSizeOracle::new();
-        let index = KvEventIndex::new_metadata_only_with_http_and_oracle(
-            reqwest::Client::new(),
-            Arc::clone(&oracle),
-        );
-        let cfg = EventConfig {
-            host: "127.0.0.1".into(),
-            port_base: 30400,
-            topic: "kv-events".into(),
-            block_size: 64,
-            dp_size: 2,
-            is_bigram: true,
-        };
-
-        index.add_worker("http://127.0.0.1:30400", Some(cfg)).await;
-
-        assert_eq!(oracle.get(), Some(64));
-        assert!(oracle.is_bigram());
-        assert_eq!(index.known_worker_count(), 0);
         index.shutdown().await;
     }
 }

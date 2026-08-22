@@ -109,45 +109,18 @@ elif [[ -r "${HF_TOKEN_FILE}" ]]; then
   HF_TOKEN_VALUE=$(cat "${HF_TOKEN_FILE}")
 fi
 
-# Persistent JIT kernel cache keyed by GPU mask + image ID (new image -> new
-# cache; avoids dlopen of stale .so's like libsycl.so.8 after a torch bump).
-if [[ -n "${XPU_KERNEL_CACHE_DIR:-}" ]]; then
-  XPU_KERNEL_CACHE_HOST="${XPU_KERNEL_CACHE_DIR}"
-else
-  # `|| IMG_ID_SHORT=""` keeps pipefail from killing the script on inspect failure.
-  IMG_ID_SHORT=$(docker image inspect --format '{{.Id}}' "${IMAGE}" 2>/dev/null \
-    | sed 's/^sha256://' | cut -c1-12) || IMG_ID_SHORT=""
-  CACHE_ROOT="${HOME}/.cache/sglang-xpu-ci"
-  GPU_KEY="gpu${ZE_AFFINITY_MASK:-shared}"
-  if [[ -n "${IMG_ID_SHORT}" ]]; then
-    XPU_KERNEL_CACHE_HOST="${CACHE_ROOT}/kernel-cache-${GPU_KEY}-${IMG_ID_SHORT}"
-    # Prune caches for other image IDs + the legacy unversioned dir (root-owned).
-    shopt -s nullglob
-    stale_siblings=("${CACHE_ROOT}"/kernel-cache-"${GPU_KEY}"-* "${CACHE_ROOT}/kernel-cache-${GPU_KEY}")
-    shopt -u nullglob
-    for sibling in "${stale_siblings[@]}"; do
-      [[ -d "${sibling}" ]] || continue
-      [[ "${sibling}" == "${XPU_KERNEL_CACHE_HOST}" ]] && continue
-      echo "Pruning stale kernel cache: ${sibling}"
-      docker run --rm -v "${CACHE_ROOT}:/c" busybox:latest \
-        rm -rf "/c/$(basename "${sibling}")" || true
-    done
-  else
-    # Throwaway per-run dir; legacy path may be poisoned. Next good run prunes it.
-    echo "Warning: could not resolve image ID for ${IMAGE}; using throwaway cache." >&2
-    XPU_KERNEL_CACHE_HOST="${CACHE_ROOT}/kernel-cache-${GPU_KEY}-unversioned-$$"
-  fi
-fi
+# Persistent JIT kernel cache (Triton/Inductor/NEO/SYCL) keyed by GPU mask.
+# Cold JIT compile can push test_xpu_basic past its 1200s timeout on B580.
+XPU_KERNEL_CACHE_HOST="${XPU_KERNEL_CACHE_DIR:-${HOME}/.cache/sglang-xpu-ci/kernel-cache-gpu${ZE_AFFINITY_MASK:-shared}}"
 mkdir -p "${XPU_KERNEL_CACHE_HOST}"/{triton,inductor,neo,sycl}
 echo "Using persistent XPU kernel cache: ${XPU_KERNEL_CACHE_HOST}"
 
-# Cap the cache (default 5 GiB); over-cap resets it via busybox (root-owned).
+# Cap the cache (default 5 GiB); over-cap resets it (misses just recompile).
 XPU_KERNEL_CACHE_MAX_MB="${XPU_KERNEL_CACHE_MAX_MB:-5120}"
 cache_mb=$(du -sm "${XPU_KERNEL_CACHE_HOST}" 2>/dev/null | cut -f1)
 if [[ -n "${cache_mb}" && "${cache_mb}" -gt "${XPU_KERNEL_CACHE_MAX_MB}" ]]; then
   echo "XPU kernel cache is ${cache_mb} MiB (> ${XPU_KERNEL_CACHE_MAX_MB} MiB cap); resetting it."
-  docker run --rm -v "${XPU_KERNEL_CACHE_HOST}:/c" busybox:latest \
-    sh -c 'rm -rf /c/triton /c/inductor /c/neo /c/sycl' || true
+  rm -rf "${XPU_KERNEL_CACHE_HOST:?}"/{triton,inductor,neo,sycl}
   mkdir -p "${XPU_KERNEL_CACHE_HOST}"/{triton,inductor,neo,sycl}
 fi
 
