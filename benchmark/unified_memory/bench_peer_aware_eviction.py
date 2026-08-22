@@ -58,13 +58,17 @@ def generate(base_url: str, text: str, max_new_tokens: int) -> dict:
     response.raise_for_status()
     body = response.json()
     meta = body["meta_info"]
+    prefill_finished_time = meta.get("prefill_finished_time")
+    forward_entry_time = meta.get("forward_entry_time")
     return {
         "prompt_tokens": meta["prompt_tokens"],
         "cached_tokens": meta["cached_tokens"],
         "e2e_latency_s": meta["e2e_latency"],
         "client_latency_s": elapsed,
         "prefill_latency_s": (
-            meta["prefill_finished_time"] - meta["forward_entry_time"]
+            prefill_finished_time - forward_entry_time
+            if prefill_finished_time is not None and forward_entry_time is not None
+            else None
         ),
         "completion_tokens": meta["completion_tokens"],
         "num_retractions": meta["num_retractions"],
@@ -83,7 +87,11 @@ def summarize_probe(probes: list[dict], batch_wall_latency_s: float) -> dict[str
     cached = [item["cached_tokens"] for item in probes]
     e2e = [item["e2e_latency_s"] for item in probes]
     client = [item["client_latency_s"] for item in probes]
-    prefill = [item["prefill_latency_s"] for item in probes]
+    prefill = [
+        item["prefill_latency_s"]
+        for item in probes
+        if item["prefill_latency_s"] is not None
+    ]
     completion_tokens = sum(item["completion_tokens"] for item in probes)
     return {
         "cached_prefixes": sum(value > 0 for value in cached),
@@ -95,8 +103,8 @@ def summarize_probe(probes: list[dict], batch_wall_latency_s: float) -> dict[str
         "p95_e2e_latency_s": percentile(e2e, 0.95),
         "mean_client_latency_s": statistics.mean(client),
         "p95_client_latency_s": percentile(client, 0.95),
-        "mean_prefill_latency_s": statistics.mean(prefill),
-        "p95_prefill_latency_s": percentile(prefill, 0.95),
+        "mean_prefill_latency_s": statistics.mean(prefill) if prefill else None,
+        "p95_prefill_latency_s": percentile(prefill, 0.95) if prefill else None,
         "batch_wall_latency_s": batch_wall_latency_s,
         "request_throughput_rps": len(probes) / batch_wall_latency_s,
         "output_throughput_tps": completion_tokens / batch_wall_latency_s,

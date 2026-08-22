@@ -69,6 +69,19 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         self.assertEqual(result.num_tokens_evicted, 80)
         self.assertEqual(result.mamba_num_evicted, 4)
 
+    def test_c128_component_keeps_zero_quota(self):
+        cache, _, _ = self._build_cache(collateral_capacity_gain=70)
+        cache.tree_components = (ComponentType.FULL, ComponentType.C128)
+        cache._evict_device_next_node.side_effect = None
+        cache._evict_device_next_node.return_value = None
+
+        result = cache.evict(EvictParams(num_tokens=1))
+
+        self.assertEqual(result.num_tokens_evicted, 0)
+        cache.tree_core.evict_device_start.assert_called_once_with(
+            ComponentType.FULL, 1
+        )
+
     def test_mamba_allocation_counts_collateral_full_capacity(self):
         cache = object.__new__(UnifiedRadixCache)
         cache.disable = False
