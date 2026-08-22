@@ -619,6 +619,8 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
         # pplx's AllToAll.combine already sums each token's expert outputs back
         # to the source rank
         return True
+    if get_moe_a2a_backend().is_mori():
+        return True
     return False
 
 
