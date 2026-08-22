@@ -26,10 +26,14 @@ class JointThresholdInDel(DllmAlgorithm):
         self.max_post_edit_steps = config.algorithm_config.get(
             "max_post_edit_steps", 16
         )
-        if self.max_post_edit_steps < 0:
+        if (
+            isinstance(self.max_post_edit_steps, bool)
+            or not isinstance(self.max_post_edit_steps, int)
+            or self.max_post_edit_steps < 0
+        ):
             raise ValueError(
-                "max_post_edit_steps must be non-negative, "
-                f"got {self.max_post_edit_steps}"
+                "max_post_edit_steps must be a non-negative integer, "
+                f"got {self.max_post_edit_steps!r}"
             )
         self.max_regular_update_steps = self.block_size + self.max_post_edit_steps
         self.delete_token_id = config.delete_token_id
