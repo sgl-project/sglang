@@ -37,9 +37,6 @@ dependencies:
       - '**/Cargo.lock'
       - '**/pyproject*.toml'
       - '**/setup.py'
-      - '**/poetry.lock'
-      - '**/package.json'
-      - '**/package-lock.json'
 
 # Multi-modal
 Multi-modal:
