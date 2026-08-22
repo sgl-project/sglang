@@ -374,19 +374,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         #                           Humming W4A8 (PR #3738/#4431)
         self._fi_kernel: Optional[str] = None
         if self.use_flashinfer:
+            # precision=fp8 is an SM90 knob (Humming W4A8). The Blackwell
+            # paths already run MXFP8 activations, so the flag is inert there
+            # rather than an error -- one config can move across hardware.
             if is_sm100_supported():
-                if self.flashinfer_mxfp4_moe_precision == "fp8":
-                    raise ValueError(
-                        "flashinfer_mxfp4_moe_precision=fp8 selects the SM90 "
-                        "Humming path; use `default` for the SM100 MXFP8 path."
-                    )
                 self._fi_kernel = "trtllm_sm100"
             elif is_sm120_supported():
-                if self.flashinfer_mxfp4_moe_precision == "fp8":
-                    raise ValueError(
-                        "flashinfer_mxfp4_moe_precision=fp8 selects the SM90 "
-                        "Humming path; use `default` for the SM120 MXFP8 path."
-                    )
                 self._fi_kernel = "cutlass_sm120"
             elif is_sm90_supported():
                 if not _FI_HAS_SM90_CUTLASS_MXFP4:

@@ -38,12 +38,10 @@ class Mxfp4FlashinferCutlassMoEMethod:
             raise RuntimeError("Mxfp4FlashinferCutlassMoEMethod requires FlashInfer.")
         self._use_mxfp8_act_scaling = is_sm120_supported()
         precision = get_exec().moe.flashinfer_mxfp4_moe_precision
+        # precision=fp8 is an SM90 knob (Humming W4A8); on SM120 the MXFP8
+        # activation path already computes in FP8, so the flag is simply inert
+        # there rather than an error -- one config can move across hardware.
         self._use_sm90_humming = not self._use_mxfp8_act_scaling and precision == "fp8"
-        if self._use_mxfp8_act_scaling and precision == "fp8":
-            raise ValueError(
-                "flashinfer_mxfp4_moe_precision=fp8 selects the SM90 Humming "
-                "path; use `default` for the SM120 MXFP8 path."
-            )
         if self._use_sm90_humming:
             # TODO: Remove this feature-specific check once the global
             # FlashInfer dependency is upgraded to >= 0.6.18 (0.6.17
