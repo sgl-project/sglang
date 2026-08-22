@@ -341,6 +341,7 @@ class MoriKVManager(CommonKVManager):
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.room_to_bootstrap_addr: Dict[int, str] = {}
             self._start_decode_thread()
+            self._start_heartbeat_checker_thread()
 
     def _init_engine(self) -> IOEngine:
         if self.kv_args.ib_device:
