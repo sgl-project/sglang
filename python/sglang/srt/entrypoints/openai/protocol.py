@@ -50,6 +50,7 @@ from openai.types.responses.response_format_text_json_schema_config import (
 )
 from openai.types.shared.response_format_json_object import ResponseFormatJSONObject
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -582,9 +583,55 @@ class ChatCompletionMessageContentVideoPart(BaseModel):
     video_url: ChatCompletionMessageContentVideoURL
 
 
-class ChatCompletionMessageContentAudioPart(BaseModel):
+class ChatCompletionMessageContentInputAudio(BaseModel):
+    data: str
+    format: Literal["wav", "mp3"]
+
+
+_AUDIO_FORMAT_TO_MIME_TYPE = {
+    "wav": "audio/wav",
+    "mp3": "audio/mpeg",
+}
+
+
+class ChatCompletionMessageContentAudioURLPart(BaseModel):
     type: Literal["audio_url"]
     audio_url: ChatCompletionMessageContentAudioURL
+
+
+class ChatCompletionMessageContentAudioInlinePart(BaseModel):
+    type: Literal["input_audio"]
+    input_audio: ChatCompletionMessageContentInputAudio
+
+
+def _to_audio_url_part(
+    part: Union[
+        ChatCompletionMessageContentAudioURLPart,
+        ChatCompletionMessageContentAudioInlinePart,
+    ],
+) -> ChatCompletionMessageContentAudioURLPart:
+    if isinstance(part, ChatCompletionMessageContentAudioURLPart):
+        return part
+
+    audio = part.input_audio
+    return ChatCompletionMessageContentAudioURLPart(
+        type="audio_url",
+        audio_url=ChatCompletionMessageContentAudioURL(
+            url=f"data:{_AUDIO_FORMAT_TO_MIME_TYPE[audio.format]};base64,{audio.data}"
+        ),
+    )
+
+
+# Audio arrives by reference as `audio_url`, holding a URL or a data URI, or
+# inline as OpenAI's `input_audio`, holding base64. Inline audio is converted to
+# the equivalent data URI as it validates.
+ChatCompletionMessageContentAudioPart = Annotated[
+    Union[
+        ChatCompletionMessageContentAudioURLPart,
+        ChatCompletionMessageContentAudioInlinePart,
+    ],
+    AfterValidator(_to_audio_url_part),
+]
 
 
 class ChatCompletionMessageContentToolReferenceBlock(BaseModel):
@@ -868,6 +915,7 @@ class ChatCompletionRequest(BaseModel):
     use_audio_in_video: bool = False
 
     images_config: Optional[Dict] = None
+    video_config: Optional[Dict] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None

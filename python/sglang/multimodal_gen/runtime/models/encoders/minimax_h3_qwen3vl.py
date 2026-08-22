@@ -41,11 +41,11 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
     eight otherwise-idle ranks during encoding.
     """
 
-    supports_dp_encode = True
     # The inherited text-layer list covers Qwen's language stack; reference
     # modes also execute the embedded visual tower.
     layer_names = [*TextEncoder.layer_names, "model.visual.blocks"]
-    supported_checkpoint_quantization_methods = frozenset({"fp8"})
+
+    supports_dp_encode = True
 
     @staticmethod
     def should_materialize_checkpoint_weight(name: str) -> bool:
@@ -193,7 +193,7 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             try:
                 can_keep_checkpoint_tensor = bool(
-                    getattr(self, "_mps_zero_copy_weight_loading", False)
+                    getattr(self, "_keep_checkpoint_mapping", False)
                     and weight_loader is default_weight_loader
                     and param.device.type == "cpu"
                     and loaded_weight.device.type == "cpu"
