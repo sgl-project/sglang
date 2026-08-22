@@ -418,6 +418,54 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
 
+class DeepSeekV4DCPTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
+    """Widened global allocator for rank-sharded DeepSeek V4 KV domains."""
+
+    supports_dsv4_dcp = True
+
+    def __init__(
+        self,
+        physical_size_full: int,
+        physical_size_swa: int,
+        physical_page_size: int,
+        dcp_size: int,
+        dcp_rank: int,
+        dtype: torch.dtype,
+        device: str,
+        kvcache: BaseSWAKVPool,
+        need_sort: bool,
+    ):
+        if dcp_size <= 1 or not 0 <= dcp_rank < dcp_size:
+            raise ValueError(
+                f"Invalid DSV4 DCP geometry: dcp_size={dcp_size}, dcp_rank={dcp_rank}"
+            )
+        if not getattr(kvcache, "supports_dsv4_dcp", False):
+            raise NotImplementedError(
+                "DeepSeek V4 DCP requires the ROCm unified-KV pool; the selected "
+                "physical KV layout has no owner-local SWA translation. Set "
+                "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton."
+            )
+        self.dcp_size = dcp_size
+        self.dcp_rank = dcp_rank
+        self.physical_size_full = physical_size_full
+        self.physical_size_swa = physical_size_swa
+        self.physical_page_size = physical_page_size
+        super().__init__(
+            size=physical_size_full * dcp_size,
+            size_swa=physical_size_swa * dcp_size,
+            page_size=physical_page_size * dcp_size,
+            dtype=dtype,
+            device=device,
+            kvcache=kvcache,
+            need_sort=need_sort,
+        )
+
+    def resize(self, config) -> None:
+        raise NotImplementedError(
+            "DeepSeek V4 DCP does not support post-construction KV-pool resizing."
+        )
+
+
 class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     """Single-pool allocator for models whose every layer is sliding-window attention."""
 

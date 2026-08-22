@@ -28,6 +28,10 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
+from sglang.srt.layers.attention.dsv4.dcp import (
+    local_c4_topk_candidates,
+    merge_c4_topk_candidates,
+)
 from sglang.srt.layers.attention.dsv4.metadata import (
     NonPagedIndexerPlan,
     PagedIndexerMetadata,
@@ -809,6 +813,8 @@ class C4IndexerBackendMixin:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
         if self.dsa_topk_backend.is_torch():
+            if get_parallel().dcp_enabled:
+                raise AssertionError("DSV4 DCP top-k must use the distributed path")
             topk_transform_512_pytorch_vectorized(
                 logits,
                 c4_seq_lens,
@@ -818,6 +824,8 @@ class C4IndexerBackendMixin:
                 raw_indices,
             )
         elif self.dsa_topk_backend.is_flashinfer():
+            if get_parallel().dcp_enabled:
+                raise AssertionError("DSV4 DCP top-k must use the distributed path")
             topk_transform_512_flashinfer_unfused(
                 logits,
                 c4_seq_lens,
@@ -826,6 +834,58 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
+        elif get_parallel().dcp_enabled:
+            dcp_size = get_parallel().attn_dcp_size
+            dcp_rank = get_parallel().attn_dcp_rank
+            local_scores, global_ids = local_c4_topk_candidates(
+                logits,
+                c4_seq_lens,
+                c4_sparse_page_indices.shape[1],
+                dcp_size,
+                dcp_rank,
+            )
+            group = get_parallel().dcp_group
+            gathered_scores = group.all_gather(local_scores.contiguous(), dim=1)
+            gathered_ids = group.all_gather(global_ids.contiguous(), dim=1)
+            result = merge_c4_topk_candidates(
+                gathered_scores,
+                gathered_ids,
+                c4_sparse_page_indices.shape[1],
+                dcp_size,
+                dcp_rank,
+                page_table,
+                indexer_metadata.c4_page_size,
+            )
+            core_metadata.c4_sparse_page_indices.copy_(result.page_indices)
+            core_metadata.c4_sparse_topk_lengths_raw.copy_(result.local_lens)
+            core_metadata.c4_sparse_topk_lengths.copy_(result.local_lens)
+            if raw_indices is not None:
+                raw_indices.copy_(result.local_raw_indices)
+
+            if forward_batch.forward_mode.is_decode_or_idle() or (
+                forward_batch.forward_mode.is_target_verify()
+            ):
+                from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import (
+                    runtime,
+                )
+
+                unified = core_metadata.unified
+                assert unified is not None
+                state_slot = unified.verify_store_state_slot[:query_rows]
+                runtime.update_dcp_csa_stream(
+                    indices=unified.csa_indices,
+                    indptr=unified.csa_indptr,
+                    state_slot=state_slot,
+                    positions=core_metadata.positions_casual[:query_rows],
+                    swa_len=core_metadata.swa_topk_lengths[:query_rows],
+                    c4_page_indices=result.page_indices,
+                    c4_len=result.local_lens,
+                    win=token_to_kv_pool.unified_swa_window,
+                    ring_stride=token_to_kv_pool.unified_swa_ring_size,
+                    swa_pages=token_to_kv_pool.unified_swa_pages,
+                    dcp_size=dcp_size,
+                    dcp_rank=dcp_rank,
+                )
         elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
             topk_transform_512_v2(
                 logits,
@@ -845,6 +905,8 @@ class C4IndexerBackendMixin:
                 raw_indices,
             )
         if hisparse_coordinator is not None:
+            if get_parallel().dcp_enabled:
+                raise NotImplementedError("DSV4 DCP does not support HiSparse.")
             if hisparse_decode:
                 compress_layer_id = token_to_kv_pool.layer_mapping[
                     c4_indexer.layer_id

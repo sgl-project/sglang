@@ -794,7 +794,7 @@ class SchedulerPPMixin:
         predicted_size = self.length_predictor.predict_next_chunk_size(
             history_len=history_len,
             base_chunk_size=self.chunked_prefill_size,
-            page_size=self.page_size,
+            page_size=self.token_to_kv_pool_allocator.page_size,
             context_len=self.model_config.context_len,
             max_chunk_size=max_chunk_size,
         )

@@ -1610,8 +1610,9 @@ class MQALayer(MqaAttentionBase):
         )
 
         if is_unified_kv_triton():
+            attn_q = q_out if q_out is not None else q
             o = attn_backend.forward(
-                q=q_out if q_out is not None else q,
+                q=attn_q,
                 k=attn_k,
                 v=attn_k,
                 layer=self.attn_mqa,
