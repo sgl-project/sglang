@@ -498,6 +498,14 @@ class Envs:
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
 
     # ===================================================================
+    # Diffusion: layerwise offload
+    # ===================================================================
+    # Kill-switch for the courier thread that ships checkpoint-mapped layers
+    # to the device off the compute thread. The courier already falls back to
+    # the synchronous copy on any failure; this forces that path up front.
+    SGLANG_DISABLE_MAPPED_COURIER = EnvBool(False)
+
+    # ===================================================================
     # Memory pools and KV-cache sizing
     # ===================================================================
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
