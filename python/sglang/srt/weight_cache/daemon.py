@@ -378,9 +378,7 @@ class WeightCacheDaemon:
         # stringifying every entry would allocate a copy of all handles.
         total_bytes = sum(
             len(handle)
-            for handle in (
-                entry.get("handle") for entry in self.state_entries.values()
-            )
+            for handle in (entry.get("handle") for entry in self.state_entries.values())
             if isinstance(handle, (str, bytes, bytearray))
         )
         logger.info(
