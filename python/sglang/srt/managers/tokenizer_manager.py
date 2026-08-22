@@ -231,6 +231,13 @@ class ReqState:
     # request as aborted instead of sending it.
     abort_before_dispatch: bool = False
 
+    # The LoRA lease for this request has already been released. Every terminal
+    # path funnels through TokenizerManager._finalize_lora_lease, which uses
+    # this flag to stay idempotent: a leaked release hangs unload's
+    # wait_for_zero forever, and a double release drives the ConcurrentCounter
+    # negative, which hangs it just the same (it waits for exactly zero).
+    lora_lease_released: bool = False
+
     # For streaming output
     last_output_offset: int = 0
 
@@ -1727,6 +1734,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             out["meta_info"] = meta_info
         return out
 
+    def _finalize_lora_lease(self, state: Optional[ReqState]) -> None:
+        """Release the request's LoRA lease exactly once, however it terminates:
+        normal finish, scheduler abort echo (queued / tokenizer-held / disagg),
+        status-code abort, or a failed dispatch. A request whose LoRA was never
+        acquired (pre-acquire failure leaves lora_id unset) has no lease to
+        release."""
+        if state is None or state.lora_lease_released:
+            return
+        # lora_path / lora_id are declared on both input structs with default
+        # None (= base model / lease never acquired), so plain None checks are
+        # the contract. State-derived checks come first: a request without a
+        # lease has nothing to release, whatever the server config says.
+        if state.obj.lora_path is None or state.obj.lora_id is None:
+            return
+        if not self.enable_lora:
+            return
+        state.lora_lease_released = True
+        asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+
     async def _handle_abort_finish_reason(
         self,
         out: dict,
@@ -1759,9 +1785,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if state.obj.rid in self.rid_to_state:
                 del self.rid_to_state[state.obj.rid]
 
-            # Mark ongoing LoRA request as finished.
-            if self.enable_lora and state.obj.lora_path:
-                await self.lora_registry.release(state.obj.lora_id)
+            # Status-code aborts also arrive through _handle_batch_output, which
+            # already released the lease and deleted the state — the finalizer's
+            # idempotency is what prevents the counter from going negative here.
+            self._finalize_lora_lease(state)
             if not is_stream:
                 raise fastapi.HTTPException(
                     status_code=finish_reason["status_code"],
@@ -2538,8 +2565,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 del self.rid_to_state[rid]
 
                 # Mark ongoing LoRA request as finished.
-                if self.enable_lora and state.obj.lora_path:
-                    asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+                self._finalize_lora_lease(state)
 
             if out_dict is not None:
                 state.out_list.append(out_dict)
@@ -3271,6 +3297,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
+        # This abort echo is the scheduler-side terminal ACK for queued,
+        # tokenizer-held, and disagg-retracted requests — none of them reach
+        # _handle_batch_output, so this is their only lease-release point.
+        self._finalize_lora_lease(self.rid_to_state.get(recv_obj.rid))
         del self.rid_to_state[recv_obj.rid]
 
         state.out_list.append(out)
@@ -3402,8 +3432,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"All loaded adapters: {self.lora_ref_cache.keys()}."
                 )
 
-            logger.info(f"Reloading evicted adapter: {lora_path}")
             new_lora_ref = self.lora_ref_cache[lora_path]
+            if not new_lora_ref.reloadable:
+                raise ValueError(
+                    f"LoRA adapter '{lora_path}' was loaded over the wire "
+                    f"(lora_path={new_lora_ref.lora_path!r}) and has no disk "
+                    "artifact to reload from; it must be re-pushed by the "
+                    "trainer instead of implicitly reloaded."
+                )
+            logger.info(f"Reloading evicted adapter: {lora_path}")
             load_result = await self.load_lora_adapter(
                 LoadLoRAAdapterReqInput(
                     lora_name=new_lora_ref.lora_name,
@@ -3484,6 +3521,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             rids = obj.rid
         for rid in rids:
+            # A failed/partial dispatch may never produce a scheduler terminal for
+            # this rid, and once the state is dropped a late terminal has no release
+            # point either — so release the LoRA lease here.
+            self._finalize_lora_lease(self.rid_to_state.get(rid))
             self.rid_to_state.pop(rid, None)
 
     def _should_dispatch_to_encoder(
