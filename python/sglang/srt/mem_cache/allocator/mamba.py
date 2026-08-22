@@ -46,7 +46,7 @@ class MambaSlotAllocator:
         self.clear()
 
     def available_size(self) -> int:
-        return len(self.free_slots)
+        return len(self.free_slots) + self.num_release_slots
 
     def schedulable_available_size(self) -> int:
         """Planner-facing free count. Identity to ``available_size`` for the
@@ -79,8 +79,12 @@ class MambaSlotAllocator:
         return self._do_alloc(need_size)
 
     def _do_alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        if need_size > len(self.free_slots):
+        if need_size > self.available_size():
             return None
+
+        if need_size > len(self.free_slots):
+            self._merge_release_slots()
+
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
         return select_index
@@ -88,10 +92,32 @@ class MambaSlotAllocator:
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
-        self.free_slots = torch.cat((self.free_slots, free_index))
+
+        # Keep released slots out of the active free-list until allocation
+        # needs them. Concatenating the entire device free-list for every
+        # request release makes a request-turnover path O(pool_size) and
+        # allocates a new GPU tensor each time.
+        # Mutable views are snapshotted by their callers before the backing
+        # storage can be reused.
+        self.release_slots.append(free_index)
+        self.num_release_slots += free_index.numel()
+
+    def _merge_release_slots(self):
+        if self.num_release_slots == 0:
+            return
+
+        if len(self.free_slots) == 0 and len(self.release_slots) == 1:
+            self.free_slots = self.release_slots[0]
+        else:
+            self.free_slots = torch.cat([self.free_slots, *self.release_slots])
+
+        self.release_slots = []
+        self.num_release_slots = 0
 
     def clear(self):
         # Slot 0 is reserved as a dummy write target for padded tokens.
         self.free_slots = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
+        self.release_slots = []
+        self.num_release_slots = 0
