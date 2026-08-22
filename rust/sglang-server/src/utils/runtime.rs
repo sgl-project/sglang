@@ -1,14 +1,14 @@
 //! Runtime bootstrap: wires channels, pins CPU-bound pools, starts the tokio
 //! API server, and returns a handle the Python boundary uses for
-//! `recv_requests` (ingress drain) and `push_batch` (egress push).
+//! `recv_requests` and `push_decode_result_batch`.
 //!
 //! Thread layout:
-//!   * API server   — tokio multi-thread runtime (I/O bound), pinned core set A
-//!   * Tokenizer    — N pinned OS threads (CPU bound), core set B
-//!   * Detokenizer  — M pinned OS threads / shards (CPU bound), core set C
-//!   * TM ingress   — 1 thread driving the ingress FSM
-//!   * TM egress    — 1 thread draining the egress ring → detok shards
-//!   * MM workers   — K unpinned OS threads, spawned late via
+//!   * API server     — tokio multi-thread runtime (I/O bound), pinned core set A
+//!   * Tokenizer      — N pinned OS threads (CPU bound), core set B
+//!   * Detokenizer    — M pinned OS threads (CPU bound), core set C
+//!   * To_scheduler   — 1 thread driving the FSM
+//!   * From_scheduler — 1 thread draining the scheduler → detok shards
+//!   * MM workers     — K unpinned OS threads, spawned late via
 //!     [`Runtime::spawn_mm_pool`] (multimodal models only)
 //!
 //! Keeping CPU-bound tokenize/detokenize off the async executor avoids stalling
@@ -17,41 +17,42 @@
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-mod config;
-mod runnable;
-mod threads;
+use crate::message::config::RuntimeConfig;
+use crate::message::detok::DetokMsg;
 
-pub use config::{DefaultSamplingParams, RuntimeConfig, RustServerServerArgs, ServerArgs};
-
-use crate::message::DetokMsg;
-use crate::ring::{
-    EgressConsumer, EgressProducer, IngressConsumer, IngressProducer, egress_ring, ingress_ring,
+use super::threads::{join_all_with_timeout, plan_cores, spawn_pool};
+use crate::tokenizer_manager::channel::{
+    FromSchedulerRx, FromSchedulerTx, ToSchedulerRx, ToSchedulerTx, from_scheduler, to_scheduler,
 };
-use crate::runtime::threads::{plan_cores, spawn_pool};
-use crate::tokenizer_manager::{Senders, TmEvent};
+use crate::tokenizer_manager::wiring::{Senders, TmEvent};
 use crate::utils::sock::bind_tcp_listener;
-use crate::{api_server, detokenizer, tokenizer, tokenizer_manager};
+use crate::{
+    api_server, tokenizer_manager, tokenizer_manager::detokenizer, tokenizer_manager::tokenizer,
+};
 
-// Re-export so stages keep importing `crate::runtime::Runnable`.
-pub use runnable::Runnable;
+/// A pipeline stage that owns its channel handles + config and runs a blocking
+/// loop until its inbox closes.
+pub trait Runnable: Send + 'static {
+    fn run(self);
+}
 
-/// Live runtime. Held by the pyo3 bridge; the Python boundary reads `ingress`
-/// and `egress`. `request_shutdown` (also run on `Drop`) stops every stage.
+/// Live runtime. Held by the pyo3 bridge; the Python boundary reads the `to_scheduler_rx` channel,
+/// and write to `from_scheduler_tx` channel. `request_shutdown` (also run on `Drop`) stops every stage.
 pub struct Runtime {
-    pub ingress: IngressConsumer,
-    pub egress: EgressProducer,
+    pub to_scheduler_rx: ToSchedulerRx,
+    pub from_scheduler_tx: FromSchedulerTx,
     /// Requests parked in `Encoding`, drained by the MM worker pool
     /// (`Server.start_mm_workers`). Stays empty for non-multimodal models —
-    /// ingress never routes to it.
-    pub mm: flume::Receiver<crate::message::MmRequest>,
-    /// Back-channel for the MM workers' `MmEncoded` / `MmFailed` into tm-ingress.
-    pub tm: flume::Sender<TmEvent>,
+    /// request never routes to it.
+    pub to_mm_worker_rx: flume::Receiver<crate::message::request::MmRequest>,
+    /// Back-channel for the MM workers' `MmEncoded` / `MmFailed` into to_scheduler.
+    pub from_mm_worker_tx: flume::Sender<TmEvent>,
     /// The loaded tokenizer, shared with the MM worker path (`None` under
     /// `skip_tokenizer_init`).
     pub tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>>,
     /// MM results parked between a worker's `MmEncoded` and the scheduler drain
     /// (`Server.take_mm`).
-    pub mm_sidecar: crate::mm::Sidecar,
+    pub mm_sidecar: crate::multi_modality::sidecar::Sidecar,
     /// Worker join handles, joined by `request_shutdown` / `Drop`.
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// The single shutdown sender.
@@ -71,40 +72,23 @@ impl Runtime {
     /// MM preprocessing floats over that whole set (rather than owning cores
     /// that idle between bursts) and never preempts the scheduler's reserved
     /// cores.
-    pub fn spawn_mm_pool(&self, workers: usize, ctx: Arc<crate::mm::Context>) {
+    pub fn spawn_mm_pool(&self, workers: usize, ctx: Arc<crate::multi_modality::worker::Context>) {
         let mut threads = self.threads.lock().unwrap();
         spawn_pool("mm-worker", None, workers.max(1), &mut threads, |_| {
-            crate::mm::MmWorker::new(self.mm.clone(), self.tm.clone(), ctx.clone())
+            crate::multi_modality::worker::MmWorker::new(
+                self.to_mm_worker_rx.clone(),
+                self.from_mm_worker_tx.clone(),
+                ctx.clone(),
+            )
         });
     }
 
     /// Stop the runtime and join every worker thread (with a bounded wait).
-    ///
-    /// Dropping `shutdown_tx` wakes the tm-ingress/tm-egress selectors (which
-    /// otherwise never see their inbox close — one self-holds a `tm` sender, the
-    /// other's inbox is the Python-fed egress ring). Those exit and drop their
-    /// `Senders` clones; the api thread's `serve` returns non-gracefully, so its
-    /// `block_on` unwinds and the api tokio runtime is dropped — cancelling
-    /// in-flight handlers, whose `AbortGuard`s release the remaining clones. With
-    /// every clone gone the tok/detok channels close and those workers exit.
-    ///
-    /// In-flight requests are **aborted**, not drained — this is the hard-stop
-    /// path (also run on `Drop`). Clients of aborted requests retry.
     pub fn request_shutdown(&self) {
         drop(self.shutdown_tx.lock().unwrap().take());
-        let handles: Vec<JoinHandle<()>> = self.threads.lock().unwrap().drain(..).collect();
-        if handles.is_empty() {
-            return; // Idempotent: a `Drop` after an explicit shutdown has nothing to join.
-        }
-        // Join off-thread and wait with a deadline: a stuck worker can't wedge exit.
-        let (done_tx, done_rx) = flume::bounded::<()>(1);
-        std::thread::spawn(move || {
-            for h in handles {
-                let _ = h.join();
-            }
-            let _ = done_tx.send(());
-        });
-        if done_rx.recv_timeout(SHUTDOWN_JOIN_TIMEOUT).is_err() {
+        // Idempotent: a `Drop` after an explicit shutdown finds nothing to join.
+        let handles = std::mem::take(&mut *self.threads.lock().unwrap());
+        if !join_all_with_timeout(handles, SHUTDOWN_JOIN_TIMEOUT) {
             tracing::warn!(
                 "shutdown: workers did not exit within {SHUTDOWN_JOIN_TIMEOUT:?}; abandoning join"
             );
@@ -118,55 +102,55 @@ impl Drop for Runtime {
     }
 }
 
-/// Boot the whole frontend. Returns once threads are spawned (non-blocking),
-/// so the Python caller regains control of the GIL immediately. `Err` on a
-/// startup misconfiguration (e.g. no tokenizer for a non-skip server).
+/// Boot the whole frontend. Returns once threads are spawned (non-blocking).
+/// `Err` on a startup misconfiguration (e.g. no tokenizer for a non-skip server).
 pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
     let mut threads = Vec::new();
     let plan = plan_cores(&cfg);
 
     // --- rings (Rust ↔ Python) ---
-    let (ingress_tx, ingress_rx): (IngressProducer, IngressConsumer) =
-        ingress_ring(cfg.rust_server_args.ingress_ring_cap);
-    let (egress_tx, egress_rx): (EgressProducer, EgressConsumer) =
-        egress_ring(cfg.rust_server_args.egress_ring_cap);
+    let (to_scheduler_tx, to_scheduler_rx): (ToSchedulerTx, ToSchedulerRx) =
+        to_scheduler(cfg.rust_server_args.to_scheduler_cap);
+    let (from_scheduler_tx, from_scheduler_rx): (FromSchedulerTx, FromSchedulerRx) =
+        from_scheduler(cfg.rust_server_args.from_scheduler_cap);
 
     // --- inter-stage channels ---
-    let (tm_tx, tm_rx) = flume::bounded::<TmEvent>(cfg.rust_server_args.channel_cap);
-    let (tok_tx, tok_rx) =
-        flume::bounded::<crate::message::Request>(cfg.rust_server_args.channel_cap);
+    let (tok_manager_tx, tok_manager_rx) =
+        flume::bounded::<TmEvent>(cfg.rust_server_args.channel_cap);
+    let (tokenizer_tx, tokenizer_rx) =
+        flume::bounded::<crate::message::request::Request>(cfg.rust_server_args.channel_cap);
     // Encoding → MM worker pool. Bounded like the other stage edges so a slow
     // pool back-pressures instead of buffering unboundedly.
-    let (mm_tx, mm_rx) =
-        flume::bounded::<crate::message::MmRequest>(cfg.rust_server_args.channel_cap);
+    let (mm_worker_tx, mm_worker_rx) =
+        flume::bounded::<crate::message::request::MmRequest>(cfg.rust_server_args.channel_cap);
     let detokenizer_worker_num = cfg.server_args.detokenizer_worker_num;
-    let mut detok_tx = Vec::with_capacity(detokenizer_worker_num);
-    let mut detok_rx = Vec::with_capacity(detokenizer_worker_num);
+    let mut detokenizer_tx = Vec::with_capacity(detokenizer_worker_num);
+    let mut detokenizer_rx = Vec::with_capacity(detokenizer_worker_num);
     for _ in 0..detokenizer_worker_num {
         let (tx, rx) = flume::bounded::<DetokMsg>(cfg.rust_server_args.channel_cap);
-        detok_tx.push(tx);
-        detok_rx.push(rx);
+        detokenizer_tx.push(tx);
+        detokenizer_rx.push(rx);
     }
 
     // Aborts get their own UNBOUNDED lane: on the bounded inbox they are dropped
     // exactly under the overload that makes them necessary (see `Senders::abort`).
-    let (abort_tx, abort_rx) = flume::unbounded::<crate::tokenizer_manager::AbortSource>();
+    let (abort_tx, abort_rx) = flume::unbounded::<crate::tokenizer_manager::wiring::AbortSource>();
     let senders = Senders {
-        tm: tm_tx.clone(),
-        abort: abort_tx.clone(),
-        tok: tok_tx,
-        detok: detok_tx,
+        tok_manager_tx: tok_manager_tx.clone(),
+        abort_tx: abort_tx.clone(),
+        tokenizer_tx,
+        detokenizer_tx,
     };
 
     // `skip_tokenizer_init`: clients send token ids and receive token ids — no
-    // tokenizer is loaded, and the egress emits raw `output_ids` (no decode).
+    // tokenizer is loaded, and the server emits raw `output_ids` (no decode).
     let skip_tokenizer_init = cfg.server_args.skip_tokenizer_init;
 
     // The same instance is shared by the tokenizer pool (encode) and the detok
     // shards (decode); `None` only under `skip_tokenizer_init`.
     let dyn_tokenizer = tokenizer::load_tokenizer(
-        // Empty only in minimal standalone blobs (the Python dump always
+        // Empty only in standalone (test) configs (the Python handoff always
         // resolves it); empty → no tokenizer, allowed only under
         // `skip_tokenizer_init`.
         (!cfg.server_args.tokenizer_path.is_empty()).then_some(&*cfg.server_args.tokenizer_path),
@@ -179,8 +163,8 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         .as_ref()
         .map(|t| Arc::new(tokenizer::DynamoTokenizer::new(t.clone())) as _);
 
-    // Shared: MM workers park, the Python drain pops, tm-ingress purges.
-    let mm_sidecar: crate::mm::Sidecar = Default::default();
+    // Shared: MM workers park, the Python drain pops.
+    let mm_sidecar: crate::multi_modality::sidecar::Sidecar = Default::default();
 
     // --- Detokenizer shards (pinned, CPU bound) ---
     {
@@ -194,12 +178,12 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let detok_cores = plan.as_ref().map(|p| p.detok.clone());
         // Each shard owns its receiver outright (one consumer per shard), so the
         // owned `detok_rx` Vec is moved out element-by-element via the iterator.
-        let count = detok_rx.len();
-        let mut rxs = detok_rx.into_iter();
+        let count = detokenizer_rx.len();
+        let mut detokenizer_rxs = detokenizer_rx.into_iter();
         spawn_pool("detokenizer", detok_cores, count, &mut threads, |i| {
             detokenizer::DetokenizerWorker::new(
                 i,
-                rxs.next().unwrap(),
+                detokenizer_rxs.next().unwrap(),
                 backend.clone(),
                 abort_tx.clone(),
             )
@@ -208,7 +192,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
 
     // --- Tokenizer pool (pinned, CPU bound) ---
     // Only spawned when a real tokenizer is loaded; under `skip_tokenizer_init`
-    // there is none and ingress never routes to the pool, so we skip it.
+    // there is none and request never routes to the pool, so we skip it.
     if let Some(tokenizer) = &text_tokenizer {
         // Reuse the single loaded tokenizer (shared with the detok shards).
         let tokenizer = tokenizer.clone();
@@ -220,29 +204,35 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             tok_cores,
             cfg.server_args.tokenizer_worker_num,
             &mut threads,
-            |_i| tokenizer::TokenizerWorker::new(tok_rx.clone(), tm_tx.clone(), tokenizer.clone()),
+            |_i| {
+                tokenizer::TokenizerWorker::new(
+                    tokenizer_rx.clone(),
+                    tok_manager_tx.clone(),
+                    tokenizer.clone(),
+                )
+            },
         );
     }
 
-    // Egress heartbeat: bumped per drained frame, watched by `/health_generate`.
-    let egress_activity: tokenizer_manager::ActivityCounter =
+    // Response heartbeat: bumped per drained frame, watched by `/health_generate`.
+    let response_activity: tokenizer_manager::from_scheduler::ActivityCounter =
         Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    // --- Egress dispatcher: drains egress ring → routes chunks to shards ---
+    // --- Response dispatcher: drains from_scheduler channel → routes chunks to shards ---
     {
-        // First TM core; egress is the hotter router (every output token). One
+        // First TM core; from_scheduler is the hotter router (every output token). One
         // worker today via `spawn_pool`, so sharding by `Rid::shard` later (see
         // `TM_CORES`) is just a larger count + per-shard receivers.
         let cores = plan
             .as_ref()
             .and_then(|p| p.tm.first().copied())
             .map(|c| vec![c]);
-        let mut egress_rx = Some(egress_rx); // moved into the single worker
-        let activity = egress_activity.clone();
+        let mut from_scheduler_rx = Some(from_scheduler_rx); // moved into the single worker
+        let activity = response_activity.clone();
         let shutdown_rx = shutdown_rx.clone();
-        spawn_pool("tm-egress", cores, 1, &mut threads, |_| {
-            tokenizer_manager::Egress::new(
-                egress_rx.take().unwrap(),
+        spawn_pool("from-scheduler", cores, 1, &mut threads, |_| {
+            tokenizer_manager::from_scheduler::Dispatcher::new(
+                from_scheduler_rx.take().unwrap(),
                 senders.clone(),
                 activity.clone(),
                 shutdown_rx.clone(),
@@ -250,7 +240,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         });
     }
 
-    // --- TokenizerManager ingress loop ---
+    // --- TokenizerManager to_scheduler loop ---
     {
         // Second TM core when present, else share the first (1-core / API-set
         // fallback) — still off the CPU-bound pool cores either way.
@@ -258,22 +248,21 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             .as_ref()
             .and_then(|p| p.tm.get(1).or_else(|| p.tm.first()).copied())
             .map(|c| vec![c]);
-        let limits = tokenizer_manager::Limits::try_from(&*cfg.server_args)
-            .map_err(|e| format!("ingress limits: {e}"))?;
-        let mm = tokenizer_manager::Mm {
+        let limits = tokenizer_manager::to_scheduler::Limits::from(&*cfg.server_args);
+        let mm = tokenizer_manager::to_scheduler::Mm {
             enabled: cfg.server_args.model_is_multimodal(),
-            tx: mm_tx,
+            tx: mm_worker_tx,
             sidecar: mm_sidecar.clone(),
         };
-        let mut parts = Some((tm_rx, ingress_tx)); // moved into the single worker
+        let mut parts = Some((tok_manager_rx, to_scheduler_tx)); // moved into the single worker
         let shutdown_rx = shutdown_rx.clone();
-        spawn_pool("tm-ingress", cores, 1, &mut threads, |_| {
-            let (tm_rx, ingress_tx) = parts.take().unwrap();
-            tokenizer_manager::Ingress::new(
-                tm_rx,
+        spawn_pool("to-scheduler", cores, 1, &mut threads, |_| {
+            let (tok_manager_rx, to_scheduler_tx) = parts.take().unwrap();
+            tokenizer_manager::to_scheduler::Intake::new(
+                tok_manager_rx,
                 abort_rx.clone(),
                 senders.clone(),
-                ingress_tx,
+                to_scheduler_tx,
                 limits.clone(),
                 mm.clone(),
                 shutdown_rx.clone(),
@@ -286,7 +275,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let cfg = cfg.clone();
         let api_cores = plan.as_ref().map(|p| p.api.clone());
         let senders = senders.clone();
-        let api_activity = egress_activity.clone();
+        let response_activity = response_activity.clone();
         let shutdown_rx = shutdown_rx.clone();
         // Bind synchronously so an unavailable port (EADDRINUSE) is a hard
         // startup error. The `?` drops `shutdown_tx`/`senders`, which stops the
@@ -299,7 +288,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             .spawn(move || {
                 let mut builder = tokio::runtime::Builder::new_multi_thread();
                 builder
-                    .worker_threads(cfg.rust_server_args.api_worker_num)
+                    .worker_threads(cfg.rust_server_args.http_api_worker_num)
                     .enable_all();
                 if let Some(cores) = api_cores {
                     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -311,13 +300,13 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                     });
                 }
                 let rt = builder.build().expect("build api runtime");
-                rt.block_on(api_server::serve(
+                rt.block_on(api_server::app::serve(
                     listener,
                     senders,
                     cfg.rust_server_args.channel_cap,
                     cfg.server_args.clone(),
-                    // Egress heartbeat watched by `/health_generate`.
-                    api_activity,
+                    // Response heartbeat watched by `/health_generate`.
+                    response_activity,
                     shutdown_rx,
                 ))
             })
@@ -326,10 +315,10 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     }
 
     Ok(Runtime {
-        ingress: ingress_rx,
-        egress: egress_tx,
-        mm: mm_rx,
-        tm: tm_tx,
+        to_scheduler_rx,
+        from_scheduler_tx,
+        to_mm_worker_rx: mm_worker_rx,
+        from_mm_worker_tx: tok_manager_tx,
         tokenizer: text_tokenizer,
         mm_sidecar,
         threads: Mutex::new(threads),
@@ -340,16 +329,16 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::config::{RuntimeConfig, RustServerServerArgs, ServerArgs};
 
-    /// Minimal boot args. `skip_tokenizer_init` avoids loading a tokenizer/detok
-    /// model; `model_config` carries the two fields `Limits::from_server_args`
-    /// requires. They are mandatory at boot, so a fixture without them panics the
-    /// runtime instead of exercising what these tests are about — `start` does not
-    /// run `ServerArgs::validate_mandatory` itself, `Server::start` does.
-    const TEST_SERVER_ARGS: &str = r#"{
-        "skip_tokenizer_init": true,
-        "model_config": {"context_len": 2048, "vocab_size": 1000}
-    }"#;
+    /// Minimal boot config: no tokenizer load, complete `model_config` (from
+    /// `Default`), unified role.
+    fn test_server_args() -> ServerArgs {
+        ServerArgs {
+            skip_tokenizer_init: true,
+            ..Default::default()
+        }
+    }
 
     /// Regression: `request_shutdown` must actually stop the API server — it joins
     /// the api thread once the listener closes, so the port stops accepting.
@@ -362,11 +351,11 @@ mod tests {
         drop(probe);
 
         // `skip_tokenizer_init` → no tokenizer/detok model load; minimal boot.
-        let server_args = ServerArgs::from_json(TEST_SERVER_ARGS).unwrap();
+        let server_args = test_server_args();
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
                 http_addr: addr,
-                api_worker_num: 1,
+                http_api_worker_num: 1,
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
@@ -387,12 +376,8 @@ mod tests {
         );
     }
 
-    /// Regression: shutdown must return promptly even with an in-flight `/generate`.
-    /// No scheduler drains the ingress ring or feeds the egress ring here, so the
-    /// handler parks on its egress channel forever. Graceful shutdown would wait
-    /// for it (deadlock → only the 5s bounded-join fallback returns); the
-    /// non-graceful path cancels the handler via the api runtime drop, whose
-    /// `AbortGuard` releases the last `Senders` clone so the workers exit.
+    /// Regression: shutdown must return promptly even with an in-flight
+    /// `/generate`.
     #[test]
     fn shutdown_returns_with_in_flight_request() {
         use std::io::Write;
@@ -402,11 +387,11 @@ mod tests {
         let addr = probe.local_addr().unwrap();
         drop(probe);
 
-        let server_args = ServerArgs::from_json(TEST_SERVER_ARGS).unwrap();
+        let server_args = test_server_args();
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
                 http_addr: addr,
-                api_worker_num: 1,
+                http_api_worker_num: 1,
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
@@ -414,7 +399,7 @@ mod tests {
         let rt = start(cfg).expect("start runtime");
 
         // Fire a request that will block (already-tokenized → valid → pushed to the
-        // ring, then the handler awaits egress frames that never arrive).
+        // ring, then the handler awaits decode frames that never arrive).
         let mut conn = std::net::TcpStream::connect(addr).expect("connect");
         let body = r#"{"input_ids":[1,2,3],"stream":false,"sampling_params":{"max_new_tokens":8}}"#;
         let req = format!(
@@ -447,11 +432,11 @@ mod tests {
         let addr = probe.local_addr().unwrap();
         drop(probe);
 
-        let server_args = ServerArgs::from_json(TEST_SERVER_ARGS).unwrap();
+        let server_args = test_server_args();
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
                 http_addr: addr,
-                api_worker_num: 1,
+                http_api_worker_num: 1,
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
@@ -508,11 +493,11 @@ mod tests {
         let hog = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = hog.local_addr().unwrap();
 
-        let server_args = ServerArgs::from_json(TEST_SERVER_ARGS).unwrap();
+        let server_args = test_server_args();
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
                 http_addr: addr,
-                api_worker_num: 1,
+                http_api_worker_num: 1,
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
@@ -522,38 +507,5 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.contains("bind"), "error should mention bind: {err}");
-    }
-
-    /// `server_args` missing a mandatory `model_config` field must be a startup
-    /// ERROR, not a panic.
-    ///
-    /// `Limits::try_from` is fallible and the ingress loop is built inside a
-    /// `spawn_pool` closure, so resolving it there would put the failure on a
-    /// freshly spawned worker thread — a thread `start` never inspects. The boot
-    /// would report success and the server would accept connections with no
-    /// ingress loop behind them, hanging every request instead of refusing to
-    /// start. Only `Server::start` runs `validate_mandatory`, so `start` cannot
-    /// assume these fields are present.
-    #[test]
-    fn start_fails_when_model_config_is_incomplete() {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = probe.local_addr().unwrap();
-        drop(probe);
-
-        // Boots fine in every other respect — only `model_config` is absent.
-        let server_args = ServerArgs::from_json(r#"{"skip_tokenizer_init": true}"#).unwrap();
-        let cfg = RuntimeConfig {
-            rust_server_args: RustServerServerArgs {
-                http_addr: addr,
-                api_worker_num: 1,
-                ..Default::default()
-            },
-            server_args: Arc::new(server_args),
-        };
-        let err = match start(cfg) {
-            Ok(_) => panic!("an incomplete model_config must not boot, got Ok"),
-            Err(e) => e,
-        };
-        assert!(err.contains("ingress limits"), "{err}");
     }
 }
