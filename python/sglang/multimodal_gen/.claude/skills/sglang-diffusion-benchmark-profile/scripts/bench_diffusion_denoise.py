@@ -106,6 +106,7 @@ MODEL_WEIGHT_SUFFIXES = {
     ".pth",
     ".safetensors",
 }
+GENERATED_OUTPUT_SUFFIXES = {".jpeg", ".jpg", ".mp4", ".png", ".wav", ".webp"}
 NIGHTLY_PRESET_ORDER = (
     "flux",
     "flux2",
@@ -1225,6 +1226,10 @@ def _run_benchmark_once_impl(
         bcg_text_buckets=bcg_text_buckets,
         artifact_dir=output_dir,
     )
+    output_file_name = f"{model_key}-{label}"
+    cmd.extend(
+        ["--output-path", str(output_dir), "--output-file-name", output_file_name]
+    )
 
     env = os.environ.copy()
     env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
@@ -1334,6 +1339,31 @@ def _run_benchmark_once_impl(
         print(f"  ERROR: exit code {returncode}")
         return {"model": model_key, "label": label, "error": True, "elapsed_s": elapsed}
 
+    output_artifacts = sorted(
+        path
+        for path in output_dir.rglob(f"{output_file_name}*")
+        if path.is_file() and path.suffix.lower() in GENERATED_OUTPUT_SUFFIXES
+    )
+    missing_artifacts = []
+    if not perf_path.is_file():
+        missing_artifacts.append("perf dump")
+    if not output_artifacts:
+        missing_artifacts.append("generated output")
+    if missing_artifacts:
+        print(
+            "  ERROR: command returned zero without required benchmark artifacts: "
+            + ", ".join(missing_artifacts)
+        )
+        return {
+            "model": model_key,
+            "label": label,
+            "quality": quality,
+            "breakable_cuda_graph": breakable_cuda_graph,
+            "missing_artifacts": missing_artifacts,
+            "error": True,
+            "elapsed_s": elapsed,
+        }
+
     metrics = {
         "model": model_key,
         "label": label,
@@ -1341,6 +1371,7 @@ def _run_benchmark_once_impl(
         "breakable_cuda_graph": breakable_cuda_graph,
         "bcg_capture_detected": bcg_capture_detected,
         "elapsed_s": elapsed,
+        "output_artifacts": [str(path) for path in output_artifacts],
         "error": False,
     }
     if perf_path.exists():

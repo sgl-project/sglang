@@ -102,6 +102,10 @@ only declares width and height: a video request can still miss because its
 frame count differs from the model's synthetic warmup contract. Treat that as
 Eager fallback, not as a valid BCG measurement.
 
+A zero process exit is not sufficient evidence: every accepted row must also
+contain its requested perf dump and a generated image, video, or audio file.
+The helper gives every cell a unique output name and rejects missing artifacts.
+
 Keep prompt, negative prompt, seed, shape, steps, guidance, dtype, topology,
 and residency fixed. Lossless comparisons require byte-identical artifacts.
 For `quality=high`, report aggregate and worst-frame SSIM/PSNR; the repository

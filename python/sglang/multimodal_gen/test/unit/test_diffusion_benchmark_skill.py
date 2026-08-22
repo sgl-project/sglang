@@ -226,6 +226,32 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
             )
             self.assertEqual(ledger["exit_reason"], "error")
 
+    def test_zero_exit_without_artifacts_is_invalid(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_root = Path(tmpdir)
+            module = _load_benchmark_module(temp_root)
+            output_dir = temp_root / "outputs"
+            output_dir.mkdir()
+
+            with patch.object(module.subprocess, "Popen") as popen:
+                popen.return_value.stdout = iter(())
+                popen.return_value.wait.return_value = 0
+                result = module._run_benchmark_once_impl(
+                    "sana-video",
+                    "missing-artifacts",
+                    output_dir,
+                    warmup=False,
+                    cuda_visible_devices="0",
+                )
+
+            command = popen.call_args.args[0]
+            self.assertIn("--output-path", command)
+            self.assertIn("--output-file-name", command)
+            self.assertTrue(result["error"])
+            self.assertEqual(
+                result["missing_artifacts"], ["perf dump", "generated output"]
+            )
+
     def test_quality_bcg_matrix_reuses_one_gpu_set_and_cleans_once(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             temp_root = Path(tmpdir)

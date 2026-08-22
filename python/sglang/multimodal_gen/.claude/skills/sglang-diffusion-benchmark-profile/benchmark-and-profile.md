@@ -576,7 +576,10 @@ Always keep:
 - exact command line, model shape, dtype, request `quality`, GPU topology, and
   whether synchronized stage profiling was enabled
 
-Never keep a perf dump produced after a diffusers-backend fallback.
+Never keep a perf dump produced after a diffusers-backend fallback. Also reject
+a zero-exit run if either the requested perf dump or generated media is absent:
+some generation failures are reported through the response payload without a
+nonzero process exit.
 
 For `quality=lossless`, compare saved artifact hashes and require byte equality
 for a claimed lossless fast path or BCG change. For `quality=high`, keep the
