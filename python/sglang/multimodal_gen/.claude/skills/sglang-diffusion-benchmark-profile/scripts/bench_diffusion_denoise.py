@@ -416,6 +416,20 @@ MODELS = {
             "--performance-mode=manual",
         ],
     },
+    "fastwan21-t2v-1.3b": {
+        "path": "FastVideo/FastWan2.1-T2V-1.3B-Diffusers",
+        "prompt": "A curious raccoon walks through a sunlit forest.",
+        "extra_args": [
+            "--width=832",
+            "--height=480",
+            "--num-frames=61",
+            "--fps=16",
+            "--num-inference-steps=3",
+            "--performance-mode=manual",
+            "--dit-layerwise-offload=false",
+            "--dit-cpu-offload=false",
+        ],
+    },
     "cosmos3-edge-t2i": {
         "path": "nvidia/Cosmos3-Edge",
         "prompt": "A warehouse robot folds a blue cloth on a clean workbench.",
