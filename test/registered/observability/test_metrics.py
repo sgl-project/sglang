@@ -795,25 +795,30 @@ class TestStartupPhaseRegistry(unittest.TestCase):
             _record("weight_load", 2.0)
         self.assertEqual(_phases, {"draft_weight_load": 2.0})
 
-    def test_named_phase_keeps_its_own_key_in_the_callers_scope(self):
+    def test_draft_covers_the_named_phase_and_its_contents(self):
         with startup_phase("worker_init", draft=True):
             _record("deepgemm_jit", 3.0)
-        self.assertEqual(_phases.keys(), {"worker_init", "draft_deepgemm_jit"})
+        self.assertEqual(_phases.keys(), {"draft_worker_init", "draft_deepgemm_jit"})
 
-    def test_prefix_applies_to_nested_recordings(self):
+    def test_draft_does_not_compound_when_nested(self):
+        with startup_phase(draft=True):
+            with startup_phase("inner", draft=True):
+                pass
+        self.assertEqual(_phases.keys(), {"draft_inner"})
+
+    def test_draft_scope_applies_to_nested_recordings(self):
         with startup_phase(draft=True):
             _record("weight_load", 2.0)
             with startup_phase("deepgemm_jit"):
                 pass
         _record("weight_load", 5.0)
 
-        phases = _phases
-        self.assertEqual(phases["draft_weight_load"], 2.0)
-        self.assertEqual(phases["weight_load"], 5.0)
-        self.assertIn("draft_deepgemm_jit", phases)
-        self.assertNotIn("deepgemm_jit", phases)
+        self.assertEqual(_phases["draft_weight_load"], 2.0)
+        self.assertEqual(_phases["weight_load"], 5.0)
+        self.assertIn("draft_deepgemm_jit", _phases)
+        self.assertNotIn("deepgemm_jit", _phases)
 
-    def test_prefix_restored_on_exception(self):
+    def test_draft_scope_restored_on_exception(self):
         with self.assertRaises(RuntimeError):
             with startup_phase(draft=True):
                 raise RuntimeError("boom")
@@ -852,9 +857,9 @@ class TestStartupPhaseRegistry(unittest.TestCase):
         _record("deepgemm_jit", 2.0)
         self.assertEqual(drain_post_startup_deltas(), {"deepgemm_jit": 2.0})
 
-    def test_inner_empty_prefix_overrides_outer(self):
+    def test_inner_target_scope_overrides_outer_draft(self):
         # A target-runner scope entered during draft setup must attribute its
-        # own work to the target, not inherit the draft prefix.
+        # own work to the target rather than inheriting the draft attribution.
         with startup_phase(draft=True):
             with startup_phase(draft=False):
                 _record("cuda_graph_capture", 3.0)

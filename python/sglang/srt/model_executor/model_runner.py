@@ -1045,9 +1045,8 @@ class ModelRunner:
             moe_dp_size=self.ps.moe_dp_size,
         )
 
-    @_with_startup_phase_scope
     def init_torch_distributed(self):
-        with startup_phase("distributed_init"):
+        with startup_phase("distributed_init", draft=self.is_draft_worker):
             result = bootstrap.init_torch_distributed(
                 server_args=self.server_args,
                 model_config=self.model_config,

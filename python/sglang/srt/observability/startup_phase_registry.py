@@ -19,13 +19,10 @@ _frozen: dict[str, float] | None = None
 _prefix: ContextVar[str] = ContextVar("startup_phase_prefix", default="")
 
 
-def _add(name: str, seconds: float) -> None:
+def _record(phase: str, seconds: float) -> None:
+    name = _prefix.get() + phase
     with _lock:
         _phases[name] = _phases.get(name, 0.0) + seconds
-
-
-def _record(phase: str, seconds: float) -> None:
-    _add(_prefix.get() + phase, seconds)
 
 
 @contextmanager
@@ -37,15 +34,18 @@ def startup_phase(
         with startup_phase("kv_cache_allocation"):        # measure
         with startup_phase(draft=runner.is_draft_worker): # attribute
         @startup_phase("load_weight")                     # measure a function
+
+    ``draft`` names the model the enclosed work belongs to, covering ``phase``
+    itself and every phase recorded inside it at any depth. A target scope inside 
+    a draft one attributes to the target.
     """
-    owner = _prefix.get()
     token = None if draft is None else _prefix.set("draft_" if draft else "")
     tic = time.perf_counter()
     try:
         yield
     finally:
         if phase is not None:
-            _add(owner + phase, time.perf_counter() - tic)
+            _record(phase, time.perf_counter() - tic)
         if token is not None:
             _prefix.reset(token)
 
