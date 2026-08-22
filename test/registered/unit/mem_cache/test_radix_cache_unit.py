@@ -525,6 +525,8 @@ class TestRadixCache(unittest.TestCase):
             last_node=cache.root_node,
         )
         req.get_fill_ids.return_value = token_ids
+        # No block in flight, so the cacheable ids are the full fill ids.
+        req.get_cacheable_fill_ids.return_value = token_ids
 
         available_before_free = allocator.available_size()
         allocator.free_group_begin()
