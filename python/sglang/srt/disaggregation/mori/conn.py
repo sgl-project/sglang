@@ -341,6 +341,7 @@ class MoriKVManager(CommonKVManager):
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.room_to_bootstrap_addr: Dict[int, str] = {}
             self._start_decode_thread()
+            self._start_heartbeat_checker_thread()
 
     def _init_engine(self) -> IOEngine:
         if self.kv_args.ib_device:
@@ -543,6 +544,37 @@ class MoriKVManager(CommonKVManager):
         except Exception:
             logger.exception("Failed to parse transfer info message")
 
+    def _handle_abort_notification(self, msg: List[bytes]) -> bool:
+        if not msg or msg[0] != b"ABORT":
+            return False
+
+        try:
+            room_to_be_aborted = int(msg[1].decode("ascii"))
+        except Exception as e:
+            logger.debug(f"Ignoring malformed abort notification: {e}")
+            return True
+
+        if (
+            room_to_be_aborted in self.request_status
+            and self.check_status(room_to_be_aborted) != KVPoll.Success
+        ):
+            self.record_failure(
+                room_to_be_aborted,
+                "Aborted by decode-side abort notification.",
+            )
+            self.update_status(room_to_be_aborted, KVPoll.Failed)
+            logger.debug(
+                f"Received abort notification for room {room_to_be_aborted}, "
+                "marked as Failed"
+            )
+        else:
+            logger.debug(
+                f"Received abort notification for room {room_to_be_aborted}, "
+                "ignoring (already completed or unknown)"
+            )
+
+        return True
+
     def _validate_message(self, msg: List[bytes]) -> Optional[List[bytes]]:
         if not msg or msg[0] != MORI_GUARD:
             logger.warning("Received malformed bootstrap message")
@@ -557,6 +589,8 @@ class MoriKVManager(CommonKVManager):
             while True:
                 try:
                     msg = self.server_socket.recv_multipart()
+                    if self._handle_abort_notification(msg):
+                        continue
                     payload = self._validate_message(msg)
                     if payload is None:
                         continue
@@ -701,6 +735,20 @@ class MoriKVManager(CommonKVManager):
         src_k_descs = src_descs[:num_local_layers]
         src_v_descs = src_descs[num_local_layers:]
 
+        # Both peers expose the same PP-local layout. Their descriptor indices
+        # are already aligned, so applying the Prefill rank's global layer
+        # offset would incorrectly index into a local list.
+        if len(src_descs) == len(dst_mem_descs):
+            dst_k_descs = dst_mem_descs[:num_local_layers]
+            dst_v_descs = dst_mem_descs[num_local_layers:]
+            return (
+                src_k_descs,
+                src_v_descs,
+                dst_k_descs,
+                dst_v_descs,
+                num_local_layers,
+            )
+
         start_layer = self.kv_args.prefill_start_layer
         end_layer = start_layer + num_local_layers
         dst_total_layers = len(dst_mem_descs) // 2
@@ -709,8 +757,18 @@ class MoriKVManager(CommonKVManager):
                 "Destination KV descriptors do not match prefill pp configuration"
             )
         dst_k_descs = dst_mem_descs[start_layer:end_layer]
+        if (
+            num_local_layers < dst_total_layers
+            and dst_total_layers % num_local_layers != 0
+        ):
+            # Decode has draft-model KV while Prefill has target-model KV only:
+            # [K_main..., V_main..., draft_K..., draft_V...].
+            multiplier_ratio = dst_total_layers // num_local_layers
+            dst_v_offset = num_local_layers * multiplier_ratio
+        else:
+            dst_v_offset = dst_total_layers
         dst_v_descs = dst_mem_descs[
-            dst_total_layers + start_layer : dst_total_layers + end_layer
+            dst_v_offset + start_layer : dst_v_offset + end_layer
         ]
         return src_k_descs, src_v_descs, dst_k_descs, dst_v_descs, num_local_layers
 
@@ -719,6 +777,10 @@ class MoriKVManager(CommonKVManager):
     ) -> tuple[List[MemoryDesc], List[MemoryDesc], int]:
         src_descs = self.kv_mem_descs
         num_local_layers = len(src_descs)
+        # Same-PP peers register matching local descriptor lists.
+        if len(src_descs) == len(dst_mem_descs):
+            return src_descs, dst_mem_descs, num_local_layers
+
         start_layer = self.kv_args.prefill_start_layer
         end_layer = start_layer + num_local_layers
         if end_layer > len(dst_mem_descs):
@@ -882,7 +944,7 @@ class MoriKVManager(CommonKVManager):
         statuses: List[TransferStatus] = []
         kv_item_len = self.kv_args.kv_item_lens[0]
 
-        if self.is_mla_backend:
+        if self.is_mla_backend or self.is_hybrid_mla_backend:
             src_descs, dst_descs, layers_current_pp_stage = (
                 self._get_mla_mem_desc_slices(peer_info.dst_kv_mem_descs)
             )
@@ -1453,6 +1515,8 @@ class MoriKVSender(CommonKVSender):
             self._finalize_failure()
 
     def _run_chunk(self, task: _TransferChunk) -> None:
+        if self.bootstrap_room not in self.kv_mgr.request_status:
+            return
         if self.conclude_state is not None:
             return
         if self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Failed:
