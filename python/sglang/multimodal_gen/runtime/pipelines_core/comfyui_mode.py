@@ -21,14 +21,11 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_comfyui_passthro
     ComfyUIPassThroughScheduler,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
         ComposedPipelineBase,
     )
-
-logger = init_logger(__name__)
 
 COMFYUI_REQUIRED_MODULES = ["transformer", "scheduler"]
 
@@ -76,13 +73,11 @@ def initialize_comfyui_pipeline(
         and hasattr(vae_config, "post_init")
         and not hasattr(vae_config, "_post_init_called")
     ):
-        arch = getattr(vae_config, "arch_config", None)
-        if arch is not None and getattr(arch, "latents_mean", None) is None:
-            logger.info(
-                "Skipping VAE post_init in comfyui_mode; checkpoint has no VAE stats"
-            )
-        else:
-            vae_config.post_init()
+        # Flux / Qwen RoPE reads arch_config.vae_scale_factor, which
+        # post_init() derives from dim_mult. Do not skip just because a
+        # ComfyUI DiT checkpoint has no latents_mean — that field is only
+        # required when this process owns the VAE (MiniMax-H3 native).
+        vae_config.post_init()
 
 
 def create_comfyui_pipeline_stages(

@@ -5,6 +5,7 @@ import torch
 from sglang.multimodal_gen.runtime.pipelines_core.comfyui_mode import (
     bind_comfyui_session,
     get_run_state,
+    initialize_comfyui_pipeline,
     release_comfyui_session,
     release_run_state,
     set_run_state,
@@ -185,3 +186,44 @@ def test_cond_keys_keep_positive_and_negative_apart() -> None:
     assert torch.equal(later_pos.prompt_embeds[0], pos.prompt_embeds[0])
     assert torch.equal(later_neg.prompt_embeds[0], neg.prompt_embeds[0])
     release_comfyui_session(sid)
+
+
+class _FakePipeline:
+    def __init__(self):
+        self.modules = {}
+
+
+def _init_vae_geometry(pipeline_config):
+    from types import SimpleNamespace
+
+    initialize_comfyui_pipeline(
+        _FakePipeline(),
+        SimpleNamespace(pipeline_config=pipeline_config, comfyui_mode=True),
+    )
+    return pipeline_config.vae_config.arch_config
+
+
+def test_comfyui_mode_derives_flux_vae_scale_factor() -> None:
+    from sglang.multimodal_gen.configs.pipeline_configs.flux import FluxPipelineConfig
+
+    arch = _init_vae_geometry(FluxPipelineConfig())
+    assert arch.vae_scale_factor == 8
+
+
+def test_comfyui_mode_derives_qwen_vae_scale_factor() -> None:
+    from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+        QwenImagePipelineConfig,
+    )
+
+    arch = _init_vae_geometry(QwenImagePipelineConfig())
+    assert arch.vae_scale_factor == 8
+
+
+def test_comfyui_mode_h3_vae_post_init_without_latent_stats() -> None:
+    from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+        MiniMaxH3PipelineConfig,
+    )
+
+    arch = _init_vae_geometry(MiniMaxH3PipelineConfig())
+    assert arch.latents_mean is None
+    assert arch.latents_std is None

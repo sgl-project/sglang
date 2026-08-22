@@ -58,6 +58,12 @@ class MiniMaxH3VideoVAEConfig(VAEConfig):
 
     def post_init(self) -> None:
         self.resolved_parallel_decode_mode()
+        if (
+            self.arch_config.latents_mean is None
+            and self.arch_config.latents_std is None
+        ):
+            # ComfyUI DiT-forward never loads this VAE; stats stay unset.
+            return
         validate_minimax_h3_vae_latent_stats(
             self.arch_config,
             component_name="video_vae",
