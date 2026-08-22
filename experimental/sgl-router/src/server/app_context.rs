@@ -9,6 +9,7 @@ use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::TokenizerRegistry;
+use crate::worker_load::WorkerLoadRegistry;
 use crate::workers::WorkerRegistry;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -32,6 +33,9 @@ pub struct AppContext {
     pub metrics: Arc<MetricsRegistry>,
     pub prefix_index: Option<Arc<sgl_kv_indexer::GrpcPrefixIndex>>,
     pub block_size_oracle: Arc<BlockSizeOracle>,
+    /// Fresh `/v1/loads` aggregates used for generation-fenced external
+    /// placement scoring. Empty when the external Indexer mode is disabled.
+    pub worker_loads: Arc<WorkerLoadRegistry>,
     ready: AtomicBool,
 }
 
@@ -86,6 +90,7 @@ impl AppContext {
             metrics,
             prefix_index: None,
             block_size_oracle: BlockSizeOracle::new(),
+            worker_loads: Arc::new(WorkerLoadRegistry::default()),
             ready: AtomicBool::new(false),
         }
     }
@@ -133,6 +138,7 @@ impl AppContext {
             metrics: MetricsRegistry::new(),
             prefix_index: None,
             block_size_oracle: BlockSizeOracle::new(),
+            worker_loads: Arc::new(WorkerLoadRegistry::default()),
             ready: AtomicBool::new(false),
         }
     }

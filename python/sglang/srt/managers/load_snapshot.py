@@ -194,6 +194,9 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
 
     timestamp: float = 0.0
     dp_rank: int = 0
+    # Server-process identity shared with KV Snapshot/Live metadata. Routers
+    # may combine this load only with placement from the same generation.
+    worker_generation: str = ""
     num_running_reqs: int = 0
     num_waiting_reqs: int = 0
     num_waiting_uncached_tokens: int = 0

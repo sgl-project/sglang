@@ -90,6 +90,13 @@ struct PrefixCandidate {
     scanner: WorkerPrefixScanner,
 }
 
+struct CoverageSelection {
+    coverage: Vec<StreamCoverage>,
+    eligible_streams: HashSet<StreamKey>,
+    uncovered_worker_addresses: Vec<String>,
+    complete: bool,
+}
+
 /// Single-process, soft-state KV placement index.
 #[derive(Debug)]
 pub struct InMemoryKvIndexerBackend {
@@ -708,8 +715,12 @@ impl InMemoryKvIndexerBackend {
         let limit = prefix_limit(req.hashes.len(), req.max_blocks);
         let hashes = &req.hashes[..limit];
         let state = self.read_state()?;
-        let (coverage, eligible_streams, uncovered_worker_addresses, complete_coverage) =
-            select_coverage(&state, &req)?;
+        let CoverageSelection {
+            coverage,
+            eligible_streams,
+            uncovered_worker_addresses,
+            complete: complete_coverage,
+        } = select_coverage(&state, &req)?;
         if hashes.is_empty() {
             return Ok(MatchExternalKvPrefixResponse {
                 matches: Vec::new(),
@@ -874,7 +885,7 @@ fn validate_snapshot_metadata(
 fn select_coverage(
     state: &State,
     request: &MatchExternalKvPrefixRequest,
-) -> Result<(Vec<StreamCoverage>, HashSet<StreamKey>, Vec<String>, bool), Status> {
+) -> Result<CoverageSelection, Status> {
     let mut selected = std::collections::BTreeSet::new();
     let mut missing_streams = Vec::new();
     let mut uncovered_worker_addresses = Vec::new();
@@ -934,12 +945,12 @@ fn select_coverage(
         && missing_streams.is_empty()
         && uncovered_worker_addresses.is_empty()
         && coverage.iter().all(|entry| entry.ready);
-    Ok((
+    Ok(CoverageSelection {
         coverage,
         eligible_streams,
         uncovered_worker_addresses,
         complete,
-    ))
+    })
 }
 
 fn dedup_strings(values: &[String]) -> Vec<String> {

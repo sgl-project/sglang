@@ -89,6 +89,7 @@ class TestLoadsResponse(CustomTestCase):
             [
                 LoadSnapshot(
                     dp_rank=0,
+                    worker_generation="generation-1",
                     num_running_reqs=3,
                     num_waiting_reqs=2,
                     num_total_tokens=256,
@@ -104,6 +105,7 @@ class TestLoadsResponse(CustomTestCase):
         self.assertNotIn("num_total_reqs", response["loads"][0])
         self.assertEqual(response["loads"][0]["num_running_reqs"], 3)
         self.assertEqual(response["loads"][0]["num_waiting_reqs"], 2)
+        self.assertEqual(response["loads"][0]["worker_generation"], "generation-1")
 
 
 class TestLoadsAcceleratorField(CustomTestCase):

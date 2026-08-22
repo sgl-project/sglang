@@ -180,6 +180,18 @@ async fn main() -> Result<()> {
         Some(Arc::clone(&active_load)),
     ));
 
+    // External placement needs a fleet-wide load view whose generation can be
+    // compared with the Indexer response. Reuse SGLang's upstream `/v1/loads`
+    // endpoint rather than introducing a second reporting subsystem.
+    let worker_loads = Arc::new(sgl_router::worker_load::WorkerLoadRegistry::default());
+    let load_poller_handle = prefix_index.as_ref().map(|_| {
+        sgl_router::worker_load::spawn_poller(
+            Arc::clone(&registry),
+            Arc::clone(&worker_loads),
+            sgl_router::worker_load::DEFAULT_POLL_INTERVAL,
+        )
+    });
+
     let proxy = Arc::new(
         sgl_router::proxy::Proxy::new(std::time::Duration::from_secs(
             cfg.proxy.request_timeout_secs,
@@ -197,6 +209,7 @@ async fn main() -> Result<()> {
     );
     app_ctx.prefix_index = prefix_index;
     app_ctx.block_size_oracle = block_size_oracle;
+    app_ctx.worker_loads = worker_loads;
     let ctx = Arc::new(app_ctx);
     ctx.mark_ready();
 
@@ -219,6 +232,10 @@ async fn main() -> Result<()> {
     // exits — useful for tracing tail logs.
     discovery_handle.abort();
     manager_handle.abort();
+    if let Some(handle) = load_poller_handle {
+        handle.abort();
+        let _ = handle.await;
+    }
     janitor_handle.shutdown().await;
     server_result
 }
