@@ -428,14 +428,22 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
                 "SubBlock routing/kernel query-block mismatch: "
                 f"plan has {plan.index.shape[2]}, kernel needs {expected_q_blocks}"
             )
-        # Proof that the sparse path actually ran, with the shape it ran on --
-        # the construction-time log above only says the layer was eligible.
-        logger.info_once(
-            f"SubBlock sparse attention active: Sq={q.shape[1]} "
-            f"Sk={k.shape[1]} heads={q.shape[2]} "
-            f"keeping {plan.topk}/{plan.num_blocks} key blocks per query block "
-            f"(sparsity {1 - plan.density:.4f})"
-        )
+        # Proof that the sparse path actually ran -- the construction-time log
+        # above only says the layer was eligible.
+        if sparse_query_block_mask is None:
+            logger.info_once(
+                f"SubBlock sparse attention active: Sq={q.shape[1]} "
+                f"Sk={k.shape[1]} heads={q.shape[2]} "
+                f"keeping {plan.topk}/{plan.num_blocks} key blocks per query "
+                f"block (sparsity {1 - plan.density:.4f})"
+            )
+        else:
+            logger.info_once(
+                f"SubBlock heterogeneous BSA active: Sq={q.shape[1]} "
+                f"Sk={k.shape[1]} heads={q.shape[2]}; selected query blocks "
+                f"keep {plan.topk}/{plan.num_blocks} key blocks and unselected "
+                "query blocks are dense"
+            )
         block_counts = None
         runner = _get_subblock_sparse_attention_runner(q.device)
         block_index = (
@@ -486,29 +494,6 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
             block_counts,
         )
 
-    def _hybrid_query_attention(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        query_plan: dict[str, Any],
-    ) -> torch.Tensor:
-        """Run one BSA call with dense non-video and sparse video Q blocks."""
-        sparse_query_block_mask = query_plan.get("sparse_query_block_mask")
-        if not isinstance(sparse_query_block_mask, torch.Tensor):
-            raise ValueError("SubBlock query plan requires a query-block mask")
-        out = self._sparse_attention(
-            q,
-            k,
-            v,
-            sparse_query_block_mask=sparse_query_block_mask,
-        )
-        logger.info_once(
-            "SubBlock heterogeneous BSA active: non-video query blocks are "
-            "dense and pure-video query blocks are sparse"
-        )
-        return out
-
     def forward(
         self,
         query: torch.Tensor,
@@ -530,13 +515,13 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
-        first_segment_query_plan: dict[str, Any] | None = None,
+        first_segment_sparse_query_block_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Packed ``[T, H, D]`` rows split into documents by ``cu_seqlens``.
 
-        Each packed document keeps its own full K/V context. The optional H3
-        query plan makes pure-video Q blocks sparse and every other Q block
-        dense within one heterogeneous BSA call.
+        Each packed document keeps its own full K/V context. The optional
+        first-segment mask selects sparse Q blocks; unselected blocks stay
+        dense within the same heterogeneous BSA call.
         Documents shorter than ``min_seq_len`` -- in H3, the padding tail --
         stay on the existing dense segment path.
         """
@@ -583,18 +568,16 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
             k_seg = key[start:stop].unsqueeze(0)
             v_seg = value[start:stop].unsqueeze(0)
             if (start, stop) in sparse_segments:
-                query_plan = (
-                    first_segment_query_plan if (start, stop) == segments[0] else None
+                sparse_query_block_mask = (
+                    first_segment_sparse_query_block_mask
+                    if (start, stop) == segments[0]
+                    else None
                 )
-                seg_out = (
-                    self._sparse_attention(q_seg, k_seg, v_seg)
-                    if query_plan is None
-                    else self._hybrid_query_attention(
-                        q_seg,
-                        k_seg,
-                        v_seg,
-                        query_plan,
-                    )
+                seg_out = self._sparse_attention(
+                    q_seg,
+                    k_seg,
+                    v_seg,
+                    sparse_query_block_mask=sparse_query_block_mask,
                 )
             else:
                 seg_out = self._dense_segment(q_seg, k_seg, v_seg)

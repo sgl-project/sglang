@@ -6,6 +6,9 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+    MiniMaxH3PipelineConfig,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
     SubBlockSparseAttentionImpl,
     _get_subblock_sparse_attention_runner,
@@ -17,7 +20,7 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
     MiniMaxH3DenoiseBranch,
-    _minimax_h3_subblock_query_plan,
+    _minimax_h3_subblock_sparse_query_block_mask,
     _minimax_h3_subblock_video_query_indices,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (
@@ -29,10 +32,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     VIDEO_PAD,
     minimax_h3_ref2va_video_presentation,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.text_encoding import (
-    _attach_text_video_token_mask,
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -74,29 +77,25 @@ class TestSubBlockSparseAttentionDispatch(CustomTestCase):
 
 
 class TestSubBlockSparseAttentionModalities(CustomTestCase):
-    def test_non_subblock_text_payload_does_not_attach_video_mask(self):
-        positive = {"text_len": 3}
-
-        _attach_text_video_token_mask(
-            positive,
-            enabled=False,
-            mask=torch.tensor([True, False, True]),
+    def test_transformer_subblock_with_ring_fails_admission(self):
+        config = MiniMaxH3PipelineConfig()
+        server_args = SimpleNamespace(
+            attention_backend="fa",
+            ring_degree=2,
+            resolve_component_attention_backend=lambda *_names: (
+                AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
+                "transformer",
+            ),
         )
 
-        self.assertNotIn("text_video_token_mask", positive)
-
-    def test_subblock_text_payload_attaches_video_mask(self):
-        positive = {"text_len": 3}
-
-        _attach_text_video_token_mask(positive, enabled=True)
-
-        torch.testing.assert_close(
-            positive["text_video_token_mask"],
-            torch.zeros(3, dtype=torch.bool),
-        )
+        with (
+            patch.object(current_platform, "is_mps", return_value=False),
+            self.assertRaisesRegex(ValueError, "ring parallelism requires"),
+        ):
+            config.validate_server_args(server_args)
 
     @staticmethod
-    def _run_attention_core_without_dense_indices(
+    def _run_attention_core_without_query_mask(
         *,
         sparse_ready: bool,
         min_seq_len: int,
@@ -119,32 +118,32 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
             cu_seqlens_host=(0, 4),
             max_seqlen=4,
             ulysses_active=False,
-            subblock_query_plan=None,
+            subblock_sparse_query_block_mask=None,
         )
         return impl
 
-    def test_missing_dense_indices_are_allowed_for_dense_fallback(self):
-        impl = self._run_attention_core_without_dense_indices(
+    def test_missing_query_mask_is_allowed_for_dense_fallback(self):
+        impl = self._run_attention_core_without_query_mask(
             sparse_ready=False,
             min_seq_len=4,
         )
 
         impl.forward_varlen.assert_called_once()
 
-    def test_missing_dense_indices_are_allowed_when_segments_are_short(self):
-        impl = self._run_attention_core_without_dense_indices(
+    def test_missing_query_mask_is_allowed_when_segments_are_short(self):
+        impl = self._run_attention_core_without_query_mask(
             sparse_ready=True,
             min_seq_len=8,
         )
 
         impl.forward_varlen.assert_called_once()
 
-    def test_missing_dense_indices_fail_only_when_sparse_attention_will_run(self):
+    def test_missing_query_mask_fails_only_when_sparse_attention_will_run(self):
         with self.assertRaisesRegex(
             ValueError,
             "when SubBlock sparse attention is active",
         ):
-            self._run_attention_core_without_dense_indices(
+            self._run_attention_core_without_query_mask(
                 sparse_ready=True,
                 min_seq_len=4,
             )
@@ -163,12 +162,13 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
         )
         video_indices = _minimax_h3_subblock_video_query_indices(
             packed,
-            torch.zeros(5, dtype=torch.bool),
+            None,
         )
         condition_image_indices = set(
             packed["img_pos"][~packed["update_mask"]].tolist()
         )
 
+        torch.testing.assert_close(video_indices, packed["video_pos"])
         self.assertTrue(condition_image_indices.isdisjoint(video_indices.tolist()))
 
     def test_ref2va_images_are_dense_but_reference_and_target_video_are_sparse(self):
@@ -260,7 +260,7 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
             torch.tensor([2, 2]),
         ):
             with self.subTest(indices=invalid.tolist()), self.assertRaises(ValueError):
-                _minimax_h3_subblock_query_plan(invalid, used_len=5)
+                _minimax_h3_subblock_sparse_query_block_mask(invalid, used_len=5)
 
     def test_ref2va_video_positions_are_subblock_only_metadata(self):
         kwargs = dict(
@@ -313,16 +313,18 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
             device=torch.device("cpu"),
         )
 
-        self.assertIsNone(branch.subblock_query_plan)
-        self.assertNotIn("subblock_query_plan", branch.static_kwargs)
+        self.assertNotIn(
+            "subblock_sparse_query_block_mask",
+            branch.static_kwargs,
+        )
 
-    def test_query_plan_marks_only_pure_video_blocks_sparse(self):
-        query_plan = _minimax_h3_subblock_query_plan(
+    def test_query_mask_marks_only_pure_video_blocks_sparse(self):
+        sparse_query_block_mask = _minimax_h3_subblock_sparse_query_block_mask(
             torch.cat([torch.arange(64), torch.arange(128, 140)]),
             used_len=140,
         )
         torch.testing.assert_close(
-            query_plan["sparse_query_block_mask"],
+            sparse_query_block_mask,
             torch.tensor([True, False, True]),
         )
 
@@ -343,7 +345,7 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
         q = torch.zeros(1, 3 * 64, 1, 2)
         k = torch.zeros(1, 8 * 64, 1, 2)
         v = torch.zeros_like(k)
-        query_plan = {"sparse_query_block_mask": torch.tensor([True, False, True])}
+        sparse_query_block_mask = torch.tensor([True, False, True])
         impl.dense_impl = Mock()
         sparse_out = torch.ones_like(q)
 
@@ -364,7 +366,12 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
                     return_value=runner,
                 ),
             ):
-                out = impl._hybrid_query_attention(q, k, v, query_plan)
+                out = impl._sparse_attention(
+                    q,
+                    k,
+                    v,
+                    sparse_query_block_mask=sparse_query_block_mask,
+                )
 
             impl.dense_impl.forward.assert_not_called()
             torch.testing.assert_close(out, sparse_out)

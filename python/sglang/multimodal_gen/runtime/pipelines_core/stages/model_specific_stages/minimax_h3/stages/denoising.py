@@ -634,15 +634,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         video_query_indices = None
         if subblock_enabled:
             text_video_token_mask = emb.get("text_video_token_mask")
-            if text_video_token_mask is None:
-                # Legacy/precomputed presentations predate this optional
-                # provenance. Conservatively keep their Qwen rows dense;
-                # packed reference/target video latents remain sparse via
-                # packed["video_pos"].
-                text_video_token_mask = torch.zeros(
-                    int(packed["text_pos"].numel()),
-                    dtype=torch.bool,
-                )
+            # Legacy/precomputed presentations may lack this optional
+            # provenance. The helper then keeps their Qwen rows dense while
+            # retaining packed reference/target video rows as sparse.
             video_query_indices = _minimax_h3_subblock_video_query_indices(
                 packed,
                 text_video_token_mask,

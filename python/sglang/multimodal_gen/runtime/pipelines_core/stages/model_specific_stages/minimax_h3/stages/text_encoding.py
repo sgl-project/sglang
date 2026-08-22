@@ -27,27 +27,6 @@ logger = init_logger(__name__)
 _MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY = "minimax_h3_single_copy_text_encode"
 
 
-def _attach_text_video_token_mask(
-    positive: dict,
-    *,
-    enabled: bool,
-    mask: torch.Tensor | None = None,
-) -> None:
-    """Attach SubBlock-only provenance without touching other backends."""
-    if not enabled:
-        return
-    text_len = int(positive["text_len"])
-    if mask is None:
-        mask = torch.zeros(text_len, dtype=torch.bool)
-    else:
-        mask = mask.view(-1).to(dtype=torch.bool)
-        if mask.shape[0] != text_len:
-            raise ValueError(
-                f"text video mask length {mask.shape[0]} != text_len {text_len}"
-            )
-    positive["text_video_token_mask"] = mask
-
-
 class MiniMaxH3TextEncodingStage(TextEncodingStage):
     deduplicated_output_fields = ("prompt_embeds", "prompt_seq_lens")
     deduplicated_extra_output_keys = (MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY,)
@@ -321,23 +300,17 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                     plan,
                     encode_ids,
                     prompt=prompt,
-                    include_video_token_mask=include_video_token_mask,
                 )
             else:
                 positive_ids = minimax_h3_text_only_ids(self.tokenizer, prompt)
-                positive = {
-                    "hidden_states": encode_ids(positive_ids),
-                    "text_len": int(positive_ids.shape[0]),
-                    "text_token_tags": torch.ones(
-                        int(positive_ids.shape[0]), dtype=torch.long
-                    ),
-                }
-                _attach_text_video_token_mask(
-                    positive,
-                    enabled=include_video_token_mask,
-                )
                 embeddings = {
-                    "positive": positive,
+                    "positive": {
+                        "hidden_states": encode_ids(positive_ids),
+                        "text_len": int(positive_ids.shape[0]),
+                        "text_token_tags": torch.ones(
+                            int(positive_ids.shape[0]), dtype=torch.long
+                        ),
+                    }
                 }
         batch.extra[MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY] = embeddings
 
@@ -348,7 +321,6 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         encode_ids,
         *,
         prompt: str,
-        include_video_token_mask: bool = False,
     ) -> dict:
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.canvas import (
             minimax_h3_prepared_keyframes,
@@ -392,16 +364,13 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
         )
-        positive = {
-            "hidden_states": pos_hidden,
-            "text_len": int(pos_ids.shape[0]),
-            "text_token_tags": pos_tags,
+        return {
+            "positive": {
+                "hidden_states": pos_hidden,
+                "text_len": int(pos_ids.shape[0]),
+                "text_token_tags": pos_tags,
+            }
         }
-        _attach_text_video_token_mask(
-            positive,
-            enabled=include_video_token_mask,
-        )
-        return {"positive": positive}
 
     def _encode_ref2va(
         self,
@@ -609,11 +578,8 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             "text_len": int(pos_ids.shape[0]),
             "text_token_tags": pos_tags,
         }
-        _attach_text_video_token_mask(
-            positive,
-            enabled=include_video_token_mask,
-            mask=pos_video_mask,
-        )
+        if pos_video_mask is not None:
+            positive["text_video_token_mask"] = pos_video_mask
         return {"positive": positive}
 
 

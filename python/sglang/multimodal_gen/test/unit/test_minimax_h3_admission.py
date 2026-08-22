@@ -353,6 +353,7 @@ def test_validate_server_args_requires_packed_varlen_backend():
     server_args = SimpleNamespace(
         component_attention_backends={},
         attention_backend="sage_attn",
+        ring_degree=1,
         resolve_component_attention_backend=lambda *_names: (None, None),
     )
     with patch(
@@ -378,6 +379,7 @@ def test_validate_server_args_accepts_transformer_backend_override():
     server_args = SimpleNamespace(
         component_attention_backends={"transformer": "subblock_sparse_attn"},
         attention_backend="fa",
+        ring_degree=1,
         resolve_component_attention_backend=lambda *_names: (
             AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
             "transformer",
@@ -439,6 +441,7 @@ def test_mps_admission_requires_layerwise_residency_for_every_h3_component():
         component_attention_backends={},
         attention_backend=None,
         enable_torch_compile=False,
+        ring_degree=1,
         residency_mode=modes.get,
         resolve_component_attention_backend=lambda *_names: (None, None),
     )

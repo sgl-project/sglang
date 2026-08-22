@@ -33,9 +33,12 @@ _MINIMAX_H3_SUBBLOCK_QUERY_BLOCK_SIZE = 64
 
 def _minimax_h3_subblock_video_query_indices(
     packed: dict[str, torch.Tensor],
-    text_video_token_mask: torch.Tensor,
+    text_video_token_mask: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Return first-segment-relative query rows that contain video."""
+    """Return packed video rows plus any Qwen rows marked as video."""
+    latent_video_pos = packed["video_pos"].view(-1).to(dtype=torch.long)
+    if text_video_token_mask is None:
+        return latent_video_pos
     text_pos = packed["text_pos"].view(-1).to(dtype=torch.long)
     text_video_token_mask = text_video_token_mask.view(-1).to(
         device=text_pos.device,
@@ -46,16 +49,15 @@ def _minimax_h3_subblock_video_query_indices(
             "text_video_token_mask must align with packed text rows "
             f"({text_pos.shape[0]}), got {text_video_token_mask.shape[0]}"
         )
-    latent_video_pos = packed["video_pos"].view(-1).to(dtype=torch.long)
     return torch.cat([text_pos[text_video_token_mask], latent_video_pos])
 
 
-def _minimax_h3_subblock_query_plan(
+def _minimax_h3_subblock_sparse_query_block_mask(
     video_query_indices: torch.Tensor,
     *,
     used_len: int,
-) -> dict[str, torch.Tensor]:
-    """Mark pure-video 64-row Q blocks sparse; every other block stays dense."""
+) -> torch.Tensor:
+    """Return True for pure-video 64-row Q blocks and False otherwise."""
     if used_len < 0:
         raise ValueError(f"used_len must be non-negative, got {used_len}")
     if video_query_indices.ndim != 1:
@@ -88,8 +90,7 @@ def _minimax_h3_subblock_query_plan(
     # BSA is block-granular. Only blocks whose real rows are all video may use
     # the sparse budget; mixed boundary blocks stay dense so their non-video
     # rows retain exact attention in the single heterogeneous BSA call.
-    sparse_query_block_mask = video_rows_per_block == real_rows_per_block
-    return {"sparse_query_block_mask": sparse_query_block_mask}
+    return video_rows_per_block == real_rows_per_block
 
 
 @torch.inference_mode()
@@ -248,20 +249,12 @@ class MiniMaxH3DenoiseBranch:
         sp_world_size = ulysses_world_size * ring_world_size
         sp_rank = ring_rank * ulysses_world_size + ulysses_rank
         token_tags_host = token_tags.view(-1).to(dtype=torch.long)
-        host_subblock_query_plan = (
-            _minimax_h3_subblock_query_plan(
+        subblock_sparse_query_block_mask = (
+            _minimax_h3_subblock_sparse_query_block_mask(
                 video_query_indices.view(-1).to(dtype=torch.long),
                 used_len=int(cu[1]),
-            )
+            ).to(device)
             if video_query_indices is not None
-            else None
-        )
-        self.subblock_query_plan = (
-            {
-                name: value.to(device) if isinstance(value, torch.Tensor) else value
-                for name, value in host_subblock_query_plan.items()
-            }
-            if host_subblock_query_plan is not None
             else None
         )
         local_seq_len = seq_len // sp_world_size
@@ -309,8 +302,10 @@ class MiniMaxH3DenoiseBranch:
                 "max_seqlen_q": text_len,
             },
         }
-        if self.subblock_query_plan is not None:
-            self.static_kwargs["subblock_query_plan"] = self.subblock_query_plan
+        if subblock_sparse_query_block_mask is not None:
+            self.static_kwargs["subblock_sparse_query_block_mask"] = (
+                subblock_sparse_query_block_mask
+            )
 
     def forward_kwargs(
         self,
