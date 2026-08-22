@@ -2278,5 +2278,56 @@ class TestDcpKvEventContract(CustomTestCase):
         self.assertEqual(args.kv_event_block_size, 8)
 
 
+class TestDeterministicQuantizedKvCacheWarning(CustomTestCase):
+    """A quantized KV cache under deterministic inference must not go
+    unreported, and an unquantized one must not be reported (#25790)."""
+
+    def _run(self, **kwargs):
+        from sglang.srt.arg_groups.overrides import (
+            _deterministic_quantized_kv_cache_warning,
+        )
+
+        view = SimpleNamespace(**kwargs)
+        return _deterministic_quantized_kv_cache_warning(view)
+
+    def test_warns_for_fp8_kv_cache_and_declares_nothing(self):
+        import sglang.srt.arg_groups.overrides as overrides_module
+
+        with self.assertLogs(overrides_module.logger, level="WARNING") as logs:
+            declared = self._run(
+                enable_deterministic_inference=True, kv_cache_dtype="fp8_e4m3"
+            )
+
+        # Warning only: changing the dtype under the user would be worse than
+        # telling them, since the combination is still reproducible run to run.
+        self.assertEqual(declared, {})
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("does not guarantee batch invariance", logs.output[0])
+        self.assertIn("fp8_e4m3", logs.output[0])
+        self.assertIn("25790", logs.output[0])
+
+    def test_silent_for_unquantized_kv_cache(self):
+        import sglang.srt.arg_groups.overrides as overrides_module
+
+        for dtype in ("auto", "bf16", "bfloat16"):
+            with self.subTest(kv_cache_dtype=dtype):
+                with self.assertNoLogs(overrides_module.logger, level="WARNING"):
+                    declared = self._run(
+                        enable_deterministic_inference=True, kv_cache_dtype=dtype
+                    )
+                self.assertEqual(declared, {})
+
+    def test_silent_when_deterministic_inference_is_off(self):
+        import sglang.srt.arg_groups.overrides as overrides_module
+
+        # fp8 KV on its own is a supported configuration; the divergence only
+        # matters against the guarantee deterministic inference advertises.
+        with self.assertNoLogs(overrides_module.logger, level="WARNING"):
+            declared = self._run(
+                enable_deterministic_inference=False, kv_cache_dtype="fp8_e4m3"
+            )
+        self.assertEqual(declared, {})
+
+
 if __name__ == "__main__":
     unittest.main()

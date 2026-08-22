@@ -8282,11 +8282,13 @@ class ServerArgs:
             # (arg_groups/overrides.py), invoked at their legacy slots.
             from sglang.srt.arg_groups.overrides import (
                 _deterministic_attention_backend,
+                _deterministic_quantized_kv_cache_warning,
                 _deterministic_sampling_backend,
                 run_post_process_pass,
             )
 
             run_post_process_pass(self, _deterministic_sampling_backend)
+            run_post_process_pass(self, _deterministic_quantized_kv_cache_warning)
             is_deepseek_model = False
             if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
                 try:

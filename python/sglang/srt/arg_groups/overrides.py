@@ -2105,6 +2105,42 @@ def _deterministic_attention_backend(view: Any) -> dict:
     return {}
 
 
+# KV cache dtypes that store quantized values, so attention reads them through
+# a dequantizing path instead of the model dtype.
+_QUANTIZED_KV_CACHE_DTYPES = frozenset(
+    {"fp8_e4m3", "fp8_e5m2", "mxfp8", "nvfp4", "fp4_mx_block16"}
+)
+
+
+@register_post_process
+def _deterministic_quantized_kv_cache_warning(view: Any) -> dict:
+    """Warn that a quantized KV cache is not covered by batch invariance.
+
+    Deterministic inference pins SplitKV but not the attention kernel's
+    internal KV-block tiling, so with fp8 KV a one-row decode and an L-row
+    prefill stop agreeing over identical KV past kv_len 96 (measured, fa3 on
+    SM90; bf16 is bitwise equal). Warning only, declaring nothing: run-to-run
+    reproducibility still holds, so rewriting the user's dtype would be worse
+    than telling them. See sgl-project/sglang#25790.
+    """
+    if not view.enable_deterministic_inference:
+        return {}
+    if view.kv_cache_dtype not in _QUANTIZED_KV_CACHE_DTYPES:
+        return {}
+    logger.warning(
+        "Deterministic inference does not guarantee batch invariance with "
+        "--kv-cache-dtype=%s: prefill and decode can disagree on the same "
+        "token, so input and output logprobs for it may differ (measured for "
+        "fp8_e4m3 on the fa3 backend at kv_len >= 97; see "
+        "https://github.com/sgl-project/sglang/issues/25790). Run-to-run "
+        "reproducibility is unaffected. Use a bf16 KV cache if you need "
+        "prefill/decode logprob consistency, for example for RL logprobs or "
+        "logprob-based evaluation.",
+        view.kv_cache_dtype,
+    )
+    return {}
+
+
 @register_post_process
 def _attention_backend_default(view: Any) -> dict:
     if view.prefill_attention_backend is not None and (
