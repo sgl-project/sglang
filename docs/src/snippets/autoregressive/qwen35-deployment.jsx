@@ -141,6 +141,15 @@ export const Qwen35Deployment = () => {
           { id: 'v2', label: 'V2', default: false }
         ];
       }
+    },
+    kvOffloading: {
+      name: 'kvOffloading',
+      title: 'KV Offloading',
+      condition: (values) => values.hardware === 'mi355x' && values.quantization === 'fp4' && values.model === '397b',
+      items: [
+        { id: 'disabled', label: 'Disabled', default: true },
+        { id: 'hicache',  label: 'HiCache',  default: false }
+      ]
     }
   };
 
@@ -379,6 +388,7 @@ export const Qwen35Deployment = () => {
       toolcall: (value) => value === 'enabled' ? '--tool-call-parser qwen3_coder' : null,
       speculative: (value) => value === 'enabled' ? '--speculative-algorithm NEXTN \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4' : null,
       mambaCache: (value) => value === 'v2' ? '--mamba-radix-cache-strategy extra_buffer' : null,
+      kvOffloading: () => null,  // HiCache flags are emitted in the FP4-specific block below
     };
 
     // Iterate options in order, applying commandRules
@@ -484,6 +494,14 @@ export const Qwen35Deployment = () => {
         // Cap concurrency under MTP to avoid OOM at tp=2.
         if (speculative === 'enabled') {
           cmd += ' \\\n  --max-running-requests 128';
+        }
+        // HiCache: hierarchical KV cache with host-DRAM offload for higher concurrency.
+        if (values.kvOffloading === 'hicache') {
+          cmd += ' \\\n  --enable-hierarchical-cache';
+          cmd += ' \\\n  --hicache-ratio 1.5';
+          cmd += ' \\\n  --hicache-write-policy write_through';
+          cmd += ' \\\n  --hicache-io-backend direct';
+          cmd += ' \\\n  --hicache-mem-layout page_first_direct';
         }
       } else {
         // NVIDIA NVFP4 on Blackwell (B200 / B300).
