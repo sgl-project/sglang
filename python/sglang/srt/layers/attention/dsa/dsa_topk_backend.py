@@ -87,9 +87,21 @@ class DSATopKBackend(Enum):
         row_starts: Optional[torch.Tensor] = None,
         batch_idx_list: Optional[List[int]] = None,
         force_unfused_topk: bool = False,
+        return_raw_indices: bool = False,
     ) -> torch.Tensor:
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
-            return self.topk_func(logits, lengths, topk, row_starts=row_starts)
+            result = self.topk_func(logits, lengths, topk, row_starts=row_starts)
+            return (result, result) if return_raw_indices else result
+
+        # Sequence-relative selection, before the kv-cache coordinate remap done
+        # by the fused transform below. Rollout R3 replay compares against the
+        # model's natural (sequence-relative) topk, so capture must use these raw
+        # indices rather than the transformed (paged/ragged) result.
+        raw_indices = (
+            self.topk_func(logits, lengths, topk, row_starts=row_starts)
+            if return_raw_indices
+            else None
+        )
 
         # Decode-shaped PAGED top-k for the SGL backend (plain decode AND spec
         # verify / draft-extend, whose expanded rows match the same shape) routes
@@ -112,7 +124,8 @@ class DSATopKBackend(Enum):
             == logits.shape[0]
             == attn_metadata.real_page_table.shape[0]
         ):
-            return _topk_transform_v2_paged(logits, lengths, topk, attn_metadata)
+            result = _topk_transform_v2_paged(logits, lengths, topk, attn_metadata)
+            return (result, raw_indices) if return_raw_indices else result
 
         # The legacy transforms below read attn_metadata.page_table_1 (page_size=1),
         # which is always present here: the fold only drops it for the decode case
@@ -131,7 +144,7 @@ class DSATopKBackend(Enum):
                     if batch_idx_list is not None
                     else attn_metadata.page_table_1
                 )
-                return fast_topk_transform_fused(
+                result = fast_topk_transform_fused(
                     score=logits,
                     lengths=lengths,
                     page_table_size_1=page_table_size_1,
@@ -139,22 +152,22 @@ class DSATopKBackend(Enum):
                     topk=topk,
                     row_starts=row_starts,
                 )
-            if topk_transform_method == TopkTransformMethod.RAGGED:
+            elif topk_transform_method == TopkTransformMethod.RAGGED:
                 if topk_indices_offset is None:
                     raise RuntimeError(
                         "RAGGED topk_transform requires topk_indices_offset; "
                         "expected extend-without-speculative metadata."
                     )
-                return fast_topk_transform_ragged_fused(
+                result = fast_topk_transform_ragged_fused(
                     score=logits,
                     lengths=lengths,
                     topk_indices_offset=topk_indices_offset,
                     topk=topk,
                     row_starts=row_starts,
                 )
-            raise RuntimeError(f"Unsupported {topk_transform_method = }.")
-
-        if self.is_flashinfer():
+            else:
+                raise RuntimeError(f"Unsupported {topk_transform_method = }.")
+        elif self.is_flashinfer():
             import flashinfer
 
             if topk_transform_method == TopkTransformMethod.PAGED:
@@ -166,7 +179,7 @@ class DSATopKBackend(Enum):
                     device=logits.device,
                     num_rows=logits.shape[0],
                 )
-                return flashinfer.top_k_page_table_transform(
+                result = flashinfer.top_k_page_table_transform(
                     logits.contiguous(),
                     attn_metadata.page_table_1.contiguous(),
                     lengths.contiguous(),
@@ -178,13 +191,13 @@ class DSATopKBackend(Enum):
                     row_starts=row_starts,
                     page_table_row_starts=page_table_row_starts,
                 )
-            if topk_transform_method == TopkTransformMethod.RAGGED:
+            elif topk_transform_method == TopkTransformMethod.RAGGED:
                 if topk_indices_offset is None:
                     raise RuntimeError(
                         "RAGGED topk_transform requires topk_indices_offset; "
                         "expected extend-without-speculative metadata."
                     )
-                return flashinfer.top_k_ragged_transform(
+                result = flashinfer.top_k_ragged_transform(
                     logits.contiguous(),
                     topk_indices_offset.contiguous(),
                     lengths.contiguous(),
@@ -194,9 +207,12 @@ class DSATopKBackend(Enum):
                     dsa_graph_safe=True,
                     row_starts=row_starts,
                 )
-            raise RuntimeError(f"Unsupported {topk_transform_method = }.")
+            else:
+                raise RuntimeError(f"Unsupported {topk_transform_method = }.")
+        else:
+            raise RuntimeError(f"Unsupported {self = } for SGLANG_DSA_FUSE_TOPK.")
 
-        raise RuntimeError(f"Unsupported {self = } for SGLANG_DSA_FUSE_TOPK.")
+        return (result, raw_indices) if return_raw_indices else result
 
 
 def _topk_unfused(
