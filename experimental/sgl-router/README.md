@@ -64,11 +64,17 @@ sgl-router \
 ```
 
 The existing cache-aware policy and thresholds are reused. When configured, the
-Indexer replaces the Router-local radix tree as the cache signal. A successful
-query with no usable match selects by minimum active load; connection failures,
-timeouts, local admission rejection, and server rejection fail the Router
-request with `503` rather than silently switching signals. The timeout and local
-concurrency bound default to 100ms and 32 respectively.
+Indexer replaces the Router-local radix tree as the cache signal. The Router
+also polls each Worker's upstream `/v1/loads` endpoint every 100 ms. Placement
+is scored with a load sample only when both carry the same Worker process
+generation; samples expire after 500 ms. Missing, stale, or generation-mismatched
+load disables that cache candidate, and the final fallback uses Router-local
+active requests.
+
+Connection failures, timeouts, overload, partial Worker coverage, and prompts
+that exceed the Indexer message limit cost cache affinity but do not fail the
+inference request. Contract rejections still return `503`. The query timeout and
+local concurrency bound default to 100 ms and 32 respectively.
 
 ## License
 

@@ -15,6 +15,7 @@ Worker's Snapshot + Live Events before that replica reports READY.
 Worker fleet ── Snapshot + ZMQ Live ──> Bridge i ── gRPC ──> Indexer i
 Router fleet <──── 100 ms status ───── Indexer fleet
 Router ───────── MatchPrefix ─────────> one fresh READY Indexer
+Router ───────── GET /v1/loads ───────> Worker fleet
 ```
 
 - SGLang publishes `BlockStored`, `BlockRemoved`, and `AllBlocksCleared` events.
@@ -35,16 +36,25 @@ leader, consensus, persistence, or state sharing between replicas.
 ## Operational contract
 
 Run any number of `Bridge + Indexer` pairs. Routers select the lowest-load fresh
-READY report, retry another READY member on timeout/unreachable/overload, and
-fall back to load-only Worker routing when none is usable.
+READY Indexer report, retry another READY member on timeout, unreachability,
+overload, or partial coverage, and fall back to load-only Worker routing when
+none is usable.
 
 Fleet mode requires snapshot-capable Workers. The Bridge subscribes to Live
-Events before requesting `snapshot-v1`, waits for the exact barrier, installs
-the snapshot atomically, and then applies only contiguous events from the same
-epoch. Indexer restart (detected by a per-process epoch even while Workers are
-idle), Worker epoch change, sequence gap, or Bridge reconnect starts a fresh
-snapshot cycle. Snapshot v1 contains whole-block HBM placement;
-tier/component-complete recovery remains a future protocol version.
+Events before requesting a snapshot, stages Snapshot v2 in bounded gRPC chunks,
+commits it atomically, and then applies only contiguous events from the same
+epoch. A sequence gap first attempts bounded replay-v2; an unavailable replay
+range falls back to a fresh snapshot. Indexer restart (detected by a per-process
+epoch even while Workers are idle), Worker generation change, unrepaired gap,
+or Bridge reconnect invalidates only that stream before recovery.
+
+The Worker generation comes from the same `PortArgs.instance_id` in Snapshot,
+Live metadata, and the upstream `/v1/loads` response. The Indexer fences
+Snapshot/Live application with it and returns it with each prefix match. The
+Router polls `/v1/loads` every 100 ms and combines placement with load only when
+their generations match; samples expire after 500 ms. This small interface
+reuses upstream SGLang load snapshots and requires no separate Load Reporter or
+Router Load Monitor subsystem.
 
 ## In-memory data model
 
@@ -159,6 +169,8 @@ The protobuf service in `proto/kv_indexer.proto` provides:
   before recovery/reconnect.
 - `ReplaceExternalKvSnapshot`: atomically installs one Worker snapshot and
   sequence checkpoint.
+- `Begin/Append/Commit/AbortExternalKvSnapshot`: stages a large Snapshot v2
+  outside query-visible state and commits it atomically.
 - `MatchExternalKv`: workers and tiers holding requested block hashes.
 - `MatchExternalKvPrefix`: per-worker longest contiguous reusable prefix.
 - `GetExternalKvHitCounts`: per-block hit counters.
@@ -180,12 +192,17 @@ router-facing address are excluded.
 
 The Indexer returns every candidate sorted by prefix length; it does not choose
 a worker. When configured, it replaces the Router's local radix tree as the
-cache signal: the Router intersects Indexer results with its healthy candidates,
-and a successful query with no usable match selects by minimum active load.
-Indexer connection failures, timeouts, overload, and a prompt too long to fit one
-gRPC message fall back to that same minimum-active-load selection, so an
-unreachable Indexer costs cache affinity rather than availability; a rejected RPC
-still fails the Router request with `503`, because it means the two sides
+cache signal. The Router intersects Indexer results with healthy candidates and
+requires a fresh `/v1/loads` sample carrying the same Worker generation before
+combining cache placement and load. Missing or mismatched load removes that
+cache candidate; a successful query with no usable match selects by fresh
+Worker load when the complete pool is available, then by Router-local active
+load.
+
+Indexer connection failures, timeouts, overload, partial coverage, and a prompt
+too long to fit one gRPC message fall back to load-only selection, so an
+unavailable Indexer costs cache affinity rather than availability. A rejected
+RPC still fails the Router request with `503`, because it means the two sides
 disagree on the request contract. An
 endpoint the Router could never dial is rejected at startup instead of failing
 every query later. The local radix tree is used only when no Indexer endpoint is
