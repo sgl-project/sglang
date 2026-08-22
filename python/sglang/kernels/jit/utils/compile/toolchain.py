@@ -137,7 +137,10 @@ def base_cxx_flags() -> List[str]:
 def base_cuda_flags() -> List[str]:
     if is_hip_runtime():
         return ["-fPIC", "-D__HIP_PLATFORM_AMD__=1", "-fno-gpu-rdc"]
-    return ["-Xcompiler", "-fPIC"]
+    # nvcc does not honor CC/CXX/CUDAHOSTCXX when selecting its host compiler.
+    # Pin the same compiler that we fingerprint and use for the final link;
+    # otherwise nvcc silently falls back to the system default compiler.
+    return ["-Xcompiler", "-fPIC", f"-ccbin={host_compiler_path()}"]
 
 
 def base_include_paths() -> List[str]:
