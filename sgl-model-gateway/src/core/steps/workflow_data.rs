@@ -316,6 +316,10 @@ impl McpWorkflowData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WasmRegistrationWorkflowData {
     pub config: WasmModuleConfigRequest,
+    /// The requested path once resolved and confirmed to lie inside a configured
+    /// module root. Every later step reads this rather than the caller's string,
+    /// so validation and use cannot disagree about which file is meant.
+    pub canonical_path: Option<String>,
     pub wasm_bytes: Option<Vec<u8>>,
     /// SHA256 hash of the module file (32 bytes)
     pub sha256_hash: Option<[u8; 32]>,

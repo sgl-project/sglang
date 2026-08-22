@@ -7,3 +7,6 @@ pub use smg_wasm::*;
 
 // Local HTTP API routes (depends on app-specific types)
 pub mod route;
+
+// Allow-list of directories modules may be loaded from
+pub mod module_roots;
