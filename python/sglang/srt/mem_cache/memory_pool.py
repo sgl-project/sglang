@@ -493,12 +493,13 @@ class MambaPool:
         self.linear_replayssm_cache_len = linear_replayssm_cache_len
         # ReplaySSM: the decode ring (--enable-linear-replayssm) allocates the
         # chunked (d, k) records + write_pos; the spec-verify flag
-        # (--enable-linear-replayssm-spec) always uses fold-every-commit and
-        # allocates only the raw (v, k, g, beta) window -- no chunked records,
-        # no cursors (KDA additionally keeps d/k, see the allocation below).
-        # The shared g allocation gates on `_replayssm_on`.
+        # (--enable-linear-replayssm-spec) uses the amortized circular ring for
+        # GDN and fold-every-commit for KDA. The shared g allocation gates on
+        # `_replayssm_on`.
         self.enable_linear_replayssm_spec = enable_linear_replayssm_spec
-        self.replayssm_spec_fold = bool(enable_linear_replayssm_spec)
+        self.replayssm_spec_fold = bool(
+            enable_linear_replayssm_spec and cache_params.is_kda
+        )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
 
         # for disagg with nvlink
@@ -645,7 +646,7 @@ class MambaPool:
                 # (bit-identical to the recurrent baseline) instead of folding
                 # the chunked `d` records open-loop.
                 if enable_linear_replayssm_spec:
-                    if cache_params.is_kda:
+                    if cache_params.is_kda or not self.replayssm_spec_fold:
                         # Backstop for the KDA ring invariants; this pool is
                         # sized with the final adaptive-aware draft maximum.
                         if L & (L - 1) != 0:
