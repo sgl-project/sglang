@@ -23,14 +23,7 @@ from sglang.srt.models.interns2_mobius import (
 from sglang.srt.models.interns2preview import InternS2PreviewForConditionalGeneration
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
-from sglang.srt.models.qwen3_5 import (
-    Qwen3_5ForConditionalGeneration,
-    Qwen3_5MoeForConditionalGeneration,
-)
-from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
 from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
-from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
-from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -292,11 +285,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
     models = [
         Qwen2VLForConditionalGeneration,
         Qwen2_5_VLForConditionalGeneration,
-        Qwen3VLForConditionalGeneration,
-        Qwen3VLMoeForConditionalGeneration,
-        Qwen3_5ForConditionalGeneration,
-        Qwen3_5MoeForConditionalGeneration,
-        Qwen3_5ForCausalLMMTP,
         InternS2PreviewForConditionalGeneration,
         InternS2MobiusForConditionalGeneration,
         Qwen3OmniMoeForConditionalGeneration,
@@ -356,6 +344,9 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
     @property
     def spatial_merge_size(self):
         return self._spatial_merge_size
+
+    async def _preprocess_video(self, video):
+        return await preprocess_video(video, video_config=self.video_config)
 
     def build_input_ids_with_timestamps(
         self, prompt, embeddings, img_grid_thw, video_grid_thw, video_timestamps
@@ -745,8 +736,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         video_metadata = None
         if base_output.videos and not isinstance(base_output.videos[0], dict):
             videos_processed = [
-                await preprocess_video(video, video_config=self.video_config)
-                for video in base_output.videos
+                await self._preprocess_video(video) for video in base_output.videos
             ]
             base_output.videos, video_metadata = map(list, zip(*videos_processed))
 
