@@ -40,6 +40,7 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
     enable_moe_dense_fully_dp,
+    enable_moe_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -71,6 +72,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.llada2_weight_utils import prepare_llada2_language_weights
 from sglang.srt.models.utils import (
     apply_qk_norm,
     create_fused_set_kv_buffer_arg,
@@ -198,6 +200,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.tp_size = get_parallel().tp_size
+        self.moe_fully_replicated = enable_moe_fully_dp()
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
         self.hidden_size = config.hidden_size
@@ -299,7 +302,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep()
+                    if get_moe_a2a_backend().is_deepep() or self.moe_fully_replicated
                     else {}
                 ),
             )
@@ -386,8 +389,12 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         if self.num_shared_experts > 0:
             final_hidden_states = final_hidden_states + shared_output
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
+        if (
+            self.tp_size > 1
+            and not self.moe_fully_replicated
+            and not should_skip_post_experts_all_reduce(
+                is_tp_path=True,
+            )
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
@@ -837,6 +844,9 @@ class LLaDA2MoeModelLM(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
+    def get_input_embeddings(self):
+        return self.model.word_embeddings
+
     def get_embed_and_head(self):
         """Used by the eagle_worker."""
         return self.model.word_embeddings.weight, self.lm_head.weight
@@ -890,7 +900,9 @@ class LLaDA2MoeModelLM(nn.Module):
         )
 
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
+        for name, loaded_weight in prepare_llada2_language_weights(
+            weights, num_experts=self.config.num_experts
+        ):
             if (
                 ("v_head" in name)
                 or ("inv_freq" in name)

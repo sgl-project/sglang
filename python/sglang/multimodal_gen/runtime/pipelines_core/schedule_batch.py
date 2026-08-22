@@ -130,6 +130,7 @@ class Req:
 
     # Latent tensors
     latents: torch.Tensor | None = None
+    source_latents: list[torch.Tensor] | None = None
     y: torch.Tensor | None = None
     # Flux-2
     latent_ids: torch.Tensor | None = None

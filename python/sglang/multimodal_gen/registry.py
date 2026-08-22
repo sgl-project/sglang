@@ -38,6 +38,7 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     HunyuanConfig,
     LingBotWorldCausalDMDConfig,
     LingBotWorldV2CausalDMDConfig,
+    LLaDAImagePipelineConfig,
     MiniMaxH3PipelineConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
@@ -151,6 +152,7 @@ from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
 from sglang.multimodal_gen.configs.sample.lingbot_world import (
     LingBotWorldSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.llada_image import LLaDAImageSamplingParams
 from sglang.multimodal_gen.configs.sample.longcat_image import (
     LongCatImageEditSamplingParams,
     LongCatImageEditTurboSamplingParams,
@@ -1065,7 +1067,18 @@ def _register_configs():
         hf_model_paths=["krea/Krea-2"],
         model_detectors=[lambda hf_id: "krea-2" in hf_id.lower()],
     )
+    # LLaDA-Image
+    register_configs(
+        sampling_param_cls=LLaDAImageSamplingParams,
+        pipeline_config_cls=LLaDAImagePipelineConfig,
+        hf_model_paths=["inclusionAI/LLaDA-Image"],
+        model_detectors=[
+            lambda hf_id: "lladaimagepipeline" in hf_id.lower()
+            or "llada-image" in hf_id.lower()
+        ],
+    )
     # Qwen-Image
+
     register_configs(
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,

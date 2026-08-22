@@ -30,6 +30,7 @@ import torch
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.schedulers.scheduling_utils import SchedulerMixin
 from diffusers.utils import BaseOutput
+from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.runtime.models.schedulers.base import BaseScheduler
 from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
@@ -38,6 +39,7 @@ from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+SP_STOCHASTIC_NOISE_KEY = "sp_stochastic_noise"
 
 
 @dataclass
@@ -90,6 +92,9 @@ class FlowMatchEulerDiscreteScheduler(
             Whether to use exponential sigmas for step sizes in the noise schedule during sampling.
         use_beta_sigmas (`bool`, defaults to False):
             Whether to use beta sigmas for step sizes in the noise schedule during sampling.
+        use_uniform_sigmas (`bool`, defaults to False):
+            Whether to use a uniform pre-shift sigma grid that excludes the terminal zero. The terminal zero is
+            appended after shifting.
         time_shift_type (`str`, defaults to "exponential"):
             The type of dynamic resolution-dependent timestep shifting to apply. Either "exponential" or "linear".
         stochastic_sampling (`bool`, defaults to False):
@@ -114,6 +119,7 @@ class FlowMatchEulerDiscreteScheduler(
         use_karras_sigmas: bool | None = False,
         use_exponential_sigmas: bool | None = False,
         use_beta_sigmas: bool | None = False,
+        use_uniform_sigmas: bool | None = False,
         time_shift_type: str = "exponential",
         stochastic_sampling: bool = False,
     ):
@@ -123,12 +129,14 @@ class FlowMatchEulerDiscreteScheduler(
                     self.config.use_beta_sigmas,
                     self.config.use_exponential_sigmas,
                     self.config.use_karras_sigmas,
+                    self.config.use_uniform_sigmas,
                 ]
             )
             > 1
         ):
             raise ValueError(
-                "Only one of `config.use_beta_sigmas`, `config.use_exponential_sigmas`, `config.use_karras_sigmas` can be used."
+                "Only one of `config.use_beta_sigmas`, `config.use_exponential_sigmas`, "
+                "`config.use_karras_sigmas`, `config.use_uniform_sigmas` can be used."
             )
         if time_shift_type not in {"exponential", "linear"}:
             raise ValueError(
@@ -339,13 +347,18 @@ class FlowMatchEulerDiscreteScheduler(
 
         sigmas_array: np.ndarray
         if sigmas is None:
-            if timesteps_array is None:
-                timesteps_array = np.linspace(
-                    self._sigma_to_t(self.sigma_max),
-                    self._sigma_to_t(self.sigma_min),
-                    num_inference_steps,
-                )
-            sigmas_array = timesteps_array / self.config.num_train_timesteps
+            if timesteps_array is None and self.config.use_uniform_sigmas:
+                sigmas_array = np.linspace(
+                    1.0, 0.0, num_inference_steps + 1, dtype=np.float32
+                )[:-1]
+            else:
+                if timesteps_array is None:
+                    timesteps_array = np.linspace(
+                        self._sigma_to_t(self.sigma_max),
+                        self._sigma_to_t(self.sigma_min),
+                        num_inference_steps,
+                    )
+                sigmas_array = timesteps_array / self.config.num_train_timesteps
         else:
             sigmas_array = np.array(sigmas).astype(np.float32)
             num_inference_steps = len(sigmas_array)
@@ -443,6 +456,68 @@ class FlowMatchEulerDiscreteScheduler(
         else:
             self._step_index = self._begin_index
 
+    @staticmethod
+    def _draw_stochastic_noise(
+        sample: torch.Tensor,
+        generator: torch.Generator | list[torch.Generator] | None,
+        batch,
+    ) -> torch.Tensor:
+        batch_extra = getattr(batch, "extra", None)
+        metadata = batch_extra.get(SP_STOCHASTIC_NOISE_KEY) if batch_extra else None
+        if metadata is None:
+            return randn_tensor(
+                sample.shape,
+                generator=generator,
+                device=sample.device,
+                dtype=sample.dtype,
+            )
+
+        required_keys = {"full_shape", "dim", "start", "length"}
+        if not isinstance(metadata, dict) or not required_keys.issubset(metadata):
+            raise ValueError("Invalid SP stochastic noise metadata fields")
+        if not getattr(batch, "did_sp_shard_latents", False):
+            raise ValueError("Invalid SP stochastic noise metadata without sharding")
+
+        full_shape = metadata["full_shape"]
+        dim = metadata["dim"]
+        start = metadata["start"]
+        length = metadata["length"]
+        if (
+            not isinstance(full_shape, tuple)
+            or len(full_shape) != sample.ndim
+            or any(type(value) is not int or value <= 0 for value in full_shape)
+        ):
+            raise ValueError("Invalid SP stochastic noise metadata full shape")
+        if type(dim) is not int or dim < 1 or dim >= sample.ndim:
+            raise ValueError("Invalid SP stochastic noise metadata dimension")
+        if type(start) is not int or type(length) is not int:
+            raise ValueError("Invalid SP stochastic noise metadata slice")
+        if length != sample.shape[dim] or start < 0:
+            raise ValueError("Invalid SP stochastic noise metadata local slice")
+        if start + length > full_shape[dim]:
+            raise ValueError("Invalid SP stochastic noise metadata slice bounds")
+        raw_latent_shape = getattr(batch, "raw_latent_shape", None)
+        if raw_latent_shape is None or tuple(raw_latent_shape) != full_shape:
+            raise ValueError("Invalid SP stochastic noise metadata raw shape")
+
+        expected_local_shape = list(full_shape)
+        expected_local_shape[dim] = length
+        if tuple(expected_local_shape) != tuple(sample.shape):
+            raise ValueError("Invalid SP stochastic noise metadata sample shape")
+        if isinstance(generator, list) and len(generator) != full_shape[0]:
+            raise ValueError("Invalid SP stochastic noise metadata generator count")
+
+        full_noise = randn_tensor(
+            full_shape,
+            generator=generator,
+            device=sample.device,
+            dtype=sample.dtype,
+        )
+        noise = full_noise.narrow(dim, start, length).contiguous()
+        if noise.shape != sample.shape:
+            raise ValueError("Invalid SP stochastic noise metadata result shape")
+        return noise
+
     def step(
         self,
         model_output: torch.FloatTensor,
@@ -452,7 +527,7 @@ class FlowMatchEulerDiscreteScheduler(
         s_tmin: float = 0.0,
         s_tmax: float = float("inf"),
         s_noise: float = 1.0,
-        generator: torch.Generator | None = None,
+        generator: torch.Generator | list[torch.Generator] | None = None,
         per_token_timesteps: torch.Tensor | None = None,
         batch=None,
         return_dict: bool = True,
@@ -473,8 +548,8 @@ class FlowMatchEulerDiscreteScheduler(
             s_tmax  (`float`):
             s_noise (`float`, defaults to 1.0):
                 Scaling factor for noise added to the sample.
-            generator (`torch.Generator`, *optional*):
-                A random number generator.
+            generator (`torch.Generator` or `list[torch.Generator]`, *optional*):
+                A random number generator, or one generator per batch item.
             per_token_timesteps (`torch.Tensor`, *optional*):
                 The timesteps for each token in the sample.
             return_dict (`bool`):
@@ -533,12 +608,7 @@ class FlowMatchEulerDiscreteScheduler(
         else:
             if self.config.stochastic_sampling:
                 x0 = sample - current_sigma * model_output
-                noise = torch.randn(
-                    sample.shape,
-                    generator=generator,
-                    device=sample.device,
-                    dtype=sample.dtype,
-                )
+                noise = self._draw_stochastic_noise(sample, generator, batch)
                 prev_sample = (1.0 - next_sigma) * x0 + next_sigma * noise
             else:
                 prev_sample = sample + dt * model_output

@@ -902,6 +902,9 @@ class SamplingParams:
         sampling_params._adjust(server_args)
 
         sampling_params._validate_with_pipeline_config(server_args.pipeline_config)
+        server_args.pipeline_config.validate_request_sampling_params(
+            sampling_params, server_args
+        )
 
         return sampling_params
 

@@ -5,6 +5,7 @@ import base64
 import contextlib
 import os
 import time
+from types import SimpleNamespace
 from typing import Any, List, Optional
 
 from fastapi import (
@@ -48,6 +49,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+from sglang.multimodal_gen.runtime.utils.common import parse_size
 from sglang.srt.observability.trace import extract_trace_headers
 
 router = APIRouter(prefix="/v1/images", tags=["images"])
@@ -81,6 +83,50 @@ def _image_request_model_kwargs(
 def _runtime_sampling_quality(quality: str | None) -> str | None:
     """Keep OpenAI's automatic default out of SGLang's sampling contract."""
     return None if quality in (None, "auto") else quality
+
+
+def _validate_num_outputs_per_prompt(server_args, num_outputs_per_prompt: int) -> None:
+    try:
+        server_args.pipeline_config.validate_num_outputs_per_prompt(
+            num_outputs_per_prompt, server_args
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+def _build_sampling_params_or_400(request_id: str, **kwargs):
+    try:
+        return build_sampling_params(request_id, **kwargs)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+def _early_validate_edit_bounds(
+    server_args, size: Optional[str], num_outputs_per_prompt: int = 1
+) -> None:
+    """Best-effort size rejection before any source image is handled."""
+    if not size:
+        return
+    width, height = parse_size(size)
+    if not width or not height:
+        return
+    lightweight = SimpleNamespace(
+        width=width,
+        height=height,
+        max_sequence_length=None,
+        num_outputs_per_prompt=num_outputs_per_prompt,
+        diffusers_kwargs=None,
+        enable_cache_dit=None,
+        cache_dit_params=None,
+        attention_backend_override=None,
+        cfg_gate_step=None,
+    )
+    try:
+        server_args.pipeline_config.validate_request_sampling_params(
+            lightweight, server_args
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
 
 def _read_b64_for_paths(paths: list[str]) -> list[str]:
@@ -266,6 +312,8 @@ async def generations(
 ):
     request_id = generate_request_id()
     server_args = get_global_server_args()
+    num_outputs_per_prompt = max(1, min(int(request.n or 1), 10))
+    _validate_num_outputs_per_prompt(server_args, num_outputs_per_prompt)
     sampling_params_cls = resolve_sampling_params_cls(server_args)
     model_kwargs = _image_request_model_kwargs(request, sampling_params_cls)
     output_format = (
@@ -276,13 +324,13 @@ async def generations(
     ext = choose_output_image_ext(output_format, request.background)
 
     with temp_dir_if_disabled(server_args.output_path) as output_dir:
-        sampling = build_sampling_params(
+        sampling = _build_sampling_params_or_400(
             request_id,
             prompt=request.prompt,
             size=request.size,
             width=request.width,
             height=request.height,
-            num_outputs_per_prompt=max(1, min(int(request.n or 1), 10)),
+            num_outputs_per_prompt=num_outputs_per_prompt,
             output_file_name=f"{request_id}.{ext}",
             output_path=output_dir,
             num_frames=1,
@@ -437,7 +485,17 @@ async def edits(
             status_code=422, detail="Field 'image' or 'url' is required"
         )
 
+    num_outputs_per_prompt = max(1, min(int(n or 1), 10))
+    _validate_num_outputs_per_prompt(server_args, num_outputs_per_prompt)
+    _early_validate_edit_bounds(server_args, size, num_outputs_per_prompt)
+
     image_list = merge_image_input_list(images, urls)
+    try:
+        server_args.pipeline_config.validate_edit_source_count(
+            len(image_list), server_args
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
     with contextlib.ExitStack() as stack:
         uploads_dir = stack.enter_context(
@@ -462,11 +520,11 @@ async def edits(
             )
 
         ext = choose_output_image_ext(output_format, background)
-        sampling = build_sampling_params(
+        sampling = _build_sampling_params_or_400(
             request_id,
             prompt=prompt,
             size=size,
-            num_outputs_per_prompt=max(1, min(int(n or 1), 10)),
+            num_outputs_per_prompt=num_outputs_per_prompt,
             output_file_name=f"{request_id}.{ext}",
             output_path=output_dir,
             image_path=input_paths,

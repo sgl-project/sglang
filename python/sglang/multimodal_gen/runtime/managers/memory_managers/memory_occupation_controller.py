@@ -188,6 +188,14 @@ class MemoryOccupationController:
                 success=False,
                 message="pipeline not initialized",
             )
+        if not self.pipeline.server_args.pipeline_config.supports_memory_release():
+            return self._memory_occupation_result(
+                success=False,
+                message=(
+                    "pipeline holds components outside generic module "
+                    "discovery and does not support memory release"
+                ),
+            )
 
         self._sleep_restore_map = self._offload_active_modules_to_cpu()
         self._sleeping = True
