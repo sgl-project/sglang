@@ -261,6 +261,14 @@ class MMDoubleStreamBlock(nn.Module):
             )
         img_q = img_q.contiguous()
         img_k = img_k.contiguous()
+        # is_neox=False here, so this can hit the NPU _apply_rotary_emb_complex
+        # fast path in RotaryEmbedding instead of the interleaved fallback
+        # (no fused NPU kernel for it). vis_freqs_cis is already validated
+        # 2D above; split back the halves cat([cos, sin], dim=-1) built it from.
+        vis_cos, vis_sin = vis_freqs_cis.chunk(2, dim=-1)
+        vis_complex_freqs = torch.complex(
+            vis_cos.to(torch.float32), vis_sin.to(torch.float32)
+        )
         img_q, img_k = apply_qk_norm_with_optional_rope(
             q=img_q,
             k=img_k,
@@ -268,6 +276,7 @@ class MMDoubleStreamBlock(nn.Module):
             k_norm=self.img_attn_k_norm,
             head_dim=img_q.shape[-1],
             cos_sin_cache=vis_freqs_cis,
+            freqs_complex=vis_complex_freqs,
             is_neox=False,
             allow_inplace=True,
         )
@@ -288,6 +297,12 @@ class MMDoubleStreamBlock(nn.Module):
             raise ValueError("txt_freqs_cis must be a 2D cos_sin_cache tensor")
         txt_q = txt_q.contiguous()
         txt_k = txt_k.contiguous()
+        txt_complex_freqs = None
+        if txt_freqs_cis is not None:
+            txt_cos, txt_sin = txt_freqs_cis.chunk(2, dim=-1)
+            txt_complex_freqs = torch.complex(
+                txt_cos.to(torch.float32), txt_sin.to(torch.float32)
+            )
         txt_q, txt_k = apply_qk_norm_with_optional_rope(
             q=txt_q,
             k=txt_k,
@@ -295,6 +310,7 @@ class MMDoubleStreamBlock(nn.Module):
             k_norm=self.txt_attn_k_norm,
             head_dim=txt_q.shape[-1],
             cos_sin_cache=txt_freqs_cis,
+            freqs_complex=txt_complex_freqs,
             is_neox=False,
             allow_inplace=True,
         )

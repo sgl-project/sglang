@@ -35,7 +35,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    _apply_rotary_emb_complex,
+    RotaryEmbedding,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -130,6 +130,13 @@ class SelfAttention(nn.Module):
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
 
+        self.rotary_emb = RotaryEmbedding(
+            head_size=self.head_dim,
+            rotary_dim=self.head_dim,
+            use_precomputed_cache=False,
+            is_neox_style=False,
+        )
+
         self.attn = USPAttention(
             # Local heads per TP rank.
             num_heads=self.num_heads_per_rank,
@@ -172,14 +179,17 @@ class SelfAttention(nn.Module):
         v = v.view(b, s, self.num_heads_per_rank, self.head_dim)
 
         # Apply RoPE
-        q = _apply_rotary_emb_complex(q, freqs)
-        k = _apply_rotary_emb_complex(k, freqs)
+        q, k = self.rotary_emb(
+            query=q,
+            key=k,
+            complex_freqs=freqs,
+        )
 
         # USPAttention expects [B, S_local, H, D] format
         # USPAttention handles SP communication internally; the tail meta keeps
         # SP padding out of the softmax.
         out = self.attn(q, k, v, attn_mask_meta=attn_mask_meta)
-        out = out.view(b, s, -1)
+        out = out.reshape(b, s, -1)
 
         out, _ = self.o(out)
         return out
