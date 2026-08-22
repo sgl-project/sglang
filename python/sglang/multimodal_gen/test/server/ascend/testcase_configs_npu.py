@@ -203,7 +203,7 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
             },
         ),
         run_perf_check=True,
-        run_consistency_check=False,
+        run_consistency_check=True,
         run_component_accuracy_check=False,
         run_models_api_check=False,
         run_t2v_input_reference_check=False,
