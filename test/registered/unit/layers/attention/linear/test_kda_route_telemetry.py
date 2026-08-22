@@ -690,7 +690,7 @@ class TestKDATerminalRouteTelemetry(unittest.TestCase):
         self.assertEqual([event.layer_id for event in events], [1, 2, 3, 1, 2, 3])
         self.assertEqual([event.graph_phase for event in events[3:]], ["replay"] * 3)
 
-    def test_live_replay_plan_mismatch_fails_closed(self):
+    def test_live_replay_route_may_change_with_request_shape(self):
         telemetry = _recorder()
         plans = KDACudaGraphRoutePlans()
         shape_key = ShapeKey(size=12)
@@ -717,11 +717,40 @@ class TestKDATerminalRouteTelemetry(unittest.TestCase):
                 telemetry=telemetry,
             )
 
-        with self.assertRaisesRegex(KDACudaGraphPlanError, "route changed"):
+        replay_kda_route_plan(
+            shape_key,
+            "decode",
+            changed_route,
+            telemetry=telemetry,
+            plans=plans,
+        )
+        replay_events = telemetry.raw_events_snapshot()[1:]
+        self.assertEqual(len(replay_events), 1)
+        self.assertEqual(replay_events[0].reason, CakePackedDecodeReason.INNER_STRIDE)
+        self.assertEqual(replay_events[0].triton_fallback, 1)
+
+    def test_live_replay_layer_order_mismatch_fails_closed(self):
+        telemetry = _recorder()
+        plans = KDACudaGraphRoutePlans()
+        shape_key = ShapeKey(size=13)
+        with capture_kda_route_plan(
+            shape_key,
+            "decode",
+            capture_probe=lambda: True,
+            physical_capture_probe=lambda: False,
+            telemetry=telemetry,
+            plans=plans,
+        ):
+            _success(telemetry, layer_id=3)
+
+        def changed_layer():
+            return _success(telemetry, layer_id=4)
+
+        with self.assertRaisesRegex(KDACudaGraphPlanError, "layer order changed"):
             replay_kda_route_plan(
                 shape_key,
                 "decode",
-                changed_route,
+                changed_layer,
                 telemetry=telemetry,
                 plans=plans,
             )

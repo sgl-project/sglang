@@ -9,8 +9,10 @@ CUDA graph capture needs special handling because a route can belong either to
 a physically captured graph segment or to live Python in a breakable/piecewise
 replay seam.  Graph runners therefore wrap ``backend.capture_one`` in
 :func:`capture_kda_route_plan`.  Backend warmups are ignored; only the backend's
-actual capture pass enters an immutable per-``ShapeKey`` plan, with replay
-ownership recorded for every route.  A successful capture emits the capture
+actual capture pass enters an immutable per-``ShapeKey`` ownership plan.  A
+physically captured route keeps its capture-time outcome; a live-Python route
+may select a different terminal outcome from the current request shape while
+retaining the captured layer order.  A successful capture emits the capture
 events once.  :func:`replay_kda_route_plan` stages live-Python events, merges
 them with synthesized captured-segment events, and commits only after the whole
 backend replay returns.  A later segment or bridge exception therefore
@@ -770,10 +772,11 @@ def _merge_successful_replay(
             continue
         actual = live_records[live_index]
         live_index += 1
-        if actual.for_phase("capture") != entry.event:
+        if actual.layer_id != entry.event.layer_id:
             raise KDACudaGraphPlanError(
-                "KDA live replay route changed for immutable graph plan: "
-                f"expected={entry.event.to_json()}, actual={actual.to_json()}"
+                "KDA live replay layer order changed for immutable graph plan: "
+                f"expected_layer_id={entry.event.layer_id}, "
+                f"actual_layer_id={actual.layer_id}"
             )
         output.append(actual)
     return tuple(output)
