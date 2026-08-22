@@ -752,7 +752,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         req = items[0][1] if items else None
         if isinstance(req, list) and req:
             req = req[0]
-        if isinstance(req, Req):
+        # request_id is Optional; server warmup and bare server-test
+        # requests arrive without one.
+        if isinstance(req, Req) and req.request_id:
             return req.request_id[:8]
         return type(req).__name__
 

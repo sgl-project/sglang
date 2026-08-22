@@ -525,7 +525,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             for metrics in output_metrics:
                 metrics.total_duration_ms = duration_ms
 
-            with maybe_record_function(f"SAVE_OUTPUTS {req.request_id[:8]}"):
+            req_label = req.request_id[:8] if req.request_id else "unnamed"
+            with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):
                 self._materialize_output_transport(output_batch, req, save_output_paths)
             self._record_output_peak_memory(output_batch)
 
