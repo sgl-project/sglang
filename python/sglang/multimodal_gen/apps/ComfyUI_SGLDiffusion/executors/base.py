@@ -32,7 +32,9 @@ class SGLDiffusionExecutor(torch.nn.Module):
             raise TypeError(f"{type(self).__name__} must set adapter_cls")
         self.adapter = self.adapter_cls()
         self.session_id = uuid.uuid4().hex
+        self._run_id = 0
         self._conditioning_sent = False
+        self._last_spatial = None
 
     @staticmethod
     def should_suppress_logs(timestep):
@@ -51,13 +53,34 @@ class SGLDiffusionExecutor(torch.nn.Module):
                 target=target,
             )
 
+    def _begin_run_if_needed(self, timestep, kwargs, spatial=None) -> None:
+        opts = kwargs.get("transformer_options") or {}
+        sigmas = opts.get("sample_sigmas")
+        if sigmas is None:
+            is_first = not self._conditioning_sent
+        else:
+            if torch.is_tensor(timestep):
+                sigma = float(timestep.reshape(-1)[0].item())
+            else:
+                sigma = float(timestep)
+            if sigma > 2.0:
+                sigma = sigma / 1000.0
+            first = float(sigmas.reshape(-1)[0].item() if torch.is_tensor(sigmas) else sigmas[0])
+            is_first = abs(sigma - first) < 1e-4
+        size_changed = spatial is not None and spatial != getattr(
+            self, "_last_spatial", None
+        )
+        if is_first or size_changed:
+            self._run_id += 1
+            self._conditioning_sent = False
+        if spatial is not None:
+            self._last_spatial = spatial
+
     def forward(self, x, timestep, context, **kwargs):
+        self._begin_run_if_needed(timestep, kwargs)
         packed = self.adapter.pack(x, timestep, context, **kwargs)
         if self._conditioning_sent:
-            packed.prompt_embeds = []
-            packed.prompt_seq_lens = None
-            packed.pooled_embeds = None
-            packed.extra_req.pop("image_latent", None)
+            self.adapter.drop_cached_fields(packed)
         else:
             self._conditioning_sent = True
         sampling_params = SamplingParams.from_user_sampling_params_args(
@@ -78,7 +101,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
         )
         self.adapter.fill_req(req, packed)
         extra = dict(req.extra or {})
-        extra["comfyui_session_id"] = self.session_id
+        extra["comfyui_session_id"] = f"{self.session_id}:{self._run_id}"
         req.extra = extra
         req.generator = [
             torch.Generator("cuda") for _ in range(req.num_outputs_per_prompt)

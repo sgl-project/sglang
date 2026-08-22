@@ -615,7 +615,11 @@ class MiniMaxH3Attention(nn.Module):
         # The reorder below translates the *safetensors* checkpoint layout. A
         # GGUF checkpoint already stores qkv as [q_all, k_all, v_all], and its
         # packed parameter is `qweight`, so there is nothing to reorder.
-        if quant_config is None or quant_config.get_name() != "gguf":
+        skip_grouped_reorder = not getattr(arch, "qkv_checkpoint_grouped", True)
+        if (
+            not skip_grouped_reorder
+            and (quant_config is None or quant_config.get_name() != "gguf")
+        ):
             self._install_qkv_weight_loader(arch)
         self.q_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         self.k_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
