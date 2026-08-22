@@ -142,19 +142,6 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                     for i in range(self.layer_num)
                 ]
 
-            # k_data_ptrs/v_data_ptrs for host pool paths (e.g. MTP in
-            # MHATokenToKVPoolHost.__init__); parent's _init_data_ptrs_and_strides is skipped.
-            self.k_data_ptrs = torch.tensor(
-                [x.data_ptr() for x in self.k_buffer],
-                dtype=torch.uint64,
-                device=self.device,
-            )
-            self.v_data_ptrs = torch.tensor(
-                [x.data_ptr() for x in self.v_buffer],
-                dtype=torch.uint64,
-                device=self.device,
-            )
-
     def _init_kv_copy_and_warmup(self):
         # implementation relies on self.data_strides / self.data_ptrs, which the
         # NPU paged buffer layout never builds.
