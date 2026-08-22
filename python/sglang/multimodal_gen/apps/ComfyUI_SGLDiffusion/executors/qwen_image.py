@@ -13,10 +13,12 @@ class QwenImageAdapter(ComfyUIModelAdapter):
 
     def pack(self, x, timestep, context, **kwargs) -> PackedForward:
         latents, orig_shape = self._pack_latents(x)
+        seq = int(context.shape[-2]) if context.ndim >= 2 else int(context.shape[0])
         return PackedForward(
             latents=latents,
             timesteps=timestep * 1000.0,
             prompt_embeds=[context],
+            prompt_seq_lens=[[seq]],
             height=orig_shape[-2] * 8,
             width=orig_shape[-1] * 8,
             unpack_ctx={"num_embeds": latents.shape[1], "orig_shape": orig_shape, "x": x},
