@@ -145,6 +145,24 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
             "I|Q|D",
         )
 
+    def test_helper_render_jinja_chat_template_roles(self):
+        """Verify that messages use 'query' and 'document' roles (not 'user')."""
+        try:
+            import jinja2  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest("jinja2 is not installed")
+
+        # Template that selects by role (like the official Qwen3-Reranker template)
+        tpl = (
+            "{{ messages | selectattr('role', 'eq', 'query') | map(attribute='content') | first }}"
+            "|"
+            "{{ messages | selectattr('role', 'eq', 'document') | map(attribute='content') | first }}"
+        )
+        self.assertEqual(
+            _render_jinja_chat_template(tpl, query="my_query", document="my_doc", instruct=None),
+            "my_query|my_doc",
+        )
+
     def test_handle_non_streaming_request_qwen3_path_uses_score_prompts(self):
         class _TM(_DummyTokenizerManager):
             def __init__(self):
