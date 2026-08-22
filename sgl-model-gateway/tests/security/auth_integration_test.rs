@@ -32,6 +32,8 @@ struct TestKeyPair {
 
 impl TestKeyPair {
     fn generate() -> Self {
+        smg::crypto::ensure_crypto_provider_installed();
+
         // Generate a new 2048-bit RSA key pair for testing
         use rsa::{pkcs8::EncodePrivateKey, rand_core::OsRng};
 

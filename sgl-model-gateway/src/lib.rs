@@ -2,6 +2,7 @@ pub mod app_context;
 pub use smg_auth as auth;
 pub mod config;
 pub mod core;
+pub mod crypto;
 pub mod middleware;
 pub mod observability;
 pub mod policies;

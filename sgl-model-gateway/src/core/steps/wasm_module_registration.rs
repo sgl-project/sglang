@@ -5,7 +5,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 use wasmtime::{component::Component, Config, Engine};
@@ -245,7 +244,7 @@ impl StepExecutor<WasmRegistrationWorkflowData> for CalculateHashStep {
                     message: format!("Failed to open file {}: {}", file_path, e),
                 })?;
 
-        let mut hasher = Sha256::new();
+        let mut hasher = crate::crypto::Sha256Hasher::new();
         let mut buffer = vec![0u8; 1024 * 1024]; // 1MB buffer
 
         loop {
@@ -265,7 +264,7 @@ impl StepExecutor<WasmRegistrationWorkflowData> for CalculateHashStep {
             hasher.update(&buffer[..bytes_read]);
         }
 
-        let hash: [u8; 32] = hasher.finalize().into();
+        let hash: [u8; 32] = hasher.finalize();
 
         // Clone path for logging before mutable borrow
         let path_for_log = file_path.clone();

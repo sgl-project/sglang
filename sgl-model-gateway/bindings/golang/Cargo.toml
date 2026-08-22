@@ -26,6 +26,7 @@ default-features = true
 [features]
 default = []
 vendored-openssl = ["sgl-model-gateway/vendored-openssl"]
+fips = ["sgl-model-gateway/fips"]
 
 [profile.release]
 opt-level = "z"     # Optimize for size
