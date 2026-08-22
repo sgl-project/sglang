@@ -13,14 +13,20 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.kimik3_format import (
+    ALL_MARKERS,
+    CALL_OPEN,
     MESSAGE_CLOSE,
     RESPONSE_CLOSE,
     RESPONSE_OPEN,
+    THINK_CLOSE,
+    THINK_OPEN,
     TOOLS_CLOSE,
     TOOLS_OPEN,
+    _SpanTracker,
     partial_suffix_len,
     strip_partial_marker_suffix,
     strip_response_wrappers,
+    strip_response_wrappers_in_place,
 )
 from sglang.srt.function_call.kimik3_structural_tag import (
     get_kimik3_auto_tool_call_structural_tag,
@@ -40,6 +46,23 @@ _ARG_RE = re.compile(
     re.DOTALL,
 )
 _ATTR_RE = re.compile(r'(?P<k>\w+)="(?P<v>[^"]*)"')
+_CHANNEL_MARKER_RE = re.compile(
+    r"<\|(?:open|close)\|>(?:think|response|tools|message|call|argument)"
+    # A cut attribute list has no closing quote, so allow the last pair to run
+    # to the end of the text rather than leaving ``tool="rea`` behind.
+    r'(?:\s+\w+="[^"]*")*(?:\s+\w+(?:="[^"]*)?$|<\|sep\|>)?'
+)
+_SPECIAL_TOKEN_RE = re.compile(r"<\|(?:open|close|sep)\|>")
+# A think channel with its content, closed or cut off: reasoning is delivered in
+# its own field, never folded into the reply. The open marker is prefilled by the
+# template, so generation usually starts inside the channel and only closes it.
+_THINK_CHANNEL_RE = re.compile(
+    re.escape(THINK_OPEN) + r".*?(?:" + re.escape(THINK_CLOSE) + r"|$)",
+    re.DOTALL,
+)
+# ``CALL_OPEN`` carries attributes instead of an immediate separator, so require
+# one to avoid truncating a reply that merely quotes the token.
+_CALL_OPEN_RE = re.compile(re.escape(CALL_OPEN) + r"(?=\s|<\|sep\|>)")
 
 
 def _unescape_attr(value: str) -> str:
@@ -48,6 +71,60 @@ def _unescape_attr(value: str) -> str:
 
 def _parse_attrs(attrs: str) -> dict:
     return {m["k"]: _unescape_attr(m["v"]) for m in _ATTR_RE.finditer(attrs)}
+
+
+def _strip_template_markers(text: str) -> str:
+    return _strip_template_markers_spans(text)[0]
+
+
+def _strip_template_markers_spans(text: str) -> tuple[str, list[tuple[int, int]]]:
+    tracker = _SpanTracker(text)
+    _strip_template_markers_in_place(tracker)
+    return tracker.result(collapse_blank=True)
+
+
+def _strip_template_markers_in_place(tracker: _SpanTracker) -> None:
+    text = tracker.text
+    # Cut markers first: their surviving half looks like plain text to the
+    # regexes below. Two characters minimum keeps a reply ending in ``<``.
+    holdback = partial_suffix_len(text, ALL_MARKERS, min_len=2)
+    if holdback:
+        tracker.delete_suffix(len(text) - holdback)
+    tracker.delete_regex_matches(_CHANNEL_MARKER_RE)
+    tracker.delete_regex_matches(_SPECIAL_TOKEN_RE)
+
+
+def _strip_template_artifacts(text: str, reasoning_separated: bool = False) -> str:
+    return _strip_template_artifacts_spans(text, reasoning_separated)[0]
+
+
+def _strip_template_artifacts_spans(
+    text: str, reasoning_separated: bool = False
+) -> tuple[str, list[tuple[int, int]]]:
+    tracker = _SpanTracker(text)
+    # An unparsed tool channel: everything from it on is call syntax, not a reply.
+    call_match = _CALL_OPEN_RE.search(text)
+    tool_starts = [
+        i
+        for i in (
+            text.find(TOOLS_OPEN),
+            -1 if call_match is None else call_match.start(),
+        )
+        if i != -1
+    ]
+    if tool_starts:
+        tracker.truncate_at(min(tool_starts))
+    if reasoning_separated:
+        tracker.delete_regex_matches(_THINK_CHANNEL_RE)
+        # A close without its prefilled open leaves the whole trace ahead of it.
+        close_idx = tracker.text.find(THINK_CLOSE)
+        if close_idx != -1:
+            tracker.delete_prefix(close_idx + len(THINK_CLOSE))
+        # Only safe once the trace is gone: otherwise this drops it along with
+        # the wrappers, even though the caller wanted it inline.
+        strip_response_wrappers_in_place(tracker)
+    _strip_template_markers_in_place(tracker)
+    return tracker.result(collapse_blank=True)
 
 
 class KimiK3Detector(BaseFormatDetector):
@@ -78,6 +155,22 @@ class KimiK3Detector(BaseFormatDetector):
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
+
+    def strip_template_artifacts(
+        self, text: str, reasoning_separated: bool = False
+    ) -> str:
+        """Drop channel syntax the tool-call parser left in client-bound text."""
+        return _strip_template_artifacts(text, reasoning_separated=reasoning_separated)
+
+    def strip_template_artifacts_spans(
+        self, text: str, reasoning_separated: bool = False
+    ) -> tuple[str, list[tuple[int, int]]]:
+        return _strip_template_artifacts_spans(
+            text, reasoning_separated=reasoning_separated
+        )
+
+    def strip_template_markers(self, text: str) -> str:
+        return _strip_template_markers(text)
 
     def supports_structural_tag(self) -> bool:
         return True
