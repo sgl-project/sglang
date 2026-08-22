@@ -1504,6 +1504,16 @@ export const Deployment = ({ config, benchmarks }) => {
             ring_degree: resourcesFollowPlatformDefault
               ? (nextRecipe?.ring_degree ?? 1)
               : next.ring_degree,
+            // Placement and encoder are per-hardware recipe facts just like
+            // the resource shape: keeping the previous card's picks produces
+            // a command the new card cannot run (e.g. a resident 61.7 GB DiT
+            // on a single consumer GPU) shown as "unverified".
+            placement: resourcesFollowPlatformDefault
+              ? (nextRecipe?.placement || "auto")
+              : next.placement,
+            encoder: resourcesFollowPlatformDefault
+              ? (nextRecipe?.encoder || "auto")
+              : next.encoder,
           };
         }
         return reseatHiddenPicks(normalizeBuilderSelection(next));

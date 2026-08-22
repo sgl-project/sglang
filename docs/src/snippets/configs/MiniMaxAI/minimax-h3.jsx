@@ -23,6 +23,7 @@ function consumerFlags(s) {
   // rounding was already in every output, so the result is bit-identical --
   // and the decode drops from 60 s streamed to ~10 s.
   const flags = [
+    "--performance-mode memory",
     "--layerwise-offload-components dit,text_encoder,vae",
     "--layerwise-resident-layers video_vae=36",
   ];
@@ -210,9 +211,7 @@ return {
             return placement === "offload" ? [
                 "--performance-mode memory",
                 "--layerwise-offload-components dit,text_encoder,vae",
-                "--dit-offload-prefetch-size 1",
                 "--dit-layerwise-resident-layers 20",
-                "--enable-torch-compile false",
               ] : ["--performance-mode speed"];
           },
           hints: (s) => (CONSUMER_SINGLE.includes(s.hw) ? consumerHints(s) : []),
@@ -238,16 +237,18 @@ return {
         {
           id: "offload",
           label: "Layerwise offload",
-          flags: [
-            "--performance-mode memory",
-            "--layerwise-offload-components dit,text_encoder,vae",
-            "--dit-offload-prefetch-size 1",
-            "--dit-layerwise-resident-layers 20",
-            "--enable-torch-compile false",
-          ],
-          soft: (s) => s.hw !== "rtx5090",
-          softReason: "Tuned and verified on RTX 5090. It runs on the datacenter GPUs too, where a resident recipe is simply faster.",
-          recommendedWhen: (s) => s.hw === "rtx5090",
+          flags: (s) => {
+            if (CONSUMER_SINGLE.includes(s.hw)) return consumerFlags(s);
+            return [
+              "--performance-mode memory",
+              "--layerwise-offload-components dit,text_encoder,vae",
+              "--dit-layerwise-resident-layers 20",
+            ];
+          },
+          hints: (s) => (CONSUMER_SINGLE.includes(s.hw) ? consumerHints(s) : []),
+          soft: (s) => s.hw !== "rtx5090" && !CONSUMER_SINGLE.includes(s.hw),
+          softReason: "Tuned and verified on the consumer cards. It runs on the datacenter GPUs too, where a resident recipe is simply faster.",
+          recommendedWhen: (s) => s.hw === "rtx5090" || CONSUMER_SINGLE.includes(s.hw),
           description: "Capacity-first PCIe path. It is substantially slower than a resident datacenter recipe.",
         },
       ],
@@ -329,7 +330,7 @@ return {
         {
           id: "auto",
           label: "Auto",
-          flags: (s) => [`--encoder-parallel ${s.nodes > 1 ? "replicate" : "auto"}`],
+          flags: (s) => (s.nodes > 1 ? ["--encoder-parallel replicate"] : []),
           recommended: true,
           description: "Folds on verified single-host P2P systems and resolves to replicate across nodes.",
         },
@@ -467,7 +468,8 @@ return {
         { id: "mi355x-resident-2", hw: "mi355x", nodes: 1, gpus_per_node: 2, placement: "resident", tp_size: 1, ulysses_degree: 2, ring_degree: 1, encoder: "auto" },
         { id: "mi355x-resident-4", hw: "mi355x", nodes: 1, gpus_per_node: 4, placement: "resident", tp_size: 1, ulysses_degree: 4, ring_degree: 1, encoder: "auto" },
         { id: "mi355x-resident-8", hw: "mi355x", nodes: 1, gpus_per_node: 8, placement: "resident", tp_size: 1, ulysses_degree: 8, ring_degree: 1, encoder: "auto", default: true },
-        { id: "rtx5090-offload-2", hw: "rtx5090", nodes: 1, gpus_per_node: 2, placement: "offload", tp_size: 2, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
+        { id: "rtx5090-offload-1", hw: "rtx5090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
+        { id: "rtx5090-offload-2", hw: "rtx5090", nodes: 1, gpus_per_node: 2, placement: "offload", tp_size: 2, ulysses_degree: 1, ring_degree: 1, encoder: "auto" },
         { id: "rtx4090-offload-1", hw: "rtx4090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
         { id: "rtx4080-offload-1", hw: "rtx4080", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
         { id: "rtx4070-offload-1", hw: "rtx4070", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
@@ -584,10 +586,11 @@ return {
       topologyParts.push(Number(s.nodes) > 1 ? `${s.nodes} nodes` : "Single node");
 
       const world = Number(s.nodes) * Number(s.gpus_per_node);
-      const flags = ["--model-path {{MODEL_NAME}}", `--num-gpus ${world}`];
+      const flags = ["--model-path {{MODEL_NAME}}"];
+      if (world > 1) flags.push(`--num-gpus ${world}`);
       if (topology.ring_degree > 1) flags.push(`--sp-degree ${world}`);
       if (topology.tp_size > 1) flags.push(`--tp-size ${topology.tp_size}`);
-      flags.push(`--ulysses-degree ${topology.ulysses_degree}`);
+      if (topology.ulysses_degree > 1) flags.push(`--ulysses-degree ${topology.ulysses_degree}`);
       if (topology.ring_degree > 1) flags.push(`--ring-degree ${topology.ring_degree}`);
       flags.push("--host {{HOST_IP}}", "--port {{PORT}}");
 
@@ -598,7 +601,7 @@ return {
       if (resolvedPlacement === "fsdp") {
         warnings.push("FSDP lowers resident DiT memory but adds per-block parameter collectives; prefer Resident when the pipeline fits.");
       }
-      if (s.hw === "rtx5090") {
+      if (s.hw === "rtx5090" && Number(s.gpus_per_node) === 2) {
         warnings.push("The 2× RTX 5090 path requires a 384 GiB-class host and prioritizes capacity over latency.");
       }
 
