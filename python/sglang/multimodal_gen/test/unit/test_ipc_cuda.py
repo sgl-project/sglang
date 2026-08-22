@@ -8,6 +8,8 @@ import torch
 
 from sglang.multimodal_gen.runtime.ipc_cuda import (
     CudaIpcRef,
+    attach_cuda_tensors,
+    detach_cuda_tensors,
     materialize_cuda_refs,
     spill_cuda_tensors,
 )
@@ -55,6 +57,43 @@ def test_spill_does_not_mutate_caller_req_tensors() -> None:
     assert holder.prompt_embeds[0] is embeds[0]
 
     restored = materialize_cuda_refs(spilled)
+    assert torch.equal(restored.latents, latents)
+    assert torch.equal(restored.prompt_embeds[0], embeds[0])
+
+
+def test_detach_attach_keeps_non_cuda_fields() -> None:
+    _require_cuda()
+
+    @dataclass
+    class _Holder:
+        extra: dict
+        vae_image_sizes: list
+        image_embeds: list
+        latents: torch.Tensor
+        prompt_embeds: list
+
+    latents = torch.arange(24, device="cuda", dtype=torch.float32).reshape(2, 3, 4)
+    embeds = [torch.ones(2, 8, device="cuda", dtype=torch.float32)]
+    holder = _Holder(
+        extra={"comfyui_session_id": "run-1"},
+        vae_image_sizes=[(64, 48)],
+        image_embeds=[],
+        latents=latents,
+        prompt_embeds=embeds,
+    )
+
+    skeleton, tensors = detach_cuda_tensors(holder)
+    assert holder.latents is latents
+    assert skeleton.extra["comfyui_session_id"] == "run-1"
+    assert skeleton.vae_image_sizes == [(64, 48)]
+    assert skeleton.image_embeds == []
+    assert skeleton.latents is None
+
+    restored = attach_cuda_tensors(skeleton, tensors)
+    assert restored.extra["comfyui_session_id"] == "run-1"
+    assert restored.vae_image_sizes == [(64, 48)]
+    assert restored.image_embeds == []
+    assert restored.latents.device.type == "cuda"
     assert torch.equal(restored.latents, latents)
     assert torch.equal(restored.prompt_embeds[0], embeds[0])
 
