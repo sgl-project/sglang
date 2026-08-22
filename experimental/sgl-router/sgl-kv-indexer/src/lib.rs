@@ -7,6 +7,10 @@
 
 pub mod bridge;
 pub mod client;
+pub mod recovery;
+pub mod snapshot;
+pub mod status;
+mod stream;
 
 pub mod pb {
     tonic::include_proto!("kv_indexer.v1");
@@ -14,6 +18,7 @@ pub mod pb {
 
 mod admission;
 mod memory_backend;
+mod replay;
 mod service;
 mod shutdown;
 
@@ -23,12 +28,18 @@ pub use client::{
     PrefixMatch, PrefixOutcome, DEFAULT_QUERY_MAX_INFLIGHT,
 };
 pub use memory_backend::InMemoryKvIndexerBackend;
+pub use recovery::{run_recoverable_bridge_fleet_until, BridgeFleetConfig};
 pub use service::{
     component_bit, server_builder, BlockComponents, KvIndexerBackend, KvIndexerService,
     WorkerPrefixInput, COMPONENT_FULL, COMPONENT_MAMBA, COMPONENT_SWA,
     DEFAULT_PREFIX_QUERY_MAX_INFLIGHT, MAX_CONCURRENT_STREAMS, MAX_GRPC_DECODING_MESSAGE_SIZE,
 };
 pub use shutdown::shutdown_signal;
+pub use status::{
+    spawn_status_reporter, IndexerCandidate, IndexerStatusHandle, IndexerStatusRegistry,
+    IndexerStatusReport, StatusReportError, StatusReporterConfig, DEFAULT_STATUS_FRESHNESS,
+    DEFAULT_STATUS_INTERVAL,
+};
 /// Re-exported because [`PrefixIndexError::Rejected`] carries it, so callers can
 /// match on a rejection without depending on tonic.
 pub use tonic::Code as RpcCode;

@@ -110,7 +110,25 @@ impl CacheAwareZmqPolicy {
     /// Lowest-load worker — ties broken by stable iteration order (which
     /// is the order the registry returned, i.e. dashmap-undefined). For
     /// production traffic the ties are rare; tests pin the load skew.
-    fn pick_min_load(workers: &[Arc<Worker>]) -> Option<Arc<Worker>> {
+    fn pick_min_load(workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
+        if let Some(loads) = ctx.worker_loads() {
+            let fresh: Vec<_> = workers
+                .iter()
+                .filter_map(|worker| loads.fresh(&worker.url).map(|load| (worker, load)))
+                .collect();
+            // Never compare a remote load against an unknown one. A partial
+            // poll cycle falls back to Router-local active request counts.
+            if fresh.len() == workers.len() {
+                return fresh
+                    .into_iter()
+                    .min_by(|(_, left), (_, right)| {
+                        left.total_requests
+                            .cmp(&right.total_requests)
+                            .then_with(|| left.token_usage.total_cmp(&right.token_usage))
+                    })
+                    .map(|(worker, _)| Arc::clone(worker));
+            }
+        }
         workers
             .iter()
             .min_by_key(|w| w.active_load())
@@ -120,7 +138,22 @@ impl CacheAwareZmqPolicy {
     /// Detect load imbalance. Returns `true` when the spread between max
     /// and min load is large enough that cache-aware routing would dump
     /// even more on the hot worker.
-    fn is_imbalanced(&self, workers: &[Arc<Worker>]) -> bool {
+    fn is_imbalanced(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> bool {
+        if let Some(loads) = ctx.worker_loads() {
+            let remote: Vec<_> = workers
+                .iter()
+                .filter_map(|worker| loads.fresh(&worker.url))
+                .map(|load| load.total_requests)
+                .collect();
+            if remote.len() == workers.len() {
+                let min_load = remote.iter().copied().min().unwrap_or(0);
+                let max_load = remote.iter().copied().max().unwrap_or(0);
+                let abs_diff = max_load.saturating_sub(min_load);
+                let rel_threshold = (min_load as f32 * self.config.balance_rel_threshold) as u64;
+                return abs_diff > self.config.balance_abs_threshold as u64
+                    && max_load > rel_threshold;
+            }
+        }
         let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(mn, mx), w| {
             let l = w.active_load();
             (mn.min(l), mx.max(l))
@@ -145,10 +178,27 @@ impl CacheAwareZmqPolicy {
         }
 
         // The index may include unhealthy workers or workers in another pool.
-        let best_routable_blocks = matches
+        // When a Worker load registry is attached (the production external
+        // Indexer path), placement is eligible only if its generation matches
+        // a fresh load sample from that same Worker process.
+        let eligible: Vec<_> = matches
             .iter()
-            .filter(|m| workers.iter().any(|worker| worker.url == m.address))
-            .map(|m| m.matched_prefix_blocks)
+            .filter_map(|matched| {
+                let worker = workers
+                    .iter()
+                    .find(|worker| worker.url == matched.address)?;
+                let load = match ctx.worker_loads() {
+                    Some(loads) => {
+                        Some(loads.fresh_for_generation(&worker.url, &matched.worker_generation)?)
+                    }
+                    None => None,
+                };
+                Some((worker, matched, load))
+            })
+            .collect();
+        let best_routable_blocks = eligible
+            .iter()
+            .map(|(_, matched, _)| matched.matched_prefix_blocks)
             .max()
             .unwrap_or(0);
 
@@ -160,15 +210,21 @@ impl CacheAwareZmqPolicy {
             return None;
         }
 
-        workers
-            .iter()
-            .filter(|worker| {
-                matches.iter().any(|m| {
-                    m.matched_prefix_blocks == best_routable_blocks && m.address == worker.url
-                })
-            })
-            .min_by_key(|worker| worker.active_load())
-            .cloned()
+        eligible
+            .into_iter()
+            .filter(|(_, matched, _)| matched.matched_prefix_blocks == best_routable_blocks)
+            .min_by(
+                |(left_worker, _, left_load), (right_worker, _, right_load)| match (
+                    left_load, right_load,
+                ) {
+                    (Some(left), Some(right)) => left
+                        .total_requests
+                        .cmp(&right.total_requests)
+                        .then_with(|| left.token_usage.total_cmp(&right.token_usage)),
+                    _ => left_worker.active_load().cmp(&right_worker.active_load()),
+                },
+            )
+            .map(|(worker, _, _)| Arc::clone(worker))
     }
 }
 
@@ -180,8 +236,8 @@ impl Policy for CacheAwareZmqPolicy {
 
         // 1. Load-imbalance fast-path: even the best cache hit gets
         //    dropped in favour of evening out load.
-        if self.is_imbalanced(workers) {
-            return Self::pick_min_load(workers);
+        if self.is_imbalanced(workers, ctx) {
+            return Self::pick_min_load(workers, ctx);
         }
 
         // An external signal is authoritative: an empty/unusable result
@@ -189,7 +245,7 @@ impl Policy for CacheAwareZmqPolicy {
         if let Some(signal) = ctx.external_prefix() {
             return self
                 .select_external(workers, ctx, signal)
-                .or_else(|| Self::pick_min_load(workers));
+                .or_else(|| Self::pick_min_load(workers, ctx));
         }
 
         // 2. Routing tokens. Prefer the ids computed once at ingress; fall
@@ -202,13 +258,13 @@ impl Policy for CacheAwareZmqPolicy {
             _ => {
                 let body = match ctx.request_body() {
                     Some(b) if !b.is_empty() => b,
-                    _ => return Self::pick_min_load(workers),
+                    _ => return Self::pick_min_load(workers, ctx),
                 };
                 let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-                    return Self::pick_min_load(workers);
+                    return Self::pick_min_load(workers, ctx);
                 };
                 let Some(rt) = request_tokens_for(&self.tokenizers, ctx.model(), &value) else {
-                    return Self::pick_min_load(workers);
+                    return Self::pick_min_load(workers, ctx);
                 };
                 fallback_ids = rt.ids;
                 &fallback_ids
@@ -225,7 +281,7 @@ impl Policy for CacheAwareZmqPolicy {
                 model = %ctx.model(),
                 "cache-aware-zmq: block size unknown (no worker page_size yet), falling back to min-load",
             );
-            return Self::pick_min_load(workers);
+            return Self::pick_min_load(workers, ctx);
         };
         // EAGLE-family workers hash KV blocks over token bigrams; the query
         // hashes must match the worker's stored hashes or the tree lookup
@@ -238,7 +294,7 @@ impl Policy for CacheAwareZmqPolicy {
             compute_block_hashes(tokens, block_size as usize)
         };
         if block_hashes.is_empty() {
-            return Self::pick_min_load(workers);
+            return Self::pick_min_load(workers, ctx);
         }
         let matched = self.tree.match_prefix(None, &block_hashes);
         let match_rate = matched.matched_blocks as f32 / block_hashes.len() as f32;
@@ -266,17 +322,18 @@ impl Policy for CacheAwareZmqPolicy {
                 cache_threshold = self.config.cache_threshold,
                 "cache-aware-zmq: overlap below threshold, falling back to min-load",
             );
-            return Self::pick_min_load(workers);
+            return Self::pick_min_load(workers, ctx);
         }
         // Among workers in the matched set, pick the lowest-load one.
         let matched_urls: std::collections::HashSet<&str> =
             matched.workers.iter().map(|kw| kw.url.as_str()).collect();
-        let best_matched: Option<Arc<Worker>> = workers
+        let matched_workers: Vec<_> = workers
             .iter()
             .filter(|w| matched_urls.contains(w.url.as_str()))
-            .min_by_key(|w| w.active_load())
-            .map(Arc::clone);
-        let chosen = best_matched.or_else(|| Self::pick_min_load(workers));
+            .map(Arc::clone)
+            .collect();
+        let best_matched = Self::pick_min_load(&matched_workers, ctx);
+        let chosen = best_matched.or_else(|| Self::pick_min_load(workers, ctx));
         if let Some(w) = &chosen {
             tracing::debug!(
                 model = %ctx.model(),
@@ -305,6 +362,7 @@ mod tests {
     use crate::policies::kv_events::tree::KvWorkerId;
     use crate::policies::kv_events::HashTree;
     use crate::tokenizer::adapter;
+    use crate::worker_load::WorkerLoadRegistry;
 
     fn cfg_default() -> CacheAwareConfig {
         CacheAwareConfig {
@@ -413,6 +471,8 @@ mod tests {
         let w1 = worker("http://w1:30000", "tiny");
         let _load = w0.load_guard();
         let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let loads = WorkerLoadRegistry::default();
+        loads.update(&w0.url, "generation-w0", 1, 0.1);
         let signal = crate::policies::ExternalPrefixSignal {
             outcome: sgl_kv_indexer::PrefixOutcome::Matched {
                 matches: vec![
@@ -420,11 +480,15 @@ mod tests {
                         address: "http://gone:30000".into(),
                         matched_prefix_blocks: 4,
                         worker_id: "gone".into(),
+                        stream_id: None,
+                        worker_generation: "generation-gone".into(),
                     },
                     sgl_kv_indexer::PrefixMatch {
                         address: w0.url.clone(),
                         matched_prefix_blocks: 2,
                         worker_id: "w0".into(),
+                        stream_id: None,
+                        worker_generation: "generation-w0".into(),
                     },
                 ],
                 best_prefix_blocks: 4,
@@ -432,9 +496,58 @@ mod tests {
             query_blocks: 4,
         };
         let model = ModelId("tiny".into());
-        let ctx = SelectionContext::new(&model, None).with_external_prefix(Some(&signal));
+        let ctx = SelectionContext::new(&model, None)
+            .with_external_prefix(Some(&signal))
+            .with_worker_loads(Some(&loads));
         let chosen = policy.select(&workers, &ctx).expect("must pick");
         assert_eq!(chosen.url, w0.url);
+    }
+
+    #[test]
+    fn external_prefix_rejects_mismatched_load_generation() {
+        let mut config = cfg_default();
+        config.cache_threshold = 0.0;
+        let policy = CacheAwareZmqPolicy::new(
+            config,
+            Arc::new(HashTree::new()),
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let loads = WorkerLoadRegistry::default();
+        loads.update(&w0.url, "generation-old", 0, 0.0);
+        loads.update(&w1.url, "generation-w1", 10, 0.5);
+        let signal = crate::policies::ExternalPrefixSignal {
+            outcome: sgl_kv_indexer::PrefixOutcome::Matched {
+                matches: vec![
+                    sgl_kv_indexer::PrefixMatch {
+                        address: w0.url.clone(),
+                        matched_prefix_blocks: 4,
+                        worker_id: "w0".into(),
+                        stream_id: None,
+                        worker_generation: "generation-new".into(),
+                    },
+                    sgl_kv_indexer::PrefixMatch {
+                        address: w1.url.clone(),
+                        matched_prefix_blocks: 4,
+                        worker_id: "w1".into(),
+                        stream_id: None,
+                        worker_generation: "generation-w1".into(),
+                    },
+                ],
+                best_prefix_blocks: 4,
+            },
+            query_blocks: 4,
+        };
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None)
+            .with_external_prefix(Some(&signal))
+            .with_worker_loads(Some(&loads));
+
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(chosen.url, w1.url);
     }
 
     #[test]

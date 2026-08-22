@@ -184,7 +184,15 @@ pub async fn chat_completions(
             let outcome = if hashes.is_empty() {
                 sgl_kv_indexer::PrefixOutcome::Empty
             } else {
-                resolve_prefix_query(index.match_prefix(hashes).await, &model_str)?
+                resolve_prefix_query(
+                    index
+                        .match_prefix_for_workers(
+                            hashes,
+                            workers.iter().map(|worker| worker.url.clone()).collect(),
+                        )
+                        .await,
+                    &model_str,
+                )?
             };
             Some(ExternalPrefixSignal {
                 outcome,
@@ -212,7 +220,8 @@ pub async fn chat_completions(
         .filter(|s| !s.is_empty());
     let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
         .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()))
-        .with_external_prefix(external_prefix.as_ref());
+        .with_external_prefix(external_prefix.as_ref())
+        .with_worker_loads(Some(&ctx.worker_loads));
     let worker =
         policy
             .select(&workers, &selection_ctx)
@@ -663,7 +672,8 @@ fn resolve_prefix_query(
         Err(
             error @ (PrefixIndexError::Overloaded
             | PrefixIndexError::Timeout
-            | PrefixIndexError::Unreachable),
+            | PrefixIndexError::Unreachable
+            | PrefixIndexError::PartialCoverage),
         ) => {
             tracing::warn!(%model, error = %error, "KV Indexer unavailable; falling back to min-load routing");
             Ok(sgl_kv_indexer::PrefixOutcome::Empty)
@@ -987,6 +997,7 @@ mod tests {
             sgl_kv_indexer::PrefixIndexError::Overloaded,
             sgl_kv_indexer::PrefixIndexError::Timeout,
             sgl_kv_indexer::PrefixIndexError::Unreachable,
+            sgl_kv_indexer::PrefixIndexError::PartialCoverage,
             sgl_kv_indexer::PrefixIndexError::QueryTooLarge,
         ] {
             assert_eq!(

@@ -69,6 +69,7 @@ class TestShmRoundTrip(CustomTestCase):
             writer.write(
                 LoadSnapshot(
                     dp_rank=0,
+                    worker_generation="generation-1",
                     num_running_reqs=5,
                     timestamp=1.0,
                     num_active_tokens=4096,
@@ -80,6 +81,7 @@ class TestShmRoundTrip(CustomTestCase):
             load = reader.read(0)
             self.assertIsNotNone(load)
             self.assertEqual(load.num_running_reqs, 5)
+            self.assertEqual(load.worker_generation, "generation-1")
             self.assertEqual(load.timestamp, 1.0)
             self.assertEqual(load.num_active_tokens, 4096)
             # The cumulative total_* counters round-trip like any other

@@ -3,24 +3,32 @@
 
 use std::collections::HashMap;
 
-use tokio::sync::Semaphore;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
 use crate::admission::{reject_if_deadline_passed, RejectionLog};
 use crate::pb::kv_indexer_server::{KvIndexer, KvIndexerServer};
 use crate::pb::{
-    ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvAction,
-    ExternalKvActionType, ExternalKvPrefixMatch, GetExternalKvHitCountsRequest,
-    GetExternalKvHitCountsResponse, MatchExternalKvPrefixRequest, MatchExternalKvPrefixResponse,
-    MatchExternalKvRequest, MatchExternalKvResponse, TierType, WorkerCacheSpec,
+    AbortExternalKvSnapshotRequest, AbortExternalKvSnapshotResponse,
+    AppendExternalKvSnapshotRequest, AppendExternalKvSnapshotResponse, ApplyExternalKvBatchRequest,
+    ApplyExternalKvBatchResponse, BeginExternalKvSnapshotRequest, BeginExternalKvSnapshotResponse,
+    CommitExternalKvSnapshotRequest, CommitExternalKvSnapshotResponse,
+    ConfigureExpectedWorkersRequest, ConfigureExpectedWorkersResponse, ExternalKvAction,
+    ExternalKvActionType, ExternalKvPrefixMatch, ExternalKvSnapshotMetadata,
+    ExternalKvSnapshotPlacement, GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse,
+    InvalidateWorkerRequest, InvalidateWorkerResponse, MatchExternalKvPrefixRequest,
+    MatchExternalKvPrefixResponse, MatchExternalKvRequest, MatchExternalKvResponse,
+    ReplaceExternalKvSnapshotRequest, ReplaceExternalKvSnapshotResponse, StreamId, TierType,
+    WorkerCacheSpec,
 };
+use crate::status::IndexerStatusHandle;
 
 /// Protocol-level resource bounds, enforced before a backend sees the request so
 /// no caller can make it allocate work proportional to an unbounded field. The
 /// prefix query is exempt from the hash bound; see [`validate_hashes`].
 pub(crate) const MAX_HASHES_PER_REQUEST: usize = 16_384;
 pub(crate) const MAX_ACTIONS_PER_BATCH: usize = 256;
+pub(crate) const MAX_SNAPSHOT_PLACEMENTS: u64 = 10_000_000;
 pub const DEFAULT_PREFIX_QUERY_MAX_INFLIGHT: usize = 32;
 /// Maximum encoded gRPC request size accepted by the Indexer server. With
 /// packed `sfixed64` hashes this holds roughly one million blocks.
@@ -43,6 +51,69 @@ static OVERLOAD_LOG: RejectionLog = RejectionLog::new();
 /// dyn-safe so the server can hold it as `Arc<dyn KvIndexerBackend>`.
 #[tonic::async_trait]
 pub trait KvIndexerBackend: Send + Sync + 'static {
+    async fn configure_expected_workers(
+        &self,
+        _request: ConfigureExpectedWorkersRequest,
+    ) -> Result<ConfigureExpectedWorkersResponse, Status> {
+        Err(Status::unimplemented(
+            "backend does not support recoverable worker configuration",
+        ))
+    }
+
+    async fn replace_external_kv_snapshot(
+        &self,
+        _request: ReplaceExternalKvSnapshotRequest,
+    ) -> Result<ReplaceExternalKvSnapshotResponse, Status> {
+        Err(Status::unimplemented(
+            "backend does not support atomic worker snapshots",
+        ))
+    }
+
+    async fn begin_external_kv_snapshot(
+        &self,
+        _request: BeginExternalKvSnapshotRequest,
+    ) -> Result<BeginExternalKvSnapshotResponse, Status> {
+        Err(Status::unimplemented(
+            "backend does not support staged worker snapshots",
+        ))
+    }
+
+    async fn append_external_kv_snapshot(
+        &self,
+        _request: AppendExternalKvSnapshotRequest,
+    ) -> Result<AppendExternalKvSnapshotResponse, Status> {
+        Err(Status::unimplemented(
+            "backend does not support staged worker snapshots",
+        ))
+    }
+
+    async fn commit_external_kv_snapshot(
+        &self,
+        _request: CommitExternalKvSnapshotRequest,
+    ) -> Result<CommitExternalKvSnapshotResponse, Status> {
+        Err(Status::unimplemented(
+            "backend does not support staged worker snapshots",
+        ))
+    }
+
+    async fn abort_external_kv_snapshot(
+        &self,
+        _request: AbortExternalKvSnapshotRequest,
+    ) -> Result<(), Status> {
+        Err(Status::unimplemented(
+            "backend does not support staged worker snapshots",
+        ))
+    }
+
+    async fn invalidate_worker(
+        &self,
+        _request: InvalidateWorkerRequest,
+    ) -> Result<InvalidateWorkerResponse, Status> {
+        Err(Status::unimplemented(
+            "backend does not support worker invalidation",
+        ))
+    }
+
     /// Applies a whole SGLang KVEventBatch. The actions are pre-validated and
     /// must be applied in order. Applies are unconditional: the request `seq` is
     /// informational only and a redelivered batch is applied again.
@@ -108,6 +179,55 @@ pub trait KvIndexerBackend: Send + Sync + 'static {
 /// `Arc<dyn KvIndexerBackend>` and still satisfy `KvIndexerService<B>`.
 #[tonic::async_trait]
 impl KvIndexerBackend for std::sync::Arc<dyn KvIndexerBackend> {
+    async fn configure_expected_workers(
+        &self,
+        request: ConfigureExpectedWorkersRequest,
+    ) -> Result<ConfigureExpectedWorkersResponse, Status> {
+        (**self).configure_expected_workers(request).await
+    }
+
+    async fn replace_external_kv_snapshot(
+        &self,
+        request: ReplaceExternalKvSnapshotRequest,
+    ) -> Result<ReplaceExternalKvSnapshotResponse, Status> {
+        (**self).replace_external_kv_snapshot(request).await
+    }
+
+    async fn begin_external_kv_snapshot(
+        &self,
+        request: BeginExternalKvSnapshotRequest,
+    ) -> Result<BeginExternalKvSnapshotResponse, Status> {
+        (**self).begin_external_kv_snapshot(request).await
+    }
+
+    async fn append_external_kv_snapshot(
+        &self,
+        request: AppendExternalKvSnapshotRequest,
+    ) -> Result<AppendExternalKvSnapshotResponse, Status> {
+        (**self).append_external_kv_snapshot(request).await
+    }
+
+    async fn commit_external_kv_snapshot(
+        &self,
+        request: CommitExternalKvSnapshotRequest,
+    ) -> Result<CommitExternalKvSnapshotResponse, Status> {
+        (**self).commit_external_kv_snapshot(request).await
+    }
+
+    async fn abort_external_kv_snapshot(
+        &self,
+        request: AbortExternalKvSnapshotRequest,
+    ) -> Result<(), Status> {
+        (**self).abort_external_kv_snapshot(request).await
+    }
+
+    async fn invalidate_worker(
+        &self,
+        request: InvalidateWorkerRequest,
+    ) -> Result<InvalidateWorkerResponse, Status> {
+        (**self).invalidate_worker(request).await
+    }
+
     async fn apply_external_kv_batch(
         &self,
         request: ApplyExternalKvBatchRequest,
@@ -147,7 +267,7 @@ impl KvIndexerBackend for std::sync::Arc<dyn KvIndexerBackend> {
 #[derive(Debug)]
 pub struct KvIndexerService<B> {
     backend: B,
-    prefix_query_semaphore: Semaphore,
+    status: std::sync::Arc<IndexerStatusHandle>,
 }
 
 impl<B> KvIndexerService<B>
@@ -159,14 +279,12 @@ where
     }
 
     pub fn with_prefix_query_max_inflight(backend: B, max_inflight: usize) -> Self {
-        assert!(
-            max_inflight > 0,
-            "prefix query max inflight must be greater than zero"
-        );
-        Self {
-            backend,
-            prefix_query_semaphore: Semaphore::new(max_inflight),
-        }
+        let status = std::sync::Arc::new(IndexerStatusHandle::new(max_inflight));
+        Self::with_status(backend, status)
+    }
+
+    pub fn with_status(backend: B, status: std::sync::Arc<IndexerStatusHandle>) -> Self {
+        Self { backend, status }
     }
 
     /// Wraps the service in its generated server with the decoding limit a
@@ -190,6 +308,125 @@ impl<B> KvIndexer for KvIndexerService<B>
 where
     B: KvIndexerBackend,
 {
+    async fn configure_expected_workers(
+        &self,
+        request: Request<ConfigureExpectedWorkersRequest>,
+    ) -> Result<Response<ConfigureExpectedWorkersResponse>, Status> {
+        let request = request.into_inner();
+        let mut seen = std::collections::HashSet::new();
+        for worker in &request.workers {
+            let stream = validated_stream_tuple(worker.stream_id.as_ref(), &worker.worker_id)?;
+            if !seen.insert(stream) {
+                return Err(Status::invalid_argument("stream_id must be unique"));
+            }
+        }
+        Ok(Response::new(
+            self.backend.configure_expected_workers(request).await?,
+        ))
+    }
+
+    async fn replace_external_kv_snapshot(
+        &self,
+        request: Request<ReplaceExternalKvSnapshotRequest>,
+    ) -> Result<Response<ReplaceExternalKvSnapshotResponse>, Status> {
+        let request = request.into_inner();
+        validated_stream_tuple(request.stream_id.as_ref(), &request.worker_id)?;
+        if request.worker_epoch.is_empty() {
+            return Err(Status::invalid_argument("worker_epoch must not be empty"));
+        }
+        for tier in &request.hashes_by_tier {
+            validate_tier(tier.tier)?;
+            validate_hashes_bounded(&tier.hashes)?;
+            validate_aligned(
+                tier.component_masks.len(),
+                tier.hashes.len(),
+                "component_masks",
+            )?;
+            validate_aligned(tier.block_sizes.len(), tier.hashes.len(), "block_sizes")?;
+        }
+        Ok(Response::new(
+            self.backend.replace_external_kv_snapshot(request).await?,
+        ))
+    }
+
+    async fn begin_external_kv_snapshot(
+        &self,
+        request: Request<BeginExternalKvSnapshotRequest>,
+    ) -> Result<Response<BeginExternalKvSnapshotResponse>, Status> {
+        let request = request.into_inner();
+        validate_stream_id(request.stream_id.as_ref())?;
+        if request.worker_epoch.is_empty() || request.snapshot_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "worker_epoch and snapshot_id must not be empty",
+            ));
+        }
+        if request.expected_placements > MAX_SNAPSHOT_PLACEMENTS {
+            return Err(Status::resource_exhausted(
+                "snapshot placement count exceeds server limit",
+            ));
+        }
+        validate_snapshot_metadata(request.metadata.as_ref())?;
+        Ok(Response::new(
+            self.backend.begin_external_kv_snapshot(request).await?,
+        ))
+    }
+
+    async fn append_external_kv_snapshot(
+        &self,
+        request: Request<AppendExternalKvSnapshotRequest>,
+    ) -> Result<Response<AppendExternalKvSnapshotResponse>, Status> {
+        let request = request.into_inner();
+        validate_transaction_id(&request.transaction_id)?;
+        if request.placements.is_empty() {
+            return Err(Status::invalid_argument(
+                "snapshot append must contain placements",
+            ));
+        }
+        if request.placements.len() > MAX_HASHES_PER_REQUEST {
+            return Err(Status::resource_exhausted(
+                "snapshot append exceeds per-RPC placement limit",
+            ));
+        }
+        for placement in &request.placements {
+            validate_snapshot_placement(placement)?;
+        }
+        Ok(Response::new(
+            self.backend.append_external_kv_snapshot(request).await?,
+        ))
+    }
+
+    async fn commit_external_kv_snapshot(
+        &self,
+        request: Request<CommitExternalKvSnapshotRequest>,
+    ) -> Result<Response<CommitExternalKvSnapshotResponse>, Status> {
+        let request = request.into_inner();
+        validate_transaction_id(&request.transaction_id)?;
+        Ok(Response::new(
+            self.backend.commit_external_kv_snapshot(request).await?,
+        ))
+    }
+
+    async fn abort_external_kv_snapshot(
+        &self,
+        request: Request<AbortExternalKvSnapshotRequest>,
+    ) -> Result<Response<AbortExternalKvSnapshotResponse>, Status> {
+        let request = request.into_inner();
+        validate_transaction_id(&request.transaction_id)?;
+        self.backend.abort_external_kv_snapshot(request).await?;
+        Ok(Response::new(AbortExternalKvSnapshotResponse {}))
+    }
+
+    async fn invalidate_worker(
+        &self,
+        request: Request<InvalidateWorkerRequest>,
+    ) -> Result<Response<InvalidateWorkerResponse>, Status> {
+        let request = request.into_inner();
+        validated_stream_tuple(request.stream_id.as_ref(), &request.worker_id)?;
+        Ok(Response::new(
+            self.backend.invalidate_worker(request).await?,
+        ))
+    }
+
     async fn match_external_kv(
         &self,
         request: Request<MatchExternalKvRequest>,
@@ -209,8 +446,9 @@ where
         // of the backlog needs to drain.
         reject_if_deadline_passed(&metadata, &extensions)?;
         validate_hashes(&request.hashes)?;
+        validate_eligible_streams(&request)?;
         // Caps concurrent prefix queries; excess is rejected, never queued.
-        let _permit = self.prefix_query_semaphore.try_acquire().map_err(|_| {
+        let _permit = self.status.try_acquire_query().map_err(|_| {
             if let Some(rejected_total) = OVERLOAD_LOG.record() {
                 tracing::warn!(
                     rejected_total,
@@ -238,7 +476,7 @@ where
         request: Request<ApplyExternalKvBatchRequest>,
     ) -> Result<Response<ApplyExternalKvBatchResponse>, Status> {
         let request = request.into_inner();
-        validate_worker_id(&request.worker_id)?;
+        validated_stream_tuple(request.stream_id.as_ref(), &request.worker_id)?;
         validate_actions(&request.actions)?;
         let response = self.backend.apply_external_kv_batch(request).await?;
         Ok(Response::new(response))
@@ -248,6 +486,97 @@ where
 fn validate_worker_id(worker_id: &str) -> Result<(), Status> {
     if worker_id.is_empty() {
         return Err(Status::invalid_argument("worker_id must not be empty"));
+    }
+    Ok(())
+}
+
+fn validate_stream_id(stream: Option<&StreamId>) -> Result<(), Status> {
+    let stream = stream.ok_or_else(|| Status::invalid_argument("stream_id is required"))?;
+    validate_worker_id(&stream.worker_id)
+}
+
+fn validated_stream_tuple(
+    stream: Option<&StreamId>,
+    legacy_worker_id: &str,
+) -> Result<(String, String, u32), Status> {
+    match stream {
+        Some(stream) => {
+            validate_worker_id(&stream.worker_id)?;
+            if !legacy_worker_id.is_empty() && legacy_worker_id != stream.worker_id {
+                return Err(Status::invalid_argument(
+                    "worker_id and stream_id.worker_id must match",
+                ));
+            }
+            Ok((
+                stream.namespace.clone(),
+                stream.worker_id.clone(),
+                stream.dp_rank,
+            ))
+        }
+        None => {
+            validate_worker_id(legacy_worker_id)?;
+            Ok((String::new(), legacy_worker_id.to_owned(), 0))
+        }
+    }
+}
+
+fn validate_snapshot_metadata(metadata: Option<&ExternalKvSnapshotMetadata>) -> Result<(), Status> {
+    let metadata =
+        metadata.ok_or_else(|| Status::invalid_argument("snapshot metadata is required"))?;
+    if metadata.model.trim().is_empty() || metadata.worker_generation.trim().is_empty() {
+        return Err(Status::invalid_argument(
+            "snapshot model and worker_generation must not be empty",
+        ));
+    }
+    if metadata.hash_schema_version == 0 || metadata.page_size == 0 {
+        return Err(Status::invalid_argument(
+            "hash_schema_version and page_size must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_snapshot_placement(placement: &ExternalKvSnapshotPlacement) -> Result<(), Status> {
+    validate_tier(placement.tier)?;
+    if placement.component_mask == 0 || placement.block_size == 0 {
+        return Err(Status::invalid_argument(
+            "snapshot v2 placement requires component_mask and block_size",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_transaction_id(transaction_id: &str) -> Result<(), Status> {
+    if transaction_id.is_empty() {
+        return Err(Status::invalid_argument(
+            "snapshot transaction_id must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_eligible_streams(request: &MatchExternalKvPrefixRequest) -> Result<(), Status> {
+    let mut streams = std::collections::HashSet::new();
+    for stream in &request.eligible_streams {
+        validate_worker_id(&stream.worker_id)?;
+        if !streams.insert((
+            stream.namespace.as_str(),
+            stream.worker_id.as_str(),
+            stream.dp_rank,
+        )) {
+            return Err(Status::invalid_argument(
+                "eligible_streams must not contain duplicates",
+            ));
+        }
+    }
+    if request
+        .eligible_worker_addresses
+        .iter()
+        .any(|address| address.trim().is_empty())
+    {
+        return Err(Status::invalid_argument(
+            "eligible_worker_addresses must not contain empty values",
+        ));
     }
     Ok(())
 }
@@ -641,6 +970,8 @@ pub(crate) fn assemble_prefix_response(
                 worker_address,
                 matched_prefix_blocks,
                 worker_id,
+                stream_id: None,
+                worker_generation: String::new(),
             },
         )
         .collect();
@@ -648,6 +979,9 @@ pub(crate) fn assemble_prefix_response(
         matches,
         best_prefix_blocks,
         blocks_read,
+        coverage: Vec::new(),
+        complete_coverage: true,
+        uncovered_worker_addresses: Vec::new(),
     }
 }
 
@@ -657,6 +991,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    use tokio::sync::Semaphore;
     use tokio::time::Duration;
 
     #[derive(Clone)]
@@ -723,6 +1058,8 @@ mod tests {
             MatchExternalKvPrefixRequest {
                 hashes: vec![-1],
                 max_blocks: 0,
+                eligible_worker_addresses: Vec::new(),
+                eligible_streams: Vec::new(),
             },
         );
         KvIndexer::match_external_kv_prefix(service, request).await

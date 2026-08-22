@@ -15,6 +15,7 @@ import zmq
 from sglang.srt.disaggregation.kv_events import (
     EventPublisherFactory,
     KVEventBatch,
+    KVSnapshotRuntimeMetadata,
     select_kv_publisher_dp_rank,
 )
 from sglang.srt.managers.io_struct import hook_custom_types, sock_send
@@ -56,11 +57,20 @@ class SchedulerKvEventsPublisher:
     get_stats: Callable
     enable_kv_cache_events: bool = False
     kv_event_publisher: Any = None
+    snapshot_namespace: str = "default"
+    snapshot_model: str = "unknown"
+    snapshot_worker_id: str = ""
+    worker_generation: str = ""
+    page_size: int = 1
+    is_bigram: bool = False
 
     def __post_init__(self) -> None:
         self.init_kv_events(self.kv_events_config)
 
     def init_kv_events(self, kv_events_config: Optional[str]):
+        # Publish one metadata stream/snapshot per independently routable DP
+        # replica. TP/CP/PP followers belong to the same logical replica and
+        # must not expose duplicate snapshots of that placement state.
         self.enable_kv_cache_events = bool(
             kv_events_config
             and self.ps.pp_rank == 0
@@ -73,6 +83,14 @@ class SchedulerKvEventsPublisher:
                 kv_events_config,
                 select_kv_publisher_dp_rank(
                     self.ps.attn_dp_size, self.ps.attn_dp_rank, self.ps.dp_rank
+                ),
+                snapshot_metadata=KVSnapshotRuntimeMetadata(
+                    namespace=self.snapshot_namespace,
+                    model=self.snapshot_model,
+                    worker_id=self.snapshot_worker_id,
+                    worker_generation=self.worker_generation,
+                    page_size=self.page_size,
+                    is_bigram=self.is_bigram,
                 ),
             )
 
