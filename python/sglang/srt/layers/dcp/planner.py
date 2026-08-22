@@ -139,13 +139,19 @@ def plan_dcp_decode_metadata(
     init_metadata_replay: bool,
     fast_decode_kwargs: dict,
     bs: int,
+    static_local_len_bounds: Optional[tuple[int, int]] = None,
 ):
     parallel = get_parallel()
     local_kv_lens = kv_lens.clone()
     update_local_kv_lens_for_dcp(local_kv_lens)
     local_kv_lens.clamp_(min=0)
 
-    if not init_metadata_replay:
+    if static_local_len_bounds is not None:
+        # (max, total) upper bounds for callers that can afford neither a
+        # GPU->CPU sync nor a CPU length array (cuda-graph target-verify).
+        # Over-estimating only sizes a grid and over-allocates a tail nobody reads.
+        max_local_len, total_local_len = static_local_len_bounds
+    elif not init_metadata_replay:
         max_local_len = (
             int(local_kv_lens.max().item()) if local_kv_lens.numel() > 0 else 0
         )
