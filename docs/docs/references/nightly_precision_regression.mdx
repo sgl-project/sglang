@@ -93,7 +93,9 @@ If the comparator returns exit code 0 but compared **zero layers** (baseline/tar
 
 ### Capture signature
 
-A `capture_signature` (SHA-1 hash of schema version, max_tokens, ignore_eos, TP size, and dumper filter) is computed per run. The HF store uses this signature during fetch to ensure only baselines with an identical capture shape are considered. If the signature changes (e.g. you add layers to the capture set or change TP), the framework establishes a fresh baseline instead of erroring on incompatible tensors.
+A `capture_signature` (SHA-1 hash of schema version, max_tokens, ignore_eos, TP size, dumper filter, fusion backend, and TP layout policy) is computed per run. The HF store uses this signature during fetch to ensure only baselines with an identical capture and comparison contract are considered. If the signature changes (e.g. you add layers to the capture set or change TP), the framework establishes a fresh baseline instead of erroring on incompatible tensors.
+
+The precision harness forcibly disables FlashInfer all-reduce fusion. Layer-entry dumps therefore observe replicated post-all-reduce hidden states, avoiding fusion initialization and kernel variance across self-hosted runners.
 
 ---
 
@@ -109,6 +111,7 @@ A `capture_signature` (SHA-1 hash of schema version, max_tokens, ignore_eos, TP 
 | `SGLANG_PRECISION_HF_REPO` | _(required)_ | HuggingFace dataset repo for cross-runner baseline storage |
 | `SGLANG_PRECISION_HF_REVISION` | `main` | Branch/revision of the HF dataset |
 | `SGLANG_PRECISION_HF_TOKEN` | _(required in CI)_ | HuggingFace token with write access to the dataset. Kept off `HF_TOKEN`, which already carries the runner's gated-model read token |
+| `SGLANG_PRECISION_HF_READ_ONLY` | `0` | Set to `1` to fetch and compare without updating the shared baseline store |
 
 ---
 
@@ -136,6 +139,8 @@ Key CI configuration:
 ```
 
 `SGLANG_PRECISION_HF_TOKEN` rather than `HF_TOKEN`: the latter already carries the runner's gated-model read token, and overwriting it would turn every gated model on the job into a 401.
+
+Standalone `/rerun-test` runs fetch the nightly baseline without changing it. Maintainers can refresh it from an in-repo PR with `/rerun-test --refresh-precision-baseline test/registered/debug_utils/test_nightly_precision_regression.py`.
 
 ### Required GitHub secrets/variables
 
