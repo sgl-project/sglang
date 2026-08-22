@@ -259,6 +259,7 @@ def _handle_output_by_index(output, i):
             indexer_topk=_extract_field_by_index(
                 output, "indexer_topk", i, check_length=False
             ),
+            indexer_topk_num_layers=getattr(output, "indexer_topk_num_layers", None),
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
             weight_versions=_extract_field_by_index(output, "weight_versions", i),
             placeholder_tokens_idx=None,
@@ -380,6 +381,7 @@ def _handle_output_by_index(output, i):
             indexer_topk=_extract_field_by_index(
                 output, "indexer_topk", i, check_length=False
             ),
+            indexer_topk_num_layers=getattr(output, "indexer_topk_num_layers", None),
             customized_info=_extract_field_by_index(
                 output, "customized_info", i, check_length=False
             ),
