@@ -434,6 +434,18 @@ MODELS = {
             "--dit-cpu-offload=false",
         ],
     },
+    "wan21-t2v-1.3b": {
+        "path": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        "prompt": "A curious raccoon walks through a sunlit forest.",
+        "extra_args": [
+            "--width=832",
+            "--height=480",
+            "--num-frames=81",
+            "--fps=16",
+            "--num-inference-steps=50",
+            "--guidance-scale=3.0",
+        ],
+    },
     "krea2-turbo": {
         "path": "krea/Krea-2-Turbo",
         "prompt": "A red fox sitting in fresh snow, golden hour, photorealistic.",
