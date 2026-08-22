@@ -130,6 +130,12 @@ from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import 
     RolloutDenoisingMixin,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.compile_trajectory_gate import (
+    CompileGateError,
+    CompileWorkloadSignature,
+    load_manifests,
+    select_validated_plan,
+)
 from sglang.multimodal_gen.runtime.utils.component_load import (
     load_transformer_if_needed,
     register_loaded_transformer,
@@ -301,6 +307,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # Whether request-scoped quality="high" fusions are currently mounted.
         self._quality_fusions_mounted = False
         self._torch_compile_registry = CompiledModuleRegistry()
+        # Lazily-loaded compile-trajectory-gate manifests (see
+        # runtime.utils.compile_trajectory_gate); None until first checked,
+        # then a (possibly empty) list cached for the process lifetime.
+        self._compile_trajectory_manifests: list | None = None
         # Breakable CUDA graph runners, one per transformer module (lazy).
         self._bcg_runners: dict[int, Any] = {}
 
@@ -471,7 +481,100 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     moved.append(module)
         return moved
 
-    def _maybe_torch_compile(self, module: object) -> None:
+    def _build_compile_workload_signature(
+        self, num_inference_steps: int | tuple[int, int], batch: Req
+    ) -> CompileWorkloadSignature:
+        """Build the workload signature the compile-trajectory gate checks
+        the current request against (see runtime.utils.compile_trajectory_gate).
+        """
+        pipeline_config = getattr(self.server_args, "pipeline_config", None)
+        dtype = str(getattr(pipeline_config, "dit_precision", None) or "unspecified")
+        steps = (
+            num_inference_steps
+            if isinstance(num_inference_steps, int)
+            else tuple(num_inference_steps)
+        )
+        if isinstance(batch.enable_teacache, bool) and batch.enable_teacache:
+            cache_mode = "teacache"
+        elif getattr(batch, "enable_step_reuse", False):
+            cache_mode = "step_reuse"
+        elif getattr(batch, "enable_spectrum", False):
+            cache_mode = "spectrum"
+        else:
+            cache_mode = "none"
+        latent_shape_regime = tuple(
+            v
+            for v in (
+                getattr(batch, "height", None),
+                getattr(batch, "width", None),
+                getattr(batch, "num_frames", None),
+            )
+            if v is not None
+        )
+        return CompileWorkloadSignature(
+            model_revision=self.server_args.model_paths.get(
+                "transformer", self.server_args.model_path
+            ),
+            dtype=dtype,
+            backend="torch.compile",
+            parallel_signature=f"sp{get_sp_world_size()}",
+            latent_shape_regime=latent_shape_regime,
+            num_inference_steps=(
+                steps if isinstance(steps, int) else steps[0] if steps else 0
+            ),
+            cfg_mode="cfg" if batch.do_classifier_free_guidance else "no_cfg",
+            cache_mode=cache_mode,
+            state_schema_version="v1",
+        )
+
+    def _is_covered_by_compile_trajectory_gate(
+        self, num_inference_steps: int | tuple[int, int], batch: Req
+    ) -> bool:
+        """Check the configured compile-trajectory-gate manifest, if any.
+
+        Returns True (proceed to compile) when
+        ``server_args.compile_trajectory_gate_manifest`` is unset -- the
+        default, which never blocks compilation on its own -- or when the
+        current request's workload signature is covered by a validated
+        manifest entry. Returns False (fall back to eager) only when a
+        manifest is configured and the signature is not covered.
+        """
+        manifest_path = getattr(
+            self.server_args, "compile_trajectory_gate_manifest", None
+        )
+        if not manifest_path:
+            return True
+
+        if self._compile_trajectory_manifests is None:
+            try:
+                self._compile_trajectory_manifests = load_manifests(manifest_path)
+            except CompileGateError as exc:
+                logger.warning(
+                    "compile-trajectory-gate manifest %r failed to load (%s); "
+                    "falling back to eager for this transformer",
+                    manifest_path,
+                    exc,
+                )
+                self._compile_trajectory_manifests = []
+
+        signature = self._build_compile_workload_signature(num_inference_steps, batch)
+        plan = select_validated_plan(self._compile_trajectory_manifests, signature)
+        if plan is None:
+            logger.info(
+                "compile-trajectory-gate: no validated plan covers signature %s; "
+                "falling back to eager",
+                signature,
+            )
+            return False
+        return True
+
+    def _maybe_torch_compile(
+        self,
+        module: object,
+        *,
+        num_inference_steps: int | tuple[int, int] | None = None,
+        batch: Req | None = None,
+    ) -> None:
         """
         Compile a module with torch.compile, and enable inductor overlap tweak if available.
         No-op if torch compile is disabled or the object is not a nn.Module.
@@ -488,6 +591,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             logger.debug("Deferring torch.compile until cache-dit is enabled")
             return
         if self._torch_compile_registry.is_compiled(module):
+            return
+        if batch is not None and not self._is_covered_by_compile_trajectory_gate(
+            num_inference_steps, batch
+        ):
             return
 
         if current_platform.is_npu():
@@ -529,7 +636,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._maybe_toggle_quality_fusions(batch)
         self._maybe_enable_cache_dit(num_inference_steps, batch)
         for transformer in filter(None, [self.transformer, self.transformer_2]):
-            self._maybe_torch_compile(transformer)
+            self._maybe_torch_compile(
+                transformer, num_inference_steps=num_inference_steps, batch=batch
+            )
 
     def _maybe_override_attention_backend(self, batch: Req) -> None:
         """Two-phase per-request backend switch: prepare all layers (may
