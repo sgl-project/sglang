@@ -202,6 +202,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._swa_aware_allocatable_token_budgets = MagicMock(
             return_value=(1024, 1024)
         )
+        queue._required_alloc_tokens = MagicMock(return_value=3)
         queue._prealloc_required_tokens = MagicMock(return_value=(3, 3))
         queue._prealloc_kv_lens = MagicMock(return_value=(3, 3))
         queue._reclaim_swa_tail_capacity = MagicMock(

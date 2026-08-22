@@ -27,7 +27,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -35,10 +35,12 @@ from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.decode_hicache_mixin import DecodePrefixMatch
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
+    IncLockRefResult,
     InsertParams,
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.utils.common import Range
 
 
@@ -96,6 +98,32 @@ def _make_req(fill_ids, req_pool_idx=0, cache_protected_len=0, last_node=None):
 class TestDecodeLockRefScenarios(unittest.TestCase):
     """Test lock_ref balance across decode transfer scenarios."""
 
+    def test_match_prefix_preserves_complete_lock_ownership(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.tree_cache = MagicMock()
+        queue.tree_cache.supports_mamba.return_value = False
+        queue.tree_cache.inc_lock_ref.return_value = IncLockRefResult(
+            swa_uuid_for_lock=17,
+            skip_lock_node_ids={ComponentType.SWA: {41}},
+        )
+        expected = object()
+        queue._build_decode_prefix_match = MagicMock(return_value=expected)
+
+        req = MagicMock()
+        req.origin_input_ids = [1, 2, 3]
+        result = MagicMock()
+        result.last_device_node = object()
+
+        with patch(
+            "sglang.srt.disaggregation.decode.match_prefix_for_req",
+            return_value=result,
+        ):
+            actual = queue._match_prefix_and_lock(req)
+
+        self.assertIs(actual, expected)
+        self.assertEqual(req.swa_uuid_for_lock, 17)
+        self.assertEqual(req.skip_lock_node_ids, {ComponentType.SWA: {41}})
+
     def test_swa_tail_len_keeps_page_aligned_matchable_window(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
@@ -111,6 +139,23 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         swa_start = 895 - tail_len
         radix_key_len = (895 // 64) * 64
         self.assertGreaterEqual(radix_key_len - swa_start, 127)
+
+    def test_dsv4_window_smaller_than_page_stays_in_fresh_delta(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
+        queue.scheduler = SimpleNamespace(
+            sliding_window_size=128,
+            server_args=SimpleNamespace(disaggregation_decode_enable_radix_cache=True),
+        )
+        queue.token_to_kv_pool_allocator = MagicMock(page_size=256)
+
+        fill_len = 1000
+        swa_tail_len = queue._swa_tail_len(fill_len)
+        prefix_cap = fill_len - swa_tail_len
+
+        self.assertEqual(swa_tail_len, 488)
+        self.assertEqual(prefix_cap, 512)
+        self.assertLessEqual(swa_tail_len, fill_len - prefix_cap)
 
     def test_swa_admission_counts_evictable_capacity(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
@@ -366,11 +411,16 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         req.rid = "req-1"
         req.origin_input_ids = list(range(8))
         req.output_ids = [99]
-        req.last_node = object()
+        matched_node = object()
+        req.last_node = matched_node
         req.finished_reason = None
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = 123
         req.swa_prefix_lock_released = False
+        req.skip_lock_node_ids = {ComponentType.SWA: {41}}
+        req.prefix_indices = torch.arange(4, dtype=torch.int64)
+        req.num_matched_prefix_tokens = 4
+        req.extra_key = None
         req.pd_rebootstrap_in_progress = False
         req.sampling_params.max_new_tokens = 16
 
@@ -397,7 +447,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
                 prefix_indices=torch.arange(4, dtype=torch.int64),
                 l2_host_hit_length=0,
                 l3_storage_hit_length=0,
-                last_device_node=req.last_node,
+                last_device_node=matched_node,
             )
         )
         queue._pre_alloc = MagicMock(
@@ -439,15 +489,111 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [])
         queue._pre_alloc.assert_not_called()
-        queue.tree_cache.dec_swa_lock_only.assert_called_once_with(req.last_node, 123)
+        queue.tree_cache.dec_swa_lock_only.assert_called_once_with(
+            matched_node,
+            123,
+            {ComponentType.SWA: {41}},
+        )
         queue.tree_cache.dec_lock_ref.assert_called_once_with(
-            req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=123),
+            matched_node,
+            DecLockRefParams(
+                swa_uuid_for_lock=123,
+                skip_lock_node_ids={ComponentType.SWA: {41}},
+            ),
             skip_swa=True,
         )
         self.assertFalse(req.swa_prefix_lock_released)
+        self.assertIsNone(req.swa_uuid_for_lock)
+        self.assertEqual(req.skip_lock_node_ids, {})
         queue._swa_tail_len.assert_called_once_with(8)
-        queue._allocatable_token_budgets.assert_called_once()
+        self.assertEqual(queue._allocatable_token_budgets.call_count, 2)
+
+    def test_post_lock_rejection_retries_as_miss_with_refreshed_budget(self):
+        class _Admitted(Exception):
+            pass
+
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pp_size = 1
+
+        matched_node = object()
+        root_node = object()
+        req = MagicMock()
+        req.rid = "req-1"
+        req.origin_input_ids = list(range(8))
+        req.output_ids = [99]
+        req.last_node = matched_node
+        req.finished_reason = None
+        req.cache_protected_len = 4
+        req.swa_uuid_for_lock = 123
+        req.swa_prefix_lock_released = False
+        req.skip_lock_node_ids = {ComponentType.SWA: {41}}
+        req.prefix_indices = torch.arange(4, dtype=torch.int64)
+        req.num_matched_prefix_tokens = 4
+        req.extra_key = None
+        req.pd_rebootstrap_in_progress = False
+        req.sampling_params.max_new_tokens = 16
+
+        decode_req = MagicMock()
+        decode_req.req = req
+        decode_req.waiting_for_input = True
+        decode_req.is_rebootstrap = False
+
+        queue.queue = [decode_req]
+        queue.pending_reqs = []
+        queue.retracted_queue = []
+        queue.num_reserved_decode_tokens = 0
+        queue._resolve_pending_reqs = MagicMock()
+        queue._update_handshake_waiters = MagicMock()
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
+        queue._swa_tail_len = MagicMock(return_value=4)
+        queue._swa_aware_allocatable_token_budgets = MagicMock(return_value=(8, 64))
+        queue._swa_tail_allocatable_token_budget = MagicMock(return_value=64)
+        queue._match_prefix_and_lock = MagicMock(
+            return_value=DecodePrefixMatch(
+                prefix_indices=torch.arange(4, dtype=torch.int64),
+                l2_host_hit_length=0,
+                l3_storage_hit_length=0,
+                last_device_node=matched_node,
+            )
+        )
+        queue._pre_alloc = MagicMock(side_effect=_Admitted)
+        queue._reclaim_swa_tail_capacity = MagicMock(return_value=None)
+        queue.transfer_queue = MagicMock(queue=[], enable_staging=False)
+        queue.tree_cache = MagicMock()
+        queue.tree_cache.root_node_handle.return_value = root_node
+        queue.req_to_token_pool = MagicMock()
+        queue.req_to_token_pool.available_size.return_value = 1
+        queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+        queue.req_to_metadata_buffer_idx_allocator.available_size.return_value = 1
+        queue.token_to_kv_pool = MagicMock()
+        queue.token_to_kv_pool_allocator = MagicMock(page_size=4)
+
+        scheduler = MagicMock()
+        scheduler.running_batch.reqs = []
+        scheduler.server_args.disaggregation_decode_enable_radix_cache = True
+        scheduler.server_args.disable_radix_cache = False
+        scheduler.enable_hisparse = False
+        scheduler.enable_decode_hicache = False
+        scheduler.enable_priority_scheduling = False
+        scheduler.waiting_queue = []
+        scheduler.last_batch = None
+        queue.scheduler = scheduler
+
+        # The locked hit cannot fit at 3 tokens. Releasing it makes 64 tokens
+        # allocatable, so the same request must progress immediately as a miss.
+        queue._allocatable_token_budgets = MagicMock(side_effect=[3, 64])
+
+        with self.assertRaises(_Admitted):
+            queue.pop_preallocated()
+
+        queue._pre_alloc.assert_called_once_with(req, None, 0, 0)
+        self.assertEqual(queue._allocatable_token_budgets.call_count, 2)
+        self.assertIs(req.last_node, root_node)
+        self.assertEqual(len(req.prefix_indices), 0)
+        self.assertEqual(req.num_matched_prefix_tokens, 0)
+        self.assertEqual(req.cache_protected_len, 0)
+        self.assertIsNone(req.swa_uuid_for_lock)
+        self.assertEqual(req.skip_lock_node_ids, {})
 
     def test_repeated_incremental_no_leak(self):
         """Multiple incremental transfers shouldn't leak lock_refs."""

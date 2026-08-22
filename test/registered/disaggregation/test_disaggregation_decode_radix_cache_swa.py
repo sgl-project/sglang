@@ -1,8 +1,8 @@
 """SWA coverage for decode-side radix cache on gpt-oss-20b.
 
 The decode worker reuses full-attention prefix KV while transferring the SWA
-window fresh per request. This path requires the unified radix tree and validates
-both multi-turn cache hits and two-pass GSM8K accuracy.
+window fresh per request. This path uses the default UnifiedRadixCache and
+validates both multi-turn cache hits and two-pass GSM8K accuracy.
 """
 
 import unittest
@@ -37,9 +37,6 @@ class TestDisaggregationDecodeRadixCacheSWANixl(
     # so keep the original 0.45 absolute floor and rely on the two-pass
     # non-regression check below to catch decode-cache corruption.
     gsm8k_min_score = 0.45
-    # SWA + decode-side radix cache is gated to the unified radix tree.
-    extra_prefill_env = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
-    extra_decode_env = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
     extra_prefill_args = SWA_SERVER_ARGS
     extra_decode_args = [
         "--disaggregation-decode-enable-radix-cache",
