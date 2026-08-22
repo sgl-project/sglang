@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     DEFAULT_SIGMA_SHIFT_VIDEO,
     serialize_comfyui_layout,
     time_shift_sigma,
+    time_shift_slope,
 )
 
 from .adapter import ComfyUIModelAdapter, PackedForward
@@ -139,7 +140,10 @@ class MiniMaxH3Adapter(ComfyUIModelAdapter):
                 "audio_scale": scale,
                 "audio_src": audio_src,
                 "carry": carry,
+                "sigma_v": sigma_v,
                 "sigma_a": sigma_a,
+                "shift_v": shift_v,
+                "shift_a": shift_a,
             },
         )
 
@@ -152,7 +156,9 @@ class MiniMaxH3Adapter(ComfyUIModelAdapter):
                 "MiniMax H3 unpack expects [video, audio] noise_pred, "
                 f"got {type(noise_pred)!r}"
             )
-        # ComfyUI MiniMaxH3._forward returns the negated DiT velocities.
+        # Match ComfyUI MiniMaxH3._forward: negated velocities, and audio
+        # scaled by d(sigma_a)/d(sigma_v) so the sampler's sigma_v ODE is
+        # the audio stream's true ODE on its shifted schedule.
         v_video = (-v_video).to(device=video_x.device, dtype=video_x.dtype)
         v_audio = (-v_audio).to(device=audio_x.device, dtype=audio_x.dtype)
         ctx = packed.unpack_ctx
@@ -164,6 +170,11 @@ class MiniMaxH3Adapter(ComfyUIModelAdapter):
             v_audio = (1.0 - scale) * (audio_src * carry) + (
                 1.0 + (scale - 1.0) * sigma_a
             ).to(v_audio.dtype) * v_audio
+        slope_a = time_shift_slope(
+            ctx["sigma_v"], ctx.get("shift_v", DEFAULT_SIGMA_SHIFT_VIDEO),
+            ctx.get("shift_a", DEFAULT_SIGMA_SHIFT_AUDIO),
+        ).to(device=v_audio.device, dtype=v_audio.dtype)
+        v_audio = slope_a * v_audio
         return [v_video, v_audio]
 
     def fill_req(self, req, packed: PackedForward) -> None:

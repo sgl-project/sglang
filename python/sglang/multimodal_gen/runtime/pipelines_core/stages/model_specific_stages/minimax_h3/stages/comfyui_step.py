@@ -63,6 +63,14 @@ def time_shift_sigma(sigma, from_shift, to_shift):
     return to_shift * base / (1.0 + (to_shift - 1.0) * base)
 
 
+def time_shift_slope(sigma, from_shift, to_shift):
+    """d(sigma_to)/d(sigma_from) at the same base-grid point."""
+    base = sigma / (from_shift + sigma * (1.0 - from_shift))
+    return (to_shift * (1.0 + (from_shift - 1.0) * base) ** 2) / (
+        from_shift * (1.0 + (to_shift - 1.0) * base) ** 2
+    )
+
+
 def patchify_video(latent, patch_size=_PATCH_SIZE):
     b, c, t_full, h_full, w_full = latent.shape
     pt, ph, pw = patch_size
@@ -773,6 +781,7 @@ __all__ = [
     "patchify_video",
     "serialize_comfyui_layout",
     "time_shift_sigma",
+    "time_shift_slope",
     "unpack_audio",
     "unpatchify_video",
 ]
