@@ -543,6 +543,47 @@ class MoriKVManager(CommonKVManager):
         except Exception:
             logger.exception("Failed to parse transfer info message")
 
+    def _handle_abort_notification(self, msg: List[bytes]) -> bool:
+        """Mark a room Failed on a decode-side ABORT notification.
+
+        These arrive unguarded from `CommonKVReceiver._send_abort_notification`,
+        so this runs ahead of the MORI_GUARD check. Returns True when the
+        message was an abort notification and has been consumed.
+        """
+        if not msg or msg[0] != b"ABORT":
+            return False
+
+        try:
+            room_to_be_aborted = int(msg[1].decode("ascii"))
+        except Exception as e:
+            logger.debug(f"Ignoring malformed abort notification: {e}")
+            return True
+
+        with self.transfer_lock:
+            room_active = (
+                room_to_be_aborted in self.request_status
+                and self.request_status[room_to_be_aborted] != KVPoll.Success
+            )
+            if room_active:
+                self.update_status(room_to_be_aborted, KVPoll.Failed)
+
+        if room_active:
+            self.record_failure(
+                room_to_be_aborted,
+                "Aborted by decode-side abort notification.",
+            )
+            logger.debug(
+                "Received abort notification for room %s, marked as Failed",
+                room_to_be_aborted,
+            )
+        else:
+            logger.debug(
+                "Received abort notification for room %s, ignoring "
+                "(already completed or unknown)",
+                room_to_be_aborted,
+            )
+        return True
+
     def _validate_message(self, msg: List[bytes]) -> Optional[List[bytes]]:
         if not msg or msg[0] != MORI_GUARD:
             logger.warning("Received malformed bootstrap message")
@@ -557,6 +598,12 @@ class MoriKVManager(CommonKVManager):
             while True:
                 try:
                     msg = self.server_socket.recv_multipart()
+                    # Decode-side abort notifications are sent without a
+                    # MORI_GUARD frame (see
+                    # CommonKVReceiver._send_abort_notification), so they must
+                    # be handled before _validate_message rejects them.
+                    if self._handle_abort_notification(msg):
+                        continue
                     payload = self._validate_message(msg)
                     if payload is None:
                         continue
