@@ -26,10 +26,12 @@ compaction only mutates those (no reference rewriting).
 from __future__ import annotations
 
 import logging
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import ClassVar, Dict, List, NamedTuple, Optional, Tuple
 
+import msgspec
 import torch
 from torch.profiler import record_function
 
@@ -120,14 +122,71 @@ class SubPoolSpec(ABC):
         return 1
 
 
+class DenseDraftRegion(msgspec.Struct, frozen=True, kw_only=True):
+    """Geometry of the DRAFT model's KV region fused into every host page.
+
+    Fused draft KV: the draft model's K/V blocks ride after the host blocks
+    inside every page envelope — one slot id, one v2p table, one compaction
+    move (the whole-page `move_kv_cache` carries the draft bytes for free).
+    The draft is a separate checkpoint, so its head geometry and layer count
+    differ from the host's; its rows form their OWN dense id space over the
+    same pages, scaled by `MHASubPoolSpec.draft_kernel_page_multiplier`.
+
+    Not a `SubPoolSpec`: this is a region nested inside the host spec's page,
+    not a sub-pool — it has no grow direction and never reaches the frontier
+    logic.
+    """
+
+    layer_num: int
+    head_num: int
+    head_dim: int
+    store_dtype: torch.dtype
+    v_head_dim: Optional[int] = None
+
+    def validate(self) -> None:
+        assert self.layer_num > 0, f"layer_num must be positive; got {self.layer_num}"
+        assert self.head_num > 0, f"head_num must be positive; got {self.head_num}"
+        assert self.head_dim > 0, f"head_dim must be positive; got {self.head_dim}"
+        v = self.head_dim if self.v_head_dim is None else self.v_head_dim
+        assert v == self.head_dim, (
+            f"fused draft KV requires uniform K/V rows (dense views); got "
+            f"head_dim={self.head_dim}, v_head_dim={v}"
+        )
+
+    def row_bytes(self) -> int:
+        return self.head_num * self.head_dim * self.store_dtype.itemsize
+
+    def blocks(self) -> int:
+        # One K + one V block per draft layer.
+        return 2 * self.layer_num
+
+    def entry_bytes(self) -> int:
+        """Draft bytes per slot (before the host spec's lcm padding)."""
+        return self.blocks() * self.row_bytes()
+
+
 @dataclass(frozen=True, kw_only=True)
 class MHASubPoolSpec(SubPoolSpec):
-    """Per-slot layout of one MHA-shaped sub-pool. `v_head_dim` defaults to `head_dim`."""
+    """Per-slot layout of one MHA-shaped sub-pool. `v_head_dim` defaults to `head_dim`.
+
+    With `draft_region` set, every page fuses the draft model's KV after the
+    host blocks:
+
+        [ host: 2*L_h blocks @ w_h | draft: 2*L_d blocks @ w_d | pad ]
+
+    The per-slot size is padded to lcm(w_h, w_d) so BOTH families' dense page
+    strides are integral row counts of their own width:
+    `blocks_per_page()` (host) and `draft_kernel_page_multiplier()`
+    (draft) — the two `kernel_page_multiplier`s the read/write rails already
+    parameterize on. `draft_region is None` keeps the layout byte-identical
+    to the unfused one.
+    """
 
     head_num: int
     head_dim: int
     store_dtype: torch.dtype
     v_head_dim: Optional[int] = None
+    draft_region: Optional[DenseDraftRegion] = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -138,6 +197,23 @@ class MHASubPoolSpec(SubPoolSpec):
         assert (
             self.v_head_dim > 0
         ), f"v_head_dim must be positive; got {self.v_head_dim}"
+        assert self.is_uniform_row(), (
+            f"sub-pool {self.name!r}: the unified pool requires uniform K/V "
+            f"rows; got k_row_bytes={self.k_row_bytes()} != "
+            f"v_row_bytes={self.v_row_bytes()}"
+        )
+        if self.draft_region is not None:
+            self.draft_region.validate()
+            # The draft's flat view storage_offset is expressed in DRAFT
+            # elements; the host region preceding it must land on a draft
+            # element boundary (ps scales the offset, preserving this).
+            assert (
+                self.host_entry_bytes() % self.draft_region.store_dtype.itemsize == 0
+            ), (
+                f"sub-pool {self.name!r}: host region ({self.host_entry_bytes()} B "
+                f"per slot) does not align to the draft dtype "
+                f"({self.draft_region.store_dtype.itemsize} B)"
+            )
 
     def k_row_bytes(self) -> int:
         return self.head_num * self.head_dim * self.store_dtype.itemsize
@@ -145,8 +221,22 @@ class MHASubPoolSpec(SubPoolSpec):
     def v_row_bytes(self) -> int:
         return self.head_num * self.v_head_dim * self.store_dtype.itemsize
 
-    def entry_bytes(self) -> int:
+    def is_uniform_row(self) -> bool:
+        """Equal K/V row width -- the precondition for per-layer views."""
+        return self.k_row_bytes() == self.v_row_bytes()
+
+    def host_entry_bytes(self) -> int:
+        """Host (target-only) bytes for one slot -- the pre-fusion entry."""
         return self.layer_num * (self.k_row_bytes() + self.v_row_bytes())
+
+    def entry_bytes(self) -> int:
+        if self.draft_region is None:
+            return self.host_entry_bytes()
+        raw = self.host_entry_bytes() + self.draft_region.entry_bytes()
+        # lcm padding: both families' page strides must be integral in their
+        # own row units (dense ids scale by rows of one width).
+        quantum = math.lcm(self.k_row_bytes(), self.draft_region.row_bytes())
+        return -(-raw // quantum) * quantum
 
     # Page-major byte math: within a page block K/V group per layer
     # [L0_K*ps | L0_V*ps | L1_K*ps | ...]; at ps==1 this collapses to the per-slot envelope.
@@ -167,8 +257,22 @@ class MHASubPoolSpec(SubPoolSpec):
         return page_size * self.entry_bytes()
 
     def blocks_per_page(self) -> int:
-        """Row-blocks per page in the kernel-facing id space (one K + one V per layer)."""
-        return 2 * self.layer_num
+        """Page stride in HOST row units — this sub-pool's
+        `kernel_page_multiplier`. Unfused: exactly `2 * layer_num` (one K +
+        one V block per layer). Fused: grows by the draft region + lcm pad,
+        integral by the `entry_bytes` padding."""
+        return self.entry_bytes() // self.k_row_bytes()
+
+    def draft_kernel_page_multiplier(self) -> int:
+        """Page stride in DRAFT row units — the fused draft family's
+        `kernel_page_multiplier` over the same pages and v2p table."""
+        assert self.draft_region is not None
+        return self.entry_bytes() // self.draft_region.row_bytes()
+
+    def draft_region_offset_in_page(self, page_size: int) -> int:
+        """Byte offset of the draft block region within one page."""
+        assert self.draft_region is not None
+        return page_size * self.host_entry_bytes()
 
     def get_dtype(self) -> torch.dtype:
         return self.store_dtype
@@ -501,6 +605,42 @@ class UnifiedKVPool:
             page_size=page_size,
             num_pages=num_pages,
             anchor_bytes=anchor_bytes,
+            # Fused-draft pages stride past the host blocks; identical to the
+            # default (2 * layer_num) when no draft region is fused.
+            page_stride_blocks=spec.blocks_per_page(),
+        )
+
+    def build_dense_draft_views(
+        self, sub_pool_name: str
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """Per-layer dense K/V views of the DRAFT region fused into
+        ``sub_pool_name``'s pages. Same pages, same v2p table, own dense id
+        space (`draft_kernel_page_multiplier`)."""
+        spec = self._specs_by_name[sub_pool_name]
+        assert (
+            isinstance(spec, MHASubPoolSpec) and spec.draft_region is not None
+        ), f"sub-pool {sub_pool_name!r} carries no fused draft region"
+        region = spec.draft_region
+        page_size = self._page_size
+        num_pages = self.max_slots(sub_pool_name) // page_size
+        _assert_kernel_id_bound(
+            sub_pool_name=f"{sub_pool_name}/draft",
+            n_rows=num_pages * spec.draft_kernel_page_multiplier() * page_size,
+        )
+        return build_mha_views(
+            self._raw,
+            layer_num=region.layer_num,
+            head_num=region.head_num,
+            head_dim=region.head_dim,
+            v_head_dim=(
+                region.head_dim if region.v_head_dim is None else region.v_head_dim
+            ),
+            store_dtype=region.store_dtype,
+            page_size=page_size,
+            num_pages=num_pages,
+            anchor_bytes=self._anchor_bytes[sub_pool_name],
+            page_stride_blocks=spec.draft_kernel_page_multiplier(),
+            region_offset_bytes=spec.draft_region_offset_in_page(page_size),
         )
 
     def _build_mla_views(
