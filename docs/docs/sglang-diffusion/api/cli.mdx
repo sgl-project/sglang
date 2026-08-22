@@ -122,20 +122,37 @@ For frame interpolation and upscaling, see [Post-Processing](./post_processing).
 
 ### Quantization
 
-For quantized transformer checkpoints, prefer:
+For a pre-quantized main transformer checkpoint, prefer:
 
 - `--model-path` for the base pipeline
 - `--transformer-path` for a quantized `transformers` transformer component folder
 - `--transformer-weights-path` for a quantized safetensors file, directory,
   repo, or a supported GGUF transformer file
-- `--quantization` for online quantization (apply quantization to unquantized models at load time, activations are quantized dynamically)
-- `--quantization-ignored-layers` layer name patterns to keep unquantized (e.g. `attention.to_`)
+- `--quantization` to override the quantization method used by the transformer loader
+- `--quantization-ignored-layers` transformer layer name patterns to keep unquantized during online quantization (e.g. `attention.to_`)
 
 Component checkpoint paths are selected separately, so changing DiT precision
-never silently changes prompt embeddings. For a native text encoder:
+never silently changes prompt embeddings. Use
+`--component-paths.<component> {MODEL}` or its shorter
+`--<component>-path {MODEL}` form for any component key from `model_index.json`
+or a native pipeline's registered module name.
+For a native text encoder:
 
 - `--component-paths.text_encoder {MODEL}` replaces the text-encoder checkpoint; `--text-encoder-path {MODEL}` is its shorter alias
-- Quantization metadata is auto-detected from that checkpoint. Each native encoder must explicitly support the serialized format; this is not blanket quantization support for every component, and unsupported combinations fail before weight loading.
+- Quantization metadata is auto-detected from that checkpoint. The native loader accepts compatible serialized formats without a model-name allowlist and rejects implementations that do not construct the required quantized layers.
+
+The same contract applies to every weighted component: path routing is generic,
+while quantized materialization is capability-based. Native auxiliary loaders
+whose current materializer expects plain state dicts reject unsupported
+quantization metadata before model construction. See
+[Quantized Component Repositories](../quantization#quantized-component-repositories)
+for the current component matrix.
+
+Component overrides accept a local component directory, a standalone Hub
+repository, or a Hub component subfolder written as `owner/repo/subfolder`.
+For transformer and native encoder loaders, an explicit weight filename keeps
+the base component configuration and replaces only its weights; the selected
+file format must still be supported by that loader.
 
 For supported realtime causal video models, `--kv-cache-quant {off|int4|int2}`
 compresses completed KV-cache chunks independently of transformer weight
@@ -216,6 +233,19 @@ model-specific padding. For a 1024x1024 deployment, use:
 sglang serve --model-path meituan-longcat/LongCat-Image \
   --enable-breakable-cuda-graph \
   --warmup-resolutions 1024x1024 \
+  --enable-torch-compile false \
+  --port 30010
+```
+
+SANA-Video supports the same path for fixed-resolution serving. Its default
+text stage emits a fixed 300-token prompt shape, so the runtime reuses one
+graph across prompt lengths without padding it to a generic text bucket:
+
+```bash Command
+sglang serve \
+  --model-path Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
+  --enable-breakable-cuda-graph \
+  --warmup-resolutions 832x480 \
   --enable-torch-compile false \
   --port 30010
 ```
@@ -332,7 +362,17 @@ sglang serve \
   --vae-path fal/FLUX.2-Tiny-AutoEncoder
 ```
 
-The component key must match the key in the model's `model_index.json`, and the path must be either a Hugging Face repo ID or a complete component directory.
+The component key must match a key in the model's `model_index.json` or a native
+pipeline's registered module name. The path must be either a Hugging Face repo
+ID or a complete component directory.
+
+Path selection and quantized checkpoint support are separate capabilities. A
+pre-quantized component repo must carry its quantization metadata, and the
+selected loader must support that serialized format. Native plain-state loaders
+fail closed; library-managed components inherit the corresponding Transformers
+or Diffusers support. The transformer-specific `--quantization` flag does not
+select the format of component checkpoints; their own metadata does. See
+[Quantized Component Repositories](../quantization#quantized-component-repositories).
 
 ## Component Attention Backend Overrides
 
