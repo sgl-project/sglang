@@ -29,6 +29,8 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+from sglang.srt.utils.common import rate_limited_hit
+
 logger = logging.getLogger(__name__)
 
 
@@ -1289,12 +1291,36 @@ class DeepseekV4AscendAttnBackend(
         metadata.start_pos = torch.zeros(bs, dtype=torch.int32, device=device)
         metadata.seqused = torch.zeros(bs, dtype=torch.int32, device=device)
 
-        metadata.kernel_metadata = {
-            "c1a_metadata": self.graph_metadata["kernel_metadata_c1a"],
-            "c4a_metadata": self.graph_metadata["kernel_metadata_c4a"],
-            "c128a_metadata": self.graph_metadata["kernel_metadata_c128a"],
-            "li_quant_metadata": self.graph_metadata["kernel_metadata_li_quant"],
-        }
+        # The graph_metadata kernel buffers are a FIXED 1024 int32 each; the
+        # per-token CP form drives bs into the thousands and the metadata op
+        # writes bs-proportional entries -- overflowing (bs-1024)*4 bytes into
+        # adjacent device memory (the req_to_token row clobber). Right-size
+        # the buffers for large bs instead of reusing the fixed ones.
+        if bs > 1024:
+            _meta_len = max(1024, bs * 8)
+            if rate_limited_hit("mf-meta-buf"):
+                logger.error(
+                    "[mf-meta] bs=%d exceeds fixed 1024 kernel-metadata "
+                    "buffers; using right-sized %d-entry buffers",
+                    bs,
+                    _meta_len,
+                )
+            metadata.kernel_metadata = {
+                k: torch.zeros(_meta_len, dtype=torch.int32, device=device)
+                for k in (
+                    "c1a_metadata",
+                    "c4a_metadata",
+                    "c128a_metadata",
+                    "li_quant_metadata",
+                )
+            }
+        else:
+            metadata.kernel_metadata = {
+                "c1a_metadata": self.graph_metadata["kernel_metadata_c1a"],
+                "c4a_metadata": self.graph_metadata["kernel_metadata_c4a"],
+                "c128a_metadata": self.graph_metadata["kernel_metadata_c128a"],
+                "li_quant_metadata": self.graph_metadata["kernel_metadata_li_quant"],
+            }
 
         T = bs * tokens_per_req
         metadata.c4_topk_indices = self.graph_metadata["c4_topk_indices"][:T, :]
