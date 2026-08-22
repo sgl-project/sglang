@@ -18,9 +18,6 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
     filter_modules_for_role,
 )
-from sglang.multimodal_gen.runtime.layers.attention.selector import (
-    component_attn_backend_context_manager,
-)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
 )
@@ -181,7 +178,9 @@ class ComposedPipelineBase(ABC):
 
         if model_subfolder is None:
             model_path = maybe_download_model(
-                self.model_path, force_diffusers_model=True
+                self.model_path,
+                force_diffusers_model=True,
+                revision=self.server_args.revision,
             )
         else:
             model_subfolder = os.path.normpath(model_subfolder)
@@ -196,6 +195,7 @@ class ComposedPipelineBase(ABC):
             model_root = maybe_download_model(
                 self.model_path,
                 allow_patterns=[f"{model_subfolder}/**"],
+                revision=self.server_args.revision,
             )
             model_path = os.path.join(model_root, model_subfolder)
 
@@ -554,16 +554,15 @@ class ComposedPipelineBase(ABC):
                     attn_backend.name.lower(),
                     matched_backend_key,
                 )
-            with component_attn_backend_context_manager(
-                attn_backend, component_name=matched_backend_key or module_name
-            ):
-                module, memory_usage = PipelineComponentLoader.load_component(
-                    component_name=load_module_name,
-                    component_model_path=component_model_path,
-                    transformers_or_diffusers=transformers_or_diffusers,
-                    server_args=server_args,
-                    component_architecture=architecture,
-                )
+            module, memory_usage = PipelineComponentLoader.load_component(
+                component_name=load_module_name,
+                component_model_path=component_model_path,
+                transformers_or_diffusers=transformers_or_diffusers,
+                server_args=server_args,
+                component_architecture=architecture,
+                component_attn_backend=attn_backend,
+                component_attn_name=matched_backend_key or module_name,
+            )
 
             self.memory_usages[load_module_name] = memory_usage
 
