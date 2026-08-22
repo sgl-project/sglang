@@ -122,6 +122,7 @@ from sglang.srt.observability.request_metrics_exporter import (
 )
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
 from sglang.srt.runtime_context import (
+    ensure_published,
     get_context,
     get_device,
     get_disagg,
@@ -130,7 +131,9 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_mm,
     get_model,
+    get_observability,
     get_parallel,
+    get_schedule,
     get_serving,
     get_spec,
 )
@@ -138,7 +141,6 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
-    set_global_server_args_for_tokenizer,
 )
 from sglang.srt.utils import (
     configure_gc_warning,
@@ -405,22 +407,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         # Parse args
         self.server_args = server_args
-        # In a tokenizer-worker process this is the process's first publish;
-        # the in-process path re-projects the object the launcher published.
-        set_global_server_args_for_tokenizer(server_args)
+        ensure_published(server_args, role="tokenizer")
         self.startup_time: Optional[Dict[str, Any]] = None
         self.elastic_worker_count = get_parallel().dp_size
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "idle"
         self.elastic_last_error = None
-        self.enable_metrics = server_args.enable_metrics
-        self.incremental_streaming_output = server_args.incremental_streaming_output
+        self.enable_metrics = get_observability().enable_metrics
+        self.incremental_streaming_output = get_serving().incremental_streaming_output
         self.enable_lora = get_lora().enable_lora
-        self.enable_trace = server_args.enable_trace
-        self.allow_auto_truncate = server_args.allow_auto_truncate
-        self.skip_tokenizer_init = server_args.skip_tokenizer_init
+        self.enable_trace = get_observability().enable_trace
+        self.allow_auto_truncate = get_serving().allow_auto_truncate
+        self.skip_tokenizer_init = get_serving().skip_tokenizer_init
         self.preferred_sampling_params = get_serving().preferred_sampling_params
-        self.crash_dump_folder = server_args.crash_dump_folder
+        self.crash_dump_folder = get_observability().crash_dump_folder
 
         # Init model config
         self.init_model_config()
@@ -464,15 +464,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         model_config_class = getattr(self, "model_config_class", ModelConfig)
 
         # Read model args
-        self.model_path = server_args.model_path
-        self.served_model_name = server_args.served_model_name
+        self.model_path = get_model().model_path
+        self.served_model_name = get_serving().served_model_name
         self.model_config = model_config_class.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
         self.max_req_input_len = None  # Will be set later in engine.py
-        self.enable_priority_scheduling = server_args.enable_priority_scheduling
-        self.default_priority_value = server_args.default_priority_value
+        self.enable_priority_scheduling = get_schedule().enable_priority_scheduling
+        self.default_priority_value = get_schedule().default_priority_value
         self.num_reserved_tokens = compute_num_reserved_tokens()
         self.validate_total_tokens = True
 
@@ -480,7 +480,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         server_args = self.server_args
 
         # Initialize tokenizer and processor
-        if self.model_config.is_multimodal and not server_args.language_model_only:
+        if self.model_config.is_multimodal and not get_disagg().language_model_only:
             import_processors("sglang.srt.multimodal.processors")
             if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
                 import_processors(mm_process_pkg, overwrite=True)
@@ -498,7 +498,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 model_config=self.model_config,
             )
 
-            if server_args.skip_tokenizer_init:
+            if get_serving().skip_tokenizer_init:
                 self.tokenizer = self.processor = None
             else:
                 self.processor = _processor
@@ -507,26 +507,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             self.mm_processor = self.processor = None
 
-            if server_args.skip_tokenizer_init:
+            if get_serving().skip_tokenizer_init:
                 self.tokenizer = None
             else:
                 self.tokenizer = get_tokenizer(
                     get_serving().tokenizer_path,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                    tokenizer_backend=server_args.tokenizer_backend,
+                    tokenizer_mode=get_serving().tokenizer_mode,
+                    trust_remote_code=get_model().trust_remote_code,
+                    revision=get_model().revision,
+                    tokenizer_backend=get_serving().tokenizer_backend,
                 )
 
         # Initialize async dynamic batch tokenizer if enabled (common for both multimodal and non-multimodal)
         if (
-            server_args.enable_dynamic_batch_tokenizer
-            and not server_args.skip_tokenizer_init
+            get_serving().enable_dynamic_batch_tokenizer
+            and not get_serving().skip_tokenizer_init
         ):
             self.async_dynamic_batch_tokenizer = AsyncDynamicbatchTokenizer(
                 self.tokenizer,
-                max_batch_size=server_args.dynamic_batch_tokenizer_batch_size,
-                batch_wait_timeout_s=server_args.dynamic_batch_tokenizer_batch_timeout,
+                max_batch_size=get_serving().dynamic_batch_tokenizer_batch_size,
+                batch_wait_timeout_s=get_serving().dynamic_batch_tokenizer_batch_timeout,
             )
         else:
             self.async_dynamic_batch_tokenizer = None
@@ -549,7 +549,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
-        if self.server_args.tokenizer_worker_num == 1:
+        if get_serving().tokenizer_worker_num == 1:
             self.send_to_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
             )
@@ -597,10 +597,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # TODO: Refactor and organize the log export code.
         # Request logging
         self.request_logger = RequestLogger(
-            log_requests=self.server_args.log_requests,
-            log_requests_level=self.server_args.log_requests_level,
-            log_requests_format=self.server_args.log_requests_format,
-            log_requests_target=self.server_args.log_requests_target,
+            log_requests=get_observability().log_requests,
+            log_requests_level=get_observability().log_requests_level,
+            log_requests_format=get_observability().log_requests_format,
+            log_requests_target=get_observability().log_requests_target,
         )
 
         # Dumping
@@ -623,7 +623,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_weight_update(self):
         # Initial weights status
         self.initial_weights_loaded = True
-        if self.server_args.checkpoint_engine_wait_weights_before_ready:
+        if get_model().checkpoint_engine_wait_weights_before_ready:
             self.initial_weights_loaded = False
 
         # Weight updates
@@ -670,7 +670,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Encoder Disaggregation
         self.encoder_bootstrap_server = None
-        if self.server_args.language_only:
+        if get_disagg().language_only:
             from sglang.srt.disaggregation.encoder.receiver import (
                 EncoderBootstrapServer,
             )
@@ -679,10 +679,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # entries as encoders register, the receiver reads from the same
             # list.  Pre-populated with static --encoder-urls so the legacy
             # CLI flag still works (alongside dynamic registrations).
-            self.encoder_urls: List[str] = list(self.server_args.encoder_urls)
+            self.encoder_urls: List[str] = list(get_disagg().encoder_urls)
             self.encoder_bootstrap_server = EncoderBootstrapServer(
-                host=self.server_args.host,
-                port=self.server_args.encoder_bootstrap_port,
+                host=get_serving().host,
+                port=get_disagg().encoder_bootstrap_port,
                 urls=self.encoder_urls,
             )
             self.mm_receiver = create_mm_receiver(
@@ -700,16 +700,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
             labels = {
-                "model_name": self.server_args.served_model_name,
+                "model_name": get_serving().served_model_name,
                 "engine_type": engine_type,
             }
             if self.enable_priority_scheduling:
                 labels["priority"] = ""
-            if self.server_args.tokenizer_metrics_allowed_custom_labels:
-                for label in self.server_args.tokenizer_metrics_allowed_custom_labels:
+            if get_observability().tokenizer_metrics_allowed_custom_labels:
+                for (
+                    label
+                ) in get_observability().tokenizer_metrics_allowed_custom_labels:
                     labels[label] = ""
-            if self.server_args.extra_metric_labels:
-                labels.update(self.server_args.extra_metric_labels)
+            if get_observability().extra_metric_labels:
+                labels.update(get_observability().extra_metric_labels)
             tokenizer_collector_cls = resolve_collector_class(
                 self.server_args,
                 STAT_LOGGER_ROLE_TOKENIZER,
@@ -718,15 +720,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.metrics_collector = tokenizer_collector_cls(
                 server_args=self.server_args,
                 labels=labels,
-                bucket_time_to_first_token=self.server_args.bucket_time_to_first_token,
-                bucket_e2e_request_latency=self.server_args.bucket_e2e_request_latency,
-                bucket_inter_token_latency=self.server_args.bucket_inter_token_latency,
+                bucket_time_to_first_token=get_observability().bucket_time_to_first_token,
+                bucket_e2e_request_latency=get_observability().bucket_e2e_request_latency,
+                bucket_inter_token_latency=get_observability().bucket_inter_token_latency,
             )
 
             start_cpu_monitor_thread("tokenizer")
 
-        if self.server_args.gc_warning_threshold_secs > 0.0:
-            configure_gc_warning(self.server_args.gc_warning_threshold_secs)
+        if get_observability().gc_warning_threshold_secs > 0.0:
+            configure_gc_warning(get_observability().gc_warning_threshold_secs)
         self.soft_watchdog = Watchdog.create(
             debug_name="TokenizerManager",
             watchdog_timeout=get_device().soft_watchdog_timeout,
@@ -775,7 +777,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if (
             isinstance(obj, GenerateReqInput)
             and obj.max_thinking_tokens is not None
-            and not self.server_args.enable_strict_thinking
+            and not get_serving().enable_strict_thinking
         ):
             raise ValueError(
                 "max_thinking_tokens requires the server to be launched with "
@@ -795,7 +797,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         self._init_req_state(obj, request)
         try:
-            if self.server_args.language_only:
+            if get_disagg().language_only:
                 self._handle_epd_disaggregation_encode_request(obj)
 
             # Log the request
@@ -995,7 +997,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
         contains_mm_input = obj.contains_mm_input()
-        if contains_mm_input and self.server_args.language_model_only:
+        if contains_mm_input and get_disagg().language_model_only:
             raise ValueError(
                 "Multimodal inputs are not supported when --language-model-only "
                 "is set; the encoder is not loaded. Restart without the flag."
@@ -1030,10 +1032,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
             if (
-                not self.server_args.language_only
+                not get_disagg().language_only
                 or get_disagg().encoder_transfer_backend == "zmq_to_tokenizer"
             ):
-                if self.server_args.language_only:
+                if get_disagg().language_only:
                     mm_inputs = await self.mm_receiver.recv_mm_data(
                         request_obj=obj,
                         mm_processor=self.mm_processor,
@@ -1055,7 +1057,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         max_req_input_len=self.max_req_input_len,
                     )
             elif (
-                self.server_args.language_only
+                get_disagg().language_only
                 and get_disagg().encoder_transfer_backend
                 in ["zmq_to_scheduler", "mooncake"]
                 and not obj.need_wait_for_mm_inputs
@@ -1240,7 +1242,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
             if (
                 obj.custom_logit_processor
-                and not self.server_args.enable_custom_logit_processor
+                and not get_exec().features.enable_custom_logit_processor
             ):
                 raise ValueError(
                     "The server is not configured to enable custom logit processor. "
@@ -1947,7 +1949,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         if (
             not abort_all
-            and self.server_args.tokenizer_worker_num == 1
+            and get_serving().tokenizer_worker_num == 1
             and rid not in self.rid_to_state
         ):
             return
@@ -2177,7 +2179,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             customized_info = None
         pending_notify: dict[str, ReqState] = {}
-        batch_notify_size = self.server_args.batch_notify_size
+        batch_notify_size = get_serving().batch_notify_size
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
@@ -3185,7 +3187,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.obj.top_logprobs_num,
                 state.obj.token_ids_logprob,
                 state.obj.return_text_in_logprobs
-                and not self.server_args.skip_tokenizer_init,
+                and not get_serving().skip_tokenizer_init,
             )
 
         output_ids = state.output_ids
@@ -3306,12 +3308,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             unique_lora_paths = set(obj.lora_path)
 
         if (
-            self.server_args.max_loaded_loras is not None
-            and len(unique_lora_paths) > self.server_args.max_loaded_loras
+            get_lora().max_loaded_loras is not None
+            and len(unique_lora_paths) > get_lora().max_loaded_loras
         ):
             raise ValueError(
                 f"Received request with {len(unique_lora_paths)} unique loras requested "
-                f"but max loaded loras is {self.server_args.max_loaded_loras}"
+                f"but max loaded loras is {get_lora().max_loaded_loras}"
             )
 
         # Reload all existing LoRA adapters that have been dynamically unloaded
@@ -3444,7 +3446,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if isinstance(obj, GenerateReqInput) and obj.contains_mm_input():
             # dispatch to encoder by default
             should_dispatch = True
-            if self.server_args.enable_adaptive_dispatch_to_encoder:
+            if get_disagg().enable_adaptive_dispatch_to_encoder:
                 should_dispatch = self._should_dispatch_to_encoder(obj)
 
             # Set need_wait_for_mm_inputs flag based on whether we dispatch to encoder
@@ -3581,7 +3583,7 @@ def get_processor_wrapper(server_args):
 
 
 def determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
-    is_cross_node = server_args.dist_init_addr
+    is_cross_node = get_parallel().dist_init_addr
 
     if is_cross_node:
         # Fallback to default CPU transport for multi-node

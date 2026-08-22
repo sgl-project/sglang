@@ -6,6 +6,10 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
 
+from sglang.srt.runtime_context import (
+    get_model,
+    get_spec,
+)
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
 if TYPE_CHECKING:
@@ -25,15 +29,15 @@ def draft_is_deepseek_v4(*, server_args: ServerArgs) -> bool:
     from sglang.srt.configs.model_config import is_deepseek_v4
     from sglang.srt.utils.hf_transformers_utils import get_config
 
-    draft_model_path = server_args.speculative_draft_model_path
+    draft_model_path = get_spec().speculative_draft_model_path
     if not draft_model_path:
         return False
     draft_hf_config = get_config(
         draft_model_path,
-        trust_remote_code=server_args.trust_remote_code,
-        revision=server_args.speculative_draft_model_revision,
-        model_override_args=json.loads(server_args.json_model_override_args),
-        model_config_parser=server_args.model_config_parser,
+        trust_remote_code=get_model().trust_remote_code,
+        revision=get_spec().speculative_draft_model_revision,
+        model_override_args=json.loads(get_model().json_model_override_args),
+        model_config_parser=get_model().model_config_parser,
     )
     return draft_hf_config is not None and is_deepseek_v4(draft_hf_config)
 
@@ -126,14 +130,23 @@ def resolve_runtime_config(
 
 def read_draft_checkpoint_gamma(*, server_args: ServerArgs) -> Optional[int]:
     """Load the draft checkpoint's hf config and read its DSpark gamma
-    (block_size). Raises on config-load failure; callers pick the fallback."""
+    (block_size). Raises on config-load failure; callers pick the fallback.
+
+    Reads the *resolving* configuration, not the bags: the speculative hook
+    calls this from inside resolution, where no bag exists yet -- and the
+    caller swallows exceptions, so a bag read here does not fail loudly, it
+    silently drops the checkpoint's gamma and the cross-check with
+    `--speculative-num-draft-tokens` along with it.
+    """
+    from sglang.srt.arg_groups.overrides import resolved_view
     from sglang.srt.utils.hf_transformers_utils import get_config
 
+    resolving = resolved_view(server_args)
     draft_hf_config = get_config(
-        server_args.speculative_draft_model_path,
-        trust_remote_code=server_args.trust_remote_code,
-        revision=server_args.speculative_draft_model_revision,
-        model_override_args=json.loads(server_args.json_model_override_args),
+        resolving.speculative_draft_model_path,
+        trust_remote_code=resolving.trust_remote_code,
+        revision=resolving.speculative_draft_model_revision,
+        model_override_args=json.loads(resolving.json_model_override_args),
     )
     return parse_dspark_draft_config(draft_hf_config=draft_hf_config).resolve_gamma(
         default=None

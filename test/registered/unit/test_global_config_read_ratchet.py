@@ -56,6 +56,13 @@ _CONFIGURED_SIZE_CALL_SITES = {
         "the launch path decides how many scheduler processes to spawn; it runs "
         "before any of them exists, so there is no group to ask"
     ),
+    ("srt/entrypoints/engine.py", "configured_attn_cp_size"): (
+        "the launcher's per-TP-rank layout, computed while deciding what to "
+        "spawn -- the groups it is laying out do not exist yet"
+    ),
+    ("srt/entrypoints/engine.py", "configured_moe_dp_size"): (
+        "the MoE factor of that same pre-spawn layout"
+    ),
     ("srt/ray/engine.py", "configured_pp_size"): (
         "the Ray driver sizes the actor placement group; the actors it is about "
         "to create are the ones that will hold the process groups"
@@ -103,6 +110,98 @@ _CONFIGURED_SIZE_CALL_SITES = {
     ),
     ("srt/managers/scheduler.py", "configured_attn_cp_size"): (
         "same pre-distributed-init arithmetic in configure_scheduler_process"
+    ),
+    ("srt/managers/scheduler.py", "configured_dcp_size"): (
+        "same pre-distributed-init arithmetic in configure_scheduler_process"
+    ),
+    ("srt/model_executor/runner/base_runner.py", "configured_pp_size"): (
+        "the runner's layer window is arithmetic over the configured stage "
+        "count; a draft runner shares the target's groups, so the live "
+        "property would answer for the wrong runner"
+    ),
+    ("srt/model_executor/cpu_graph_runner.py", "configured_pp_size"): (
+        "the same window, on the CPU graph path"
+    ),
+    (
+        "srt/managers/scheduler_components/metrics_reporter.py",
+        "configured_pp_size",
+    ): (
+        "the reporter labels its metrics with the stage count it was launched "
+        "with, which is configuration; the live group answers per process"
+    ),
+    ("srt/speculative/eagle_draft_cuda_graph_runner.py", "configured_pp_size"): (
+        "the draft runner's window over the target's stages: its own groups are "
+        "the target's, so the configured count is the one that describes it"
+    ),
+    (
+        "srt/speculative/eagle_draft_extend_cuda_graph_runner.py",
+        "configured_pp_size",
+    ): ("the same draft window, on the extend path"),
+    (
+        "srt/speculative/multi_layer_eagle_draft_extend_cuda_graph_runner.py",
+        "configured_pp_size",
+    ): ("the same draft window, multi-layer extend"),
+    ("srt/speculative/frozen_kv_mtp_cuda_graph_runner.py", "configured_pp_size"): (
+        "the same draft window, frozen-KV MTP"
+    ),
+    ("srt/managers/data_parallel_controller.py", "configured_pp_size"): (
+        "the controller lays out its schedulers' ranks before spawning them, so "
+        "the groups it is sizing for do not exist yet"
+    ),
+    ("srt/managers/data_parallel_controller.py", "configured_attn_cp_size"): (
+        "the same pre-spawn rank arithmetic"
+    ),
+    ("srt/managers/data_parallel_controller.py", "configured_moe_dp_size"): (
+        "the same pre-spawn rank arithmetic"
+    ),
+    ("srt/entrypoints/v1_loads.py", "configured_pp_size"): (
+        "the /v1/loads accelerator count is arithmetic over the launch shape, "
+        "reported from the tokenizer process, which holds no model groups"
+    ),
+    ("srt/disaggregation/common/conn.py", "configured_pp_size"): (
+        "the bootstrap connection is built by the KV manager on the transfer "
+        "path, which the CPU-only conn tests exercise without ever starting "
+        "torch.distributed"
+    ),
+    ("srt/elastic_ep/elastic_ep.py", "configured_tp_size"): (
+        "the joiner's rank window is computed against the size the process was "
+        "configured with, not the size of the group it is about to join"
+    ),
+    ("srt/elastic_ep/expert_backup_manager.py", "configured_tp_size"): (
+        "the backup server counts the clients it expects to report in, which "
+        "is how many the launch configured -- the live group is what they are "
+        "still joining"
+    ),
+    (
+        "srt/model_executor/model_runner_components/startup_weight_load.py",
+        "configured_tp_size",
+    ): (
+        "the load options are assembled in ModelRunner.__init__ for a runner "
+        "that may be a draft, whose groups are the target's; the configured "
+        "sizes are what the record answered before"
+    ),
+    (
+        "srt/model_executor/model_runner_components/startup_weight_load.py",
+        "configured_pp_size",
+    ): ("same options object, same reason"),
+    (
+        "srt/model_executor/model_runner_components/startup_weight_load.py",
+        "configured_attn_cp_size",
+    ): ("same options object, same reason"),
+    (
+        "srt/model_executor/model_runner_components/startup_weight_load.py",
+        "configured_dcp_size",
+    ): ("same options object, same reason"),
+    (
+        "srt/model_executor/model_runner_components/spec_aux_hidden_state.py",
+        "configured_tp_size",
+    ): (
+        "the draft KV bytes/token estimate sizes the memory pool before the "
+        "draft runner exists, so its shard count is configuration"
+    ),
+    ("srt/eplb/expert_location.py", "configured_tp_size"): (
+        "the elastic-EP joiner window, used to size the expert layout: the "
+        "size the process was configured with, not the group it is joining"
     ),
     ("srt/utils/cuda_vmm_transport_utils.py", "configured_tp_size"): (
         "the consumer count is configured fan-out arithmetic (tp_size // "

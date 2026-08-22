@@ -74,7 +74,11 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_lora,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -186,7 +190,7 @@ class TokenizerControlMixin:
         self: TokenizerManager, obj: AddExternalCorpusReqInput
     ) -> AddExternalCorpusReqOutput:
         self.auto_create_handle_loop()
-        if self.server_args.speculative_algorithm != "NGRAM":
+        if get_spec().speculative_algorithm != "NGRAM":
             return AddExternalCorpusReqOutput(
                 success=False,
                 message="Ngram speculative decoding is not enabled.",
@@ -262,7 +266,7 @@ class TokenizerControlMixin:
         self: TokenizerManager, corpus_id: str
     ) -> RemoveExternalCorpusReqOutput:
         self.auto_create_handle_loop()
-        if self.server_args.speculative_algorithm != "NGRAM":
+        if get_spec().speculative_algorithm != "NGRAM":
             return RemoveExternalCorpusReqOutput(
                 success=False,
                 message="Ngram speculative decoding is not enabled.",
@@ -277,7 +281,7 @@ class TokenizerControlMixin:
         self: TokenizerManager,
     ) -> ListExternalCorporaReqOutput:
         self.auto_create_handle_loop()
-        if self.server_args.speculative_algorithm != "NGRAM":
+        if get_spec().speculative_algorithm != "NGRAM":
             return ListExternalCorporaReqOutput(
                 success=False,
                 message="Ngram speculative decoding is not enabled.",
@@ -602,7 +606,7 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
 
         try:
-            if not self.server_args.enable_lora:
+            if not get_lora().enable_lora:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
@@ -680,7 +684,7 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
 
         try:
-            if not self.server_args.enable_lora:
+            if not get_lora().enable_lora:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
@@ -756,7 +760,7 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
 
         try:
-            if not self.server_args.enable_lora:
+            if not get_lora().enable_lora:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )

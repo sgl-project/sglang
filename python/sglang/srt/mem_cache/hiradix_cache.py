@@ -65,7 +65,11 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetricsCollector,
     resolve_collector_class,
 )
-from sglang.srt.runtime_context import get_memory
+from sglang.srt.runtime_context import (
+    get_memory,
+    get_observability,
+    get_serving,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -88,9 +92,9 @@ class HiRadixCache(RadixCache):
             self.token_to_kv_pool_host = get_mha_host_pool_cls(self.kv_cache)(
                 self.kv_cache,
                 get_memory().hicache_ratio,
-                server_args.hicache_size,
+                get_memory().hicache_size,
                 self.page_size,
-                server_args.hicache_mem_layout,
+                get_memory().hicache_mem_layout,
                 allocator_type=allocator_type,
             )
         elif isinstance(self.kv_cache, DSATokenToKVPool):
@@ -106,9 +110,9 @@ class HiRadixCache(RadixCache):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
                 get_memory().hicache_ratio,
-                server_args.hicache_size,
+                get_memory().hicache_size,
                 self.page_size,
-                server_args.hicache_mem_layout,
+                get_memory().hicache_mem_layout,
                 allocator_type=allocator_type,
                 dcp_size=_parallel.attn_dcp_size,
                 dcp_rank=_parallel.attn_dcp_rank,
@@ -123,9 +127,9 @@ class HiRadixCache(RadixCache):
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
-        self.enable_storage = server_args.hicache_storage_backend is not None
+        self.enable_storage = get_memory().hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
-        self.extra_metric_labels = server_args.extra_metric_labels
+        self.extra_metric_labels = get_observability().extra_metric_labels
 
         (
             extra_config,
@@ -133,11 +137,11 @@ class HiRadixCache(RadixCache):
             prefetch_timeout_config,
             hicache_storage_pass_prefix_keys,
         ) = self._parse_storage_backend_extra_config(
-            server_args.hicache_storage_backend_extra_config
+            get_memory().hicache_storage_backend_extra_config
         )
         # TODO: support more timeout check functions
         self.is_prefetch_timeout = self._prefetch_timeout_check_linear_func
-        self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
+        self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
         if isinstance(self.kv_cache, DSATokenToKVPool):
@@ -174,16 +178,16 @@ class HiRadixCache(RadixCache):
                 attn_cp_group=self.attn_cp_group,
                 attn_tp_group=self.attn_tp_group,
                 pp_group=self.pp_group,
-                write_policy=server_args.hicache_write_policy,
-                io_backend=server_args.hicache_io_backend,
-                storage_backend=server_args.hicache_storage_backend,
+                write_policy=get_memory().hicache_write_policy,
+                io_backend=get_memory().hicache_io_backend,
+                storage_backend=get_memory().hicache_storage_backend,
                 prefetch_threshold=prefetch_threshold,
-                model_name=server_args.served_model_name,
+                model_name=get_serving().served_model_name,
                 storage_backend_extra_config=extra_config,
                 enable_storage_metrics=self.enable_storage_metrics,
             )
         self._apply_storage_runtime_config(
-            storage_backend=server_args.hicache_storage_backend,
+            storage_backend=get_memory().hicache_storage_backend,
             prefetch_threshold=prefetch_threshold,
             prefetch_timeout_config=prefetch_timeout_config,
             hicache_storage_pass_prefix_keys=hicache_storage_pass_prefix_keys,
@@ -205,7 +209,7 @@ class HiRadixCache(RadixCache):
         self.work_list: List[torch.distributed.Work] = []
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
-            1 if server_args.hicache_write_policy == "write_through" else 2
+            1 if get_memory().hicache_write_policy == "write_through" else 2
         )
         self.load_back_threshold = 10
         # Detach storage backend automatically on process shutdown
