@@ -21,6 +21,7 @@ from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import (
     CheckpointFilePrefetchHandle,
     _prefetch_all_checkpoints,
+    _prefetch_checkpoint_file,
     buffered_multi_thread_safetensors_weights_iterator,
     fastsafetensors_weights_iterator,
     safetensors_weights_iterator,
@@ -107,6 +108,16 @@ class TestPrefetchCheckpoints(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "num_threads"):
             _prefetch_all_checkpoints(["dummy.safetensors"], num_threads=0)
 
+    def test_prefetch_file_distinguishes_eof_from_cancellation(self):
+        with tempfile.NamedTemporaryFile() as checkpoint:
+            checkpoint.write(b"checkpoint")
+            checkpoint.flush()
+            self.assertTrue(_prefetch_checkpoint_file(checkpoint.name))
+
+            cancel_event = threading.Event()
+            cancel_event.set()
+            self.assertFalse(_prefetch_checkpoint_file(checkpoint.name, cancel_event))
+
     @patch("torch.distributed.is_initialized", return_value=False)
     def test_wait_returns_after_worker_thread_failure(self, _):
         worker_errors = []
@@ -125,6 +136,8 @@ class TestPrefetchCheckpoints(CustomTestCase):
 
         self.assertTrue(handle.done)
         self.assertTrue(handle.failed)
+        handle.cancel()
+        self.assertTrue(handle.failed)
         self.assertEqual(handle.errors, ())
         self.assertEqual(len(worker_errors), 1)
         self.assertIsInstance(worker_errors[0], RuntimeError)
@@ -136,7 +149,7 @@ class TestPrefetchCheckpoints(CustomTestCase):
         handle = CheckpointFilePrefetchHandle(
             thread=thread,
             cancel_event=cancel_event,
-            succeeded_event=threading.Event(),
+            normal_exit_event=threading.Event(),
             errors=[],
         )
 
@@ -165,7 +178,10 @@ class TestPrefetchCheckpoints(CustomTestCase):
             patch("threading.Thread", _InlineThread),
             patch("concurrent.futures.ThreadPoolExecutor", RecordingExecutor),
             patch("concurrent.futures.wait", side_effect=record_pending_size),
-            patch("sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file"),
+            patch(
+                "sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file",
+                return_value=True,
+            ),
         ):
             _prefetch_all_checkpoints(paths, num_threads=4)
 
@@ -192,6 +208,7 @@ class TestPrefetchCheckpoints(CustomTestCase):
             handle = _prefetch_all_checkpoints(paths, num_threads=1)
 
         handle.wait()
+        self.assertTrue(handle.failed)
         self.assertEqual(handle.errors[0][0], paths[0])
         self.assertIsInstance(handle.errors[0][1], OSError)
         warning.assert_called_once()
@@ -210,7 +227,10 @@ class TestPrefetchCheckpoints(CustomTestCase):
             patch("threading.Thread", _InlineThread),
             patch("concurrent.futures.ThreadPoolExecutor", _InlineExecutor),
             patch("concurrent.futures.wait", side_effect=_wait_all),
-            patch("sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file"),
+            patch(
+                "sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file",
+                return_value=True,
+            ),
             patch("sglang.srt.model_loader.weight_utils.logger.info") as log_info,
         ):
             _prefetch_all_checkpoints(paths, num_threads=1)
@@ -243,7 +263,9 @@ class TestPrefetchCheckpoints(CustomTestCase):
             ),
             patch(
                 "sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file",
-                side_effect=lambda path, cancel_event: loaded_paths.append(path),
+                side_effect=lambda path, cancel_event: (
+                    loaded_paths.append(path) or True
+                ),
             ),
         ):
             _prefetch_all_checkpoints(paths, num_threads=2)
@@ -262,9 +284,12 @@ class TestPrefetchCheckpoints(CustomTestCase):
             started.set()
             self.assertTrue(release.wait(timeout=5))
 
-        with patch(
-            "sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file",
-            side_effect=block_first_prefetch,
+        with (
+            patch(
+                "sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file",
+                side_effect=block_first_prefetch,
+            ),
+            patch("sglang.srt.model_loader.weight_utils.logger.info") as log_info,
         ):
             handle = _prefetch_all_checkpoints(paths, num_threads=1)
             self.assertTrue(started.wait(timeout=5))
@@ -275,7 +300,15 @@ class TestPrefetchCheckpoints(CustomTestCase):
             handle.wait(timeout=5)
 
         self.assertTrue(handle.cancelled)
+        self.assertFalse(handle.failed)
         self.assertEqual(loaded_paths, paths[:1])
+        stopped_log = next(
+            call for call in log_info.call_args_list if "worker stopped" in call.args[0]
+        )
+        self.assertEqual(stopped_log.args[3:], (0, len(paths)))
+        self.assertFalse(
+            any("finished in" in call.args[0] for call in log_info.call_args_list)
+        )
 
     @patch("torch.distributed.is_initialized", return_value=False)
     def test_buffered_loader_drops_cache_after_each_loaded_shard(self, _):
@@ -543,6 +576,89 @@ class TestPrefetchDispatch(CustomTestCase):
         self.assertFalse(mock_single.call_args.kwargs["prefetch"])
         mock_buffered.assert_not_called()
         mock_warning.assert_called_once()
+
+    def test_active_startup_prefetch_honors_explicit_multithread_config(self):
+        for extra_config, expected_workers in (
+            ({"enable_multithread_load": True}, DefaultModelLoader.DEFAULT_NUM_THREADS),
+            ({"num_threads": 64}, 64),
+        ):
+            with self.subTest(extra_config=extra_config):
+                loader = self._make_loader(extra_config)
+                source = self._make_source()
+                resolved_source = DefaultModelLoader.ResolvedSource(
+                    source=source,
+                    hf_folder="/dummy",
+                    weight_files=("f.safetensors",),
+                    use_safetensors=True,
+                )
+                p_prep, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+                    prefetch=False
+                )
+                with (
+                    p_prep as mock_prepare,
+                    p_model,
+                    p_buffered as mock_buffered,
+                    p_single as mock_single,
+                    p_warn as mock_warning,
+                ):
+                    list(
+                        loader._get_weights_iterator(
+                            source,
+                            resolved_source=resolved_source,
+                            startup_prefetch_started=True,
+                            startup_prefetch_active=True,
+                        )
+                    )
+
+                mock_prepare.assert_not_called()
+                mock_buffered.assert_called_once()
+                self.assertEqual(
+                    mock_buffered.call_args.kwargs["max_workers"], expected_workers
+                )
+                self.assertFalse(mock_buffered.call_args.kwargs["prefetch"])
+                mock_single.assert_not_called()
+                mock_warning.assert_not_called()
+
+    def test_startup_prefetch_dispatch_is_independent_of_source_path(self):
+        for hf_folder in ("/local/model", "/remote/model"):
+            for active in (True, False):
+                with self.subTest(hf_folder=hf_folder, active=active):
+                    loader = self._make_loader({})
+                    source = self._make_source()
+                    resolved_source = DefaultModelLoader.ResolvedSource(
+                        source=source,
+                        hf_folder=hf_folder,
+                        weight_files=("f.safetensors",),
+                        use_safetensors=True,
+                    )
+                    p_prep, p_model, p_buffered, p_single, p_warn = (
+                        self._patch_dispatch(prefetch=False)
+                    )
+                    with (
+                        p_prep as mock_prepare,
+                        p_model,
+                        p_buffered as mock_buffered,
+                        p_single as mock_single,
+                        p_warn,
+                    ):
+                        list(
+                            loader._get_weights_iterator(
+                                source,
+                                resolved_source=resolved_source,
+                                startup_prefetch_started=True,
+                                startup_prefetch_active=active,
+                            )
+                        )
+
+                    mock_prepare.assert_not_called()
+                    if active:
+                        mock_single.assert_called_once()
+                        mock_buffered.assert_not_called()
+                        self.assertFalse(mock_single.call_args.kwargs["prefetch"])
+                    else:
+                        mock_buffered.assert_called_once()
+                        mock_single.assert_not_called()
+                        self.assertFalse(mock_buffered.call_args.kwargs["prefetch"])
 
     def test_completed_startup_prefetch_restores_multithread_loader(self):
         loader = self._make_loader({})

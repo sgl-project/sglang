@@ -872,16 +872,19 @@ def np_cache_weights_iterator(
 def _prefetch_checkpoint_file(
     file_path: str,
     cancel_event: Optional[threading.Event] = None,
-) -> None:
+) -> bool:
     """Prefetch a checkpoint file into the OS page cache.
 
     Reads the file sequentially in 16 MB blocks so the kernel caches its pages
-    before workers load the same file via mmap.
+    before workers load the same file via mmap. Returns whether EOF was reached;
+    cooperative cancellation may leave the file only partially prefetched.
     """
     with open(file_path, "rb") as f:
-        while cancel_event is None or not cancel_event.is_set():
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                return False
             if not f.read(_get_prefetch_block_size()):
-                break
+                return True
 
 
 class CheckpointFilePrefetchHandle:
@@ -892,12 +895,12 @@ class CheckpointFilePrefetchHandle:
         *,
         thread: threading.Thread,
         cancel_event: threading.Event,
-        succeeded_event: threading.Event,
+        normal_exit_event: threading.Event,
         errors: List[Tuple[str, Exception]],
     ) -> None:
         self._thread = thread
         self._cancel_event = cancel_event
-        self._succeeded_event = succeeded_event
+        self._normal_exit_event = normal_exit_event
         self._errors = errors
 
     def wait(self, timeout: Optional[float] = None) -> None:
@@ -920,7 +923,9 @@ class CheckpointFilePrefetchHandle:
 
     @property
     def failed(self) -> bool:
-        return bool(self._errors) or (self.done and not self._succeeded_event.is_set())
+        return bool(self._errors) or (
+            self.done and not self._normal_exit_event.is_set()
+        )
 
     @property
     def cancelled(self) -> bool:
@@ -969,7 +974,7 @@ def _prefetch_all_checkpoints(
     my_files = sorted_files[local_rank::local_world_size]
     total_for_rank = len(my_files)
     cancel_event = threading.Event()
-    succeeded_event = threading.Event()
+    normal_exit_event = threading.Event()
     errors: List[Tuple[str, Exception]] = []
 
     logger.info(
@@ -982,7 +987,7 @@ def _prefetch_all_checkpoints(
         num_threads,
     )
 
-    def _prefetch_all() -> None:
+    def _prefetch_all() -> int:
         completed = 0
         next_log_pct = 10
 
@@ -1028,7 +1033,8 @@ def _prefetch_all_checkpoints(
                             path,
                             exc,
                         )
-                    record_complete()
+                    elif future.result():
+                        record_complete()
 
                     next_path = None if cancel_event.is_set() else next(file_iter, None)
                     if next_path is not None:
@@ -1039,23 +1045,35 @@ def _prefetch_all_checkpoints(
                                 cancel_event,
                             )
                         ] = next_path
+        return completed
 
     def _run_prefetch() -> None:
         start = time.perf_counter()
-        _prefetch_all()
-        succeeded_event.set()
-        logger.info(
-            "Rank %d: prefetching checkpoint files into page cache "
-            "finished in %.2fs",
-            local_rank,
-            time.perf_counter() - start,
-        )
+        completed = _prefetch_all()
+        normal_exit_event.set()
+        elapsed = time.perf_counter() - start
+        if completed == total_for_rank and not errors:
+            logger.info(
+                "Rank %d: prefetching checkpoint files into page cache "
+                "finished in %.2fs",
+                local_rank,
+                elapsed,
+            )
+        else:
+            logger.info(
+                "Rank %d: checkpoint prefetch worker stopped after %.2fs "
+                "(%d/%d shards fully prefetched)",
+                local_rank,
+                elapsed,
+                completed,
+                total_for_rank,
+            )
 
     thread = threading.Thread(target=_run_prefetch, daemon=True)
     handle = CheckpointFilePrefetchHandle(
         thread=thread,
         cancel_event=cancel_event,
-        succeeded_event=succeeded_event,
+        normal_exit_event=normal_exit_event,
         errors=errors,
     )
     thread.start()
@@ -1635,15 +1653,35 @@ def set_runai_streamer_env(load_config: LoadConfig):
 def initialize_capture_safe_weights(
     model: torch.nn.Module,
     value: float = CAPTURE_SAFE_WEIGHT_SENTINEL,
-) -> None:
+) -> Tuple[Tuple[torch.nn.Parameter, torch.Tensor], ...]:
     """Fill floating-point parameters with finite values for graph warmup.
 
+    Parameters marked ``_skip_weight_check`` may be absent from a checkpoint,
+    so preserve their constructor values for the real post-load pass. The
+    returned snapshots must be restored before checkpoint tensors are copied;
+    this gives optional-weight logic the same inputs as serial loading even
+    though capture preparation runs post-load processing once first.
     Persistent buffers are intentionally left intact: unlike parameters, they
     are not guaranteed to be replaced by ``model.load_weights()``.
     """
+    optional_parameter_values = []
     for param in model.parameters():
-        if torch.is_floating_point(param):
+        if not torch.is_floating_point(param):
+            continue
+        if getattr(param, "_skip_weight_check", False):
+            optional_parameter_values.append((param, param.detach().clone()))
+        else:
             param.fill_(value)
+    return tuple(optional_parameter_values)
+
+
+@torch.no_grad()
+def restore_optional_checkpoint_parameter_values(
+    parameter_values: Tuple[Tuple[torch.nn.Parameter, torch.Tensor], ...],
+) -> None:
+    """Restore optional parameters to their pre-capture constructor values."""
+    for parameter, value in parameter_values:
+        parameter.copy_(value)
 
 
 def initialize_dummy_weights(

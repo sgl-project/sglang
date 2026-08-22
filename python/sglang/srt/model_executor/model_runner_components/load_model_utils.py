@@ -303,7 +303,8 @@ def load_model_with_memory_saver(
             model_config=model_config,
         )
         device_config = DeviceConfig(device, gpu_id)
-        if server_args.is_startup_weight_load_overlap:
+        model = None
+        if server_args.should_attempt_startup_weight_load_overlap:
             from sglang.srt.model_executor.model_runner_components.startup_weight_load import (
                 StartupWeightLoadManager,
             )
@@ -316,8 +317,11 @@ def load_model_with_memory_saver(
                 server_args=server_args,
                 is_draft_worker=is_draft_worker,
             )
-            model = startup_weight_load.prepare()
-        else:
+            if startup_weight_load is not None:
+                model = startup_weight_load.prepare()
+                if not startup_weight_load.is_deferred:
+                    startup_weight_load = None
+        if model is None:
             model = loader.load_model(
                 model_config=model_config,
                 device_config=device_config,

@@ -80,13 +80,9 @@ from sglang.srt.connector import (
     get_connector_type,
 )
 from sglang.srt.connector.utils import parse_model_name
-from sglang.srt.distributed import (
-    model_parallel_is_initialized,
-)
+from sglang.srt.distributed import model_parallel_is_initialized
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
-from sglang.srt.layers.moe.utils import (
-    install_shared_experts_fusion_decision,
-)
+from sglang.srt.layers.moe.utils import install_shared_experts_fusion_decision
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
@@ -120,6 +116,7 @@ from sglang.srt.model_loader.weight_utils import (
     multi_thread_pt_weights_iterator,
     np_cache_weights_iterator,
     pt_weights_iterator,
+    restore_optional_checkpoint_parameter_values,
     safetensors_weights_iterator,
     set_runai_streamer_env,
 )
@@ -427,6 +424,7 @@ class DefaultModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
+        self._startup_optional_parameter_values = None
         extra_config = load_config.model_loader_extra_config
         allowed_keys = {"enable_multithread_load", "num_threads"}
         if load_config.load_format == LoadFormat.FASTSAFETENSORS:
@@ -640,8 +638,7 @@ class DefaultModelLoader(BaseModelLoader):
             # Setting enable_multithread_load or num_threads in
             # --model-loader-extra-config opts out (the latter is consumed
             # only by the multi-threaded iterator, so it signals intent);
-            # e.g. local NVMe, where prefetch is a no-op and multi-threading
-            # helps.
+            # this can be preferable on high-throughput local storage.
             if (
                 concurrent_prefetch_active
                 and not weight_loader_disable_mmap
@@ -787,7 +784,7 @@ class DefaultModelLoader(BaseModelLoader):
         *,
         num_threads: int,
     ) -> CheckpointFilePrefetchHandle:
-        """Start CPU-only page-cache staging for already-resolved sources."""
+        """Start CPU-only page-cache prefetching for already-resolved sources."""
         if not all(source.use_safetensors for source in resolved_sources):
             raise ValueError(
                 "Startup weight-loading overlap requires safetensors checkpoints"
@@ -833,12 +830,17 @@ class DefaultModelLoader(BaseModelLoader):
         so overlap invokes it once more than the serial path. That is safe for
         the currently supported matrix, where the CUDA unquantized path is a
         no-op, and it is not covered by the storage manifest, which proves
-        tensor identity rather than idempotence. Any quantization method that
-        mutates weights in place therefore has to be evaluated here before its
-        configuration is added to the supported set.
+        tensor identity rather than idempotence. Native dense profiles use
+        post-load paths that are no-ops on CUDA. Quantized profiles are admitted
+        only when their exact backend combination refreshes the same parameter
+        and derived-tensor storage in place. Any additional quantization method
+        must therefore be evaluated here before its configuration is added to
+        the supported set.
         """
         with set_default_torch_dtype(model_config.dtype):
-            initialize_capture_safe_weights(model)
+            self._startup_optional_parameter_values = initialize_capture_safe_weights(
+                model
+            )
             _post_load_weights(model)
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
@@ -863,6 +865,12 @@ class DefaultModelLoader(BaseModelLoader):
     ) -> None:
         """Load real checkpoint values into a capture-ready model."""
 
+        assert self._startup_optional_parameter_values is not None
+        restore_optional_checkpoint_parameter_values(
+            self._startup_optional_parameter_values
+        )
+        self._startup_optional_parameter_values = None
+
         def weights_iterator():
             for resolved_source in resolved_sources:
                 yield from self._get_weights_iterator(
@@ -879,6 +887,39 @@ class DefaultModelLoader(BaseModelLoader):
                 target_device,
             )
         self.counter_after_loading_weights = time.perf_counter()
+
+    def load_initialized_model_from_resolved_sources(
+        self,
+        *,
+        model: nn.Module,
+        model_config: ModelConfig,
+        resolved_sources: Tuple[ResolvedSource, ...],
+        target_device: torch.device,
+    ) -> nn.Module:
+        """Run the serial loader on an already initialized model.
+
+        Startup ``auto`` mode resolves checkpoint sources before deciding
+        whether overlap is possible. If source-dependent admission rejects
+        overlap, reuse the allocated model and resolved files instead of
+        constructing a second model. Iterator prefetch remains in its normal
+        serial mode because no overlap prefetch worker has been started.
+        """
+
+        def weights_iterator():
+            for resolved_source in resolved_sources:
+                yield from self._get_weights_iterator(
+                    resolved_source.source,
+                    resolved_source=resolved_source,
+                )
+
+        with set_default_torch_dtype(model_config.dtype):
+            self.load_weights_and_postprocess(
+                model,
+                weights_iterator(),
+                target_device,
+            )
+        self.counter_after_loading_weights = time.perf_counter()
+        return model.eval()
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(
