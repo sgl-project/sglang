@@ -124,7 +124,7 @@ class TestDSV4FlashFP4B200Balanced_CP_Megamoe(
                 "--enable-dp-attention",
                 "--moe-a2a-backend",
                 "megamoe",
-                "--enable-w4a4-megamoe",
+                "--enable-w4a4-mxfp4-megamoe",
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-num-steps",

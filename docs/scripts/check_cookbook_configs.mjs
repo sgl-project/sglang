@@ -83,7 +83,7 @@ for (const oldName of [
     fail("config.jsx.tmpl", `still emits removed W4A4 setting ${oldName}`);
   }
 }
-if (!cookbookModelTemplate.includes("--enable-w4a4-megamoe")) {
+if (!cookbookModelTemplate.includes("--enable-w4a4-mxfp4-megamoe")) {
   fail("config.jsx.tmpl", "W4A4 MegaMoE option is missing the server flag");
 }
 

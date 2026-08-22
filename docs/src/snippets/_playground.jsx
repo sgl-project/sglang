@@ -621,7 +621,7 @@ export const Playground = ({ config }) => {
         const flags = (cell && cell.flags) || [];
         const a2a    = h.findFlagArg(flags, "--moe-a2a-backend");
         const runner = h.findFlagArg(flags, "--moe-runner-backend");
-        const w4a4 = h.hasFlag(flags, "--enable-w4a4-megamoe");
+        const w4a4 = h.hasFlag(flags, "--enable-w4a4-mxfp4-megamoe");
         return {
           backend: a2a || runner || null,
           ep: h.parseIntFlagAny(flags, h.EP_HEADS),

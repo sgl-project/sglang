@@ -43,21 +43,27 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
-    def test_enable_w4a4_megamoe_sets_deepgemm_env(self):
+    def test_enable_w4a4_mxfp4_megamoe_sets_deepgemm_env(self):
         deepgemm_env = {
             "DG_USE_FP4_ACTS": "0",
             "DG_USE_MXF4_KIND": "0",
         }
         with patch.dict(os.environ, deepgemm_env, clear=False):
-            args = prepare_server_args(
-                ["--model-path", "dummy", "--enable-w4a4-megamoe"]
-            )
+            try:
+                args = prepare_server_args(
+                    ["--model-path", "dummy", "--enable-w4a4-mxfp4-megamoe"]
+                )
+            except SystemExit as exc:
+                self.fail(
+                    "--enable-w4a4-mxfp4-megamoe must be accepted by the CLI "
+                    f"parser, got SystemExit({exc.code})"
+                )
 
-            self.assertTrue(args.enable_w4a4_megamoe)
+            self.assertTrue(args.enable_w4a4_mxfp4_megamoe)
             self.assertEqual(os.environ["DG_USE_FP4_ACTS"], "1")
             self.assertEqual(os.environ["DG_USE_MXF4_KIND"], "1")
 
-    def test_w4a4_megamoe_disabled_preserves_deepgemm_env(self):
+    def test_w4a4_mxfp4_megamoe_disabled_preserves_deepgemm_env(self):
         deepgemm_env = {
             "DG_USE_FP4_ACTS": "0",
             "DG_USE_MXF4_KIND": "0",
@@ -65,7 +71,7 @@ class TestPrepareServerArgs(CustomTestCase):
         with patch.dict(os.environ, deepgemm_env, clear=False):
             args = prepare_server_args(["--model-path", "dummy"])
 
-            self.assertFalse(args.enable_w4a4_megamoe)
+            self.assertFalse(args.enable_w4a4_mxfp4_megamoe)
             self.assertEqual(os.environ["DG_USE_FP4_ACTS"], "0")
             self.assertEqual(os.environ["DG_USE_MXF4_KIND"], "0")
 

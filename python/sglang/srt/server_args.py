@@ -2390,9 +2390,9 @@ class ServerArgs:
         ),
         NS("exec.moe"),
     ] = "none"
-    enable_w4a4_megamoe: A[
+    enable_w4a4_mxfp4_megamoe: A[
         bool,
-        "Enable the W4A4 MegaMoE path by setting DeepGEMM's "
+        "Enable the W4A4 MXFP4 MegaMoE path by setting DeepGEMM's "
         "DG_USE_FP4_ACTS=1 and DG_USE_MXF4_KIND=1. Use with "
         "--moe-a2a-backend megamoe.",
         NS("exec.moe"),
@@ -3658,8 +3658,9 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
-        self._handle_moe_runner_backend_alias()
-        self._handle_w4a4_megamoe_env()
+        from sglang.srt.arg_groups.mega_moe_hook import handle_mega_moe
+
+        handle_mega_moe(self)
         self._handle_return_hidden_states_mode()
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
@@ -3831,27 +3832,6 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
-
-    def _handle_moe_runner_backend_alias(self):
-        if self.moe_runner_backend != "megamoe":
-            return
-
-        if self.moe_a2a_backend not in ("none", "megamoe"):
-            logger.warning(
-                "--moe-runner-backend megamoe is an alias for "
-                "--moe-a2a-backend megamoe; overriding "
-                "--moe-a2a-backend %s.",
-                self.moe_a2a_backend,
-            )
-        self.moe_runner_backend = "auto"
-        self.moe_a2a_backend = "megamoe"
-
-    def _handle_w4a4_megamoe_env(self):
-        if not self.enable_w4a4_megamoe:
-            return
-
-        os.environ["DG_USE_FP4_ACTS"] = "1"
-        os.environ["DG_USE_MXF4_KIND"] = "1"
 
     def _handle_return_hidden_states_mode(self):
         if self.return_hidden_states_mode not in (None, "last", "full"):

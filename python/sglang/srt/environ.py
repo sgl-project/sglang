@@ -1618,10 +1618,10 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
         "'--speculative-moe-runner-backend=cutlass' instead."
     ),
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS": _DeprecatedEnv(
-        note="Please use '--enable-w4a4-megamoe' instead."
+        note="Please use '--enable-w4a4-mxfp4-megamoe' instead."
     ),
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND": _DeprecatedEnv(
-        note="Please use '--enable-w4a4-megamoe' instead."
+        note="Please use '--enable-w4a4-mxfp4-megamoe' instead."
     ),
     "SGLANG_DFLASH_PREFILL_REFILL_TARGET": _DeprecatedEnv(
         note="DFlash now auto-enables the min-free-slots delay; unset this env. "
