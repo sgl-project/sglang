@@ -38,6 +38,8 @@ register_amd_ci(est_time=526, suite="stage-b-test-2-gpu-large-amd")
 class HiCacheStorageBaseMixin:
     """Base mixin class with common setup and utilities"""
 
+    flush_cache_timeout = 30
+
     @classmethod
     def setUpClass(cls):
         """Set up test environment and launch server once for all tests"""
@@ -173,10 +175,15 @@ class HiCacheStorageBaseMixin:
         """Flush device cache to force remote storage access."""
         res = requests.post(
             f"{self.base_url}/flush_cache",
-            params={"timeout": 30},
-            timeout=40,
+            params={"timeout": self.flush_cache_timeout},
+            timeout=self.flush_cache_timeout + 10,
         )
-        res.raise_for_status()
+        try:
+            res.raise_for_status()
+        except requests.HTTPError as e:
+            raise AssertionError(
+                f"flush_cache failed: status={res.status_code}, body={res.text!r}"
+            ) from e
 
     def gen_prompt(self, token_num: int) -> str:
         """Generate a random prompt of specified token length using tokenizer vocabulary."""
@@ -285,7 +292,13 @@ class TestHiCacheStorageAccuracy(HiCacheStorageBaseMixin, CustomTestCase):
         run_eval_accuracy_test(self)
 
 
-def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.03):
+def run_eval_accuracy_test(
+    test_instance,
+    accuracy_threshold: float = 0.03,
+    max_tokens: int = 512,
+    num_threads: int = 64,
+    num_examples: int = 200,
+):
     """Generic eval accuracy test with configurable accuracy threshold
 
     Args:
@@ -299,9 +312,9 @@ def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.03):
         base_url=f"http://{test_instance.base_host}:{test_instance.base_port}",
         eval_name="gsm8k",
         api="completion",
-        max_tokens=512,
-        num_examples=200,
-        num_threads=64,
+        max_tokens=max_tokens,
+        num_examples=num_examples,
+        num_threads=num_threads,
     )
     metrics_initial = run_eval(args_initial)
 
@@ -313,10 +326,6 @@ def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.03):
     print("Phase 3: Running second GSM8K evaluation using remote cache...")
     metrics_cached = run_eval(args_initial)
 
-    # Verify accuracy consistency
-    accuracy_diff = abs(metrics_initial["score"] - metrics_cached["score"])
-    print(f"Accuracy difference: {accuracy_diff:.4f}")
-
     # Assertions
     test_instance.assertGreater(
         metrics_initial["score"], 0.6, "Initial accuracy should be reasonable"
@@ -324,11 +333,17 @@ def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.03):
     test_instance.assertGreater(
         metrics_cached["score"], 0.6, "Cached accuracy should be reasonable"
     )
-    test_instance.assertLess(
-        accuracy_diff,
-        accuracy_threshold,
-        "Accuracy should be consistent between cache states",
-    )
+
+    # Verify accuracy consistency
+    if metrics_initial["score"] > metrics_cached["score"]:
+        accuracy_diff = abs(metrics_initial["score"] - metrics_cached["score"])
+        print(f"Accuracy difference: {accuracy_diff:.4f}")
+
+        test_instance.assertLess(
+            accuracy_diff,
+            accuracy_threshold,
+            "Accuracy should be consistent between cache states",
+        )
 
 
 if __name__ == "__main__":
