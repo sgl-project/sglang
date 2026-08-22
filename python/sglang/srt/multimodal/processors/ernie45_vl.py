@@ -346,7 +346,7 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
                     if result["pixel_values_videos"].numel() == 0:
                         del result["pixel_values_videos"]
 
-        if not self.use_cuda_ipc:
+        if not self.use_device_ipc:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
                 if feature_name in result and isinstance(

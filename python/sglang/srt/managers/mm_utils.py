@@ -33,9 +33,9 @@ from sglang.srt.managers.mm_schedule import (
     init_mm_embedding_cache as init_mm_embedding_cache,
 )
 from sglang.srt.managers.schedule_batch import (
-    CudaIpcTensorTransportProxy,
     Modality,
     MultimodalInputs,
+    is_ipc_tensor_transport_proxy,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
@@ -43,7 +43,7 @@ from sglang.srt.runtime_context import (
     get_server_args,
     get_serving,
 )
-from sglang.srt.utils import flatten_nested_list, print_warning_once
+from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
 
@@ -61,6 +61,8 @@ _GPU_FEATURE_BUFFER: Optional[torch.Tensor] = None
 _BUFFER_OFFSET = 0
 
 _is_default_tensor_transport = None
+
+_is_npu = is_npu()
 
 
 def init_feature_buffer(device):
@@ -853,8 +855,11 @@ def hash_feature(f):
         return int.from_bytes(hash_bytes, byteorder="big", signed=False)
     elif isinstance(f, torch.Tensor):
         return tensor_hash([f])
-    elif isinstance(f, CudaIpcTensorTransportProxy):
-        reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
+    elif is_ipc_tensor_transport_proxy(f):
+        target_device = (
+            torch.npu.current_device() if _is_npu() else torch.cuda.current_device()
+        )
+        reconstruct_t = f.reconstruct_on_target_device(target_device)
         return tensor_hash([reconstruct_t])
     elif isinstance(f, ShmPointerMMData):
         if f.precomputed_hash is not None:

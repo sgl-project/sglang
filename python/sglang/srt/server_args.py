@@ -2899,7 +2899,7 @@ class ServerArgs:
         NS("mm"),
     ] = False
     mm_feature_transport: A[
-        Optional[Literal["cpu", "cuda_ipc", "cuda_vmm"]],
+        Optional[Literal["cpu", "cuda_ipc", "cuda_vmm", "npu_ipc"]],
         "Transport multimodal features through CPU memory, a bounded CUDA IPC "
         "pool, or a bounded CUDA VMM pool. "
         "Unset uses cpu except for validated multi-node GB200/GB300 MNNVL models, "
@@ -2911,8 +2911,8 @@ class ServerArgs:
     ] = None
     keep_mm_feature_on_device: A[
         bool,
-        "Deprecated. Use --mm-feature-transport=cuda_ipc for bounded GPU-resident "
-        "multimodal feature transport.",
+        "Deprecated. Use --mm-feature-transport=cuda_ipc (or npu_ipc on NPU) for "
+        "bounded device-resident multimodal feature transport.",
         NS("mm"),
     ] = False
 
@@ -7993,10 +7993,11 @@ class ServerArgs:
                     f"--mm-feature-transport={requested_transport}. Use only "
                     "--mm-feature-transport=cuda_ipc."
                 )
-            requested_transport = "cuda_ipc"
+            requested_transport = "npu_ipc" if is_npu() else "cuda_ipc"
             logger.warning(
                 "--keep-mm-feature-on-device is deprecated; using "
-                "--mm-feature-transport=cuda_ipc instead."
+                "--mm-feature-transport=%s instead.",
+                requested_transport,
             )
 
         if requested_transport is None:
@@ -8132,6 +8133,24 @@ class ServerArgs:
                     if envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
                     else "disabled"
                 ),
+            )
+
+        if requested_transport == "npu_ipc":
+            if not is_npu():
+                raise ValueError("--mm-feature-transport=npu_ipc requires Ascend NPU.")
+            if self.nnodes != 1:
+                raise ValueError(
+                    "--mm-feature-transport=npu_ipc only supports a single node."
+                )
+
+            pool_budget_mb = envs.SGLANG_MM_FEATURE_CACHE_MB.get()
+            logger.info(
+                "Using NPU IPC for multimodal features: reserving up to %d MiB "
+                "on base NPU %d across %d tokenizer worker(s). This reduces KV "
+                "cache headroom; a full pool falls back to CPU transport.",
+                pool_budget_mb,
+                self.base_gpu_id,
+                self.tokenizer_worker_num,
             )
 
         self.mm_feature_transport = requested_transport
