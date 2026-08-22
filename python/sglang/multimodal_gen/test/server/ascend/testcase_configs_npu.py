@@ -163,6 +163,8 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
                 "1",
                 "--attention-backend",
                 "laser_attn",
+                "--component-residency",
+                "text_encoder=layerwise-offload",
             ],
             env_vars={
                 "SGLANG_CACHE_DIT_ENABLED": "true",
