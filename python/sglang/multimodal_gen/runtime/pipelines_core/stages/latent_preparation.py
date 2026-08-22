@@ -141,18 +141,33 @@ class LatentPreparationStage(PipelineStage):
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
 
-        # Generate or use provided latents
+        # Generate or use provided latents. Latents that arrive in the same
+        # layout this stage would have drawn go through the same latent-ids /
+        # packing preparation as freshly drawn noise -- otherwise packed models
+        # (which read batch.latent_ids while building rotary embeddings) see it
+        # unset.
+        spec = self.get_latent_preparation_spec(
+            batch, server_args, batch_size, latent_num_frames, device
+        )
         if latents is None:
-            spec = self.get_latent_preparation_spec(
-                batch, server_args, batch_size, latent_num_frames, device
-            )
             latents = randn_tensor(
                 spec.shape,
                 generator=generator,
                 device=spec.device,
                 dtype=spec.dtype,
             )
+            needs_preparation = True
+        else:
+            latents = latents.to(device)
+            # Only latents shaped like the noise this stage would have drawn are
+            # unprepared. Callers that hand over an already-packed tensor (the
+            # ComfyUI executors send flat [B, S, D]) must be left alone:
+            # maybe_pack_latents would re-view it into a different layout, and
+            # since the element count still matches it would corrupt the latents
+            # silently rather than raise.
+            needs_preparation = tuple(latents.shape) == tuple(spec.shape)
 
+        if needs_preparation:
             latent_ids = (
                 server_args.pipeline_config.maybe_prepare_latent_ids(latents)
                 if spec.prepare_latent_ids
@@ -166,8 +181,6 @@ class LatentPreparationStage(PipelineStage):
                 latents = server_args.pipeline_config.maybe_pack_latents(
                     latents, batch_size, batch
                 )
-        else:
-            latents = latents.to(device)
 
         # Scale the initial noise if needed
         if self.should_scale_initial_noise(batch, server_args) and hasattr(
