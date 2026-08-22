@@ -32,6 +32,8 @@ _GROUP_SIZE = 32
 class Mxfp4FlashinferCutlassMoEMethod:
     """FlashInfer MXFP4 MoE: W4A16 on SM90 and W4A8 on SM120."""
 
+    fuse_routed_scaling_factor_in_topk = True
+
     def __init__(self, fp8_method, prefix: str):
         if not is_flashinfer_available():
             raise RuntimeError("Mxfp4FlashinferCutlassMoEMethod requires FlashInfer.")

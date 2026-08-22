@@ -10,7 +10,10 @@ class LinearAttnKernelBase(ABC):
     and provides decode/extend/target_verify methods with a unified interface.
     """
 
+    # Capability flags. Declared here so callers can read them off ANY kernel
+    # without defensive getattr; concrete kernels override to opt in.
     uses_state_checkpoints: bool = False
+    supports_fused_chain_verify: bool = False
 
     @abstractmethod
     def decode(

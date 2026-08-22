@@ -40,7 +40,10 @@ def qwen3_next_config(model_config: ModelConfig):
 
 def hybrid_lightning_config(model_config: ModelConfig):
     config = model_config.hf_config
-    if isinstance(config, BailingHybridConfig):
+    # BailingHybridConfig covers both Bailing generations: V2.5 uses lightning
+    # linear attention, Ling-V3 uses KDA. use_kda separates them -- see
+    # kimi_linear_config below, which claims the KDA half.
+    if isinstance(config, BailingHybridConfig) and not config.use_kda:
         return config
     return None
 
@@ -101,6 +104,10 @@ def mamba2_config(model_config: ModelConfig):
 def kimi_linear_config(model_config: ModelConfig):
     config = model_config.hf_config
     if isinstance(config, KimiLinearConfig):
+        return config
+    # Ling-V3 (BailingMoeV3) is a KDA model that reuses BailingHybridConfig, so
+    # it must route to KDAAttnBackend rather than the lightning backend.
+    if isinstance(config, BailingHybridConfig) and config.use_kda:
         return config
     text_config = getattr(config, "text_config", None)
     if isinstance(text_config, KimiLinearConfig):
