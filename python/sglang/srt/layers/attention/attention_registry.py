@@ -299,11 +299,26 @@ def attn_backend_wrapper_for_draft_extend(
     the mamba hybrids whose MTP draft is all softmax attention. Inkling's draft has
     its own short convs, so it must expose ``conv_state_metadata`` too.
     """
+    from sglang.srt.configs.dots3 import Dots3Config
     from sglang.srt.configs.inkling import InklingMMConfig, InklingModelConfig
 
     if isinstance(runner.model_config.hf_config, (InklingModelConfig, InklingMMConfig)):
         return attn_backend_wrapper(runner, full_attn_backend)
+    if isinstance(runner.model_config.hf_text_config, Dots3Config):
+        return attn_backend_wrapper(runner, full_attn_backend)
     return full_attn_backend
+
+
+def attn_backend_wrapper_for_draft_decode(runner: "ModelRunner", backend):
+    """Apply the Dots model wrapper to per-step draft backends."""
+    from sglang.srt.configs.dots3 import Dots3Config
+
+    if not hasattr(runner, "model_config"):
+        return backend
+    hf_text_config = runner.model_config.hf_text_config
+    if isinstance(hf_text_config, Dots3Config):
+        return hf_text_config.wrap_draft_decode_attention_backend(backend)
+    return backend
 
 
 def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBackend"):
@@ -315,7 +330,13 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         hybrid_gdn_config(runner.model_config) is not None and runner.use_mla_backend
     ), "hybrid_gdn can only be used with non-MLA models."
 
+    from sglang.srt.configs.dots3 import Dots3Config
     from sglang.srt.configs.model_config import is_minimax_sparse
+
+    if isinstance(runner.model_config.hf_text_config, Dots3Config):
+        return runner.model_config.hf_text_config.wrap_attention_backend(
+            runner, full_attn_backend
+        )
 
     if is_minimax_sparse(runner.model_config.hf_config):
         from sglang.srt.layers.attention.minimax_sparse_backend import (
