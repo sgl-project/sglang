@@ -12,6 +12,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -190,13 +191,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
         else:
             target_model = self.target_worker.model_runner.model
-            lm_head = getattr(target_model, "lm_head", None)
+            lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
             if lm_head is None or not hasattr(lm_head, "weight"):
                 raise RuntimeError(
                     "DSpark requires the target model to expose `lm_head` with `weight`."
                 )
             self.draft_model.attach_shared_modules(
-                embed_tokens=self._resolve_target_embed_tokens(target_model),
+                embed_tokens=unwrap_lora_layer(
+                    self._resolve_target_embed_tokens(target_model)
+                ),
                 lm_head=lm_head,
             )
 

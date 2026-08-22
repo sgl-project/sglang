@@ -47,7 +47,7 @@ from fastapi import BackgroundTasks
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
-from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
+from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
@@ -671,7 +671,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Encoder Disaggregation
         self.encoder_bootstrap_server = None
         if self.server_args.language_only:
-            from sglang.srt.disaggregation.encode_receiver import (
+            from sglang.srt.disaggregation.encoder.receiver import (
                 EncoderBootstrapServer,
             )
 
@@ -1409,7 +1409,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
-                mm_data_mooncake=obj.mm_data_mooncake,
                 encoder_urls=obj.encoder_urls,
             )
         elif isinstance(obj, EmbeddingReqInput):
@@ -2253,11 +2252,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         i
                     ]
                 if customized_info is not None:
-                    for k, v in customized_info.items():
-                        if k not in state.customized_info_accumulated:
-                            state.customized_info_accumulated[k] = []
-                        state.customized_info_accumulated[k].extend(v[i])
-                        meta_info[k] = state.customized_info_accumulated[k]
+                    self.update_request_meta_info(
+                        meta_info,
+                        state,
+                        customized_info,
+                        i,
+                        recv_obj.finished_reasons[i],
+                    )
 
                 # Add multimodal prompt token counts only for requests that
                 # actually consumed them, so plain-text meta_info stays unchanged.
@@ -2456,6 +2457,34 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # handle_loop awaits next recv immediately
         for s in pending_notify.values():
             s.event.set()
+
+    @staticmethod
+    def _accumulate_request_meta_info(
+        meta_info: dict,
+        state: ReqState,
+        key: str,
+        values: list,
+    ) -> None:
+        accumulated = state.customized_info_accumulated.setdefault(key, [])
+        accumulated.extend(values)
+        meta_info[key] = accumulated
+
+    def update_request_meta_info(
+        self,
+        meta_info: dict,
+        state: ReqState,
+        customized_info: dict,
+        index: int,
+        finish_reason: Optional[dict],
+    ) -> None:
+        """Accumulate metadata; subclasses may use finish_reason for terminal data."""
+        for key, values in customized_info.items():
+            self._accumulate_request_meta_info(
+                meta_info,
+                state,
+                key,
+                values[index],
+            )
 
     def add_logprob_to_meta_info(
         self,

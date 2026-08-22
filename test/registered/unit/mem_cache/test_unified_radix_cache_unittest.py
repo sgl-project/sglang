@@ -3026,6 +3026,171 @@ class UnifiedRadixCacheSuite:
             # Rejection must come from the surfaced window charge.
             self.assertGreaterEqual(surfaced_swa_hit, window)
 
+    def test_buffer_only_load_back_drops_on_sibling_published_span(self):
+        """Queued-UAF regression: a sibling publishes the staged span between
+        staging and consumption; the live pre-check must drop the hold before
+        any device allocation or H2D exists."""
+        self._skip_unsupported_hicache_test()
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+
+        seq = self._buffer_swa_seq()
+        self._produce_buffer_l3(storage_dir, seq)
+
+        cons, cons_alloc, cons_rtp = build_fixture(self.cfg)
+        self._init_buffer_hicache(cons, storage_dir)
+        avail0 = self._host_avail_sizes(cons)
+
+        req_id = "sibling-publish"
+        cons.prefetch_from_storage(
+            req_id, cons.root_node.id, array("q", seq), None, None
+        )
+        self._pump_hicache_until(
+            cons,
+            lambda: cons.check_prefetch_progress(req_id)
+            and cons.buffer_pipeline.has_staged(req_id),
+            "prefetch did not stage",
+        )
+        cons.pop_prefetch_loaded_tokens(req_id)
+
+        # Sibling publishes the identical span (live FULL + SWA).
+        self._insert(cons, cons_alloc, cons_rtp, seq)
+        sib = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        self.assertEqual(len(sib.device_indices), len(seq))
+        self._fill_full_kv(cons_alloc, sib.device_indices, marker=3)
+        sib_kv = self._snapshot_full_kv(cons_alloc, sib.device_indices)
+        dev_avail0 = cons.token_to_kv_pool_allocator.available_size()
+
+        # Consume with the batch-stale empty prefix view: the live unified
+        # check must drop it.
+        spliced = self._consume_staged_prefetch(cons, req_id, prefix_len=0)
+        self.assertEqual(int(spliced.numel()), 0)
+
+        # Nothing device-side happened; sibling slots and staging intact.
+        self.assertEqual(cons.token_to_kv_pool_allocator.available_size(), dev_avail0)
+        self.assertEqual(cons.buffer_pipeline.ongoing_buffer_load_back, {})
+        self.assertFalse(cons.buffer_pipeline.has_staged(req_id))
+        self.assertEqual(cons.cache_controller.prefetch_tokens_occupied, 0)
+        self.assertEqual(self._host_avail_sizes(cons), avail0)
+        m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        self.assertTrue(torch.equal(m.device_indices, sib.device_indices))
+        k, v = self._snapshot_full_kv(cons_alloc, m.device_indices)
+        self.assertTrue(torch.equal(k, sib_kv[0]))
+        self.assertTrue(torch.equal(v, sib_kv[1]))
+        cons.sanity_check()
+
+    def test_buffer_only_load_back_drops_on_full_overlap_masked_by_swa_tombstone(
+        self,
+    ):
+        """Queued-UAF regression: live FULL under an SWA tombstone is invisible
+        to the unified match but still dedup-freed by insert; only the
+        full_kv_hit_length pre-check can drop the hold."""
+        self._skip_unsupported_hicache_test()
+        if not self.cfg.has_swa:
+            self.skipTest("masked overlap requires an SWA component")
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+
+        seq = self._buffer_swa_seq()
+        self._produce_buffer_l3(storage_dir, seq)
+
+        cons, cons_alloc, cons_rtp = build_fixture(self.cfg)
+        self._init_buffer_hicache(cons, storage_dir)
+
+        # Masked state: nodes born with live FULL under SWA tombstones
+        # (sibling insert whose SWA ring had slid past the span).
+        value = self._alloc(cons_alloc, len(seq))
+        cons.insert(
+            InsertParams(
+                key=RadixKey(array("q", seq)),
+                value=value[: len(seq)],
+                swa_evicted_seqlen=len(seq),
+            )
+        )
+        masked = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        self.assertEqual(len(masked.device_indices), 0, "unified match not masked")
+        self.assertEqual(masked.full_kv_hit_length, len(seq), "live FULL not resident")
+
+        avail0 = self._host_avail_sizes(cons)
+        req_id = "masked-overlap"
+        cons.prefetch_from_storage(
+            req_id, cons.root_node.id, array("q", seq), None, None
+        )
+        self._pump_hicache_until(
+            cons,
+            lambda: cons.check_prefetch_progress(req_id)
+            and cons.buffer_pipeline.has_staged(req_id),
+            "prefetch did not stage",
+        )
+        cons.pop_prefetch_loaded_tokens(req_id)
+        dev_avail0 = cons.token_to_kv_pool_allocator.available_size()
+
+        # Every unified-length guard passes at 0 == 0; only the Full-only
+        # pre-check drops.
+        spliced = self._consume_staged_prefetch(cons, req_id, prefix_len=0)
+        self.assertEqual(int(spliced.numel()), 0)
+
+        self.assertEqual(cons.token_to_kv_pool_allocator.available_size(), dev_avail0)
+        self.assertEqual(cons.buffer_pipeline.ongoing_buffer_load_back, {})
+        self.assertEqual(cons.cache_controller.prefetch_tokens_occupied, 0)
+        self.assertEqual(self._host_avail_sizes(cons), avail0)
+        # The masked FULL is still intact (nothing dedup-freed it).
+        after = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        self.assertEqual(after.full_kv_hit_length, len(seq))
+        cons.sanity_check()
+
+    def test_buffer_only_load_back_fail_stops_on_post_check_overlap(self):
+        """If the tree mutates between the pre-check and the insert (simulated
+        via cc.load), consumption must fail-stop rather than hand out slots a
+        queued H2D no longer owns."""
+        self._skip_unsupported_hicache_test()
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+
+        seq = self._buffer_swa_seq()
+        self._produce_buffer_l3(storage_dir, seq)
+
+        cons, cons_alloc, cons_rtp = build_fixture(self.cfg)
+        self._init_buffer_hicache(cons, storage_dir)
+
+        req_id = "post-check-overlap"
+        cons.prefetch_from_storage(
+            req_id, cons.root_node.id, array("q", seq), None, None
+        )
+        self._pump_hicache_until(
+            cons,
+            lambda: cons.check_prefetch_progress(req_id)
+            and cons.buffer_pipeline.has_staged(req_id),
+            "prefetch did not stage",
+        )
+        cons.pop_prefetch_loaded_tokens(req_id)
+
+        from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
+
+        real_load = cons.cache_controller.load
+
+        def adversarial_load(*args, **kwargs):
+            # Mutate the tree after the pre-check has already passed.
+            self._insert(cons, cons_alloc, cons_rtp, seq)
+            return real_load(*args, **kwargs)
+
+        f = cons.buffer_pipeline.staged_prefetches[req_id]
+        req = mock.Mock()
+        req.rid = req_id
+        req.prefix_indices = torch.zeros(
+            0,
+            dtype=torch.int64,
+            device=cons.tree_core.empty_match_result.device_indices.device,
+        )
+        req.last_node = cons.root_node.id
+        with mock.patch.object(cons.cache_controller, "load", adversarial_load):
+            with self.assertRaisesRegex(RuntimeError, "ownership violation"):
+                cons.init_load_back(
+                    InitLoadBackParams(
+                        best_match_node=None, host_hit_length=f.num_tokens, req=req
+                    )
+                )
+
     def test_buffer_only_swa_window_semantics(self):
         """SWA window handling across the three partial-window cases:
         root-anchored sub-window sequence (the sequence IS its window),
@@ -6147,9 +6312,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         alloc.translate_loc_from_full_to_swa.assert_called_once_with(incoming_full)
         alloc.set_full_to_swa_mapping.assert_called_once_with(kept_full, swa_value)
         # the incoming full's stale mapping is cleared, then its slot freed (full-only)
-        key, val = alloc.full_to_swa_index_mapping.__setitem__.call_args.args
-        self.assertTrue(torch.equal(key, incoming_full))
-        self.assertEqual(val, 0)
+        alloc.clear_full_to_swa_mapping.assert_called_once_with(incoming_full)
         alloc.full_attn_allocator.free.assert_called_once_with(incoming_full)
         alloc.free.assert_not_called()
         cache.tree_core.set_component_device_value.assert_called_once_with(

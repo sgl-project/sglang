@@ -333,6 +333,7 @@ class DeepseekSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
+        self.supports_mha_one_shot: bool = True
         self.dsa_prefill_impl: _DSA_IMPL_T = (
             model_runner.server_args.dsa_prefill_backend
         )
@@ -3325,7 +3326,8 @@ class DeepseekSparseAttnBackend(
 
             # Requirements: H200/B200/MI355X, short sequences, supported dtype, fits in chunk
             self.use_mha = (
-                (
+                self.supports_mha_one_shot
+                and (
                     device_sm == 90
                     or (device_sm >= 100 and device_sm < 110)
                     or _IS_GFX95

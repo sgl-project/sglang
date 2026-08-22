@@ -1298,12 +1298,6 @@ class CommonKVSender(BaseKVSender):
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         return KVPoll.Failed
 
-    def poll(self) -> KVPoll:
-        pass
-
-    def failure_exception(self):
-        raise Exception("Fake KVReceiver Exception")
-
     def clear(self) -> None:
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
@@ -1561,9 +1555,6 @@ class CommonKVReceiver(BaseKVReceiver):
             self._send_abort_notification()
             self.abort_notified = True
         return KVPoll.Failed
-
-    def failure_exception(self):
-        raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)

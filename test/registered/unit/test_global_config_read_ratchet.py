@@ -108,7 +108,7 @@ _CONFIGURED_SIZE_CALL_SITES = {
         "the consumer count is configured fan-out arithmetic (tp_size // "
         "dp_size), which is what the record answered before"
     ),
-    ("srt/disaggregation/encode_server.py", "configured_tp_size"): (
+    ("srt/disaggregation/encoder/runtime.py", "configured_tp_size"): (
         "the encode server's launch entry sizes its workers before it has "
         "spawned any of them"
     ),

@@ -69,9 +69,11 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             device="cuda",
             gpu_id=0,
             is_draft_worker=False,
+            # A real ModelRunner always has this attribute; the prefill gate
+            # reads it rather than the process-wide LoRA config.
+            lora_manager=None,
             spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
             server_args=SimpleNamespace(
-                enable_lora=False,
                 cuda_graph_config=SimpleNamespace(
                     prefill=SimpleNamespace(bs=[1], backend=Backend.BREAKABLE)
                 ),

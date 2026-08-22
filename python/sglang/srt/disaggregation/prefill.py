@@ -680,6 +680,10 @@ class SchedulerDisaggregationPrefillMixin:
 
         if copy_done is not None:
             copy_done.synchronize()
+        auxiliary_output_starts = (
+            self.batch_result_processor.snapshot_auxiliary_output_starts(batch, result)
+        )
+        auxiliary_output = result.auxiliary_host_output
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None
@@ -818,6 +822,13 @@ class SchedulerDisaggregationPrefillMixin:
                     ), f"Req {req.rid} does not have metadata buffer allocated"
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
+
+        if auxiliary_output is not None:
+            self.batch_result_processor.consume_auxiliary_output(
+                batch,
+                auxiliary_output,
+                auxiliary_output_starts,
+            )
 
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
@@ -962,24 +973,6 @@ class SchedulerDisaggregationPrefillMixin:
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
-
-    def get_transferred_rids(self: Scheduler) -> List[str]:
-        """
-        Used by PP, get the transferred rids but **do not pop**
-        """
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
-        )
-
-        transferred_rids: List[str] = []
-
-        for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
-            if poll == KVPoll.Success or poll == KVPoll.Failed:
-                transferred_rids.append(req.rid)
-
-        return transferred_rids
 
     def clear_pending_chunk_send(self: Scheduler, req: Req) -> None:
         """Drop `req` from the sent-but-unconcluded chunk set.

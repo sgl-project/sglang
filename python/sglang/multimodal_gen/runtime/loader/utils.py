@@ -249,6 +249,46 @@ def _try_redownload_missing_shards(model_path: str, missing: list[str]) -> bool:
         return False
 
 
+def checkpoint_bytes(model_path: str) -> int:
+    """On-disk size of every safetensors under a path, readable before any is."""
+    total = 0
+    for path in glob.glob(
+        os.path.join(str(model_path), "**", "*.safetensors"), recursive=True
+    ):
+        try:
+            total += os.path.getsize(path)
+        except OSError:
+            continue
+    return total
+
+
+def keep_checkpoint_mapped(*, weight_bytes: int, component: str) -> bool:
+    """Whether a component's weights should stay on their file mapping.
+
+    Judged against the whole deployment rather than the one component: on a
+    host that cannot afford copies of everything it is about to serve, every
+    byte of anonymous memory a copy takes is a byte the pin budget for the
+    stepped components loses. On a host with room, the copy is the faster
+    choice -- its pages are resident, where a mapping's first use pays a fault.
+    """
+    from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+        host_copies_would_not_fit,
+        host_memory_available_bytes,
+    )
+
+    if not host_copies_would_not_fit(weight_bytes):
+        return False
+    logger.info(
+        "%s stays on its checkpoint mapping: the deployment is %.2f GiB of "
+        "weights against %.2f GiB of host memory, so copies are host memory "
+        "the streamed components need more.",
+        component,
+        weight_bytes / 1024**3,
+        host_memory_available_bytes() / 1024**3,
+    )
+    return True
+
+
 def _list_safetensors_files(model_path: str) -> list[str]:
     """List all .safetensors files under a directory.
 

@@ -22,6 +22,7 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -480,7 +481,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self.block_size <= 1:
             return _eager("block_size<=1")
         target_model = self._target_worker.model_runner.model
-        lm_head = getattr(target_model, "lm_head", None)
+        lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
         if lm_head is None:
             return _eager("no target lm_head")
 
@@ -1749,8 +1750,8 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
-        embed_module = target_model.get_input_embeddings()
-        lm_head = getattr(target_model, "lm_head", None)
+        embed_module = unwrap_lora_layer(target_model.get_input_embeddings())
+        lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
         if lm_head is None or not (
             hasattr(lm_head, "weight")
             or callable(getattr(getattr(lm_head, "quant_method", None), "apply", None))
