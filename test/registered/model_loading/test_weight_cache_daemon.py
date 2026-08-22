@@ -1,13 +1,14 @@
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 
 import requests
 import torch
-
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.weight_cache.registry import FileWeightCacheRegistry
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -43,12 +44,29 @@ PROMPTS = [
 ]
 
 
+def _wait_for_daemons(process, registry, expected, timeout):
+    start = time.time()
+    while len(registry.list_registrations()) < expected:
+        if time.time() - start > timeout:
+            kill_process_tree(process.pid)
+            raise TimeoutError(
+                f"Only {len(registry.list_registrations())}/{expected} weight "
+                f"cache daemons registered within {timeout}s"
+            )
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"Weight cache daemon launcher exited prematurely with "
+                f"code {process.returncode}"
+            )
+        time.sleep(2)
+
+
 @unittest.skipIf(
     torch.cuda.device_count() < 2,
     "TP=2 weight cache daemon test requires >=2 GPUs (skipped on the 1-gpu runner)",
 )
 class TestWeightCacheDaemonTP2(CustomTestCase):
-    """E2E test: start weight cache daemons, then launch server in client mode with TP2."""
+    """Start cache daemons, then launch a TP=2 server in client mode."""
 
     @classmethod
     def setUpClass(cls):
@@ -56,12 +74,13 @@ class TestWeightCacheDaemonTP2(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.tp_size = 2
 
-        # Clean up stale ready/socket files from previous runs
-        for rank in range(cls.tp_size):
-            for suffix in (".ready", ".sock"):
-                path = f"/tmp/sglang_weight_cache_rank{rank}{suffix}"
-                if os.path.exists(path):
-                    os.unlink(path)
+        cls.runtime_dir = tempfile.TemporaryDirectory(
+            prefix="sglang-weight-cache-tp2-", dir="/tmp"
+        )
+        cls.namespace = f"ci-tp2-{os.getpid()}"
+        cls.registry = FileWeightCacheRegistry(
+            cls.runtime_dir.name, namespace=cls.namespace
+        )
 
         # Step 1: Launch weight cache daemons (blocks until all ranks are ready,
         # then monitors child processes)
@@ -74,26 +93,19 @@ class TestWeightCacheDaemonTP2(CustomTestCase):
                 cls.model,
                 "--tp-size",
                 str(cls.tp_size),
+                "--weight-cache-runtime-dir",
+                cls.runtime_dir.name,
+                "--weight-cache-namespace",
+                cls.namespace,
             ]
         )
 
-        # Step 2: Wait for all daemon ready files
-        timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
-        start = time.time()
-        for rank in range(cls.tp_size):
-            ready_path = f"/tmp/sglang_weight_cache_rank{rank}.ready"
-            while not os.path.exists(ready_path):
-                if time.time() - start > timeout:
-                    kill_process_tree(cls.daemon_process.pid)
-                    raise TimeoutError(
-                        f"Weight cache daemon rank {rank} not ready within {timeout}s"
-                    )
-                if cls.daemon_process.poll() is not None:
-                    raise RuntimeError(
-                        f"Weight cache daemon exited prematurely "
-                        f"with code {cls.daemon_process.returncode}"
-                    )
-                time.sleep(2)
+        _wait_for_daemons(
+            cls.daemon_process,
+            cls.registry,
+            cls.tp_size,
+            DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        )
 
         # Step 3: Launch server in client mode — loads weights via IPC from daemons
         cls.stdout = open(STDOUT_FILENAME, "w")
@@ -107,6 +119,10 @@ class TestWeightCacheDaemonTP2(CustomTestCase):
                 str(cls.tp_size),
                 "--weight-cache-mode",
                 "client",
+                "--weight-cache-runtime-dir",
+                cls.runtime_dir.name,
+                "--weight-cache-namespace",
+                cls.namespace,
             ],
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
@@ -129,14 +145,8 @@ class TestWeightCacheDaemonTP2(CustomTestCase):
                     os.unlink(path)
                 except OSError:
                     pass
-        for rank in range(getattr(cls, "tp_size", 2)):
-            for suffix in (".ready", ".sock"):
-                path = f"/tmp/sglang_weight_cache_rank{rank}{suffix}"
-                if os.path.exists(path):
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
+        if hasattr(cls, "runtime_dir"):
+            cls.runtime_dir.cleanup()
 
     def test_generate(self):
         for prompt in PROMPTS:
@@ -214,12 +224,13 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.tp_size = 1
 
-        # Clean up stale ready/socket files from previous runs.
-        for rank in range(cls.tp_size):
-            for suffix in (".ready", ".sock"):
-                path = f"/tmp/sglang_weight_cache_rank{rank}{suffix}"
-                if os.path.exists(path):
-                    os.unlink(path)
+        cls.runtime_dir = tempfile.TemporaryDirectory(
+            prefix="sglang-weight-cache-tp1-", dir="/tmp"
+        )
+        cls.namespace = f"ci-tp1-{os.getpid()}"
+        cls.registry = FileWeightCacheRegistry(
+            cls.runtime_dir.name, namespace=cls.namespace
+        )
 
         # Step 1: Launch the weight cache daemon (blocks until the rank is
         # ready, then monitors the child process).
@@ -232,26 +243,19 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
                 cls.model,
                 "--tp-size",
                 str(cls.tp_size),
+                "--weight-cache-runtime-dir",
+                cls.runtime_dir.name,
+                "--weight-cache-namespace",
+                cls.namespace,
             ]
         )
 
-        # Step 2: Wait for the daemon ready file.
-        timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
-        start = time.time()
-        for rank in range(cls.tp_size):
-            ready_path = f"/tmp/sglang_weight_cache_rank{rank}.ready"
-            while not os.path.exists(ready_path):
-                if time.time() - start > timeout:
-                    kill_process_tree(cls.daemon_process.pid)
-                    raise TimeoutError(
-                        f"Weight cache daemon rank {rank} not ready within {timeout}s"
-                    )
-                if cls.daemon_process.poll() is not None:
-                    raise RuntimeError(
-                        f"Weight cache daemon exited prematurely "
-                        f"with code {cls.daemon_process.returncode}"
-                    )
-                time.sleep(2)
+        _wait_for_daemons(
+            cls.daemon_process,
+            cls.registry,
+            cls.tp_size,
+            DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        )
 
         # Step 3: Launch server in client mode — loads weights via IPC.
         cls.stdout = open(SMOKE_STDOUT_FILENAME, "w")
@@ -265,6 +269,10 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
                 str(cls.tp_size),
                 "--weight-cache-mode",
                 "client",
+                "--weight-cache-runtime-dir",
+                cls.runtime_dir.name,
+                "--weight-cache-namespace",
+                cls.namespace,
             ],
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
@@ -287,14 +295,8 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
                     os.unlink(path)
                 except OSError:
                     pass
-        for rank in range(getattr(cls, "tp_size", 1)):
-            for suffix in (".ready", ".sock"):
-                path = f"/tmp/sglang_weight_cache_rank{rank}{suffix}"
-                if os.path.exists(path):
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
+        if hasattr(cls, "runtime_dir"):
+            cls.runtime_dir.cleanup()
 
     def test_generate(self):
         resp = requests.post(
