@@ -281,9 +281,6 @@ class TestLlama32DetectorSeparators(CustomTestCase):
         self.assertEqual(len(result.calls), 1)
         self.assertTrue(result.normal_text.strip().startswith("Some intro."))
 
-
-
-
 if __name__ == "__main__":
     import unittest
 
