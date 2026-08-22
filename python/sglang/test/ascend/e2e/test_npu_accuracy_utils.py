@@ -5,7 +5,6 @@ import logging
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import threading
@@ -279,13 +278,13 @@ def assert_metrics(self, metrics):
         )
 
 
-def _kill_forkserver_group(orphans_only=False):
-    """Kill processes in the current process group except this process.
+def _kill_forkserver_group():
+    """Kill orphan forkserver processes in the current process group.
 
-    By default kills every process in the group (server and forkserver alike).
-    With orphans_only=True, only stray forkserver children reparented to PID 1,
-    together with their descendants, are killed; the directly spawned server is
-    left alive.
+    Forkserver children spawned by the evalscope benchmark get reparented to PID 1
+    after their parent eval subprocess exits, but keep holding open pipe write
+    ends. Only these orphans and their descendants are killed here; the directly
+    spawned server process is left for `kill_process_tree` to clean up.
     """
     me = os.getpid()
     try:
@@ -299,7 +298,7 @@ def _kill_forkserver_group(orphans_only=False):
             f"(pgid={pgid}), refusing to kill the parent suite"
         )
         return
-    logger.info(f"Cleaning up process group pgid={pgid}, orphans_only={orphans_only}")
+    logger.info(f"Cleaning up orphan forkserver processes in group pgid={pgid}")
     for pid in psutil.pids():
         if pid == me:
             continue
@@ -308,13 +307,10 @@ def _kill_forkserver_group(orphans_only=False):
             if os.getpgid(pid) != pgid:
                 continue
             ppid = proc.ppid()
-            if orphans_only and ppid != 1:
+            if ppid != 1:
                 continue
-            logger.info(f"Killing leftover process pid={pid} ppid={ppid} pgid={pgid}")
-            if orphans_only:
-                kill_process_tree(pid)
-            else:
-                os.kill(pid, signal.SIGKILL)
+            logger.info(f"Killing leftover forkserver pid={pid} ppid={ppid} pgid={pgid}")
+            kill_process_tree(pid)
         except (
             psutil.NoSuchProcess,
             psutil.AccessDenied,
@@ -501,7 +497,7 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
         try:
             if cls.benchmark_tool == EVALSCOPE:
                 _kill_forkserver_group()
-            elif hasattr(cls, "process") and cls.process:
+            if hasattr(cls, "process") and cls.process:
                 kill_process_tree(cls.process.pid)
         except Exception as e:
             logger.error(f"Error during tearDown: {e}")
@@ -644,7 +640,7 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
     def tearDownClass(cls):
         try:
             if cls.benchmark_tool == EVALSCOPE:
-                _kill_forkserver_group(orphans_only=True)
+                _kill_forkserver_group()
         except Exception as e:
             logger.error(f"Error during tearDown: {e}")
 
@@ -759,7 +755,7 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
         try:
             if cls.benchmark_tool == EVALSCOPE:
                 _kill_forkserver_group()
-            elif cls.process:
+            if cls.process:
                 kill_process_tree(cls.process.pid)
         except Exception as e:
             logger.error(f"Error during tearDown: {e}")
