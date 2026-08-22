@@ -17,6 +17,8 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
+    checkpoint_bytes,
+    keep_checkpoint_mapped,
     set_default_torch_dtype,
     skip_init_modules,
 )
@@ -258,14 +260,23 @@ class VAELoader(ComponentLoader):
         _backfill_ltx2_audio_vae_latent_stats(loaded, component_name)
         strict_load = native_only
         # `loaded` holds views into the safetensors mapping. When the component
-        # starts on the CPU, assigning them keeps the weights file-backed
-        # instead of copying them into anonymous host memory: the page cache
-        # can drop and refetch file-backed bytes, a copy it cannot. MPS always
-        # did this; on any other host the copy is anonymous memory the pin
-        # budget can then not spend -- MiniMax-H3's video VAE is 9.70 GiB of a
-        # 32 GiB budget. A tensor whose dtype differs from its parameter's is
-        # converted, which copies exactly the tensors that cannot stay.
-        keep_mapping = component_starts_on_cpu
+        # starts on the CPU and the host cannot afford copies of the whole
+        # deployment, assigning them keeps the weights file-backed instead of
+        # copying them into anonymous host memory: the page cache can drop and
+        # refetch file-backed bytes, and every anonymous byte here is a byte
+        # the stepped components' pin budget loses -- MiniMax-H3's video VAE is
+        # 9.70 GiB of a 32 GiB budget. On a host with room the copy stays the
+        # default, because its pages are resident where a mapping's first use
+        # pays a fault. MPS always assigns; the memory is unified. A tensor
+        # whose dtype differs from its parameter's is converted, which copies
+        # exactly the tensors that cannot stay.
+        keep_mapping = component_starts_on_cpu and (
+            current_platform.is_mps()
+            or keep_checkpoint_mapped(
+                weight_bytes=checkpoint_bytes(server_args.model_path),
+                component=f"{component_name or 'vae'} (VAE)",
+            )
+        )
         if keep_mapping:
             _match_checkpoint_dtypes(loaded, vae.state_dict())
         vae.load_state_dict(

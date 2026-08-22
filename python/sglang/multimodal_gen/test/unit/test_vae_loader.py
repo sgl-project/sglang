@@ -24,6 +24,10 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import (
     _require_native_loader_for_quantized_vae,
     _should_use_channels_last_3d,
 )
+from sglang.multimodal_gen.runtime.loader.utils import keep_checkpoint_mapped
+from sglang.multimodal_gen.runtime.managers.memory_managers import (
+    host_memory_budget,
+)
 from sglang.multimodal_gen.runtime.models.vaes import wanvae
 
 
@@ -40,6 +44,30 @@ class _FakeServerArgs:
 
     def should_start_component_on_cpu(self, _component_name):
         return False
+
+
+class TestKeepCheckpointMapped(unittest.TestCase):
+    """The mapping is for hosts that cannot afford the whole deployment."""
+
+    def test_a_small_deployment_on_a_roomy_host_copies(self):
+        with unittest.mock.patch.object(
+            host_memory_budget, "host_memory_available_bytes", lambda: 64 * 1024**3
+        ):
+            self.assertFalse(
+                keep_checkpoint_mapped(weight_bytes=3 * 1024**3, component="vae (VAE)"),
+                "copies are the faster choice when the host has room: their "
+                "pages are resident where a mapping's first use pays a fault",
+            )
+
+    def test_a_deployment_larger_than_the_host_stays_mapped(self):
+        with unittest.mock.patch.object(
+            host_memory_budget, "host_memory_available_bytes", lambda: 19 * 1024**3
+        ):
+            self.assertTrue(
+                keep_checkpoint_mapped(
+                    weight_bytes=117 * 1024**3, component="vae (VAE)"
+                )
+            )
 
 
 class TestMatchCheckpointDtypes(unittest.TestCase):
