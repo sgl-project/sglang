@@ -42,6 +42,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
     """Triton-based kernel for GDN (Gated Delta Network) linear attention."""
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
+    supports_strided_target_verify_qkv: bool = True
 
     def packed_decode(
         self,

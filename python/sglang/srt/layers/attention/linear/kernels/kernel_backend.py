@@ -11,6 +11,8 @@ class LinearAttnKernelBase(ABC):
     """
 
     uses_state_checkpoints: bool = False
+    # Opt in only when target-verify kernels honor non-unit token strides.
+    supports_strided_target_verify_qkv: bool = False
 
     @abstractmethod
     def decode(
