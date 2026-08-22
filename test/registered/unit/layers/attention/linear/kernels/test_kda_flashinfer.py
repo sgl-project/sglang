@@ -429,6 +429,7 @@ class TestCakeKDAPrefillCheckpointAdapter(CustomTestCase):
         self.assertIs(call["ssm_state_indices"], inputs["cache_indices"])
         self.assertIs(call["cu_seqlens"], query_start_loc_i64)
         self.assertIs(call["checkpoint_cu_starts"], checkpoint_cu_starts)
+        self.assertEqual(call["backend"], "cake")
         self.assertEqual(call["beta"].stride(), (160, 32, 1))
         self.assertTrue(call["beta_is_logit"])
         self.assertEqual(output.shape, inputs["v"].shape)

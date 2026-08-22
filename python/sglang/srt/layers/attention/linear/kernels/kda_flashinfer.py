@@ -844,6 +844,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 checkpoint_every_n_tokens=(
                     state_checkpoint_every_n_tokens if needs_checkpoints else 0
                 ),
+                backend="cake",
             )
             if needs_checkpoints:
                 output, final_state, state_checkpoints = recurrent_result
