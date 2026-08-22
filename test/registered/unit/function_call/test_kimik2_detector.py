@@ -177,7 +177,7 @@ class TestKimiK2DetectorBasic(unittest.TestCase):
     def test_partial_tool_call_keeps_incomplete_json(self):
         chunks = [
             "<|tool_calls_section_begin|><|tool_call_begin|>functions.ReadFile:0"
-            '<|tool_call_argument_begin|>{',
+            "<|tool_call_argument_begin|>{",
             '"path": "/tmp"',
         ]
         tool_calls, _ = _collect_streaming_tool_calls(self.detector, chunks, self.tools)
