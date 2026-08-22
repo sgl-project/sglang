@@ -9,10 +9,10 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.environ import temp_set_env
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
     MooncakeStoreConfig,
 )
+from sglang.srt.utils.common import temp_set_env
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
