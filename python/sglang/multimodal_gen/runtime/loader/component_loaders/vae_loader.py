@@ -17,6 +17,8 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
+    checkpoint_bytes,
+    keep_checkpoint_mapped,
     set_default_torch_dtype,
     skip_init_modules,
 )
@@ -124,6 +126,21 @@ def _should_use_channels_last_3d(
     return False
 
 
+def _match_checkpoint_dtypes(loaded: dict, target_state: dict) -> dict:
+    """Convert checkpoint tensors whose dtype differs from their parameter's.
+
+    Assignment replaces the parameter rather than writing through it, so a
+    mismatched dtype would silently change the module's. Converting makes a
+    copy, which is the point: only the tensors that already match can stay on
+    the mapping.
+    """
+    for name, tensor in list(loaded.items()):
+        param = target_state.get(name)
+        if param is not None and param.dtype != tensor.dtype:
+            loaded[name] = tensor.to(dtype=param.dtype)
+    return loaded
+
+
 class VAELoader(ComponentLoader):
     """Shared loader for (video/audio) VAE modules."""
 
@@ -133,8 +150,11 @@ class VAELoader(ComponentLoader):
     def customized_load_kwargs_for_component(
         self, server_args: ServerArgs, component_name: str
     ) -> dict[str, bool]:
-        if current_platform.is_mps() and self._is_component_set_as_layerwise_load(
-            server_args, component_name
+        if (
+            current_platform.is_mps()
+            and server_args.should_configure_layerwise_offload_for_lazy_component(
+                component_name
+            )
         ):
             logger.info(
                 "Loading %s on CPU first for MPS layerwise offload", component_name
@@ -242,10 +262,30 @@ class VAELoader(ComponentLoader):
             loaded.update(safetensors_load_file(sf_path))
         _backfill_ltx2_audio_vae_latent_stats(loaded, component_name)
         strict_load = native_only
+        # `loaded` holds views into the safetensors mapping. When the component
+        # starts on the CPU and the host cannot afford copies of the whole
+        # deployment, assigning them keeps the weights file-backed instead of
+        # copying them into anonymous host memory: the page cache can drop and
+        # refetch file-backed bytes, and every anonymous byte here is a byte
+        # the stepped components' pin budget loses -- MiniMax-H3's video VAE is
+        # 9.70 GiB of a 32 GiB budget. On a host with room the copy stays the
+        # default, because its pages are resident where a mapping's first use
+        # pays a fault. MPS always assigns; the memory is unified. A tensor
+        # whose dtype differs from its parameter's is converted, which copies
+        # exactly the tensors that cannot stay.
+        keep_mapping = component_starts_on_cpu and (
+            current_platform.is_mps()
+            or keep_checkpoint_mapped(
+                weight_bytes=checkpoint_bytes(server_args.model_path),
+                component=f"{component_name or 'vae'} (VAE)",
+            )
+        )
+        if keep_mapping:
+            _match_checkpoint_dtypes(loaded, vae.state_dict())
         vae.load_state_dict(
             loaded,
             strict=strict_load,
-            assign=bool(cpu_offload_flag and current_platform.is_mps()),
+            assign=keep_mapping,
         )
 
         if not strict_load:
