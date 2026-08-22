@@ -72,25 +72,31 @@ class LoRAConfig:
             base_vocab_size=base_vocab_size,
         )
 
+    def _resolve_weights_dir(self):
+        if os.path.isdir(self.path):
+            return self.path
+        if self.path and not self.path.startswith(("/", "./", "../", "~")):
+            raise ValueError(
+                f"Remote HuggingFace Hub paths are not allowed: '{self.path}'. "
+                "Only local filesystem paths are supported."
+            )
+        if os.path.exists(self.path):
+            return self.path
+        weights_dir = snapshot_download(self.path, allow_patterns=["*.json"])
+        return weights_dir
+
     def get_lora_config(self, dummy=False):
         if dummy:
             raise NotImplementedError()
         else:
-            if not os.path.isdir(self.path):
-                weights_dir = snapshot_download(self.path, allow_patterns=["*.json"])
-            else:
-                weights_dir = self.path
+            weights_dir = self._resolve_weights_dir()
             config_name = "adapter_config.json"
             with open(os.path.join(weights_dir, config_name), "r") as f:
                 return json.load(f)
 
     def get_added_tokens_config(self):
         """Load added tokens from the LoRA adapter if the file exists."""
-        # Determine the weights directory
-        if not os.path.isdir(self.path):
-            weights_dir = snapshot_download(self.path, allow_patterns=["*.json"])
-        else:
-            weights_dir = self.path
+        weights_dir = self._resolve_weights_dir()
 
         # Construct the path to added_tokens.json
         added_tokens_path = os.path.join(weights_dir, "added_tokens.json")
