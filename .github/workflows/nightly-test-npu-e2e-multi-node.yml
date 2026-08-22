@@ -101,8 +101,9 @@ jobs:
       - name: Prepare code for testing
         run: |
           # copy source code to shared-disk
+          # Append run_id to isolate concurrent runs sharing the same PVC.
           current_path=$(pwd)
-          target_path=/root/.cache/tests/sglang
+          target_path=/root/.cache/tests/sglang-${{ github.run_id }}
           rm -rf ${target_path}
           mkdir -p ${target_path}
           cp -r ${current_path}/* ${target_path}/
@@ -114,22 +115,37 @@ jobs:
 
           pod_name_prefix="${KUBE_JOB_NAME}-"
           echo "kube name space: $NAMESPACE, pod name prefix: ${pod_name_prefix}"
-          while true; do
-            if kubectl get po -A -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
-              echo "Found exist sglang job, sleeping for 30 seconds..."
+          max_retries=60
+          retry_count=0
+          while [ $retry_count -lt $max_retries ]; do
+            if kubectl get pods -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
+              echo "Found stale sglang pods, retry $((retry_count+1))/${max_retries} (sleeping 30s)..."
               sleep 30
-              kubectl get pods | grep "${pod_name_prefix}" | awk '{print $1}' | xargs kubectl delete pod -n $NAMESPACE || true
+              kubectl get pods -n $NAMESPACE | grep "${pod_name_prefix}" | awk '{print $1}' | while read -r pod_name; do
+                [ -z "$pod_name" ] && continue
+                if kubectl delete pod "$pod_name" -n $NAMESPACE --force --ignore-not-found=true; then
+                  echo "  $pod_name: SUCCESS"
+                else
+                  echo "  $pod_name: WARNING (delete failed)"
+                fi
+              done
+              retry_count=$((retry_count+1))
             else
-              echo "No sglang job exist, start test case..."
+              echo "No stale sglang pods found, start test case..."
               break
             fi
           done
+          if [ $retry_count -ge $max_retries ]; then
+            echo "ERROR: pre-test cleanup timeout after $((max_retries*30))s, some pods still remain"
+            exit 1
+          fi
 
       - name: Run test
         timeout-minutes: 300
         run: |
           # sglang_source_relative_path is shared-disk path
-          sglang_source_relative_path=tests/sglang
+          # Append run_id so concurrent runs do not overwrite each other on the shared PVC.
+          sglang_source_relative_path=tests/sglang-${{ github.run_id }}
           sglang_source_path=/root/.cache/${sglang_source_relative_path}
           echo "Source code path: ${sglang_source_path}"
 
@@ -184,7 +200,8 @@ jobs:
             --test-case ${test_case} \
             --kube-name-space ${NAMESPACE} \
             --kube-job-type ${kube_job_type} \
-            --kube-job-name-prefix ${KUBE_JOB_NAME}"
+            --kube-job-name-prefix ${KUBE_JOB_NAME} \
+            --run-id ${{ github.run_id }}"
 
           if [ "$prefill_decode_deployment" = "separation" ];then
             CMD="${CMD} \
@@ -234,18 +251,42 @@ jobs:
         if: always()
         run: |
           cd ${ASCEND_E2E_TEST_CONFIG_PATH}
-          kubectl get pods -n $NAMESPACE | grep $KUBE_JOB_NAME
+          kubectl get pods -n $NAMESPACE | grep $KUBE_JOB_NAME || true
           kubectl delete -f ./k8s_multi_pd_*.yaml --ignore-not-found=true || true
 
-          pod_name_prefix="${KUBE_JOB_NAME}-"
+          # Prefer the exact job name (run_id-scoped random_str) written by the Python
+          # script so we only delete pods belonging to this run, not other concurrent runs.
+          if [ -f /tmp/kube_job_name.txt ]; then
+            pod_name_prefix=$(cat /tmp/kube_job_name.txt)
+            echo "Post-test cleanup using exact job name: ${pod_name_prefix}"
+          else
+            pod_name_prefix="${KUBE_JOB_NAME}-"
+            echo "WARNING: /tmp/kube_job_name.txt not found, falling back to fixed prefix: ${pod_name_prefix}"
+          fi
           echo "kube name space: $NAMESPACE, pod name prefix: ${pod_name_prefix}"
-          while true; do
-            if kubectl get po -A -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
-              echo "Found exist sglang job, sleeping for 30 seconds..."
+          max_retries=60
+          retry_count=0
+          while [ $retry_count -lt $max_retries ]; do
+            if kubectl get pods -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
+              echo "Found remaining sglang pods, retry $((retry_count+1))/${max_retries} (sleeping 30s)..."
               sleep 30
-              kubectl get pods | grep "${pod_name_prefix}" | awk '{print $1}' | xargs kubectl delete pod -n $NAMESPACE || true
+              kubectl get pods -n $NAMESPACE | grep "${pod_name_prefix}" | awk '{print $1}' | while read -r pod_name; do
+                [ -z "$pod_name" ] && continue
+                if kubectl delete pod "$pod_name" -n $NAMESPACE --force --ignore-not-found=true; then
+                  echo "  $pod_name: SUCCESS"
+                else
+                  echo "  $pod_name: WARNING (delete failed)"
+                fi
+              done
+              retry_count=$((retry_count+1))
             else
-              echo "No sglang job exist, start test case..."
+              echo "No sglang pods remain."
               break
             fi
           done
+          if [ $retry_count -ge $max_retries ]; then
+            echo "WARNING: post-test cleanup timeout after $((max_retries*30))s, some pods may remain"
+          fi
+
+          # Cleanup the run-scoped source code directory on the shared PVC.
+          rm -rf /root/.cache/tests/sglang-${{ github.run_id }} || true
