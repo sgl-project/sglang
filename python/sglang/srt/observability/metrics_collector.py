@@ -1090,8 +1090,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
         collector: Optional[SchedulerMetricsCollector] = None
         if enable_metrics:
-            engine_type = DisaggregationMode.to_engine_type(
-                server_args.disaggregation_mode
+            # Keep one metric series across role flips.
+            engine_type = (
+                "dynamic"
+                if server_args.enable_pd_role_switch
+                else DisaggregationMode.to_engine_type(server_args.disaggregation_mode)
             )
             labels = {
                 "model_name": server_args.served_model_name,
