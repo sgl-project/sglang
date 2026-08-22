@@ -714,6 +714,18 @@ class ServerArgs:
         ),
         NS("model"),
     ] = "auto"
+    fp4_kv_cache_recipe: A[
+        str,
+        Arg(
+            help=(
+                "FP4 KV-cache scaling recipe. 'mxfp4' uses MX block scaling "
+                "(E8M0 block-32, no global scale); 'nvfp4' uses an FP32 tensor "
+                "scale plus E4M3 block-16 scales."
+            ),
+            choices=["nvfp4", "mxfp4"],
+        ),
+        NS("model"),
+    ] = "mxfp4"
     enable_fp32_lm_head: A[
         bool, "If set, the LM head outputs (logits) are in FP32.", NS("exec.features")
     ] = False
@@ -6123,7 +6135,24 @@ class ServerArgs:
     def _handle_kv4_compatibility(self):
         """Check FP4 KV cache compatibility with the attention backend"""
 
-        if self.kv_cache_dtype not in ("nvfp4", "fp4_mx_block16"):
+        if self.kv_cache_dtype not in ("nvfp4", "fp4_mx_block16", "fp4_e2m1"):
+            return
+
+        if self.kv_cache_dtype == "fp4_e2m1":
+            # The fp4_e2m1 spelling of --kv-cache-dtype is the DeepSeek V4
+            # MXFP4 recipe (E8M0 block-32; recipe and SM90 are validated in
+            # _deepseek_v4_kv_cache_dtype at the DSV4 slot, which has already
+            # run). Other models must pick one of the generic FP4 recipes —
+            # previously they fell through to the KV-cache quant registry,
+            # which rejected fp4_e2m1 as "deprecated" deep in pool
+            # construction.
+            model_arch = self.get_model_config().hf_config.architectures[0]
+            if model_arch != "DeepseekV4ForCausalLM":
+                raise ValueError(
+                    "--kv-cache-dtype fp4_e2m1 is only supported for DeepSeek V4 "
+                    "(with --fp4-kv-cache-recipe mxfp4). Use --kv-cache-dtype "
+                    "nvfp4 or fp4_mx_block16 for the generic FP4 KV cache recipes."
+                )
             return
 
         use_mla_backend = self.use_mla_backend()
