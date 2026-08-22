@@ -59,7 +59,6 @@ import { Qwen38MambaRatioCalculator } from "/src/snippets/_qwen38_mamba_ratio_ca
 
 <Deployment config={config} />
 
-
 <Note>
   The RTX 5090 and RTX PRO 6000 cells above — including every Speculative
   Decoding / Serving Strategy / SSM dtype combination — were validated at
@@ -68,14 +67,7 @@ import { Qwen38MambaRatioCalculator } from "/src/snippets/_qwen38_mamba_ratio_ca
   cells cover the full combination set — DFLASH2 included — re-measured end to
   end on `1cf2b8c`, but to a weaker standard: each of the 48 was confirmed to
   **boot and serve** at ISL 8192 / OSL 1024, concurrency 1, with no throughput
-  or acceptance-length numbers taken. The H200 and GB300 recipes carry their
-  original validation, which covers the default overlay picks (plus MTP on
-  GB300); non-default overlay picks there are valid but unmeasured.
-
-  DFLASH2 has not been exercised on H200 or GB300: selecting it there switches
-  the cell's badge to **Final Verification In Progress** until that round
-  lands. The other picks on those platforms keep the validation described
-  above.
+  or acceptance-length numbers taken.
 </Note>
 
 ### Mamba ratio calculator
