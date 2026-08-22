@@ -22,21 +22,16 @@ from sglang.srt.runtime_context import attention_backends
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cuda,
-    is_npu,
     is_xpu,
     support_triton,
 )
 
 _is_cuda = is_cuda()
-_is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_cuda:
     from sglang.kernels.ops.attention.rope import apply_rope_with_cos_sin_cache_inplace
-
-if _is_npu:
-    import torch_npu
 
 if _is_xpu:
     from sgl_kernel import multimodal_rotary_embedding
