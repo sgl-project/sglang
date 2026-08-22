@@ -450,6 +450,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
             node_rank=0,
             tokenizer_worker_num=1,
             check_server_args=MagicMock(),
+            resolve_once=MagicMock(),
         )
         scheduler_init_result = SimpleNamespace(
             all_child_pids=[],

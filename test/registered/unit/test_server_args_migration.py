@@ -24,7 +24,11 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
 
     def _parse(self, args_list):
         args = self.parser.parse_args(["--model", "dummy"] + args_list)
-        return ServerArgs.from_cli_args(args)
+        server_args = ServerArgs.from_cli_args(args)
+        # Parsing hands back the raw record; the cases below read values that
+        # resolution normalises, so resolve here the way a launcher would.
+        server_args.resolve_once()
+        return server_args
 
     def test_aliases_and_dest(self):
         """Field name drives dest; long forms and short aliases both work."""
