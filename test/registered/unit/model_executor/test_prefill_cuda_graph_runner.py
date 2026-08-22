@@ -8,6 +8,7 @@ import torch
 
 import sglang.srt.model_executor.model_runner_components.cuda_graph_setup as graph_setup
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
@@ -62,6 +63,73 @@ class _FakeKVIndexKernel:
 
 
 class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
+    def test_capture_prepare_applies_model_runner_batch_hook(self):
+        class Slot:
+            def __init__(self, buffer):
+                self.buffer = buffer
+
+            def slice_for(self, _bs, num_tokens):
+                return self.buffer[:num_tokens]
+
+        slots = {
+            "input_ids": Slot(torch.zeros(4, dtype=torch.int64)),
+            "out_cache_loc": Slot(torch.zeros(4, dtype=torch.int64)),
+            "positions": Slot(torch.zeros(4, dtype=torch.int64)),
+        }
+        registry = SimpleNamespace(
+            has_slot=lambda name: name in slots,
+            get_slot=lambda name: slots[name],
+        )
+        prepared = []
+        captured = []
+        attention_backend = object()
+        model_runner = SimpleNamespace(
+            model_config=SimpleNamespace(context_len=8),
+            pp_group=SimpleNamespace(is_last_rank=False),
+            prepare_dummy_forward_batch=lambda batch: prepared.append(batch) or batch,
+            attn_backend=attention_backend,
+        )
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.model_runner = model_runner
+        runner.device = torch.device("cpu")
+        runner.prefill_backend_name = Backend.BREAKABLE
+        runner._capture_req_slots = 1
+        runner.max_bs = 4
+        runner._prefill_static_buffers = None
+        runner.buffer_registry = registry
+        runner.require_mlp_tp_gather = False
+        runner.require_attn_tp_gather = False
+        runner._capture_lora = False
+        runner.capture_hidden_mode = CaptureHiddenMode.NULL
+        runner.static_draft_hidden_states = None
+        runner.capture_return_pooled_hidden_states = False
+        runner.tbo_plugin = SimpleNamespace(
+            capture_one_batch_size=lambda batch, **_: captured.append(batch)
+        )
+
+        batch, backend = runner.capture_prepare(4)
+
+        self.assertEqual(prepared, [batch])
+        self.assertEqual(captured, [batch])
+        self.assertIs(backend, attention_backend)
+
+    def test_trim_logits_output_preserves_customized_info(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.model_runner = SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
+        )
+        runner.raw_bs = 1
+        runner._is_full_backend = True
+        customized_info = {"per_request": [object()]}
+        output = runner._trim_logits_output(
+            LogitsProcessorOutput(
+                next_token_logits=torch.zeros((4, 8)),
+                customized_info=customized_info,
+            )
+        )
+
+        self.assertIs(output.customized_info, customized_info)
+
     def test_low_free_memory_still_captures_prefill_graph(self):
         eager_runner = object()
         prefill_runner = object()
