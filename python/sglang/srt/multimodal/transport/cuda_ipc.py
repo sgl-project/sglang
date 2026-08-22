@@ -26,6 +26,10 @@ DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY = (
     "_sglang_defer_cuda_ipc_feature_reconstruction"
 )
 
+# Per-image content hashes computed at feature-production time (one list entry
+# per bundled item), preserved by item expansion instead of re-hashing.
+PRECOMPUTED_FEATURE_HASHES_KEY = "_sglang_precomputed_feature_hashes"
+
 
 def get_mm_feature_pool_size_per_worker(
     total_pool_size: int, tokenizer_worker_num: int
