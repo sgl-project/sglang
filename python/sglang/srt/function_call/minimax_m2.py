@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import re
 from typing import Any, Dict, List, Tuple
 
@@ -178,9 +179,14 @@ class MinimaxM2Detector(BaseFormatDetector):
             elif param_type in ["number", "float"]:
                 try:
                     val = float(value)
-                    return val if val != int(val) else int(val)
                 except (ValueError, TypeError):
                     continue
+                # A non-finite literal ("1e999" -> inf, "nan") would make
+                # int(val) raise (crashing detect_and_parse) or serialize as
+                # invalid `Infinity`/`NaN` JSON; keep the raw string instead.
+                if not math.isfinite(val):
+                    return value
+                return val if val != int(val) else int(val)
             elif param_type in ["boolean", "bool"]:
                 lower_val = value.lower().strip()
                 if lower_val in ["true", "1", "yes", "on"]:
