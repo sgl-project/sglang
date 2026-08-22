@@ -144,7 +144,9 @@ class CompressorHip(_CompressorBase):
             pre_state_indices = self.compute_state_len_indices(
                 seq_len=prefix_lens[i], ratio=self.ratio
             ).to(device)
-            if self.ratio == 128:
+            if self.ratio == 128 or (
+                self.ratio == 4 and getattr(token_to_kv_pool, "_unified_kv", False)
+            ):
                 state_loc = state_pool.translate_from_req_position_to_state_loc(
                     req_pool_indices[i], pre_state_indices
                 )
@@ -166,7 +168,9 @@ class CompressorHip(_CompressorBase):
             post_state_len = post_state_indices.size(0)
 
             assert post_state_len <= valid_kv_len
-            if self.ratio == 128:
+            if self.ratio == 128 or (
+                self.ratio == 4 and getattr(token_to_kv_pool, "_unified_kv", False)
+            ):
                 post_state_loc = state_pool.translate_from_req_position_to_state_loc(
                     req_pool_indices[i], post_state_indices
                 )
@@ -271,7 +275,9 @@ class CompressorHip(_CompressorBase):
             seq_lens = seq_lens_2d.view(-1)
             req_pool_indices = req_pool_indices.repeat_interleave(draft_tokens)
 
-        if self.ratio == 128:
+        if self.ratio == 128 or (
+            self.ratio == 4 and getattr(token_to_kv_pool, "_unified_kv", False)
+        ):
             state_locs = state_pool.translate_from_req_position_to_state_loc(
                 req_pool_indices, seq_lens - 1
             )
@@ -286,7 +292,9 @@ class CompressorHip(_CompressorBase):
             -compress_bulk_len, 0, device=seq_lens.device
         )
         compress_indices.clamp_(min=-1)
-        if self.ratio == 128:
+        if self.ratio == 128 or (
+            self.ratio == 4 and getattr(token_to_kv_pool, "_unified_kv", False)
+        ):
             compress_indices_state = (
                 state_pool.translate_from_req_position_to_state_loc(
                     req_pool_indices[:, None], compress_indices
