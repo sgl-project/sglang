@@ -51,6 +51,7 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    empty_device_cache,
     is_cpu,
     is_flashinfer_available,
     is_gfx95_supported,
@@ -59,6 +60,7 @@ from sglang.srt.utils import (
     is_sm100_supported,
     is_sm120_supported,
     is_triton_kernels_available,
+    is_xpu,
     next_power_of_2,
     round_up,
     set_weight_attrs,
@@ -201,6 +203,72 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     )
     scale = convert_layout(wrap_torch_tensor(scale), scale_layout, **scale_layout_opts)
     return quant_tensor, InFlexData(), scale
+
+
+# OCP MXFP4: 32 elements share one UE8M0 scale, packed two per byte.
+_MXFP4_PACKED_BYTES_PER_BLOCK = 16
+_MXFP4_E2M1_LUT = (
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+)
+
+
+def _upcast_mxfp4_to_bf16(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    rows_per_chunk: int = 1 << 20,
+) -> torch.Tensor:
+    """Upcast a packed OCP MXFP4 weight to bf16 along the last axis.
+
+    Prefers `triton_kernels.upcast_from_mxfp`; that package is CUDA/HIP-only, so
+    the fallback is a chunked pure-torch upcast. Chunking is not optional: a
+    whole-tensor version allocates float32/int64 temporaries several times the
+    size of the bf16 result and exhausts a 24 GB XPU card on gpt-oss-20b.
+
+    `MXFP4QuantizeUtil.dequantize` computes the same values but whole-tensor, so
+    it is not usable here.
+    """
+    try:
+        from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
+
+        return upcast_from_mxfp(weight, scale, target_dtype=torch.bfloat16, axis=-1)
+    except ImportError:
+        pass
+
+    lut = torch.tensor(_MXFP4_E2M1_LUT, dtype=torch.bfloat16, device=weight.device)
+
+    blocks = weight.reshape(-1, _MXFP4_PACKED_BYTES_PER_BLOCK)
+    exponents = scale.reshape(-1, 1).to(torch.int32) - _UE8M0_ONE
+    out = torch.empty(
+        blocks.shape[0],
+        _MXFP4_PACKED_BYTES_PER_BLOCK * 2,
+        dtype=torch.bfloat16,
+        device=weight.device,
+    )
+
+    for start in range(0, blocks.shape[0], rows_per_chunk):
+        stop = min(start + rows_per_chunk, blocks.shape[0])
+        block = blocks[start:stop]
+        chunk = out[start:stop]
+        chunk[:, 0::2] = lut[(block & 0x0F).to(torch.int32)]
+        chunk[:, 1::2] = lut[(block >> 4).to(torch.int32)]
+        torch.ldexp(chunk, exponents[start:stop], out=chunk)
+
+    return out.reshape(*weight.shape[:-1], weight.shape[-1] * 2)
 
 
 def _dequant_mxfp4_fake(
@@ -463,6 +531,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         elif has_triton_kernels:
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, triton_kernels_padding_alignment
+            )
+        elif is_xpu():
+            # gpt_oss.py shards the MoE intermediate by whole mxfp4 blocks
+            # (ceil(blocks / tp) * 32), so a rank's slice can exceed
+            # intermediate_size / tp -- 736 vs 720 for gpt-oss-20b at tp=4. The
+            # branches above absorb that in their own alignment; this path has
+            # none, so pad to 2 * mxfp4_block as the comment above prescribes.
+            intermediate_size_per_partition_after_pad = round_up(
+                intermediate_size_per_partition, 2 * mxfp4_block
             )
 
         self.intermediate_size_per_partition = intermediate_size_per_partition_after_pad
@@ -990,27 +1067,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     )
             return
         else:
-            from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
-
-            w13_weight = upcast_from_mxfp(
-                layer.w13_weight,
-                layer.w13_weight_scale,
-                target_dtype=torch.bfloat16,
-                axis=-1,
-            )
-            w2_weight = upcast_from_mxfp(
-                layer.w2_weight,
-                layer.w2_weight_scale,
-                target_dtype=torch.bfloat16,
-                axis=-1,
-            )
+            w13_weight = _upcast_mxfp4_to_bf16(layer.w13_weight, layer.w13_weight_scale)
+            w2_weight = _upcast_mxfp4_to_bf16(layer.w2_weight, layer.w2_weight_scale)
             del layer.w13_weight
             del layer.w2_weight
             del layer.w13_weight_scale
             del layer.w2_weight_scale
             layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
             layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
-        torch.cuda.empty_cache()
+        empty_device_cache()
 
     def _process_weights_for_sm90_cutlass(self, layer):
         """De-interleave + pad + halving-swap + byte-interleave MXFP4 weights
