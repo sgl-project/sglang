@@ -1293,6 +1293,13 @@ class PrefillAdder:
         if not self.token_to_kv_pool_allocator.prefill_compressed_headroom(
             real_input_tokens, self.chunked_reserve_tokens
         ):
+            if envs.SGLANG_DEBUG_MEMORY_POOL.get():
+                logger.info(
+                    "[c128-gate] queue req: extend=%d reserve=%d c128_avail=%d",
+                    real_input_tokens,
+                    self.chunked_reserve_tokens,
+                    self.token_to_kv_pool_allocator.c128_attn_allocator.available_size(),
+                )
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):

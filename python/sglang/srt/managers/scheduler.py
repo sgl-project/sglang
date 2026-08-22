@@ -3479,6 +3479,20 @@ class Scheduler(
 
         new_batch.prepare_for_extend()
 
+        # Pool-headroom observability for DSV4 compressed sidecars, sharing the
+        # allocator debug switch so both turn on together.
+        if envs.SGLANG_DEBUG_MEMORY_POOL.get():
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
+                DSV4NPUTokenToKVPoolAllocator,
+            )
+
+            _alloc = self.token_to_kv_pool_allocator
+            if isinstance(_alloc, DSV4NPUTokenToKVPoolAllocator):
+                logger.info(
+                    "[c-pool] c128 avail=%d",
+                    _alloc.c128_attn_allocator.available_size(),
+                )
+
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
                 req.swa_evict_floor = req.extend_range.end

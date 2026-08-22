@@ -39,6 +39,17 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         num_new_pages: int = None,
     ):
         if self.debug_mode:
+            # Input sentinel: a last_loc outside [-1, size) is garbage from
+            # upstream (the get_last_loc triton defect) and will propagate
+            # verbatim into out_cache_loc and the req_to_token rows.
+            oob = (last_loc < -1) | (last_loc >= self.size)
+            if bool(oob.any()):
+                logger.error(
+                    "alloc_extend got out-of-range last_loc INPUT: rows=%s "
+                    "values=%s (source is upstream of the allocator)",
+                    oob.nonzero(as_tuple=False).flatten().tolist(),
+                    last_loc[oob].cpu().tolist()[:8],
+                )
             violation = (last_loc + 1) % self.page_size != prefix_lens % self.page_size
             if bool(violation.any()):
                 # Dump the offending rows so a remote crash log is readable.

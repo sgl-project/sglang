@@ -747,6 +747,17 @@ class MooncakeKVManager(CommonKVManager):
             )
             if inside:
                 good.append(block)
+                continue
+            nearest = ranges[i] if i >= 0 else ranges[0]
+            logger.error(
+                "[mf-trans] dropping src outside registered regions: "
+                "src:0x%x len:%d (nearest region [0x%x, 0x%x), delta:0x%x)",
+                src,
+                length,
+                nearest[0],
+                nearest[1],
+                src - nearest[1] if src >= nearest[1] else nearest[0] - src,
+            )
         return good
 
     def _submit_transfer_batch(self, mooncake_session_id, batch) -> int:

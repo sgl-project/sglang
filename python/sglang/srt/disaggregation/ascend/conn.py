@@ -8,7 +8,10 @@ import numpy.typing as npt
 
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
 from sglang.srt.disaggregation.base.conn import StateType
-from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
+from sglang.srt.disaggregation.common.utils import (
+    debug_log_transfer_fragmentation,
+    group_concurrent_contiguous,
+)
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVBootstrapServer,
     MooncakeKVManager,
@@ -127,6 +130,50 @@ class AscendKVManager(MooncakeKVManager):
         layers_current_pp_stage = len(src_kv_ptrs)
         return src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage
 
+    def _debug_log_out_of_range_kv_pages(
+        self,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_indices: npt.NDArray[np.int32],
+    ) -> None:
+        """[mf-kv] name the layer whose page ids escape its own buffer.
+
+        Complements the address-level drop log: a garbage page id (~+/-8M)
+        and an unregistered-but-valid pointer produce the same symptom at
+        submit time; this check separates them by testing ids against each
+        layer's own page count.
+        """
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_DEBUG_MEMORY_POOL.get():
+            return
+        idx = np.asarray(prefill_kv_indices, dtype=np.int64)
+        if idx.size == 0:
+            return
+        for layer_id, (ptr, total, item) in enumerate(
+            zip(
+                self.kv_args.kv_data_ptrs,
+                self.kv_args.kv_data_lens,
+                self.kv_args.kv_item_lens,
+            )
+        ):
+            num_pages = total // item if item else 0
+            bad = idx[(idx < 0) | (idx >= max(num_pages, 1))]
+            if bad.size:
+                logger.error(
+                    "[mf-kv] layer=%d ptr=0x%x item_len=%d pages=%d: %d/%d "
+                    "page ids out of range, e.g. %s",
+                    layer_id,
+                    ptr,
+                    item,
+                    num_pages,
+                    bad.size,
+                    idx.size,
+                    bad[:8].tolist(),
+                )
+        dst = np.asarray(dst_kv_indices, dtype=np.int64)
+        if dst.size and (dst.min() < 0):
+            logger.error("[mf-kv] negative dst page ids: %s", dst[:8].tolist())
+
     def send_kvcache(
         self,
         mooncake_session_id: str,
@@ -150,6 +197,14 @@ class AscendKVManager(MooncakeKVManager):
         # Group by indices
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices
+        )
+        self._debug_log_out_of_range_kv_pages(prefill_kv_indices, dst_kv_indices)
+        debug_log_transfer_fragmentation(
+            "kv",
+            prefill_kv_indices,
+            dst_kv_indices,
+            self.kv_args.kv_item_lens,
+            self.kv_args.kv_data_lens,
         )
 
         if self.pp_size > 1:

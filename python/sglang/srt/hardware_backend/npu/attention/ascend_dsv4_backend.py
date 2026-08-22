@@ -492,6 +492,16 @@ class CompressorAscendBackendMixin:
         else:
             backend_fm = self.forward_metadata
             loc = backend_fm.c4_loc if compressor.ratio == 4 else backend_fm.c128_loc
+        # Keep the last few forwards' quant payloads alive so the send-path
+        # fingerprint can sequence-match them; pools churn every forward, so
+        # post-hoc matching only works against retained tensors.
+        _recent = getattr(self, "_mf_recent_payloads", None)
+        if _recent is None:
+            _recent = self._mf_recent_payloads = []
+        _recent.append(
+            (kv.detach(), None if kv_scale is None else kv_scale.detach())
+        )
+        del _recent[:-8]
         if loc is not None:
             if loc.numel() != kv.shape[0]:
                 raise RuntimeError(

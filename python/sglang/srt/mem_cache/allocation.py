@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.runtime_context import attention_backends, get_parallel
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -100,6 +101,28 @@ def write_cache_indices(
                 (req_idx, slice(prefix_len, seq_len)),
                 out_cache_loc[pt : pt + extend_len],
             )
+            pt += extend_len
+
+    if _is_npu and envs.SGLANG_DEBUG_MEMORY_POOL.get():
+        # Post-write read-back: separates "written dirty" (writer inputs) from
+        # "written clean, clobbered later" (an OOB kernel during forward).
+        pt = 0
+        for i in range(req_pool_indices_cpu.shape[0]):
+            req_idx = req_pool_indices_cpu[i].item()
+            prefix_len = prefix_lens_cpu[i].item()
+            seq_len = seq_lens_cpu[i].item()
+            extend_len = extend_lens_cpu[i].item()
+            seg = req_to_token_pool.req_to_token[req_idx, prefix_len:seq_len]
+            if int(seg.min()) < 0:
+                logger.error(
+                    "[mf-write] row EXTEND seg dirty IMMEDIATELY post-write: "
+                    "req_slot=%d seg=[%d,%d) min=%d max=%d",
+                    req_idx,
+                    prefix_len,
+                    seq_len,
+                    int(seg.min()),
+                    int(seg.max()),
+                )
             pt += extend_len
 
 
