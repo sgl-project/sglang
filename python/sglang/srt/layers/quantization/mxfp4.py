@@ -346,6 +346,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # MoE runner, so it needs the same unpadded checkpoint layout and
         # DeepGEMM scale preparation even when the runner is flashinfer_mxfp4.
         self.use_mega_moe = get_moe_a2a_backend().is_megamoe()
+        # MegaMoE runs experts through DeepGEMM's packed-FP4 grouped GEMM,
+        # which is built for SM100 only (it asserts ``arch_major == 10``). On
+        # SM90 (Hopper) this crashes late, at decode CUDA-graph capture, with a
+        # message whose tuning suggestions do not apply. Fail fast here, before
+        # weight load, with the actionable alternatives. See sgl-project#35557.
+        if self.use_mega_moe and not is_sm100_supported():
+            raise ValueError(
+                "MXFP4 experts under the MegaMoE/DeepEP expert-parallel path "
+                "require SM100 (Blackwell): DeepGEMM's packed-FP4 grouped GEMM "
+                "asserts arch_major == 10 and crashes at CUDA-graph capture on "
+                "SM90 (Hopper). On Hopper, either serve the stock MXFP4 "
+                "checkpoint with tensor parallelism (Marlin backend; do not set "
+                "--moe-a2a-backend deepep), or use the FP8-converted checkpoint "
+                "(e.g. sgl-project/DeepSeek-V4-Flash-FP8) for DP-attention + "
+                "DeepEP. Tracking Hopper MXFP4 EP support: "
+                "https://github.com/sgl-project/sglang/issues/35557"
+            )
         self.flashinfer_mxfp4_moe_precision = (
             get_exec().moe.flashinfer_mxfp4_moe_precision
         )
