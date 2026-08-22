@@ -6312,9 +6312,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         alloc.translate_loc_from_full_to_swa.assert_called_once_with(incoming_full)
         alloc.set_full_to_swa_mapping.assert_called_once_with(kept_full, swa_value)
         # the incoming full's stale mapping is cleared, then its slot freed (full-only)
-        key, val = alloc.full_to_swa_index_mapping.__setitem__.call_args.args
-        self.assertTrue(torch.equal(key, incoming_full))
-        self.assertEqual(val, 0)
+        alloc.clear_full_to_swa_mapping.assert_called_once_with(incoming_full)
         alloc.full_attn_allocator.free.assert_called_once_with(incoming_full)
         alloc.free.assert_not_called()
         cache.tree_core.set_component_device_value.assert_called_once_with(
