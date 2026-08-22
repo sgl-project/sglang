@@ -11,6 +11,7 @@ and uses BatchMLAPaged wrapper for decoding.
 More details can be found in https://docs.flashinfer.ai/api/mla.html
 """
 
+import logging
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Union
@@ -45,6 +46,7 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.utils import (
     is_flashinfer_available,
+    is_sm90_supported,
     is_sm100_supported,
     next_power_of_2,
 )
@@ -67,6 +69,40 @@ if is_flashinfer_available():
     from flashinfer import (
         BatchMLAPagedAttentionWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
+    )
+
+logger = logging.getLogger(__name__)
+
+# Set once the fp8-KV fallback warning has been emitted. A process can
+# construct several qualifying backends (e.g. one per scheduler), and the
+# fallback config cannot differ between them, so the warning is per
+# process, not per instance. Subclasses and multistep scaffolds never
+# emit it (see warn_fp8_fallback in __init__).
+_FP8_FALLBACK_WARNED = False
+
+
+def _fp8_kv_enabled(
+    kv_cache_dtype: torch.dtype,
+    model_dtype: torch.dtype,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    dcp_enabled: bool,
+    sm90_supported: bool,
+) -> bool:
+    """Whether flashinfer's native fp8 MLA kernel can read the KV pool as-is.
+
+    flashinfer's fp8 MLA path (fa3 backend, SM90 only) requires bf16 queries,
+    ``head_dim_ckv == 512`` and ``head_dim_kpe == 64`` (fp8 NoPE is not
+    released yet), and accepts e4m3 only. DCP feeds attention a separate bf16
+    ``dcp_kv_buffer``, so it keeps the upcast path.
+    """
+    return (
+        kv_cache_dtype == torch.float8_e4m3fn
+        and sm90_supported
+        and model_dtype == torch.bfloat16
+        and kv_lora_rank == 512
+        and qk_rope_head_dim == 64
+        and not dcp_enabled
     )
 
 
@@ -222,6 +258,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
+        warn_fp8_fallback: Optional[bool] = None,
     ):
         super().__init__()
 
@@ -240,6 +277,49 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             and not get_exec().kernel.flashinfer_mla_disable_ragged
         )
         self.page_size = model_runner.page_size
+
+        # Native fp8 KV cache: on SM90 flashinfer's MLA kernel can consume the
+        # e4m3 pool buffer directly, which removes the per-layer full-pool
+        # `.to(q.dtype)` bf16 upcast in forward_decode/forward_extend. Note
+        # the fp8 kernel itself is slower than the bf16 one; the win over the
+        # upcast fallback is decode-dominated (one token of attention per
+        # layer per step against a full-pool cast), while paged extend keeps
+        # a smaller, pool-size-dependent saving.
+        self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self.fp8_kv = _fp8_kv_enabled(
+            self.kv_cache_dtype,
+            model_runner.dtype,
+            model_runner.model_config.kv_lora_rank,
+            model_runner.model_config.qk_rope_head_dim,
+            get_parallel().dcp_enabled,
+            is_sm90_supported(),
+        )
+        if warn_fp8_fallback is None:
+            # The fallback warning only concerns deployments that actually
+            # selected flashinfer_mla. Subclasses reuse this constructor but
+            # are their own backend selection (e.g. TRT-LLM MLA consumes
+            # fp8 KV natively), so they stay silent instead of telling the
+            # user to switch to the backend they are already using.
+            warn_fp8_fallback = type(self) is FlashInferMLAAttnBackend
+        if (
+            warn_fp8_fallback
+            and self.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            and not self.fp8_kv
+        ):
+            global _FP8_FALLBACK_WARNED
+            # Spec decode builds several MLA backends per scheduler (one per
+            # draft step) and the fallback config cannot differ between them,
+            # so warn once per process instead of once per instance.
+            if not _FP8_FALLBACK_WARNED:
+                logger.warning(
+                    "flashinfer_mla: fp8 KV cache requested, but the native fp8 MLA "
+                    "path needs SM90, a bf16 model, MLA dims kv_lora_rank=512/"
+                    "qk_rope_head_dim=64 with e4m3, and no DCP; keeping the per-layer "
+                    "bf16 upcast fallback. On Blackwell use trtllm_mla for native "
+                    "fp8 KV."
+                )
+                _FP8_FALLBACK_WARNED = True
+        self.kv_data_type = torch.float8_e4m3fn if self.fp8_kv else model_runner.dtype
 
         # Allocate buffers
         # different from flashinfer zero_init_global_workspace_buffer
@@ -653,6 +733,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 and forward_batch.attn_dcp_metadata.dcp_kv_buffer is not None
             ):
                 k_buf = forward_batch.attn_dcp_metadata.dcp_kv_buffer.to(q.dtype)
+            elif self.fp8_kv:
+                # The pool stores unscaled e4m3, so the bits are identical to
+                # the `.to(q.dtype)` upcast and the dequant scales are 1.0.
+                # Per-tensor ckv/kpe scale plumbing is left as a follow-up.
+                k_buf = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             else:
                 k_buf = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
             if q_rope is None:
@@ -661,6 +746,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     qall[:, :, : layer.v_head_dim],
                     qall[:, :, layer.v_head_dim :],
                 )
+            # flashinfer requires ckv_scale/kpe_scale when the planned KV dtype
+            # is fp8, and rejects them otherwise.
+            fp8_scale_kwargs = (
+                {"ckv_scale": 1.0, "kpe_scale": 1.0} if self.fp8_kv else {}
+            )
             o = q.new_empty(q.shape)
             o = prefill_wrapper_paged.run(
                 q,
@@ -668,6 +758,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 k_buf[:, :, : layer.v_head_dim],
                 k_buf[:, :, layer.v_head_dim :],
                 out=o,
+                **fp8_scale_kwargs,
             )
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -716,11 +807,20 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             q_nope = reshaped_q[:, :, : layer.v_head_dim]
             q_rope = reshaped_q[:, :, layer.v_head_dim :]
 
-        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
+        if self.fp8_kv:
+            # The pool stores unscaled e4m3, so the bits are identical to the
+            # `.to(q.dtype)` upcast and the dequant scales are 1.0. Per-tensor
+            # ckv/kpe scale plumbing is left as a follow-up.
+            k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        else:
+            k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
 
         o = q_nope.new_empty(q_nope.shape)
         # for decode and dcp_world_size > 1, lse should be returned to compute final attn_out
         # Direct call to run without the wrapper
+        # flashinfer requires ckv_scale/kpe_scale when the planned KV dtype is
+        # fp8, and rejects them otherwise.
+        fp8_scale_kwargs = {"ckv_scale": 1.0, "kpe_scale": 1.0} if self.fp8_kv else {}
         o = decode_wrapper.run(
             q_nope,
             q_rope,
@@ -731,6 +831,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             return_lse=(
                 forward_batch.forward_mode.is_decode() and get_parallel().dcp_enabled
             ),
+            **fp8_scale_kwargs,
         )
         if isinstance(o, tuple):
             out, lse = o
@@ -752,6 +853,8 @@ class FlashInferMLAIndicesUpdaterDecode:
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
         self.scaling = model_runner.model_config.scaling
         self.data_type = model_runner.dtype
+        # e4m3 when the backend took the native fp8 KV path, else model dtype.
+        self.kv_data_type = attn_backend.kv_data_type
         self.attn_backend = attn_backend
 
         # Buffers and wrappers
@@ -860,7 +963,7 @@ class FlashInferMLAIndicesUpdaterDecode:
                 False,
                 sm_scale,
                 self.data_type,
-                self.data_type,
+                self.kv_data_type,
             )
         else:
             wrapper.plan(
@@ -875,7 +978,7 @@ class FlashInferMLAIndicesUpdaterDecode:
                 False,
                 sm_scale,
                 self.data_type,
-                self.data_type,
+                self.kv_data_type,
             )
 
 
@@ -892,6 +995,8 @@ class FlashInferMLAIndicesUpdaterPrefill:
         self.scaling = model_runner.model_config.scaling
         self.data_type = model_runner.dtype
         self.q_data_type = model_runner.dtype
+        # e4m3 when the backend took the native fp8 KV path, else model dtype.
+        self.kv_data_type = attn_backend.kv_data_type
         self.attn_backend = attn_backend
 
         # Buffers and wrappers
@@ -1048,7 +1153,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 True,
                 sm_scale,
                 self.q_data_type,
-                self.data_type,
+                self.kv_data_type,
             )
 
 
@@ -1093,6 +1198,10 @@ class FlashInferMLAMultiStepDraftBackend:
                     skip_prefill=True,
                     kv_indptr_buf=self.kv_indptr[i],
                     q_indptr_decode_buf=self.q_indptr_decode,
+                    # Temporary scaffolds (TRT-LLM's multistep subclass
+                    # replaces them right after); the selected backend's own
+                    # instance emits the fallback warning if due.
+                    warn_fp8_fallback=False,
                 )
             )
 
