@@ -1,0 +1,56 @@
+---
+title: "FlashBoot integration"
+description: "Use FlashBoot load formats from the external FlashBoot package."
+---
+
+SGLang exposes `flashload` and `flashclone` as load formats for the external FlashBoot package.
+
+## Install FlashBoot
+
+Install SGLang with the FlashBoot extra:
+
+```bash
+pip install "sglang[flashboot]"
+```
+
+The FlashBoot implementation lives in the third-party repository `https://github.com/scitix/flashboot-release`. SGLang keeps only the integration points for load-format registration, loader dispatch, and optional sharded-state export.
+
+## Build a Docker image with FlashBoot
+
+The default SGLang Dockerfile does not install FlashBoot. Build the FlashBoot-specific Dockerfile to include the external package:
+
+```bash
+docker build \
+  -f docker/Dockerfile_flashboot \
+  --target runtime \
+  --build-arg BRANCH_TYPE=local \
+  -t sglang-flashboot .
+```
+
+## Load with FlashBoot
+
+After you install FlashBoot, SGLang dispatches `flashload` and `flashclone` to `flashboot.sglang_plugin.get_flashboot_loader`.
+
+```bash
+python -m sglang.launch_server \
+  --model-path /path/to/flashboot/export \
+  --load-format flashload
+```
+
+Use `flashclone` on clone instances and pass FlashBoot-specific options through `--model-loader-extra-config`.
+
+## Export sharded state
+
+Set `FB_SHARD_SAVE_DIR` to export per-rank sharded state after the model loads. SGLang writes files with the pattern `model-rank-{rank}-part-{part}.safetensors`.
+
+```bash
+FB_SHARD_SAVE_DIR=/path/to/flashboot/export \
+python -m sglang.launch_server \
+  --model-path /path/to/model \
+  --load-format sharded_state
+```
+
+Optional environment variables:
+
+- `FB_SHARD_SAVE_MAXSIZE`: Maximum bytes per shard part. Defaults to `5 GiB`.
+- `FB_SHARD_PAD_ALIGNMENT`: Byte alignment for padding tensors in exported shard files. Defaults to `0`, which disables padding.
