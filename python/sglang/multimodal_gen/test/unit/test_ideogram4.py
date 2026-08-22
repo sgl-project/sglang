@@ -509,7 +509,7 @@ class TestIdeogram4(unittest.TestCase):
         server_args = SimpleNamespace(
             transformer_weights_path="/unused/override.safetensors",
             nunchaku_config={"enabled": True},
-            component_transformer_weights_paths={},
+            component_weights_paths={},
         )
         component_args = _server_args_for_transformer_component(
             server_args, "unconditional_transformer"
@@ -524,7 +524,7 @@ class TestIdeogram4(unittest.TestCase):
                 "/ckpt/diffusion_models/ideogram4_nvfp4_mixed.safetensors"
             ),
             nunchaku_config={"enabled": True},
-            component_transformer_weights_paths={
+            component_weights_paths={
                 "unconditional_transformer": (
                     "/ckpt/diffusion_models/"
                     "ideogram4_unconditional_nvfp4_mixed.safetensors"
