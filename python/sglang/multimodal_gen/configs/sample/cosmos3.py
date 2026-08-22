@@ -9,6 +9,7 @@ For ``num_frames == 1`` the output ``data_type`` flips to ``IMAGE``
 so the file extension and decode path agree.
 """
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -44,6 +45,24 @@ COSMOS3_EDGE_SUPPORTED_RESOLUTIONS = [
 ]
 
 
+def _parse_request_value(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return value
+
+
+def _optional_int_list(value: Any) -> list[int] | None:
+    value = _parse_request_value(value)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, (list, tuple)):
+        return [int(item) for item in value]
+    return [int(value)]
+
+
 @dataclass
 class Cosmos3SamplingParams(SamplingParams):
     """Cosmos3 sampling parameters (T2V defaults; also used for I2V / V2V / T2I).
@@ -62,6 +81,12 @@ class Cosmos3SamplingParams(SamplingParams):
     num_inference_steps: int = 35
 
     negative_prompt: str = ""
+
+    use_duration_template: bool | None = None
+    use_resolution_template: bool | None = None
+    use_system_prompt: bool | None = None
+    use_guardrails: bool | None = None
+    sound_duration: float = 0.0
 
     # Optional CFG window — T2I requests typically pass e.g. ``(400, 1000)`` to
     # skip guidance at low noise levels. T2V / I2V / V2V leave it unset.
@@ -103,10 +128,87 @@ class Cosmos3SamplingParams(SamplingParams):
     action_stats_path: str | None = None
     action_normalization: str = "quantile"
 
+    @classmethod
+    def image_request_extra_fields(cls) -> frozenset[str]:
+        return frozenset(
+            {
+                "guidance_interval",
+                "use_duration_template",
+                "use_guardrails",
+                "use_resolution_template",
+                "use_system_prompt",
+            }
+        )
+
+    @classmethod
+    def video_request_extra_fields(cls) -> frozenset[str]:
+        return cls.image_request_extra_fields() | frozenset(
+            {
+                "action",
+                "action_fps",
+                "action_mode",
+                "action_normalization",
+                "action_view_point",
+                "condition_frame_indexes",
+                "condition_frame_indexes_vision",
+                "condition_video_keep",
+                "domain_id",
+                "domain_name",
+                "generate_sound",
+                "guardrails",
+                "raw_action_dim",
+                "sound_duration",
+            }
+        )
+
+    @classmethod
+    def lower_video_request_kwargs(
+        cls,
+        request: Any,
+        kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        kwargs = super().lower_video_request_kwargs(request, dict(kwargs))
+        extras = getattr(request, "model_extra", None) or {}
+
+        if "use_guardrails" not in kwargs and extras.get("guardrails") is not None:
+            kwargs["use_guardrails"] = _parse_request_value(extras["guardrails"])
+
+        condition_indexes = kwargs.get("condition_frame_indexes")
+        if condition_indexes is None:
+            condition_indexes = extras.get("condition_frame_indexes_vision")
+        condition_indexes = _optional_int_list(condition_indexes)
+        if condition_indexes is not None:
+            kwargs["condition_frame_indexes"] = condition_indexes
+
+        generate_sound = _parse_request_value(extras.get("generate_sound"))
+        if generate_sound is False:
+            kwargs["sound_duration"] = 0.0
+        elif generate_sound is True and "sound_duration" not in kwargs:
+            kwargs["sound_duration"] = float(kwargs["num_frames"]) / float(
+                kwargs["fps"]
+            )
+
+        for name in (
+            "condition_video_keep",
+            "action_mode",
+            "domain_name",
+            "action_view_point",
+            "action_normalization",
+        ):
+            value = _parse_request_value(kwargs.get(name))
+            if isinstance(value, str) and not value.strip():
+                kwargs.pop(name, None)
+            elif value is not None:
+                kwargs[name] = value
+
+        return kwargs
+
     def _adjust(self, server_args) -> None:
         # adjust distil and edge args — read from the pre-computed config fields
         # so no checkpoint download happens at request time.
         pipeline_config = server_args.pipeline_config
+        if self.action_stats_path is None:
+            self.action_stats_path = getattr(pipeline_config, "action_stats_path", None)
         distilled_sigmas = pipeline_config.distilled_sigmas
         if distilled_sigmas is not None:
             self.num_inference_steps = len(distilled_sigmas)

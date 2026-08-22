@@ -180,23 +180,10 @@ class SamplingParams:
     width: int | None = None
     fps: int = 24
 
-    # LTX-2.5 duration head. Ignored by other models, so the flags stay
-    # universally accepted.
-    # Decode with the diffusion decoder instead of the VAE one. Ignored by
-    # models that ship no such decoder.
-    use_diffusion_decoder: bool = False
-
-    auto_duration: bool = False
-    auto_duration_min_seconds: float = 1.0
-    auto_duration_max_seconds: float = 20.0
-
     # Resolution validation
     supported_resolutions: list[tuple[int, int]] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
     )  # None means all resolutions allowed
-
-    # Output audio duration in seconds (models without an audio modality ignore this).
-    sound_duration: float = 0.0
 
     # Denoising parameters
     num_inference_steps: int = None
@@ -214,11 +201,6 @@ class SamplingParams:
     progressive_mode: str = "fullres"
     progressive_levels: int = 1
     progressive_delta: float = 0.01
-
-    # LongCat-Image parameters
-    enable_cfg_renorm: bool = False
-    cfg_renorm_min: float = 0.0
-    enable_prompt_rewrite: bool = False
 
     # TeaCache parameters
     enable_teacache: bool = False
@@ -292,16 +274,8 @@ class SamplingParams:
     max_sequence_length: int | None = None
     flow_shift: float | None = None
 
-    # cosmos-related
-    use_duration_template: bool | None = None
-    use_resolution_template: bool | None = None
-    use_system_prompt: bool | None = None
-    use_guardrails: bool | None = None
     condition_inputs: dict[str, Any] = field(default_factory=dict)
     realtime_chunk_size: int | None = None
-
-    # Prompt enhancement (ErnieImage)
-    use_pe: bool | None = None
 
     def _set_output_file_ext(self):
         # add extension if needed
@@ -393,6 +367,12 @@ class SamplingParams:
             req.condition_inputs.update(self.condition_inputs)
         if self.realtime_chunk_size is not None:
             req.realtime_chunk_size = self.realtime_chunk_size
+
+    @classmethod
+    def image_request_extra_fields(cls) -> frozenset[str]:
+        """Declare model-specific JSON fields accepted by the image API."""
+
+        return frozenset()
 
     @classmethod
     def video_request_extra_fields(cls) -> frozenset[str]:
@@ -1008,7 +988,7 @@ class SamplingParams:
         add_argument(
             "--enable-cfg-renorm",
             action=StoreBoolean,
-            help="Enable CFG renormalization for LongCat-Image (default: false).",
+            help="Enable CFG renormalization for LongCat-Image (enabled by default).",
         )
         add_argument(
             "--cfg-renorm-min",
@@ -1018,7 +998,7 @@ class SamplingParams:
         add_argument(
             "--enable-prompt-rewrite",
             action=StoreBoolean,
-            help="Enable prompt rewriting via Qwen2.5-VL before encoding for LongCat-Image (default: false).",
+            help="Enable prompt rewriting via Qwen2.5-VL before encoding for LongCat-Image (enabled by default).",
         )
 
         # profiling

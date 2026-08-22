@@ -1490,6 +1490,13 @@
                     ]
                   },
                   {
+                    "group": "LongCat-Image",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/LongCat/LongCat-Image"
+                    ]
+                  },
+                  {
                     "group": "Z-Image",
                     "pages": [
                       "cookbook/diffusion/Z-Image/Z-Image-Turbo"
