@@ -371,6 +371,7 @@ class _DeepEPDispatcherImplBase:
         hidden_size: int,
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
+        num_trailing_shared_slots: int,
     ):
         if not use_deepep:
             raise ImportError(
@@ -386,6 +387,7 @@ class _DeepEPDispatcherImplBase:
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
+        self.num_trailing_shared_slots = num_trailing_shared_slots
 
         self.params_bytes = 2
         # A large value will lead to large memory occupation, thus users should change it accordingly
@@ -612,6 +614,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             num_tokens_per_rank=num_tokens_per_rank,
             num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
             num_tokens_per_expert=num_tokens_per_expert,
+            num_trailing_shared_slots=self.num_trailing_shared_slots,
         )
 
         return (
@@ -724,7 +727,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hook() if self.return_recv_hook else event.current_stream_wait()
 
         get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
-            masked_m
+            masked_m,
+            num_trailing_shared_slots=self.num_trailing_shared_slots,
         )
 
         if isinstance(hidden_states, tuple):
@@ -897,6 +901,8 @@ class DeepEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        *,
+        num_trailing_shared_slots: int,
     ):
         super().__init__()
 
@@ -911,6 +917,7 @@ class DeepEPDispatcher(BaseDispatcher):
             hidden_size=hidden_size,
             params_dtype=params_dtype,
             deepep_mode=deepep_mode,
+            num_trailing_shared_slots=num_trailing_shared_slots,
         )
 
         if self.deepep_mode.enable_low_latency():
