@@ -141,7 +141,16 @@ class SchedulerWeightUpdaterManager:
     ) -> Tuple[bool, str]:
         """Update the online model parameter."""
         with self._observe_weight_load("distributed"):
-            success, message = self.tp_worker.update_weights_from_distributed(recv_req)
+            # Load the same broadcasted weights into the speculative draft
+            # model(s) too (e.g. MTP/NEXTN layers) so the draft does not go
+            # stale. A single broadcast feeds every model; no second collective
+            # is issued on the co-located draft. See #27718.
+            extra_models = (
+                self.draft_worker.draft_models if self.draft_worker is not None else []
+            )
+            success, message = self.tp_worker.update_weights_from_distributed(
+                recv_req, extra_models=extra_models
+            )
             if success:
                 self.flush_cache_after_weight_update(recv_req)
             else:
