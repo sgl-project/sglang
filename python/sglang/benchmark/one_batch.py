@@ -197,6 +197,7 @@ class BenchArgs:
     run_name: str = "default"
     batch_size: Tuple[int] = (1,)
     input_len: Tuple[int] = (1024,)
+    skewed_input_lens: Tuple[int, ...] = ()
     output_len: Tuple[int] = (16,)
     prompt_filename: str = ""
     result_filename: str = "result.jsonl"
@@ -220,6 +221,18 @@ class BenchArgs:
         )
         parser.add_argument(
             "--input-len", type=int, nargs="+", default=BenchArgs.input_len
+        )
+        parser.add_argument(
+            "--skewed-input-lens",
+            type=int,
+            nargs="+",
+            default=BenchArgs.skewed_input_lens,
+            help=(
+                "Run one batch with per-request input lengths. For example, "
+                "`--skewed-input-lens 128 512 1024 2048` creates a batch of "
+                "four requests and uses the sum of these lengths for prefill "
+                "throughput accounting."
+            ),
         )
         parser.add_argument(
             "--output-len", type=int, nargs="+", default=BenchArgs.output_len
@@ -464,6 +477,16 @@ def prepare_synthetic_inputs_for_latency_test(
         reqs.append(req)
 
     return reqs
+
+
+def prepare_skewed_synthetic_inputs_for_latency_test(input_lens):
+    input_ids = [
+        np.random.randint(0, 10000, input_len, dtype=np.int32)
+        for input_len in input_lens
+    ]
+    return prepare_synthetic_inputs_for_latency_test(
+        len(input_ids), max(input_lens), custom_inputs=input_ids
+    )
 
 
 class TreeCacheNamespace(SimpleNamespace):
@@ -748,6 +771,7 @@ def latency_test_run_once(
     tp_rank,
     profile_start_step=None,
     profile_steps=None,
+    total_input_tokens=None,
 ):
     max_batch_size = model_runner.max_batch_size(input_len, output_len)
     if batch_size > max_batch_size:
@@ -764,6 +788,9 @@ def latency_test_run_once(
         "input_len": input_len,
         "output_len": output_len,
     }
+    if total_input_tokens is None:
+        total_input_tokens = input_len * batch_size
+    measurement_results["total_input_tokens"] = total_input_tokens
 
     tot_latency = 0
 
@@ -798,7 +825,7 @@ def latency_test_run_once(
         )
 
     tot_latency += prefill_latency
-    throughput = input_len * batch_size / prefill_latency
+    throughput = total_input_tokens / prefill_latency
     rank_print(
         f"Prefill. latency: {prefill_latency:6.5f} s, throughput: {throughput:9.2f} token/s"
     )
@@ -863,7 +890,7 @@ def latency_test_run_once(
         measurement_results["median_decode_latency"] = med_decode_latency
         measurement_results["median_decode_throughput"] = med_decode_throughput
 
-    throughput = (input_len + output_len) * batch_size / tot_latency
+    throughput = (total_input_tokens + output_len * batch_size) / tot_latency
     rank_print(
         f"Total. latency: {tot_latency:6.3f} s, throughput: {throughput:9.2f} token/s"
     )
@@ -894,14 +921,31 @@ def latency_test(
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
+    skewed_input_lens = tuple(int(x) for x in bench_args.skewed_input_lens)
+    if skewed_input_lens:
+        if any(x <= 0 for x in skewed_input_lens):
+            raise ValueError("--skewed-input-lens values must be positive integers")
+        if bench_args.prompt_filename:
+            raise ValueError(
+                "--skewed-input-lens cannot be combined with --prompt-filename"
+            )
 
     # Load the model
     model_runner, tokenizer = load_model(server_args, port_args, gpu_id, tp_rank)
 
     # Prepare inputs for warm up
-    reqs = prepare_synthetic_inputs_for_latency_test(
-        bench_args.batch_size[0], bench_args.input_len[0]
-    )
+    if skewed_input_lens:
+        reqs = prepare_skewed_synthetic_inputs_for_latency_test(skewed_input_lens)
+        warmup_batch_size = len(skewed_input_lens)
+        warmup_input_len = max(skewed_input_lens)
+        warmup_total_input_tokens = sum(skewed_input_lens)
+    else:
+        reqs = prepare_synthetic_inputs_for_latency_test(
+            bench_args.batch_size[0], bench_args.input_len[0]
+        )
+        warmup_batch_size = bench_args.batch_size[0]
+        warmup_input_len = bench_args.input_len[0]
+        warmup_total_input_tokens = warmup_batch_size * warmup_input_len
 
     # Warm up
     rank_print("Warmup ...")
@@ -910,8 +954,8 @@ def latency_test(
         model_runner,
         rank_print,
         reqs,
-        bench_args.batch_size[0],
-        bench_args.input_len[0],
+        warmup_batch_size,
+        warmup_input_len,
         min(32, bench_args.output_len[0]),  # shorter decoding to speed up the warmup
         log_decode_step=0,
         profile=False,
@@ -922,6 +966,7 @@ def latency_test(
         tp_rank=tp_rank,
         profile_start_step=None,
         profile_steps=None,
+        total_input_tokens=warmup_total_input_tokens,
     )
 
     rank_print("Benchmark ...")
@@ -932,30 +977,47 @@ def latency_test(
 
     # Run the sweep
     result_list = []
-    for bs, il, ol in itertools.product(
-        bench_args.batch_size, bench_args.input_len, bench_args.output_len
-    ):
-        bs_aligned_inputs = []
-        if custom_inputs:
-            if custom_input_len == bs:
-                bs_aligned_inputs = custom_inputs
-            elif custom_input_len > bs:
-                rank_print(
-                    f"Custom input size ({custom_input_len}) is larger than batch_size ({bs}). "
-                    f"Using the first {bs} prompts."
-                )
-                bs_aligned_inputs = copy.deepcopy(custom_inputs[:bs])
-            else:
-                rank_print(
-                    f"Custom input size ({custom_input_len}) is smaller than batch_size ({bs}). "
-                    f"Pad to the desired batch_size with the last prompt."
-                )
-                bs_aligned_inputs = copy.deepcopy(custom_inputs)
-                bs_aligned_inputs.extend(
-                    [bs_aligned_inputs[-1]] * (bs - custom_input_len)
-                )
+    if skewed_input_lens:
+        sweep = [
+            (
+                len(skewed_input_lens),
+                max(skewed_input_lens),
+                ol,
+                prepare_skewed_synthetic_inputs_for_latency_test(skewed_input_lens),
+                sum(skewed_input_lens),
+            )
+            for ol in bench_args.output_len
+        ]
+        rank_print(f"Skewed input lengths: {list(skewed_input_lens)}")
+    else:
+        sweep = []
+        for bs, il, ol in itertools.product(
+            bench_args.batch_size, bench_args.input_len, bench_args.output_len
+        ):
+            bs_aligned_inputs = []
+            if custom_inputs:
+                if custom_input_len == bs:
+                    bs_aligned_inputs = custom_inputs
+                elif custom_input_len > bs:
+                    rank_print(
+                        f"Custom input size ({custom_input_len}) is larger than batch_size ({bs}). "
+                        f"Using the first {bs} prompts."
+                    )
+                    bs_aligned_inputs = copy.deepcopy(custom_inputs[:bs])
+                else:
+                    rank_print(
+                        f"Custom input size ({custom_input_len}) is smaller than batch_size ({bs}). "
+                        f"Pad to the desired batch_size with the last prompt."
+                    )
+                    bs_aligned_inputs = copy.deepcopy(custom_inputs)
+                    bs_aligned_inputs.extend(
+                        [bs_aligned_inputs[-1]] * (bs - custom_input_len)
+                    )
 
-        reqs = prepare_synthetic_inputs_for_latency_test(bs, il, bs_aligned_inputs)
+            reqs = prepare_synthetic_inputs_for_latency_test(bs, il, bs_aligned_inputs)
+            sweep.append((bs, il, ol, reqs, bs * il))
+
+    for bs, il, ol, reqs, total_input_tokens in sweep:
         ret = latency_test_run_once(
             bench_args.run_name,
             model_runner,
@@ -973,6 +1035,7 @@ def latency_test(
             tp_rank,
             bench_args.profile_start_step,
             bench_args.profile_steps,
+            total_input_tokens=total_input_tokens,
         )
         if ret is not None:
             result_list.append(ret)
@@ -992,7 +1055,10 @@ def main(server_args, bench_args):
     # Post-init write to the legacy cuda_graph_max_bs_decode field would
     # not propagate to cuda_graph_config; update the decode phase directly.
     if server_args.cuda_graph_config is not None:
-        server_args.cuda_graph_config[Phase.DECODE].max_bs = max(bench_args.batch_size)
+        max_decode_bs = max(bench_args.batch_size)
+        if bench_args.skewed_input_lens:
+            max_decode_bs = max(max_decode_bs, len(bench_args.skewed_input_lens))
+        server_args.cuda_graph_config[Phase.DECODE].max_bs = max_decode_bs
 
     _set_envs_and_config(server_args)
 

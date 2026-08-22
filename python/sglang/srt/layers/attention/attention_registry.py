@@ -192,6 +192,13 @@ def create_torch_native_backend(runner):
     return TorchNativeAttnBackend(runner)
 
 
+@register_attention_backend("mps_paged")
+def create_mps_paged_backend(runner):
+    from sglang.srt.layers.attention.mps_paged_backend import MpsPagedAttnBackend
+
+    return MpsPagedAttnBackend(runner)
+
+
 @register_attention_backend("flex_attention")
 def create_flex_attention_backend(runner):
     from sglang.srt.layers.attention.torch_flex_backend import TorchFlexAttnBackend

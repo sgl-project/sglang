@@ -202,6 +202,8 @@ ATTENTION_BACKEND_CHOICES = [
     # AMD specific
     "aiter",
     "wave",
+    # Apple Silicon specific
+    "mps_paged",
     # Other platforms
     "intel_amx",
     "ascend",
@@ -6010,6 +6012,13 @@ class ServerArgs:
         if attention_backend == "torch_native":
             logger.warning(
                 "Cuda graph is disabled because of using torch native attention backend"
+            )
+            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+
+        if attention_backend == "mps_paged":
+            logger.warning(
+                "Cuda graph is disabled because of using the MPS paged attention backend"
             )
             self.cuda_graph_config.decode.backend = Backend.DISABLED
             self.cuda_graph_config.prefill.backend = Backend.DISABLED
