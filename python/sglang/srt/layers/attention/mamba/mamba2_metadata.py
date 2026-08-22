@@ -22,7 +22,27 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+
+
+def logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
+    """The mode the mamba rows actually carry.
+
+    DP MAX_LEN padding relabels a real decode batch as EXTEND so the rank can
+    emit a prefilling peer's token count out of far fewer rows (see
+    ``ForwardBatch.prepare_mlp_sync_batch``). The extend fields it fabricates
+    serve the full-attn side; the rows stay decode rows — one new token each on
+    an already allocated state slot, checkpointed by the decode track path — so
+    state-carrying metadata is built from the original mode.
+    """
+    original = forward_batch._original_forward_mode
+    if (
+        original is not None
+        and original.is_decode()
+        and forward_batch.forward_mode.is_extend()
+    ):
+        return original
+    return forward_batch.forward_mode
 
 
 @dataclass(kw_only=True)
@@ -212,7 +232,10 @@ class Mamba2Metadata(ForwardMetadata):
         forward_batch: ForwardBatch,
     ) -> "Mamba2Metadata":
         """This path cannot run with CUDA graph, as it contains extend requests."""
-        if forward_batch.extend_num_tokens is None:
+        if (
+            forward_batch.extend_num_tokens is None
+            or logical_forward_mode(forward_batch).is_decode()
+        ):
             draft_token_num = (
                 forward_batch.spec_info.draft_token_num
                 if forward_batch.spec_info is not None
