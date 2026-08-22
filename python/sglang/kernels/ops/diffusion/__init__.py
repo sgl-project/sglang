@@ -18,7 +18,7 @@ numerics and platform plumbing, ``sites`` the request-scoped mount policy, and
 ``README.md``: several norms look interchangeable and are not.
 
 Resolution is lazy (PEP 562).  The backends have disjoint, heavy dependencies
--- Triton, CUTLASS/CuTe-DSL, FlyDSL (ROCm), MLX (Apple) -- so an eager
+-- Triton, CUTLASS/CuTe-DSL, and FlyDSL (ROCm) -- so an eager
 re-export would turn every one of them into a hard import-time requirement on
 every platform.  ``_EXPORTS`` maps a symbol to its module and the import
 happens on first attribute access.
@@ -201,11 +201,25 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "LTX-2 QK-norm + split RoPE.",
     ),
     (
+        "diffusion.ltx25_decoder_rope",
+        KernelBackend.JIT,
+        "rope.ltx25_decoder_rope_jit:fused_ltx25_decoder_rope",
+        _CUDA,
+        "Paired LTX-2.5 decoder 3D RoPE.",
+    ),
+    (
         "diffusion.rope_rotate_half",
         KernelBackend.TRITON,
         "rope.rope_rotate_half_bitexact:fused_rope_rotate_half_bitexact",
         _CUDA,
         "Bit-exact rotate-half RoPE.",
+    ),
+    (
+        "diffusion.interleaved_rope_fp64",
+        KernelBackend.JIT,
+        "rope.interleaved_rope_fp64_jit:fused_interleaved_rope_fp64",
+        _CUDA,
+        "Paired interleaved RoPE with fp64 Diffusers semantics.",
     ),
     (
         "diffusion.hunyuan_qkv_rope_pack",
@@ -386,11 +400,15 @@ _EXPORTS: dict[str, str] = {
     "can_use_ltx2_qknorm_split_rope_cuda": "rope.ltx2_qknorm_split_rope_jit",
     "ltx2_qknorm_split_rope_cuda": "rope.ltx2_qknorm_split_rope_jit",
     "apply_ltx2_split_rotary_emb": "rope.ltx2_rotary_triton",
+    "can_use_ltx25_decoder_rope": "rope.ltx25_decoder_rope_jit",
+    "fused_ltx25_decoder_rope": "rope.ltx25_decoder_rope_jit",
     "can_use_fused_inplace_qknorm_rope": "rope.qknorm_rope_jit",
     "fused_inplace_qknorm_rope": "rope.qknorm_rope_jit",
     "fused_qknorm_rope_pack_kv": "rope.qknorm_rope_jit",
     "can_use_fused_rope_rotate_half": "rope.rope_rotate_half_bitexact",
     "fused_rope_rotate_half_bitexact": "rope.rope_rotate_half_bitexact",
+    "can_use_interleaved_rope_fp64": "rope.interleaved_rope_fp64_jit",
+    "fused_interleaved_rope_fp64": "rope.interleaved_rope_fp64_jit",
     "apply_rotary_embedding": "rope.rotary_triton",
     # Activation-function fusions
     "can_use_fused_bias_glu": "activation.sana_conv_post_triton",
@@ -451,6 +469,11 @@ _EXPORTS: dict[str, str] = {
     "mark_ltx2_rms_norm_modulate_site": "sites.ltx2_rmsnorm_modulate_site",
     "mount_ltx2_rms_norm_modulate": "sites.ltx2_rmsnorm_modulate_site",
     "unmount_ltx2_rms_norm_modulate": "sites.ltx2_rmsnorm_modulate_site",
+    "mark_sana_video_linear_attention_site": "sites.sana_video_linear_attention_site",
+    "mount_sana_video_linear_attention": "sites.sana_video_linear_attention_site",
+    "sana_video_linear_attention_active": "sites.sana_video_linear_attention_site",
+    "try_sana_video_linear_attention": "sites.sana_video_linear_attention_site",
+    "unmount_sana_video_linear_attention": "sites.sana_video_linear_attention_site",
     "QualityGatedFusion": "sites.quality_gate",
     # JIT C++/CUDA extensions (not kernels, not in the registry)
     "interpolate": "ext.hunyuan3d_rasterizer",

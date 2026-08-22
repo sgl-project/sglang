@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import PoolEntry
     from sglang.srt.server_args import ServerArgs
 
+from sglang.srt.utils.rank_consensus_checker import rank_consensus
 
 T = TypeVar("T")
 
@@ -490,6 +491,10 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.host_pool_group is not None:
             self.host_pool_group.destroy()
 
+    @rank_consensus(
+        same_params=["params"],
+        same_results=["result.full_kv_hit_length", "result.swa_host_hit_length"],
+    )
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)
         if result is not None:
@@ -895,7 +900,8 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params.value = values
         result = self.insert(insert_params)
 
-        # Match prefix
+        # Match prefix. SWA insertion retains one extra window before the
+        # page-aligned boundary, so the normal match remains safe to repoint.
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key, req=req))
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
@@ -1041,24 +1047,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 "an MHA or hybrid-SWA HiCache host stack."
             )
 
-        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        device_pools = {PoolName.KV: kv_cache}
-        if isinstance(kv_cache, SWAKVPool):
-            device_pools = {
-                PoolName.KV: kv_cache.full_kv_pool,
-                PoolName.SWA: kv_cache.swa_kv_pool,
-            }
-
-        for name, device_pool in device_pools.items():
-            host_pool = self.host_pool_group.entry_map[name].host_pool
-            if host_pool.logical_size < device_pool.size:
-                raise ValueError(
-                    "Retraction host pool is smaller than its device pool: "
-                    f"pool={name}, host_slots={host_pool.logical_size}, "
-                    f"device_slots={device_pool.size}. Increase --hicache-ratio "
-                    "or --hicache-size."
-                )
-
         for spec in self.sidecar_pool_specs:
             source_size = self.host_pool_group.entry_map[
                 spec.indices_from_pool
@@ -1137,7 +1125,8 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         return self.evict_host(num_tokens)
 
-    def retraction_backup(self, req: Req) -> RetractionBackup:
+    def retraction_backup(self, req: Req) -> Optional[RetractionBackup]:
+        """Back up device KV to the host pool; None when it cannot fit after reclaim."""
         assert req.seqlen > 1
 
         device_indices, extra_transfers = self._retraction_device_transfers(req)
@@ -1146,11 +1135,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self._reclaim_retraction_host(len(device_indices))
             host_indices = self.host_pool_group.alloc(len(device_indices))
         if host_indices is None:
-            raise RuntimeError(
-                "Retraction host KV pool exhausted after reclaim: "
-                f"request={req.rid}, required_slots={len(device_indices)}, "
-                f"available_slots={self.host_pool_group.available_size()}."
-            )
+            return None
 
         resolved = self.cache_controller._resolve_pool_transfers_allocation(
             extra_transfers or None,
@@ -1160,10 +1145,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         if resolved is None and extra_transfers:
             self.host_pool_group.free(host_indices)
-            raise RuntimeError(
-                "Retraction auxiliary host allocation failed after atomic rollback: "
-                f"request={req.rid}, pools={[x.name for x in extra_transfers]}."
-            )
+            return None
 
         backup = RetractionBackup(
             host_indices=host_indices,
@@ -1557,6 +1539,50 @@ class UnifiedRadixCache(BasePrefixCache):
     def get_prefix_hash_values(self, node_id: NodeId) -> list[str]:
         return self.tree_core.get_prefix_hash_values(node_id)
 
+    def query_storage_hit_length(
+        self,
+        last_host_node_id: NodeId,
+        new_input_tokens: list[int],
+        last_hash: Optional[str] = None,
+        prefix_keys: Optional[list[str]] = None,
+    ) -> int:
+        """Synchronously probe L3 storage for the reusable prefix length."""
+        if (
+            not self.enable_storage
+            or self.cache_controller is None
+            or self.cache_controller.prefetch_rate_limited()
+        ):
+            return 0
+
+        extra_key, cache_salt = self.tree_core.prefetch_anchor_info(last_host_node_id)
+        prefetch_key = RadixKey(
+            new_input_tokens,
+            extra_key=extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=cache_salt,
+        ).page_aligned(self.page_size)
+        if len(prefetch_key) < self.prefetch_threshold:
+            return 0
+
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            PrefetchOperation,
+        )
+
+        operation = PrefetchOperation(
+            "__storage_hit_query__",
+            prefetch_key,
+            last_hash,
+            prefix_keys,
+        )
+        _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
+        storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
+        self._all_reduce_attn_groups(
+            storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
+        )
+        storage_hit_count = storage_hit_count_tensor.item()
+        storage_hit_count -= storage_hit_count % self.page_size
+        return storage_hit_count
+
     def prefetch_from_storage(
         self,
         req_id: str,
@@ -1697,6 +1723,7 @@ class UnifiedRadixCache(BasePrefixCache):
         else:
             return True
 
+    @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
             return True
@@ -1883,6 +1910,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
             if self.buffer_pipeline is not None:
                 self.buffer_pipeline.pop_prefix_ctx(req_id)
+                self.buffer_pipeline.release_anchor_lock(req_id)
             del self.ongoing_prefetch[req_id]
             self.cache_controller.prefetch_tokens_occupied -= (
                 self._prefetch_occupied_span(prefetch_key, host_indices)
@@ -1914,6 +1942,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         return self.buffer_pipeline.staged_prefetch_swa_tokens(req_id)
 
+    @rank_consensus(same_params=True)
     def release_aborted_request(self, rid: str) -> None:
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         if (
@@ -1943,6 +1972,7 @@ class UnifiedRadixCache(BasePrefixCache):
         del self.ongoing_prefetch[rid]
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.pop_prefix_ctx(rid)
+            self.buffer_pipeline.release_anchor_lock(rid)
         pool_transfers = [x for xfers in comp_xfers.values() for x in xfers]
         self.cache_controller.append_host_mem_release(
             host_indices=host_indices[:completed_tokens],
@@ -2022,6 +2052,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self._invalidate_absent_from_hit_query(operation)
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.pop_prefix_ctx(req_id)
+            self.buffer_pipeline.release_anchor_lock(req_id)
         cc = self.cache_controller
         cc.append_host_mem_release(
             extra_pools=[x for xfers in comp_xfers.values() for x in xfers]
@@ -2115,6 +2146,10 @@ class UnifiedRadixCache(BasePrefixCache):
             self.ongoing_prefetch[req_id] = info._replace(host_indices=host_indices)
             if buffer_mode:
                 cc.prefetch_tokens_occupied += alloc_len
+                # IO commit: pin the anchor until consumption. Do not read
+                # attributes off `operation` here — alternative cache
+                # controllers may expose a narrower surface.
+                self.buffer_pipeline.try_lock_anchor(req_id, info.anchor_node_id)
             cc.prefetch_buffer.put(operation)
             return True
 
@@ -2627,6 +2662,27 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.cache_controller is not None:
             return self.cache_controller.start_loading()
         return 0
+
+    def is_load_back_event_done(self, consumer_index: int) -> bool:
+        """Return True after the local load-back event is complete.
+
+        Mirrors ``HiRadixCache`` so the disagg decode restore state machine
+        (``DecodeHiCacheTransferMixin``) can gate on load-back completion; the
+        controller-level ``layer_done_counter`` event is shared across cache
+        implementations, while the tree-side bookkeeping runs in
+        ``loading_check``.
+        """
+        if consumer_index < 0 or self.cache_controller is None:
+            return True
+
+        finish_event = self.cache_controller.layer_done_counter.events[
+            consumer_index
+        ].finish_event
+        if not finish_event.query():
+            return False
+
+        self.loading_check()
+        return True
 
     # ---- Query / Inspection APIs ----
     # These APIs exist for compatibility with other RadixTree implementations.
