@@ -39,6 +39,25 @@ if TYPE_CHECKING:
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
 
+def _spec_input_cuda_graph_compatible(
+    local_batch: Optional[ScheduleBatch],
+) -> bool:
+    """Return the local speculative-draft graph admission bit.
+
+    None/idle/prebuilt inputs stay permissive so an active rank with complete
+    runtime state can still use graphs. Any active incompatible input is
+    min-reduced by ``MLPSyncBatchInfo`` and forces every DP rank eager.
+    """
+    if (
+        local_batch is None
+        or local_batch.forward_mode.is_idle()
+        or local_batch.forward_mode.is_prebuilt()
+    ):
+        return True
+    spec_info = local_batch.spec_info
+    return spec_info is None or spec_info.cuda_graph_compatible
+
+
 def _resolve_elastic_world_dp_size(
     dp_size: int,
     *,
@@ -85,6 +104,7 @@ class MLPSyncBatchInfo:
     num_tokens: int
     num_tokens_for_logprob: int
     can_run_decode_cuda_graph: bool
+    can_run_draft_cuda_graph: bool
     can_run_prefill_cuda_graph: bool
     is_extend_in_batch: bool
     local_can_run_tbo: bool
@@ -108,6 +128,7 @@ class MLPSyncBatchInfo:
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
                 int(self.can_run_prefill_cuda_graph),
+                int(self.can_run_draft_cuda_graph),
             ],
             device=device,
             dtype=dtype,
@@ -123,6 +144,7 @@ class MLPSyncBatchInfo:
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_prefill_cuda_graph
+                1,  # can_run_draft_cuda_graph
             ],
             device=device,
             dtype=dtype,
@@ -194,6 +216,7 @@ class MLPSyncBatchInfo:
         self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
+        self.can_run_draft_cuda_graph = bool(tp0_info_cpu[:, 7].min())
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 tp0_info_cpu[:, 5].tolist()
@@ -204,6 +227,7 @@ def _update_gather_batch(
     batch: ScheduleBatch,
     mlp_sync_info: MLPSyncBatchInfo,
     require_mlp_tp_gather: bool,
+    draft_require_mlp_tp_gather: Optional[bool],
     skip_all_gather=False,
 ):
     # TODO: handle the case when moe_dense_tp_size != 1
@@ -215,6 +239,19 @@ def _update_gather_batch(
         batch.global_num_tokens_for_logprob = (
             mlp_sync_info.global_num_tokens_for_logprob
         )
+    # Reuse the same all-gather result for a draft model whose A2A backend
+    # requires a different local/full token-count representation.
+    if draft_require_mlp_tp_gather is not None:
+        if draft_require_mlp_tp_gather:
+            batch.draft_global_num_tokens = mlp_sync_info.global_num_tokens
+            batch.draft_global_num_tokens_for_logprob = (
+                mlp_sync_info.global_num_tokens_for_logprob
+            )
+        else:
+            batch.draft_global_num_tokens = [mlp_sync_info.num_tokens]
+            batch.draft_global_num_tokens_for_logprob = [
+                mlp_sync_info.num_tokens_for_logprob
+            ]
     if not skip_all_gather:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
@@ -222,6 +259,7 @@ def _update_gather_batch(
 
     # Check forward mode for cuda graph
     batch.can_run_dp_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
+    batch.can_run_dp_draft_cuda_graph = mlp_sync_info.can_run_draft_cuda_graph
     batch.can_run_dp_breakable_cuda_graph = mlp_sync_info.can_run_prefill_cuda_graph
 
 
@@ -237,6 +275,7 @@ def prepare_mlp_sync_batch_raw(
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
     offload_tags: set[str],
+    draft_require_mlp_tp_gather: Optional[bool] = None,
     dwdp: bool = False,
 ):
     # Check if other DP workers have running batches
@@ -271,6 +310,7 @@ def prepare_mlp_sync_batch_raw(
         or local_batch.forward_mode.is_decode_or_idle()
         or local_batch.forward_mode.is_prebuilt()
     ) and not disable_cuda_graph
+    can_run_draft_cuda_graph = _spec_input_cuda_graph_compatible(local_batch)
     breakable_prefill = check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
     prefill_graph_runner = (
         model_runner.prefill_cuda_graph_runner if breakable_prefill else None
@@ -337,6 +377,7 @@ def prepare_mlp_sync_batch_raw(
         num_tokens=num_tokens,
         num_tokens_for_logprob=num_tokens_for_logprob,
         can_run_decode_cuda_graph=can_run_decode_cuda_graph,
+        can_run_draft_cuda_graph=can_run_draft_cuda_graph,
         can_run_prefill_cuda_graph=can_run_prefill_cuda_graph,
         is_extend_in_batch=is_extend_in_batch,
         local_can_run_tbo=local_can_run_tbo,
@@ -373,7 +414,11 @@ def prepare_mlp_sync_batch_raw(
 
     if batch_to_gather is not None:
         _update_gather_batch(
-            batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
+            batch_to_gather,
+            mlp_sync_info,
+            require_mlp_tp_gather,
+            draft_require_mlp_tp_gather,
+            skip_all_gather,
         )
 
     # Set on `local_batch`, not `batch_to_gather`: for PREBUILT batches the
@@ -407,6 +452,16 @@ class SchedulerDPAttnAdapter:
     get_require_mlp_sync: Callable[[], bool]
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
+        draft_require_mlp_tp_gather = None
+        if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
+            draft_moe_a2a_backend = self.server_args.speculative_moe_a2a_backend
+            if draft_moe_a2a_backend is None:
+                draft_moe_a2a_backend = self.server_args.moe_a2a_backend
+            draft_require_mlp_tp_gather = require_mlp_tp_gather(
+                self.server_args,
+                moe_a2a_backend=draft_moe_a2a_backend,
+            )
+
         return prepare_mlp_sync_batch_raw(
             local_batch,
             model_runner=self.model_runner,
@@ -417,6 +472,7 @@ class SchedulerDPAttnAdapter:
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=cuda_graph_fully_disabled(),
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
+            draft_require_mlp_tp_gather=draft_require_mlp_tp_gather,
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=self.offload_tags,
             dwdp=get_parallel().dwdp_size > 1,
