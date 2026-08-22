@@ -35,6 +35,13 @@ logger = logging.getLogger(__name__)
 _LOG_INPUT = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT")
 
 
+def _get_p2p_transport_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Return an NCCL-compatible view without changing the tensor's bytes."""
+    if tensor.dtype == torch.float8_e8m0fnu:
+        return tensor.view(torch.uint8)
+    return tensor
+
+
 class ExpertLocationUpdater:
     def __init__(self):
         self._first_execution = True
@@ -354,7 +361,9 @@ def update_expert_weights_single_layer(
                 [
                     P2POp(
                         op=torch.distributed.irecv,
-                        tensor=_get_tensor(temp_buffers, i, dst_expert_location),
+                        tensor=_get_p2p_transport_tensor(
+                            _get_tensor(temp_buffers, i, dst_expert_location)
+                        ),
                         peer=src_rank,
                     )
                     for i in range(num_tensors)
@@ -402,8 +411,10 @@ def update_expert_weights_single_layer(
                 [
                     P2POp(
                         op=torch.distributed.isend,
-                        tensor=_get_tensor(
-                            routed_experts_weights, i, src_expert_location
+                        tensor=_get_p2p_transport_tensor(
+                            _get_tensor(
+                                routed_experts_weights, i, src_expert_location
+                            )
                         ),
                         peer=dst_rank,
                     )
