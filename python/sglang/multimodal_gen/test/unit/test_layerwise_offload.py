@@ -409,6 +409,31 @@ def test_layerwise_capability_selects_layerwise_strategy_for_any_component():
     assert isinstance(strategy, LayerwiseOffloadStrategy)
 
 
+def test_restore_before_capture_is_a_noop_not_an_error(monkeypatch):
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "is_mps", lambda: True)
+
+    class _Comp(torch.nn.Module, LayerwiseOffloadableModuleMixin):
+        mps_stream_non_layer_weights = True
+
+        def __init__(self):
+            super().__init__()
+            self.head = torch.nn.Linear(4, 4)
+
+    comp = _Comp()
+    before = comp.head.weight.detach().clone()
+
+    # A residency strategy can run a use interval before the managers have
+    # captured anything; every MPS non-layer path must tolerate that state.
+    comp.restore_mps_cpu_non_layer_weights()
+    comp.materialize_mps_non_layer_weights("head")
+    comp.release_mps_non_layer_weights("head")
+
+    assert torch.equal(comp.head.weight, before), (
+        "with nothing captured there is nothing to restore or release; the "
+        "weights must be untouched"
+    )
+
+
 def test_layerwise_pipeline_selection_uses_dit_group(monkeypatch):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
