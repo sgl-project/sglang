@@ -1,11 +1,3 @@
-"""Unit tests for dropping empty assistant turns before mistral_common — no model loading.
-
-mistral_common rejects an assistant message that carries neither content nor tool
-calls, so an OpenAI-compatible request that works on every other model would fail.
-patch_mistral_common_tokenizer removes those turns; these tests drive that wiring
-through a stub tokenizer and assert on what mistral_common would have received.
-"""
-
 import unittest
 
 from sglang.srt.utils.hf_transformers.mistral_utils import (
@@ -55,15 +47,7 @@ class TestDropEmptyAssistantMessages(unittest.TestCase):
         return [msg["role"] for msg in tokenizer.seen]
 
     def test_empty_assistant_turn_is_dropped(self):
-        """The reported failing case: user / assistant("") / user."""
-        roles = self._roles_passed_through(
-            [_user("Say hello."), _assistant(content=""), _user("Continue.")]
-        )
-
-        self.assertEqual(roles, ["user", "user"])
-
-    def test_whitespace_and_none_content_are_dropped(self):
-        for content in ("   ", None):
+        for content in ("", "   ", None, [], [{"type": "text", "text": ""}]):
             with self.subTest(content=content):
                 roles = self._roles_passed_through(
                     [_user("a"), _assistant(content=content), _user("b")]
@@ -71,8 +55,22 @@ class TestDropEmptyAssistantMessages(unittest.TestCase):
 
                 self.assertEqual(roles, ["user", "user"])
 
-    def test_assistant_with_tool_calls_is_kept(self):
-        """An empty-content turn still matters when it carries tool calls."""
+    def test_nonempty_assistant_turn_is_kept(self):
+        for content in (
+            "hi",
+            [{"type": "text", "text": "hi"}],
+            [
+                {"type": "text", "text": ""},
+                {"type": "image_url", "image_url": {"url": "https://x/y.png"}},
+            ],
+        ):
+            with self.subTest(content=content):
+                roles = self._roles_passed_through(
+                    [_user("a"), _assistant(content=content), _user("b")]
+                )
+
+                self.assertEqual(roles, ["user", "assistant", "user"])
+
         roles = self._roles_passed_through(
             [
                 _user("a"),
@@ -82,15 +80,6 @@ class TestDropEmptyAssistantMessages(unittest.TestCase):
         )
 
         self.assertEqual(roles, ["user", "assistant", "user"])
-
-    def test_normal_and_multimodal_assistant_are_kept(self):
-        for content in ("hi", [{"type": "text", "text": "hi"}]):
-            with self.subTest(content=content):
-                roles = self._roles_passed_through(
-                    [_user("a"), _assistant(content=content), _user("b")]
-                )
-
-                self.assertEqual(roles, ["user", "assistant", "user"])
 
 
 if __name__ == "__main__":
