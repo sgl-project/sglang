@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -104,6 +105,21 @@ def get_max_retries(datasets):
     return 1
 
 
+def _kill_evalscope_session(process):
+    """Kill the whole evalscope session (process.pid is the leader == pgid)."""
+    if process is None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+        logger.info(f"run_evalscope killed session pgid={process.pid}")
+    except ProcessLookupError:
+        logger.info(f"run_evalscope session pgid={process.pid} already gone")
+    except PermissionError:
+        logger.warning(
+            f"run_evalscope no permission to kill session pgid={process.pid}"
+        )
+
+
 def run_evalscope(
     host,
     port,
@@ -177,6 +193,12 @@ def run_evalscope(
         text=True,
         bufsize=1,
         shell=True,
+        start_new_session=True,
+    )
+
+    logger.info(
+        f"run_evalscope spawned: pid={process.pid} "
+        f"pgid={os.getpgid(process.pid)} cmd={cmd}"
     )
 
     output_lines = []
@@ -187,6 +209,13 @@ def run_evalscope(
             output_lines.append(line.strip())
 
         process.wait()
+
+        logger.info(
+            f"run_evalscope finished: pid={process.pid} "
+            f"returncode={process.returncode}"
+        )
+
+        _kill_evalscope_session(process)
 
         if process.returncode != 0:
             logger.error(f"Command failed with return code: {process.returncode}")
@@ -204,12 +233,10 @@ def run_evalscope(
             try:
                 with open(report_path, "r") as rf:
                     report_data = json.load(rf)
-                for item in report_data:
-                    score = item.get("score")
-                    if score is not None:
-                        metrics["accuracy"] = float(score)
-                        logger.info(f"The Final Accuracy from report: {score}")
-                        break
+                score = report_data.get("score")
+                if score is not None:
+                    metrics["accuracy"] = float(score)
+                    logger.info(f"The Final Accuracy from report: {score}")
             except Exception as e:
                 logger.warning(f"Failed to read report file {report_path}: {e}")
 
@@ -245,11 +272,14 @@ def run_evalscope(
             logger.warning("Process did not terminate gracefully, killing it...")
             process.kill()
             logger.info("Process killed")
+        _kill_evalscope_session(process)
         raise
+
     except Exception as e:
         logger.error(f"Error executing command: {e}")
         process.terminate()
         process.wait(timeout=5)
+        _kill_evalscope_session(process)
         raise
 
 
