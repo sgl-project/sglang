@@ -375,7 +375,8 @@ HCCL_BUFFSIZE=256 sglang serve \
   --tp-size 2 \
   --sp-degree 4 \
   --attention-backend laser_attn \
-  --port 30088
+  --port 30088 \
+  --component-residency text_encoder=layerwise-offload
 ```
 
 For a four-NPU host, use TP2 + SP2:
@@ -398,7 +399,8 @@ HCCL_BUFFSIZE=256 sglang serve \
   --tp-size 2 \
   --sp-degree 2 \
   --attention-backend laser_attn \
-  --port 30088
+  --port 30088 \
+  --component-residency text_encoder=layerwise-offload
 ```
 
 ## 4. Generate video and audio
