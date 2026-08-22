@@ -55,6 +55,7 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.model_executor.cuda_graph_config import (
     ALLOWED_BACKENDS_PER_PHASE,
@@ -102,7 +103,6 @@ from sglang.srt.utils.common import (
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
-from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -2390,6 +2390,13 @@ class ServerArgs:
         ),
         NS("exec.moe"),
     ] = "none"
+    enable_w4a4_mxfp4_megamoe: A[
+        bool,
+        "Enable the W4A4 MXFP4 MegaMoE path by setting DeepGEMM's "
+        "DG_USE_FP4_ACTS=1 and DG_USE_MXF4_KIND=1. Use with "
+        "--moe-a2a-backend megamoe.",
+        NS("exec.moe"),
+    ] = False
     moe_runner_backend: A[
         str,
         Arg(
@@ -3651,11 +3658,17 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
-        self._handle_moe_runner_backend_alias()
+        from sglang.srt.arg_groups.mega_moe_hook import handle_mega_moe
+
+        handle_mega_moe(self)
         self._handle_return_hidden_states_mode()
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
         self._validate_prefill_decode_interval()
+
+        # Reject an explicitly enabled but incompatible hardware runtime before
+        # model path resolution, downloads, or the dummy-model short circuit.
+        self._handle_hardware_runtime_validation()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -3823,20 +3836,6 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
-
-    def _handle_moe_runner_backend_alias(self):
-        if self.moe_runner_backend != "megamoe":
-            return
-
-        if self.moe_a2a_backend not in ("none", "megamoe"):
-            logger.warning(
-                "--moe-runner-backend megamoe is an alias for "
-                "--moe-a2a-backend megamoe; overriding "
-                "--moe-a2a-backend %s.",
-                self.moe_a2a_backend,
-            )
-        self.moe_runner_backend = "auto"
-        self.moe_a2a_backend = "megamoe"
 
     def _handle_return_hidden_states_mode(self):
         if self.return_hidden_states_mode not in (None, "last", "full"):
@@ -4405,6 +4404,13 @@ class ServerArgs:
                     "torch_native" if is_host_cpu_arm64() else "intel_amx"
                 )
             self.sampling_backend = "pytorch"
+
+    def _handle_hardware_runtime_validation(self):
+        # This is intentionally independent of self.device: setting
+        # SGLANG_USE_MLX opts into the MLX backend and must fail immediately if
+        # the environment cannot honor that request. With the flag unset,
+        # use_mlx() remains lazy and does not import MLX.
+        use_mlx()
 
     def _handle_npu_backends(self):
         if self.device == "npu":
@@ -5540,15 +5546,6 @@ class ServerArgs:
             validate_deepseek_v4_cp(self)
             validate_deepseek_v4_mega_moe_token_budget(self)
 
-            # The SM120 marlin fallback moved to the resolution pipeline
-            # (arg_groups/overrides.py: _deepseek_v4_sm120_moe), invoked here
-            # at its legacy slot.
-            from sglang.srt.arg_groups.overrides import (
-                _deepseek_v4_sm120_moe,
-                run_post_process_pass,
-            )
-
-            run_post_process_pass(self, _deepseek_v4_sm120_moe)
             if is_sm120_supported():
                 # SM120 lacks tcgen05/TMEM: disable features that depend on
                 # DeepGEMM or require >99KB SMEM (topk_v2).

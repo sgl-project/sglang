@@ -9,7 +9,7 @@ use bytes::Bytes;
 use rmpv::Value;
 use sglang_mm::driver::{ImageSource, MmInput};
 
-use super::request::MmWorkItem;
+use crate::message::request::MmWorkItem;
 
 /// True for sources the API layer must resolve before MM dispatch: I/O — network
 /// *or* disk, since a network mount can hang past any HTTP timeout — never runs
@@ -114,8 +114,7 @@ fn collect_images(
 }
 
 /// Rust mirror of Python `has_valid_data`: `nil` and (recursively) empty or
-/// all-nil lists don't count as multimodal input. Shared with the ingress
-/// `has_multimodal` check so routing and parsing cannot drift.
+/// all-nil lists don't count as multimodal input.
 pub fn value_present(value: &Value) -> bool {
     match value {
         Value::Nil => false,
