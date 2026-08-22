@@ -2134,6 +2134,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     is_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False
+    # DP-consensus adaptive speculative num_steps (min across ranks); None when
+    # adaptive spec is off or no rank expressed a tier this round.
+    adaptive_consensus_steps: Optional[int] = None
     tbo_split_seq_index: Optional[int] = None
     # Rank-consistent forward mode for the recv skipper, derived from the MLP
     # sync all-gather (the TBO-only `global_forward_mode` is None without TBO).

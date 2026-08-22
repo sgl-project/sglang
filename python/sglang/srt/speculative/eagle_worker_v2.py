@@ -1086,6 +1086,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self.adaptive_controller = AdaptiveController(
                 self,
                 config_path=server_args.speculative_adaptive_config,
+                sync_across_dp=server_args.enable_dp_attention,
             )
 
         # Some dummy tensors
@@ -1143,6 +1144,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         else get_exec().graph.cuda_graph_bs_decode
                     ),
                 )
+            # Expose the (live, EMA-updated) router on the target model_runner so
+            # the scheduler's DP MLP-sync can gather each rank's desired tier and
+            # min-reduce it into a cross-rank consensus (see dp_attn.py).
+            self._target_worker.model_runner.adaptive_spec_params = (
+                self.adaptive_controller.params
+            )
 
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
@@ -1184,7 +1191,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
                 return batch_output
         else:
-            self.activate_step_by_batch(batch.seq_lens.shape[0])
+            # Under DP attention the tier was agreed across ranks during the
+            # scheduler's MLP-sync all_gather; honor that consensus so every
+            # rank runs identical draft-token shapes. Otherwise route locally.
+            if batch.adaptive_consensus_steps is not None:
+                self.activate_step(batch.adaptive_consensus_steps)
+            else:
+                self.activate_step_by_batch(batch.seq_lens.shape[0])
 
             if batch.spec_info is None:
                 capture_mode = (
@@ -1337,6 +1350,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def activate_step_by_batch(self, batch_size: int) -> None:
         if self.adaptive_controller is not None:
             self.adaptive_controller.activate_step_by_batch(batch_size)
+
+    def activate_step(self, speculative_num_steps: int) -> None:
+        if self.adaptive_controller is not None:
+            self.adaptive_controller.activate_step(speculative_num_steps)
 
     # -- Adaptive speculative decoding protocol --
 
