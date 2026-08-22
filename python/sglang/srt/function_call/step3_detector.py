@@ -66,9 +66,12 @@ class Step3Detector(BaseFormatDetector):
         self.tool_call_end = "<｜tool_call_end｜>"
         self.tool_sep = "<｜tool_sep｜>"
 
-        # Regex for parsing steptml invocations
+        # Regex for parsing steptml invocations. The body is allowed to be empty
+        # so that a parameter-less call (`<steptml:invoke name="x"></steptml:invoke>`)
+        # is still recognised instead of being silently dropped.
+        self.invoke_end = "</steptml:invoke>"
         self.invoke_regex = re.compile(
-            r'<steptml:invoke name="([^"]+)">(.+?)</steptml:invoke>', re.DOTALL
+            r'<steptml:invoke name="([^"]+)">(.*?)</steptml:invoke>', re.DOTALL
         )
         self.param_regex = re.compile(
             r'<steptml:parameter name="([^"]+)">([^<]*)</steptml:parameter>', re.DOTALL
@@ -127,11 +130,15 @@ class Step3Detector(BaseFormatDetector):
         try:
             pre_text, rest = text.split(self.bot_token, 1)
 
-            # If no end token, return everything as normal text
-            if self.eot_token not in rest:
-                return StreamingParseResult(normal_text=text, calls=[])
-
-            tool_section, post_text = rest.split(self.eot_token, 1)
+            # A block without its end token was cut short by the token limit.
+            # The unfinished markup is not content, so only the text that
+            # precedes the block is returned; the calls that did complete
+            # before the cut are still parsed below, as in streaming.
+            if self.eot_token in rest:
+                tool_section, post_text = rest.split(self.eot_token, 1)
+            else:
+                logger.warning("Tool call block is not terminated, treating as markup")
+                tool_section, post_text = rest, ""
 
             # Find all individual tool calls using regex
             calls = []
@@ -171,6 +178,11 @@ class Step3Detector(BaseFormatDetector):
     ) -> StreamingParseResult:
         """
         Streaming incremental parsing for Step3 format.
+
+        The buffer is drained in a loop: a single increment may carry the
+        preamble, several complete tool calls and the trailing text all at once
+        (``stream_interval > 1``, speculative decoding, or simply the last
+        increment of the stream, which has no successor to defer work to).
         """
         self._buffer += new_text
 
@@ -178,94 +190,144 @@ class Step3Detector(BaseFormatDetector):
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
-        # If we've finished the tool block, everything is normal text
-        if self._tool_block_finished:
-            normal_text = self._buffer
-            self._buffer = ""
-            return StreamingParseResult(normal_text=normal_text)
-
-        # Check if tool block hasn't started yet
-        if not self._in_tool_block:
-            if self.bot_token in self._buffer:
-                idx = self._buffer.find(self.bot_token)
-                normal_text = self._buffer[:idx]
-                self._buffer = self._buffer[idx + len(self.bot_token) :]
-                self._in_tool_block = True
-                return StreamingParseResult(normal_text=normal_text)
-            else:
-                # Check if we might have a partial bot_token
-                partial_len = self._ends_with_partial_token(
-                    self._buffer, self.bot_token
-                )
-                if partial_len:
-                    return StreamingParseResult()  # Wait for more text
-                else:
-                    normal_text = self._buffer
-                    self._buffer = ""
-                    return StreamingParseResult(normal_text=normal_text)
-
-        # We're inside the tool block
+        normal_parts: List[str] = []
         calls: List[ToolCallItem] = []
 
-        # Check if tool block is ending
-        if self.eot_token in self._buffer:
-            idx = self._buffer.find(self.eot_token)
+        while self._buffer:
+            # Everything after the tool block is ordinary text
+            if self._tool_block_finished:
+                normal_parts.append(self._buffer)
+                self._buffer = ""
+                break
 
-            # If we're in the middle of a tool call, we need to handle it
-            if self._in_tool_call:
-                # The buffer before eot_token might contain the end of the current tool call
-                before_eot = self._buffer[:idx]
-                if self.tool_call_end in before_eot:
-                    # Parse this final tool call
-                    result = self._parse_partial_tool_call(tools)
-                    calls.extend(result.calls)
-                else:
-                    # Incomplete tool call - log warning
-                    logger.warning("Tool block ended with incomplete tool call")
+            # Before the tool block: emit text, hold back a partial bot_token
+            if not self._in_tool_block:
+                idx = self._buffer.find(self.bot_token)
+                if idx == -1:
+                    partial_len = self._ends_with_partial_token(
+                        self._buffer, self.bot_token
+                    )
+                    if partial_len:
+                        if len(self._buffer) > partial_len:
+                            normal_parts.append(self._buffer[:-partial_len])
+                            self._buffer = self._buffer[-partial_len:]
+                        break  # wait for more text
+                    normal_parts.append(self._buffer)
+                    self._buffer = ""
+                    break
+                normal_parts.append(self._buffer[:idx])
+                self._buffer = self._buffer[idx + len(self.bot_token) :]
+                self._in_tool_block = True
+                continue
 
-            remaining = self._buffer[idx + len(self.eot_token) :]
-            self._buffer = ""
-            self._tool_block_finished = True
-
-            # Reset any partial tool call state
-            self._reset_streaming_state()
-
-            return StreamingParseResult(normal_text=remaining, calls=calls)
-
-        # Check if we're in a tool call or need to start one
-        if not self._in_tool_call:
-            if self.tool_call_begin in self._buffer:
-                idx = self._buffer.find(self.tool_call_begin)
-                # Remove any content before tool call begin (shouldn't happen but be safe)
-                self._buffer = self._buffer[idx + len(self.tool_call_begin) :]
+            # Inside the tool block, between calls
+            if not self._in_tool_call:
+                begin_idx = self._buffer.find(self.tool_call_begin)
+                eot_idx = self._buffer.find(self.eot_token)
+                if eot_idx != -1 and (begin_idx == -1 or eot_idx < begin_idx):
+                    self._buffer = self._buffer[eot_idx + len(self.eot_token) :]
+                    self._tool_block_finished = True
+                    self._reset_streaming_state()
+                    continue
+                if begin_idx == -1:
+                    break  # wait for the next call or the end of the block
+                # Anything between two calls is protocol filler, not content
+                self._buffer = self._buffer[begin_idx + len(self.tool_call_begin) :]
                 self._in_tool_call = True
                 self._function_name_sent = False
                 self._current_function_name = ""
                 self._current_parameters = {}
-                # Fall through to parse the partial tool call
-            else:
-                # Wait for tool call to begin
-                return StreamingParseResult()
+                continue
 
-        # Parse partial tool call
-        if self._in_tool_call:
-            return self._parse_partial_tool_call(tools)
+            # Inside a tool call
+            result, consumed = self._parse_partial_tool_call(tools)
+            calls.extend(result.calls)
+            if consumed:
+                continue
+            if self.eot_token in self._buffer:
+                # The block ends while this call is still unfinished: it was
+                # truncated (token limit), so it is markup, not content.
+                logger.warning("Tool block ended with incomplete tool call")
+                eot_idx = self._buffer.find(self.eot_token)
+                self._buffer = self._buffer[eot_idx + len(self.eot_token) :]
+                self._tool_block_finished = True
+                self._reset_streaming_state()
+                continue
+            break  # wait for more text
 
-        return StreamingParseResult()
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
 
-    def _parse_partial_tool_call(self, tools: List[Tool]) -> StreamingParseResult:
-        """Parse partial tool call for streaming scenarios."""
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Flush at end of stream.
+
+        Text held back because it looked like the start of ``bot_token`` is real
+        content once no more text can arrive. A buffer still inside the tool
+        block is an unfinished tool call, i.e. markup, and is dropped -- but a
+        call whose name has already been streamed cannot be taken back, so its
+        JSON is closed here to keep ``arguments`` parsable.
+        """
+        held, self._buffer = self._buffer, ""
+        if held and not self._in_tool_block:
+            return StreamingParseResult(normal_text=held)
+
+        calls: List[ToolCallItem] = []
+        if self._in_tool_call and self._function_name_sent:
+            logger.warning("Stream ended inside a tool call, closing its arguments")
+            closing = "}" if self.streamed_args_for_tool[self.current_tool_id] else "{}"
+            calls.append(
+                ToolCallItem(tool_index=self.current_tool_id, parameters=closing)
+            )
+            self.streamed_args_for_tool[self.current_tool_id] += closing
+            self._reset_streaming_state()
+            self.current_tool_id += 1
+        return StreamingParseResult(calls=calls)
+
+    def _current_call_segment(self) -> str:
+        """The slice of the buffer that belongs to the call being parsed.
+
+        Parameters must never be read past this call's own end: when a second
+        complete call arrives in the same increment, an unbounded search grafts
+        its parameters onto the current call and drops it.
+        """
+        end = self._buffer.find(self.tool_call_end)
+        segment = self._buffer if end == -1 else self._buffer[:end]
+        close = segment.find(self.invoke_end)
+        if close != -1:
+            segment = segment[: close + len(self.invoke_end)]
+        return segment
+
+    def _skip_current_call(self) -> bool:
+        """Drop the malformed call in the buffer. True if the buffer advanced."""
+        self._reset_streaming_state()
+        end = self._buffer.find(self.tool_call_end)
+        if end == -1:
+            return False
+        self._buffer = self._buffer[end + len(self.tool_call_end) :]
+        return True
+
+    def _parse_partial_tool_call(
+        self, tools: List[Tool]
+    ) -> tuple[StreamingParseResult, bool]:
+        """Parse the tool call at the head of the buffer.
+
+        Returns the deltas to stream plus whether the buffer was advanced past
+        this call (so the caller may look at what follows it).
+        """
         calls = []
+        segment = self._current_call_segment()
 
         # Check if we have tool_sep (means we're past the type declaration)
-        if self.tool_sep not in self._buffer:
-            return StreamingParseResult(calls=calls)  # Wait for more text
+        if self.tool_sep not in segment:
+            if self.tool_call_end in self._buffer:
+                logger.warning("Tool call without a type separator, skipping")
+                return StreamingParseResult(calls=calls), self._skip_current_call()
+            return StreamingParseResult(calls=calls), False  # Wait for more text
 
-        type_part, invoke_part = self._buffer.split(self.tool_sep, 1)
+        type_part, invoke_part = segment.split(self.tool_sep, 1)
         if type_part.strip() != "function":
             # Invalid tool type, skip this tool call
-            self._reset_streaming_state()
-            return StreamingParseResult(calls=calls)
+            logger.warning(f"Unsupported tool call type: {type_part.strip()!r}")
+            return StreamingParseResult(calls=calls), self._skip_current_call()
 
         # Try to extract function name if not sent yet
         if not self._function_name_sent:
@@ -305,11 +367,10 @@ class Step3Detector(BaseFormatDetector):
                 else:
                     # Invalid function name
                     logger.warning(f"Invalid function name: {func_name}")
-                    self._reset_streaming_state()
-                    return StreamingParseResult(calls=calls)
+                    return StreamingParseResult(calls=calls), self._skip_current_call()
             else:
                 # Function name not complete yet
-                return StreamingParseResult(calls=calls)
+                return StreamingParseResult(calls=calls), False
 
         # Parse parameters incrementally
         if self._function_name_sent:
@@ -371,15 +432,19 @@ class Step3Detector(BaseFormatDetector):
 
             # Check if tool call is complete
             if self.tool_call_end in self._buffer:
-                # Send closing brace if we've sent any parameters
-                if self.streamed_args_for_tool[self.current_tool_id]:
-                    calls.append(
-                        ToolCallItem(
-                            tool_index=self.current_tool_id,
-                            parameters="}",
-                        )
+                # Close the JSON object. A call with no parameters has streamed
+                # nothing so far, so it needs a whole "{}" -- otherwise its
+                # arguments stay "", which is not valid JSON.
+                closing = (
+                    "}" if self.streamed_args_for_tool[self.current_tool_id] else "{}"
+                )
+                calls.append(
+                    ToolCallItem(
+                        tool_index=self.current_tool_id,
+                        parameters=closing,
                     )
-                    self.streamed_args_for_tool[self.current_tool_id] += "}"
+                )
+                self.streamed_args_for_tool[self.current_tool_id] += closing
 
                 # Find the end position
                 end_idx = self._buffer.find(self.tool_call_end)
@@ -389,8 +454,9 @@ class Step3Detector(BaseFormatDetector):
                 # Reset state for next tool call
                 self._reset_streaming_state()
                 self.current_tool_id += 1
+                return StreamingParseResult(calls=calls), True
 
-        return StreamingParseResult(calls=calls)
+        return StreamingParseResult(calls=calls), False
 
     def _reset_streaming_state(self):
         """Reset streaming state for the next tool call"""
