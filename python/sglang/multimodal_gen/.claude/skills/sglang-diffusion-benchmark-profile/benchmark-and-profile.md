@@ -293,7 +293,7 @@ Use the preset categories this way:
 | `ideogram4-instant` | `fal/ideogram-v4-instant` | No | Recent distilled T2I checkpoint at 1024x1024; the registered sampling class owns its step and guidance defaults. |
 | `longlive2-t2v` | `Rabinovich/LongLive-2.0-5B-Diffusers` | No | CI-aligned 832x480, 61-frame causal DMD T2V baseline at 4 steps and guidance 1.0. |
 | `longlive2-i2v` | `Rabinovich/LongLive-2.0-5B-Diffusers` | No | CI-aligned 960x928, 61-frame causal DMD I2V baseline using the cat image. |
-| `fast-hunyuan` | `FastVideo/FastHunyuan-diffusers` | No | Native 1280x720, 125-frame FastHunyuan baseline using its registered 6-step schedule. |
+| `fast-hunyuan` | `FastVideo/FastHunyuan-diffusers` | No | Validated one-H200 832x480, 61-frame FastHunyuan baseline using its registered 6-step schedule. |
 | `turbowan21-t2v-1.3b` | `IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers` | No | Registered one-GPU TurboWan path at 832x480, 81 frames, and 4 steps. |
 | `helios-mid` | `BestWishYsh/Helios-Mid` | No | CI-sized 640x384, 33-frame pyramid-SR baseline using Helios-Mid's 20-step schedule. |
 | `helios-distilled` | `BestWishYsh/Helios-Distilled` | No | CI-sized 640x384, 33-frame DMD baseline at 10 steps and guidance 1.0. |

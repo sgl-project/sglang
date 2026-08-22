@@ -495,9 +495,9 @@ MODELS = {
         "path": "FastVideo/FastHunyuan-diffusers",
         "prompt": "A curious raccoon",
         "extra_args": [
-            "--width=1280",
-            "--height=720",
-            "--num-frames=125",
+            "--width=832",
+            "--height=480",
+            "--num-frames=61",
             "--num-inference-steps=6",
         ],
     },
