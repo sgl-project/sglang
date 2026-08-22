@@ -239,12 +239,16 @@ def module_weight_bytes(module) -> int:
     seen: set[int] = set()
     total = 0
     for tensor in list(module.parameters()) + list(module.buffers()):
-        storage = tensor.untyped_storage()
-        pointer = storage.data_ptr()
+        try:
+            storage = tensor.untyped_storage()
+            pointer = storage.data_ptr()
+            storage_bytes = storage.nbytes()
+        except RuntimeError:
+            continue
         if pointer == 0 or pointer in seen:
             continue
         seen.add(pointer)
-        total += storage.nbytes()
+        total += storage_bytes
     return total
 
 
