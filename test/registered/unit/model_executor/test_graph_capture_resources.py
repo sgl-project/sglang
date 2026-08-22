@@ -6,10 +6,6 @@ stream per capture pass re-reserves that pool's MoE / DeepEP scratch instead of
 reusing what an earlier pass left inactive. With adaptive speculative decoding
 that is one pass per candidate step times three runners — tens of GB of
 segments that all read back ``inactive``.
-
-CPU-only: constructing a real ``torch.cuda.Stream`` needs a live CUDA runtime,
-so the stream tests patch ``torch.cuda.Stream`` with a counting fake (or inject
-through ``set_stream``) and the memory-pool tests use a fake device module.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci

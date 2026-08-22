@@ -11,13 +11,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Process-wide CUDA graph capture resources — the memory pool and the
-capture stream — shared across the prefill and decode graph backends.
-
-The phases never replay concurrently, so one pool reserves only the larger
-phase's capture footprint. Sharing the *stream* matters for the same reason:
-the caching allocator partitions segments by stream, so a per-pass stream would
-re-reserve the pool's scratch instead of reusing it.
+"""Process-wide CUDA graph memory pool shared across the prefill and
+decode graph backends. The two phases never replay concurrently, so
+sharing one pool reserves only the larger phase's capture footprint.
+Serial capture passes also share one stream to reuse allocator scratch.
 """
 
 from __future__ import annotations
