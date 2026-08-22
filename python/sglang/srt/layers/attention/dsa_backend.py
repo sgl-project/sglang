@@ -3631,11 +3631,3 @@ class DeepseekSparseAttnMultiStepBackend:
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata_in_graph(forward_batch)
-
-
-# Backward-compat aliases (deprecated: use DSA class names)
-DeepseekSparseAttnBackend = DeepseekSparseAttnBackend
-DeepseekSparseAttnMultiStepBackend = DeepseekSparseAttnMultiStepBackend
-DSAMetadata = DSAMetadata
-DSAFlashMLAMetadata = DSAFlashMLAMetadata
-DSAIndexerMetadata = DSAIndexerMetadata

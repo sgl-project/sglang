@@ -266,7 +266,7 @@ class _PplxDispatcherImpl:
         if not self.use_fp8:
             return hidden_states, None
 
-        from sglang.srt.layers.quantization.fp8_kernel import (
+        from sglang.kernels.ops.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
         )
 

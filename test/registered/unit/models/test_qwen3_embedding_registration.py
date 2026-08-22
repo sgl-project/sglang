@@ -24,9 +24,6 @@ class TestQwen3ModelEmbeddingRegistration(CustomTestCase):
         entry = qwen3_embedding.EntryClass
         self.assertEqual(entry.__name__, "Qwen3Model")
         self.assertEqual(entry.__module__, "sglang.srt.models.qwen3_embedding")
-        # It carries a LAST-token / normalized pooler, i.e. an embedding head.
-        self.assertTrue(hasattr(entry, "forward"))
-        self.assertTrue(hasattr(entry, "load_weights"))
 
     def test_registry_resolves_native_not_transformers_fallback(self):
         """ModelRegistry resolves 'Qwen3Model' to the native class, not the

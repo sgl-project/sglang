@@ -481,14 +481,14 @@ ONE thread — do not design for TBO threads that don't exist.
    resolved config with `get_context().override`; hand a per-runner value to its
    runner as a constructor argument. Projected bags are sealed the same way (leaf
    assignment raises).
-2. **Mutation ratchet** (`test_server_args_mutation_ratchet.py`, exact pin 0 over the whole
+2. **Mutation ratchet** (`runtime_context/test_config_ratchets.py`, exact pin 0 over the whole
    package minus the pipeline / multimodal_gen): textual scan for assignment forms. Never
    raise the baseline.
 3. **No-copy contract** (`test_server_args_no_instance_mutation_entry.py`): neither
    `ServerArgs.override` nor `ServerArgs.derive` exists, and nothing in the package
    calls either form. Rerouting a writer to the bags means flipping **all its readers
    in the same commit** (no transitional dual-write).
-4. **Legacy-accessor ratchet** (`test_legacy_global_ratchet.py`): `get_global_server_args`
+4. **Legacy-accessor ratchet** (`runtime_context/test_config_ratchets.py`): `get_global_server_args`
    call sites must not grow. The replacement for a *decision* is a bag leaf, a named
    accessor, or the owning runner's stamp — not `get_server_args().field`, which the
    read ratchet below pins at zero. `runtime_context.get_server_args()` is only for the
@@ -505,11 +505,11 @@ ONE thread — do not design for TBO threads that don't exist.
    carries `_CONFIGURED_SIZE_CALL_SITES`, the (file, accessor) map of every
    `configured_*_size()` reader with the reason the live property cannot serve it — a new
    file or a new accessor in a listed file must be added there.
-6. **Module-state ratchet** (`test_module_state_ratchet.py`): `global` statements in the
+6. **Module-state ratchet** (`runtime_context/test_config_ratchets.py`): `global` statements in the
    flag-owning layers are pinned by name. A new module-level runtime global belongs on a
    flags group / resources slot instead; migrating a pinned survivor must shrink the pin.
-7. **Namespace coverage** (`test_server_args_namespaces.py`,
-   `test_runtime_context_config_bags.py`): every `ServerArgs` field carries `NS(...)`
+7. **Namespace coverage** (`server_args/test_server_args_namespaces.py`,
+   `runtime_context/test_runtime_context_config_bags.py`): every `ServerArgs` field carries `NS(...)`
    metadata and the projected bags must cover the fields exactly (two-way).
 
 Never module-skip a test "until the migration settles" — seed the context instead
@@ -560,8 +560,8 @@ Key source files: `python/sglang/srt/runtime_context.py` (the container, every t
 `python/sglang/srt/arg_groups/overrides.py` (override registry, passes,
 `declare_late_resolution`), `python/sglang/srt/server_args.py` (`NS` metadata,
 `Arg(..., resolvable=True)`, `__setattr__` strict guard), and the guardrail tests under
-`test/registered/unit/` (`test_server_args_mutation_ratchet.py`,
-`test_global_config_read_ratchet.py`, `test_legacy_global_ratchet.py`,
-`test_module_state_ratchet.py`, `test_server_args_namespaces.py`,
+`test/registered/unit/runtime_context/` (`test_config_ratchets.py`,
+`test_global_config_read_ratchet.py`,
 `test_runtime_context.py` — the last one doubles
-as executable documentation of every tier's semantics).
+as executable documentation of every tier's semantics) and
+`test/registered/unit/server_args/test_server_args_namespaces.py`.

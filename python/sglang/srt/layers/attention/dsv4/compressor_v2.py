@@ -281,7 +281,7 @@ class CompressorBackendMixin:
         from sglang.kernels.ops.attention.deepseek_v4_rope import (
             fused_norm_rope_inplace_triton,
         )
-        from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
+        from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
 
         compress_ratio = compressor.ratio
         head_dim = compressor.head_dim

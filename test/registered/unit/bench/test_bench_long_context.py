@@ -18,7 +18,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 HICACHE_DIR = REPO_ROOT / "benchmark" / "hicache"
 if str(HICACHE_DIR) not in sys.path:
     sys.path.insert(0, str(HICACHE_DIR))
