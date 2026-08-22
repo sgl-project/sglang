@@ -104,6 +104,7 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -327,7 +328,6 @@ from sglang.srt.utils.hf_transformers_utils import (
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
-from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -2181,7 +2181,7 @@ class Scheduler(
         )
 
     def init_output_streamer(self) -> None:
-        self.output_streamer = SchedulerOutputStreamer(
+        self.output_streamer = self.get_output_streamer_class()(
             send_to_detokenizer=self.ipc_channels.send_to_detokenizer,
             tree_cache=self.tree_cache,
             ps=self.ps,
@@ -2192,6 +2192,9 @@ class Scheduler(
             enable_hicache_storage=lambda: self.enable_hicache_storage,
             rust_server=self.rust_server,
         )
+
+    def get_output_streamer_class(self) -> type[SchedulerOutputStreamer]:
+        return SchedulerOutputStreamer
 
     def init_beam_coordinator(self) -> None:
         self.beam_coordinator = BeamCoordinator(
@@ -3896,6 +3899,7 @@ class Scheduler(
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 self._relay_forward_payload(batch, batch.req_pool_indices, batch_result)
                 batch.input_ids = None
+                self._copy_auxiliary_output_to_cpu(batch, batch_result)
             elif not batch.spec_algorithm.is_none():
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).
@@ -3935,6 +3939,7 @@ class Scheduler(
                     )
                     batch.input_ids = None
                 self.update_cache_from_scheduler(batch, batch_result)
+                self._copy_auxiliary_output_to_cpu(batch, batch_result)
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
@@ -4034,6 +4039,32 @@ class Scheduler(
         self.future_map.stash(future_indices, payload)
         self.beam_coordinator.maybe_select_and_relay(
             batch, batch_result, chunked_req=self.chunked_req
+        )
+
+    def _copy_auxiliary_output_to_cpu(
+        self,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> None:
+        logits_output = result.logits_output
+        if (
+            logits_output is None
+            or logits_output.auxiliary_device_output is None
+            or result.auxiliary_host_output is not None
+        ):
+            return
+        # PP transports the device output to the first rank before copying it.
+        if self.ps.pp_size > 1:
+            return
+        if result.copy_done is not None:
+            raise RuntimeError(
+                "generation result has an uncopied auxiliary output after its "
+                "device-to-host copy was scheduled"
+            )
+        result.copy_done = self.device_module.Event()
+        result.copy_to_cpu(
+            return_logprob=batch.return_logprob,
+            return_hidden_states=batch.return_hidden_states,
         )
 
     def launch_batch_sample_if_needed(

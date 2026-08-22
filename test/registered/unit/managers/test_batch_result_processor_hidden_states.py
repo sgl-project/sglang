@@ -135,6 +135,7 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                 )
                 result = SimpleNamespace(
                     copy_done=None,
+                    auxiliary_host_output=None,
                     routed_experts_output=None,
                     indexer_topk_output=None,
                     logits_output=SimpleNamespace(
@@ -183,6 +184,7 @@ class TestDecodeHiddenStateRetention(CustomTestCase):
         def result(hidden_states):
             return SimpleNamespace(
                 copy_done=None,
+                auxiliary_host_output=None,
                 routed_experts_output=None,
                 indexer_topk_output=None,
                 logits_output=SimpleNamespace(hidden_states=hidden_states),

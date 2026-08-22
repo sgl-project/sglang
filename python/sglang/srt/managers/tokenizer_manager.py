@@ -2264,11 +2264,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         i
                     ]
                 if customized_info is not None:
-                    for k, v in customized_info.items():
-                        if k not in state.customized_info_accumulated:
-                            state.customized_info_accumulated[k] = []
-                        state.customized_info_accumulated[k].extend(v[i])
-                        meta_info[k] = state.customized_info_accumulated[k]
+                    self.update_request_meta_info(
+                        meta_info,
+                        state,
+                        customized_info,
+                        i,
+                        recv_obj.finished_reasons[i],
+                    )
 
                 # Add multimodal prompt token counts only for requests that
                 # actually consumed them, so plain-text meta_info stays unchanged.
@@ -2473,6 +2475,34 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # handle_loop awaits next recv immediately
         for s in pending_notify.values():
             s.event.set()
+
+    @staticmethod
+    def _accumulate_request_meta_info(
+        meta_info: dict,
+        state: ReqState,
+        key: str,
+        values: list,
+    ) -> None:
+        accumulated = state.customized_info_accumulated.setdefault(key, [])
+        accumulated.extend(values)
+        meta_info[key] = accumulated
+
+    def update_request_meta_info(
+        self,
+        meta_info: dict,
+        state: ReqState,
+        customized_info: dict,
+        index: int,
+        finish_reason: Optional[dict],
+    ) -> None:
+        """Accumulate metadata; subclasses may use finish_reason for terminal data."""
+        for key, values in customized_info.items():
+            self._accumulate_request_meta_info(
+                meta_info,
+                state,
+                key,
+                values[index],
+            )
 
     def add_logprob_to_meta_info(
         self,

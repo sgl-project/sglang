@@ -81,6 +81,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
 def _make_result():
     return SimpleNamespace(
         copy_done=None,
+        auxiliary_host_output=None,
         routed_experts_output=None,
         indexer_topk_output=None,
         logits_output=SimpleNamespace(hidden_states=None, customized_info=None),

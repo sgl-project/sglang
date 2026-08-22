@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
-import aiohttp
 import msgspec
 import numpy as np
 import torch
@@ -1943,17 +1942,6 @@ class MMEncoder:
         finally:
             logger.info(f"Cleaning up resources for req_id {req_id}")
             await self.release_request(req_id)
-
-    async def get_embedding_port(self, prefill_url):
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=1800)
-        ) as session:
-            response = await session.post(
-                f"{prefill_url}/embedding_bootstrap",
-                json={"embedding_port": None},
-            )
-            response_json = await response.json()
-            return response_json["embedding_port"]
 
 
 class EncoderProfiler:
