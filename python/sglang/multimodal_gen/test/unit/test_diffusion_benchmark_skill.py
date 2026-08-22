@@ -61,6 +61,7 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
                 "longcat-image",
                 "sana-video",
                 "lingbot-video-moe",
+                "fastwan21-t2v-1.3b",
                 "cosmos3-edge-t2i",
                 "cosmos3-super-t2i-distilled",
                 "ltx25",
@@ -78,6 +79,11 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
 
             h3_cmd = module.build_sglang_cmd("minimax-h3-t2va", torch_compile=True)
             self.assertNotIn("--enable-torch-compile", h3_cmd)
+
+            fastwan_cmd = module.build_sglang_cmd("fastwan21-t2v-1.3b")
+            self.assertIn("--num-frames=61", fastwan_cmd)
+            self.assertIn("--num-inference-steps=3", fastwan_cmd)
+            self.assertIn("--dit-layerwise-offload=false", fastwan_cmd)
 
     def test_quality_and_bcg_comparators_are_explicit_and_exclusive(self):
         with tempfile.TemporaryDirectory() as tmpdir:
