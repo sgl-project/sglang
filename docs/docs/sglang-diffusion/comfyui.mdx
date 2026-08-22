@@ -7,7 +7,7 @@ The [ComfyUI SGLDiffusion plugin](https://github.com/sgl-project/sglang/tree/mai
 
 **Server mode** talks to a standalone `sglang serve` process over HTTP. ComfyUI sends prompts and receives images or video. This is the same path as the [OpenAI-compatible API](/docs/sglang-diffusion/api/openai_api).
 
-**Integrated mode** keeps ComfyUI's CLIP, VAE, and sampler loop. SGLang loads only the DiT and runs one forward per sampler step. The worker starts the native Flux / Qwen-Image / Z-Image pipeline under `--comfyui-mode`. A single-file ComfyUI `.safetensors` is loaded through a checkpoint spec. Each `apply_model` call is translated by a per-model adapter.
+**Integrated mode** keeps ComfyUI's CLIP, VAE, and sampler loop. SGLang loads only the DiT and runs one forward per sampler step. The worker starts the native Flux / Qwen-Image / Z-Image / MiniMax-H3 pipeline under `--comfyui-mode`. A single-file ComfyUI `.safetensors` (or a GGUF overlay) is loaded through a checkpoint spec. Each `apply_model` call is translated by a per-model adapter.
 
 Integrated mode does not ship a separate `comfyui_*` pipeline class per model.
 
@@ -25,7 +25,7 @@ Example workflows live next to the plugin under `workflows/`.
 2. Set `num_gpus`, `tp_size`, `model_type`, or compile flags with `SGLDiffusion Options`.
 3. Connect the loaded model to a standard ComfyUI sampler.
 
-Supported integrated-mode families: Flux, Qwen-Image, Z-Image. Qwen-Image edit is experimental.
+Supported integrated-mode families: Flux, Qwen-Image, Z-Image, MiniMax-H3. Qwen-Image edit is experimental.
 
 ## How a sampler step reaches the worker
 
@@ -44,5 +44,8 @@ Integrated mode currently supports:
 | Z-Image | `lumina2` | `ZImagePipeline` | `Z-Image-Turbo` |
 | Qwen-Image | `qwen_image` | `QwenImagePipeline` | `Qwen-Image`, `Qwen-Image-2512` |
 | Qwen-Image edit | `qwen_image_edit` | `QwenImageEditPlusPipeline` | `Qwen-Image-Edit-2511` (experimental) |
+| MiniMax-H3 | `minimax_h3` | `MiniMaxH3Pipeline` | `minimax_h3_fl2va_*.safetensors`, `minimax_h3_ref2va_*.safetensors` |
+
+MiniMax-H3 example graphs: `minimax_h3_t2v_sgld.json` (T2V / I2VA / FL2VA on the FL2VA DiT), `minimax_h3_r2v_sgld.json` (reference-to-video; use a `ref2va` file), `minimax_h3_t2v_sgld_upscaler.json` (two-pass 3D ×2). Set `SGLDOptions.model_type` to `minimax_h3`. On 24 GB, keep the 32B CLIP on CPU and prefer pruned BF16, GGUF, or `kitchen_int8` with DiT layerwise offload. See the [MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#comfyui-integrated-mode).
 
 To add a model, register a checkpoint spec under `runtime/loader/comfyui_checkpoints/` and a `ComfyUIModelAdapter`. Do not add another ComfyUI pipeline class.
