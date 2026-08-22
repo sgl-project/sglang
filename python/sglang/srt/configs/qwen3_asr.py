@@ -164,5 +164,7 @@ class Qwen3ASRConfig(PretrainedConfig):
         return self.thinker_config.text_config
 
 
-AutoConfig.register("qwen3_asr", Qwen3ASRConfig)
-AutoConfig.register("qwen3_asr_thinker", Qwen3ASRThinkerConfig)
+# Newer Transformers releases provide these model types themselves. Keep the
+# SGLang compatibility configs authoritative without failing at import time.
+AutoConfig.register("qwen3_asr", Qwen3ASRConfig, exist_ok=True)
+AutoConfig.register("qwen3_asr_thinker", Qwen3ASRThinkerConfig, exist_ok=True)

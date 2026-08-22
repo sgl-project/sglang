@@ -112,6 +112,11 @@ ALL_MODELS = [
         skip_long_prompt=True,
     ),
     ModelCase(
+        "swiss-ai/Apertus-v1.5-8B",
+        trust_remote_code=True,
+        skip_long_prompt=True,
+    ),
+    ModelCase(
         "LiquidAI/LFM2.5-1.2B-Instruct",
         trust_remote_code=True,
     ),
