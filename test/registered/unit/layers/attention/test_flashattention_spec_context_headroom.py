@@ -80,7 +80,9 @@ class TestFlashAttentionSpecContextHeadroom(CustomTestCase):
         return runner
 
     def _backend(self, *, page_size: int = 16, **server_args_fields):
-        runner = self._publish_runner(_make_runner(page_size=page_size), **server_args_fields)
+        runner = self._publish_runner(
+            _make_runner(page_size=page_size), **server_args_fields
+        )
         backend = FlashAttentionBackend(runner)
         return runner, backend
 

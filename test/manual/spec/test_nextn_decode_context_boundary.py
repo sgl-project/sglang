@@ -89,7 +89,9 @@ def fetch_server_context_settings(base_url: str) -> tuple[int, int, int]:
 
     server_context = info.get("context_length")
     if server_context is None:
-        models_resp = requests.get(f"{root}/v1/models", timeout=SERVER_QUERY_TIMEOUT_SEC)
+        models_resp = requests.get(
+            f"{root}/v1/models", timeout=SERVER_QUERY_TIMEOUT_SEC
+        )
         models_resp.raise_for_status()
         models = models_resp.json()
         data = models.get("data") or []
@@ -282,7 +284,15 @@ def parse_stream(resp, tokenizer, *, log_prefix: str | None = None):
     return "".join(pieces), finish_reason
 
 
-def send_chat(args, messages, label: str, *, max_tokens: int, ignore_eos: bool = False, tokenizer=None):
+def send_chat(
+    args,
+    messages,
+    label: str,
+    *,
+    max_tokens: int,
+    ignore_eos: bool = False,
+    tokenizer=None,
+):
     url = args.base_url
     payload = {
         "model": args.model,
@@ -324,7 +334,9 @@ def send_chat(args, messages, label: str, *, max_tokens: int, ignore_eos: bool =
         return None, f"{type(exc).__name__}: {exc}", ""
 
 
-def long_decode_worker(args, tokenizer, crash: CrashFlag, stop: threading.Event, state: LongDecodeState):
+def long_decode_worker(
+    args, tokenizer, crash: CrashFlag, stop: threading.Event, state: LongDecodeState
+):
     messages, prompt_n = grow_prompt(tokenizer, args.long_prompt_tokens, "long-prompt")
     ceiling = max(1, args.long_max_tokens - TOKEN_SLACK)
     probe_max = ceiling
@@ -387,7 +399,9 @@ def long_decode_worker(args, tokenizer, crash: CrashFlag, stop: threading.Event,
 
 
 def _prefill_messages(tokenizer, prompt_tokens_n: int, label: str) -> tuple[list, int]:
-    messages = [{"role": "user", "content": make_text(tokenizer, prompt_tokens_n, label)}]
+    messages = [
+        {"role": "user", "content": make_text(tokenizer, prompt_tokens_n, label)}
+    ]
     return messages, prompt_tokens(tokenizer, messages)
 
 
@@ -422,7 +436,9 @@ def _background_prefill_loop(
             return
 
 
-def background_worker(args, tokenizer, crash: CrashFlag, stop: threading.Event, state: LongDecodeState):
+def background_worker(
+    args, tokenizer, crash: CrashFlag, stop: threading.Event, state: LongDecodeState
+):
     long_tokens = max(1, args.long_prompt_tokens // 2)
     print(
         f"background: 1x long_prefill≈{long_tokens}tok "
@@ -513,7 +529,9 @@ def main() -> int:
         flush=True,
     )
     print(f"loading tokenizer: {args.tokenizer_path}", flush=True)
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.tokenizer_path, trust_remote_code=True
+    )
 
     stop = threading.Event()
     crash = CrashFlag()

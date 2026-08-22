@@ -230,9 +230,8 @@ class FlashAttentionBackend(AttentionBackend):
         # from max_context_len; without this headroom FA indexes past the
         # page_table near the context wall (CUDA illegal memory access).
         if self.speculative_num_draft_tokens:
-            self.max_context_len = (
-                int(model_runner.model_config.context_len)
-                + int(self.speculative_num_draft_tokens)
+            self.max_context_len = int(model_runner.model_config.context_len) + int(
+                self.speculative_num_draft_tokens
             )
             self.max_num_pages = (
                 self.max_context_len + self.page_size - 1
