@@ -5,8 +5,50 @@ import torch
 
 from sglang.multimodal_gen.runtime.cache.spectrum import (
     ChebyshevForecaster,
+    SpectrumContext,
     SpectrumForecaster,
+    SpectrumMixin,
 )
+
+
+class _DummySpectrum(SpectrumMixin):
+    prefix = "wan"
+
+    def __init__(self) -> None:
+        self._init_spectrum_state()
+
+
+class _DummySharedSpectrum(SpectrumMixin):
+    prefix = "flux"
+
+    def __init__(self) -> None:
+        self._init_spectrum_state()
+
+
+class _SpectrumParams:
+    window_size = 2.0
+    flex_window = 0.75
+    warmup_steps = 5
+    history_size = 20
+    m = 2
+    lam = 0.1
+    tau_num_steps = 50
+    taylor_order = 1
+    w = 1.0
+
+
+def _spectrum_context(
+    *, is_cfg_negative: bool, total_forward_steps: int = 50
+) -> SpectrumContext:
+    return SpectrumContext(
+        current_step=0,
+        num_inference_steps=total_forward_steps,
+        total_forward_steps=total_forward_steps,
+        do_cfg=True,
+        is_cfg_negative=is_cfg_negative,
+        spectrum_params=_SpectrumParams(),
+        debug=False,
+    )
 
 
 class TestSpectrumForecaster(unittest.TestCase):
@@ -86,6 +128,70 @@ class TestSpectrumForecaster(unittest.TestCase):
         t = torch.tensor([10.0])
         self.assertAlmostEqual(f50._taus(t).item(), -0.6, places=5)
         self.assertAlmostEqual(f20._taus(t).item(), 0.0, places=5)
+
+
+class TestSpectrumLifecycle(unittest.TestCase):
+    def test_cfg_parallel_negative_branch_initializes_at_generation_start(
+        self,
+    ) -> None:
+        model = _DummySpectrum()
+        model.spectrum_cnt = 7
+        model.spectrum_cnt_negative = 7
+        model.spectrum_num_consecutive_cached_steps_negative = 3
+        model.spectrum_curr_ws_negative = 9.0
+        model.spectrum_real_steps_negative = 4
+        model.spectrum_skipped_steps_negative = 2
+        model.spectrum_shadow_rel_l2_sum_negative = 1.5
+        model.spectrum_shadow_rel_l2_count_negative = 3
+        model._get_spectrum_context = lambda: _spectrum_context(is_cfg_negative=True)
+
+        self.assertTrue(model.begin_spectrum_step())
+
+        self.assertEqual(model.spectrum_cnt_negative, 1)
+        self.assertEqual(model.spectrum_curr_ws_negative, _SpectrumParams.window_size)
+        self.assertEqual(model.spectrum_num_consecutive_cached_steps_negative, 0)
+        self.assertEqual(model.spectrum_real_steps_negative, 1)
+        self.assertEqual(model.spectrum_skipped_steps_negative, 0)
+        self.assertEqual(model.spectrum_shadow_rel_l2_sum_negative, 0.0)
+        self.assertEqual(model.spectrum_shadow_rel_l2_count_negative, 0)
+        self.assertEqual(model.spectrum_cnt, 7)
+
+    def test_cfg_parallel_negative_branch_drops_previous_forecaster(self) -> None:
+        model = _DummySpectrum()
+        previous_forecaster = object()
+        model.spectrum_forecaster_negative = previous_forecaster
+        model._get_spectrum_context = lambda: _spectrum_context(
+            is_cfg_negative=True, total_forward_steps=1
+        )
+
+        self.assertTrue(model.begin_spectrum_step())
+
+        self.assertIsNone(model.spectrum_forecaster_negative)
+
+    def test_serial_cfg_branches_start_with_synchronized_counters(self) -> None:
+        model = _DummySpectrum()
+        context = _spectrum_context(is_cfg_negative=False)
+        model._get_spectrum_context = lambda: context
+
+        self.assertTrue(model.begin_spectrum_step())
+        context = _spectrum_context(is_cfg_negative=True)
+        self.assertTrue(model.begin_spectrum_step())
+
+        self.assertEqual(model.spectrum_cnt, 1)
+        self.assertEqual(model.spectrum_cnt_negative, 1)
+        self.assertEqual(model.spectrum_curr_ws, _SpectrumParams.window_size)
+        self.assertEqual(model.spectrum_curr_ws_negative, _SpectrumParams.window_size)
+
+    def test_serial_cfg_shared_counter_is_not_reset_by_negative_branch(self) -> None:
+        model = _DummySharedSpectrum()
+        context = _spectrum_context(is_cfg_negative=False, total_forward_steps=100)
+        model._get_spectrum_context = lambda: context
+
+        self.assertTrue(model.begin_spectrum_step())
+        context = _spectrum_context(is_cfg_negative=True, total_forward_steps=100)
+        self.assertTrue(model.begin_spectrum_step())
+
+        self.assertEqual(model.spectrum_cnt, 2)
 
 
 if __name__ == "__main__":
