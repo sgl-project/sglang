@@ -29,6 +29,7 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromDistributedReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     SendWeightsToRemoteInstanceReqInput,
@@ -283,6 +284,22 @@ class BaseTpWorker(ABC):
             tensors,
             recv_req.config_dict,
             recv_req.added_tokens_config,
+            upsert=recv_req.upsert,
+        )
+        return result
+
+    def load_lora_adapter_from_distributed(
+        self, recv_req: LoadLoRAAdapterFromDistributedReqInput
+    ):
+        result = self.model_runner.load_lora_adapter_from_distributed(
+            recv_req.to_ref(),
+            recv_req.names,
+            recv_req.dtypes,
+            recv_req.shapes,
+            recv_req.config_dict,
+            recv_req.group_name,
+            recv_req.added_tokens_config,
+            upsert=recv_req.upsert,
         )
         return result
 
