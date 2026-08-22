@@ -9,6 +9,8 @@ from sglang.multimodal_gen.configs.sample.sana_video import SanaVideoSamplingPar
 from sglang.multimodal_gen.registry import get_model_info
 from sglang.multimodal_gen.runtime.models.dits.sana_video import (
     SanaVideoRotaryPosEmbed,
+    apply_interleaved_rotary_emb,
+    apply_interleaved_rotary_emb_pair,
 )
 from sglang.multimodal_gen.runtime.pipelines.sana_video import (
     select_sana_video_prompt_window,
@@ -85,3 +87,15 @@ def test_sana_video_rotary_embeddings_follow_video_token_order():
     assert sin.shape == (1, 12, 1, 12)
     assert torch.isfinite(cos).all()
     assert torch.isfinite(sin).all()
+
+
+def test_sana_video_paired_rope_falls_back_to_eager_on_cpu():
+    query = torch.randn(2, 7, 3, 12, dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    cos = torch.randn(1, 7, 1, 12, dtype=torch.float64)
+    sin = torch.randn_like(cos)
+
+    query_out, key_out = apply_interleaved_rotary_emb_pair(query, key, cos, sin)
+
+    assert torch.equal(query_out, apply_interleaved_rotary_emb(query, cos, sin))
+    assert torch.equal(key_out, apply_interleaved_rotary_emb(key, cos, sin))
