@@ -1264,9 +1264,11 @@ launcher, which holds no weights.
 **Recipe A — fits 12 GB VRAM + 32 GB host**
 
 ```bash 12 GB + 32 GB, lossless
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
   --performance-mode memory \
-  --layerwise-offload-components dit,text_encoder,vae
+  --layerwise-offload-components dit,text_encoder,vae \
+  --layerwise-resident-layers video_vae=36
 ```
 
 **Recipe B — host memory is free (the fast path)**
@@ -1279,19 +1281,20 @@ sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
   --layerwise-resident-layers video_vae=36
 ```
 
-Recipe B pins 116.7 GB of host memory (DiT 61.56 GB, text encoder 46.18 GB, VAE
-9.00 GB). Do not reach for it on a 32 GB machine.
+Recipe B pins ~112 GB of host memory (DiT 61.56 GB, text encoder 46.18 GB, VAE
+~4.5 GB in its decode dtype). Do not reach for it on a 32 GB machine.
 
 **What not to change, and why**
 
-- `video_vae=36` is a 16 GB flag, not a 12 GB one. Holding all 36 decoder
-  blocks turns the 150 s streamed decode into 13 s, because `decode_temporal`
-  re-runs the whole decoder once per temporal chunk — but the held blocks are
-  9 GB of VRAM that the decode's own activations then collide with: at a 12 GiB
-  allocator cap the denoise completes and the decode raises out-of-memory, so
-  no output is ever written. Recipe B keeps it; Recipe A must not, and its
-  streamed decode measured 209 s on a busy host. That decode is the slow part
-  of Recipe A's request, and it is the price of fitting 12 GB.
+- `video_vae=36` holds every decoder block for the decode only — residency
+  arms at the decoder's first block and releases when it finishes, so the
+  denoise still runs on an empty card. It fits 12 GB because decoder weights
+  are held in their decode compute dtype (fp16) from load, which halves them
+  to ~4.9 GiB; the rounding was already part of every output (the decode
+  computes in fp16 autocast), so the result is bit-identical, and the decode
+  drops from 60 s streamed (or 209 s on a busy host) to ~10 s. The
+  `expandable_segments` line stays: the decode sits close enough to the cap
+  that fragmentation otherwise tips it over.
 - Leave `--enable-torch-compile` off, as elsewhere on this page. Layerwise offload
   rebinds `param.data` on every layer, so compiled graphs do not get the benefit
   they would on resident weights.
@@ -1313,12 +1316,13 @@ request.
   32 GB host: the DiT streams from the checkpoint file. If instead the log
   reports pinned weights, the runtime decided your host has room — which is
   faster, and means the 32 GB figures above do not apply to you.
-- `Loaded video_vae: ... host mmap` vs `host pageable` — where the VAE's 9.7 GB
-  landed. `Loaded <component>` lines carry the same buckets for every component.
+- `Loaded video_vae: ... host mmap` vs `host pageable` — where the VAE landed
+  (decoder weights are ~4.9 GiB once held in their decode dtype).
+  `Loaded <component>` lines carry the same buckets for every component.
 
-If a request dies after the denoise finishes, it is the decode: you are holding
-`video_vae=36` on a card without room for it. Drop the flag and take the
-streamed decode.
+If a request dies after the denoise finishes, it is the decode colliding with
+the cap: keep the `expandable_segments` line, and if it persists drop to
+`video_vae=24` and take the partially streamed decode.
 
 **Against ComfyUI, on the same weights**
 
@@ -1332,38 +1336,38 @@ When host memory is free, the engines are close and sglang is ahead:
 | sglang, Recipe B | **6.01 s/it** | 116.7 GB pinned | ≤ 16 GiB |
 | ComfyUI KSampler | 6.58–6.59 s/it | 116.5 GiB | 13048 MiB |
 
-Inside 12 GB + 32 GB, both run these weights — and today ComfyUI runs them
-faster. ComfyUI's memory manager reads system RAM and adapts, so measuring it
-on an unconstrained box says nothing about a 32 GB one; the row below patches
-`psutil` so it sees a 32 GiB world, the same convention the sglang rows were
-measured under. Under that budget its manager holds anonymous memory at
-30.3 GiB and its default `--async-offload` streams weights through pinned
-staging buffers, which overlaps the copies sglang's checkpoint-mapping path
-currently makes synchronously:
+Inside 12 GB, both engines run these weights, and one measurement convention
+matters on each side. ComfyUI's memory manager reads system RAM and adapts, so
+the rows below patch `psutil` to a pretend host size — the same convention the
+sglang rows use. Its `--reserve-vram` is also soft: told to keep 12 GiB free it
+still peaked at 13.5 GiB, a figure a real 12 GB card cannot give it, so both
+engines here run under the same hard allocator cap
+(`set_per_process_memory_fraction`), where its peak stays at 12.1–12.3 GiB.
+Under that cap, Recipe A wins the whole request at every host size:
 
-| 12 GB VRAM + 32 GB host | denoise | whole request | host anonymous |
-| --- | ---: | ---: | ---: |
-| sglang, Recipe A | **10.5–11.3 s/it** | **279–283 s** | ≤ 27 GiB |
-| ComfyUI, bf16, 32 GiB world | 13.0 s/it | 290–348 s (warm) | 30.3 GiB |
+| 12 GB VRAM, both engines hard-capped | sglang Recipe A (TE + denoise + decode) | ComfyUI, bf16 (warm) |
+| --- | ---: | ---: |
+| 32 GB host | 12.4 + 212.8 + 9.4 ≈ **235 s** | 276–302 s |
+| 48 GB host | 15.8 + 192.1 + 10.0 ≈ **218 s** | 246–267 s |
+| 64 GB host | 7.5 + 162.4 + 10.3 ≈ **180 s** | 194–195 s |
 
-Two interleaved rounds on the same GPU in the same load window, both engines
-under the same 32 GiB psutil convention, both on the unpruned bf16 weights,
-outputs verified; every ComfyUI warm request came in above every sglang one.
-The request breaks down as ~15 s of text encoding, 200–215 s of denoise, and
-54–64 s of decode. Three merged or in-flight changes carry it: the VAE staying
-on its checkpoint mapping (#35862 with the root fix in #35946), per-layer
-pinning with net-cost accounting (#35867, merged), and the courier thread that
-ships still-mapped layers through pinned slots (#35882) — plus the
-decode-scoped `video_vae=24` residency in the recipe above. Output equivalence
-was checked: the courier's video SSIM against baseline equals baseline's own
-run-to-run SSIM, and the audio stream is bit-identical.
+Same GPU, same load window, unpruned bf16 checkpoints, outputs verified. Four
+changes carry it: the VAE staying on its checkpoint mapping (#35862, root fix
+#35946), per-layer pinning with net-cost accounting (#35867), the courier
+thread that ships still-mapped layers through pinned slots (#35882), and
+decoder weights held in their decode dtype from load (#35967) — which is what
+lets `video_vae=36` fit and turns the decode from the slowest stage (54–96 s
+streamed) into the fastest (~10 s, faster than ComfyUI's own 15–25 s). Output
+equivalence is bit-level: the fp16-held decode reproduced the fp32-store run's
+video byte for byte, and the audio stream is bit-identical.
 
-ComfyUI's requests are also shorter after the denoise: its decode runs the VAE
-whole once the DiT is unloaded, where Recipe A streams the decoder's blocks —
-still the case, and still tracked. Two ComfyUI notes
-that still matter: `--fast-disk` measured no faster than its default here, and
-stacking `--novram --cache-none --disable-pinned-memory` made things strictly
-worse (69.1 GiB anonymous, 750 s requests) — the adaptive default is the right
+Stage by stage under the cap: text encoding is even (both stream the same
+48 GB Qwen3VL), the denoise leads at 32–48 GB hosts and sits within
+run-to-run variance of ComfyUI at 64 GB (162 vs 159 s), and the decode leads
+everywhere. Two ComfyUI notes that still matter: `--fast-disk` measured no
+faster than its default here, and stacking
+`--novram --cache-none --disable-pinned-memory` made things strictly worse
+(69.1 GiB anonymous, 750 s requests) — the adaptive default is the right
 configuration on a small host.
 
 The path ComfyUI ships for 12 GB cards uses

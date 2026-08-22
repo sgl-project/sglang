@@ -15,15 +15,15 @@ const CONSUMER_SINGLE = ["rtx4070", "rtx4080", "rtx4090"];
 const CONSUMER_VRAM_16_PLUS = ["rtx4080", "rtx4090"];
 
 function consumerFlags(s) {
-  // Two thirds of the video decoder held for the decode only: residency arms
-  // at the decoder's first block and releases when it finishes, so the
-  // denoise still runs on an empty card, and the decode drops from 209 s to
-  // ~60 s. All 36 blocks fit neither 12 GB nor a busy 16 GB -- the decode's
-  // own activations need the rest -- and measured on 16 GB they also slow the
-  // denoise; 24 is the measured setting for both.
+  // The whole video decoder held for the decode only: residency arms at the
+  // decoder's first block and releases when it finishes, so the denoise still
+  // runs on an empty card. All 36 blocks fit 12 GB because decoder weights are
+  // held in their decode compute dtype (fp16, ~4.9 GiB) from load -- the
+  // rounding was already in every output, so the result is bit-identical --
+  // and the decode drops from 60 s streamed to ~10 s.
   const flags = [
     "--layerwise-offload-components dit,text_encoder,vae",
-    "--layerwise-resident-layers video_vae=24",
+    "--layerwise-resident-layers video_vae=36",
   ];
   if (CONSUMER_VRAM_16_PLUS.includes(s.hw) && s.host_ram === "ram96") {
     flags.push("--dit-layerwise-resident-layers 4");
@@ -39,14 +39,14 @@ function consumerHints(s) {
     if (CONSUMER_VRAM_16_PLUS.includes(s.hw)) {
       hints.push("verified end to end: ~6 s per denoise step, 13 s decode");
     } else {
-      hints.push("~6 s per step once the host pins the DiT; the decode still streams (~3.5 min) because 12 GB cannot hold the VAE blocks");
+      hints.push("~6 s per step once the host pins the DiT; the decode holds all 36 blocks in their fp16 decode dtype and takes ~10 s");
     }
     return hints;
   }
-  hints.push("measured: ~10.5-11.3 s per denoise step, ~60 s decode, 279-283 s per request; output verified end to end");
+  hints.push("measured at 32 GB host: ~10.6 s per denoise step, ~9.4 s decode, ~235 s per request -- ahead of ComfyUI (276-302 s) on the same weights under the same hard 12 GiB cap, output bit-identical");
   hints.push("run with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -- the decode sits close enough to the cap that fragmentation otherwise tips it over");
   if (midHost) {
-    hints.push("48-64 GB hosts land between the 32 GB and 96 GB figures; this tier is not individually verified");
+    hints.push("measured at 48 GB host: ~9.6 s/step, ~218 s per request (ComfyUI 246-267 s); at 64 GB: ~8.1 s/step, ~180 s (ComfyUI 194-195 s)");
   } else {
     hints.push("a 32 GB host cannot cache the 108 GB checkpoint: NVMe is required, and real runs land above the quoted step time");
   }
