@@ -1154,7 +1154,7 @@ class TestOffloadDefaults(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "native SGLang backend"):
             resolve_diffusers_pipeline_offload({"all": LAYERWISE_OFFLOAD})
 
-    def test_vae_cpu_offload_defaults_false_on_low_memory_gpu(self):
+    def test_memory_mode_layerwise_offloads_vae_on_low_memory_gpu(self):
         args = self._from_dict_with_task_type(
             ModelTaskType.T2V,
             memory_gb=16,
@@ -1169,6 +1169,22 @@ class TestOffloadDefaults(unittest.TestCase):
             args.layerwise_offload_components,
             ["text_encoder", "image_encoder", "vae"],
         )
+        self.assertEqual(args.residency_mode("vae"), LAYERWISE_OFFLOAD)
+
+    def test_memory_mode_preserves_explicit_vae_residency(self):
+        for kwargs, expected_mode in (
+            ({"component_residency": ["vae=resident"]}, RESIDENT),
+            ({"vae_cpu_offload": True}, COMPONENT_OFFLOAD),
+        ):
+            with self.subTest(expected_mode=expected_mode):
+                args = self._from_dict_with_task_type(
+                    ModelTaskType.T2V,
+                    memory_gb=16,
+                    kwargs={"performance_mode": "memory", **kwargs},
+                )
+
+                self.assertNotIn("vae", args.layerwise_offload_components or [])
+                self.assertEqual(args.residency_mode("vae"), expected_mode)
 
     def test_explicit_vae_cpu_offload_true_is_preserved_by_default_layerwise(
         self,
@@ -1985,24 +2001,19 @@ class TestOffloadDefaults(unittest.TestCase):
             ["text_encoder", "image_encoder", "vae"],
         )
 
-    def test_ltx23_snapshot_device_mode_is_deprecated_alias_for_original(self):
-        args = self._from_dict_with_pipeline_config(
-            LTX2PipelineConfig(),
-            memory_gb=140,
-            available_memory_gb=134,
-            kwargs={
-                "model_path": "Lightricks/LTX-2.3",
-                "num_gpus": 2,
-                "pipeline_class_name": "LTX2TwoStagePipeline",
-                "ltx2_two_stage_device_mode": "snapshot",
-            },
-        )
-
-        self.assertEqual(args.ltx2_two_stage_device_mode, "original")
-        self.assertEqual(
-            args.layerwise_offload_components,
-            ["text_encoder", "image_encoder", "vae"],
-        )
+    def test_ltx23_snapshot_device_mode_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Expected one of"):
+            self._from_dict_with_pipeline_config(
+                LTX2PipelineConfig(),
+                memory_gb=140,
+                available_memory_gb=134,
+                kwargs={
+                    "model_path": "Lightricks/LTX-2.3",
+                    "num_gpus": 2,
+                    "pipeline_class_name": "LTX2TwoStagePipeline",
+                    "ltx2_two_stage_device_mode": "snapshot",
+                },
+            )
 
     def test_explicit_layerwise_components_preserved_in_ltx23_resident(self):
         args = self._from_dict_with_pipeline_config(
@@ -2204,6 +2215,8 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.dit_layerwise_offload)
         self.assertIn("text_encoder", args.layerwise_offload_components or [])
         self.assertIn("vae", args.layerwise_offload_components or [])
+        self.assertFalse(args.vae_cpu_offload)
+        self.assertEqual(args.residency_mode("vae"), LAYERWISE_OFFLOAD)
 
     def test_minimax_h3_rejects_explicit_cfg_parallel(self):
         with self.assertRaisesRegex(
@@ -2407,7 +2420,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(server_args.use_fsdp_inference)
         self.assertFalse(server_args.enable_cfg_parallel)
 
-    def test_ltx23_snapshot_device_mode_cli_alias_is_accepted(self):
+    def test_ltx23_snapshot_device_mode_cli_is_rejected(self):
         parser = FlexibleArgumentParser()
         ServerArgs.add_cli_args(parser)
         argv = [
@@ -2419,36 +2432,8 @@ class TestOffloadDefaults(unittest.TestCase):
             "snapshot",
         ]
 
-        with (
-            patch.object(sys, "argv", ["sglang"] + argv),
-            patch.object(
-                PipelineConfig, "from_kwargs", return_value=LTX2PipelineConfig()
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cpu",
-                return_value=False,
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.platforms.current_platform.is_mps",
-                return_value=False,
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
-                return_value=True,
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
-                return_value=140 * 1024**3,
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.platforms.current_platform.get_available_gpu_memory",
-                return_value=134,
-            ),
-        ):
-            args, unknown_args = parser.parse_known_args(argv)
-            server_args = ServerArgs.from_cli_args(args, unknown_args)
-
-        self.assertEqual(server_args.ltx2_two_stage_device_mode, "original")
+        with self.assertRaises(SystemExit):
+            parser.parse_known_args(argv)
 
 
 class TestKVGatherDegree(unittest.TestCase):

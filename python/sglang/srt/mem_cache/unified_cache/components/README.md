@@ -329,7 +329,7 @@ Each component implements these hooks. See `tree_component.py` for the ABC and d
 
 ## Construction
 
-`UnifiedRadixCache` is constructed directly from `mem_cache/registry.py` when `SGLANG_ENABLE_UNIFIED_RADIX_TREE` is enabled. The registry sets `params.tree_components` before construction:
+`UnifiedRadixCache` is the default tree cache and is constructed directly from `mem_cache/registry.py`. The registry sets `params.tree_components` before construction:
 
 - Regular full-attention models → `(ComponentType.FULL,)`
 - Hybrid SWA models → `(ComponentType.FULL, ComponentType.SWA)`

@@ -33,7 +33,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
+from sglang.srt.models.qwen3_5 import QWEN3_5_KV_SCALE_MAPPER, Qwen3_5ForCausalLM
 from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
@@ -232,6 +232,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
+        weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),

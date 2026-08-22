@@ -413,31 +413,37 @@ class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
         self.assertEqual(mgr.failure_records, {})
 
 
-class TestDecodePrebuiltPriority(unittest.TestCase):
-    def test_waiting_queue_is_sorted_before_prebuilt_selection(self):
+class TestDecodePrebuilt(unittest.TestCase):
+    def _new_scheduler(self, *, enable_overlap: bool) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.has_waiting_grammars.return_value = False
-        original_waiting_queue = [MagicMock(rid="low"), MagicMock(rid="high")]
-        scheduler.waiting_queue = original_waiting_queue
-        scheduler.waiting_queue[0].priority = 1
-        scheduler.waiting_queue[1].priority = 10
-        scheduler.enable_priority_scheduling = True
+        scheduler.waiting_queue = []
+        scheduler.enable_priority_scheduling = False
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.batch_size.return_value = 0
         scheduler.req_to_token_pool = MagicMock(size=1)
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.tree_cache = MagicMock()
         scheduler.model_config = MagicMock()
-        scheduler.enable_overlap = False
+        scheduler.enable_overlap = enable_overlap
         scheduler.spec_algorithm = MagicMock()
         scheduler.max_running_requests = 1
-        # Passed whole into the (mocked) batch's process_prebuilt; never read.
-        scheduler.server_args = SimpleNamespace()
         scheduler.future_map = MagicMock()
         scheduler.policy = MagicMock()
-        scheduler.policy.calc_priority.side_effect = lambda waiting_queue, _: (
-            waiting_queue.sort(key=lambda req: -req.priority)
+        scheduler.schedule_stream = MagicMock()
+        scheduler.forward_stream = MagicMock()
+        return scheduler
+
+    def test_waiting_queue_is_sorted_before_prebuilt_selection(self):
+        scheduler = self._new_scheduler(enable_overlap=False)
+        original_waiting_queue = [MagicMock(rid="low"), MagicMock(rid="high")]
+        scheduler.waiting_queue = original_waiting_queue
+        scheduler.waiting_queue[0].priority = 1
+        scheduler.waiting_queue[1].priority = 10
+        scheduler.enable_priority_scheduling = True
+        scheduler.policy.calc_priority.side_effect = (
+            lambda waiting_queue, _: waiting_queue.sort(key=lambda req: -req.priority)
         )
 
         new_batch = MagicMock()
@@ -460,6 +466,36 @@ class TestDecodePrebuiltPriority(unittest.TestCase):
         selected_reqs = init_new.call_args.args[0]
         self.assertEqual([req.rid for req in selected_reqs], ["high"])
         self.assertEqual([req.rid for req in scheduler.waiting_queue], ["low"])
+
+    def test_overlap_waits_for_forward_before_processing_prebuilt(self):
+        scheduler = self._new_scheduler(enable_overlap=True)
+        scheduler.waiting_queue = [MagicMock(rid="request")]
+
+        call_order = []
+        new_batch = MagicMock()
+        new_batch.prepare_for_prebuilt.side_effect = lambda: call_order.append(
+            "prepare"
+        )
+        scheduler.schedule_stream.wait_stream.side_effect = lambda _: call_order.append(
+            "wait"
+        )
+        new_batch.process_prebuilt.side_effect = lambda *_: call_order.append("process")
+
+        with patch(
+            "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+            return_value=new_batch,
+        ), get_context().override_server_args(
+            disaggregation_decode_enable_radix_cache=False
+        ):
+            ret = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
+                scheduler, scheduler.running_batch
+            )
+
+        self.assertIs(ret, new_batch)
+        scheduler.schedule_stream.wait_stream.assert_called_once_with(
+            scheduler.forward_stream
+        )
+        self.assertEqual(call_order, ["prepare", "wait", "process"])
 
 
 if __name__ == "__main__":

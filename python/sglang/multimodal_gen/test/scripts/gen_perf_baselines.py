@@ -141,7 +141,7 @@ def _run_case(case: DiffusionTestCase) -> dict:
             if "per_frame_generation" not in perf.stage_metrics:
                 perf.stage_metrics["per_frame_generation"] = perf.e2e_ms / sp.num_frames
 
-        return {
+        baseline = {
             "stages_ms": {k: round(v, 2) for k, v in perf.stage_metrics.items()},
             "denoise_step_ms": {
                 str(k): round(v, 2) for k, v in perf.all_denoise_steps.items()
@@ -150,6 +150,14 @@ def _run_case(case: DiffusionTestCase) -> dict:
             "expected_avg_denoise_ms": round(perf.avg_denoise_ms, 2),
             "expected_median_denoise_ms": round(perf.median_denoise_ms, 2),
         }
+        if current_platform.is_cuda():
+            baseline.update(
+                {
+                    "load_peak_vram_mb": round(perf.load_peak_vram_mb, 2),
+                    "runtime_peak_vram_mb": round(perf.runtime_peak_vram_mb, 2),
+                }
+            )
+        return baseline
     finally:
         ctx.cleanup()
 

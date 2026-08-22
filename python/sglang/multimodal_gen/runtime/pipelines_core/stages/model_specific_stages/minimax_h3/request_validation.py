@@ -16,7 +16,9 @@ from typing import Any
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
     MINIMAX_H3_MAX_DURATION_SECONDS,
     MINIMAX_H3_MIN_DURATION_SECONDS,
+    MINIMAX_H3_RECOMMENDED_SHORT_EDGE,
     MINIMAX_H3_SUPPORTED_FPS,
+    warn_unverified_short_edge,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     MINIMAX_H3_CONDITION_ROLE_KEYFRAME,
@@ -83,10 +85,13 @@ def _validate_target(target: Any, *, profile: MiniMaxH3TaskProfile) -> dict[str,
     # compatibility keys are ignored; only these three declared values are
     # validated and emitted below.
     short_edge = _require_int(target.get("short_edge"), f"{path}.short_edge")
-    if short_edge != 768:
-        raise ValueError(
-            f"{path}.short_edge must be 768 for minimax_h3, got {short_edge}"
-        )
+    if short_edge <= 0:
+        raise ValueError(f"{path}.short_edge must be positive, got {short_edge}")
+    if short_edge != MINIMAX_H3_RECOMMENDED_SHORT_EDGE:
+        # Same guard the resolver applies. Without it the recommended value warns
+        # that it is "outside the verified configuration", naming itself as the
+        # verified one.
+        warn_unverified_short_edge(short_edge)
     aspect_ratio = _require_str(target.get("aspect_ratio"), f"{path}.aspect_ratio")
     if profile.aspect_ratio_forced_auto and aspect_ratio != "auto":
         raise ValueError(

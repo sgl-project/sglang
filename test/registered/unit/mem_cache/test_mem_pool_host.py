@@ -2,6 +2,7 @@
 
 import threading
 import unittest
+import unittest.mock
 
 import torch
 
@@ -9,9 +10,11 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     LogicalHostPool,
-    MambaPoolHost,
 )
+from sglang.srt.mem_cache.pool_host import base
+from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -196,6 +199,43 @@ class TestLazyHostPoolRelease(CustomTestCase):
             pool.alloc(1)
         with self.assertRaises(ValueError):
             pool.free(torch.tensor([0]))
+
+
+class TestHostMemoryBudget(CustomTestCase):
+    # Pinned so the two budget reads below see identical free memory; the real
+    # psutil value drifts between calls and would flake the equality checks.
+    _AVAILABLE = base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 64 * (1024**3)
+
+    def _budget_with_ranks(self, ranks):
+        # Deliberate single-accessor stub: isolates the budget math from the
+        # topology derivation, which the ranks_per_host case below covers.
+        fake_mem = unittest.mock.Mock(available=self._AVAILABLE)
+        with unittest.mock.patch.object(
+            base, "ranks_per_host", return_value=ranks
+        ), unittest.mock.patch.object(
+            base.psutil, "virtual_memory", return_value=fake_mem
+        ):
+            return base.host_memory_budget_bytes()
+
+    def test_budget_is_split_across_co_located_ranks(self):
+        solo = self._budget_with_ranks(1)
+        self.assertEqual(self._budget_with_ranks(4), solo // 4)
+
+    def test_reserve_is_taken_before_the_split(self):
+        # Each rank must not get its own copy of the reserve.
+        budget = self._budget_with_ranks(8)
+        self.assertLessEqual(
+            budget * 8, self._AVAILABLE - base.HICACHE_HOST_MEMORY_RESERVE_BYTES
+        )
+
+    def test_ranks_per_host_divides_world_size_by_nodes(self):
+        # The launcher slices ranks uniformly across nodes, so the co-located
+        # rank count is world_size // nnodes — no hostname collective.
+        fake_group = unittest.mock.Mock(world_size=16)
+        with get_context().override_server_args(nnodes=2), unittest.mock.patch.object(
+            torch.distributed, "is_initialized", return_value=True
+        ), unittest.mock.patch.object(base, "get_world_group", return_value=fake_group):
+            self.assertEqual(base.ranks_per_host(), 8)
 
 
 if __name__ == "__main__":

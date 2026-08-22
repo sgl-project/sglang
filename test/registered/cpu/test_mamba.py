@@ -1,6 +1,7 @@
 import sys
 
 import pytest
+import sgl_kernel  # noqa: F401
 import torch
 import torch.nn.functional as F
 from torch.nn.functional import softplus

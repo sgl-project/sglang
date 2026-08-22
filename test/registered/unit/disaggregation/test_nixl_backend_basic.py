@@ -347,6 +347,9 @@ class TestNixlAbortHandling(CustomTestCase):
         mgr._connect = MagicMock()
         mgr.failure_lock = threading.Lock()
         mgr.failure_records = {}
+        # These cases cover the legacy no-ack behavior; the deferred-release ack
+        # path is exercised in test_nixl_deferred_kv_release.py.
+        mgr.enable_deferred_decode_kv_release = False
         return mgr
 
     def test_given_known_incomplete_room_when_abort_arrives_then_room_fails_without_ack(
@@ -466,6 +469,7 @@ class TestNixlTransferWorker(CustomTestCase):
         }
         mgr.req_to_decode_prefix_len = {room: 4}
         mgr.enable_staging = False
+        mgr.enable_deferred_decode_kv_release = False
         mgr._staging_ctx = None
         mgr._staging_outstanding = defaultdict(int)
         mgr.is_mla_backend = False

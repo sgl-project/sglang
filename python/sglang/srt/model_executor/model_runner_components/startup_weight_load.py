@@ -20,6 +20,7 @@ from sglang.srt.model_loader.weight_utils import (
     CheckpointFilePrefetchHandle,
 )
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -112,8 +113,8 @@ class StartupWeightLoadOptions:
             attn_cp_size=server_args.attn_cp_size,
             dcp_size=server_args.dcp_size,
             pp_size=server_args.pp_size,
-            dp_size=server_args.dp_size,
-            ep_size=server_args.ep_size,
+            dp_size=get_parallel().dp_size,
+            ep_size=get_parallel().ep_size,
             cpu_offload_gb=server_args.cpu_offload_gb,
             offload_group_size=server_args.offload_group_size,
             enable_memory_saver=server_args.enable_memory_saver,

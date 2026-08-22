@@ -49,7 +49,7 @@ from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
 from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
-from sglang.srt.runtime_context import get_exec, publish
+from sglang.srt.runtime_context import get_exec, get_parallel, publish
 from sglang.srt.server_args import (
     DP_ATTENTION_HANDSHAKE_PORT_DELTA,
     PortArgs,
@@ -147,7 +147,7 @@ class DataParallelController:
         self.run_scheduler_process_func = run_scheduler_process_func
 
         # Init inter-process communication
-        self.context = zmq.Context(1 + server_args.dp_size)
+        self.context = zmq.Context(1 + get_parallel().dp_size)
         if server_args.node_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
@@ -167,8 +167,8 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS,
         )
 
-        self.launch_dp_size: int = server_args.dp_size
-        self.max_dp_size: int = server_args.max_ep_size or server_args.dp_size
+        self.launch_dp_size: int = get_parallel().dp_size
+        self.max_dp_size: int = server_args.max_ep_size or get_parallel().dp_size
         assert self.max_dp_size >= self.launch_dp_size, (
             f"--max-ep-size ({self.max_dp_size}) must be >= "
             f"--dp ({self.launch_dp_size})."
@@ -178,9 +178,8 @@ class DataParallelController:
             self.max_dp_size - self.launch_dp_size
         )
 
-        self.dp_budget = DPBudget(server_args.dp_size)
+        self.dp_budget = DPBudget(get_parallel().dp_size)
         self.load_snapshot_reader = create_load_snapshot_reader(
-            server_args,
             port_args,
             caller="DataParallelController",
         )
@@ -196,14 +195,14 @@ class DataParallelController:
         self._active_workers: List[int] = list(range(self.launch_dp_size))
         self._active_count_cache: int = self.launch_dp_size
 
-        if server_args.enable_dp_attention:
+        if get_parallel().enable_dp_attention:
             self.launch_dp_attention_schedulers(server_args, port_args)
             # When local control broadcast is enabled, send control messages to
             # every DP group leader (attn_tp_rank=0) so each leader broadcasts
             # within its own attn_tp_group instead of the full tp_group.
             # Otherwise fall back to the original behaviour: send to only the
             # first leader, which then broadcasts over the full tp_group.
-            local_ctrl = server_args.enable_dp_attention_local_control_broadcast
+            local_ctrl = get_parallel().enable_dp_attention_local_control_broadcast
             self.control_message_step = 1 if local_ctrl else server_args.tp_size
         else:
             self.launch_dp_schedulers(server_args, port_args)
@@ -367,7 +366,7 @@ class DataParallelController:
         threads = []
         sockets = []
         ready_events = []
-        for dp_rank in range(server_args.dp_size):
+        for dp_rank in range(get_parallel().dp_size):
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
@@ -569,7 +568,7 @@ class DataParallelController:
             bind_count = (
                 self.max_dp_size
                 if server_args.elastic_ep_backend is not None
-                else server_args.dp_size
+                else get_parallel().dp_size
             )
             for slot in range(bind_count):
                 worker_port, worker_socket = get_zmq_socket_on_host(
@@ -599,7 +598,7 @@ class DataParallelController:
         dp_rank: Optional[int],
         worker_ports: Optional[List[int]] = None,
     ):
-        if not server_args.enable_dp_attention:
+        if not get_parallel().enable_dp_attention:
             logger.info(f"Launch DP{dp_rank} starting at GPU #{base_gpu_id}.")
 
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -633,13 +632,13 @@ class DataParallelController:
             for tp_rank in tp_rank_range:
                 rank_port_args = port_args
 
-                if server_args.enable_dp_attention:
+                if get_parallel().enable_dp_attention:
                     # dp attention has different sharding logic
                     _, _, dp_rank, _ = compute_dp_attention_world_info(
-                        server_args.enable_dp_attention,
+                        get_parallel().enable_dp_attention,
                         tp_rank,
                         server_args.tp_size,
-                        server_args.dp_size,
+                        get_parallel().dp_size,
                         server_args.attn_cp_size,
                     )
                     # compute zmq ports for this dp rank
@@ -669,7 +668,7 @@ class DataParallelController:
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
                 attn_dp_size = (
-                    server_args.dp_size if server_args.enable_dp_attention else 1
+                    get_parallel().dp_size if get_parallel().enable_dp_attention else 1
                 )
 
                 # Parallelism hierarchy (outermost to innermost):
@@ -688,7 +687,7 @@ class DataParallelController:
                     // (
                         server_args.tp_size
                         // server_args.moe_dp_size
-                        // server_args.ep_size
+                        // get_parallel().ep_size
                     )
                 )
 

@@ -41,8 +41,6 @@ _DEEPEP_ENV = {
 _MEGAMOE_ENV = {
     "SGLANG_ENABLE_CP_V2": "1",
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "8320",
-    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS": "1",
-    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND": "1",
 }
 
 
@@ -126,6 +124,7 @@ class TestDSV4FlashFP4B200Balanced_CP_Megamoe(
                 "--enable-dp-attention",
                 "--moe-a2a-backend",
                 "megamoe",
+                "--enable-w4a4-mxfp4-megamoe",
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-num-steps",

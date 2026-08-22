@@ -232,22 +232,22 @@ def _resolve_warmup_num_frames(
     server_based_warmup: bool,
 ) -> int:
     num_frames = getattr(sampling_defaults, "num_frames", 1)
-    if (
-        not server_based_warmup
-        or not _is_video_warmup_task(server_args)
-        or num_frames is None
-    ):
-        # use default num frames
+    if not _is_video_warmup_task(server_args) or num_frames is None:
         return num_frames
 
     # Breakable CUDA graph replays only exact latent shapes: the warmup
     # request must run the full serving frame count so its captured graphs
     # match serving signatures (mirrors the uncapped-steps rule in
     # _resolve_warmup_steps).
-    if getattr(server_args, "enable_breakable_cuda_graph", False) is True:
-        return num_frames
+    if (
+        not server_based_warmup
+        or getattr(server_args, "enable_breakable_cuda_graph", False) is True
+    ):
+        warmup_num_frames = num_frames
+    else:
+        warmup_num_frames = min(num_frames, SERVER_WARMUP_MAX_VIDEO_FRAMES)
 
-    return min(num_frames, SERVER_WARMUP_MAX_VIDEO_FRAMES)
+    return server_args.pipeline_config.adjust_num_frames(warmup_num_frames)
 
 
 def _effective_cfg_scale(sampling_defaults: SamplingParams) -> float | None:

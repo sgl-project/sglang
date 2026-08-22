@@ -65,6 +65,9 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loa
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
+from sglang.multimodal_gen.runtime.models.encoders.base import (
+    EncoderTensorParallelMixin,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -635,7 +638,9 @@ class Mistral3Model(nn.Module):
         )
 
 
-class Mistral3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixin):
+class Mistral3ForConditionalGeneration(
+    EncoderTensorParallelMixin, nn.Module, LayerwiseOffloadableModuleMixin
+):
     _checkpoint_conversion_mapping = {
         "^language_model.model": "model.language_model",
         "^multi_modal_projector": "model.multi_modal_projector",

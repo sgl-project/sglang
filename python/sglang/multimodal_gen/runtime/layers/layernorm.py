@@ -11,12 +11,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.kernels.ops.diffusion.qknorm_rope import (
+from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
+    fuse_scale_shift_kernel,
     fused_inplace_qknorm_rope,
+    triton_one_pass_rms_norm,
 )
-from sglang.kernels.ops.diffusion.triton.rmsnorm_onepass import triton_one_pass_rms_norm
-from sglang.kernels.ops.diffusion.triton.scale_shift import fuse_scale_shift_kernel
 from sglang.kernels.ops.layernorm.norm import (
     can_use_fused_inplace_qknorm,
     fused_inplace_qknorm,
@@ -58,7 +58,7 @@ if _is_xpu:
     from sgl_kernel import fused_inplace_qknorm_rope
 
 if not _is_cpu:
-    from sglang.kernels.ops.diffusion.triton.norm import norm_infer, rms_norm_fn
+    from sglang.kernels.ops.diffusion import norm_infer, rms_norm_fn
 
 
 # Copied and adapted from sglang
@@ -614,9 +614,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
             )
             return self.forward_native(residual, x, gate, shift, scale)
 
-        from sglang.kernels.ops.diffusion.cutedsl.scale_residual_norm_scale_shift import (
-            fused_scale_residual_norm_scale_shift,
-        )
+        from sglang.kernels.ops.diffusion import fused_scale_residual_norm_scale_shift
 
         if isinstance(gate, int) and gate != 1:
             raise ValueError(
@@ -647,7 +645,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
             return self.forward_native(residual, x, gate, shift, scale)
 
         try:
-            from sglang.kernels.ops.diffusion.flydsl.fused_residual_norm import (
+            from sglang.kernels.ops.diffusion import (
                 FLYDSL_NORM_MIN_ALIGNED_DIM,
                 flydsl_fused_residual_norm_scale_shift,
             )
@@ -792,9 +790,7 @@ class _NormScaleShift(CustomOp):
             )
             return self.forward_native(x, shift, scale)
 
-        from sglang.kernels.ops.diffusion.cutedsl.scale_residual_norm_scale_shift import (
-            fused_norm_scale_shift,
-        )
+        from sglang.kernels.ops.diffusion import fused_norm_scale_shift
 
         return fused_norm_scale_shift(
             x.contiguous(),
@@ -816,7 +812,7 @@ class _NormScaleShift(CustomOp):
             return self.forward_native(x, shift, scale)
 
         try:
-            from sglang.kernels.ops.diffusion.flydsl.fused_residual_norm import (
+            from sglang.kernels.ops.diffusion import (
                 FLYDSL_NORM_MIN_ALIGNED_DIM,
                 flydsl_norm_scale_shift,
             )

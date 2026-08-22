@@ -19,7 +19,10 @@ For all methods and hardware platforms, see the [official SGLang installation gu
 ```bash Command
 pip install --upgrade pip
 pip install uv
-uv pip install sglang
+
+git clone https://github.com/sgl-project/sglang.git && cd sglang
+git checkout 1cf2b8c54d81802abc15dcf23a29b9cc687bc01e
+uv pip install --prerelease=allow -e "python[all]"
 ```
 
 Then run the **Python** output of the command panel below in that environment.
@@ -29,7 +32,7 @@ Then run the **Python** output of the command panel below in that environment.
 <Tab title="Docker">
 
 ```bash Command
-docker pull lmsysorg/sglang:qwen38-27b
+docker pull lmsysorg/sglang:dev-qwen38-27b-dflash2
 ```
 
 For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
@@ -56,6 +59,17 @@ import { Qwen38MambaRatioCalculator } from "/src/snippets/_qwen38_mamba_ratio_ca
 
 <Deployment config={config} />
 
+<Note>
+  The RTX 5090 and RTX PRO 6000 cells above — including every Speculative
+  Decoding / Serving Strategy / SSM dtype combination — were validated at
+  ISL 8192 / OSL 1024, concurrency 1; for DFLASH2, to that full standard on
+  NVFP4 and to boot-and-serve on the RTX PRO 6000 BF16/FP8 cells. The DGX Spark
+  cells cover the full combination set — DFLASH2 included — re-measured end to
+  end on `1cf2b8c`, but to a weaker standard: each of the 48 was confirmed to
+  **boot and serve** at ISL 8192 / OSL 1024, concurrency 1, with no throughput
+  or acceptance-length numbers taken.
+</Note>
+
 ### Mamba ratio calculator
 
 <Qwen38MambaRatioCalculator />
@@ -73,9 +87,18 @@ ratio = (S + D) x state_bytes / (L x kv_bytes_per_token)
 ```
 
 - `S` — state slots per running request: `extra_buffer=5` (default),
-  `extra_buffer_lazy=4`, `no_buffer=3`, disabled radix cache `=1`.
+  `extra_buffer_lazy=4`, `no_buffer=3`, disabled radix cache `=1`. For the two
+  `extra_buffer` strategies, `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1` frees one
+  slot, and `extra_buffer` frees one more with the overlap scheduler off; the
+  calculator reads both knobs.
 - `D` — verify intermediate states under speculative decoding:
-  `--speculative-num-draft-tokens` (4 at the recommended EAGLE 3/1/4), 0 otherwise.
+  `--speculative-num-draft-tokens` for EAGLE/MTP (4 at the recommended 3/1/4)
+  and for DFLASH (8, DFlash2's block size);
+  `--speculative-dspark-block-size + 1` for DSPARK, where the block size falls
+  back to the draft checkpoint's `block_size` when the flag is omitted (7 for
+  `RadixArk/Qwen3.8-27B-DSpark`, so `D = 8`); 0 with speculation off or with
+  `--enable-linear-replayssm-spec`, which keeps the verify intermediates on a
+  fixed ring instead of per-request slots.
 - `state_bytes` — one state slot, from the fixed geometry
   (48 GDN layers x 48 heads x 128 x 128 at `--mamba-ssm-dtype`, plus bf16 conv
   state): 153.9 MB at fp32, 78.4 MB at bf16.
@@ -83,10 +106,12 @@ ratio = (S + D) x state_bytes / (L x kv_bytes_per_token)
   32.8 KB at fp8, 65.5 KB at bf16.
 - `L` — average total request length in tokens: input + output.
 
-`--max-mamba-cache-size = target_concurrency x (S + D)` is the equivalent
-explicit pin and overrides the ratio; the calculator emits it alongside. After
-boot, verify with the `max_running_requests` line in the server log — it should
-not be capped below your target concurrency.
+`--max-mamba-cache-size = target_concurrency x S` is the equivalent explicit
+pin and overrides the ratio; the calculator emits it alongside. `D` is not a
+term here: the engine divides the state pool by `S` alone and sizes the
+speculative verify buffer separately, so folding `D` into the pin would
+over-provision the pool. After boot, verify with the `max_running_requests`
+line in the server log — it should not be capped below your target concurrency.
 
 </Accordion>
 
@@ -161,9 +186,26 @@ checkpoint's calibration scales automatically.
   requires a FlashInfer build whose prefill `plan` accepts `uniform_q_len`
   (newer than 0.6.15.post1); otherwise run spec with `--attention-backend triton`.
   On DGX Spark the 128GB is unified memory shared with the host CPU, so all
-  three checkpoints fit; its cells use 8192-token prefill chunks,
-  `--mem-fraction-static 0.95`, and `--disable-prefill-cuda-graph`. The SM121
-  recipe is not yet validated on that platform.
+  three checkpoints fit, and its cells reuse the RTX PRO 6000 recipe at
+  `--mem-fraction-static 0.80` rather than a separate operating point. The one
+  lower pin is the unified pool pricing the host's memory too: 0.85 of 128GB
+  leaves ~8GB for the OS — exactly DGX OS earlyoom's SIGTERM threshold — and
+  the first long prefill or boot-time graph capture dips under it and gets the
+  scheduler killed with `exit code -15` and no traceback (`journalctl -u
+  earlyoom` shows the kill). At 0.85, 15 of the 48 cells were killed that way,
+  and which cells is margin noise; at 0.80 every cell served on every attempt.
+  **Validated on SM121 / aarch64**: all 48 configurations (3 checkpoints x
+  Speculative Decoding x Serving Strategy x Mamba SSM Dtype, DFLASH2 included)
+  booted and served on GB10 at `1cf2b8c` at ISL 8192 / OSL 1024, concurrency 1.
+  That is boot-and-serve coverage only — no throughput or acceptance-length
+  numbers — and it includes the FlashInfer `plan` / `uniform_q_len` path above,
+  which raised no arity error on that build. Three host quirks when reproducing
+  on GB10: docker GPU access is CDI-only (`--device nvidia.com/gpu=all`, as no
+  `nvidia` runtime is registered); `nvidia-smi` reports `Not Supported` for
+  memory because it is unified with the CPU — gate a relaunch on `MemAvailable`
+  in `/proc/meminfo` instead; and the BF16 checkpoint takes ~6.5 minutes just
+  to load its 18 shards from NVMe, so budget ~10 minutes to READY before
+  calling a boot hung.
 - **H200 (SM90)**: BF16 and FP8 only — the card has no FP4 tensor cores, so the
   NVFP4 checkpoint's MLP would fall back to the Marlin W4A16 weight-only path
   and its cell is greyed out. The H200 recipes use 32768-token prefill chunks
@@ -178,7 +220,44 @@ checkpoint's calibration scales automatically.
 - **DSpark**: the trained draft model is a separate checkpoint — add
   `--speculative-algorithm DSPARK --speculative-draft-model-path
   RadixArk/Qwen3.8-27B-DSpark` (the Playground's Speculative Decoding card
-  emits this pair).
+  emits this pair). DSpark does **not** take
+  `--speculative-num-draft-tokens`: its verify window is
+  `--speculative-dspark-block-size` (gamma) **+ 1**, and gamma is auto-inferred
+  from the draft checkpoint when the flag is omitted (7 for this checkpoint, so
+  D = 8). That `D` is a term in the balanced ratio —
+  `r = (S + D) x token_equiv / L`, where `token_equiv` is the state slot
+  expressed in KV tokens, `state_bytes / kv_bytes_per_token` (4698 at fp32
+  state / 2394 at bf16, over fp8 KV) — so DSpark needs a materially higher
+  `--mamba-full-memory-ratio` than no-spec at the same `S`, and pinning a
+  different gamma changes the ratio with it. MTP is the opposite case: with
+  `--enable-linear-replayssm-spec` its draft intermediates move onto a fixed
+  ring, so `D = 0` and the ratio returns to the no-spec value. The
+  [calculator](#mamba-ratio-calculator) applies both rules.
+- **DFlash2**: a trained block-diffusion draft in a separate checkpoint — add
+  `--speculative-algorithm DFLASH --speculative-draft-model-path
+  incoai/Qwen3.8-27B-DFlash2 --speculative-num-draft-tokens 8` (8 is the
+  draft's block size, and it is the `D` term in the ratio, same value as
+  DSpark's). The selector projects candidates through the target `lm_head`,
+  including quantized heads, so it runs on the NVFP4 checkpoint (whose head
+  is NVFP4-packed; the BF16 and FP8 checkpoints keep a dense head).
+  Validation: NVFP4 measured end-to-end on RTX PRO 6000 and RTX 5090; the
+  RTX PRO 6000 BF16/FP8 cells boot and serve; all 12 DGX Spark DFLASH2 cells
+  boot and serve on `1cf2b8c` with the selector folded into the draft CUDA
+  graph; on H200 and GB300 those cells carry the
+  **Final Verification In Progress** badge. The
+  RTX PRO 6000 recipe needs no changes. On the 32GB RTX 5090 every pin is
+  re-measured against that commit, and the panel applies them automatically:
+  DFlash2 at `--mem-fraction-static 0.91` with `--chunked-prefill-size 1024` —
+  the only cell on this page needing a smaller prefill chunk, because at 0.91
+  the pools fit but a 2048-token chunk's activations do not — DSpark at 0.88,
+  EAGLE at 0.93 (bfloat16) and 0.94 (float32), and no-speculation at 0.90.
+  float32 is greyed out for both draft-model picks on that card: an fp32 state
+  slot costs 154 MB against bfloat16's 78 MB, so below ~0.92 the state pool
+  never reaches the tier's slot count, while at or above it prefill graph
+  capture or the first request runs out of memory. That was verified across
+  0.86–0.96 at both chunk sizes and with balanced-ratio overrides up to 20.
+  bfloat16 is also the faster choice: DFlash2 posts 4.92 ms median TPOT at an
+  accept length of 4.29, the best result on this card.
 - **Hardware fit**: FP8 weights ~28.5GB (not serviceable beyond bs≤2 on
   32GB cards); NVFP4 weights ~16.5GB (recommended for RTX 5090-class GPUs).
 - `--mamba-radix-cache-strategy extra_buffer_lazy` lowers the state cost per
@@ -187,11 +266,28 @@ checkpoint's calibration scales automatically.
   `S` (lazy strategy, or `--disable-radix-cache` for S=1); the
   [calculator](#mamba-ratio-calculator) re-derives the ratio for the new `S`.
   The balanced ratio itself is VRAM-independent.
+- `--mamba-ssm-dtype`: the GDN state slot is **153.9 MB at `float32`** (the
+  checkpoint's declared precision) and **78.4 MB at `bfloat16`**, so bf16 roughly
+  halves the state pool and hands the difference to KV — measured on an RTX 5090
+  with no speculation, 97,280 KV tokens at bf16 against 68,588 at fp32. On 32GB
+  cards it also decides whether a config fits at all: EAGLE needs
+  `--mem-fraction-static 0.94` at fp32 but 0.92 at bf16. Speed is **not** a
+  one-way trade — with speculative decoding fp32 sometimes wins (NVFP4 + EAGLE:
+  152.9 vs 144.5 tok/s/user) and sometimes loses (FP8 + EAGLE: 106.3 vs 116.1);
+  measure both for your quantization. Treat
+  `bfloat16` as an accuracy gate and validate it for your workload. On SM120
+  both precisions run the Triton linear-attn prefill path — the FlashInfer GDN
+  prefill fast path gates on SM100, where its validated domain is in fact a
+  bf16 state pool — so no dtype forces an extra flag here. One interaction to
+  know: `--enable-linear-replayssm-spec` auto-selects fp32 state when
+  `--mamba-ssm-dtype` is unset, and an explicit non-fp32 value logs a
+  state-drift warning at boot. The SSM dtype row always emits the flag
+  explicitly, so the bf16 + EAGLE cells run with that warning — accounted for
+  in their validation.
 - `--chunked-prefill-size 2048`: decode steps stall behind each prefill chunk
   on hybrid GDN models, and 8192-token chunks stall them ~600ms at a time.
   2048 keeps decode inter-token latency smooth under mixed load and also
-  improves single-wave TTFT. (DGX Spark is the exception: its cells run
-  8192-token chunks.)
+  improves single-wave TTFT.
 
 ## 3. Agent Harnesses
 

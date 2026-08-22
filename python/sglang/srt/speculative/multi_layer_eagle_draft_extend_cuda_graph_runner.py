@@ -189,10 +189,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # tokens, which lets all steps share one buffer set.
         self.num_front_tokens = eagle_worker.draft_extend_num_front_tokens
         self.captured_req_width = (
-            resolve_num_tokens_per_req(
-                phase="draft_extend", server_args=model_runner.server_args
-            )
-            + self.num_front_tokens
+            resolve_num_tokens_per_req(phase="draft_extend") + self.num_front_tokens
         )
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width

@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
+from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
 import pytest
@@ -50,6 +51,7 @@ from sglang.multimodal_gen.test.test_utils import (
     get_video_frame_count,
     is_image_url,
     prepare_perf_log,
+    validate_audio_output,
     validate_image,
     validate_image_file,
     validate_openai_video,
@@ -404,6 +406,9 @@ class ServerManager:
         ]
         if self.extra_args.strip():
             command.extend(self.extra_args.strip().split())
+        access_log_exclude_flag = "--uvicorn-access-log-exclude-prefixes"
+        if not any(arg.startswith(access_log_exclude_flag) for arg in command):
+            command.extend(["--uvicorn-access-log-exclude-prefixes", "/health"])
 
         env = os.environ.copy()
         env["SGLANG_DIFFUSION_STAGE_LOGGING"] = "1"
@@ -457,9 +462,7 @@ class ServerManager:
             flush=True,
         )
 
-        self._wait_for_ready(process, stdout_path)
-
-        return ServerContext(
+        context = ServerContext(
             port=self.port,
             process=process,
             model=self.model,
@@ -469,11 +472,18 @@ class ServerManager:
             _stdout_fh=stdout_fh,
             _log_thread=log_thread,
         )
+        try:
+            self._wait_for_ready(process, stdout_path)
+        except BaseException:
+            context.cleanup()
+            raise
+
+        return context
 
     def _wait_for_ready(self, process: subprocess.Popen, stdout_path: Path) -> None:
-        """Wait for server to become ready."""
+        """Wait until model warmup finishes and inference traffic is accepted."""
         start = time.time()
-        ready_message = "Application startup complete."
+        health_url = f"http://127.0.0.1:{self.port}/health"
         log_period = 30
         prev_log_period_count = 0
 
@@ -484,14 +494,13 @@ class ServerManager:
                     f"Server exited early (code {process.returncode}).\n{tail}"
                 )
 
-            if stdout_path.exists():
-                try:
-                    content = stdout_path.read_text(encoding="utf-8", errors="ignore")
-                    if ready_message in content:
+            try:
+                with urlopen(health_url, timeout=1) as response:
+                    if response.status == 200:
                         logger.info("[server-test] Server ready")
                         return
-                except Exception as e:
-                    logger.debug("Could not read log yet: %s", e)
+            except (HTTPError, URLError, TimeoutError, OSError):
+                pass
 
             elapsed = int(time.time() - start)
             if (elapsed // log_period) > prev_log_period_count:
@@ -536,7 +545,8 @@ class PerformanceValidator:
         actual: float,
         expected: float,
         tolerance: float,
-        min_abs_tolerance_ms: float = 20.0,
+        min_abs_tolerance: float = 20.0,
+        unit: str = "ms",
     ):
         """Assert that actual is less than or equal to expected within a tolerance.
 
@@ -552,28 +562,53 @@ class PerformanceValidator:
             # Use 100% higher tolerance for AMD (2x the expected value)
             amd_tolerance = 1.0  # 100%
             upper_bound = calculate_upper_bound(
-                expected, amd_tolerance, min_abs_tolerance_ms
+                expected, amd_tolerance, min_abs_tolerance
             )
             if actual > upper_bound:
                 logger.warning(
                     f"[AMD PERF WARNING] Validation would fail for '{name}'.\n"
-                    f"  Actual:   {actual:.4f}ms\n"
-                    f"  Expected: {expected:.4f}ms\n"
-                    f"  AMD Limit: {upper_bound:.4f}ms "
-                    f"(rel_tol: {amd_tolerance:.1%}, abs_pad: {min_abs_tolerance_ms}ms)\n"
+                    f"  Actual:   {actual:.4f}{unit}\n"
+                    f"  Expected: {expected:.4f}{unit}\n"
+                    f"  AMD Limit: {upper_bound:.4f}{unit} "
+                    f"(rel_tol: {amd_tolerance:.1%}, "
+                    f"abs_pad: {min_abs_tolerance}{unit})\n"
                     f"  Original tolerance was: {tolerance:.1%}"
                 )
         else:
-            upper_bound = calculate_upper_bound(
-                expected, tolerance, min_abs_tolerance_ms
-            )
+            upper_bound = calculate_upper_bound(expected, tolerance, min_abs_tolerance)
             assert actual <= upper_bound, (
                 f"Validation failed for '{name}'.\n"
-                f"  Actual:   {actual:.4f}ms\n"
-                f"  Expected: {expected:.4f}ms\n"
-                f"  Limit:    {upper_bound:.4f}ms "
-                f"(rel_tol: {tolerance:.1%}, abs_pad: {min_abs_tolerance_ms}ms)"
+                f"  Actual:   {actual:.4f}{unit}\n"
+                f"  Expected: {expected:.4f}{unit}\n"
+                f"  Limit:    {upper_bound:.4f}{unit} "
+                f"(rel_tol: {tolerance:.1%}, "
+                f"abs_pad: {min_abs_tolerance}{unit})"
             )
+
+    def validate_peak_vram(
+        self,
+        summary: PerformanceSummary,
+        expected_load_peak_vram_mb: float,
+        expected_runtime_peak_vram_mb: float,
+    ) -> None:
+        assert summary.load_peak_vram_mb > 0, "Load peak VRAM metric missing"
+        assert summary.runtime_peak_vram_mb > 0, "Runtime peak VRAM metric missing"
+        self._assert_le(
+            "Load Peak VRAM",
+            summary.load_peak_vram_mb,
+            expected_load_peak_vram_mb,
+            self.tolerances.load_peak_vram,
+            min_abs_tolerance=128.0,
+            unit=" MiB",
+        )
+        self._assert_le(
+            "Runtime Peak VRAM",
+            summary.runtime_peak_vram_mb,
+            expected_runtime_peak_vram_mb,
+            self.tolerances.runtime_peak_vram,
+            min_abs_tolerance=128.0,
+            unit=" MiB",
+        )
 
     def validate(
         self, perf_record: RequestPerfRecord, *args, **kwargs
@@ -637,7 +672,7 @@ class PerformanceValidator:
                     actual,
                     expected,
                     FIRST_DENOISE_STEP_TOLERANCE,
-                    min_abs_tolerance_ms=FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
+                    min_abs_tolerance=FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
                 )
                 continue
 
@@ -664,15 +699,15 @@ class PerformanceValidator:
             )
             if stage.endswith("DecodingStage"):
                 tolerance = max(tolerance, 0.9)
-                min_abs_tolerance_ms = DECODING_STAGE_MIN_ABS_TOLERANCE_MS
+                min_abs_tolerance = DECODING_STAGE_MIN_ABS_TOLERANCE_MS
             else:
-                min_abs_tolerance_ms = 120.0
+                min_abs_tolerance = 120.0
             self._assert_le(
                 f"Stage '{stage}'",
                 actual,
                 expected,
                 tolerance,
-                min_abs_tolerance_ms=min_abs_tolerance_ms,
+                min_abs_tolerance=min_abs_tolerance,
             )
 
 
@@ -693,7 +728,7 @@ class VideoPerformanceValidator(PerformanceValidator):
                     actual,
                     expected,
                     FIRST_DENOISE_STEP_TOLERANCE,
-                    min_abs_tolerance_ms=FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
+                    min_abs_tolerance=FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
                 )
                 continue
 
@@ -704,7 +739,7 @@ class VideoPerformanceValidator(PerformanceValidator):
                 actual,
                 expected,
                 self.tolerances.denoise_step,
-                min_abs_tolerance_ms=VIDEO_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
+                min_abs_tolerance=VIDEO_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
             )
 
     def validate(
@@ -1019,6 +1054,15 @@ def get_generate_fn(
         validate_video_file(
             tmp_path, expected_filename, expected_width, expected_height
         )
+        if sampling_params.expect_audio_output:
+            audio_info = validate_audio_output(tmp_path)
+            logger.info(
+                "%s: validated audio output (%s Hz, %s channels, %.3fs)",
+                case_id,
+                audio_info.sample_rate,
+                audio_info.channels,
+                audio_info.duration_seconds,
+            )
 
         if expected_frame_count is not None:
             actual_count = get_video_frame_count(tmp_path)
@@ -1387,7 +1431,7 @@ def get_generate_fn(
                 init_payload=init_payload,
                 events=list(sampling_params.realtime_events),
                 num_chunks=sampling_params.realtime_num_chunks,
-                require_chunk_stats=bool(sampling_params.realtime_perf_thresholds),
+                require_chunk_stats=True,
             )
         )
         record_realtime_perf_stats(case_id, realtime_output.chunk_stats)

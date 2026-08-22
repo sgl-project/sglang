@@ -69,6 +69,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "quantization",
                     "enable_dp_attention",
                     "enable_dp_lm_head",
+                    "enable_tp_lm_head_all_to_all",
                     "moe_a2a_backend",
                     "ep_size",
                     "moe_dense_tp_size",
@@ -970,20 +971,28 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             defaults = dict(
                 device="cuda",
                 swa_full_tokens_ratio=ServerArgs.swa_full_tokens_ratio,
+                moe_a2a_backend="none",
                 moe_runner_backend="auto",
-                get_model_config=lambda: SimpleNamespace(nvfp4_moe_meta=None),
+                get_model_config=lambda: SimpleNamespace(
+                    is_fp4_experts=True, nvfp4_moe_meta=None
+                ),
             )
             defaults.update(kw)
             return SimpleNamespace(**defaults)
 
-        self.assertEqual(
-            _deepseek_v4_overrides(_args(), hf),
-            {
-                "attention_backend": "dsv4",
-                "page_size": 256,
-                "swa_full_tokens_ratio": 0.1,
-            },
-        )
+        with (
+            envs.SGLANG_DSV4_FP4_DEQUANT.override(False),
+            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+        ):
+            self.assertEqual(
+                _deepseek_v4_overrides(_args(), hf),
+                {
+                    "attention_backend": "dsv4",
+                    "moe_runner_backend": "flashinfer_mxfp4",
+                    "page_size": 256,
+                    "swa_full_tokens_ratio": 0.1,
+                },
+            )
         # NPU pool geometry
         self.assertEqual(
             _deepseek_v4_overrides(_args(device="npu"), hf)["page_size"], 128
@@ -993,44 +1002,81 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "swa_full_tokens_ratio",
             _deepseek_v4_overrides(_args(swa_full_tokens_ratio=0.5), hf),
         )
+        # An explicit user choice takes precedence over the model default.
+        self.assertNotIn(
+            "moe_runner_backend",
+            _deepseek_v4_overrides(_args(moe_runner_backend="triton"), hf),
+        )
+        # FlashInfer MXFP4 only supports the standard (non-A2A) dispatcher.
+        with (
+            envs.SGLANG_DSV4_FP4_DEQUANT.override(False),
+            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+        ):
+            self.assertNotIn(
+                "moe_runner_backend",
+                _deepseek_v4_overrides(_args(moe_a2a_backend="deepep"), hf),
+            )
+        # Runtime FP4-to-FP8 dequantization must retain the generic FP8 runner.
+        with (
+            envs.SGLANG_DSV4_FP4_DEQUANT.override(True),
+            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+        ):
+            self.assertNotIn(
+                "moe_runner_backend",
+                _deepseek_v4_overrides(_args(), hf),
+            )
+        # FP8 checkpoints and non-CUDA platforms keep their platform-specific
+        # auto-resolution paths.
+        fp8_model_config = lambda: SimpleNamespace(
+            is_fp4_experts=False, nvfp4_moe_meta=None
+        )
+        self.assertNotIn(
+            "moe_runner_backend",
+            _deepseek_v4_overrides(_args(get_model_config=fp8_model_config), hf),
+        )
+        self.assertNotIn(
+            "moe_runner_backend",
+            _deepseek_v4_overrides(_args(device="npu"), hf),
+        )
+        with patch.object(overrides_module, "is_hip", return_value=True):
+            self.assertNotIn(
+                "moe_runner_backend",
+                _deepseek_v4_overrides(_args(), hf),
+            )
+        # Unsupported NVIDIA architectures keep the generic auto-resolution
+        # path instead of selecting a FlashInfer kernel that cannot launch.
+        with (
+            patch.object(overrides_module, "is_sm90_supported", return_value=False),
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+            patch.object(overrides_module, "is_sm120_supported", return_value=False),
+        ):
+            self.assertNotIn(
+                "moe_runner_backend",
+                _deepseek_v4_overrides(_args(), hf),
+            )
+        # SM120 uses the same model hook; no later pass is needed.
+        with (
+            envs.SGLANG_DSV4_FP4_DEQUANT.override(False),
+            patch.object(overrides_module, "is_sm90_supported", return_value=False),
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+            patch.object(overrides_module, "is_sm120_supported", return_value=True),
+        ):
+            self.assertEqual(
+                _deepseek_v4_overrides(_args(), hf)["moe_runner_backend"],
+                "flashinfer_mxfp4",
+            )
         # nvfp4 hybrid checkpoint routes the MoE runner
         self.assertEqual(
             _deepseek_v4_overrides(
                 _args(
-                    get_model_config=lambda: SimpleNamespace(nvfp4_moe_meta=object())
+                    get_model_config=lambda: SimpleNamespace(
+                        is_fp4_experts=False, nvfp4_moe_meta=object()
+                    )
                 ),
                 hf,
             )["moe_runner_backend"],
             "flashinfer_trtllm_routed",
         )
-
-    def test_deepseek_v4_sm120_moe_pass(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _deepseek_v4_sm120_moe,
-        )
-
-        def _view(arch="DeepseekV4ForCausalLM", **kw):
-            hf = SimpleNamespace(architectures=[arch])
-            defaults = dict(moe_runner_backend="auto")
-            defaults.update(kw)
-            return ResolvedView(
-                SimpleNamespace(
-                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
-                )
-            )
-
-        with patch.object(overrides_module, "is_sm120_supported", return_value=True):
-            self.assertEqual(
-                _deepseek_v4_sm120_moe(_view()),
-                {"moe_runner_backend": "flashinfer_mxfp4"},
-            )
-            self.assertEqual(
-                _deepseek_v4_sm120_moe(_view(moe_runner_backend="triton")), {}
-            )
-            self.assertEqual(_deepseek_v4_sm120_moe(_view(arch="LlamaForCausalLM")), {})
-        with patch.object(overrides_module, "is_sm120_supported", return_value=False):
-            self.assertEqual(_deepseek_v4_sm120_moe(_view()), {})
 
     def test_nemotron_h_overrides_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
@@ -1773,29 +1819,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
 
-    def test_cutlass_moe_env_override_pass(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _cutlass_moe_env_override,
-        )
-
-        with patch("sglang.srt.environ.envs.SGLANG_CUTLASS_MOE") as e:
-            e.get.return_value = True
-            self.assertEqual(
-                _cutlass_moe_env_override(
-                    ResolvedView(SimpleNamespace(quantization="fp8"))
-                ),
-                {"moe_runner_backend": "cutlass"},
-            )
-            with self.assertRaises(AssertionError):
-                _cutlass_moe_env_override(
-                    ResolvedView(SimpleNamespace(quantization=None))
-                )
-            e.get.return_value = False
-            self.assertEqual(
-                _cutlass_moe_env_override(ResolvedView(SimpleNamespace())), {}
-            )
-
     def test_gguf_quantization_pass(self):
         from sglang.srt.arg_groups.overrides import ResolvedView, _gguf_quantization
 
@@ -2146,7 +2169,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_data_parallelism_and_a2a_passes(self):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
-            _a2a_backend_overrides,
             _a2a_ep_size,
             _data_parallelism_defaults,
         )
@@ -2163,27 +2185,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ),
             {},
         )
-
-        with patch("sglang.srt.environ.envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE") as e:
-            e.get.return_value = False
-            self.assertEqual(
-                _a2a_backend_overrides(
-                    ResolvedView(
-                        SimpleNamespace(enable_waterfill=True, moe_a2a_backend="none")
-                    )
-                ),
-                {"moe_a2a_backend": "deepep"},
-            )
-            e.get.return_value = True
-            # megamoe env wins over the waterfill override (chained, last write)
-            self.assertEqual(
-                _a2a_backend_overrides(
-                    ResolvedView(
-                        SimpleNamespace(enable_waterfill=True, moe_a2a_backend="none")
-                    )
-                ),
-                {"moe_a2a_backend": "megamoe"},
-            )
 
         self.assertEqual(
             _a2a_ep_size(

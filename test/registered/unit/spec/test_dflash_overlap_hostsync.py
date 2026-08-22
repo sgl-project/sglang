@@ -256,10 +256,8 @@ class TestFilterBatchHostIndices(CustomTestCase):
 
         def make():
             info = DFlashDraftInputV2.create_idle_input(device=torch.device("cpu"))
-            info.reserved_seq_lens_cpu = torch.tensor(
-                [10, 20, 30, 40], dtype=torch.int32
-            )
-            info.reserved_seq_lens_sum = 100
+            info.nxt_kv_lens_cpu = torch.tensor([10, 20, 30, 40], dtype=torch.int32)
+            info.nxt_kv_lens_sum = 100
             info.future_indices = torch.tensor([5, 6, 7, 8])
             return info
 
@@ -270,8 +268,8 @@ class TestFilterBatchHostIndices(CustomTestCase):
             new_indices=torch.tensor(keep),
             new_indices_cpu=keep,
         )
-        torch.testing.assert_close(a.reserved_seq_lens_cpu, b.reserved_seq_lens_cpu)
-        self.assertEqual(a.reserved_seq_lens_sum, b.reserved_seq_lens_sum)
+        torch.testing.assert_close(a.nxt_kv_lens_cpu, b.nxt_kv_lens_cpu)
+        self.assertEqual(a.nxt_kv_lens_sum, b.nxt_kv_lens_sum)
         torch.testing.assert_close(a.future_indices, b.future_indices)
 
 

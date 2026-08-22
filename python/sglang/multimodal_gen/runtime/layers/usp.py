@@ -9,10 +9,7 @@ import torch.distributed._functional_collectives as ft_c
 from torch.distributed.tensor.experimental._attention import _cp_options
 
 from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
-from sglang.kernels.ops.diffusion.triton.ulysses_qkv import (
-    pack_qkv_destination_major,
-)
-from sglang.kernels.ops.diffusion.usp_relayout import usp_merge_heads
+from sglang.kernels.ops.diffusion import pack_qkv_destination_major, usp_merge_heads
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_sp_group,

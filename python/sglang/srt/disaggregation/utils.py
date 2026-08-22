@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import random
 from collections import deque
 from contextlib import nullcontext
@@ -160,16 +159,8 @@ def unified_memory_disagg_move_gate(scheduler):
 #########################
 
 
-def _get_failure_prob() -> float:
-    try:
-        return float(envs.SGLANG_TEST_DISAGG_FAILURE_PROB.get())
-    except Exception:
-        # fallback to legacy env var
-        return float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", "0"))
-
-
 def _poll_with_failure_injection(pollers) -> List[int]:
-    if (failure_prob := _get_failure_prob()) > 0:
+    if (failure_prob := envs.SGLANG_TEST_DISAGG_FAILURE_PROB.get()) > 0:
         return [
             int(KVPoll.Failed) if random.random() < failure_prob else int(poller.poll())
             for poller in pollers
@@ -202,6 +193,13 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args) -> N
                 polls[i] = int(KVPoll.Transferring)
 
 
+def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
+    """MIN-reduce poll states so no rank commits ahead of its peers."""
+    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
+    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
+    return tensor_to_reduce.tolist()
+
+
 def poll_and_all_reduce(
     pollers,
     gloo_group: dist.ProcessGroup,
@@ -219,9 +217,7 @@ def poll_and_all_reduce(
         and server_args is not None
     ):
         _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args)
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
-    return tensor_to_reduce.tolist()
+    return _all_reduce_polls(polls, gloo_group)
 
 
 def poll_and_all_reduce_attn_cp_tp_group(
@@ -235,13 +231,7 @@ def poll_and_all_reduce_attn_cp_tp_group(
 
     # Then sync across attn-cp ranks, so all TPxCP participants in one DP shard
     # converge to the same global status.
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(
-        tensor_to_reduce,
-        op=dist.ReduceOp.MIN,
-        group=attn_cp_cpu_group,
-    )
-    return tensor_to_reduce.tolist()
+    return _all_reduce_polls(polls, attn_cp_cpu_group)
 
 
 def poll_and_all_reduce_with_staging(
@@ -277,9 +267,7 @@ def poll_and_all_reduce_with_staging(
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if metadata_buffers is not None and server_args is not None:
         _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers, server_args)
-    poll_tensor = torch.tensor(raw_polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(poll_tensor, op=dist.ReduceOp.MIN, group=gloo_group)
-    return poll_tensor.tolist()
+    return _all_reduce_polls(raw_polls, gloo_group)
 
 
 #########################
@@ -630,10 +618,13 @@ def get_kv_class(
 def get_kv_class(
     transfer_backend: TransferBackend, class_type: KVClassType
 ) -> Optional[Type]:
-    from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
+    from sglang.srt.disaggregation.base import KVArgs
+
+    # Every backend shares the same KVArgs container.
+    if class_type == KVClassType.KVARGS:
+        return KVArgs
 
     if transfer_backend == TransferBackend.MOONCAKE:
-        from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.mooncake import (
             MooncakeKVBootstrapServer,
             MooncakeKVManager,
@@ -642,15 +633,12 @@ def get_kv_class(
         )
 
         class_mapping = {
-            KVClassType.KVARGS: KVArgs,
             KVClassType.MANAGER: MooncakeKVManager,
             KVClassType.SENDER: MooncakeKVSender,
-            KVClassType.RECEIVER: (MooncakeKVReceiver),
+            KVClassType.RECEIVER: MooncakeKVReceiver,
             KVClassType.BOOTSTRAP_SERVER: MooncakeKVBootstrapServer,
         }
-        return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.MORI:
-        from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.mori import (
             MoriKVBootstrapServer,
             MoriKVManager,
@@ -659,13 +647,11 @@ def get_kv_class(
         )
 
         class_mapping = {
-            KVClassType.KVARGS: KVArgs,
             KVClassType.MANAGER: MoriKVManager,
             KVClassType.SENDER: MoriKVSender,
-            KVClassType.RECEIVER: (MoriKVReceiver),
+            KVClassType.RECEIVER: MoriKVReceiver,
             KVClassType.BOOTSTRAP_SERVER: MoriKVBootstrapServer,
         }
-        return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.ASCEND:
         from sglang.srt.disaggregation.ascend import (
             AscendKVBootstrapServer,
@@ -673,18 +659,14 @@ def get_kv_class(
             AscendKVReceiver,
             AscendKVSender,
         )
-        from sglang.srt.disaggregation.base import KVArgs
 
         class_mapping = {
-            KVClassType.KVARGS: KVArgs,
             KVClassType.MANAGER: AscendKVManager,
             KVClassType.SENDER: AscendKVSender,
-            KVClassType.RECEIVER: (AscendKVReceiver),
+            KVClassType.RECEIVER: AscendKVReceiver,
             KVClassType.BOOTSTRAP_SERVER: AscendKVBootstrapServer,
         }
-        return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.NIXL:
-        from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.nixl import (
             NixlKVBootstrapServer,
             NixlKVManager,
@@ -693,30 +675,28 @@ def get_kv_class(
         )
 
         class_mapping = {
-            KVClassType.KVARGS: KVArgs,
             KVClassType.MANAGER: NixlKVManager,
             KVClassType.SENDER: NixlKVSender,
-            KVClassType.RECEIVER: (NixlKVReceiver),
+            KVClassType.RECEIVER: NixlKVReceiver,
             KVClassType.BOOTSTRAP_SERVER: NixlKVBootstrapServer,
         }
-        return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.FAKE:
-        from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.fake import (
             FakeKVManager,
             FakeKVReceiver,
             FakeKVSender,
         )
 
+        # No bootstrap server: the fake backend never registers one.
         class_mapping = {
-            KVClassType.KVARGS: KVArgs,
             KVClassType.MANAGER: FakeKVManager,
             KVClassType.SENDER: FakeKVSender,
-            KVClassType.RECEIVER: (FakeKVReceiver),
+            KVClassType.RECEIVER: FakeKVReceiver,
         }
-        return class_mapping.get(class_type)
+    else:
+        raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
 
-    raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
+    return class_mapping.get(class_type)
 
 
 def _get_cp_rank_page_bounds(
@@ -727,52 +707,6 @@ def _get_cp_rank_page_bounds(
     local_start = cp_rank * base + min(cp_rank, rem)
     n_pages = base + (1 if cp_rank < rem else 0)
     return local_start, local_start + n_pages
-
-
-def page_indices_to_cp_rank_page_indices(
-    page_indices: np.ndarray,
-    total_pages: int,
-    cp_rank: int,
-    cp_size: int,
-) -> np.ndarray:
-    """
-    Filter page_indices (which are *global* page ids in the KV pool) to those
-    belonging to the given CP rank for this request.
-
-    For a single request, its pages occupy a contiguous global range
-    [first_page, first_page + total_pages). We first compute the local
-    split [0, total_pages) across cp_size ranks, then shift that local
-    range by first_page back into the global page id space and take
-    the intersection with page_indices.
-
-    Returns:
-        Subset of page_indices that fall in this rank's global
-        [start_page, end_page) slice for the given CP rank.
-    """
-    if cp_size <= 1:
-        return page_indices
-
-    if page_indices.size == 0:
-        return np.asarray(page_indices)
-
-    first_page = int(page_indices.min())
-    base = total_pages // cp_size
-    rem = total_pages % cp_size
-
-    if rem == 0:
-        local_start = cp_rank * base
-        local_end = local_start + base
-    else:
-        local_start = cp_rank * base + min(cp_rank, rem)
-        n_pages = base + (1 if cp_rank < rem else 0)
-        local_end = local_start + n_pages
-
-    # Map back to global page ids.
-    start_page = first_page + local_start
-    end_page = first_page + local_end
-
-    mask = (page_indices >= start_page) & (page_indices < end_page)
-    return np.asarray(page_indices)[mask]
 
 
 def filter_kv_indices_for_cp_rank(
@@ -1051,8 +985,10 @@ def setup_state_kv_args(
     from sglang.srt.mem_cache.memory_pool import (
         DSATokenToKVPool,
         HybridLinearKVPool,
+        MHATokenToKVPoolMXFP8,
         MiniMaxSparseKVPool,
     )
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
     kv_args.state_types = []
     kv_args.state_data_ptrs = []
@@ -1064,17 +1000,14 @@ def setup_state_kv_args(
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
 
-    if is_npu() and isinstance(token_to_kv_pool, DSV4NPUTokenToKVPool):
-        # Pool ships each sub-pool as its own page-indexed component (fixed order
-        # so prefill and decode register identically); skips get_state_buf_infos.
-        for (
-            st,
-            comp_ptrs,
-            comp_lens,
-            comp_item_lens,
-        ) in token_to_kv_pool.get_pd_state_components():
-            append_state_component(kv_args, st, comp_ptrs, comp_lens, comp_item_lens)
-    elif isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
+    if isinstance(token_to_kv_pool, MHATokenToKVPoolMXFP8):
+        append_state_component(
+            kv_args,
+            StateType.BLOCK_SCALE,
+            *token_to_kv_pool.get_kv_scale_buf_infos(),
+        )
+
+    if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
         if token_to_kv_pool.index_kv_pool is not None:
             raise NotImplementedError(
                 "PD disaggregation for MiniMax sparse layers with index value "
@@ -1092,6 +1025,23 @@ def setup_state_kv_args(
             append_state_component(
                 kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
             )
+            # MXFP8 KV: each sub-pool's block scales ride as their own component
+            # so they inherit the index payload of the KV they describe.
+            # Only the concrete SWAKVPool owns a full sub-pool; other
+            # BaseSWAKVPool implementations describe their state per entry.
+            if isinstance(token_to_kv_pool, SWAKVPool) and isinstance(
+                token_to_kv_pool.full_kv_pool, MHATokenToKVPoolMXFP8
+            ):
+                append_state_component(
+                    kv_args,
+                    StateType.BLOCK_SCALE,
+                    *token_to_kv_pool.get_kv_scale_buf_infos(),
+                )
+                append_state_component(
+                    kv_args,
+                    StateType.BLOCK_SCALE_SWA,
+                    *token_to_kv_pool.get_swa_kv_scale_buf_infos(),
+                )
             # unified_kv: the SWA ring lives in the unified buffers (no separate
             # swa_kv_pool) and is addressed per-row, so ship it as SWA_RING.
             if getattr(token_to_kv_pool, "_unified_kv", False) and hasattr(
@@ -1175,15 +1125,25 @@ def setup_state_kv_args(
                     kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
                 )
 
+    if is_npu() and isinstance(token_to_kv_pool, DSV4NPUTokenToKVPool):
+        from sglang.srt.disaggregation.ascend.conn import AscendStateType
+
+        c128_ptrs, c128_lens, c128_item_lens = token_to_kv_pool.get_c128_kv_buf_infos()
+        if c128_ptrs:
+            append_state_component(
+                kv_args,
+                AscendStateType.DSV4_C128,
+                c128_ptrs,
+                c128_lens,
+                c128_item_lens,
+            )
+
     # DSV4 NextN shares the target allocator, so target and draft use the same
     # local SWA indices. Keep draft buffers in a separate positional component
     # to avoid mixing them into the target's heterogeneous state layout, while
-    # reusing the existing SWA transport dispatch. NPU has a different paged
-    # state layout and is intentionally left unchanged.
-    if (
-        not is_npu()
-        and isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        and isinstance(draft_token_to_kv_pool, DeepSeekV4TokenToKVPool)
+    # reusing the existing SWA transport dispatch on both GPU and NPU.
+    if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool) and isinstance(
+        draft_token_to_kv_pool, DeepSeekV4TokenToKVPool
     ):
         if not draft_token_to_kv_pool.compression_ratios or not all(
             ratio == 0 for ratio in draft_token_to_kv_pool.compression_ratios

@@ -26,6 +26,9 @@ Before running any benchmark, profiler, or kernel-validation command:
 - set `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1` when comparing stage-level
   denoise/decode timings; the preset helper sets it by default unless the
   caller explicitly overrides it
+- for downloaded checkpoints, use the preset helper's task-owned
+  `--model-cache-root` together with `--cleanup-model-cache`; verify the JSONL
+  ledger reports zero residual weight files before moving to the next model
 - choose idle GPU(s) before starting perf work
 
 ## Native Backend Gate
@@ -45,10 +48,10 @@ If any benchmark, perf-dump, or `torch.profiler` command prints one of those sig
 
 ## Main Reference
 
-- [benchmark-and-profile.md](benchmark-and-profile.md) — canonical denoise benchmark, perf dump, and `torch.profiler` workflow; uses checked-in nightly-aligned presets plus current-source extras such as MiniMax-H3 joint video/audio T2VA, FLUX.2 Klein, Cosmos3, Ideogram4, ERNIE/GLM/SANA image models, FastWan2.2, `LTX-2.3` one-stage/two-stage/HQ, HunyuanVideo, MOVA, Helios, JoyAI/FireRed image edit, and Hunyuan3D shape
+- [benchmark-and-profile.md](benchmark-and-profile.md) — canonical denoise benchmark, perf dump, and `torch.profiler` workflow; uses checked-in nightly-aligned presets plus current-source extras such as LongCat-Image, SANA-Video, LingBot Video MoE, Cosmos3 Edge/distilled, LTX-2.5 and its diffusion decoder, MiniMax-H3, FLUX.2 Klein, Ideogram4, ERNIE/GLM/SANA image models, FastWan2.2, `LTX-2.3`, HunyuanVideo, MOVA, Helios, image edit, and Hunyuan3D shape
 - [existing-fast-paths.md](existing-fast-paths.md) — map bottlenecks to existing fused kernels, packed QKV paths, fused `QK norm + RoPE`, distributed overlap patterns, and open optimization PRs before proposing new code
 - [scripts/diffusion_skill_env.py](scripts/diffusion_skill_env.py) — preflight helper: repo root discovery via `sglang.__file__`, write-access probe, benchmark/profile output directories, idle GPU selection
-- [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark preset runner via `sglang generate`; supports `--no-torch-compile`, forces the H3 preset to its eager consistency mode, enables synchronized stage attribution for perf dumps, validates nightly preset drift with `--validate-nightly-alignment`, and saves perf dumps by label for `compare_perf.py`
+- [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark preset runner via `sglang generate`; defaults to eager, supports opt-in `--torch-compile`, forces H3 to its eager consistency mode, enables synchronized stage attribution, validates nightly preset drift, and can clean an isolated model cache in a `finally` block with a JSONL ledger
 
 ## Opportunity Discovery Rule
 
@@ -59,6 +62,11 @@ Always rule out these existing families first:
 - LTX upsampler GroupNorm+SiLU
 - Z-Image bf16-native Triton RMSNorm scale/tanh-residual modulation
 - SANA packed self-attention Q/K/V and cross-attention K/V GEMMs
+- SANA-Video's packed projections and request-scoped BF16-input linear
+  attention at `quality=high`; keep the second attention GEMM in FP32 and
+  compare against `quality=lossless` before changing its precision further
+- SANA-Video reuse of SANA's bit-exact bias/activation, residual-gate, and
+  LayerNorm-modulation fast paths before adding video-only kernels
 - MiniMax-H3 indexed modulation, fused QK norm + RoPE, packed Ulysses QKV,
   USP relayout, and batched TP AdaLN collectives
 - bit-exact diffusion adaLN modulation and fused LayerNorm + modulation for
@@ -68,6 +76,8 @@ Always rule out these existing families first:
 - fused diffusion `QK norm + RoPE`
 - LTX2 split RoPE
 - LTX2 residual-gate add
+- LTX-2.5 diffusion-decoder NATTEN selection before interpreting a
+  FlexAttention fallback trace
 - varlen USP attention pack/scatter
 - NVFP4 / Nunchaku packed QKV
 - Nunchaku fused GELU MLP
@@ -77,10 +87,9 @@ Always rule out these existing families first:
 - breakable CUDA graph capture for supported fixed-resolution pipelines
 - dual-stream diffusion execution
 
-If the user explicitly requires `torch.compile` to stay off, do not use the
-default benchmark preset invocation unchanged. Either pass the checked-in
-benchmark helper its no-compile switch or run the equivalent manual command
-without `--enable-torch-compile`.
+The checked-in helper defaults to eager. Use `--torch-compile` only for a
+controlled comparator, never for the eager ground truth. The legacy
+`--no-torch-compile` spelling remains accepted but is redundant.
 
 MiniMax-H3 is always an eager consistency case on current main. Use
 `--model minimax-h3-t2va`; its preset writes the H3 request fields through a

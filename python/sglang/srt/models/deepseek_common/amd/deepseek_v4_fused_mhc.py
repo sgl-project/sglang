@@ -4,8 +4,6 @@ from typing import Optional, Tuple
 import torch
 import triton
 
-from sglang.srt.environ import envs
-
 logger = logging.getLogger(__name__)
 
 _FUSED_HC_POST_PRE_M_THRESHOLD = 64
@@ -104,7 +102,6 @@ def try_fused_hc_post_pre(
 
     if (
         _TRITON_MHC_POST_PRE_RUNTIME_DISABLED
-        or not envs.SGLANG_OPT_USE_TRITON_FUSED_MHC.get()
         or not is_gfx95_supported
         or x.shape[0] == 0
         or x.shape[0] > _FUSED_HC_POST_PRE_M_THRESHOLD

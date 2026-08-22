@@ -4,7 +4,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    SharedReadEnds,
+)
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -82,6 +85,9 @@ class HybridAttnBackend(AttentionBackend):
             )
         else:
             return self.prefill_backend
+
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        return self._select_backend(fm).shared_read_ends(fm)
 
     @property
     def supports_full_cuda_graph_chunked_prefix(self) -> bool:

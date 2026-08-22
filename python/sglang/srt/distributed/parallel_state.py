@@ -724,14 +724,8 @@ class GroupCoordinator:
             self.pymscclpp_comm is not None
             and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
         )
-        # With the MNNVL opt-in, let CustomAllReduceV2 take eligible (small)
-        # inputs ahead of the symm-mem pynccl fast path; otherwise pynccl
-        # would absorb every all-reduce whenever --enable-symm-mem is on and
-        # v2 never runs. Large inputs fail should_custom_ar and still go to
-        # the symm-mem path below.
-        _ca_takes_input = (
-            _CA_V2_MULTINODE
-            and self.ca_comm is not None
+        should_use_custom_allreduce = (
+            self.ca_comm is not None
             and not self.ca_comm.disabled
             and self.ca_comm.should_custom_ar(input_)
         )
@@ -739,7 +733,7 @@ class GroupCoordinator:
             self.pynccl_comm is not None
             and self.is_symmetric_memory_enabled()
             and not should_use_pymscclpp_allreduce
-            and not _ca_takes_input
+            and not should_use_custom_allreduce
         ):
             self.debug_check_symmetric_mempool(self, {"input": input_}, "all_reduce")
             with self.pynccl_comm.change_state(enable=True):
@@ -1085,7 +1079,8 @@ class GroupCoordinator:
         return output
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu:
+        if _is_npu or _is_cpu:
+            # TODO: add optimized reduce_scatter_tensor kernel for cpu
             self._reduce_scatter_tensor(output, input)
         elif self._maybe_aiter_reduce_scatter(output, input):
             return
@@ -1265,7 +1260,8 @@ class GroupCoordinator:
         return envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu:
+        if _is_npu or _is_cpu:
+            # TODO: add optimized all_gather_into_tensor kernel for cpu
             self._all_gather_into_tensor(output, input)
         else:
             # XPU and CUDA both go through reg_all_gather_into_tensor (custom_op) to
@@ -1928,6 +1924,7 @@ def init_model_parallel_group(
 _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
+_ATTN_CP_OVERLAP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
 
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
@@ -1963,6 +1960,55 @@ def get_attn_cp_group() -> GroupCoordinator:
         _ATTN_CP is not None
     ), "attention context model parallel group is not initialized"
     return _ATTN_CP
+
+
+def get_attn_cp_overlap_group() -> GroupCoordinator:
+    return _ATTN_CP_OVERLAP if _ATTN_CP_OVERLAP is not None else get_attn_cp_group()
+
+
+def _init_attn_cp_overlap_group(
+    *,
+    world_size: int,
+    attn_cp_size: int,
+    attn_tp_size: int,
+    backend: Optional[str],
+    recovered_rank: bool,
+    rank_offset: int,
+    max_world_size: Optional[int],
+) -> None:
+    """Second communicator over the attention CP ranks; RCCL deadlocks when one
+    communicator is driven from two streams at once."""
+    global _ATTN_CP_OVERLAP
+    assert (
+        _ATTN_CP_OVERLAP is None
+    ), "attention context parallel overlap group is already initialized"
+    if attn_cp_size <= 1:
+        return
+
+    span = attn_tp_size * attn_cp_size
+    group_ranks = [
+        list(range(base + i, base + i + span, attn_tp_size))
+        for base in range(0, world_size, span)
+        for i in range(attn_tp_size)
+    ]
+    rank = torch.distributed.get_rank()
+    mine = next(ranks for ranks in group_ranks if rank in ranks)
+    assert mine == get_attn_cp_group().ranks, (
+        f"attn_cp_overlap partition {mine} does not match attn_cp "
+        f"{get_attn_cp_group().ranks}; the two communicators must span the "
+        "same ranks or the overlapped collectives will not pair up"
+    )
+
+    _ATTN_CP_OVERLAP = init_model_parallel_group(
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        use_message_queue_broadcaster=False,
+        group_name="attn_cp_overlap",
+        recovered_rank=recovered_rank,
+        rank_offset=rank_offset,
+        max_world_size=max_world_size,
+    )
 
 
 def get_dcp_group_no_assert() -> Optional[GroupCoordinator]:
@@ -2054,9 +2100,6 @@ logger = logging.getLogger(__name__)
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP_ALL_REDUCE = False
 _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
-# Read once at import: whether CustomAllReduceV2 is opted in on a multi-node
-# (MNNVL) group. Used on the all_reduce hot path (see GroupCoordinator).
-_CA_V2_MULTINODE = envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.get()
 _ENABLE_FLASHINFER_ALLREDUCE_ONLY = False
 
 
@@ -2292,6 +2335,7 @@ def initialize_model_parallel(
     decode_context_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
+    duplicate_attn_cp_group: bool = False,
     enable_symm_mem: bool = False,
     recovered_rank: bool = False,
     rank_offset: int = 0,
@@ -2330,12 +2374,16 @@ def initialize_model_parallel(
 
     Let's say we use 2 GPUs for attention context parallelism (attn_cp_size=2) and 4 GPUs for
     attention tensor parallelism (attn_tp_size=4). As for MoE part, we use 2 GPUs for moe data
-    parallelism (moe_dp_size=2) and 4 GPUs for moe expert parallelism (moe_ep_size=4). The present
+    parallelism (moe_dp_size=2) and 4 GPUs for moe expert parallelism (moe_ep_size=4). Note that
+    this implies tensor_model_parallel_size=8 (attn_tp_size = tp_size // attn_cp_size //
+    attn_dp_size), so all 8 GPUs form a single tensor model-parallel group. The present
     function will create the following groups:
-        2 tensor model-parallel groups:
-            [g0, g1, g2, g3], [g4, g5, g6, g7]
+        1 tensor model-parallel group:
+            [g0, g1, g2, g3, g4, g5, g6, g7]
         4 attention context-parallel groups:
             [g0, g4], [g1, g5], [g2, g6], [g3, g7]
+        2 attention tensor-parallel groups:
+            [g0, g1, g2, g3], [g4, g5, g6, g7]
         2 moe expert-parallel groups:
             [g0, g1, g2, g3], [g4, g5, g6, g7]
         4 moe data-parallel groups:
@@ -2481,6 +2529,17 @@ def initialize_model_parallel(
             backend,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attn_cp",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
+
+    if duplicate_attn_cp_group and is_hip():
+        _init_attn_cp_overlap_group(
+            world_size=world_size,
+            attn_cp_size=attn_cp_size,
+            attn_tp_size=attn_tp_size,
+            backend=backend,
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
             max_world_size=max_world_size,
@@ -2887,12 +2946,16 @@ def destroy_model_parallel():
     _MOE_TP = None
 
     global _ATTN_CP
+    global _ATTN_CP_OVERLAP
     global _MOE_DP
     # Destroy _MOE_DP before _ATTN_CP since it may alias _ATTN_CP.
     # Only destroy if not aliasing another group.
     if _MOE_DP and _MOE_DP is not _ATTN_CP and _MOE_DP is not _TP:
         _MOE_DP.destroy()
     _MOE_DP = None
+    if _ATTN_CP_OVERLAP:
+        _ATTN_CP_OVERLAP.destroy()
+    _ATTN_CP_OVERLAP = None
     if _ATTN_CP:
         _ATTN_CP.destroy()
     _ATTN_CP = None

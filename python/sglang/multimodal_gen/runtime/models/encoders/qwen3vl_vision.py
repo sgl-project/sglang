@@ -10,10 +10,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
+from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_vision import (
+    PackedSequenceMetadata,
+    QwenVLVisionAttention,
+)
+from sglang.srt.models.qwen3_vl import (
+    Qwen3_VisionMLP,
+    Qwen3VLMoeVisionPatchMerger,
+    Qwen3VLVisionPatchEmbed,
+)
+from sglang.srt.runtime_context import get_parallel
 
 
 @dataclass(frozen=True)
@@ -21,57 +27,6 @@ class Qwen3VLVisionOutput:
     last_hidden_state: torch.Tensor
     pooler_output: torch.Tensor
     deepstack_features: list[torch.Tensor]
-
-
-@dataclass(frozen=True)
-class _PackedSequenceMetadata:
-    cu_seqlens: torch.Tensor
-    cu_seqlens_host: tuple[int, ...]
-    max_seqlen: int
-
-    @classmethod
-    def from_cu_seqlens(cls, cu_seqlens: torch.Tensor) -> _PackedSequenceMetadata:
-        bounds = tuple(int(value) for value in cu_seqlens.tolist())
-        return cls(
-            cu_seqlens=cu_seqlens,
-            cu_seqlens_host=bounds,
-            max_seqlen=max(
-                stop - start for start, stop in zip(bounds[:-1], bounds[1:])
-            ),
-        )
-
-
-class Qwen3VLVisionPatchEmbed(nn.Module):
-    def __init__(self, config: Any) -> None:
-        super().__init__()
-        self.patch_size = config.patch_size
-        self.temporal_patch_size = config.temporal_patch_size
-        self.in_channels = config.in_channels
-        self.embed_dim = config.hidden_size
-        kernel_size = (
-            config.temporal_patch_size,
-            config.patch_size,
-            config.patch_size,
-        )
-        self.proj = nn.Conv3d(
-            config.in_channels,
-            config.hidden_size,
-            kernel_size=kernel_size,
-            stride=kernel_size,
-            bias=True,
-        )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = hidden_states.view(
-            -1,
-            self.in_channels,
-            self.temporal_patch_size,
-            self.patch_size,
-            self.patch_size,
-        )
-        return self.proj(hidden_states.to(self.proj.weight.dtype)).view(
-            -1, self.embed_dim
-        )
 
 
 class Qwen3VLVisionRotaryEmbedding(nn.Module):
@@ -89,140 +44,32 @@ class Qwen3VLVisionRotaryEmbedding(nn.Module):
         return torch.outer(positions, self.inv_freq)
 
 
-def _rotate_half(hidden_states: torch.Tensor) -> torch.Tensor:
-    first, second = hidden_states.chunk(2, dim=-1)
-    return torch.cat((-second, first), dim=-1)
-
-
-def _apply_vision_rotary_embedding(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    query_dtype = query.dtype
-    key_dtype = key.dtype
-    query = query.float()
-    key = key.float()
-    cos = cos.unsqueeze(-2).float()
-    sin = sin.unsqueeze(-2).float()
-    query = query * cos + _rotate_half(query) * sin
-    key = key * cos + _rotate_half(key) * sin
-    return query.to(query_dtype), key.to(key_dtype)
-
-
-class Qwen3VLVisionAttention(nn.Module):
-    def __init__(self, config: Any, prefix: str) -> None:
-        super().__init__()
-        self.num_heads = config.num_heads
-        self.head_dim = config.hidden_size // config.num_heads
-        self.scaling = self.head_dim**-0.5
-        self.qkv = nn.Linear(config.hidden_size, config.hidden_size * 3, bias=True)
-        self.proj = nn.Linear(config.hidden_size, config.hidden_size)
-        backend = get_attn_backend(self.head_dim, torch.get_default_dtype())
-        self._attention_impl = None
-        if backend.supports_packed_varlen():
-            self._attention_impl = backend.get_impl_cls()(
-                num_heads=self.num_heads,
-                head_size=self.head_dim,
-                num_kv_heads=self.num_heads,
-                softmax_scale=self.scaling,
-                causal=False,
-                prefix=prefix,
-            )
-        else:
-            logger.warning_once(
-                "Qwen3-VL vision attention uses torch SDPA because "
-                f"{backend.get_enum().name.lower()} does not support packed sequences"
-            )
-
-    def _packed_attention(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        metadata: _PackedSequenceMetadata,
-    ) -> torch.Tensor:
-        if self._attention_impl is not None:
-            return self._attention_impl.forward_varlen(
-                query,
-                key,
-                value,
-                cu_seqlens=metadata.cu_seqlens,
-                cu_seqlens_host=metadata.cu_seqlens_host,
-                max_seqlen=metadata.max_seqlen,
-            )
-
-        output = torch.empty_like(query)
-        for start, stop in zip(
-            metadata.cu_seqlens_host[:-1], metadata.cu_seqlens_host[1:]
-        ):
-            if start == stop:
-                continue
-            segment = F.scaled_dot_product_attention(
-                query[start:stop].transpose(0, 1).unsqueeze(0),
-                key[start:stop].transpose(0, 1).unsqueeze(0),
-                value[start:stop].transpose(0, 1).unsqueeze(0),
-                dropout_p=0.0,
-                is_causal=False,
-                scale=self.scaling,
-            )
-            output[start:stop] = segment.squeeze(0).transpose(0, 1)
-        return output
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        *,
-        metadata: _PackedSequenceMetadata,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
-        sequence_length = hidden_states.shape[0]
-        query, key, value = (
-            self.qkv(hidden_states)
-            .reshape(sequence_length, 3, self.num_heads, self.head_dim)
-            .permute(1, 0, 2, 3)
-            .unbind(0)
-        )
-        query, key = _apply_vision_rotary_embedding(query, key, *position_embeddings)
-        output = self._packed_attention(query, key, value, metadata)
-        return self.proj(output.reshape(sequence_length, -1).contiguous())
-
-
-class Qwen3VLVisionMLP(nn.Module):
-    def __init__(self, config: Any) -> None:
-        super().__init__()
-        if config.hidden_act != "gelu_pytorch_tanh":
-            raise ValueError(
-                f"Unsupported Qwen3-VL vision activation: {config.hidden_act}"
-            )
-        self.linear_fc1 = nn.Linear(
-            config.hidden_size, config.intermediate_size, bias=True
-        )
-        self.linear_fc2 = nn.Linear(
-            config.intermediate_size, config.hidden_size, bias=True
-        )
-        self.act_fn = nn.GELU(approximate="tanh")
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_states)))
-
-
 class Qwen3VLVisionBlock(nn.Module):
     def __init__(self, config: Any, layer_idx: int) -> None:
         super().__init__()
+        parallel = get_parallel()
         self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
         self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-6)
-        self.attn = Qwen3VLVisionAttention(
-            config, prefix=f"visual.blocks.{layer_idx}.attn"
+        self.attn = QwenVLVisionAttention(
+            config,
+            prefix=f"visual.blocks.{layer_idx}.attn",
+            model_name="Qwen3-VL",
         )
-        self.mlp = Qwen3VLVisionMLP(config)
+        self.mlp = Qwen3_VisionMLP(
+            config.hidden_size,
+            config.intermediate_size,
+            bias=True,
+            hidden_act=config.hidden_act,
+            prefix=f"visual.blocks.{layer_idx}.mlp",
+            tp_rank=parallel.tp_rank,
+            tp_size=parallel.tp_size,
+        )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         *,
-        metadata: _PackedSequenceMetadata,
+        metadata: PackedSequenceMetadata,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(
@@ -231,24 +78,6 @@ class Qwen3VLVisionBlock(nn.Module):
             position_embeddings=position_embeddings,
         )
         return hidden_states + self.mlp(self.norm2(hidden_states))
-
-
-class Qwen3VLVisionPatchMerger(nn.Module):
-    def __init__(self, config: Any, *, use_postshuffle_norm: bool) -> None:
-        super().__init__()
-        self.hidden_size = config.hidden_size * config.spatial_merge_size**2
-        self.use_postshuffle_norm = use_postshuffle_norm
-        norm_size = self.hidden_size if use_postshuffle_norm else config.hidden_size
-        self.norm = nn.LayerNorm(norm_size, eps=1e-6)
-        self.linear_fc1 = nn.Linear(self.hidden_size, self.hidden_size)
-        self.act_fn = nn.GELU()
-        self.linear_fc2 = nn.Linear(self.hidden_size, config.out_hidden_size)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.use_postshuffle_norm:
-            hidden_states = hidden_states.view(-1, self.hidden_size)
-        hidden_states = self.norm(hidden_states).view(-1, self.hidden_size)
-        return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_states)))
 
 
 def _vision_position_ids(
@@ -349,11 +178,12 @@ def _vision_cu_seqlens(grid_thw: torch.Tensor) -> torch.Tensor:
 class Qwen3VLVisionTransformer(nn.Module):
     def __init__(self, config: Any) -> None:
         super().__init__()
+        parallel = get_parallel()
         self.config = config
         self.spatial_merge_size = config.spatial_merge_size
         self.spatial_merge_unit = config.spatial_merge_size**2
         self.patch_size = config.patch_size
-        self.patch_embed = Qwen3VLVisionPatchEmbed(config)
+        self.patch_embed = Qwen3VLVisionPatchEmbed(config, disable_linear=True)
         self.pos_embed = nn.Embedding(
             config.num_position_embeddings, config.hidden_size
         )
@@ -363,11 +193,29 @@ class Qwen3VLVisionTransformer(nn.Module):
         self.blocks = nn.ModuleList(
             Qwen3VLVisionBlock(config, layer_idx) for layer_idx in range(config.depth)
         )
-        self.merger = Qwen3VLVisionPatchMerger(config, use_postshuffle_norm=False)
+        self.merger = Qwen3VLMoeVisionPatchMerger(
+            dim=config.out_hidden_size,
+            context_dim=config.hidden_size,
+            padded_context_dim=config.hidden_size,
+            spatial_merge_size=config.spatial_merge_size,
+            use_postshuffle_norm=False,
+            prefix="visual.merger",
+            tp_rank=parallel.tp_rank,
+            tp_size=parallel.tp_size,
+        )
         self.deepstack_visual_indexes = tuple(config.deepstack_visual_indexes)
         self.deepstack_merger_list = nn.ModuleList(
-            Qwen3VLVisionPatchMerger(config, use_postshuffle_norm=True)
-            for _ in self.deepstack_visual_indexes
+            Qwen3VLMoeVisionPatchMerger(
+                dim=config.out_hidden_size,
+                context_dim=config.hidden_size,
+                padded_context_dim=config.hidden_size,
+                spatial_merge_size=config.spatial_merge_size,
+                use_postshuffle_norm=True,
+                prefix=f"visual.deepstack_merger_list.{merger_idx}",
+                tp_rank=parallel.tp_rank,
+                tp_size=parallel.tp_size,
+            )
+            for merger_idx, _ in enumerate(self.deepstack_visual_indexes)
         )
         self._deepstack_merger_by_layer = {
             layer_idx: merger_idx
@@ -407,7 +255,7 @@ class Qwen3VLVisionTransformer(nn.Module):
         rotary = rotary.flatten(1)
         rotary = torch.cat((rotary, rotary), dim=-1)
         position_embeddings = (rotary.cos(), rotary.sin())
-        metadata = _PackedSequenceMetadata.from_cu_seqlens(_vision_cu_seqlens(grid_thw))
+        metadata = PackedSequenceMetadata.from_cu_seqlens(_vision_cu_seqlens(grid_thw))
 
         deepstack_features = []
         for layer_idx, block in enumerate(self.blocks):

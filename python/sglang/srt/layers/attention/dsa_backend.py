@@ -333,6 +333,7 @@ class DeepseekSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
+        self.supports_mha_one_shot: bool = True
         self.dsa_prefill_impl: _DSA_IMPL_T = (
             model_runner.server_args.dsa_prefill_backend
         )
@@ -393,9 +394,7 @@ class DeepseekSparseAttnBackend(
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
-        self.use_fused_topk = should_use_dsa_fused_topk(
-            model_runner.server_args, seed_dsa_topk_from_draft_extend
-        )
+        self.use_fused_topk = should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend)
         if envs.SGLANG_DSA_FUSE_TOPK.get() and not self.use_fused_topk:
             print_warning_once(
                 "Disabling fused DSA top-k for IndexShare under PD disaggregation."
@@ -3327,7 +3326,8 @@ class DeepseekSparseAttnBackend(
 
             # Requirements: H200/B200/MI355X, short sequences, supported dtype, fits in chunk
             self.use_mha = (
-                (
+                self.supports_mha_one_shot
+                and (
                     device_sm == 90
                     or (device_sm >= 100 and device_sm < 110)
                     or _IS_GFX95

@@ -1,6 +1,7 @@
 import sys
 
 import pytest
+import sgl_kernel  # noqa: F401
 import torch
 
 from sglang.srt.utils import is_host_cpu_arm64

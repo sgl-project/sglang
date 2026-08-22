@@ -12,8 +12,6 @@ from typing import TYPE_CHECKING, Optional, Sequence
 
 import msgspec
 
-from sglang.srt.mem_cache.events import KVCacheEventMixin
-
 # Tree node id -- the node handle used outside the TreeCore. The concrete tree
 # node is a TreeCore-internal type.
 NodeId = int
@@ -95,6 +93,7 @@ if TYPE_CHECKING:
         MatchPrefixParams,
         MatchResult,
     )
+    from sglang.srt.mem_cache.events import KVCacheEventRecorder
     from sglang.srt.mem_cache.hicache_storage import PoolTransfer, PoolTransferResult
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -112,11 +111,10 @@ if TYPE_CHECKING:
     )
 
 
-class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
+class UnifiedTreeCoreInterface(ABC):
     """Methods the Controller invokes on the Tree Core. The Controller treats the
     Tree Core as opaque behind this surface, which grows as tree operations
-    migrate onto the TreeCore. Inherits KVCacheEventMixin for the KV-event API
-    (take_events, _record_* recorders)."""
+    migrate onto the TreeCore."""
 
     # ==== Tree-owned state the Controller reads (or, via its facade setters, writes) ====
     page_size: int
@@ -127,8 +125,13 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
     write_through_threshold: int
     is_write_back: bool
     has_swa_host_pool: bool
+    kv_events: KVCacheEventRecorder
 
     # ==== Tree API ====
+
+    def take_events(self) -> list:
+        """Hand the queued KV placement events to the Controller."""
+        return self.kv_events.take()
 
     @abstractmethod
     def reset(self) -> None:
@@ -168,6 +171,16 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
     @abstractmethod
     def get_hash_values(self, node_id: NodeId) -> list[str]:
         """The hash values owned by this node, excluding its ancestors."""
+        ...
+
+    @abstractmethod
+    def backfill_missing_hash_values(self) -> int:
+        """Hash every node built while storage was disabled; return how many.
+
+        Called when a storage backend is attached at runtime: nodes already in
+        the tree carry no hash, and hashing their descendants against them would
+        restart the page hash chain mid-sequence.
+        """
         ...
 
     @abstractmethod

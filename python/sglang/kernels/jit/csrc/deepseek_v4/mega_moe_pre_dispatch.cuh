@@ -9,6 +9,7 @@
 
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 
+#include <algorithm>
 #include <cstdint>
 #include <cuda_fp8.h>
 
@@ -16,6 +17,10 @@ namespace sglang {
 
 using deepseek_v4::fp8::cast_to_ue8m0;
 using deepseek_v4::fp8::pack_fp8;
+
+// CUDA block-size ceiling. One CTA per token row, so a row wider than
+// kMaxBlockThreads * 8 bf16 elements is covered in several strided chunks.
+inline constexpr uint32_t kMaxBlockThreads = 1024;
 
 struct MegaMoEPreDispatchParams {
   const bf16_t* __restrict__ x;            // [num_tokens, hidden]
@@ -35,14 +40,18 @@ struct MegaMoEPreDispatchParams {
 };
 
 // kGroupSize must match sglang_per_token_group_quant_fp8_ue8m0(group_size=).
-template <uint32_t kGroupSize, bool kUsePDL>
-__global__ __launch_bounds__(1024, 2) void  //
+// kMultiChunk covers rows too wide for one chunk per thread. It is a template
+// parameter rather than a runtime check because this kernel is issue-bound: the
+// loop bookkeeping alone costs ~10% on the rows that fit a single chunk.
+template <uint32_t kGroupSize, bool kUsePDL, bool kMultiChunk>
+__global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
     mega_moe_pre_dispatch_kernel(const MegaMoEPreDispatchParams __grid_constant__ params) {
   using namespace device;
 
   constexpr uint32_t kVecElems = 8;  // 8 bf16 = 16B load per thread
   static_assert(kGroupSize % kVecElems == 0, "group_size must be a multiple of 8");
   constexpr uint32_t kThreadsPerGroup = kGroupSize / kVecElems;
+  static_assert(kMaxBlockThreads % kThreadsPerGroup == 0, "block must stride by whole quant groups");
   using InputVec = AlignedVector<bf16x2_t, kVecElems / 2>;
   using OutputVec = AlignedVector<fp8x2_e4m3_t, kVecElems / 2>;
 
@@ -57,43 +66,58 @@ __global__ __launch_bounds__(1024, 2) void  //
     const auto token_in = params.x + static_cast<uint64_t>(token_id) * params.hidden;
     const auto token_out = params.buf_x + static_cast<uint64_t>(token_id) * params.hidden;
 
-    InputVec in_vec;
-    in_vec.load(token_in, tid);
+    const auto quantize_chunk = [&](uint32_t chunk) {
+      InputVec in_vec;
+      in_vec.load(token_in, chunk);
 
-    float local_max = 0.0f;
-    float vals[kVecElems];
+      float local_max = 0.0f;
+      float vals[kVecElems];
 #pragma unroll
-    for (uint32_t i = 0; i < kVecElems / 2; ++i) {
-      const auto [v0, v1] = cast<fp32x2_t>(in_vec[i]);
-      vals[2 * i + 0] = v0;
-      vals[2 * i + 1] = v1;
-      local_max = fmaxf(local_max, fmaxf(fabsf(v0), fabsf(v1)));
-    }
+      for (uint32_t i = 0; i < kVecElems / 2; ++i) {
+        const auto [v0, v1] = cast<fp32x2_t>(in_vec[i]);
+        vals[2 * i + 0] = v0;
+        vals[2 * i + 1] = v1;
+        local_max = fmaxf(local_max, fmaxf(fabsf(v0), fabsf(v1)));
+      }
 
-    // Absmax across the kThreadsPerGroup threads that cover one group.
-    local_max = warp::reduce_max<kThreadsPerGroup>(local_max);
+      // Absmax across the kThreadsPerGroup threads that cover one group.
+      local_max = warp::reduce_max<kThreadsPerGroup>(local_max);
 
-    const float absmax = fmaxf(local_max, 1e-10f);
-    const float raw_scale = absmax / math::FP8_E4M3_MAX;
-    const uint32_t ue8m0_exp = cast_to_ue8m0(raw_scale);
-    // 2^-ue8m0_exp as fp32 (equivalent to 1 / __uint_as_float(ue8m0 << 23)).
-    const float inv_scale = __uint_as_float((127u + 127u - ue8m0_exp) << 23);
+      const float absmax = fmaxf(local_max, 1e-10f);
+      const float raw_scale = absmax / math::FP8_E4M3_MAX;
+      const uint32_t ue8m0_exp = cast_to_ue8m0(raw_scale);
+      // 2^-ue8m0_exp as fp32 (equivalent to 1 / __uint_as_float(ue8m0 << 23)).
+      const float inv_scale = __uint_as_float((127u + 127u - ue8m0_exp) << 23);
 
-    OutputVec out_vec;
+      OutputVec out_vec;
 #pragma unroll
-    for (uint32_t i = 0; i < kVecElems / 2; ++i) {
-      out_vec[i] = pack_fp8(vals[2 * i + 0] * inv_scale, vals[2 * i + 1] * inv_scale);
-    }
-    out_vec.store(token_out, tid);
+      for (uint32_t i = 0; i < kVecElems / 2; ++i) {
+        out_vec[i] = pack_fp8(vals[2 * i + 0] * inv_scale, vals[2 * i + 1] * inv_scale);
+      }
+      out_vec.store(token_out, chunk);
 
-    // One thread per group writes its UE8M0 byte into the contiguous
-    // row-major int32-packed layout: byte address = t*num_groups + g
-    // (see layout comment at the top of the file).
-    const uint32_t group_id = tid / kThreadsPerGroup;
-    const uint32_t within_group_id = tid % kThreadsPerGroup;
-    if (within_group_id == 0 && group_id < params.num_groups) {
-      const uint32_t byte_off = token_id * params.num_groups + group_id;
-      reinterpret_cast<uint8_t*>(params.buf_x_sf)[byte_off] = static_cast<uint8_t>(ue8m0_exp);
+      // One thread per group writes its UE8M0 byte into the contiguous
+      // row-major int32-packed layout: byte address = t*num_groups + g
+      // (see layout comment at the top of the file).
+      const uint32_t group_id = chunk / kThreadsPerGroup;
+      const uint32_t within_group_id = chunk % kThreadsPerGroup;
+      if (within_group_id == 0 && group_id < params.num_groups) {
+        const uint32_t byte_off = token_id * params.num_groups + group_id;
+        reinterpret_cast<uint8_t*>(params.buf_x_sf)[byte_off] = static_cast<uint8_t>(ue8m0_exp);
+      }
+    };
+
+    if constexpr (kMultiChunk) {
+      // The reduce_max in quantize_chunk shuffles with a full-warp mask:
+      // blockDim.x is a multiple of kThreadsPerGroup and the host pins the tail
+      // iteration to whole warps, so each quant group stays on converged
+      // consecutive lanes.
+      const uint32_t num_chunks = params.hidden / kVecElems;
+      for (uint32_t chunk = tid; chunk < num_chunks; chunk += blockDim.x) {
+        quantize_chunk(chunk);
+      }
+    } else {
+      quantize_chunk(tid);
     }
 
     // Copy this token's topk row (no alignment assumptions; top_k is small).
@@ -123,7 +147,10 @@ __global__ __launch_bounds__(1024, 2) void  //
 template <int64_t kGroupSize, bool kUsePDL>
 struct MegaMoEPreDispatchKernel {
   static_assert(kGroupSize == 32 || kGroupSize == 64 || kGroupSize == 128, "unsupported group_size");
-  static constexpr auto kernel = mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL>;
+  static constexpr auto kernel_one_chunk =
+      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, false>;
+  static constexpr auto kernel_multi_chunk =
+      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, true>;
 
   static void
   run(const tvm::ffi::TensorView x,
@@ -189,12 +216,18 @@ struct MegaMoEPreDispatchKernel {
     const auto num_groups = hidden / static_cast<uint32_t>(kGroupSize);
     RuntimeCheck(num_groups == num_groups_div_4 * 4u, "num_groups must be a multiple of 4");
     RuntimeCheck(hidden % 8u == 0, "hidden must be a multiple of 8 (16B bf16 loads)");
-    const auto num_threads = hidden / 8u;
-    RuntimeCheck(num_threads <= 1024, "hidden too large for single-block-per-row quant");
-    RuntimeCheck(num_threads >= top_k, "top_k must fit into one quant CTA");
+    const auto num_chunks = hidden / 8u;
+    const auto block_size = std::min(num_chunks, kMaxBlockThreads);
+    const bool one_chunk_per_thread = num_chunks <= kMaxBlockThreads;
+    // The quant group absmax is a full-warp-mask shuffle, so either the row fits
+    // one iteration or its tail iteration is entered by whole warps.
+    RuntimeCheck(
+        one_chunk_per_thread || num_chunks % device::kWarpThreads == 0,
+        "hidden above 8192 must be a multiple of 256 so the tail quant chunks fill whole warps");
+    RuntimeCheck(block_size >= top_k, "top_k must fit into one quant CTA");
 
     const auto pad_slots = (padded_max - num_tokens) * top_k;
-    const uint32_t num_pad_blocks = pad_slots == 0 ? 0u : ((pad_slots + num_threads - 1u) / num_threads);
+    const uint32_t num_pad_blocks = pad_slots == 0 ? 0u : ((pad_slots + block_size - 1u) / block_size);
     const auto num_total_blocks = num_tokens + num_pad_blocks;
 
     const auto params = MegaMoEPreDispatchParams{
@@ -213,8 +246,13 @@ struct MegaMoEPreDispatchKernel {
     };
 
     if (num_total_blocks == 0) return;
-    LaunchKernel(num_total_blocks, num_threads, device.unwrap())  //
-        .enable_pdl(kUsePDL)(kernel, params);
+    if (one_chunk_per_thread) {
+      LaunchKernel(num_total_blocks, block_size, device.unwrap())  //
+          .enable_pdl(kUsePDL)(kernel_one_chunk, params);
+    } else {
+      LaunchKernel(num_total_blocks, block_size, device.unwrap())  //
+          .enable_pdl(kUsePDL)(kernel_multi_chunk, params);
+    }
   }
 };
 
