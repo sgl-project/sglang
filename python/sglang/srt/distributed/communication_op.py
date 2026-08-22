@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.distributed
 
+from sglang.srt.tp_invariant_ops import tree_all_reduce_sum
+from sglang.srt.true_on_policy import should_use_tp_invariant_tree_all_reduce
 from sglang.srt.utils import broadcast_pyobj
 
 from .parallel_state import (
@@ -20,6 +22,8 @@ from .parallel_state import (
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
+    if should_use_tp_invariant_tree_all_reduce():
+        return tree_all_reduce_sum(input_, device_group=get_tp_group().device_group)
     return get_tp_group().all_reduce(input_)
 
 
@@ -118,6 +122,10 @@ def attn_cp_tp_broadcast_pyobj(data: List[Any]) -> List[Any]:
 
 def attention_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across attention parallel group."""
+    if should_use_tp_invariant_tree_all_reduce():
+        return tree_all_reduce_sum(
+            input_, device_group=get_attn_tp_group().device_group
+        )
     return get_attn_tp_group().all_reduce(input_)
 
 

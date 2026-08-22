@@ -189,7 +189,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
 
-RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
+RL_ON_POLICY_TARGET_CHOICES = ["fsdp", "fsdp_tp"]
 
 LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "triton",

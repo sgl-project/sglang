@@ -939,6 +939,15 @@ class ExecDeterministic(msgspec.Struct):
     enable_deterministic_inference: A[
         bool, "Enable deterministic inference mode with batch invariant ops."
     ] = False
+    enable_prefill_only_deterministic_inference: A[
+        bool,
+        "Enable prefill-only deterministic inference mode with batch invariant ops.",
+    ] = False
+    true_on_policy_contract: A[
+        Optional[str],
+        "Internal true-on-policy parity contract selected by the launcher. "
+        "Normal users should prefer the Miles true_on_policy switch.",
+    ] = None
     rl_on_policy_target: A[
         Optional[str],
         Arg(
