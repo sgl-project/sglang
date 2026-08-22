@@ -195,7 +195,11 @@ def prepare_for_draft_extend(
         forward_batch
     )
     if not batch.forward_mode.is_idle() and not can_run_decode_cuda_graph:
-        draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+        from sglang.srt.layers.dcp import draft_forward_guard
+
+        # Must match the DCP state of the forward that consumes this metadata.
+        with draft_forward_guard(True):
+            draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer
         # cannot rebuild its deep_gemm schedule_meta on a DP-padded batch
         # (the `_batch_size == batch_size` assertion, see #27091); the

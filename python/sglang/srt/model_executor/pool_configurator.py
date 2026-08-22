@@ -83,6 +83,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _eagle_draft_layers(kvc: KVCacheConfigurator) -> int:
+    """EAGLE/STANDALONE draft layer count for KV budgeting, replicated across DCP ranks."""
+    if kvc.is_draft_worker or not (
+        kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
+    ):
+        return 0
+    draft_layers = kvc.spec_aux_config.eagle_draft_num_layers
+    if draft_layers is None or int(draft_layers) <= 0:
+        return 0
+    return int(draft_layers) * get_parallel().attn_dcp_size
+
+
 def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     """Bytes/token the DFLASH draft KV pool adds to the target's budget, 0 if none.
 
@@ -178,14 +190,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if (
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
-            eagle_draft_num_layers = kvc.spec_aux_config.eagle_draft_num_layers
-            if (
-                eagle_draft_num_layers is not None
-                and int(eagle_draft_num_layers) > 0
-                and int(num_layers) > 0
-            ):
-                draft_num_layers = int(eagle_draft_num_layers)
+            eagle_draft_layers = _eagle_draft_layers(kvc)
+            if eagle_draft_layers > 0 and int(num_layers) > 0:
                 if is_deepseek_dsa(kvc.model_config.hf_config):
+                    draft_num_layers = int(kvc.spec_aux_config.eagle_draft_num_layers)
                     target_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
                         num_layers=num_layers,
@@ -206,10 +214,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         num_layers=draft_num_layers,
                         allocate_all_layers=True,
                     )
-                    self._cell_size += draft_kv_size + draft_indexer_size
+                    # The draft pool is replicated, not sharded, across DCP ranks.
+                    self._cell_size += (
+                        draft_kv_size + draft_indexer_size
+                    ) * get_parallel().attn_dcp_size
                 else:
                     self._cell_size = int(
-                        self._cell_size * (1 + draft_num_layers / int(num_layers))
+                        self._cell_size * (1 + eagle_draft_layers / int(num_layers))
                     )
 
         # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
@@ -503,8 +514,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                             if i < draft_layers
                         ]
                     )
-                self._draft_swa_full_layers_num = banded_depths
-                self._draft_full_layers_num = draft_layers - banded_depths
+                dcp = get_parallel().attn_dcp_size
+                self._draft_swa_full_layers_num = banded_depths * dcp
+                self._draft_full_layers_num = (draft_layers - banded_depths) * dcp
 
         self._draft_cell_size = _dflash_draft_cell_size(kvc)
 

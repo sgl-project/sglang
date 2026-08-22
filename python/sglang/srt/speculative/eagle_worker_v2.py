@@ -376,9 +376,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"num_tokens_per_req={self.topk}, bs={capture_bs}, "
                 f"avail mem={before_mem:.2f} GB",
             )
-            self.cuda_graph_runner = Device2DraftCudaGraphRunner[
-                self.target_worker.device
-            ](self)
+            from sglang.srt.layers.dcp import draft_forward_guard
+
+            # Capture with DCP disabled to match draft replay.
+            with draft_forward_guard(True):
+                self.cuda_graph_runner = Device2DraftCudaGraphRunner[
+                    self.target_worker.device
+                ](self)
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             capture_time = time.perf_counter() - tic
             self._specialized_graph_memory_usage["draft_decode"] = (
@@ -527,7 +531,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else contextlib.nullcontext()
         )
 
-        with canary_outside_ctx:
+        from sglang.srt.layers.dcp import draft_forward_guard
+
+        # This draft path runs outside ModelRunner.forward, so guard it here.
+        with canary_outside_ctx, draft_forward_guard(True):
             # Run draft
             if can_run_decode_cuda_graph:
                 parent_list, top_scores_index, draft_tokens, draft_probs = (

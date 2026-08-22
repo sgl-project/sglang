@@ -1554,9 +1554,12 @@ class ModelRunner:
             else contextlib.nullcontext()
         )
 
+        from sglang.srt.layers.dcp import draft_forward_guard
+
         with (
             canary_ctx,
             step_span_ctx,
+            draft_forward_guard(self.is_draft_worker),
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,
