@@ -267,8 +267,10 @@ export const config = {
 
   dockerImages: {
     h200:    "lmsysorg/sglang:qwen38-27b",
-    rtx6000: "lmsysorg/sglang:qwen38-27b",
-    rtx5090: "lmsysorg/sglang:qwen38-27b",
+    // Both SM120 cards are validated on this image (built from 1cf2b8c, the
+    // commit every pin on those cards was measured against).
+    rtx6000: "lmsysorg/sglang:dev-qwen38-27b-dflash2",
+    rtx5090: "lmsysorg/sglang:dev-qwen38-27b-dflash2",
     // Multi-arch: this tag ships both linux/amd64 and linux/arm64, so it pulls
     // natively on DGX Spark (GB10 is aarch64).
     "dgx-spark": "lmsysorg/sglang:qwen38-27b",

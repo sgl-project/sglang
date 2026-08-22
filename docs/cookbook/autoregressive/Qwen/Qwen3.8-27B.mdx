@@ -19,14 +19,10 @@ For all methods and hardware platforms, see the [official SGLang installation gu
 ```bash Command
 pip install --upgrade pip
 pip install uv
-uv pip install sglang
 
-# For the DFLASH2 cells, and for every RTX 5090 cell — those pins were
-# measured on the commit below, and DFlash2 support is newer than the latest
-# release. Build from it instead of the line above:
-# git clone https://github.com/sgl-project/sglang.git && cd sglang
-# git checkout 1cf2b8c54d81802abc15dcf23a29b9cc687bc01e   # PR #35496
-# uv pip install -e "python[all]"
+git clone https://github.com/sgl-project/sglang.git && cd sglang
+git checkout 1cf2b8c54d81802abc15dcf23a29b9cc687bc01e
+uv pip install -e "python[all]"
 ```
 
 Then run the **Python** output of the command panel below in that environment.
@@ -36,14 +32,7 @@ Then run the **Python** output of the command panel below in that environment.
 <Tab title="Docker">
 
 ```bash Command
-docker pull lmsysorg/sglang:qwen38-27b
-
-# For the DFLASH2 cells, and for every RTX 5090 cell — that tag predates
-# DFlash2 support, and the 5090 pins were measured on the commit below.
-# Build the image from it instead:
-# git clone https://github.com/sgl-project/sglang.git && cd sglang
-# git checkout 1cf2b8c54d81802abc15dcf23a29b9cc687bc01e   # PR #35496
-# docker build -t sglang:dflash2 -f docker/Dockerfile .
+docker pull lmsysorg/sglang:dev-qwen38-27b-dflash2
 ```
 
 For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
@@ -51,29 +40,6 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 </Tab>
 
 </Tabs>
-
-<Warning>
-**DFLASH2 needs a build from `1cf2b8c` (PR
-[#35496](https://github.com/sgl-project/sglang/pull/35496)) or newer.** DFlash2
-landed in [#35371](https://github.com/sgl-project/sglang/pull/35371) and its
-quantized-`lm_head` path — what the NVFP4 cells need — in #35496, both newer
-than the pinned `lmsysorg/sglang:qwen38-27b` tag and than the latest PyPI
-release. A build without #35496 fails on the NVFP4 cells at boot with `requires
-a dense FP16/BF16/FP32 target lm_head`. The DFLASH2 pins on this page were
-measured on `1cf2b8c` exactly, which is why both install paths above check that
-commit out rather than tracking a moving branch.
-
-**The RTX 5090 recipes are pinned to that same commit**, DSpark included. A
-draft model plus the automatic prefill CUDA-graph capture no longer fit at the
-mem-fractions the older builds allowed, so DSpark on this card serves at 0.89
-(fp32) and 0.88 (bf16) rather than 0.92 / 0.90. **The DGX Spark grid was
-re-measured end to end on that same commit** — all 48 cells serve, DFLASH2
-included, with the platform's base mem-fraction moved to 0.80 (see
-Configuration Tips for why 0.85 collides with the host's earlyoom on unified
-memory). EAGLE, MTP and no-speculation keep their pins on every card, and the
-remaining platforms — H200, RTX PRO 6000, GB300 — run the pinned tag as
-written.
-</Warning>
 
 </Accordion>
 
@@ -93,17 +59,6 @@ import { Qwen38MambaRatioCalculator } from "/src/snippets/_qwen38_mamba_ratio_ca
 
 <Deployment config={config} />
 
-<Warning>
-  **Picking DFLASH2 requires SGLang built from main.** DFlash2 landed in
-  [#35371](https://github.com/sgl-project/sglang/pull/35371), and DFlash2 +
-  NVFP4 — the quantized `lm_head` path — in
-  [#35496](https://github.com/sgl-project/sglang/pull/35496). Both are newer
-  than the `lmsysorg/sglang:qwen38-27b` tag pinned in
-  [Install SGLang](#install) and than the latest PyPI release; on NVFP4 a build
-  without #35496 fails at boot with `requires a dense FP16/BF16/FP32 target
-  lm_head`. Every other Speculative Decoding pick — None, EAGLE, DSPARK — runs
-  on the pinned tag as written.
-</Warning>
 
 <Note>
   The RTX 5090 and RTX PRO 6000 cells above — including every Speculative
