@@ -349,6 +349,7 @@ class TestMistralDetectorNestedContent(CustomTestCase):
         self.assertEqual(params["decision"], "TOOL")
         self.assertEqual(params["content"], "Use weather API")
 
+
 if __name__ == "__main__":
     import unittest
 
