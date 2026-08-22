@@ -49,6 +49,14 @@ MIMO_V2_MODEL_ARCHS = (
 )
 MIMO_V2_MULTIMODAL_ARCHS = ("MiMoV2ForCausalLM",)
 
+SWA_SINK_ARCHS = frozenset(
+    {
+        "GptOssForCausalLM",
+        "GraniteSWAForCausalLM",
+        "GraniteMoeSWAForCausalLM",
+    }
+)
+
 
 def get_mimo_v2_fused_qkv_expected_tp_size(hf_config):
     layout = getattr(hf_config, "attention_projection_layout", None)
@@ -123,6 +131,10 @@ def is_deepseek_dsa(config) -> bool:
 
 def is_kimi_k3(config) -> bool:
     return _hf_arch(config) == "KimiK3ForConditionalGeneration"
+
+
+def is_dspark_draft(config) -> bool:
+    return _hf_arch(config) == "DSparkDraftModel"
 
 
 def is_qwen3_5(config) -> bool:
@@ -460,13 +472,17 @@ class ModelConfig:
         self.is_audio_model = enable_multimodal and is_audio_model(
             self.hf_config.architectures
         )
-        # TODO: requires further polishing
+        # Gated on `is_multimodal` because this flag is advertised via /model_info
+        # and drives the VLM warmup request, while the OpenAI serving layer rejects
+        # media input for models that are not `is_multimodal`. A text-only model
+        # with an auto-populated `vision_config` (see above) would otherwise warm up
+        # with an image request that its own serving layer answers with 400.
         # Key on the tower, not the attribute: several config classes default
         # vision_config to None, which presence alone would read as image-capable
         # (MuseGlimmerConfig's text-only layouts are one such case).
+        # TODO: requires further polishing
         self.is_image_understandable_model = (
-            enable_multimodal
-            and not self.is_lm_only
+            self.is_multimodal
             and getattr(self.hf_config, "vision_config", None) is not None
         )
 
@@ -805,8 +821,7 @@ class ModelConfig:
         attention.  Not every hybrid-SWA model uses them.
         """
         archs = self.hf_config.architectures or []
-        # GptOss always creates sinks unconditionally.
-        if "GptOssForCausalLM" in archs:
+        if any(a in SWA_SINK_ARCHS for a in archs):
             return True
 
         # MiMoV2 creates sinks only when the config flags are set.
@@ -2058,7 +2073,7 @@ def is_hybrid_swa_model(
         "DeepseekV4ForCausalLM",
         "DeepseekV4ForCausalLMNextN",
         "DeepseekV4ForCausalLMDSpark",
-        "GptOssForCausalLM",
+        *SWA_SINK_ARCHS,
         *MIMO_V2_MODEL_ARCHS,
         "MiMoV2MTP",
         "Step3p5ForCausalLM",
@@ -2103,7 +2118,7 @@ def get_hybrid_layer_ids(
         full_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 == 0
         ]
-    elif "GptOssForCausalLM" in model_architectures:
+    elif any(arch in SWA_SINK_ARCHS for arch in model_architectures):
         layer_types = getattr(hf_text_config, "layer_types", [])
         swa_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "sliding_attention"
