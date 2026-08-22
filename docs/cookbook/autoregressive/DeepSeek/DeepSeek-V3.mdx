@@ -404,7 +404,7 @@ The spec-v2 overlap scheduler is enabled by default. It improves performance by 
 DeepSeek V3 uses [Multi-head Latent Attention (MLA)](https://arxiv.org/pdf/2405.04434), an attention mechanism that improves inference efficiency. SGLang implements several optimizations:
 
 - **Weight Absorption:** Reorders matrix multiplications to improve decoding phase efficiency.
-- **MLA Attention Backends:** FA3, Flashinfer, FlashMLA, CutlassMLA, TRTLLM MLA (Blackwell), and Triton. FA3 is the default.
+- **MLA Attention Backends:** FA3, Flashinfer, FlashMLA, TRTLLM MLA (Blackwell), and Triton. FA3 is the default.
 - **FP8 Quantization:** W8A8 FP8 and KV Cache FP8, with BMM operators for weight-absorbed MLA in FP8.
 - **CUDA Graph & Torch.compile:** Both MLA and MoE support CUDA Graph and Torch.compile for reduced decoding latency.
 - **Chunked Prefix Cache:** Increases throughput for long-sequence chunked prefill (FlashAttention3 backend only).
