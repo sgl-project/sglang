@@ -308,7 +308,7 @@ Copy `python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion` into ComfyUI
 Pruned BF16 / FP8 files from [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/diffusion_models)
 are the usual loader inputs. GGUF goes in `SGLDOptions.transformer_weights_path`.
 On a 24 GB card put the 32B CLIP on CPU and enable DiT layerwise offload; use
-`kitchen_int8` or GGUF rather than the full unpruned BF16 DiT. 
+`kitchen_int8` or GGUF rather than the full unpruned BF16 DiT.
 
 ### Advanced: precomputed AdaLN cache
 
