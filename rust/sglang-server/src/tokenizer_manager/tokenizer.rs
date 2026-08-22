@@ -14,11 +14,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::error::Error;
-use crate::fsm::Event;
-use crate::message::{Request, RequestKind, TokenIds};
+use crate::message::request::{Request, RequestKind};
+use crate::message::types::TokenIds;
 use crate::runtime::Runnable;
-use crate::tokenizer_manager::TmEvent;
+use crate::tokenizer_manager::wiring::TmEvent;
+use crate::utils::{error::Error, fsm::Event};
 
 /// Pluggable text→token-ids backend. `Send + Sync` so one instance is shared
 /// (read-only) across all pinned workers.
@@ -230,8 +230,10 @@ impl Runnable for TokenizerWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fsm::RequestState;
-    use crate::message::{EgressSink, GenerateRequest, RequestKind, SamplingParams};
+    use crate::message::request::{GenerateRequest, RequestKind};
+    use crate::message::response::ResponseSink;
+    use crate::message::sampling::SamplingParams;
+    use crate::utils::fsm::RequestState;
     use tokio::sync::mpsc;
 
     /// One token per whitespace-separated word, so a stop's token count differs
@@ -266,7 +268,7 @@ mod tests {
             .send(Request {
                 rid: "1".into(),
                 state: RequestState::Tokenizing,
-                sink: EgressSink::Local(sink_tx),
+                sink: ResponseSink::Local(sink_tx),
                 kind: RequestKind::Generate(Box::new(GenerateRequest {
                     rid: "1".into(),
                     text: Some("hello world".into()),
@@ -326,7 +328,7 @@ mod tests {
                 .send(Request {
                     rid: "1".into(),
                     state: RequestState::Tokenizing,
-                    sink: EgressSink::Local(tokio::sync::mpsc::channel(4).0),
+                    sink: ResponseSink::Local(tokio::sync::mpsc::channel(4).0),
                     kind: RequestKind::Generate(Box::new(GenerateRequest {
                         rid: "1".into(),
                         text: Some("hi".into()),

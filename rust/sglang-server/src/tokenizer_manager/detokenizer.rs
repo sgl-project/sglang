@@ -17,22 +17,26 @@
 //! `skip_tokenizer_init` is set) the backend is `Skip`: no decoding, the raw
 //! `output_ids` are emitted instead of text.
 //!
-//! Per-chunk egress flow (no FSM state change inside Streaming):
+//! Per-chunk response flow (no FSM state change inside Streaming):
 //!   ChunkEvent{finish:None}  -> step ids -> delta -> Server frame
 //!   ChunkEvent{finish:Some}  -> step ids -> delta -> final frame
 
 use std::collections::HashMap;
 
-use crate::error::Error;
-use crate::fsm::{Event, RequestState};
-use crate::ids::Rid;
-use crate::message::DetokMsg;
-use crate::message::{ChunkEvent, EgressItem, EgressSink, Matched, SinkError, TokenIds};
-use crate::runtime::Runnable;
-use crate::tokenizer_manager::AbortSource;
+use crate::message::detok::DetokMsg;
+use crate::message::finish_reason::Matched;
+use crate::message::ids::Rid;
+use crate::message::response::{ChunkEvent, ResponseItem, ResponseSink, SinkError};
+use crate::message::types::TokenIds;
+use crate::tokenizer_manager::wiring::AbortSource;
+use crate::utils::runtime::Runnable;
+use crate::utils::{
+    error::Error,
+    fsm::{Event, RequestState},
+};
 
 /// Default for `skip_special_tokens` (SGLang's SamplingParams default). The
-/// per-request value isn't available on the egress side yet; see the note in
+/// per-request value isn't available on the response yet; see the note in
 /// `DetokenizerBackend::new_decoder`.
 const SKIP_SPECIAL_TOKENS: bool = true;
 
@@ -126,7 +130,7 @@ impl DetokenizerBackend {
 }
 
 struct DetokState {
-    sink: EgressSink,
+    sink: ResponseSink,
     /// `return_text_in_logprobs`: whether to decode this request's logprob token
     /// ids to text (in this shard) for the `[logprob, token_id, text]` tuples.
     decode_logprob_text: bool,
@@ -140,15 +144,14 @@ struct DetokState {
     /// cumulative view where a consumer needs it (every unary response and the
     /// cumulative SGLang `/generate` stream); OpenAI streaming forwards deltas.
     decoder: Option<Box<dyn StreamDecoder>>,
-    /// Egress half of the lifecycle FSM. Lives here because the ingress
-    /// `Request` (and its FSM) was handed to the scheduler when queued; the
-    /// shard is the sole owner of the request's egress state, so no lock.
+    /// Response half of the lifecycle FSM. Lives here because the `Request` (and
+    /// its FSM) was handed to the scheduler when queued; the shard is the sole
+    /// owner of the response state, so no lock.
     fsm: RequestState,
 }
 
 /// One detokenizer shard: owns a *local* `rid -> DetokState` map (single accessor,
-/// no lock) and the egress backend. Spawned (pinned) per shard as a [`Runnable`];
-/// a given rid is routed to exactly one shard.
+/// no lock) and the detokenizer backend.
 pub struct DetokenizerWorker {
     shard: usize,
     rx: flume::Receiver<DetokMsg>,
@@ -182,7 +185,7 @@ impl Runnable for DetokenizerWorker {
         // Plain `recv`: exits when the `DetokMsg` channel closes (every `Senders`
         // clone gone). On shutdown that happens once the API runtime drop cancels
         // in-flight handlers (their `AbortGuard`s release the last clones) and
-        // tm-ingress/tm-egress exit — no shutdown signal needed here.
+        // to-scheduler/from-scheduler exit — no shutdown signal needed here.
         while let Ok(msg) = self.rx.recv() {
             match msg {
                 DetokMsg::Register {
@@ -203,7 +206,7 @@ impl Runnable for DetokenizerWorker {
                         },
                     );
                 }
-                // One decode step's chunks for this shard, batched by tm-egress.
+                // One decode step's chunks for this shard, batched by from-scheduler.
                 DetokMsg::Chunks(evs) => {
                     for ev in evs {
                         handle_chunk(&mut table, ev, &self.backend, &self.abort);
@@ -224,7 +227,7 @@ impl Runnable for DetokenizerWorker {
     }
 }
 
-/// The `RequestKind::Detokenize` backend stage: tm-ingress queued this rid's
+/// The `RequestKind::Detokenize` backend stage: to-scheduler queued this rid's
 /// `Register` just before on this same channel, so the entry exists — deliver
 /// the decoded text (or the error) through the registered sink and drop it,
 /// like a one-result control request. No scheduler abort on failure: this kind
@@ -237,8 +240,8 @@ fn handle_decode(
 ) {
     if let Some(mut st) = table.remove(rid) {
         let item = match backend.decode_once(token_ids) {
-            Ok(text) => EgressItem::Data(text.into()),
-            Err(e) => EgressItem::Error(e),
+            Ok(text) => ResponseItem::Data(text.into()),
+            Err(e) => ResponseItem::Error(e),
         };
         let _ = st.sink.try_send(item);
         st.fsm = RequestState::Completed;
@@ -249,8 +252,8 @@ fn handle_decode(
 /// single `Done` frame — no detokenization, no streaming.
 fn handle_result(table: &mut HashMap<Rid, DetokState>, rid: &Rid, payload: bytes::Bytes) {
     if let Some(mut st) = table.remove(rid) {
-        let _ = st.sink.try_send(EgressItem::Control(payload));
-        // Egress FSM: a control request goes straight to Completed (no Streaming
+        let _ = st.sink.try_send(ResponseItem::Control(payload));
+        // Response FSM: a control request goes straight to Completed (no Streaming
         // / Finalizing states — single response, never streamed).
         st.fsm = RequestState::Completed;
     }
@@ -274,7 +277,7 @@ fn handle_fail(
         let _ = abort.send(AbortSource::Detok(rid.clone()));
         let _ = st
             .sink
-            .try_send(EgressItem::Error(Error::Internal(message)));
+            .try_send(ResponseItem::Error(Error::Internal(message)));
         st.fsm = RequestState::Completed;
     }
 }
@@ -328,7 +331,7 @@ fn handle_chunk(
                 // — the other two terminal paths (disconnect, fail) both abort.
                 let _ = st.fsm.apply(Event::Error(e.clone()));
                 let _ = abort.send(AbortSource::Detok(rid.clone()));
-                let _ = st.sink.try_send(EgressItem::Error(e));
+                let _ = st.sink.try_send(ResponseItem::Error(e));
                 table.remove(&rid);
                 return;
             }
@@ -365,7 +368,7 @@ fn handle_chunk(
 
     if finished {
         // The Done frame *is* the final frame: Finalizing → Completed.
-        let sent = st.sink.try_send(EgressItem::Done(ev)).is_ok();
+        let sent = st.sink.try_send(ResponseItem::Done(ev)).is_ok();
         let _ = st.fsm.apply(if sent {
             Event::FinalFrameSent
         } else {
@@ -379,7 +382,7 @@ fn handle_chunk(
         // silently dropping the frame would truncate the response and still look
         // like success at EOS. So treat both as terminal: drop the request AND
         // abort scheduler work for it.
-        if let Err(e) = st.sink.try_send(EgressItem::Frame(ev)) {
+        if let Err(e) = st.sink.try_send(ResponseItem::Frame(ev)) {
             match e {
                 SinkError::Full => {
                     tracing::warn!(
@@ -441,15 +444,15 @@ mod tests {
     #[test]
     fn full_sink_drops_request_and_aborts_scheduler() {
         // Capacity-1 sink, pre-filled so the next send hits `Full`.
-        let (tx, _rx) = mpsc::channel::<EgressItem>(1);
-        tx.try_send(EgressItem::Frame(ChunkEvent::default()))
+        let (tx, _rx) = mpsc::channel::<ResponseItem>(1);
+        tx.try_send(ResponseItem::Frame(ChunkEvent::default()))
             .unwrap();
 
         let mut table = HashMap::new();
         table.insert(
             Rid::from("1"),
             DetokState {
-                sink: EgressSink::Local(tx),
+                sink: ResponseSink::Local(tx),
                 decode_logprob_text: false,
                 no_stop_trim: false,
                 decoder: None,
@@ -510,19 +513,15 @@ mod tests {
     }
 
     /// A `Decode` job answers through the REGISTERED sink and consumes the
-    /// entry — the `RequestKind::Detokenize` egress contract. Uses the `Skip`
-    /// backend, whose decode error must arrive as an `Error` item (not vanish):
-    /// dropping it leaves the submitter awaiting a reply forever. (Unlike
-    /// `handle_fail` there is deliberately no abort lane in the signature —
-    /// this kind never reached the ring, so there is no scheduler work to stop.)
+    /// entry.
     #[test]
     fn decode_answers_via_registered_sink_and_consumes_the_entry() {
-        let (tx, mut rx) = mpsc::channel::<EgressItem>(4);
+        let (tx, mut rx) = mpsc::channel::<ResponseItem>(4);
         let mut table = HashMap::new();
         table.insert(
             Rid::from("d1"),
             DetokState {
-                sink: EgressSink::Local(tx),
+                sink: ResponseSink::Local(tx),
                 decode_logprob_text: false,
                 no_stop_trim: false,
                 decoder: None,
@@ -537,7 +536,7 @@ mod tests {
             &DetokenizerBackend::Skip,
         );
 
-        let Ok(EgressItem::Error(err)) = rx.try_recv() else {
+        let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
             panic!("the decode error must reach the sink, not vanish");
         };
         assert!(matches!(err, Error::Validation(_)));
@@ -562,11 +561,11 @@ mod tests {
     /// deterministically, without needing to find a real 64-bit collision.
     #[test]
     fn co_located_requests_keep_their_own_sinks() {
-        let (tx_a, mut rx_a) = mpsc::channel::<EgressItem>(4);
-        let (tx_b, mut rx_b) = mpsc::channel::<EgressItem>(4);
+        let (tx_a, mut rx_a) = mpsc::channel::<ResponseItem>(4);
+        let (tx_b, mut rx_b) = mpsc::channel::<ResponseItem>(4);
         let mut table = HashMap::new();
         let state = |tx| DetokState {
-            sink: EgressSink::Local(tx),
+            sink: ResponseSink::Local(tx),
             decode_logprob_text: false,
             no_stop_trim: false,
             decoder: None,
@@ -594,8 +593,8 @@ mod tests {
             &tm_tx,
         );
 
-        let ids = |rx: &mut mpsc::Receiver<EgressItem>| match rx.try_recv() {
-            Ok(EgressItem::Frame(ev)) => ev.token_ids,
+        let ids = |rx: &mut mpsc::Receiver<ResponseItem>| match rx.try_recv() {
+            Ok(ResponseItem::Frame(ev)) => ev.token_ids,
             other => panic!("expected a frame, got {other:?}"),
         };
         assert_eq!(
@@ -618,12 +617,12 @@ mod tests {
         finish_reason: serde_json::Value,
         ids: Vec<i32>,
     ) -> ChunkEvent {
-        let (tx, mut rx) = mpsc::channel::<EgressItem>(4);
+        let (tx, mut rx) = mpsc::channel::<ResponseItem>(4);
         let mut table = HashMap::new();
         table.insert(
             Rid::from("1"),
             DetokState {
-                sink: EgressSink::Local(tx),
+                sink: ResponseSink::Local(tx),
                 decode_logprob_text: false,
                 no_stop_trim,
                 decoder: None, // skip mode → output_ids passthrough
@@ -643,7 +642,7 @@ mod tests {
         };
         handle_chunk(&mut table, ev, &DetokenizerBackend::Skip, &tm_tx);
         match rx.try_recv() {
-            Ok(EgressItem::Done(out)) => out,
+            Ok(ResponseItem::Done(out)) => out,
             other => panic!("expected Done, got {other:?}"),
         }
     }
