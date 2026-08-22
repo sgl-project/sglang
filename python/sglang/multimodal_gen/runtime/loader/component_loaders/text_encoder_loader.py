@@ -7,7 +7,9 @@ from itertools import chain
 from typing import cast
 
 import torch
+import transformers
 from torch import nn
+from transformers import PretrainedConfig
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig
@@ -29,6 +31,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     ComponentCheckpointUnsupportedError,
     ComponentLoader,
     NativeComponentLoaderRequired,
+    uses_native_transformers_bnb4,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     set_default_torch_dtype,
@@ -59,23 +62,22 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     load_dict,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.precision import precision_to_dtype
 from sglang.multimodal_gen.runtime.utils.quantization_utils import get_quant_config
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.environ import envs
-from sglang.srt.model_loader.checkpoint_quantization import (
-    resolve_checkpoint_quant_spec,
-)
 
 logger = init_logger(__name__)
 
-_TRANSFORMERS_ENCODER_ONLY_ARCHITECTURES = {
-    "T5Model": "T5EncoderModel",
-    "T5ForConditionalGeneration": "T5EncoderModel",
-    "UMT5Model": "UMT5EncoderModel",
-    "UMT5ForConditionalGeneration": "UMT5EncoderModel",
-    "MT5Model": "MT5EncoderModel",
-    "MT5ForConditionalGeneration": "MT5EncoderModel",
+_TRANSFORMERS_ENCODER_ONLY_CLASSES = {
+    "T5EncoderModel": transformers.T5EncoderModel,
+    "T5Model": transformers.T5EncoderModel,
+    "T5ForConditionalGeneration": transformers.T5EncoderModel,
+    "UMT5EncoderModel": transformers.UMT5EncoderModel,
+    "UMT5Model": transformers.UMT5EncoderModel,
+    "UMT5ForConditionalGeneration": transformers.UMT5EncoderModel,
+    "MT5EncoderModel": transformers.MT5EncoderModel,
+    "MT5Model": transformers.MT5EncoderModel,
+    "MT5ForConditionalGeneration": transformers.MT5EncoderModel,
 }
 
 
@@ -84,36 +86,11 @@ def _delegate_standard_bnb4_to_transformers(
     component_name: str,
 ) -> None:
     """Use Transformers when it owns a standard serialized BnB4 checkpoint."""
-    try:
-        quant_spec = resolve_checkpoint_quant_spec(component_config)
-    except (TypeError, ValueError) as error:
-        raise ComponentCheckpointUnsupportedError(
-            f"Cannot parse checkpoint quantization for {component_name!r}: {error}"
-        ) from error
-    if quant_spec is None or quant_spec.declared_method != "bitsandbytes":
-        return
-    if quant_spec.source != "quantization_config":
-        raise ComponentCheckpointUnsupportedError(
-            f"Transformers-managed {component_name!r} quantization requires "
-            "a top-level quantization_config; "
-            f"got metadata from {quant_spec.source!r}"
+    if uses_native_transformers_bnb4(component_config, component_name):
+        raise NativeComponentLoaderRequired(
+            f"{component_name!r} delegates serialized bitsandbytes checkpoint "
+            "loading to Transformers"
         )
-
-    load_in_4bit = quant_spec.config.get(
-        "load_in_4bit", quant_spec.config.get("_load_in_4bit")
-    )
-    load_in_8bit = quant_spec.config.get(
-        "load_in_8bit", quant_spec.config.get("_load_in_8bit", False)
-    )
-    if load_in_4bit is not True or load_in_8bit is True:
-        raise ComponentCheckpointUnsupportedError(
-            f"Transformers-managed {component_name!r} quantization supports only "
-            "serialized BitsAndBytes 4-bit checkpoints"
-        )
-    raise NativeComponentLoaderRequired(
-        f"{component_name!r} delegates serialized bitsandbytes checkpoint "
-        "loading to Transformers"
-    )
 
 
 def _configure_encoder_quantization(
@@ -317,55 +294,7 @@ class TextEncoderLoader(ComponentLoader):
         allow_patterns_overrides: list[str] | None = None
         """If defined, weights will load exclusively using these patterns."""
 
-    def load_native(
-        self,
-        component_model_path: str,
-        server_args: ServerArgs,
-        transformers_or_diffusers: str,
-        component_name: str | None = None,
-    ):
-        if transformers_or_diffusers != "transformers":
-            return super().load_native(
-                component_model_path,
-                server_args,
-                transformers_or_diffusers,
-                component_name,
-            )
-
-        encoder_idx = (
-            self._extract_encoder_index(component_name or "text_encoder_2")
-            if component_name
-            else 1 if component_model_path.rstrip("/").endswith("text_encoder_2") else 0
-        )
-        encoder_dtype = server_args.pipeline_config.text_encoder_precisions[encoder_idx]
-        dtype = precision_to_dtype(
-            encoder_dtype,
-            f"text_encoder_precisions[{encoder_idx}]",
-        )
-        resolved_component_name = component_name or (
-            "text_encoder" if encoder_idx == 0 else f"text_encoder_{encoder_idx + 1}"
-        )
-        transformers_model_class = self._resolve_transformers_text_encoder_class(
-            component_model_path, server_args
-        )
-        component_config = get_diffusers_component_config(
-            component_path=component_model_path
-        )
-        quant_spec = resolve_checkpoint_quant_spec(component_config)
-        if quant_spec is not None and quant_spec.declared_method == "bitsandbytes":
-            server_args.require_component_resident(
-                resolved_component_name,
-                feature_name="Transformers bitsandbytes text encoder",
-            )
-        return transformers_model_class.from_pretrained(
-            component_model_path,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-            torch_dtype=dtype,
-        )
-
-    @staticmethod
-    def _resolve_transformers_text_encoder_class(component_model_path, server_args):
+    def resolve_native_transformers_model_class(self, config: PretrainedConfig) -> type:
         """Resolve the concrete transformers class for a text encoder.
 
         AutoModel maps encoder-decoder model types (e.g. T5/UMT5) to full
@@ -375,24 +304,12 @@ class TextEncoderLoader(ComponentLoader):
         full seq2seq architecture to its encoder-only counterpart. Encoders that
         are not encoder-decoder keep using AutoModel unchanged.
         """
-        import transformers
-        from transformers import AutoConfig, AutoModel
-
-        try:
-            config = AutoConfig.from_pretrained(
-                component_model_path,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
-            )
-        except Exception:
-            return AutoModel
-        if getattr(config, "is_encoder_decoder", False):
-            for arch in getattr(config, "architectures", None) or []:
-                encoder_arch = _TRANSFORMERS_ENCODER_ONLY_ARCHITECTURES.get(arch, arch)
-                transformers_model_class = getattr(transformers, encoder_arch, None)
-                if isinstance(transformers_model_class, type):
+        if config.is_encoder_decoder:
+            for arch in config.architectures or []:
+                transformers_model_class = _TRANSFORMERS_ENCODER_ONLY_CLASSES.get(arch)
+                if transformers_model_class is not None:
                     return transformers_model_class
-        return AutoModel
+        return transformers.AutoModel
 
     def _prepare_weights(
         self,
