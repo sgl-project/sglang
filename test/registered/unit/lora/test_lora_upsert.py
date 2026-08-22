@@ -358,6 +358,7 @@ def _make_tokenizer_manager(tokenizer_worker_num: int = 1) -> TokenizerManager:
     tm.server_args = MagicMock()
     tm.server_args.enable_lora = True
     tm.server_args.dp_size = 1
+    tm.server_args.enable_dp_attention = False
     tm.server_args.max_loaded_loras = None
     tm.server_args.tokenizer_worker_num = tokenizer_worker_num
     tm.auto_create_handle_loop = Mock()
@@ -394,6 +395,33 @@ def _make_tensors_req(
 
 
 class TestLoadFromDistributedUpsert(CustomTestCase):
+    def test_dp_attention_fanout_is_allowed(self):
+        tm = _make_tokenizer_manager()
+        tm.server_args.dp_size = 8
+        tm.server_args.enable_dp_attention = True
+        tm.update_lora_adapter_communicator = AsyncMock(
+            return_value=[MagicMock(success=True) for _ in range(8)]
+        )
+
+        obj = _make_distributed_req(upsert=True)
+        result = asyncio.run(tm.load_lora_adapter_from_distributed(obj))
+
+        self.assertTrue(result.success)
+        tm.update_lora_adapter_communicator.assert_awaited_once_with(obj)
+
+    def test_plain_data_parallelism_is_rejected(self):
+        tm = _make_tokenizer_manager()
+        tm.server_args.dp_size = 8
+
+        with self.assertRaisesRegex(AssertionError, "dp attention must be enabled"):
+            asyncio.run(
+                tm.load_lora_adapter_from_distributed(
+                    _make_distributed_req(upsert=True)
+                )
+            )
+
+        tm.update_lora_adapter_communicator.assert_not_awaited()
+
     def test_upsert_reuses_existing_lora_id(self):
         tm = _make_tokenizer_manager()
         existing = LoRARef(lora_name="a", lora_path="__distributed__")
