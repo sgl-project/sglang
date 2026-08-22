@@ -36,6 +36,7 @@ from sglang.kernels.ops.kvcache.cache_move import store_cache_4d_kernel
 from sglang.kernels.ops.kvcache.zero_pages import zero_pages
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.allocator.mamba import MAMBA_STATE_INDEX_INVARIANT
 from sglang.srt.mem_cache.layout.page_major import (
     build_dense_mla_views,
     build_page_major_mamba_views,
@@ -866,6 +867,7 @@ class UnifiedMambaSlotAllocator:
         self._max_size = max_size  # excludes reserved slot 0
         self._device = device
         self._alloc_iter = None  # active alloc_group batch iterator
+        self.state_index_invariant = MAMBA_STATE_INDEX_INVARIANT
 
     # -- translation (owns the v<->p mapping) --
 

@@ -94,6 +94,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = model_runner.tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
+        self._in_actual_capture_pass = False
         self._compile_config: CompilationConfig = self.build_compilation_config(
             model_runner.server_args
         )
@@ -105,6 +106,9 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         # model_runner.model.forward is the wrapper that builds LogitsProcessorOutput.
         # The compiled trampoline is dispatched internally by it.
         self._compiled_fn: Callable = model_runner.model.forward
+
+    def is_actual_capture_pass(self) -> bool:
+        return self._in_actual_capture_pass
 
     @staticmethod
     def build_compilation_config(server_args: ServerArgs) -> CompilationConfig:
@@ -234,12 +238,16 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
     ) -> None:
         # Call 1 warms FX state; call 2 captures the cuda graph inside capture_session.
         # See cuda_piecewise_backend.py for the FX backend that drives the capture.
-        for _ in range(2):
+        for pass_index in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
-            forward_fn()
-            if post_warmup_hook is not None:
-                post_warmup_hook()
+            self._in_actual_capture_pass = pass_index == 1
+            try:
+                forward_fn()
+                if post_warmup_hook is not None:
+                    post_warmup_hook()
+            finally:
+                self._in_actual_capture_pass = False
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         # torch.compile manages its per-shape cache internally.

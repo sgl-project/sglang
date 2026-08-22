@@ -157,7 +157,10 @@ class TestFusedReplayStateIndices(CustomTestCase):
 
     def test_shared_mamba_slots(self):
         # Multiple requests mapping to the same mamba slot (mapping is not
-        # injective in general) must gather identically on both paths.
+        # injective in general) must gather identically on both paths.  This
+        # low-level transport test deliberately does not issue the allocator
+        # attestation: production issues it only for a selected active prefix,
+        # whose request-owned slots are unique.
         mapping_const = torch.full((_REQ_POOL_SIZE,), 3, dtype=torch.int32)
         device = torch.device("cuda")
         total_bs, num_padding = 7, 2
