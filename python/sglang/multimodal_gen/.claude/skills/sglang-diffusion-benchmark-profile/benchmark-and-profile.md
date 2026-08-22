@@ -139,6 +139,50 @@ The helper defaults to eager. Add `--torch-compile` only for a labeled compile
 control. `--no-torch-compile` remains accepted for compatibility but is no
 longer required.
 
+Run one explicit quality or BCG comparator with `--quality lossless|high` and
+`--breakable-cuda-graph`. BCG and `torch.compile` are intentionally mutually
+exclusive in this helper. When a preset has explicit width and height, the
+helper declares that same `--warmup-resolutions` value automatically:
+
+```bash
+PYTHONPATH=python python3 "$BENCH_PY" \
+  --model longcat-image \
+  --quality high \
+  --breakable-cuda-graph \
+  --label bcg-high \
+  --output-dir "${BENCH_DIR}"
+```
+
+For optimization discovery, use the full repeated matrix. It runs
+Eager/BCG/BCG/Eager at `lossless`, then the same ABBA pair at `high`, while
+holding one GPU set and one isolated checkpoint cache. Cleanup occurs only
+after all eight runs, including on failure or interruption:
+
+```bash
+MODEL_CACHE_ROOT=/path/to/task-owned/model-caches
+PYTHONPATH=python python3 "$BENCH_PY" \
+  --model longcat-image \
+  --quality-bcg-matrix \
+  --label h200 \
+  --output-dir "${BENCH_DIR}" \
+  --model-cache-root "${MODEL_CACHE_ROOT}" \
+  --cleanup-model-cache
+```
+
+Before starting, confirm the chosen GPU set has no foreign process and remains
+unchanged through every run boundary. The helper rejects a BCG row unless its
+log contains `[Diffusion BCG] captured` and contains none of: support-gate
+disable, capture failure, `serving signature MISSED`, or a message that no
+graph will be captured. Do not average rejected rows with valid results.
+
+BCG signatures include more than width and height. The public
+`--warmup-resolutions` flag declares only `WxH`; synthetic warmup still uses
+the model's own frame-count and conditioning defaults. A short video preset
+can therefore capture a default temporal shape and miss the actual request
+even at the same resolution. The helper marks that row invalid. Use a request
+whose complete temporal/conditioning contract matches warmup, or fix the
+model's BCG warmup/padding contract before claiming a speedup.
+
 The helper sets `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1` for accurate stage
 attribution. Set it to `0` explicitly only when collecting an e2e-only run and
 do not compare its per-stage values with synchronized results.
@@ -242,6 +286,18 @@ Use the preset categories this way:
 | `longcat-image` | `meituan-longcat/LongCat-Image` | No | Eager DiT baseline at 1024x1024, 50 steps, guidance 4.5; prompt rewrite is disabled so Qwen2.5-VL does not contaminate the DiT A/B. |
 | `sana-video` | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` | No | CI-sized eager T2V baseline: 832x480, 17 frames, 8 steps, guidance 6.0. Compare `quality=lossless` and `quality=high`; high enables the BF16-input first linear-attention GEMM while retaining FP32 output and the FP32 second GEMM. |
 | `lingbot-video-moe` | `robbyant/lingbot-video-moe-30b-a3b` | No | One-GPU eager baseline using the CI structured-JSON caption, 384x640, 17 frames, 12 steps, and text-encoder CPU offload. |
+| `fastwan21-t2v-1.3b` | `FastVideo/FastWan2.1-T2V-1.3B-Diffusers` | No | One-GPU 832x480, 61-frame, 3-step DMD baseline. The preset pins manual mode with a resident DiT so lossless/high comparisons do not measure an offload-policy change. |
+| `krea2-turbo` | `krea/Krea-2-Turbo` | No | Recent T2I checkpoint at 1024x1024, 8 steps, guidance 1.0. |
+| `krea2-raw` | `krea/Krea-2-Raw` | No | Recent T2I checkpoint at 1024x1024, 50 steps, guidance 4.5; keep separate from Turbo because CFG and the longer schedule change the hotspot mix. |
+| `ideogram4-fast` | `fal/ideogram-v4-fast` | No | Recent distilled T2I checkpoint at 1024x1024; the registered sampling class owns its step and guidance defaults. |
+| `ideogram4-instant` | `fal/ideogram-v4-instant` | No | Recent distilled T2I checkpoint at 1024x1024; the registered sampling class owns its step and guidance defaults. |
+| `longlive2-t2v` | `Rabinovich/LongLive-2.0-5B-Diffusers` | No | CI-aligned 832x480, 61-frame causal DMD T2V baseline at 4 steps and guidance 1.0. |
+| `longlive2-i2v` | `Rabinovich/LongLive-2.0-5B-Diffusers` | No | CI-aligned 960x928, 61-frame causal DMD I2V baseline using the cat image. |
+| `fast-hunyuan` | `FastVideo/FastHunyuan-diffusers` | No | Native 1280x720, 125-frame FastHunyuan baseline using its registered 6-step schedule. |
+| `turbowan21-t2v-1.3b` | `IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers` | No | Registered one-GPU TurboWan path at 832x480, 81 frames, and 4 steps. |
+| `helios-mid` | `BestWishYsh/Helios-Mid` | No | CI-sized 640x384, 33-frame pyramid-SR baseline using Helios-Mid's 20-step schedule. |
+| `helios-distilled` | `BestWishYsh/Helios-Distilled` | No | CI-sized 640x384, 33-frame DMD baseline at 10 steps and guidance 1.0. |
+| `joy-echo` | `jdopensource/JoyAI-Echo` | No | CI-aligned two-GPU Ulysses baseline at 640x384, 33 frames, 8 steps, with the cross-request memory bank disabled for isolated single-request timing. |
 | `cosmos3-edge-t2i` | `nvidia/Cosmos3-Edge` | No | One-GPU eager T2I baseline at Edge's native 640x640 shape, 35 steps, guidance 7.0. |
 | `cosmos3-super-t2i-distilled` | `nvidia/Cosmos3-Super-Text2Image-4Step` | No | Four-GPU eager distilled T2I baseline. The checkpoint owns its fixed sigma schedule; the preset does not override the step count. |
 | `ltx25` | `Lightricks/LTX-2.5-Diffusers` | No | One-stage distilled eager baseline at 960x544, 121 frames, 8 steps, guidance 1.0. |
@@ -282,6 +338,11 @@ For MiniMax-H3, keep the native contract intact:
   `--model-variant`; do not point at a checkpoint subdirectory
 - use eager BF16/FP32 for consistency ground truth; current H3
   `torch.compile` changes numerical output
+- keep BCG off in the validated recipe. The support gate alone is not enough:
+  prompt-dependent packed-sequence host boundaries can differ between warmup
+  and serving and cause a signature miss. Any experimental fix must prove real
+  segment replay, byte-identical media, and an e2e win without excessive graph
+  memory
 - use Ulysses, not Ring, for H3's packed multi-segment attention; CFG parallel
   is invalid because the released pipeline has one denoising branch
 - keep the released overlapping tiled video-VAE decode. H3 rejects
@@ -531,7 +592,24 @@ Always keep:
 - exact command line, model shape, dtype, request `quality`, GPU topology, and
   whether synchronized stage profiling was enabled
 
-Never keep a perf dump produced after a diffusers-backend fallback.
+Never keep a perf dump produced after a diffusers-backend fallback. Also reject
+a zero-exit run if either the requested perf dump or generated media is absent:
+some generation failures are reported through the response payload without a
+nonzero process exit.
+
+For `quality=lossless`, compare saved artifact hashes and require byte equality
+for a claimed lossless fast path or BCG change. For `quality=high`, keep the
+lossless artifact as ground truth and report both aggregate and worst-frame
+SSIM/PSNR. Repository defaults are SSIM 0.95 / PSNR 28 dB for images and SSIM
+0.92 / PSNR 24 dB for videos; checked-in model/hardware consistency metadata
+may override them. Always inspect the image or a start/middle/end video contact
+sheet in addition to scalar metrics.
+
+Use denoise timing to locate the opportunity, but gate a performance PR on
+repeated saved-request end-to-end time. The project threshold for this sweep is
+at least 1.5% mean e2e improvement on same-GPU ABBA runs. Attach one
+representative baseline/candidate profile plus before/after images or videos to
+the PR description.
 
 Stage durations are host wall times around asynchronous GPU launches unless
 `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1`. Without the sync, queued denoise
@@ -672,10 +750,14 @@ This skill intentionally stops here. It tells you whether you are looking at:
 
 - [ ] fixed-shape baseline perf dump saved
 - [ ] fixed-shape new perf dump saved
-- [ ] request `quality` and `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING` match
+- [ ] Eager/BCG x `quality=lossless|high` matrix attempted on one GPU set
+- [ ] BCG rows show capture and no disable/failure/signature-miss marker
+- [ ] request shape, seed, steps, guidance, topology, residency, and synchronized stage profiling match
 - [ ] `compare_perf.py` table generated
 - [ ] one representative `torch.profiler` trace saved
 - [ ] hotspot classified against `existing-fast-paths.md`
-- [ ] reference image or video checked for correctness
+- [ ] lossless artifact hash is exact; high-quality aggregate and worst-frame SSIM/PSNR pass the checked-in threshold
+- [ ] reference image or start/middle/end video contact sheet checked visually
+- [ ] any PR claim has repeated saved-request e2e improvement >= 1.5%
 - [ ] task-owned checkpoint cache cleaned and ledger shows zero residual weight files
 - [ ] any remaining kernel work handed off with perf/profile evidence attached
