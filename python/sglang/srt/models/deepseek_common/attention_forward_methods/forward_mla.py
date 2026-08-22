@@ -60,6 +60,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_hip,
     _is_musa,
+    _use_aiter_gfx95,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
@@ -108,6 +109,114 @@ def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
 
 if _is_cuda:
     from sglang.kernels.ops.gemm import bmm_fp8
+
+
+if _use_aiter_gfx95:
+    from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
+        _get_config as _get_mxfp4_bmm_config,
+    )
+    from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
+
+    from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
+        batched_gemm_afp4wfp4_pre_quant,
+    )
+
+
+def _get_single_split_mxfp4_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
+    config, _ = _get_mxfp4_bmm_config(x.shape[1], weight.shape[1], x.shape[2])
+    config = config.copy()
+    config["NUM_KSPLIT"] = 1
+    return config
+
+
+def _get_glm_mxfp4_k_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
+    config = _get_single_split_mxfp4_bmm_config(x, weight)
+    # GLM's K-up has K=192. Larger blocks over-read its six E8M0 scale groups.
+    config["BLOCK_SIZE_K"] = 64
+    return config
+
+
+def _get_glm_mxfp4_v_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
+    config = _get_single_split_mxfp4_bmm_config(x, weight)
+    # Keep AITER's small-M decode buckets; use the profiled prefill tiles.
+    if x.shape[1] > 256:
+        config["BLOCK_SIZE_M"] = 128
+        config["BLOCK_SIZE_K"] = 128
+    return config
+
+
+def _run_tuned_mxfp4_bmm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+    config: dict,
+    *,
+    transpose_bm: bool,
+) -> torch.Tensor:
+    return batched_gemm_a16wfp4(
+        x,
+        weight,
+        weight_scale,
+        y=output,
+        config=config,
+        transpose_bm=transpose_bm,
+        prequant=True,
+        y_scale=None,
+        dtype=torch.bfloat16,
+    )
+
+
+def _run_mxfp4_k_bmm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    if x.shape[2] == 192 and weight.shape[1] == 512:
+        _run_tuned_mxfp4_bmm(
+            x,
+            weight,
+            weight_scale,
+            output,
+            _get_glm_mxfp4_k_bmm_config(x, weight),
+            transpose_bm=False,
+        )
+        return
+
+    batched_gemm_afp4wfp4_pre_quant(
+        x,
+        weight,
+        weight_scale,
+        torch.bfloat16,
+        output,
+    )
+
+
+def _run_mxfp4_v_bmm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    if x.shape[2] == 512 and weight.shape[1] == 256:
+        return _run_tuned_mxfp4_bmm(
+            x,
+            weight,
+            weight_scale,
+            output,
+            _get_glm_mxfp4_v_bmm_config(x, weight),
+            transpose_bm=True,
+        )
+
+    batched_gemm_afp4wfp4_pre_quant(
+        x,
+        weight,
+        weight_scale,
+        torch.bfloat16,
+        output.transpose(0, 1),
+    )
+    return output
 
 
 def should_defer_dsa_cp_kv_gather(
@@ -516,6 +625,21 @@ class DeepseekMLAForwardMixin:
                     expected_m,
                 )
                 q_nope_out = q_nope_out[:, :expected_m, :]
+            elif _use_aiter_gfx95 and self.w_kc.dtype == torch.uint8:
+                x = q_nope.transpose(0, 1)
+                q_nope_out = torch.empty(
+                    x.shape[0],
+                    x.shape[1],
+                    self.w_kc.shape[2],
+                    device=x.device,
+                    dtype=torch.bfloat16,
+                )
+                _run_mxfp4_k_bmm(
+                    x,
+                    self.w_kc.transpose(-2, -1),
+                    self.w_scale_k.transpose(-2, -1),
+                    q_nope_out,
+                )
             elif self.w_kc.dtype == torch.float8_e4m3fn:
                 if _is_cpu:
                     q_nope_out = torch.bmm(
@@ -820,6 +944,21 @@ class DeepseekMLAForwardMixin:
             attn_bmm_output = (
                 attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
             )
+        elif _use_aiter_gfx95 and self.w_vc.dtype == torch.uint8:
+            x = attn_output.transpose(0, 1)
+            bmm_output = torch.empty(
+                x.shape[1],
+                x.shape[0],
+                self.w_vc.shape[2],
+                device=x.device,
+                dtype=torch.bfloat16,
+            )
+            attn_bmm_output = _run_mxfp4_v_bmm(
+                x,
+                self.w_vc.transpose(-2, -1),
+                self.w_scale_v.transpose(-2, -1),
+                bmm_output,
+            ).flatten(1, 2)
         elif self.w_vc.dtype == torch.float8_e4m3fn:
             if _is_cpu:
                 attn_bmm_output = torch.bmm(
