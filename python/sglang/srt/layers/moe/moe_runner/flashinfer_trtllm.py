@@ -92,6 +92,41 @@ def finalize_flashinfer_trtllm_deferred_output(
     )
 
 
+def _make_deferred_finalize_output(
+    result,
+    *,
+    top_k: int,
+) -> FlashInferTrtllmDeferredFinalizeOutput:
+    """Validate and adapt FlashInfer's ``do_finalize=False`` output ABI."""
+    gemm2_out, expert_weights, expanded_idx_to_permuted_idx = result[:3]
+    # Some FlashInfer versions size this buffer from routing_logits dtype while
+    # writing BF16 weights into it. Reinterpret only the live BF16 prefix.
+    if expert_weights.dtype == torch.float32:
+        n, k = expert_weights.shape
+        expert_weights = expert_weights.view(torch.bfloat16).view(-1, k)[:n]
+    if expert_weights.dtype != torch.bfloat16:
+        raise RuntimeError(
+            "FlashInfer deferred finalize must return BF16 expert weights, got "
+            f"{expert_weights.dtype}"
+        )
+    if gemm2_out.dtype != torch.bfloat16:
+        raise RuntimeError(
+            "FlashInfer deferred finalize must return BF16 GEMM2 output, got "
+            f"{gemm2_out.dtype}"
+        )
+    if expanded_idx_to_permuted_idx.dtype != torch.int32:
+        raise RuntimeError(
+            "FlashInfer deferred finalize must return Int32 permuted indices, got "
+            f"{expanded_idx_to_permuted_idx.dtype}"
+        )
+    return FlashInferTrtllmDeferredFinalizeOutput(
+        gemm2_out=gemm2_out,
+        expert_weights=expert_weights,
+        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+        top_k=top_k,
+    )
+
+
 def round_up_to_multiple(x: int, m: int) -> int:
     """Round up *x* to the nearest multiple of *m*."""
     return (x + m - 1) // m * m
@@ -714,6 +749,16 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         else Fp8QuantizationType.DeepSeekFp8
     )
     use_shuffled_weight = quant_info.use_mxfp8
+    defer_finalize = _deferred_finalize_enabled.get()
+    if defer_finalize and (
+        not quant_info.block_quant
+        or use_routed_topk
+        or not TopKOutputChecker.format_is_bypassed(topk_output)
+    ):
+        raise RuntimeError(
+            "FP8 deferred finalize requires block quantization, the logits-based "
+            "FlashInfer TRTLLM backend, and bypassed TopK"
+        )
 
     if quant_info.block_quant:
         assert quant_info.weight_block_k is not None
@@ -736,16 +781,19 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             )
             a_sf_t = a_sf.t()
 
-        # Allocate output inside symmetric memory context
-        with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
-        ):
-            symm_output = torch.empty(
-                hidden_states.shape[0],
-                hidden_states.shape[1],
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-            )
+        symm_output = None
+        if not defer_finalize:
+            # The deferred path returns FlashInfer's permuted/padded GEMM2
+            # materialization and must not allocate the ordinary final output.
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                symm_output = torch.empty(
+                    hidden_states.shape[0],
+                    hidden_states.shape[1],
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
 
         # Move kernel call outside context manager to avoid graph breaks
         # during torch.compile for piecewise cuda graph.
@@ -791,10 +839,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 fp8_quantization_type=int(fp8_quantization_type),
                 activation_type=quant_info.activation_type,
             )
+            output = cast(torch.Tensor, symm_output)
         else:
             assert TopKOutputChecker.format_is_bypassed(topk_output)
-
-            trtllm_fp8_block_scale_moe_out_wrapper(
+            common_kwargs = dict(
                 routing_logits=router_logits,
                 routing_bias=correction_bias,
                 hidden_states=a_q,
@@ -806,7 +854,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
                 gemm2_weights=quant_info.w2_weight,
                 gemm2_weights_scale=quant_info.w2_weight_scale_inv,
-                output=symm_output,
                 num_experts=quant_info.global_num_experts,
                 top_k=topk_config.top_k,
                 n_group=topk_config.num_expert_group,
@@ -822,10 +869,34 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 routing_method_type=routing_method_type,
                 use_shuffled_weight=use_shuffled_weight,
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
-                fp8_quantization_type=int(fp8_quantization_type),
-                activation_type=quant_info.activation_type,
             )
-        output = symm_output
+            if defer_finalize:
+                from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
+
+                deferred_kwargs = dict(
+                    **common_kwargs,
+                    do_finalize=False,
+                    fp8_quantization_type=fp8_quantization_type,
+                    enable_pdl=a_q.shape[0] <= _TRTLLM_MOE_PDL_MAX_TOKENS,
+                )
+                if quant_info.activation_type is not None:
+                    from flashinfer.fused_moe.core import ActivationType
+
+                    deferred_kwargs["activation_type"] = ActivationType(
+                        quant_info.activation_type
+                    )
+                output = _make_deferred_finalize_output(
+                    trtllm_fp8_block_scale_moe(**deferred_kwargs),
+                    top_k=topk_config.top_k,
+                )
+            else:
+                trtllm_fp8_block_scale_moe_out_wrapper(
+                    **common_kwargs,
+                    output=cast(torch.Tensor, symm_output),
+                    fp8_quantization_type=int(fp8_quantization_type),
+                    activation_type=quant_info.activation_type,
+                )
+                output = cast(torch.Tensor, symm_output)
     else:
         assert TopKOutputChecker.format_is_bypassed(topk_output)
         assert quant_info.w13_input_scale is not None
@@ -1344,22 +1415,25 @@ def fused_experts_none_to_flashinfer_trtllm_routed(
     )
 
 
+@register_fused_func("flashinfer", "flashinfer_trtllm")
 @register_fused_func("flashinfer", "flashinfer_trtllm_routed")
-def fused_experts_flashinfer_to_flashinfer_trtllm_routed(
-    dispatch_output: FlashinferDispatchOutput,
+def fused_experts_flashinfer_to_flashinfer_trtllm(
+    dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
     quant_info: MoeQuantInfo,
     runner_config: MoeRunnerConfig,
-) -> FlashinferCombineInput:
-    """Fused function for flashinfer A2A + flashinfer_trtllm_routed runner.
+) -> FlashinferCombineInput | StandardCombineInput:
+    """Fused function for FlashInfer A2A + TRT-LLM Gen MoE.
 
-    FlashinferDispatchOutput and StandardDispatchOutput share the same field
-    layout (hidden_states, hidden_states_scale, topk_output), so the existing
-    FP8/FP4/BF16 implementations work unchanged.  We wrap the returned
-    StandardCombineInput into a FlashinferCombineInput for the FlashinferDispatcher
-    combine path.
+    Both one-sided decode and AG+RS prefill materialize routing IDs and weights,
+    so the regular and explicitly-routed backend names enter TRT-LLM's routed
+    kernel. The dispatch formats share the fields consumed by the implementation;
+    only the combine wrapper differs.
     """
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
         FlashinferCombineInput,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import (
+        StandardDispatchOutput,
     )
 
     if isinstance(quant_info, FlashInferTrtllmFp4MoeQuantInfo):
@@ -1370,6 +1444,16 @@ def fused_experts_flashinfer_to_flashinfer_trtllm_routed(
             use_routed_topk=True,
         )
     elif isinstance(quant_info, FlashInferTrtllmFp8MoeQuantInfo):
+        if dispatch_output.hidden_states.dtype != torch.bfloat16:
+            raise TypeError(
+                "FlashInfer A2A + TRT-LLM Gen FP8 MoE requires a BF16 "
+                f"dispatch payload, got {dispatch_output.hidden_states.dtype}."
+            )
+        if dispatch_output.hidden_states_scale is not None:
+            raise ValueError(
+                "FlashInfer A2A + TRT-LLM Gen FP8 MoE quantizes locally; "
+                "the BF16 dispatch payload must not carry activation scales."
+            )
         result = fused_experts_none_to_flashinfer_trtllm_fp8(
             dispatch_output,
             quant_info,
@@ -1385,8 +1469,18 @@ def fused_experts_flashinfer_to_flashinfer_trtllm_routed(
         )
     else:
         raise TypeError(
-            f"Unexpected quant_info type for flashinfer a2a + flashinfer_trtllm_routed: {type(quant_info)}"
+            f"Unexpected quant_info type for flashinfer a2a + flashinfer_trtllm: {type(quant_info)}"
         )
+    if (
+        isinstance(quant_info, FlashInferTrtllmFp8MoeQuantInfo)
+        and result.hidden_states.dtype != torch.bfloat16
+    ):
+        raise TypeError(
+            "FlashInfer A2A + TRT-LLM Gen FP8 MoE must return a BF16 combine "
+            f"payload, got {result.hidden_states.dtype}."
+        )
+    if isinstance(dispatch_output, StandardDispatchOutput):
+        return result
     return FlashinferCombineInput(hidden_states=result.hidden_states)
 
 

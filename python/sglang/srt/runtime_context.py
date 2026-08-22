@@ -392,6 +392,10 @@ class MoeFlags(_FlagGroupBase):
     # speculative_moe_backend_context is active, so a draft gate's write also
     # lands on the speculative leaf.
     in_speculative_scope: bool = False
+    # True only while constructing/running the speculative draft model.  A2A
+    # dispatchers use it to keep draft CUDA graphs off the target model's
+    # one-sided communication workspace.
+    speculative_context: bool = False
 
 
 @dataclasses.dataclass
