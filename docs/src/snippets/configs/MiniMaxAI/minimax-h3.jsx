@@ -28,6 +28,13 @@ function consumerFlags(s) {
   if (CONSUMER_VRAM_16_PLUS.includes(s.hw) && s.host_ram === "ram96") {
     flags.push("--dit-layerwise-resident-layers 4");
   }
+  // A 24 GB card on a 32 GB host has allocator headroom to keep ten DiT
+  // layers resident (measured 10.4 vs 11.6 s/step); a 16 GB card does not --
+  // there even four resident layers measured slower than none, so it keeps
+  // the plain recipe.
+  if (s.hw === "rtx4090" && s.host_ram === "ram32") {
+    flags.push("--dit-layerwise-resident-layers 10");
+  }
   return flags;
 }
 
@@ -43,10 +50,16 @@ function consumerHints(s) {
     }
     return hints;
   }
-  hints.push("measured at 32 GB host: ~10.6 s per denoise step, ~9.4 s decode, ~235 s per request -- ahead of ComfyUI (276-302 s) on the same weights under the same hard 12 GiB cap, output bit-identical");
+  if (s.hw === "rtx4090") {
+    hints.push("measured at 32 GB host: ~10.4 s per denoise step with ten resident layers, ~9.6 s decode, ~230 s per request -- ahead of ComfyUI (249-260 s) under the same hard 24 GiB cap");
+  } else if (s.hw === "rtx4080") {
+    hints.push("measured at 32 GB host: ~11.9 s per denoise step, ~11 s decode, ~250 s per request -- ahead of ComfyUI (292-301 s) under the same hard 16 GiB cap");
+  } else {
+    hints.push("measured at 32 GB host: ~10.6 s per denoise step, ~9.4 s decode, ~235 s per request -- ahead of ComfyUI (276-302 s) on the same weights under the same hard 12 GiB cap, output bit-identical");
+  }
   hints.push("run with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -- the decode sits close enough to the cap that fragmentation otherwise tips it over");
   if (midHost) {
-    hints.push("measured at 48 GB host: ~9.6 s/step, ~218 s per request (ComfyUI 246-267 s); at 64 GB: ~8.1 s/step, ~180 s (ComfyUI 194-195 s)");
+    hints.push("measured on a 12 GB card at a 48 GB host: ~9.6 s/step, ~218 s per request (ComfyUI 246-267 s); at 64 GB: ~8.1 s/step, ~180 s (ComfyUI 194-195 s); larger cards land at or below these");
   } else {
     hints.push("a 32 GB host cannot cache the 108 GB checkpoint: NVMe is required, and real runs land above the quoted step time");
   }
