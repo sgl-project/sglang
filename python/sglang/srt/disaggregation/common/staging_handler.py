@@ -824,6 +824,46 @@ def handle_staging_req(
                 pass
 
 
+class StagingManagerMixin:
+    """Shared STAGING_REQ handling for KV managers that support staging.
+
+    Mixed into the managers whose decode thread receives STAGING_REQ messages
+    (currently Mooncake and NIXL). Expects the concrete manager to provide
+    ``_staging_handler``, ``_staging_ctx``, ``kv_args``, ``attn_tp_size`` and
+    optionally ``kv_buffer_tensors``.
+    """
+
+    def _handle_staging_req(self, msg):
+        room = int(msg[1].decode("ascii"))
+        session_id = msg[4].decode("ascii")
+        handler = self._staging_handler
+        assert (
+            handler is not None
+        ), "STAGING_REQ received before staging handler initialized"
+        decode_req = handler._room_to_decode_req.get(room)
+        if decode_req is None:
+            logger.warning(
+                "STAGING_REQ received for unregistered room=%s, skipping",
+                room,
+            )
+            return
+        prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
+        handle_staging_req(
+            msg,
+            self._staging_ctx.allocator,
+            self.kv_args,
+            self.attn_tp_size,
+            prefill_tp,
+            getattr(self, "kv_buffer_tensors", None),
+            self._staging_ctx.room_receivers,
+            self._staging_ctx.room_bootstrap,
+        )
+
+        receiver = self._staging_ctx.room_receivers.get(room)
+        if receiver is not None:
+            handler.register_wm_subscriber(receiver, session_id)
+
+
 def prefetch_staging_reqs(
     room: int,
     transfer_infos: dict,

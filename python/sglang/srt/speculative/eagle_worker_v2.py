@@ -278,8 +278,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.hot_token_id = None
 
     def init_lm_head(self):
+        from sglang.srt.lora.layers import unwrap_lora_layer
+
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
-        target_lm_head = getattr(self.target_worker.model_runner.model, "lm_head", None)
+        target_lm_head = unwrap_lora_layer(
+            getattr(self.target_worker.model_runner.model, "lm_head", None)
+        )
 
         def maybe_share_target_lm_head():
             if (
@@ -560,6 +564,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
         spec_info: EagleDraftInput = forward_batch.spec_info
+        if forward_batch.forward_mode.is_idle():
+            return self._draft_forward_idle(forward_batch, spec_info)
+
         out_cache_loc = forward_batch.out_cache_loc
         topk_p, topk_index, hidden_states = (
             spec_info.topk_p,
@@ -725,6 +732,38 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
         return parent_list, top_scores_index, draft_tokens, draft_probs
+
+    def _draft_forward_idle(
+        self, forward_batch: ForwardBatch, spec_info: EagleDraftInput
+    ):
+        """Run eager idle-rank collectives without materializing draft state."""
+        input_ids = forward_batch.input_ids
+        out_cache_loc = forward_batch.out_cache_loc
+        hidden_states = spec_info.hidden_states
+
+        # ModelRunner pads and unpads the empty batch on every call. Avoid the
+        # normal tree/cache-layout path: idle outputs are discarded when the
+        # verify input is built, but every rank must still enter each forward.
+        for i in range(self.speculative_num_steps - 1):
+            forward_batch.input_ids = input_ids
+            forward_batch.out_cache_loc = out_cache_loc
+            spec_info.hidden_states = hidden_states
+            canary_index_ctx = (
+                c.with_active_single_forward_manager(i)
+                if (c := self.draft_runner.canary_manager) is not None
+                else contextlib.nullcontext()
+            )
+            with (
+                forward_context(
+                    ForwardContext(
+                        attn_backend=self.draft_attn_backend.attn_backends[i]
+                    )
+                ),
+                canary_index_ctx,
+            ):
+                self.draft_runner.forward(forward_batch)
+
+        return None, None, None, None
 
     def draft_extend(self):
         pass
