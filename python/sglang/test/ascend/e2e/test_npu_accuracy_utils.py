@@ -13,8 +13,6 @@ import time
 from datetime import datetime
 from urllib.parse import urlparse
 
-import psutil
-
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     SERVICE_PORT,
@@ -119,34 +117,6 @@ def _kill_evalscope_session(process):
     except PermissionError:
         logger.warning(
             f"run_evalscope no permission to kill session pgid={process.pid}"
-        )
-
-    leftovers = []
-    for p in psutil.process_iter(["pid", "name", "cmdline"]):
-        try:
-            if p.pid == process.pid:
-                continue
-            if os.getpgid(p.pid) != process.pid:
-                continue
-            cmdline = " ".join(p.info["cmdline"] or [])
-            leftovers.append(
-                f"pid={p.pid} name={p.info['name']} cmdline={cmdline}"
-            )
-        except (
-            psutil.NoSuchProcess,
-            psutil.AccessDenied,
-            ProcessLookupError,
-            PermissionError,
-        ):
-            continue
-    if leftovers:
-        logger.warning(
-            f"run_evalscope session pgid={process.pid} leftovers: "
-            + "; ".join(leftovers)
-        )
-    else:
-        logger.info(
-            f"run_evalscope session pgid={process.pid} cleanup verified: no leftovers"
         )
 
 
@@ -263,12 +233,10 @@ def run_evalscope(
             try:
                 with open(report_path, "r") as rf:
                     report_data = json.load(rf)
-                for item in report_data:
-                    score = item.get("score")
-                    if score is not None:
-                        metrics["accuracy"] = float(score)
-                        logger.info(f"The Final Accuracy from report: {score}")
-                        break
+                score = report_data.get("score")
+                if score is not None:
+                    metrics["accuracy"] = float(score)
+                    logger.info(f"The Final Accuracy from report: {score}")
             except Exception as e:
                 logger.warning(f"Failed to read report file {report_path}: {e}")
 
@@ -306,6 +274,7 @@ def run_evalscope(
             logger.info("Process killed")
         _kill_evalscope_session(process)
         raise
+    
     except Exception as e:
         logger.error(f"Error executing command: {e}")
         process.terminate()
@@ -335,74 +304,6 @@ def assert_metrics(self, metrics):
             threshold,
             f"Accuracy check failed. Expected >= {threshold}, Got: {metrics['accuracy']}",
         )
-
-
-def _kill_forkserver_group():
-    """Kill orphan forkserver processes in the current process group.
-
-    Forkserver children spawned by the evalscope benchmark get reparented to PID 1
-    after their parent eval subprocess exits, but keep holding open pipe write
-    ends. Only these orphans and their descendants are killed here; the directly
-    spawned server process is left for `kill_process_tree` to clean up.
-    """
-    me = os.getpid()
-    try:
-        pgid = os.getpgid(me)
-    except ProcessLookupError:
-        logger.warning(f"Cannot resolve own process group for pid {me}")
-        return
-    if pgid != me:
-        logger.warning(
-            f"Skip process-group cleanup: pid {me} is not the group leader "
-            f"(pgid={pgid}), refusing to kill the parent suite"
-        )
-        return
-    all_pids = psutil.pids()
-    logger.info(
-        f"[forkserver-cleanup] start pgid={pgid} me={me} "
-        f"total_pids_scanned={len(all_pids)}"
-    )
-    killed = 0
-    still_parented = 0
-    for pid in all_pids:
-        if pid == me:
-            continue
-        try:
-            proc = psutil.Process(pid)
-            if os.getpgid(pid) != pgid:
-                continue
-            ppid = proc.ppid()
-            if ppid != 1:
-                still_parented += 1
-                name = proc.name()
-                cmdline = " ".join(proc.cmdline())
-                if any(
-                    k in (name + " " + cmdline)
-                    for k in ("forkserver", "evalscope", "multiprocessing")
-                ):
-                    logger.info(
-                        f"[forkserver-cleanup] skip still-parented pid={pid} "
-                        f"ppid={ppid} name={name} cmdline={cmdline}"
-                    )
-                continue
-            name = proc.name()
-            cmdline = " ".join(proc.cmdline())
-            logger.info(
-                f"Killing leftover forkserver pid={pid} ppid={ppid} pgid={pgid} "
-                f"name={name} cmdline={cmdline}"
-            )
-            kill_process_tree(pid)
-            killed += 1
-        except (
-            psutil.NoSuchProcess,
-            psutil.AccessDenied,
-            ProcessLookupError,
-            PermissionError,
-        ):
-            continue
-    logger.info(
-        f"[forkserver-cleanup] done killed={killed} still_parented={still_parented}"
-    )
 
 
 class TestNpuAccuracyTestCaseBase(CustomTestCase):
@@ -551,10 +452,6 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        try:
-            os.setsid()
-        except OSError:
-            pass
         cls._setup_per_case_output()
         cls.base_url = DEFAULT_URL_FOR_TEST
         env = os.environ.copy()
@@ -577,13 +474,13 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            try:
+                kill_process_tree(cls.process.pid)
+            except Exception as e:
+                logger.error(f"Error during tearDown: {e}")
         cls._save_metrics_json()
         cls._backup_plog()
-        try:
-            if hasattr(cls, "process") and cls.process:
-                kill_process_tree(cls.process.pid)
-        except Exception as e:
-            logger.error(f"Error during tearDown: {e}")
 
     def run_accuracy(self):
         parsed_url = urlparse(self.base_url)
@@ -704,10 +601,6 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        try:
-            os.setsid()
-        except OSError:
-            pass
         cls.local_ip = "127.0.0.1"
         cls.host = os.getenv("POD_IP")
         cls.port = SERVICE_PORT
@@ -809,10 +702,6 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        try:
-            os.setsid()
-        except OSError:
-            pass
         cls.process = None
         cls.local_ip = "127.0.0.1"
         cls.host = os.getenv("POD_IP")
@@ -831,11 +720,11 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        try:
-            if cls.process:
+        if cls.process:
+            try:
                 kill_process_tree(cls.process.pid)
-        except Exception as e:
-            logger.error(f"Error during tearDown: {e}")
+            except Exception as e:
+                logger.error(f"Error during tearDown: {e}")
 
     @classmethod
     @check_role(allowed_roles=["router"])
