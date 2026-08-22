@@ -80,6 +80,7 @@ CONSISTENCY_THRESHOLD_FILE_BY_PLATFORM = {
     "h100": "h100.json",
     "b200": "b200.json",
     "5090": "5090.json",
+    "intel_xpu_b60": "intel_xpu_b60.json",
 }
 CONSISTENCY_PLATFORM_ALIASES = {
     "sm90": "h100",
@@ -91,6 +92,7 @@ CONSISTENCY_PLATFORM_ALIASES = {
     "sm120": "5090",
     "rtx5090": "5090",
     "5090": "5090",
+    "intelxpub60": "intel_xpu_b60",
 }
 CLIP_MODEL_NAME = "openai/clip-vit-large-patch14"
 DEFAULT_CLIP_THRESHOLD_IMAGE = 0.92
@@ -903,6 +905,8 @@ def get_consistency_platform() -> str:
         return "5090"
     if current_platform.is_blackwell():
         return "b200"
+    if current_platform.is_xpu():
+        return "intel_xpu_b60"
     return "h100"
 
 
