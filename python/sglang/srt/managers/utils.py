@@ -21,6 +21,7 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.sampling.sampling_observer import HostAuxiliaryOutput
     from sglang.srt.speculative.eagle_info import EagleDraftInput
 
 
@@ -108,6 +109,8 @@ class GenerationBatchResult:
     fpm_start_event: Optional[torch.cuda.Event] = None
     fpm_end_event: Optional[torch.cuda.Event] = None
 
+    auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
+
     @property
     def has_sampled_token_ids(self) -> bool:
         """True when this iter sampled token ids; False when none were produced
@@ -175,7 +178,17 @@ class GenerationBatchResult:
             if holder is not None:
                 holder.map_device_tensors(_async_d2h)
 
+        self.copy_auxiliary_output_to_cpu()
+
         self.copy_done.record()
+
+    def copy_auxiliary_output_to_cpu(self) -> None:
+        if self.logits_output is None or self.auxiliary_host_output is not None:
+            return
+        device_output = self.logits_output.auxiliary_device_output
+        if device_output is not None:
+            self.auxiliary_host_output = device_output.copy_to_host(_async_d2h)
+            self.logits_output.auxiliary_device_output = None
 
     @classmethod
     def from_pp_proxy(

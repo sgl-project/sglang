@@ -27,6 +27,7 @@ from sglang.srt.configs import (
     ChatGLMConfig,
     DbrxConfig,
     DeepseekVL2Config,
+    Dots3Config,
     DotsOCRConfig,
     DotsVLMConfig,
     ExaoneConfig,
@@ -112,6 +113,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         GraniteMoeHybridConfig,
         DotsVLMConfig,
         DotsOCRConfig,
+        Dots3Config,
         NemotronH_Nano_VL_V2_Config,
         NemotronH_Nano_Omni_Reasoning_V3_Config,
         NemotronHConfig,
@@ -138,6 +140,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         MiniMaxM3VLConfig,
     ]
 }
+
 
 # DeepSeek V3.2 / V4 reuse the V3 config schema. Subclass the upstream
 # transformers class with each model_type so AutoConfig.register passes its
