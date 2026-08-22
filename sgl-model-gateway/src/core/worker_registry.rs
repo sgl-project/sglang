@@ -21,7 +21,7 @@ use crate::{
     core::{
         circuit_breaker::CircuitState,
         worker::{HealthChecker, RuntimeType, WorkerType},
-        ConnectionMode, Worker,
+        ConnectionMode, Worker, UNKNOWN_MODEL_ID,
     },
     observability::metrics::Metrics,
 };
@@ -220,11 +220,33 @@ impl WorkerRegistry {
     /// Rebuild the hash ring for a model based on current workers in the model index
     fn rebuild_hash_ring(&self, model_id: &str) {
         if let Some(workers) = self.model_index.get(model_id) {
-            let ring = HashRing::new(&workers);
-            self.hash_rings.insert(model_id.to_string(), Arc::new(ring));
+            if workers.is_empty() {
+                self.hash_rings.remove(model_id);
+            } else {
+                let ring = HashRing::new(&workers);
+                self.hash_rings.insert(model_id.to_string(), Arc::new(ring));
+            }
         } else {
             // No workers for this model, remove the ring
             self.hash_rings.remove(model_id);
+        }
+
+        // Also rebuild the UNKNOWN_MODEL_ID ring which contains all workers.
+        // This ring is used when enable_igw=false (the common case) where
+        // pd_router calls get_hash_ring(UNKNOWN_MODEL_ID). Without this,
+        // the UNKNOWN_MODEL_ID ring would never be updated after worker changes.
+        if model_id != UNKNOWN_MODEL_ID {
+            let all_workers: Vec<Arc<dyn Worker>> = self
+                .workers
+                .iter()
+                .map(|entry| entry.value().clone())
+                .collect();
+            if all_workers.is_empty() {
+                self.hash_rings.remove(UNKNOWN_MODEL_ID);
+            } else {
+                let ring = HashRing::new(&all_workers);
+                self.hash_rings.insert(UNKNOWN_MODEL_ID.to_string(), Arc::new(ring));
+            }
         }
     }
 
@@ -831,5 +853,44 @@ mod tests {
         let llama_workers_after = registry.get_by_model("llama-3");
         assert_eq!(llama_workers_after.len(), 1);
         assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
+    }
+}
+
+#[cfg(test)]
+mod extra_tests {
+    use std::sync::Arc;
+    use crate::core::{BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID};
+
+    #[test]
+    fn test_unknown_model_ring_updated_on_worker_remove() {
+        let registry = WorkerRegistry::new();
+
+        let worker1 = Arc::new(
+            BasicWorkerBuilder::new("http://prefill1:8000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        ) as Arc<dyn Worker>;
+
+        let worker2 = Arc::new(
+            BasicWorkerBuilder::new("http://prefill2:8000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        ) as Arc<dyn Worker>;
+
+        registry.register(worker1.clone());
+        registry.register(worker2.clone());
+
+        let ring = registry.get_hash_ring(UNKNOWN_MODEL_ID).expect("ring should exist");
+        assert_eq!(ring.worker_count(), 2);
+
+        registry.remove_by_url("http://prefill1:8000");
+
+        let ring_after = registry.get_hash_ring(UNKNOWN_MODEL_ID).expect("ring should exist after remove");
+        assert_eq!(ring_after.worker_count(), 1);
+
+        registry.remove_by_url("http://prefill2:8000");
+
+        let ring_empty = registry.get_hash_ring(UNKNOWN_MODEL_ID);
+        assert!(ring_empty.is_none());
     }
 }
