@@ -1261,9 +1261,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
     def _resolve_extend_meta(self, forward_batch: ForwardBatch, q: torch.Tensor):
         """Return (cu_seqlens, seq_lens, prefix_lens); NPU caches per-forward casts."""
-        # NPU TARGET_VERIFY has extend_seq_lens=None (seq_lens=prefix+draft);
+        # TARGET_VERIFY has extend_seq_lens=None (seq_lens=prefix+draft);
         # reconstruct per-seq extend lengths + prefix_lens for cu_seqlens.
-        if self.is_npu and forward_batch.extend_seq_lens is None:
+        if forward_batch.extend_seq_lens is None and (
+            self.is_npu or forward_batch.forward_mode.is_target_verify()
+        ):
             _bs = forward_batch.seq_lens.shape[0]
             _ndt = self.speculative_num_draft_tokens or (q.shape[0] // max(_bs, 1))
             forward_batch.extend_seq_lens = torch.full(
