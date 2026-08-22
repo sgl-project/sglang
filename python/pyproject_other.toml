@@ -167,14 +167,15 @@ diffusion_musa = [
   "vsa==0.0.4",
 ]
 
-# https://docs.sglang.io/platforms/mps.md
+# https://docs.sglang.io/hardware-platforms/apple_metal
 srt_mps = [
-    "mlx",
+    "mlx>=0.32.0",
     "mlx-lm",
     "sglang[runtime_common]",
-    "torch==2.11.0",
+    "torch==2.13.0",
     "torchaudio==2.11.0",
-    "torchvision",
+    "torchcodec==0.15.0",
+    "torchvision==0.28.0",
 ]
 
 diffusion_mps = [
