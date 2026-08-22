@@ -1197,21 +1197,16 @@ class SchedulerPPMixin:
                 if logits_output is None:
                     logits_output = LogitsProcessorOutput(next_token_logits=None)
                 logits_output.auxiliary_device_output = auxiliary_output
-        # PP outputs may be on CPU after result processing, while draft state is
-        # filtered with device-resident batch indices.
-        next_token_ids = pp_outputs["next_token_ids"].to(
-            device=batch.device,
-            dtype=torch.int64,
-            non_blocking=True,
-        )
-        # PP rank 0 also relays into output_tokens_buf so the next iter's
-        # resolve_forward_inputs finds these tokens for the decode portion
-        # of mixed-chunk batches (which gather via mix_running_indices).
-        self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
-        )
+        next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
         next_draft_input = None
-        if batch.spec_algorithm.is_dspark():
+        if isinstance(batch, ScheduleBatch) and batch.spec_algorithm.is_dspark():
+            # PP outputs may be on CPU after result processing, while draft state is
+            # filtered with device-resident batch indices.
+            next_token_ids = next_token_ids.to(
+                device=batch.device,
+                dtype=torch.int64,
+                non_blocking=True,
+            )
             from sglang.srt.speculative.dspark_components.dspark_draft import (
                 make_next_draft_input,
             )
@@ -1221,6 +1216,12 @@ class SchedulerPPMixin:
                 new_seq_lens=batch.seq_lens,
             )
             batch.spec_info = next_draft_input
+        # PP rank 0 also relays into output_tokens_buf so the next iter's
+        # resolve_forward_inputs finds these tokens for the decode portion
+        # of mixed-chunk batches (which gather via mix_running_indices).
+        self.future_map.stash(
+            batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
+        )
         batch.input_ids = None
         output_result = GenerationBatchResult(
             logits_output=logits_output,
