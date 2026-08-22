@@ -63,6 +63,23 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
     )
 
 
+def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+) -> Optional[Tuple[torch.Tensor, ...]]:
+    """Fused TP all-reduce + RMSNorm + per-TOKEN FP8 quant (ROCm/aiter).
+
+    Returns ``(fp8_output, residual_out, per_token_scale)`` or ``None`` when
+    the backend cannot service the request (caller must fall back to the
+    separate fused-AR-RMSNorm + quant path).
+    """
+    return get_tp_group().fused_allreduce_rmsnorm_quant(
+        input_, residual_inp_, weight_, eps
+    )
+
+
 def tensor_model_parallel_all_gather(
     input_: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:
