@@ -164,17 +164,19 @@ class PipelineExecutor(ABC):
                     server_args,
                 )
 
+    @staticmethod
     @contextlib.contextmanager
-    def _stage_execution_context(self, stage: "PipelineStage", server_args: ServerArgs):
-        if self._stage_needs_version_counters(stage, server_args):
+    def _stage_execution_context(stage: "PipelineStage", server_args: ServerArgs):
+        if PipelineExecutor._stage_needs_version_counters(stage, server_args):
             # fsdp and cpu-offload hooks need tensor version counters
             with torch.inference_mode(False), torch.no_grad():
                 yield
             return
         yield
 
+    @staticmethod
     def _stage_needs_version_counters(
-        self, stage: "PipelineStage", server_args: ServerArgs
+        stage: "PipelineStage", server_args: ServerArgs
     ) -> bool:
         if server_args.use_fsdp_inference:
             return True
@@ -182,9 +184,6 @@ class PipelineExecutor(ABC):
         stage_name = stage._active_component_stage_name()
         for use in stage.component_uses(server_args, stage_name):
             if server_args.should_cpu_offload_component(use.component_name):
-                return True
-            module = self.component_residency_manager.get_module(use.component_name)
-            if getattr(module, "_sglang_fsdp_cpu_offload", False):
                 return True
         return False
 
