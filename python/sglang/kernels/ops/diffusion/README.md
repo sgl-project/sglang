@@ -21,7 +21,7 @@ free to move; the facade is not. `test_import_surface.py` enforces this, with
 a small allowlist for tests that deliberately exercise one backend.
 
 Resolution is lazy (PEP 562): the backends have disjoint heavy dependencies
-(Triton, CUTLASS/CuTe-DSL, FlyDSL on ROCm, MLX on Apple), so an eager
+(Triton, CUTLASS/CuTe-DSL, and FlyDSL on ROCm), so an eager
 re-export would make all of them import-time requirements everywhere.
 
 ## Layout
@@ -62,6 +62,10 @@ transformer (`sites/quality_gate.py`). A plain fp32 single-pass norm fusion
 looks harmless and is not: on ERNIE-Image it moved the 50-step trajectory to
 PSNR 18.83 dB at `quality=high`, which is what motivated the bit-exact
 rewrite.
+
+SANA-Video's quality-gated linear-attention site keeps BF16 inputs for the
+first GEMM while requesting FP32 accumulation/output, then runs the second
+GEMM in FP32. The default path still promotes Q/K/V before both GEMMs.
 
 ## Entry-point protocol
 
