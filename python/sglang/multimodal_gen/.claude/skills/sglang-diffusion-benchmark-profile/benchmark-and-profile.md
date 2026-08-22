@@ -308,10 +308,13 @@ Use the preset categories this way:
 | `turbowan21-t2v-1.3b` | `IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers` | No | Registered one-GPU TurboWan path at 832x480, 81 frames, and 4 steps. |
 | `turbowan21-t2v-14b-480p` | `IPostYellow/TurboWan2.1-T2V-14B-Diffusers` | No | One-H200 TurboWan 14B path at 832x480, 81 frames, and its 4-step DMD schedule. |
 | `turbowan21-t2v-14b-720p` | `IPostYellow/TurboWan2.1-T2V-14B-720P-Diffusers` | No | One-H200 high-resolution TurboWan 14B path at 1280x720, 81 frames, and its 4-step DMD schedule. Keep it separate because it is a distinct checkpoint. |
+| `turbowan22-i2v-a14b` | `IPostYellow/TurboWan2.2-I2V-A14B-Diffusers` | No | Four-GPU CFG/Ulysses image-conditioned baseline at 1280x720, 81 frames, and its 4-step DMD schedule. Uses the shared cat fixture and keeps both high- and low-noise guidance at 3.5. |
 | `helios-mid` | `BestWishYsh/Helios-Mid` | No | CI-sized 640x384, 33-frame pyramid-SR baseline using Helios-Mid's 20-step schedule. |
 | `helios-distilled` | `BestWishYsh/Helios-Distilled` | No | CI-sized 640x384, 33-frame DMD baseline at 10 steps and guidance 1.0. |
 | `joy-echo` | `jdopensource/JoyAI-Echo` | No | CI-aligned two-GPU Ulysses baseline at 640x384, 33 frames, 8 steps, with the cross-request memory bank disabled for isolated single-request timing. |
 | `cosmos3-edge-t2i` | `nvidia/Cosmos3-Edge` | No | One-GPU eager T2I baseline at Edge's native 640x640 shape, 35 steps, guidance 7.0. |
+| `cosmos3-edge-t2v` | `nvidia/Cosmos3-Edge` | No | One-GPU eager T2V baseline at Edge's native 832x480 video shape, 81 frames, 35 steps, and guidance 5.0. |
+| `cosmos3-edge-i2v` | `nvidia/Cosmos3-Edge` | No | Matching one-GPU I2V baseline with the shared cat fixture; keep it separate because image conditioning adds the VAE encode and latent-mask paths. |
 | `cosmos3-super-t2i-distilled` | `nvidia/Cosmos3-Super-Text2Image-4Step` | No | Four-GPU eager distilled T2I baseline. The checkpoint owns its fixed sigma schedule; the preset does not override the step count. |
 | `ltx25` | `Lightricks/LTX-2.5-Diffusers` | No | One-stage distilled eager baseline at 960x544, 121 frames, 8 steps, guidance 1.0. |
 | `ltx25-diffusion-decoder` | `Lightricks/LTX-2.5-Diffusers` | No | Same fixed DiT workload with `--use-diffusion-decoder`; attribute decoder time separately and confirm NATTEN `na3d` is active. |
