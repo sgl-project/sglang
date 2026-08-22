@@ -275,7 +275,7 @@ def run_eval(args):
     elif args.eval_name == "gpqa":
         from sglang.test.simple_eval_gpqa import GPQAEval
 
-        filename = (
+        filename = args.gpqa_data_path or (
             "https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv"
         )
         eval_obj = GPQAEval(filename, args.num_examples, args.num_threads)
@@ -508,6 +508,12 @@ if __name__ == "__main__":
         type=str,
         default="THUDM/LongBench-v2",
         help="Path to dataset file or HuggingFace dataset name for LongBench-v2",
+    )
+    parser.add_argument(
+        "--gpqa-data-path",
+        type=str,
+        default=None,
+        help="Optional local GPQA-Diamond CSV; avoids downloading it during a run",
     )
     parser.add_argument(
         "--categories",

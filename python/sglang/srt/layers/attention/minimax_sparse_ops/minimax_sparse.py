@@ -73,6 +73,9 @@ def minimax_sparse_prefill(
     idx_q_scale: Optional[float] = None,
     idx_k_scale: Optional[float] = None,
     idx_v_scale: Optional[float] = None,
+    msa_backend: Optional[str] = None,
+    msa_page_table: Optional[torch.Tensor] = None,
+    msa_graph_state=None,
 ):
     """Run MiniMax-M3 sparse prefill.
 
@@ -128,7 +131,11 @@ def minimax_sparse_prefill(
     # replaces this step; the indexer above is unchanged. MSA has no attn-sink
     # input, so keep the Triton path when sink is present.
     if use_msa and sink is None:
-        from .msa import MSAUnavailableError, msa_sparse_prefill_main
+        from .msa import (
+            MSAUnavailableError,
+            msa_runtime_fallback_allowed,
+            msa_sparse_prefill_main,
+        )
 
         try:
             o = msa_sparse_prefill_main(
@@ -146,8 +153,13 @@ def minimax_sparse_prefill(
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                backend=msa_backend,
+                page_table=msa_page_table,
+                graph_state=msa_graph_state,
             )
         except MSAUnavailableError as err:
+            if not msa_runtime_fallback_allowed():
+                raise
             _warn_msa_fallback(err)
             o = flash_prefill_with_gqa_share_sparse(
                 q=q,
@@ -226,6 +238,9 @@ def minimax_sparse_decode(
         torch.Tensor
     ] = None,  # per-forward MSA page table (cached)
     msa_plan=None,  # per-forward MSA fmha_sm100 plan (cached)
+    msa_backend: Optional[str] = None,
+    msa_page_table: Optional[torch.Tensor] = None,
+    msa_graph_state=None,
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
@@ -274,7 +289,11 @@ def minimax_sparse_decode(
         # Step 3: Sparse attention using topk index (main head). The MSA path
         # only replaces this step; keep the Triton path when sink is present.
         if use_msa and sink is None:
-            from .msa import MSAUnavailableError, msa_sparse_decode_main
+            from .msa import (
+                MSAUnavailableError,
+                msa_runtime_fallback_allowed,
+                msa_sparse_decode_main,
+            )
 
             try:
                 o = msa_sparse_decode_main(
@@ -292,8 +311,13 @@ def minimax_sparse_decode(
                     q_scale=q_scale,
                     k_scale=k_scale,
                     v_scale=v_scale,
+                    backend=msa_backend,
+                    page_table=msa_page_table,
+                    graph_state=msa_graph_state,
                 )
             except MSAUnavailableError as err:
+                if not msa_runtime_fallback_allowed():
+                    raise
                 _warn_msa_fallback(err)
                 o = flash_decode_with_gqa_share_sparse(
                     q=q,
