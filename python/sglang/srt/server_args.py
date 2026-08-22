@@ -6862,13 +6862,38 @@ class ServerArgs:
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
         if a2a_backend == "moonep":
-            logger.warning(
-                "MoonEP MoE is enabled in experimental BF16 PoC mode. "
-                "Cuda graph is disabled while the eager MoonEP dispatch/"
-                "prefetch/compute/combine path is validated."
-            )
-            self.cuda_graph_config.decode.backend = Backend.DISABLED
-            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            moonep_cuda_graph = envs.SGLANG_ENABLE_MOONEP_CUDA_GRAPH.get()
+            if self.enable_two_batch_overlap or self.enable_single_batch_overlap:
+                raise ValueError(
+                    "MoonEP does not support TBO or SBO; disable batch overlap."
+                )
+            if envs.SGLANG_MOONEP_ZERO_COPY.get():
+                if moonep_cuda_graph:
+                    raise ValueError(
+                        "SGLANG_MOONEP_ZERO_COPY supports eager execution only; "
+                        "unset SGLANG_ENABLE_MOONEP_CUDA_GRAPH."
+                    )
+                if self.forward_hooks:
+                    raise ValueError(
+                        "SGLANG_MOONEP_ZERO_COPY does not support forward hooks "
+                        "that may retain the leased MoonEP buffer view."
+                    )
+                if self.enable_lora or (
+                    self.enable_lora is None and self.lora_paths
+                ):
+                    raise ValueError(
+                        "SGLANG_MOONEP_ZERO_COPY does not support LoRA hooks "
+                        "that may retain the leased MoonEP buffer view."
+                    )
+            if not moonep_cuda_graph:
+                logger.warning(
+                    "Cuda graph is disabled while the eager MoonEP dispatch/"
+                    "prefetch/compute/combine path is validated. MoonEP's buffers "
+                    "are statically shaped, so capture should be possible; set "
+                    "SGLANG_ENABLE_MOONEP_CUDA_GRAPH=1 to try it."
+                )
+                self.cuda_graph_config.decode.backend = Backend.DISABLED
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
         if (
             self.moe_a2a_backend == "none" and is_npu()

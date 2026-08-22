@@ -134,7 +134,10 @@ def _get_deepep_comm_group(a2a_backend):
     return group
 
 
-def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
+def create_moe_dispatcher(
+    moe_runner_config: MoeRunnerConfig,
+    moonep_zero_copy_supported: bool = False,
+) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none() and is_npu():
         return AscendTPDispatcher(moe_runner_config)
@@ -155,7 +158,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         or a2a_backend.is_nixl()
         or a2a_backend.is_pplx()
     ):
-        return MaybeTboDeepEPDispatcher(
+        dispatcher_kwargs = dict(
             group=_get_deepep_comm_group(a2a_backend),
             router_topk=moe_runner_config.top_k,
             permute_fusion=True,
@@ -167,6 +170,9 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             async_finish=True,
             return_recv_hook=True,
         )
+        if a2a_backend.is_moonep():
+            dispatcher_kwargs["zero_copy_supported"] = moonep_zero_copy_supported
+        return MaybeTboDeepEPDispatcher(**dispatcher_kwargs)
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
             group=get_tp_group().device_group,
@@ -397,15 +403,15 @@ class FusedMoE(torch.nn.Module):
                 f"quant_method={type(self.quant_method).__name__})."
             )
 
-        moonep_global_weight_storage = get_moe_a2a_backend().is_moonep()
-        if moonep_global_weight_storage:
-            if quant_config is not None:
-                raise NotImplementedError(
-                    "MoonEP PoC supports unquantized BF16 MoE weights only."
-                )
+        # Quantized experts instead keep the normal EP
+        # shard and are relocated into a symmetric VMM range after loading
+        moonep_global_weight_storage = (
+            get_moe_a2a_backend().is_moonep() and quant_config is None
+        )
+        if get_moe_a2a_backend().is_moonep():
             if num_fused_shared_experts != 0:
                 raise NotImplementedError(
-                    "MoonEP PoC does not support fused shared experts yet."
+                    "MoonEP does not support fused shared experts yet."
                 )
 
         self.quant_method.create_weights(
@@ -435,7 +441,18 @@ class FusedMoE(torch.nn.Module):
                 self.w2_weight_bias._sglang_require_global_experts = True
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
-        self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
+        runner_backend = get_moe_runner_backend()
+        moonep_bf16_correctness_supported = (
+            self.quant_config is None
+            and params_dtype == torch.bfloat16
+            and (runner_backend.is_auto() or runner_backend.is_triton())
+        )
+        self.dispatcher = create_moe_dispatcher(
+            self.moe_runner_config,
+            moonep_zero_copy_supported=(
+                moonep_bf16_correctness_supported or self.use_deep_gemm
+            ),
+        )
         # Dispatchers are not nn.Modules, so they cannot register their own
         # buffers; the AITER expert mask would not survive a memory-saver resume.
         expert_mask = getattr(self.dispatcher, "expert_mask_gpu", None)

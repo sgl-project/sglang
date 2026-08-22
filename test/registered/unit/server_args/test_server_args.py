@@ -1506,6 +1506,7 @@ class TestMoonEPArgs(CustomTestCase):
             model_path="dummy",
             moe_a2a_backend="moonep",
         )
+        server_args.cuda_graph_config = CudaGraphConfig()
 
         server_args._handle_a2a_moe()
 
@@ -1516,6 +1517,47 @@ class TestMoonEPArgs(CustomTestCase):
         self.assertEqual(server_args.cuda_graph_config.decode.backend, Backend.DISABLED)
         self.assertEqual(server_args.cuda_graph_config.prefill.backend, Backend.DISABLED)
 
+    def test_moonep_zero_copy_rejects_cuda_graph(self):
+        with (
+            envs.SGLANG_MOONEP_ZERO_COPY.override(True),
+            envs.SGLANG_ENABLE_MOONEP_CUDA_GRAPH.override(True),
+        ):
+            server_args = ServerArgs(
+                model_path="dummy",
+                moe_a2a_backend="moonep",
+            )
+            with self.assertRaisesRegex(ValueError, "eager execution only"):
+                server_args._handle_a2a_moe()
+
+    def test_moonep_zero_copy_rejects_batch_overlap(self):
+        with envs.SGLANG_MOONEP_ZERO_COPY.override(True):
+            server_args = ServerArgs(
+                model_path="dummy",
+                moe_a2a_backend="moonep",
+                enable_two_batch_overlap=True,
+            )
+            with self.assertRaisesRegex(ValueError, "TBO or SBO"):
+                server_args._handle_a2a_moe()
+
+    def test_moonep_zero_copy_rejects_lora_hooks(self):
+        with envs.SGLANG_MOONEP_ZERO_COPY.override(True):
+            server_args = ServerArgs(
+                model_path="dummy",
+                moe_a2a_backend="moonep",
+                enable_lora=True,
+            )
+            with self.assertRaisesRegex(ValueError, "LoRA hooks"):
+                server_args._handle_a2a_moe()
+
+    def test_moonep_zero_copy_rejects_implicit_lora_hooks(self):
+        with envs.SGLANG_MOONEP_ZERO_COPY.override(True):
+            server_args = ServerArgs(
+                model_path="dummy",
+                moe_a2a_backend="moonep",
+                lora_paths=["adapter"],
+            )
+            with self.assertRaisesRegex(ValueError, "LoRA hooks"):
+                server_args._handle_a2a_moe()
 
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):
     """Validation for --prefill-only-disable-kv-cache.
