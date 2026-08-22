@@ -29,6 +29,9 @@ if is_intel:
     from sglang.srt.hardware_backend.xpu.kernels.fla.chunk_fwd import (
         chunk_gated_delta_rule_fwd_intra,
     )
+    from sglang.srt.hardware_backend.xpu.kernels.fla.chunk_o import (
+        chunk_fwd_o,
+    )
 
 CHUNK_SIZE = 64
 
