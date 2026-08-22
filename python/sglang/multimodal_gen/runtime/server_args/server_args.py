@@ -146,7 +146,9 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
     {
         "comfy-org/ideogram-4",
         "efficient-large-model/sana1.5_1.6b_1024px_diffusers",
+        "efficient-large-model/sana-video_2b_480p_diffusers",
         "sana1.5_1.6b_1024px_diffusers",
+        "sana-video_2b_480p_diffusers",
         "fal/ideogram-v4-fast",
         "fal/ideogram-v4-instant",
         "glm-image",
@@ -186,6 +188,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "MiniMaxH3PipelineConfig",
         "QwenImagePipelineConfig",
         "SanaPipelineConfig",
+        "SanaVideoPipelineConfig",
         "ZImagePipelineConfig",
     }
 )
@@ -646,7 +649,7 @@ class ServerArgs(DisaggServerArgsMixin):
         logger.warning(
             "[Diffusion BCG] disabled for %s: only Ideogram-4, "
             "Lightricks/LTX-2, LongCat-Image, MiniMax-H3, "
-            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, "
+            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, SANA-Video, "
             "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image are "
             "currently supported.",
             pipeline_config_name,
@@ -1823,10 +1826,11 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=None,
             help=(
-                "The attention backend to use. For SGLang-native pipelines, use "
-                "values like fa, torch_sdpa, sage_attn, etc. For diffusers pipelines, "
-                "use diffusers attention backend names such as flash, _flash_3_hub, "
-                "sage, or xformers."
+                "The global attention backend. Native DiT components treat it as "
+                "strict; auxiliary native components use a compatible fallback when "
+                "needed. Use --component-attention-backends for a component-scoped "
+                "choice. For diffusers pipelines, use names such as flash, "
+                "_flash_3_hub, sage, or xformers."
             ),
         )
         parser.add_argument(
