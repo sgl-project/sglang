@@ -11,6 +11,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils import is_xpu
 
 from .utils import make_name
 
@@ -56,6 +57,10 @@ def topk_transform_512(
 ) -> None:
     if is_hip_runtime():
         torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
+            scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+        )
+    elif is_xpu():
+        torch.ops.sgl_kernel.topk_transform_512(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
         )
     else:
@@ -143,6 +148,17 @@ def topk_transform_512_v2(
     the valid way to express "no tokens": the row takes the trivial path and
     the output is all -1.
     """
+    if is_xpu():
+        torch.ops.sgl_kernel.topk_transform_512_v2(
+            scores,
+            seq_lens,
+            page_tables,
+            out_page_indices,
+            page_size,
+            metadata,
+            out_raw_indices,
+        )
+        return
     module = _jit_topk_v2_module()
     module.topk_transform_paged(
         scores,
