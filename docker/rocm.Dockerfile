@@ -1,5 +1,5 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx1250-rocm7_15 -t v0.5.17-rocm715-gfx1250 -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx1250-rocm7_14 -t v0.5.17-rocm714-gfx1250 -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx942 -t v0.5.17-rocm700-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx942-rocm720 -t v0.5.17-rocm720-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx942-rocm724 -t v0.5.17-rocm724-mi30x -f rocm.Dockerfile .
@@ -17,7 +17,7 @@
 # Keep the build-arg for user to select the desired nic support, current choice: [ainic, bxnt]
 # if no set this arg, it will support nic auto detection. On a target with more than 1 type of
 # RDMA NICs installed (rare), overwrite w. runtime env MORI_DEVICE_NIC = "bnxt"|"ionic"|"mlx5"
-#   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx1250-rocm7_15 --build-arg ENABLE_MORI=1 -t v0.5.17-rocm715-gfx1250 -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx1250-rocm7_14 --build-arg ENABLE_MORI=1 -t v0.5.17-rocm714-gfx1250 -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx942 --build-arg ENABLE_MORI=1 -t v0.5.17-rocm700-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx942-rocm720 --build-arg ENABLE_MORI=1 -t v0.5.17-rocm720-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx950 --build-arg ENABLE_MORI=1 -t v0.5.17-rocm700-mi35x -f rocm.Dockerfile .
@@ -30,7 +30,7 @@
 #   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.17-rocm720-mi35x -f rocm.Dockerfile .
 
 # Default base images
-ARG BASE_IMAGE_1250_ROCM7_15="ubuntu:24.04"
+ARG BASE_IMAGE_1250_ROCM7_14="ubuntu:24.04"
 ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_942_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 ARG BASE_IMAGE_942_ROCM724="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0"
@@ -42,9 +42,9 @@ ARG BASE_IMAGE_950_ROCM724="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_re
 ARG GPU_ARCH=gfx950
 
 # ===============================
-# Base image 1250 with rocm7_15 and args
+# Base image 1250 with rocm7_14 and args
 # Builds from ubuntu:24.04 — installs ROCm SDK and torch stack via pip.
-FROM $BASE_IMAGE_1250_ROCM7_15 AS gfx1250-rocm7_15
+FROM $BASE_IMAGE_1250_ROCM7_14 AS gfx1250-rocm7_14
 
 # Install Python and system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -60,9 +60,9 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 RUN python3 -m pip install --no-cache-dir -U pip setuptools setuptools_scm wheel
 
 # Version pins — override with --build-arg to update
-ARG ROCM_VERSION="7.15.0a20260712"
-ARG INDEX_URL="https://rocm.nightlies.amd.com/whl-multi-arch/"
-ARG PIP_EXTRA_INDEX_URL="https://rocm.devreleases.amd.com/whl-multi-arch/"
+ARG ROCM_VERSION="7.14.0"
+ARG INDEX_URL="https://repo.amd.com/rocm/whl-multi-arch/"
+# ARG PIP_EXTRA_INDEX_URL="https://rocm.devreleases.amd.com/whl-multi-arch/"
 ARG TORCH_VERSION="2.11.0"
 ARG TORCHVISION_VERSION="0.26.0"
 ARG TRITON_VERSION="3.7.1+git0263a6a6"
@@ -70,8 +70,10 @@ ARG TRITON_VERSION="3.7.1+git0263a6a6"
 # ROCm SDK + PyTorch stack — single pip install, single index.
 RUN python3 -m pip install --no-cache-dir --pre \
     --index-url ${INDEX_URL} \
-    --extra-index-url ${PIP_EXTRA_INDEX_URL} \
-    "rocm[libraries,devel,device-gfx1250]==${ROCM_VERSION}" \
+    "rocm-sdk-core==${ROCM_VERSION}" \
+    "rocm-sdk-libraries==${ROCM_VERSION}" \
+    "rocm-sdk-devel==${ROCM_VERSION}" \
+    "rocm-sdk-device-gfx1250==${ROCM_VERSION}" \
     "torch[device-gfx1250]==${TORCH_VERSION}+rocm${ROCM_VERSION}" \
     "torchvision[device-gfx1250]==${TORCHVISION_VERSION}+rocm${ROCM_VERSION}" \
     "torchaudio==${TORCH_VERSION}+rocm${ROCM_VERSION}" \
@@ -100,7 +102,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
+ENV AITER_COMMIT_DEFAULT="aa30480f3bcda73da17a44339a3d05beedf83f2c"
 ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
 
 # ===============================
@@ -317,7 +319,7 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
 # See https://github.com/ROCm/ROCm/issues/5992
 RUN set -eux; \
     case "${GPU_ARCH}" in \
-      *rocm7_15*) \
+      *rocm7_14*) \
         ;; \
       *rocm724*) \
         echo "ROCm 7.2.4 (GPU_ARCH=${GPU_ARCH}): installing libdrm-amdgpu from graphics/7.2.4 noble"; \
@@ -361,7 +363,7 @@ RUN apt-get purge -y sccache; python -m pip uninstall -y sccache; rm -f "$(which
 # The ROCm 7.2 base image (rocm/pytorch) does not pre-install this package.
 RUN set -eux; \
     case "${GPU_ARCH}" in \
-      *rocm7_15*) \
+      *rocm7_14*) \
         # Should install it properly, however it seems there are race
         # conditions between torch and amdsmi module initialization code.
         # keep the following section commented before it is fixed.
@@ -444,7 +446,7 @@ RUN git clone ${AITER_REPO} \
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
      && echo "[AITER] AITER_USE_SYSTEM_TRITON=${AITER_USE_SYSTEM_TRITON}" \
-     && if [ "${GPU_ARCH}" = "gfx1250-rocm7_15" ]; then \
+     && if [ "${GPU_ARCH}" = "gfx1250-rocm7_14" ]; then \
           PATH=$PATH:$ROCM_HOME/llvm/bin ENABLE_CK=0 GPU_ARCHS="${GPU_ARCH_LIST}" python setup.py build_ext --inplace \
           && PATH=$PATH:$ROCM_HOME/llvm/bin ENABLE_CK=0 GPU_ARCHS="${GPU_ARCH_LIST}" pip install --no-build-isolation -e .; \
         elif [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
@@ -552,12 +554,12 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
 RUN pip list --format=freeze | grep -E '^(torch|triton)' > /tmp/constraints.txt
 
 # srt_hip pins compressed-tensors==0.15.0, which requires torch<2.11 and so
-# cannot be satisfied on the ROCm 7.2.4/7.15 torch 2.11 stack. The *_torch2_11 extras
+# cannot be satisfied on the ROCm 7.2.4/7.14 torch 2.11 stack. The *_torch2_11 extras
 # carry a 0.16.0 pin instead; all other flavors keep the extras they used before.
 RUN cd sglang \
     && cp python/pyproject_other.toml python/pyproject.toml \
     && case "${GPU_ARCH}" in \
-         *-rocm7_15) srt_extras="srt_hip_torch2_11,diffusion_hip"; \
+         *-rocm7_14) srt_extras="srt_hip_torch2_11,diffusion_hip"; \
                      all_extras="all_hip_torch2_11" ; \
                      CONS="-c /tmp/constraints.txt" ; \
                      ;; \
@@ -683,7 +685,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   git fetch --depth=1 origin "${TILELANG_COMMIT}" || true && \
   git checkout -f "${TILELANG_COMMIT}" && \
   git submodule update --init --recursive && \
-  if [ "${GPU_ARCH}" = "gfx1250-rocm7_15" ]; then \
+  if [ "${GPU_ARCH}" = "gfx1250-rocm7_14" ]; then \
     export ROCM_PATH=${ROCM_HOME}; \
   else \
     export ROCM_PATH=/opt/rocm; \
@@ -796,7 +798,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   git checkout "${MORI_COMMIT}"; \
   git submodule update --init --recursive; \
   \
-  if [ "${GPU_ARCH}" = "gfx1250-rocm7_15" ]; then \
+  if [ "${GPU_ARCH}" = "gfx1250-rocm7_14" ]; then \
     export ROCM_PATH=${ROCM_HOME}; \
     # Build with proper CMAKE_PREFIX_PATH to find NUMA and other ROCm SDK dependencies
     PATH=${ROCM_HOME}/bin:$PATH \
@@ -856,7 +858,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
 # Torch may hardcode triton== in Requires-Dist. Relax to >= so the pinned Triton
 # installed below satisfies the requirement without pip pulling CUDA torch.
 #   rocm720:   repack the base-image .whl (bundled at /) and reinstall torch.
-#   rocm7_15:  patch the pip-installed torch METADATA in site-packages.
+#   rocm7_14:  patch the pip-installed torch METADATA in site-packages.
 #   rocm724:   torch upgraded earlier; Requires-Dist fixed after the Triton swap.
 #   others:    skip (BUILD_TRITON=0 or no pin to relax).
 # --- rocm720: repack the base-image torch .whl with the triton pin relaxed ---
@@ -918,7 +920,7 @@ RUN case "${GPU_ARCH}" in \
     esac \
     && rm -f /tmp/relax_triton_whl.py
 
-# --- rocm7_15: patch the pip-installed torch METADATA in-place ---
+# --- rocm7_14: patch the pip-installed torch METADATA in-place ---
 RUN cat > /tmp/relax_triton_meta.py <<'PY'
 import csv, re, sys
 from pathlib import Path
@@ -948,10 +950,10 @@ with record_path.open("w", newline="", encoding="utf-8") as f:
 PY
 
 RUN case "${GPU_ARCH}" in \
-      *rocm7_15*) \
-        echo "[torch patch] ROCm 7.15 (${GPU_ARCH}): relax triton pin in installed torch"; \
+      *rocm7_14*) \
+        echo "[torch patch] ROCm 7.14 (${GPU_ARCH}): relax triton pin in installed torch"; \
         python3 /tmp/relax_triton_meta.py ;; \
-      *) echo "[torch patch] rocm7_15: skip (${GPU_ARCH})" ;; \
+      *) echo "[torch patch] rocm7_14: skip (${GPU_ARCH})" ;; \
     esac \
     && rm -f /tmp/relax_triton_meta.py
 
@@ -972,8 +974,8 @@ RUN python3 -c "from pathlib import Path; import transformers.dynamic_module_uti
 # torch 2.11 names this `triton-rocm`; uninstall it so the pin is the only Triton.
 RUN if [ "$BUILD_TRITON" = "1" ]; then \
         case "${GPU_ARCH}" in \
-          *rocm7_15*) \
-            echo "[Triton] ROCm 7.15: building from source (${TRITON_COMMIT})"; \
+          *rocm7_14*) \
+            echo "[Triton] ROCm 7.14: building from source (${TRITON_COMMIT})"; \
             pip uninstall -y triton \
             && apt-get update && apt-get install -y --no-install-recommends cmake && rm -rf /var/lib/apt/lists/* \
             && git clone ${TRITON_REPO} triton-custom \

@@ -120,7 +120,7 @@ srt_hip = [
 
 # Kept in step with srt_hip above by hand; only the two pins below differ.
 srt_hip_torch2_11 = [
-  # ROCm 7.2.4 and >7.15 uses torch 2.11. compressed-tensors 0.15.0 requires
+  # ROCm 7.2.4 and >=7.14 uses torch 2.11. compressed-tensors 0.15.0 requires
   # torch<2.11, while 0.16.0 supports torch>=2.10.
   "compressed-tensors==0.16.0",
   "petit_kernel==0.0.2",

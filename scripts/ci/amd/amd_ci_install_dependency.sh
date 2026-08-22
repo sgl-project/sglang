@@ -174,7 +174,7 @@ CI_ROCM_VERSION=$(docker exec ci_sglang bash -c 'cat $ROCM_HOME/.info/version 2>
 echo "Detected ROCm version inside container: ${CI_ROCM_VERSION}"
 
 if [[ "${CI_ROCM_VERSION}" != "unknown" ]] && \
-   [[ "$(printf '%s\n' "7.15.0" "${CI_ROCM_VERSION}" | sort -V | head -n1)" == "7.15.0" ]]; then
+   [[ "$(printf '%s\n' "7.14.0" "${CI_ROCM_VERSION}" | sort -V | head -n1)" == "7.14.0" ]]; then
   CT_EXTRA="rocm_rock"
 else
   CT_EXTRA="rocm_legacy"
@@ -304,7 +304,7 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
     cd /sgl-workspace/mori
     git checkout '${MORI_COMMIT}'
     git submodule update --init --recursive
-    if [[ '${ROCM_VERSION}' != 'unknown' ]] && [[ \"\$(printf '%s\n' '7.15.0' '${ROCM_VERSION}' | sort -V | head -n1)\" == '7.15.0' ]]; then
+    if [[ '${ROCM_VERSION}' != 'unknown' ]] && [[ \"\$(printf '%s\n' '7.14.0' '${ROCM_VERSION}' | sort -V | head -n1)\" == '7.14.0' ]]; then
       apt-get update
       apt-get install -y --no-install-recommends libgrpc++-dev 2>/dev/null || true
       # Fix ROCm SDK: add find_package(NUMA) before hsakmt
@@ -348,13 +348,13 @@ echo "[CI-AITER-CHECK] Runner GPU_ARCH=${GPU_ARCH}"
 
 # ROCm 7.0 keeps the Triton its base image ships;
 # ROCm 7.2 images run on the Triton AITER pins, so a rebuilt AITER has to bring its own along.
-# TODO: ROCm 7.15 and later should keep the triton built in the image, but we need
+# TODO: ROCm 7.14 and later should keep the triton built in the image, but we need
 #       to revisit the effect in CI test time.
 IMAGE_HIP_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.version.hip or "")')
 case "${IMAGE_HIP_VERSION}" in
     7.0*)  INSTALL_AITER_TRITON="false" ;;
     7.2*)  INSTALL_AITER_TRITON="true" ;;
-    7.15*) INSTALL_AITER_TRITON="false" ;;
+    7.14*) INSTALL_AITER_TRITON="false" ;;
     *)
         echo "[CI-AITER-CHECK] ERROR: Unsupported or empty HIP version: '${IMAGE_HIP_VERSION}'"
         exit 1
@@ -479,9 +479,9 @@ PY
     ROCM_VERSION=$(docker exec ci_sglang bash -c 'cat $ROCM_HOME/.info/version 2>/dev/null || cat /opt/rocm/.info/version 2>/dev/null || echo unknown')
     echo "[CI-AITER-CHECK] ROCm version=${ROCM_VERSION}"
 
-    # build AITER with ROCm 7.15 awareness
-    if [[ "${ROCM_VERSION}" != "unknown" ]] && [[ "$(printf '%s\n' "7.15.0" "${ROCM_VERSION}" | sort -V | head -n1)" == "7.15.0" ]]; then
-        echo "[CI-AITER-CHECK] ROCm version ${ROCM_VERSION} >= 7.15.0 detected, using pip install --no-build-isolation"
+    # build AITER with ROCm 7.14 awareness
+    if [[ "${ROCM_VERSION}" != "unknown" ]] && [[ "$(printf '%s\n' "7.14.0" "${ROCM_VERSION}" | sort -V | head -n1)" == "7.14.0" ]]; then
+        echo "[CI-AITER-CHECK] ROCm version ${ROCM_VERSION} >= 7.14.0 detected, using pip install --no-build-isolation"
         docker exec ci_sglang bash -c "
             set -euo pipefail
             cd /sgl-workspace/aiter
@@ -501,7 +501,7 @@ PY
             "
         fi
 
-        echo "[CI-AITER-CHECK] ROCm version ${ROCM_VERSION} < 7.15.0 or unknown, using setup.py develop"
+        echo "[CI-AITER-CHECK] ROCm version ${ROCM_VERSION} < 7.14.0 or unknown, using setup.py develop"
         docker exec ci_sglang bash -c "
             cd /sgl-workspace/aiter && \
             AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
