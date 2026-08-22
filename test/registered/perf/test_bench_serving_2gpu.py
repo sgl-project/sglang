@@ -4,6 +4,8 @@ Performance tests for 2-GPU that need large GPUs (H200 80GB) - MoE and Pipeline 
 
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
@@ -18,6 +20,7 @@ register_cuda_ci(est_time=721, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=1450, suite="stage-b-test-2-gpu-large-amd")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestBenchServing2GPU(CustomTestCase):
     def test_moe_offline_throughput_default(self):
         res = run_bench_serving(

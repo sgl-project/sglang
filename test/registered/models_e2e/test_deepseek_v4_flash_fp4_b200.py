@@ -10,6 +10,8 @@ Registry: base-c-test-4-gpu-b200 (per-commit, 4x B200)
 
 import unittest
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
@@ -33,6 +35,7 @@ _DEEPEP_ENV = {
 }
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDSV4FlashFP4B200(
     SpecDecodingMixin,
     BasicDecodeCorrectnessMixin,
@@ -77,6 +80,7 @@ class TestDSV4FlashFP4B200(
             kill_process_tree(cls.process.pid)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDSV4FlashFP4B200Balanced(
     SpecDecodingMixin,
     BasicDecodeCorrectnessMixin,
@@ -126,6 +130,7 @@ class TestDSV4FlashFP4B200Balanced(
             kill_process_tree(cls.process.pid)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDSV4FlashFP4NonMTPB200(
     BasicDecodeCorrectnessMixin, GSM8KMixin, CustomTestCase
 ):
@@ -162,6 +167,7 @@ class TestDSV4FlashFP4NonMTPB200(
             kill_process_tree(cls.process.pid)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDSV4FlashFP4BreakableCudaGraphB200(
     BasicDecodeCorrectnessMixin, GSM8KMixin, CustomTestCase
 ):

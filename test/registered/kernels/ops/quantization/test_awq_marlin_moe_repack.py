@@ -12,6 +12,9 @@ from sglang.srt.layers.quantization.utils import pack_cols, quantize_weights
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
 
 
 def _has_aot_awq_marlin_moe_repack() -> bool:

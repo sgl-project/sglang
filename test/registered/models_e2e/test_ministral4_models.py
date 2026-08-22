@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.mmmu_vlm_kit import MMMUMixin
@@ -11,12 +13,14 @@ register_cuda_ci(est_time=200, stage="extra-a", runner_config="2-gpu-large")
 MODEL = "mistralai/Mistral-Small-4-119B-2603"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMistralSmall4TextOnly(GSM8KMixin, DefaultServerBase):
     gsm8k_accuracy_thres = 0.9
     model = MODEL
     other_args = ["--tp-size", "2", "--trust-remote-code"]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMistralSmall4MMMU(MMMUMixin, MMMUServerBase):
     accuracy = 0.45
     model = MODEL

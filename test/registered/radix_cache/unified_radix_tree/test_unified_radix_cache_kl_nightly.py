@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from urllib.parse import urlparse
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -141,6 +142,7 @@ class AccuracyTwoPassMixin:
         )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestGLM5HiRadixCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):
     """GLM-5.2-FP8 + HiCache L3 (file backend), with HiRadixTree."""
 
@@ -197,6 +199,7 @@ class TestGLM5HiRadixCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):
             shutil.rmtree(cls.hicache_dir, ignore_errors=True)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestGLM5UnifiedRadixCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):
     """GLM-5.2-FP8 + HiCache L3 (file backend), with UnifiedRadixTree."""
 

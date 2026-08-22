@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import numpy as np
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
@@ -154,6 +155,7 @@ def run_gsm8k_benchmark(
     return float(acc), float(invalid), float(latency)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestGLM51EvalMI35x(unittest.TestCase):
     """GLM-5.1 GSM8K Completion Evaluation Test for AMD MI35x."""
 

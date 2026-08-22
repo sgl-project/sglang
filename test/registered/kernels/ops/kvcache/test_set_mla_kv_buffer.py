@@ -11,6 +11,9 @@ from sglang.kernels.ops.kvcache.set_mla_kv_buffer import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
 
 DEVICE = "cuda"
 CACHE_SIZE = 4096

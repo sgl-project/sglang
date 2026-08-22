@@ -30,6 +30,7 @@ register_amd_ci(est_time=180, suite="stage-b-test-1-gpu-large-amd")
 AMD_MEM_FRACTION_STATIC = 0.6
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):
     """Test piecewise CUDA graph with Qwen2.5-VL-7B-Instruct model"""
 
@@ -69,6 +70,7 @@ class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):
         self.assertGreaterEqual(metrics["score"], 0.80)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPiecewiseCudaGraphQwen25VLEmbedding(CustomTestCase):
     """Test piecewise CUDA graph with Qwen2.5-VL-3B-Instruct embedding model"""
 

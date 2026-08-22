@@ -38,6 +38,7 @@ def _build_flat(seqs: list[list[int]]) -> torch.Tensor:
     return torch.tensor(flat, dtype=torch.int64, device=_DEVICE)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestScatterReqTokenIds(CustomTestCase):
     def test_scatter_byte_equal_basic(self) -> None:
         """Triton output matches the PyTorch reference for a small mixed batch."""
@@ -213,6 +214,7 @@ class TestScatterReqTokenIds(CustomTestCase):
             self.assertTrue(torch.equal(triton_pool, ref_pool))
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestScatterInputValidation(CustomTestCase):
     """Cover the strict input checks in launch_scatter_req_token_ids_kernel."""
 

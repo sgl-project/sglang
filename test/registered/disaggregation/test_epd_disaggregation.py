@@ -8,6 +8,7 @@ import unittest
 
 import grpc
 import openai
+import torch
 import zmq
 from grpc_health.v1 import health_pb2, health_pb2_grpc
 
@@ -40,6 +41,7 @@ KIMI_VL_MODEL = "moonshotai/Kimi-VL-A3B-Instruct"
 register_cuda_ci(est_time=300, stage="base-c", runner_config="4-gpu-h100")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(
     is_in_ci(),
     "Omni model EPD test with image, video, and audio modalities, running locally only",
@@ -619,6 +621,7 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
         )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(is_in_ci(), "Skipping in CI to reduce multi-GPU runtime")
 class TestEPDDisaggregationOneEncoder(MMMUMixin, PDDisaggregationServerBase):
     """Test EPD disaggregation with single encode server"""
@@ -751,6 +754,7 @@ class TestEPDDisaggregationOneEncoder(MMMUMixin, PDDisaggregationServerBase):
                     print(f"Error killing process: {e}")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEPDDisaggregationKimiVL(PDDisaggregationServerBase):
     """Regression test for Kimi-VL two-dimensional image grids in E/PD mode."""
 
@@ -929,6 +933,7 @@ class TestEPDDisaggregationKimiVL(PDDisaggregationServerBase):
             )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(
     is_in_ci(),
     "Qwen3.5 EPD image/video test runs locally only",
@@ -1112,6 +1117,7 @@ class TestEPDDisaggregationQwen35(PDDisaggregationServerBase):
         )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEPDDisaggregationMultiEncoders(MMMUMixin, PDDisaggregationServerBase):
     """
     Test EPD disaggregation with multiple encode servers for load balancing.
@@ -1268,6 +1274,7 @@ class TestEPDDisaggregationMultiEncoders(MMMUMixin, PDDisaggregationServerBase):
                     print(f"Error killing process: {e}")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(is_in_ci(), "Skipping in CI to reduce multi-GPU runtime")
 class TestEPDDisaggregationGrpcEncoderMMMU(MMMUMixin, PDDisaggregationServerBase):
     """Test MMMU evaluation with gRPC encoder in EPD mode."""
@@ -1431,6 +1438,7 @@ class TestEPDDisaggregationGrpcEncoderMMMU(MMMUMixin, PDDisaggregationServerBase
                     print(f"Error killing process: {e}")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(is_in_ci(), "Skipping in CI to reduce multi-GPU runtime")
 class TestEPDDisaggregationGrpcEncoderOnly(PDDisaggregationServerBase):
     """Test gRPC encoder server integration with zmq_to_scheduler transfers."""
@@ -1556,6 +1564,7 @@ class TestEPDDisaggregationGrpcEncoderOnly(PDDisaggregationServerBase):
             channel.close()
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(
     is_in_ci(),
     "TestEPDDisaggregationMooncake test requires RDMA hardware, skipping in CI",

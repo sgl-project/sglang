@@ -7,6 +7,8 @@ path with the DFlash hidden-state variant enabled.
 
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.pcg_spec_fixture import PCGSpecBase
 from sglang.test.test_utils import (
@@ -18,6 +20,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=110, stage="nightly", runner_config="1-gpu-large")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPCGWithDFlash(PCGSpecBase, CustomTestCase):
     """PCG + DFLASH on Llama-3.1-8B-Instruct."""
 

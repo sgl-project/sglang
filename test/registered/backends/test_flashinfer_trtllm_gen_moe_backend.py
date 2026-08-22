@@ -2,6 +2,8 @@ import os
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -15,6 +17,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=1770, stage="nightly", runner_config="4-gpu-b200")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class FlashinferTrtllmGenMoeBackendFP8Base:
     backend = None
 
@@ -62,6 +65,7 @@ class FlashinferTrtllmGenMoeBackendFP8Base:
         self.assertGreater(metrics["score"], 0.89)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class FlashinferTrtllmGenMoeBackendBF16Base:
     backend = None
 
@@ -110,6 +114,7 @@ class FlashinferTrtllmGenMoeBackendBF16Base:
         self.assertGreater(metrics["score"], 0.93)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class FlashinferTrtllmGenMoeBackendMXFP8Base:
     backend = None
 
@@ -155,6 +160,7 @@ class FlashinferTrtllmGenMoeBackendMXFP8Base:
         self.assertGreater(metrics["score"], 0.93)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class FlashinferTrtllmGenMoeBackendMXFP8MixedBF16Base:
     backend = None
 
@@ -199,6 +205,7 @@ class FlashinferTrtllmGenMoeBackendMXFP8MixedBF16Base:
         self.assertGreater(metrics["score"], 0.92)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class FlashinferTrtllmGenMoeBackendNVFP4Base:
     backend = None
     extra_env = {}

@@ -14,6 +14,7 @@
 
 import multiprocessing as mp
 import os
+import torch
 import unittest
 from typing import List
 
@@ -29,6 +30,7 @@ from sglang.test.lora_utils import (
 from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRABackend(CustomTestCase):
 
     def _run_backend_on_model_cases(self, model_cases: List[LoRAModelCase]):

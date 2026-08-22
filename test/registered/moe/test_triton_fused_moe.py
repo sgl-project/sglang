@@ -92,6 +92,7 @@ class TestFusedMOE(CustomTestCase):
 
         return weighted.sum(dim=1)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def _test_case(self, m, n, k, e, topk, dtype):
         rtol, atol = self.get_tolerance(dtype)
 

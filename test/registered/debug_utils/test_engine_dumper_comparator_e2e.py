@@ -22,10 +22,14 @@ from typing import Optional
 
 import pytest
 import requests
+import torch
 
-pytestmark = pytest.mark.filterwarnings(
-    "ignore:Unknown config option. asyncio_mode:pytest.PytestConfigWarning",
-)
+pytestmark = [
+    pytest.mark.filterwarnings(
+        "ignore:Unknown config option. asyncio_mode:pytest.PytestConfigWarning",
+    ),
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA"),
+]
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci

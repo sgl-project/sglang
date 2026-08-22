@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.lm_eval_kit import LMEvalMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
@@ -19,6 +21,7 @@ NEMOTRON_3_NANO_THINKING_ARGS = [
 ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNvidiaNemotron3Nano30BFP8(LMEvalMixin, DefaultServerBase):
     """Test Nemotron-3-Nano-30B FP8 model with lm-eval GSM8K evaluation."""
 

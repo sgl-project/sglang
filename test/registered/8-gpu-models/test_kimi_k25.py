@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
@@ -13,6 +15,7 @@ register_cuda_ci(est_time=2820, stage="nightly", runner_config="8-gpu-b200")
 KIMI_K25_MODEL_PATH = "moonshotai/Kimi-K2.5"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestKimiK25(unittest.TestCase):
     """Unified test class for Kimi-K2.5 performance and accuracy.
 
