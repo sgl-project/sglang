@@ -830,6 +830,7 @@ class Scheduler(
                     self.ipc_channels.recv_from_tokenizer,
                     self.ipc_channels.recv_from_rpc,
                 ],
+                can_empty_cache=lambda: not self._engine_paused,
             )
         else:
             self.idle_sleeper = None
@@ -2162,7 +2163,9 @@ class Scheduler(
         # drains its request ring (rust_server_mode) instead of a zmq socket.
         self.recv_from_tokenizer = rust_server
         # Park the idle loop on the request ring within the rank-0 rust-server
-        self.idle_sleeper = RustServerIdleSleeper(rust_server)
+        self.idle_sleeper = RustServerIdleSleeper(
+            rust_server, can_empty_cache=lambda: not self._engine_paused
+        )
 
     def init_request_receiver(self) -> None:
         self.request_receiver = SchedulerRequestReceiver(
