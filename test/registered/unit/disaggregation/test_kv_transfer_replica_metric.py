@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from sglang.srt.disaggregation.base.conn import KVTransferMetric
+from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferMetric
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVSender
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -21,6 +21,14 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 KV_ITEM_LENS_SUM = 100
 STATE_ITEM_LENS_SUM = 7
+
+
+class _MetricOnlyKVSender(CommonKVSender):
+    def poll(self) -> KVPoll:
+        return KVPoll.Success
+
+    def failure_exception(self):
+        return None
 
 
 def _room(fan_out):
@@ -47,7 +55,7 @@ def _make_kv_mgr(is_mla_backend):
 
 def _make_sender(kv_mgr):
     """CommonKVSender bypassing __init__, wiring only the fields the path reads."""
-    sender = CommonKVSender.__new__(CommonKVSender)
+    sender = _MetricOnlyKVSender.__new__(_MetricOnlyKVSender)
     sender._transfer_metric = KVTransferMetric()
     sender._transfer_num_kv_indices = 0
     sender._transfer_num_state_indices = 0
