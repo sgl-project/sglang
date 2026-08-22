@@ -402,7 +402,7 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   // [num_slots, head_dim] bf16 cache (page_size==1) at row out_loc
   // kUniformFp8Store: write the whole head_dim (rope tail included) as plain
   // e4m3 at per-tensor scale 1.0 into the uniform 512-byte-per-token pool.
-  constexpr int64_t kPageBytes = kBf16Store        ? ((kHeadDim * 2ll) << kPageBits)
+  constexpr int64_t kPageBytes = kBf16Store         ? ((kHeadDim * 2ll) << kPageBits)
                                  : kUniformFp8Store ? (kHeadDim << kPageBits)
                                                     : host::div_ceil(584ll << kPageBits, 576) * 576;
   static_assert(kHeadDim == kBlockSize * kVecSize);
@@ -475,8 +475,7 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   const int64_t page = out_loc >> kPageBits;
   const int64_t offset = out_loc & ((1 << kPageBits) - 1);
   const auto page_ptr = params.kvcache + page * kPageBytes;
-  const auto value_ptr =
-      page_ptr + offset * (kBf16Store ? (kHeadDim * 2) : kUniformFp8Store ? kHeadDim : 576);
+  const auto value_ptr = page_ptr + offset * (kBf16Store ? (kHeadDim * 2) : kUniformFp8Store ? kHeadDim : 576);
 
   PDLTriggerSecondary<kUsePDL>();
 
@@ -549,8 +548,8 @@ struct FusedNormRopeKernel {
   static constexpr int64_t kIndexerBytes = 132 * kPageSize;
   static constexpr int64_t kFlashMLABytes = host::div_ceil(584 * kPageSize, 576) * 576;
   static constexpr int64_t kBf16Bytes = kHeadDim * 2 * kPageSize;  // plain bf16 cache
-  static constexpr int64_t kUniformBytes = kHeadDim * kPageSize;  // uniform e4m3, 512 B/token
-  static constexpr int64_t kPageBytes = kBf16Store        ? kBf16Bytes
+  static constexpr int64_t kUniformBytes = kHeadDim * kPageSize;   // uniform e4m3, 512 B/token
+  static constexpr int64_t kPageBytes = kBf16Store         ? kBf16Bytes
                                         : kUniformFp8Store ? kUniformBytes
                                                            : (kIsIndexer ? kIndexerBytes : kFlashMLABytes);
 
