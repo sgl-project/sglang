@@ -65,6 +65,9 @@ class LoadedModel(msgspec.Struct, frozen=True, kw_only=True):
 def maybe_downgrade_dtype_for_legacy_gpu(
     *, server_args: ServerArgs, model_config: ModelConfig
 ) -> None:
+    if not current_platform.is_cuda():
+        return
+
     if torch.cuda.get_device_capability()[0] < 8:
         logger.info(
             "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
