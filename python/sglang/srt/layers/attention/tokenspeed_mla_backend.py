@@ -351,24 +351,8 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         llama_4_scaling: Optional[torch.Tensor] = None,
     ):
         parallel = get_parallel()
-        # FlashInfer autotunes MoE kernels with a synthetic full-model decode
-        # and discards the attention/logits result.  On multi-node GB300, the
-        # synthetic full-head DCP metadata can make both the TokenSpeed and
-        # TRTLLM decode kernels surface cudaErrorNvlinkUncorrectable.  Skip
-        # attention only inside that explicitly scoped dummy pass.  Real
-        # requests and CUDA graph capture continue through TokenSpeed below.
         if parallel.dcp_enabled and get_in_autotune_dummy_run():
-            output = torch.zeros(
-                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
-                dtype=self.q_data_type,
-                device=q.device,
-            )
-            lse = torch.zeros(
-                (q.shape[0], layer.tp_q_head_num),
-                dtype=torch.float32,
-                device=q.device,
-            )
-            return output, lse
+            return self._dummy_dcp_decode_for_autotune(q, layer)
 
         if not parallel.dcp_enabled:
             return super().forward_decode(
