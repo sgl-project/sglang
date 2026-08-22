@@ -134,8 +134,6 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         )
 
         self.logits_processor = LogitsProcessor(text_config)
-
-        # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
     @classmethod
@@ -185,6 +183,15 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         return MiniMaxM3SparseForCausalLM.get_model_config_for_expert_location(
             text_config
         )
+
+    def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        self.set_eagle3_layers_to_capture(layer_ids)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(

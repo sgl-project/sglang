@@ -1632,11 +1632,18 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
-        # forward checks the per-layer ``_is_layer_to_capture`` flag, not the id
-        # list, so set it explicitly (mirrors qwen3_next/qwen2_moe).
         for layer_id in self.model.layers_to_capture:
             if 0 <= layer_id < len(self.model.layers):
                 setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
+
+    def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        self.set_eagle3_layers_to_capture(layer_ids)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
