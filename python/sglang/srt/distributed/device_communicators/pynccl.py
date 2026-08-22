@@ -347,8 +347,20 @@ class PyNcclCommunicator:
         )
         chunk_size = input_tensor.numel() // self.world_size
         dtype = ncclDataTypeEnum.from_torch(input_tensor.dtype)
+
+        # Keep the local chunk on-device instead of routing it through a
+        # grouped self-send/self-recv. RCCL can execute self P2P, but repeated
+        # CUDA-graph replay of grouped self P2P is not reliable on ROCm and can
+        # deadlock when the graph batch size changes. A stream-ordered D2D copy
+        # has identical all-to-all semantics and also removes two NCCL ops.
+        local_input = input_tensor.narrow(0, self.rank * chunk_size, chunk_size)
+        local_output = output_tensor.narrow(0, self.rank * chunk_size, chunk_size)
+        local_output.copy_(local_input)
+
         self.nccl.ncclGroupStart()
         for i in range(self.world_size):
+            if i == self.rank:
+                continue
             send_buf = input_tensor.narrow(0, i * chunk_size, chunk_size)
             self.nccl.ncclSend(
                 buffer_type(send_buf.data_ptr()),
