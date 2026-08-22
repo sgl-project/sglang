@@ -2,6 +2,75 @@ import torch
 import triton
 import triton.language as tl
 
+_UINT32_MASK = 0xFFFFFFFF
+def _rotl32_torch(x: torch.Tensor, r: int) -> torch.Tensor:
+    """Rotate left with uint32 semantics using int64 tensors."""
+    x = x & _UINT32_MASK
+    return ((x << r) | (x >> (32 - r))) & _UINT32_MASK
+
+def _fmix32_torch(h: torch.Tensor) -> torch.Tensor:
+    """Torch implementation matching fmix32()."""
+    h = (h ^ (h >> 16)) & _UINT32_MASK
+    h = (h * 0x85EBCA6B) & _UINT32_MASK
+    h = (h ^ (h >> 13)) & _UINT32_MASK
+    h = (h * 0xC2B2AE35) & _UINT32_MASK
+    h = (h ^ (h >> 16)) & _UINT32_MASK
+
+    return h
+
+
+def _murmur3_mix_torch(
+    h: torch.Tensor,
+    k: torch.Tensor,
+) -> torch.Tensor:
+    """Torch implementation matching murmur3_mix()."""
+    k = (k * 0xCC9E2D51) & _UINT32_MASK
+    k = _rotl32_torch(k, 15)
+    k = (k * 0x1B873593) & _UINT32_MASK
+    h = (h ^ k) & _UINT32_MASK
+    h = _rotl32_torch(h, 13)
+    h = (h * 5 + 0xE6546B64) & _UINT32_MASK
+
+    return h
+
+def _murmur_hash32_torch(
+    seed: torch.Tensor,
+    positions: torch.Tensor,
+    col_indices: torch.Tensor,
+) -> torch.Tensor:
+    """CPU implementation matching murmur_hash32_kernel bit-for-bit."""
+    # Use int64 because uint32 arithmetic support is limited in PyTorch.
+    # Masking after every operation preserves uint32 wraparound semantics.
+    seed = seed.to(torch.int64)
+    positions = positions.to(torch.int64)
+    col_indices = col_indices.to(torch.int64)
+
+    n = seed.shape[0]
+    m = col_indices.shape[0]
+
+    h = torch.zeros((n, m), dtype=torch.int64, device=seed.device)
+
+    # Process seed_low
+    seed_low = (seed & _UINT32_MASK).view(n, 1)
+    h = _murmur3_mix_torch(h, seed_low)
+
+    # Process seed_high
+    seed_high = ((seed >> 32) & _UINT32_MASK).view(n, 1)
+    h = _murmur3_mix_torch(h, seed_high)
+
+    # position block
+    pos = (positions & _UINT32_MASK).view(n, 1)
+    h = _murmur3_mix_torch(h, pos)
+
+    # column block
+    col = (col_indices & _UINT32_MASK).view(1, m)
+    h = _murmur3_mix_torch(h, col)
+
+
+    h = (h ^ 16) & _UINT32_MASK
+    h = _fmix32_torch(h)
+
+    return h.to(torch.uint32)
 
 @triton.jit
 def rotl32(x, r: tl.constexpr) -> tl.uint32:
@@ -108,6 +177,8 @@ def murmur_hash32(seed, positions, col_indices):
     assert (
         len(seed.shape) == 1 and len(col_indices.shape) == 1
     ), f"Inputs must be 1D tensors {seed.shape=} {col_indices.shape=}"
+    if seed.device.type == "cpu":
+        return _murmur_hash32_torch(seed, positions, col_indices)
     n = seed.shape[0]
     m = col_indices.shape[0]
     device = seed.device
