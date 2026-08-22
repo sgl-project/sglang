@@ -13,7 +13,6 @@ from .base_device_communicator import DeviceCommunicatorBase
 
 
 class CpuCommunicator(DeviceCommunicatorBase):
-
     def __init__(
         self,
         cpu_group: ProcessGroup,
@@ -34,12 +33,140 @@ class CpuCommunicator(DeviceCommunicatorBase):
         ):
             self.dist_module = _CPUSHMDistributed(self)
 
+        self._group_shm_handles: dict[tuple[int, ...], int] = {}
+        self._group_shm_available = self._load_group_shm_ops()
+
+    def _load_group_shm_ops(self) -> bool:
+        try:
+            import sgl_kernel  # noqa: F401
+        except ImportError:
+            return False
+
+        return (
+            hasattr(torch.ops.sgl_kernel, "shm_group_initialize")
+            and hasattr(torch.ops.sgl_kernel, "shm_group_allgather")
+            and hasattr(torch.ops.sgl_kernel, "shm_group_alltoall")
+            and hasattr(torch.ops.sgl_kernel, "shm_group_allreduce")
+        )
+
+    @staticmethod
+    def _sanitize_shm_name(name: str) -> str:
+        return "".join(c if c.isalnum() or c in ("_", "-", ".") else "_" for c in name)
+
+    def _get_group_shm_handle(self, group: ProcessGroup) -> int:
+        group_ranks = tuple(torch.distributed.get_process_group_ranks(group))
+
+        handle = self._group_shm_handles.get(group_ranks)
+        if handle is not None:
+            return handle
+
+        group_size = torch.distributed.get_world_size(group)
+        group_rank = torch.distributed.get_rank(group)
+
+        # Example:
+        #
+        #   sglang_group_1000_localhost_29500_sp_group_0_0_2
+        addr = self._sanitize_shm_name(os.environ.get("MASTER_ADDR", "localhost"))
+        port = self._sanitize_shm_name(os.environ.get("MASTER_PORT", "0"))
+        unique_name = self._sanitize_shm_name(self.unique_name)
+        ranks_name = "_".join(str(rank) for rank in group_ranks)
+
+        group_name = (
+            f"sglang_group_"
+            f"{os.getuid()}_"
+            f"{addr}_"
+            f"{port}_"
+            f"{unique_name}_"
+            f"{ranks_name}"
+        )
+        handle = int(
+            torch.ops.sgl_kernel.shm_group_initialize(
+                group_name, group_size, group_rank
+            )
+        )
+        self._group_shm_handles[group_ranks] = handle
+
+        return handle
+
+    def _can_use_group_shm_allgather(
+        self,
+        input_: torch.Tensor,
+    ) -> bool:
+        data_size = input_.numel() * input_.element_size()
+
+        return (
+            self._group_shm_available
+            and input_.device.type == "cpu"
+            and input_.is_contiguous()
+        )
+
+    def _can_use_group_shm_allreduce(
+        self,
+        input_: torch.Tensor,
+        op,
+    ) -> bool:
+        return (
+            self._group_shm_available
+            and op == torch.distributed.ReduceOp.SUM
+            and input_.device.type == "cpu"
+            and input_.is_contiguous()
+            and input_.dtype
+            in (
+                torch.float32,
+                torch.bfloat16,
+                torch.float16,
+            )
+        )
+
+    def _can_use_group_shm_alltoall(
+        self,
+        input_: torch.Tensor,
+        output: torch.Tensor,
+        group_size: int,
+    ) -> bool:
+
+        return (
+            self._group_shm_available
+            and input_.device.type == "cpu"
+            and output.device.type == "cpu"
+            and input_.is_contiguous()
+            and output.is_contiguous()
+            and input_.dtype == output.dtype
+            and input_.numel() == output.numel()
+            and input_.numel() % group_size == 0
+        )
+
     def all_reduce(
         self,
         input_: torch.Tensor,
         op: torch.distributed.ReduceOp | None = torch.distributed.ReduceOp.SUM,
+        group=None,
+        async_op: bool = False,
     ) -> torch.Tensor:
-        self.dist_module.all_reduce(input_, group=self.device_group, op=op)
+        if group is None:
+            group = self.device_group
+        group_size = torch.distributed.get_world_size(group)
+        if group_size == 1:
+            return input_
+        if not async_op and self._can_use_group_shm_allreduce(
+            input_,
+            op,
+        ):
+
+            handle = self._get_group_shm_handle(group)
+            torch.ops.sgl_kernel.shm_group_allreduce(
+                handle,
+                input_,
+            )
+            return input_
+
+        torch.distributed.all_reduce(
+            input_,
+            op=op,
+            group=group,
+            async_op=async_op,
+        )
+
         return input_
 
     def gather(
@@ -75,33 +202,79 @@ class CpuCommunicator(DeviceCommunicatorBase):
             output_tensor = None
         return output_tensor
 
-    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    def all_gather(
+        self, input_: torch.Tensor, dim: int = -1, group=None
+    ) -> torch.Tensor:
+        if group is None:
+            group = self.device_group
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
+        world_size = torch.distributed.get_world_size(group)
         input_size = input_.size()
         # NOTE: we have to use concat-style all-gather here,
         # stack-style all-gather has compatibility issues with
         # torch.compile . see https://github.com/pytorch/pytorch/issues/138795
-        output_size = (input_size[0] * self.world_size,) + input_size[1:]
+        output_size = (input_size[0] * world_size,) + input_size[1:]
         # Allocate output tensor.
         output_tensor = torch.empty(
             output_size, dtype=input_.dtype, device=input_.device
         )
-        # All-gather.
-        self.dist_module.all_gather_into_tensor(
-            output_tensor, input_, group=self.device_group
-        )
+
+        if self._can_use_group_shm_allgather(input_):
+            handle = self._get_group_shm_handle(group)
+
+            torch.ops.sgl_kernel.shm_group_allgather(
+                handle,
+                output_tensor,
+                input_,
+            )
+        else:
+            self.dist_module.all_gather_into_tensor(
+                output_tensor,
+                input_,
+                group=group,
+            )
 
         # Reshape
-        output_tensor = output_tensor.reshape((self.world_size,) + input_size)
+        output_tensor = output_tensor.reshape((world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
         output_tensor = output_tensor.reshape(
-            input_size[:dim]
-            + (self.world_size * input_size[dim],)
-            + input_size[dim + 1 :]
+            input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
         )
         return output_tensor
+
+    def all_to_all_single(
+        self,
+        output: torch.Tensor,
+        input_: torch.Tensor,
+        group: ProcessGroup | None = None,
+    ) -> None:
+        if group is None:
+            group = self.device_group
+
+        assert group is not None
+
+        group_size = torch.distributed.get_world_size(group)
+
+        if group_size == 1:
+            output.copy_(input_)
+            return
+
+        if self._can_use_group_shm_alltoall(input_, output, group_size):
+            handle = self._get_group_shm_handle(group)
+
+            torch.ops.sgl_kernel.shm_group_alltoall(
+                handle,
+                output,
+                input_,
+            )
+        else:
+            torch.distributed.all_to_all_single(
+                output,
+                input_,
+                group=group,
+            )
 
 
 class _CPUSHMDistributed:
@@ -160,3 +333,40 @@ class _CPUSHMDistributed:
         group: ProcessGroup | None = None,
     ) -> None:
         torch.ops._C.shm_all_gather(self.handle, input, output)
+
+    def all_to_all_single(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        group: ProcessGroup | None = None,
+    ) -> None:
+        """
+        TODO: Replace this with a native SHM all-to-all primitive to avoid
+        gathering data that the destination rank does not need.
+        """
+
+        TORCH_WORLD_SIZE = self.communicator.world_size
+        rank = self.communicator.rank_in_group
+
+        assert input.device.type == "cpu"
+        assert output.device.type == "cpu"
+        assert input.is_contiguous()
+        assert output.is_contiguous()
+        assert input.dtype == output.dtype
+        assert input.numel() == output.numel()
+        assert input.numel() % TORCH_WORLD_SIZE == 0
+        chunk_numel = input.numel() // TORCH_WORLD_SIZE
+
+        input_flat = input.view(-1)
+        output_flat = output.view(-1)
+
+        gathered = torch.empty(
+            TORCH_WORLD_SIZE * input_flat.numel(),
+            dtype=input.dtype,
+            device=input.device,
+        )
+        torch.ops._C.shm_all_gather(self.handle, input_flat, gathered)
+
+        gathered = gathered.view(TORCH_WORLD_SIZE, TORCH_WORLD_SIZE, chunk_numel)
+
+        output_flat.copy_(gathered[:, rank, :].reshape(-1))
