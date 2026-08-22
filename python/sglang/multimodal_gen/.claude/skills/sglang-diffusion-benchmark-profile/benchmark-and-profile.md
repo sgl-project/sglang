@@ -335,7 +335,8 @@ Use the preset categories this way:
 | `ltx23-two-stage` | `Lightricks/LTX-2.3` | No | Skill-only high-resolution stress preset for the native `LTX-2.3` two-stage path; uses `LTX2TwoStagePipeline`, 2 GPUs, 1536x1024, 121 frames, fps 24, 30 steps, guidance 3.0, seed 1234 |
 | `ltx23-two-stage-cfg-parallel` | `Lightricks/LTX-2.3` | No | Skill-only high-resolution CFG-parallel stress preset matching `ltx23-two-stage` plus `--cfg-parallel-size 2` |
 | `hunyuanvideo` | `hunyuanvideo-community/HunyuanVideo` | No | Skill-only native T2V preset at a model-supported 960x544 resolution, 65 requested frames, and 30 steps. Sequence-parallel runs may increase the frame count to satisfy their topology; record the resolved shape from the runtime log. |
-| `mova-720p` | `OpenMOSS-Team/MOVA-720p` | No | Skill-only extra preset |
+| `mova-360p` | `OpenMOSS-Team/MOVA-360p` | No | Two-GPU Ulysses I2VA baseline at 640x352 and 193 frames. Uses the upstream single-person fixture and a two-step profiling schedule. |
+| `mova-720p` | `OpenMOSS-Team/MOVA-720p` | No | Four-GPU Ulysses I2VA baseline at 1280x720 and 193 frames. Uses the same upstream single-person fixture and two-step profiling schedule. |
 | `helios` | `BestWishYsh/Helios-Base` | No | Skill-only extra preset |
 | `joyai-edit` | `jdopensource/JoyAI-Image-Edit-Diffusers` | No | Skill-only JoyAI image-edit preset; uses the cat image, 1024x1024, 40 steps, guidance 4.0, 2-GPU CFG parallel |
 | `firered-edit-1.0` | `FireRedTeam/FireRed-Image-Edit-1.0` | No | Skill-only FireRed 1.0 image-edit preset; QwenImageEditPlus native path; uses 2-GPU CFG parallel |

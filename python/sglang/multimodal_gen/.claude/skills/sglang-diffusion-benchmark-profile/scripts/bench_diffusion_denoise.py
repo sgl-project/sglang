@@ -961,8 +961,21 @@ MODELS = {
             "--num-inference-steps=30",
         ],
     },
-    # Skill-only extra preset
-    # Requires: <repo>/inputs/diffusion_benchmark/figs/mova_single_person.jpg
+    # Skill-only extra presets
+    # Require: <repo>/inputs/diffusion_benchmark/figs/mova_single_person.jpg
+    "mova-360p": {
+        "path": "OpenMOSS-Team/MOVA-360p",
+        "prompt": 'A man in a blue blazer and glasses speaks in a formal indoor setting, framed by wooden furniture and a filled bookshelf. Quiet room acoustics underscore his measured tone as he delivers his remarks. At one point, he says, "I would also believe that this advance in AI recently was not unexpected."',
+        "image_path": str(ASSET_DIR / "mova_single_person.jpg"),
+        "extra_args": [
+            "--adjust-frames=false",
+            "--num-gpus=2",
+            "--ulysses-degree=2",
+            "--num-frames=193",
+            "--fps=24",
+            "--num-inference-steps=2",
+        ],
+    },
     "mova-720p": {
         "path": "OpenMOSS-Team/MOVA-720p",
         "prompt": 'A man in a blue blazer and glasses speaks in a formal indoor setting, framed by wooden furniture and a filled bookshelf. Quiet room acoustics underscore his measured tone as he delivers his remarks. At one point, he says, "I would also believe that this advance in AI recently was not unexpected."',
