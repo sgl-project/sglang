@@ -27,6 +27,7 @@ from sglang.srt.batch_invariant_ops import (
     rms_norm_batch_invariant,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.quantization.fp8_utils import MXFP8_DENSE_PTPC_DECODE_MAX_M
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -39,6 +40,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_gfx95_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -136,6 +138,8 @@ if _is_hip:
         _has_rocm_triton_gemma_rms_norm = True
     except ImportError:
         _has_rocm_triton_gemma_rms_norm = False
+
+_FUSE_NORM_FP8_MAX_M = MXFP8_DENSE_PTPC_DECODE_MAX_M if is_gfx95_supported() else 0
 
 if _is_cuda:
     # HF-semantics RMSNorm kernel (JIT-compiled).  Used when `cast_x_before_out_mul=True`
@@ -367,6 +371,36 @@ def _forward_with_allreduce_fusion_quant_per_group(
     if use_bpreshuffle:
         scale_out = materialize_bpreshuffle_fp8_scale(scale_out)
     return (bf16_out, fp8_out, scale_out), residual_out
+
+
+def _forward_with_allreduce_fusion_quant_per_token(
+    norm_module,
+    x: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    weight: torch.Tensor,
+):
+    """Fused AR + RMSNorm + per-token FP8 quant (ROCm/aiter, single kernel).
+
+    Returns ``(normed_bf16, residual)`` where the bf16 output carries the
+    quantized pair as ``out._fp8_qinput = (fp8, scale)`` -- the same handoff
+    the Triton fused-add-RMSNorm uses --
+    or ``None`` when the fused kernel cannot service the request.
+    """
+    if residual is None or not _use_aiter:
+        return None
+
+    from sglang.srt.distributed import (
+        tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_token,
+    )
+
+    result = tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_token(
+        x, residual, weight, norm_module.variance_epsilon
+    )
+    if result is None or len(result) != 4:
+        return None
+    fp8_out, residual_out, scale_out, bf16_out = result
+    bf16_out._fp8_qinput = (fp8_out, scale_out)
+    return bf16_out, residual_out
 
 
 def _fp8_static_input_scale(linear) -> Optional[torch.Tensor]:
@@ -1133,7 +1167,11 @@ class GemmaRMSNorm(BaseFusedOp):
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
                 return rocm_triton_gemma_fused_add_rmsnorm(
-                    x, residual, self.weight.data, self.variance_epsilon
+                    x,
+                    residual,
+                    self.weight.data,
+                    self.variance_epsilon,
+                    emit_fp8=x.numel() // x.shape[-1] <= _FUSE_NORM_FP8_MAX_M,
                 )
             return rocm_triton_gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
 
@@ -1259,6 +1297,16 @@ class GemmaRMSNorm(BaseFusedOp):
             group_size,
             use_attn_tp_group,
             keep_bf16,
+        )
+
+    def forward_with_allreduce_fusion_quant_per_token(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ):
+        """Fused AR + RMSNorm + per-token FP8 quant (Gemma-style: weight + 1)."""
+        return _forward_with_allreduce_fusion_quant_per_token(
+            self, x, residual, self.gemma_weight
         )
 
 

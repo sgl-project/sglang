@@ -60,6 +60,7 @@ from sglang.srt.layers.moe import (
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    MXFP8_DENSE_PTPC_DECODE_MAX_M,
     _use_aiter_bpreshuffle_gfx95,
     materialize_bpreshuffle_fp8_scale_tuple,
 )
@@ -94,6 +95,15 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
+_fuse_norm_fp8_max_m = MXFP8_DENSE_PTPC_DECODE_MAX_M if _is_gfx95_supported else 0
+
+
+def _fuse_norm_fp8_quant(hidden_states: torch.Tensor) -> bool:
+    """Same gate as the Triton fused-add-RMSNorm fp8 emission: only up to the
+    M where the ptpc decode GEMM (the only consumer of the pre-quantized pair)
+    is selected, and only on the arch that has that GEMM."""
+    return hidden_states.numel() // hidden_states.shape[-1] <= _fuse_norm_fp8_max_m
+
 
 if _use_aiter:
     from aiter.ops.rmsnorm import add_rmsnorm_quant as _aiter_add_rmsnorm_quant
@@ -458,6 +468,7 @@ class LayerCommunicator:
         force_layernorm_before_dp_gather: bool = False,
         enable_fused_ar_quant: bool = False,
         fused_ar_quant_keep_bf16: bool = False,
+        enable_fused_ar_quant_per_token: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -468,6 +479,7 @@ class LayerCommunicator:
         self.force_layernorm_before_dp_gather = force_layernorm_before_dp_gather
         self.enable_fused_ar_quant = enable_fused_ar_quant
         self.fused_ar_quant_keep_bf16 = fused_ar_quant_keep_bf16
+        self.enable_fused_ar_quant_per_token = enable_fused_ar_quant_per_token
 
         self._context = CommunicateContext.init_new()
         self._context.force_layernorm_before_dp_gather = (
@@ -586,6 +598,21 @@ class LayerCommunicator:
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
                     quant_result = None
                     if (
+                        self.enable_fused_ar_quant_per_token
+                        and _fuse_norm_fp8_quant(hidden_states)
+                        and _use_aiter
+                        and hasattr(
+                            self.input_layernorm,
+                            "forward_with_allreduce_fusion_quant_per_token",
+                        )
+                    ):
+                        # Fused AR+RMSNorm+per-token quant: the bf16 output
+                        # carries (fp8, scale) for ptpc consumers, matching the
+                        # Triton fused-add-RMSNorm handoff.
+                        quant_result = self.input_layernorm.forward_with_allreduce_fusion_quant_per_token(
+                            hidden_states, residual
+                        )
+                    if quant_result is None and (
                         self.enable_fused_ar_quant
                         and _use_aiter
                         and hasattr(

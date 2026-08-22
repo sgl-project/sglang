@@ -18,6 +18,12 @@ from ..common.utils import (
 )
 
 
+def _prune_decode_configs(configs, named_args, **kwargs):
+    """Drop autotune configs whose token tile is smaller than a sparse block."""
+    block_size = named_args["block_size"]
+    return [config for config in configs if config.kwargs["BLOCK_SIZE_N"] >= block_size]
+
+
 @triton.heuristics(
     {
         "BLOCK_SIZE_H": lambda args: max(
@@ -41,6 +47,7 @@ from ..common.utils import (
         "block_size",
         "SCORE_TYPE",
     ],
+    prune_configs_by={"early_config_prune": _prune_decode_configs},
 )
 @triton.jit
 def _decode_score_kernel(
@@ -228,6 +235,7 @@ def _decode_score_kernel(
         "HAS_SINK",
         "SCORE_TYPE",
     ],
+    prune_configs_by={"early_config_prune": _prune_decode_configs},
 )
 @triton.jit
 def _decode_score_attn_kernel(
@@ -803,6 +811,7 @@ def flash_decode_with_topk_idx(
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    topk_out: Optional[torch.Tensor] = None,  # [num_q_heads, batch_size, topk] int32
 ) -> torch.Tensor:
     assert score_type in (
         "max",
@@ -860,7 +869,7 @@ def flash_decode_with_topk_idx(
     )
     use_jit_topk = (
         envs.SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX.get()
-        and score.shape[2] <= 4096
+        and score.shape[2] <= 16384
         and topk <= 32
     )
     # If the live context has <= topk sparse blocks, the downstream dense
@@ -991,11 +1000,18 @@ def flash_decode_with_topk_idx(
 
     # get topk index
     if not _skip_block_topk:
-        topk_idx = torch.empty(
-            (num_q_heads, batch_size, topk),
-            device=score.device,
-            dtype=torch.int32,
-        )
+        if topk_out is not None and tuple(topk_out.shape) == (
+            num_q_heads,
+            batch_size,
+            topk,
+        ):
+            topk_idx = topk_out
+        else:
+            topk_idx = torch.empty(
+                (num_q_heads, batch_size, topk),
+                device=score.device,
+                dtype=torch.int32,
+            )
 
     if _skip_block_topk:
         pass

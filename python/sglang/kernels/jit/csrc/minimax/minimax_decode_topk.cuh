@@ -35,7 +35,7 @@ struct TopKTrait {
   static constexpr uint32_t kMaxTopK = 64;
   static constexpr uint32_t kCTASize = 512;
   static constexpr uint32_t kNumWarps = kCTASize / device::kWarpThreads;
-  static constexpr uint32_t kMaxNumBlocks = 4096;  // block topk
+  static constexpr uint32_t kMaxNumBlocks = 16384;  // block topk
   static constexpr uint32_t kSmallThreshold = 8 * kNumWarps;
   static constexpr uint32_t kRadixBits = 8;
   static constexpr uint32_t kRadixSize = 1 << kRadixBits;
