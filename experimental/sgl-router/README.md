@@ -50,6 +50,35 @@ Omit `--service-discovery-namespace` to watch all namespaces (requires
 cluster-wide RBAC). For prefill/decode disaggregation, replace `--selector`
 with `--prefill-selector` and `--decode-selector`.
 
+## Token dataset export
+
+The optional token-export tee writes gzipped NDJSON batches without blocking
+request serving. A full queue or upload backlog drops export records and
+increments `sgl_router_token_export_total`.
+
+Amazon S3 uses static SigV4 credentials:
+
+```bash
+export RADIXARK_TOKEN_EXPORT_S3_URI=s3://bucket/prefix/
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_REGION=us-west-2
+```
+
+Google Cloud Storage uses [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials):
+
+```bash
+export RADIXARK_TOKEN_EXPORT_GCS_URI=gs://bucket/prefix/
+```
+
+ADC supports `GOOGLE_APPLICATION_CREDENTIALS`, local `gcloud` ADC, and the
+metadata service used by GCE service accounts and GKE Workload Identity.
+Production deployments should use a dedicated service account with
+`roles/storage.objectCreator` on the destination bucket. Export objects contain
+prompt/output token sequences and client key identifiers, so bucket readers and
+retention must be restricted accordingly. S3 and GCS export are mutually
+exclusive.
+
 ## License
 
 Apache-2.0.

@@ -358,7 +358,7 @@ async fn chat_completions_inner(
     // extension must be matchable at all (`extension_can_match`: DSV4 thinking
     // mode without tools re-renders history divergently, so its extensions
     // could only ever be dead blocks — mirroring the engine's own miss).
-    let extend_tee_armed = (ctx.cache_sim_tee.is_some() || ctx.s3_export_sink.is_some())
+    let extend_tee_armed = (ctx.cache_sim_tee.is_some() || ctx.token_export_sink.is_some())
         && request_tokens.is_some()
         && request_value
             .as_ref()
@@ -483,7 +483,7 @@ async fn chat_completions_inner(
     if let (Some(tee), Some(t)) = (ctx.cache_sim_tee.as_ref(), request_tokens.as_ref()) {
         tee.offer(&model_str, &t.ids, &derived_request_id, tee_attr.clone());
     }
-    if let (Some(sink), Some(t)) = (ctx.s3_export_sink.as_ref(), request_tokens.as_ref()) {
+    if let (Some(sink), Some(t)) = (ctx.token_export_sink.as_ref(), request_tokens.as_ref()) {
         sink.offer_ingest(
             &model_str,
             &t.ids,
@@ -703,23 +703,25 @@ async fn chat_completions_inner(
             //
             // When cache-sim is on, draw from the cache-sim tee's pool and record
             // `capture_capped` there. Also record `dropped_capture_capped` on the
-            // S3 sink so both consumers reflect the drop.
-            // When cache-sim is off but the S3 sink is on, draw from the sink's
-            // own permit pool so S3-only mode is equally memory-bounded.
+            // token-export sink so both consumers reflect the drop.
+            // When cache-sim is off but token export is on, draw from the sink's
+            // own permit pool so export-only mode is equally memory-bounded.
             let permit = if let Some(tee) = ctx.cache_sim_tee.as_ref() {
                 let p = tee.try_acquire_capture_permit();
                 if p.is_none() {
                     ctx.metrics.record_cache_sim_tee("capture_capped");
-                    if ctx.s3_export_sink.is_some() {
-                        ctx.metrics.record_s3_export("dropped_capture_capped");
+                    if let Some(sink) = ctx.token_export_sink.as_ref() {
+                        ctx.metrics
+                            .record_token_export(sink.backend(), "dropped_capture_capped");
                     }
                     return None;
                 }
                 p
-            } else if let Some(sink) = ctx.s3_export_sink.as_ref() {
+            } else if let Some(sink) = ctx.token_export_sink.as_ref() {
                 let p = sink.try_acquire_capture_permit();
                 if p.is_none() {
-                    ctx.metrics.record_s3_export("dropped_capture_capped");
+                    ctx.metrics
+                        .record_token_export(sink.backend(), "dropped_capture_capped");
                     return None;
                 }
                 p

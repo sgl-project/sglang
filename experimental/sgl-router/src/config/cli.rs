@@ -436,8 +436,20 @@ pub struct Cli {
     /// writes each request's ingest/extend token sequences as NDJSON+gzip.
     /// Credentials and region come from the standard AWS environment variables.
     /// When absent, export is disabled.
-    #[arg(long, env = "RADIXARK_TOKEN_EXPORT_S3_URI")]
+    #[arg(
+        long,
+        env = "RADIXARK_TOKEN_EXPORT_S3_URI",
+        conflicts_with = "token_export_gcs_uri"
+    )]
     pub token_export_s3_uri: Option<String>,
+    /// `gs://bucket/prefix/` target. Uses Google Application Default
+    /// Credentials and the Cloud Storage JSON API. Mutually exclusive with S3.
+    #[arg(
+        long,
+        env = "RADIXARK_TOKEN_EXPORT_GCS_URI",
+        conflicts_with = "token_export_s3_uri"
+    )]
+    pub token_export_gcs_uri: Option<String>,
 }
 
 impl Cli {
@@ -711,6 +723,7 @@ impl Cli {
                 cache_sim_url: self.cache_sim_url,
                 cache_sim_max_concurrent_captures: self.cache_sim_max_concurrent_captures,
                 token_export_s3_uri: self.token_export_s3_uri,
+                token_export_gcs_uri: self.token_export_gcs_uri,
             },
             model: ModelConfig {
                 // Default the tokenizer source to the model id (treated as a
@@ -2625,6 +2638,47 @@ mod tests {
             err.contains("--sticky-eviction-interval-secs must be greater than 0"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn token_export_selects_one_object_store() {
+        let s3 = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--token-export-s3-uri",
+            "s3://bucket/prefix",
+        ]))
+        .unwrap();
+        assert_eq!(
+            s3.observability.token_export_s3_uri.as_deref(),
+            Some("s3://bucket/prefix")
+        );
+        assert!(s3.observability.token_export_gcs_uri.is_none());
+
+        let gcs = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--token-export-gcs-uri",
+            "gs://bucket/prefix",
+        ]))
+        .unwrap();
+        assert_eq!(
+            gcs.observability.token_export_gcs_uri.as_deref(),
+            Some("gs://bucket/prefix")
+        );
+        assert!(gcs.observability.token_export_s3_uri.is_none());
+
+        let error = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--token-export-s3-uri",
+            "s3://bucket/prefix",
+            "--token-export-gcs-uri",
+            "gs://bucket/prefix",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("cannot be used with"), "got: {error}");
     }
 
     #[test]

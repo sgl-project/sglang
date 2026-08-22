@@ -1,12 +1,27 @@
-//! S3 token-dataset export: a second tee independent of the cache-sim that
-//! writes ingest/extend token sequences as NDJSON+gzip batches to S3 for
-//! offline cache-hit recomputation.
+//! Object-storage token-dataset export: a second tee independent of the
+//! cache-sim that writes ingest/extend token sequences as NDJSON+gzip batches
+//! to S3 or Google Cloud Storage for offline cache-hit recomputation.
 
 use std::collections::HashMap;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExportBackend {
+    S3,
+    Gcs,
+}
+
+impl ExportBackend {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::S3 => "s3",
+            Self::Gcs => "gcs",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -57,15 +72,20 @@ impl ExportRecord {
     }
 }
 
-/// Parse `s3://bucket/prefix/...` into `(bucket, key_prefix)`.
-/// `key_prefix` is stripped of leading and trailing `/` (re-added when
-/// constructing the key). Returns `None` for non-s3:// URIs.
-pub fn parse_s3_uri(uri: &str) -> Option<(String, String)> {
-    let rest = uri.trim().strip_prefix("s3://")?;
+fn parse_bucket_uri(uri: &str, scheme: &str) -> Option<(String, String)> {
+    let rest = uri.trim().strip_prefix(scheme)?;
     let mut parts = rest.splitn(2, '/');
     let bucket = parts.next().filter(|b| !b.is_empty())?.to_string();
     let prefix = parts.next().unwrap_or("").trim_matches('/').to_string();
     Some((bucket, prefix))
+}
+
+pub fn parse_s3_uri(uri: &str) -> Option<(String, String)> {
+    parse_bucket_uri(uri, "s3://")
+}
+
+pub fn parse_gcs_uri(uri: &str) -> Option<(String, String)> {
+    parse_bucket_uri(uri, "gs://")
 }
 
 /// Hive-style partitioned object key. `unix_nanos + seq` prevents collisions
@@ -87,7 +107,7 @@ pub(crate) fn object_key(
 }
 
 /// The slug is a client-suppliable header (x-radixark-endpoint-slug). Only a
-/// strict allowlist may reach S3 key paths or the batcher map: hostile values
+/// strict allowlist may reach object key paths or the batcher map: hostile values
 /// (path separators, huge/high-cardinality strings) collapse to "unknown".
 fn safe_slug(slug: Option<&str>) -> String {
     match slug {
@@ -110,7 +130,7 @@ pub(crate) struct ReadyObject {
     pub slug: String,
     pub raw_bytes: Vec<u8>,
     /// NDJSON record count in this batch; added to
-    /// `sgl_router_s3_export_records_uploaded_total` on successful upload.
+    /// `sgl_router_token_export_records_uploaded_total` on successful upload.
     pub records: u64,
 }
 
@@ -271,6 +291,32 @@ pub(crate) fn string_to_sign(
     )
 }
 
+const GCS_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write";
+const GCS_UPLOAD_ENDPOINT: &str = "https://storage.googleapis.com";
+
+pub(crate) enum GcsAuth {
+    Adc(tokio::sync::OnceCell<Arc<dyn gcp_auth::TokenProvider>>),
+    #[cfg(test)]
+    Static(String),
+}
+
+impl GcsAuth {
+    fn adc() -> Self {
+        Self::Adc(tokio::sync::OnceCell::new())
+    }
+
+    async fn bearer_token(&self) -> anyhow::Result<String> {
+        match self {
+            Self::Adc(cell) => {
+                let provider = cell.get_or_try_init(gcp_auth::provider).await?;
+                Ok(provider.token(&[GCS_SCOPE]).await?.as_str().to_string())
+            }
+            #[cfg(test)]
+            Self::Static(token) => Ok(token.clone()),
+        }
+    }
+}
+
 pub(crate) enum Uploader {
     S3 {
         http: reqwest::Client,
@@ -279,12 +325,30 @@ pub(crate) enum Uploader {
         region: String,
         bucket: String,
     },
-    // Test-only variant; suppressed outside #[cfg(test)] builds.
+    Gcs {
+        http: reqwest::Client,
+        auth: GcsAuth,
+        bucket: String,
+        endpoint: String,
+    },
     #[cfg_attr(not(test), allow(dead_code))]
     Fake(Arc<FakeStore>),
 }
 
 impl Uploader {
+    pub(crate) const fn backend(&self) -> ExportBackend {
+        match self {
+            Self::S3 { .. } | Self::Fake(_) => ExportBackend::S3,
+            Self::Gcs { .. } => ExportBackend::Gcs,
+        }
+    }
+    async fn preflight(&self) -> anyhow::Result<()> {
+        if let Self::Gcs { auth, .. } = self {
+            auth.bearer_token().await?;
+        }
+        Ok(())
+    }
+
     async fn put(&self, key: &str, body: Vec<u8>) -> anyhow::Result<()> {
         match self {
             Uploader::S3 {
@@ -343,6 +407,42 @@ impl Uploader {
                     anyhow::bail!("s3 put returned {status}: {body}");
                 }
             }
+            Uploader::Gcs {
+                http,
+                auth,
+                bucket,
+                endpoint,
+            } => {
+                let token = auth.bearer_token().await?;
+                let url = format!(
+                    "{}/upload/storage/v1/b/{}/o",
+                    endpoint.trim_end_matches('/'),
+                    uri_encode(bucket, true)
+                );
+                let resp = http
+                    .post(url)
+                    .query(&[
+                        ("uploadType", "media"),
+                        ("name", key),
+                        ("ifGenerationMatch", "0"),
+                    ])
+                    .bearer_auth(token)
+                    .header("content-encoding", "gzip")
+                    .header("content-type", "application/x-ndjson")
+                    .body(body)
+                    .send()
+                    .await?;
+                let status = resp.status();
+                // A retry after a successful upload whose response was lost returns 412
+                // because ifGenerationMatch=0 made the first write immutable.
+                if status.is_success() || status == reqwest::StatusCode::PRECONDITION_FAILED {
+                    resp.bytes().await?;
+                    Ok(())
+                } else {
+                    let body = resp.text().await.unwrap_or_default();
+                    anyhow::bail!("gcs object upload returned {status}: {body}");
+                }
+            }
             Uploader::Fake(store) => {
                 if store.fail_first.load(Ordering::SeqCst) > 0 {
                     store.fail_first.fetch_sub(1, Ordering::SeqCst);
@@ -369,7 +469,13 @@ pub(crate) async fn put_with_retry(
         match up.put(key, body.clone()).await {
             Ok(()) => return true,
             Err(e) => {
-                tracing::warn!(key, attempt, error = %e, "s3 export put failed; will retry");
+                tracing::warn!(
+                    backend = up.backend().as_str(),
+                    key,
+                    attempt,
+                    error = %e,
+                    "token export upload failed; will retry"
+                );
                 if attempt == max_attempts {
                     return false;
                 }
@@ -391,7 +497,7 @@ const TICK: Duration = Duration::from_secs(1);
 /// on the shared 8-core container while allowing parallelism.
 const UPLOAD_CONCURRENCY: usize = 4;
 /// Bounds pending raw-batch memory (~32×8 MiB) and keeps the pump loop live
-/// during an S3 outage — a best-effort tee sheds, never stalls its own
+/// during an object-store outage — a best-effort tee sheds, never stalls its own
 /// heartbeat.
 const MAX_PENDING_UPLOADS: usize = 32;
 
@@ -400,34 +506,38 @@ enum PumpMsg {
     Drain(tokio::sync::oneshot::Sender<()>),
 }
 
-pub struct S3ExportSink {
+pub struct TokenExportSink {
     tx: mpsc::Sender<PumpMsg>,
     metrics: Arc<MetricsRegistry>,
+    backend: ExportBackend,
+    uploader: Arc<Uploader>,
     join: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Semaphore bounding the number of concurrent captures in S3-only mode.
-    /// Mirrors `CacheSimTee::try_acquire_capture_permit` so S3-only deployments
-    /// have the same aggregate-capture memory bound as cache-sim deployments.
     capture_sem: Arc<tokio::sync::Semaphore>,
 }
 
-impl std::fmt::Debug for S3ExportSink {
+impl std::fmt::Debug for TokenExportSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("S3ExportSink").finish_non_exhaustive()
+        f.debug_struct("TokenExportSink").finish_non_exhaustive()
     }
 }
 
-impl S3ExportSink {
-    /// Production entry point: parse `uri`, read credentials/region from the
-    /// standard AWS environment variables, build an S3 uploader, and start the
-    /// pump. Returns `None` if the URI is invalid, credentials are missing, or
-    /// temporary (session-token) credentials are detected.
-    pub fn spawn(
+impl TokenExportSink {
+    pub fn spawn_s3(
         uri: &str,
         pod: String,
         metrics: Arc<MetricsRegistry>,
         max_captures: usize,
     ) -> Option<Arc<Self>> {
-        let (bucket, prefix) = parse_s3_uri(uri)?;
+        let (bucket, prefix) = match parse_s3_uri(uri) {
+            Some(parts) => parts,
+            None => {
+                tracing::error!(
+                    uri,
+                    "invalid S3 token export URI; expected s3://bucket/prefix"
+                );
+                return None;
+            }
+        };
         // `.trim()`: a secretKeyRef-injected value can carry a trailing newline
         // (if the stored secret was created with a trailing `\n`); an untrimmed
         // key silently breaks SigV4 with SignatureDoesNotMatch. Creds/region
@@ -481,28 +591,66 @@ impl S3ExportSink {
             region,
             bucket,
         };
-
-        let metrics2 = Arc::clone(&metrics);
-        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let join = tokio::spawn(async move {
-            run_pump(
-                rx,
-                Arc::new(uploader),
-                prefix,
-                pod,
-                metrics2,
-                DEFAULT_MAX_BATCH_BYTES,
-            )
-            .await;
-        });
-        let capture_sem = Arc::new(tokio::sync::Semaphore::new(max_captures.max(1)));
-        tracing::info!("s3 token export enabled");
-        Some(Arc::new(Self {
-            tx,
+        tracing::info!(bucket_uri = uri, "S3 token export enabled");
+        Some(Self::spawn_uploader(
+            uploader,
+            prefix,
+            pod,
             metrics,
-            join: AsyncMutex::new(Some(join)),
-            capture_sem,
-        }))
+            max_captures,
+            DEFAULT_MAX_BATCH_BYTES,
+        ))
+    }
+
+    pub fn spawn_gcs(
+        uri: &str,
+        pod: String,
+        metrics: Arc<MetricsRegistry>,
+        max_captures: usize,
+    ) -> Option<Arc<Self>> {
+        let (bucket, prefix) = match parse_gcs_uri(uri) {
+            Some(parts) => parts,
+            None => {
+                tracing::error!(
+                    uri,
+                    "invalid GCS token export URI; expected gs://bucket/prefix"
+                );
+                return None;
+            }
+        };
+        let http = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::error!(%error, "failed to build GCS token export client");
+                return None;
+            }
+        };
+        let uploader = Uploader::Gcs {
+            http,
+            auth: GcsAuth::adc(),
+            bucket,
+            endpoint: GCS_UPLOAD_ENDPOINT.to_string(),
+        };
+        tracing::info!(bucket_uri = uri, "GCS token export enabled");
+        Some(Self::spawn_uploader(
+            uploader,
+            prefix,
+            pod,
+            metrics,
+            max_captures,
+            DEFAULT_MAX_BATCH_BYTES,
+        ))
+    }
+
+    pub const fn backend(&self) -> &'static str {
+        self.backend.as_str()
+    }
+
+    pub async fn preflight(&self) -> anyhow::Result<()> {
+        self.uploader.preflight().await
     }
 
     /// Try to acquire one capture permit. Returns `None` when the pool is
@@ -512,7 +660,32 @@ impl S3ExportSink {
         Arc::clone(&self.capture_sem).try_acquire_owned().ok()
     }
 
-    /// Test entry point: inject an uploader (does not touch AWS).
+    fn spawn_uploader(
+        uploader: Uploader,
+        prefix: String,
+        pod: String,
+        metrics: Arc<MetricsRegistry>,
+        max_captures: usize,
+        max_batch_bytes: usize,
+    ) -> Arc<Self> {
+        let backend = uploader.backend();
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let metrics2 = Arc::clone(&metrics);
+        let uploader = Arc::new(uploader);
+        let pump_uploader = Arc::clone(&uploader);
+        let join = tokio::spawn(async move {
+            run_pump(rx, pump_uploader, prefix, pod, metrics2, max_batch_bytes).await;
+        });
+        Arc::new(Self {
+            tx,
+            metrics,
+            backend,
+            uploader,
+            join: AsyncMutex::new(Some(join)),
+            capture_sem: Arc::new(tokio::sync::Semaphore::new(max_captures.max(1))),
+        })
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn spawn_with_uploader(
         uploader: Uploader,
@@ -520,11 +693,9 @@ impl S3ExportSink {
         pod: String,
         metrics: Arc<MetricsRegistry>,
     ) -> Arc<Self> {
-        Self::spawn_with_uploader_batch(uploader, prefix, pod, metrics, DEFAULT_MAX_BATCH_BYTES)
+        Self::spawn_uploader(uploader, prefix, pod, metrics, 64, DEFAULT_MAX_BATCH_BYTES)
     }
 
-    /// Test entry point (configurable batch size): for tests that need to
-    /// trigger multiple batches from a small number of records.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn spawn_with_uploader_batch(
         uploader: Uploader,
@@ -533,32 +704,18 @@ impl S3ExportSink {
         metrics: Arc<MetricsRegistry>,
         max_batch_bytes: usize,
     ) -> Arc<Self> {
-        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let metrics2 = Arc::clone(&metrics);
-        let uploader = Arc::new(uploader);
-        let join = tokio::spawn(async move {
-            run_pump(rx, uploader, prefix, pod, metrics2, max_batch_bytes).await;
-        });
-        let capture_sem = Arc::new(tokio::sync::Semaphore::new(64));
-        Arc::new(Self {
-            tx,
-            metrics,
-            join: AsyncMutex::new(Some(join)),
-            capture_sem,
-        })
+        Self::spawn_uploader(uploader, prefix, pod, metrics, 64, max_batch_bytes)
     }
 
     fn enqueue(&self, rec: ExportRecord) {
         match self.tx.try_send(PumpMsg::Record(Box::new(rec))) {
-            Ok(()) => self.metrics.record_s3_export("enqueued"),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.metrics.record_s3_export("dropped_queue_full")
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                // Pump is gone (post-drain offers). Make these visible so a
-                // closed sink doesn't look like zero traffic.
-                self.metrics.record_s3_export("dropped_closed")
-            }
+            Ok(()) => self.metrics.record_token_export(self.backend(), "enqueued"),
+            Err(mpsc::error::TrySendError::Full(_)) => self
+                .metrics
+                .record_token_export(self.backend(), "dropped_queue_full"),
+            Err(mpsc::error::TrySendError::Closed(_)) => self
+                .metrics
+                .record_token_export(self.backend(), "dropped_closed"),
         }
     }
 
@@ -692,7 +849,7 @@ async fn upload_job(args: UploadJobArgs) {
     let gz = match tokio::task::spawn_blocking(move || gzip_fast(raw_bytes)).await {
         Ok(Some(gz)) => gz,
         Ok(None) | Err(_) => {
-            metrics.record_s3_export("put_failed");
+            metrics.record_token_export(uploader.backend().as_str(), "put_failed");
             return;
         }
     };
@@ -702,13 +859,14 @@ async fn upload_job(args: UploadJobArgs) {
     let key = object_key(&prefix, &slug, &date, &pod, nanos, seq);
 
     if put_with_retry(&uploader, &key, gz, PUT_MAX_ATTEMPTS).await {
-        metrics.record_s3_export("object_put");
-        metrics.add_s3_export_records_uploaded(records);
+        let backend = uploader.backend().as_str();
+        metrics.record_token_export(backend, "object_put");
+        metrics.add_token_export_records_uploaded(backend, records);
         if is_drain {
-            metrics.record_s3_export("drain_flushed");
+            metrics.record_token_export(backend, "drain_flushed");
         }
     } else {
-        metrics.record_s3_export("put_failed");
+        metrics.record_token_export(uploader.backend().as_str(), "put_failed");
     }
     // _permit is dropped here, releasing the semaphore slot.
 }
@@ -808,7 +966,7 @@ fn dispatch_ready(
         // The drain/close path (`force`) is exempt — shutdown must flush every
         // remaining batch.
         if !force && join_set.len() >= MAX_PENDING_UPLOADS {
-            metrics.record_s3_export("dropped_upload_backlog");
+            metrics.record_token_export(uploader.backend().as_str(), "dropped_upload_backlog");
             continue;
         }
 
@@ -900,6 +1058,20 @@ mod tests {
         );
         assert_eq!(parse_s3_uri("https://x"), None);
         assert_eq!(parse_s3_uri("s3://"), None);
+    }
+
+    #[test]
+    fn parse_gcs_uri_splits_bucket_and_prefix() {
+        assert_eq!(
+            parse_gcs_uri("gs://my-bucket/token-export/"),
+            Some(("my-bucket".into(), "token-export".into()))
+        );
+        assert_eq!(
+            parse_gcs_uri("gs://only-bucket"),
+            Some(("only-bucket".into(), "".into()))
+        );
+        assert_eq!(parse_gcs_uri("s3://my-bucket"), None);
+        assert_eq!(parse_gcs_uri("gs://"), None);
     }
 
     #[test]
@@ -1007,11 +1179,110 @@ mod tests {
         assert!(store.puts.lock().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn gcs_put_is_authenticated_and_idempotent() {
+        use axum::extract::{Path, Query, State};
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::routing::post;
+        use axum::Router;
+
+        #[derive(Debug)]
+        struct CapturedRequest {
+            bucket: String,
+            query: HashMap<String, String>,
+            authorization: String,
+            content_encoding: String,
+            content_type: String,
+            body: Vec<u8>,
+        }
+
+        async fn capture(
+            State(state): State<Arc<Mutex<Vec<CapturedRequest>>>>,
+            Path(bucket): Path<String>,
+            Query(query): Query<HashMap<String, String>>,
+            headers: HeaderMap,
+            body: bytes::Bytes,
+        ) -> StatusCode {
+            let mut requests = state.lock().unwrap();
+            requests.push(CapturedRequest {
+                bucket,
+                query,
+                authorization: headers["authorization"].to_str().unwrap().to_string(),
+                content_encoding: headers["content-encoding"].to_str().unwrap().to_string(),
+                content_type: headers["content-type"].to_str().unwrap().to_string(),
+                body: body.to_vec(),
+            });
+            if requests.len() == 1 {
+                StatusCode::OK
+            } else {
+                StatusCode::PRECONDITION_FAILED
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/upload/storage/v1/b/{bucket}/o", post(capture))
+            .with_state(Arc::clone(&captured));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let uploader = Uploader::Gcs {
+            http: reqwest::Client::new(),
+            auth: GcsAuth::Static("test-token".into()),
+            bucket: "test-bucket".into(),
+            endpoint: endpoint.clone(),
+        };
+        let body = gzip_fast(b"{\"kind\":\"ingest\"}\n".to_vec()).unwrap();
+        for _ in 0..2 {
+            uploader
+                .put("prefix/slug=x/object.ndjson.gz", body.clone())
+                .await
+                .unwrap();
+        }
+
+        let metrics = test_metrics();
+        let sink = TokenExportSink::spawn_with_uploader(
+            Uploader::Gcs {
+                http: reqwest::Client::new(),
+                auth: GcsAuth::Static("test-token".into()),
+                bucket: "test-bucket".into(),
+                endpoint,
+            },
+            "prefix".into(),
+            "pod-1".into(),
+            Arc::clone(&metrics),
+        );
+        sink.offer_ingest("m", &[1, 2], "rid", Some("slug-x"), None);
+        sink.drain().await;
+        server.abort();
+
+        let rendered = metrics.render();
+        assert!(rendered
+            .contains("sgl_router_token_export_total{backend=\"gcs\",result=\"object_put\"} 1"));
+        assert!(
+            rendered.contains("sgl_router_token_export_records_uploaded_total{backend=\"gcs\"} 1")
+        );
+
+        let mut requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        let request = requests.remove(0);
+        assert_eq!(request.bucket, "test-bucket");
+        assert_eq!(request.query["uploadType"], "media");
+        assert_eq!(request.query["name"], "prefix/slug=x/object.ndjson.gz");
+        assert_eq!(request.query["ifGenerationMatch"], "0");
+        assert_eq!(request.authorization, "Bearer test-token");
+        assert_eq!(request.content_encoding, "gzip");
+        assert_eq!(request.content_type, "application/x-ndjson");
+        assert_eq!(request.body, body);
+        assert_eq!(gunzip(&request.body), "{\"kind\":\"ingest\"}\n");
+    }
+
     /// Real S3 round-trip against the actual `Uploader::S3` SigV4 path.
     /// Ignored by default (no creds in CI). Run manually with STATIC keys:
     ///   AWS_ACCESS_KEY_ID=.. AWS_SECRET_ACCESS_KEY=.. AWS_REGION=us-west-2 \
     ///   TEST_S3_URI=s3://<bucket>/<prefix>/ \
-    ///   cargo test --lib s3_export::tests::real_s3_roundtrip -- --ignored --nocapture
+    ///   cargo test --lib token_export::tests::real_s3_roundtrip -- --ignored --nocapture
     /// (SSO/temporary creds won't work — we don't sign x-amz-security-token.)
     #[tokio::test]
     #[ignore]
@@ -1077,6 +1348,41 @@ mod tests {
             }
         }
         panic!("real S3 PutObject to {key} failed: {}", last_err.unwrap());
+    }
+
+    /// Real GCS round-trip using Application Default Credentials.
+    /// Run with `TEST_GCS_URI=gs://bucket/prefix/ cargo test --lib
+    /// token_export::tests::real_gcs_roundtrip -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn real_gcs_roundtrip() {
+        let uri = match std::env::var("TEST_GCS_URI") {
+            Ok(uri) => uri,
+            Err(_) => {
+                eprintln!("real_gcs_roundtrip skipped: set TEST_GCS_URI=gs://bucket/prefix/");
+                return;
+            }
+        };
+        let (bucket, prefix) = parse_gcs_uri(&uri).expect("TEST_GCS_URI must use gs://");
+        let uploader = Uploader::Gcs {
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth: GcsAuth::adc(),
+            bucket,
+            endpoint: GCS_UPLOAD_ENDPOINT.to_string(),
+        };
+        let key = if prefix.is_empty() {
+            "roundtrip-check.txt".to_string()
+        } else {
+            format!("{prefix}/roundtrip-check.txt")
+        };
+        let body = gzip_fast(b"{\"source\":\"sgl-router-gcs-roundtrip\"}\n".to_vec()).unwrap();
+        uploader
+            .put(&key, body)
+            .await
+            .unwrap_or_else(|error| panic!("real GCS object upload to {key} failed: {error}"));
     }
 
     // ---- SigV4 building blocks ----
@@ -1162,7 +1468,7 @@ mod tests {
         let store = Arc::new(FakeStore::new(0));
         let up = Uploader::Fake(Arc::clone(&store));
         let sink =
-            S3ExportSink::spawn_with_uploader(up, "pfx".into(), "pod-1".into(), test_metrics());
+            TokenExportSink::spawn_with_uploader(up, "pfx".into(), "pod-1".into(), test_metrics());
         sink.offer_ingest("m", &[1, 2, 3], "rid", Some("slugA"), Some("key-abc"));
         sink.offer_extend(
             "m",
@@ -1194,7 +1500,7 @@ mod tests {
     #[tokio::test]
     async fn offer_never_blocks_and_missing_slug_becomes_unknown() {
         let store = Arc::new(FakeStore::new(0));
-        let sink = S3ExportSink::spawn_with_uploader(
+        let sink = TokenExportSink::spawn_with_uploader(
             Uploader::Fake(Arc::clone(&store)),
             "".into(),
             "pod-1".into(),
@@ -1214,7 +1520,7 @@ mod tests {
     async fn drain_waits_for_all_concurrent_uploads() {
         // Use a 1-byte batch threshold to force one object per record.
         let store = Arc::new(FakeStore::new(0));
-        let sink = S3ExportSink::spawn_with_uploader_batch(
+        let sink = TokenExportSink::spawn_with_uploader_batch(
             Uploader::Fake(Arc::clone(&store)),
             "pfx".into(),
             "pod-1".into(),
