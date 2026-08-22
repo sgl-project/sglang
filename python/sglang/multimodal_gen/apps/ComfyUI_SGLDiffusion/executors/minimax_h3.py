@@ -3,15 +3,12 @@
 
 from __future__ import annotations
 
-import logging
-import os
-import time
+from dataclasses import fields
 from typing import Any
 
 import torch
 
-_logger = logging.getLogger(__name__)
-_STEP_PROFILE = os.environ.get("SGLANG_H3_STEP_PROFILE", "0") == "1"
+from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.comfyui_step import (
     DEFAULT_SIGMA_SHIFT_AUDIO,
@@ -22,6 +19,30 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 
 from .adapter import ComfyUIModelAdapter, PackedForward
 from .base import SGLDiffusionExecutor
+
+# H3 pins loop/CFG fields with init=False; ComfyUI owns those.
+_H3_PINNED_SAMPLING_FIELDS = frozenset(
+    f.name for f in fields(MiniMaxH3SamplingParams) if not f.init
+)
+
+
+def drop_h3_pinned_sampling_fields(kwargs: dict[str, Any]) -> dict[str, Any]:
+    for name in _H3_PINNED_SAMPLING_FIELDS:
+        kwargs.pop(name, None)
+    return kwargs
+
+
+_WORKER_TRANSFORMER_OPTION_KEYS = (
+    "minimax_h3_sigma_shift_video",
+    "minimax_h3_sigma_shift_audio",
+    "sample_sigmas",
+)
+
+
+def worker_transformer_options(opts: dict[str, Any] | None) -> dict[str, Any]:
+    """Keep only pickle-safe H3 keys; drop ComfyUI model_sampling etc."""
+    src = opts or {}
+    return {key: src[key] for key in _WORKER_TRANSFORMER_OPTION_KEYS if key in src}
 
 
 def _split_av(x) -> tuple[torch.Tensor, torch.Tensor]:
@@ -42,6 +63,22 @@ def _as_context(context: torch.Tensor) -> torch.Tensor:
     if context.ndim == 3:
         return context[0]
     return context
+
+
+def _cache_fingerprint(video, sample_sigmas, serialized_layout) -> dict[str, Any]:
+    spatial = tuple(int(dim) for dim in video.shape[-3:])
+    sigmas_fp = None
+    if sample_sigmas is not None:
+        values = (
+            sample_sigmas.reshape(-1)
+            if torch.is_tensor(sample_sigmas)
+            else sample_sigmas
+        )
+        sigmas_fp = (float(values[0]), float(values[-1]), int(len(values)))
+    layout_sig = None
+    if isinstance(serialized_layout, dict):
+        layout_sig = serialized_layout.get("signature")
+    return {"spatial": spatial, "sigmas": sigmas_fp, "layout": layout_sig}
 
 
 class MiniMaxH3Adapter(ComfyUIModelAdapter):
@@ -74,7 +111,7 @@ class MiniMaxH3Adapter(ComfyUIModelAdapter):
         extra_req: dict[str, Any] = {
             "audio_latents": audio,
             "h3_payload": payload,
-            "h3_transformer_options": transformer_options,
+            "h3_transformer_options": worker_transformer_options(transformer_options),
             "h3_sample_sigmas": sample_sigmas,
             "h3_context": text,
         }
@@ -87,6 +124,9 @@ class MiniMaxH3Adapter(ComfyUIModelAdapter):
                 extra_req[f"h3_{name}"] = mask
         if sample_sigmas is not None:
             extra_req["sigmas"] = sample_sigmas
+        extra_req["comfyui_cache_fp"] = _cache_fingerprint(
+            video, sample_sigmas, serialized
+        )
         return PackedForward(
             latents=video,
             timesteps=timestep,
@@ -137,6 +177,8 @@ class MiniMaxH3Adapter(ComfyUIModelAdapter):
             "h3_layout",
             "h3_denoise_mask",
             "h3_audio_denoise_mask",
+            "comfyui_cache_fp",
+            "comfyui_cond_key",
         ):
             value = packed.extra_req.get(key)
             if value is not None:
@@ -153,6 +195,7 @@ class MiniMaxH3Adapter(ComfyUIModelAdapter):
         packed.extra_req.pop("h3_denoise_mask", None)
         packed.extra_req.pop("h3_audio_denoise_mask", None)
         packed.extra_req.pop("sigmas", None)
+        # Keep comfyui_cache_fp / comfyui_cond_key; later steps still send them.
 
 
 class MiniMaxH3Executor(SGLDiffusionExecutor):
@@ -168,66 +211,10 @@ class MiniMaxH3Executor(SGLDiffusionExecutor):
         """
         return text_states
 
-    def forward(self, x, timestep, context, **kwargs):
-        t0 = time.perf_counter()
-        video, _audio = _split_av(x)
-        spatial = (
-            int(video.shape[-3]),
-            int(video.shape[-2]),
-            int(video.shape[-1]),
-        )
-        self._begin_run_if_needed(timestep, kwargs, spatial=spatial)
-        packed = self.adapter.pack(x, timestep, context, **kwargs)
-        if self._conditioning_sent:
-            self.adapter.drop_cached_fields(packed)
-        else:
-            self._conditioning_sent = True
-        from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-        from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
-
-        t1 = time.perf_counter()
-        sampling_kwargs = {
-            "prompt": " ",
-            "height": packed.height,
-            "width": packed.width,
-            "num_inference_steps": 1,
-            "save_output": False,
-            "suppress_logs": self.should_suppress_logs(timestep),
-        }
+    def _sampling_params_kwargs(self, packed, timestep) -> dict:
+        kwargs = super()._sampling_params_kwargs(packed, timestep)
+        drop_h3_pinned_sampling_fields(kwargs)
         enable_cache_dit = getattr(self, "enable_cache_dit", None)
         if enable_cache_dit is not None:
-            sampling_kwargs["enable_cache_dit"] = bool(enable_cache_dit)
-        sampling_params = SamplingParams.from_user_sampling_params_args(
-            self.model_path,
-            server_args=self.generator.server_args,
-            **sampling_kwargs,
-        )
-        req = prepare_request(
-            server_args=self.generator.server_args,
-            sampling_params=sampling_params,
-        )
-        self.adapter.fill_req(req, packed)
-        extra = dict(req.extra or {})
-        extra["comfyui_session_id"] = (
-            f"{self.session_id}:{self._run_id}:{packed.height}x{packed.width}"
-        )
-        req.extra = extra
-        req.generator = [
-            torch.Generator("cuda") for _ in range(req.num_outputs_per_prompt)
-        ]
-        t2 = time.perf_counter()
-        output_batch = self.generator._send_to_scheduler_and_wait_for_response([req])
-        t3 = time.perf_counter()
-        out = self.adapter.unpack(output_batch.noise_pred, packed, x)
-        t4 = time.perf_counter()
-        if _STEP_PROFILE:
-            _logger.info(
-                "[h3-step-profile] parent pack=%.2fms prep=%.2fms rpc=%.2fms "
-                "unpack=%.2fms total=%.2fms",
-                (t1 - t0) * 1e3,
-                (t2 - t1) * 1e3,
-                (t3 - t2) * 1e3,
-                (t4 - t3) * 1e3,
-                (t4 - t0) * 1e3,
-            )
-        return out
+            kwargs["enable_cache_dit"] = bool(enable_cache_dit)
+        return kwargs

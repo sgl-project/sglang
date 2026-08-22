@@ -123,3 +123,65 @@ def test_session_restores_extra_keys_on_later_steps() -> None:
     assert torch.equal(second.extra["sample_sigmas"], sigmas)
     assert torch.equal(second.prompt_embeds[0], first.prompt_embeds[0])
     release_comfyui_session(sid)
+
+
+def test_new_run_id_evicts_previous_run_for_same_executor() -> None:
+    first = _Req()
+    first.extra = {"comfyui_session_id": "exec1:1", "h3_layout": {"signature": (1, 2)}}
+    first.prompt_embeds = [torch.ones(2, 4)]
+    bind_comfyui_session(first)
+    set_run_state(first, {"branch": "old"})
+
+    second = _Req()
+    second.extra = {"comfyui_session_id": "exec1:2"}
+    bind_comfyui_session(second)
+    assert "h3_layout" not in second.extra
+    assert second.prompt_embeds == []
+    old = _Req()
+    old.extra = {"comfyui_session_id": "exec1:1"}
+    assert get_run_state(old) is None
+    release_comfyui_session("exec1:2")
+
+
+def test_fingerprint_mismatch_does_not_restore_extras() -> None:
+    sid = "exec2:1"
+    first = _Req()
+    first.extra = {
+        "comfyui_session_id": sid,
+        "comfyui_cache_fp": {"spatial": (5, 15, 27)},
+        "h3_layout": {"signature": (8, 5, 15, 27, 4)},
+    }
+    first.prompt_embeds = [torch.ones(2, 4)]
+    bind_comfyui_session(first)
+
+    second = _Req()
+    second.extra = {
+        "comfyui_session_id": sid,
+        "comfyui_cache_fp": {"spatial": (5, 30, 54)},
+    }
+    bind_comfyui_session(second)
+    assert "h3_layout" not in second.extra
+    assert torch.equal(second.prompt_embeds[0], first.prompt_embeds[0])
+    release_comfyui_session(sid)
+
+
+def test_cond_keys_keep_positive_and_negative_apart() -> None:
+    sid = "exec3:1"
+    pos = _Req()
+    pos.extra = {"comfyui_session_id": sid, "comfyui_cond_key": "pos"}
+    pos.prompt_embeds = [torch.ones(2, 4)]
+    bind_comfyui_session(pos)
+    neg = _Req()
+    neg.extra = {"comfyui_session_id": sid, "comfyui_cond_key": "neg"}
+    neg.prompt_embeds = [torch.zeros(2, 4)]
+    bind_comfyui_session(neg)
+
+    later_pos = _Req()
+    later_pos.extra = {"comfyui_session_id": sid, "comfyui_cond_key": "pos"}
+    bind_comfyui_session(later_pos)
+    later_neg = _Req()
+    later_neg.extra = {"comfyui_session_id": sid, "comfyui_cond_key": "neg"}
+    bind_comfyui_session(later_neg)
+    assert torch.equal(later_pos.prompt_embeds[0], pos.prompt_embeds[0])
+    assert torch.equal(later_neg.prompt_embeds[0], neg.prompt_embeds[0])
+    release_comfyui_session(sid)

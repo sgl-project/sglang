@@ -33,8 +33,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
         self.adapter = self.adapter_cls()
         self.session_id = uuid.uuid4().hex
         self._run_id = 0
-        self._conditioning_sent = False
-        self._last_spatial = None
+        self._sent_conds: set[tuple] = set()
 
     @staticmethod
     def should_suppress_logs(timestep):
@@ -53,47 +52,65 @@ class SGLDiffusionExecutor(torch.nn.Module):
                 target=target,
             )
 
-    def _begin_run_if_needed(self, timestep, kwargs, spatial=None) -> None:
-        opts = kwargs.get("transformer_options") or {}
-        sigmas = opts.get("sample_sigmas")
-        if sigmas is None:
-            is_first = not self._conditioning_sent
-        else:
-            if torch.is_tensor(timestep):
-                sigma = float(timestep.reshape(-1)[0].item())
-            else:
-                sigma = float(timestep)
-            if sigma > 2.0:
-                sigma = sigma / 1000.0
-            first = float(sigmas.reshape(-1)[0].item() if torch.is_tensor(sigmas) else sigmas[0])
-            is_first = abs(sigma - first) < 1e-4
-        size_changed = spatial is not None and spatial != getattr(
-            self, "_last_spatial", None
-        )
-        if is_first or size_changed:
-            self._run_id += 1
-            self._conditioning_sent = False
-        if spatial is not None:
-            self._last_spatial = spatial
+    def begin_sampler_run(self) -> None:
+        """One ComfyUI ``sampler.sample()`` invocation is one cache lifetime."""
+        self._run_id += 1
+        self._sent_conds = set()
 
-    def forward(self, x, timestep, context, **kwargs):
-        self._begin_run_if_needed(timestep, kwargs)
-        packed = self.adapter.pack(x, timestep, context, **kwargs)
-        if self._conditioning_sent:
-            self.adapter.drop_cached_fields(packed)
-        else:
-            self._conditioning_sent = True
+    def end_sampler_run(self) -> None:
+        """Run cache is evicted on the next bind of a newer id for this executor."""
+
+    def sampler_sample_wrapper(self, executor, *args, **kwargs):
+        self.begin_sampler_run()
+        try:
+            return executor(*args, **kwargs)
+        finally:
+            self.end_sampler_run()
+
+    def comfyui_session_id(self) -> str:
+        return f"{self.session_id}:{self._run_id}"
+
+    def _cond_key(self, packed) -> tuple | None:
+        embeds = packed.prompt_embeds
+        if not embeds:
+            return None
+        tensor = embeds[0]
+        if not torch.is_tensor(tensor) or tensor.numel() == 0:
+            return None
+        flat = tensor.reshape(-1)
+        return (
+            tuple(int(dim) for dim in tensor.shape),
+            float(flat[0].item()),
+            float(flat[-1].item()),
+        )
+
+    def _mark_and_maybe_drop(self, packed) -> None:
+        key = self._cond_key(packed)
+        if key is not None:
+            packed.extra_req["comfyui_cond_key"] = repr(key)
+            if key in self._sent_conds:
+                self.adapter.drop_cached_fields(packed)
+            else:
+                self._sent_conds.add(key)
+
+    def _sampling_params_kwargs(self, packed, timestep) -> dict:
+        return {
+            "prompt": " ",
+            "guidance_scale": packed.guidance_scale,
+            "height": packed.height,
+            "width": packed.width,
+            "num_frames": 1,
+            "num_inference_steps": 1,
+            "save_output": False,
+            "suppress_logs": self.should_suppress_logs(timestep),
+        }
+
+    def _execute_packed(self, packed, x, timestep):
+        self._mark_and_maybe_drop(packed)
         sampling_params = SamplingParams.from_user_sampling_params_args(
             self.model_path,
             server_args=self.generator.server_args,
-            prompt=" ",
-            guidance_scale=packed.guidance_scale,
-            height=packed.height,
-            width=packed.width,
-            num_frames=1,
-            num_inference_steps=1,
-            save_output=False,
-            suppress_logs=self.should_suppress_logs(timestep),
+            **self._sampling_params_kwargs(packed, timestep),
         )
         req = prepare_request(
             server_args=self.generator.server_args,
@@ -101,10 +118,18 @@ class SGLDiffusionExecutor(torch.nn.Module):
         )
         self.adapter.fill_req(req, packed)
         extra = dict(req.extra or {})
-        extra["comfyui_session_id"] = f"{self.session_id}:{self._run_id}"
+        extra["comfyui_session_id"] = self.comfyui_session_id()
+        for key in ("comfyui_cond_key", "comfyui_cache_fp"):
+            value = packed.extra_req.get(key)
+            if value is not None:
+                extra[key] = value
         req.extra = extra
         req.generator = [
             torch.Generator("cuda") for _ in range(req.num_outputs_per_prompt)
         ]
         output_batch = self.generator._send_to_scheduler_and_wait_for_response([req])
         return self.adapter.unpack(output_batch.noise_pred, packed, x)
+
+    def forward(self, x, timestep, context, **kwargs):
+        packed = self.adapter.pack(x, timestep, context, **kwargs)
+        return self._execute_packed(packed, x, timestep)
