@@ -269,6 +269,7 @@ class DSparkVerifyPlanner:
                     anchor_tokens=anchor_tokens,
                     sampled_tokens=draft_tokens,
                     x_post_hc=confidence_tap,
+                    gamma=self.gamma,
                 )
         assert draft_hidden is not None
         return compute_confidence(
