@@ -3361,7 +3361,9 @@ class KimiK3ForConditionalGeneration(nn.Module):
                                 x, first_config.transparent_bg_config
                             ),
                         )
-                        expected_grids = grid_thws_host[indices]
+                        expected_grids = grid_thws_host[
+                            [image_indices[i] for i in indices]
+                        ]
                         if not torch.equal(produced_grids.cpu(), expected_grids):
                             raise ValueError(
                                 "Kimi-K3 deferred GPU preprocessing produced wrong grids"
@@ -3380,7 +3382,8 @@ class KimiK3ForConditionalGeneration(nn.Module):
                         )
 
                     patch_counts = [
-                        int(grid_thws_host[index].prod().item()) for index in indices
+                        int(grid_thws_host[image_indices[index]].prod().item())
+                        for index in indices
                     ]
                     if sum(patch_counts) != pixel_values.shape[0]:
                         raise ValueError(
