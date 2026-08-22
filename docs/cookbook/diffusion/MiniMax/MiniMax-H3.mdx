@@ -589,10 +589,10 @@ sglang serve \
   --port 30010
 ```
 
-`auto` merges an adapter into ordinary resident weights to avoid per-step LoRA
-matmuls, but keeps the dynamic path for FSDP-sharded weights where a full
-gather can increase peak memory. Use `dynamic` when one resident server must
-switch repeatedly between base and LoRA output.
+`auto` merges an adapter into ordinary unquantized resident weights to avoid
+per-step LoRA matmuls, but keeps the dynamic path for quantized or FSDP-sharded
+weights. Use `dynamic` explicitly when one resident server must switch
+repeatedly between base and LoRA output.
 
 Use the filename, scale, and request schedule from the table together. The
 4-evaluation LightX2V recipe is the more aggressive latency/quality tradeoff.

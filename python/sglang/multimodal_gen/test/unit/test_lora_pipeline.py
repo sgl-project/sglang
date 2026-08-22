@@ -5,8 +5,9 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from torch.nn import Parameter
 
-from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
+from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
@@ -215,95 +216,96 @@ def test_lora_exact_file_url_needs_no_weight_name(tmp_path):
     ]
 
 
-def _quantized_layer() -> BaseLayerWithLoRA:
-    """A layer whose weights went through online FP8 post-load quantization."""
-    layer = _make_layer()
-    layer.base_layer.quant_method = object.__new__(Fp8LinearMethod)
-    return layer
+def _fp8_runtime_layer() -> BaseLayerWithLoRA:
+    base_layer = ReplicatedLinear(2, 3, bias=False)
+    # reproduce the post-load [input, output] storage boundary without CUDA kernels
+    base_layer.weight = Parameter(torch.zeros(2, 3))
+    base_layer.register_parameter("weight_scale", Parameter(torch.ones(3)))
+    base_layer.quant_method = object.__new__(Fp8LinearMethod)
+    return BaseLayerWithLoRA(base_layer)
 
 
-class _OtherQuantMethod:
-    """A quantization method this policy does not (yet) classify."""
-
-
-def _other_quantized_layer() -> BaseLayerWithLoRA:
-    layer = _make_layer()
-    layer.base_layer.quant_method = _OtherQuantMethod()
-    return layer
-
-
-def _unquantized_layer() -> BaseLayerWithLoRA:
-    layer = _make_layer()
-    layer.base_layer.quant_method = UnquantizedLinearMethod()
-    return layer
-
-
-def test_auto_uses_dynamic_for_quantized_linear():
-    """Online FP8 stores a transposed, separately scaled weight, so a static
-    merge would corrupt it even if the shapes happened to line up."""
-    layer = _quantized_layer()
+def _make_fp8_pipeline(layer: BaseLayerWithLoRA) -> _TestLoRAPipeline:
     pipeline = _make_pipeline(layer)
+    pipeline.lora_adapters["adapter"]["linear.lora_B"] = torch.ones(3, 1)
+    return pipeline
 
-    assert (
-        pipeline._should_merge_lora_for_layers("transformer", {"linear": layer}, "auto")
-        is False
-    )
+
+def test_auto_applies_fp8_lora_dynamically():
+    layer = _fp8_runtime_layer()
+    pipeline = _make_fp8_pipeline(layer)
+    original = layer.base_layer.weight.detach().clone()
+
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline.set_lora("adapter", None, target="transformer", merge_mode="auto")
+
+    assert not layer.merged
+    assert not layer.disable_lora
+    assert layer.lora_A is not None
+    assert layer.lora_B is not None
+    assert torch.equal(layer.base_layer.weight, original)
+    assert not pipeline.is_lora_merged["transformer"]
 
 
 def test_auto_still_merges_unquantized_linear():
-    layer = _unquantized_layer()
+    layer = _make_layer()
     pipeline = _make_pipeline(layer)
 
-    assert (
-        pipeline._should_merge_lora_for_layers("transformer", {"linear": layer}, "auto")
-        is True
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline.set_lora("adapter", None, target="transformer", merge_mode="auto")
+
+    assert layer.merged
+    assert pipeline.is_lora_merged["transformer"]
+
+
+def test_explicit_merge_rejects_mixed_layers_before_applying_lora():
+    unquantized_layer = _make_layer()
+    fp8_layer = _fp8_runtime_layer()
+    pipeline = _make_pipeline(unquantized_layer)
+    pipeline._get_target_lora_layers = lambda target: (
+        [
+            (
+                target,
+                {
+                    "linear": (
+                        unquantized_layer if target == "transformer" else fp8_layer
+                    )
+                },
+            )
+        ],
+        None,
     )
+    original_unquantized = unquantized_layer.base_layer.weight.detach().clone()
+    original_fp8 = fp8_layer.base_layer.weight.detach().clone()
 
+    def fail_apply(*args, **kwargs):
+        raise AssertionError("LoRA application must not start before admission")
 
-def test_explicit_merge_rejects_quantized_linear():
-    layer = _quantized_layer()
-    pipeline = _make_pipeline(layer)
+    pipeline._apply_lora_to_layers = fail_apply
 
-    with pytest.raises(ValueError, match="dynamic"):
-        pipeline._should_merge_lora_for_layers(
-            "transformer", {"linear": layer}, "merge"
-        )
+    with patch(_RANK_PATCH, return_value=0):
+        with pytest.raises(ValueError, match="dynamic"):
+            pipeline.set_lora(
+                ["adapter", "adapter"],
+                [None, None],
+                target=["transformer", "transformer_2"],
+                merge_mode="merge",
+            )
 
-
-def test_dynamic_remains_dynamic_for_quantized_linear():
-    layer = _quantized_layer()
-    pipeline = _make_pipeline(layer)
-
-    assert (
-        pipeline._should_merge_lora_for_layers(
-            "transformer", {"linear": layer}, "dynamic"
-        )
-        is False
-    )
-
-
-def test_explicit_merge_fails_before_mutating_any_layer():
-    """A partial merge would leave the model in an inconsistent state."""
-    layer = _quantized_layer()
-    pipeline = _make_pipeline(layer)
-    original = layer.base_layer.weight.detach().clone()
-
-    with pytest.raises(ValueError, match="dynamic"):
-        pipeline._should_merge_lora_for_layers(
-            "transformer", {"linear": layer}, "merge"
-        )
-
-    assert torch.equal(layer.base_layer.weight, original)
+    assert torch.equal(unquantized_layer.base_layer.weight, original_unquantized)
+    assert torch.equal(fp8_layer.base_layer.weight, original_fp8)
     assert not pipeline.is_lora_merged
 
 
-def test_auto_still_merges_unclassified_quant_methods():
-    """Only FP8 is known to break; other methods keep their existing path so
-    this change cannot regress a configuration that works today."""
-    layer = _other_quantized_layer()
-    pipeline = _make_pipeline(layer)
+def test_manual_merge_rejects_fp8_before_materializing_offloaded_layers():
+    layer = _fp8_runtime_layer()
+    pipeline = _make_fp8_pipeline(layer)
+    layer.set_lora_weights(torch.ones(1, 2), torch.ones(3, 1), merge_weights=False)
 
-    assert (
-        pipeline._should_merge_lora_for_layers("transformer", {"linear": layer}, "auto")
-        is True
-    )
+    def fail_offload_context(*args, **kwargs):
+        raise AssertionError("unsupported merge must fail before materialization")
+
+    pipeline._temporarily_disable_offload = fail_offload_context
+
+    with pytest.raises(ValueError, match="dynamic"):
+        pipeline.merge_lora_weights("transformer")
