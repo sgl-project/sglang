@@ -9,7 +9,7 @@ import shutil
 import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import List
+from typing import Any, List
 
 import torch
 
@@ -179,3 +179,17 @@ def is_arch_support_pdl() -> bool:
     if is_hip_runtime() or is_musa_runtime():
         return False
     return get_jit_cuda_arch().major >= 9
+
+
+@cache_once
+def get_max_vector_bytes() -> int:
+    if is_hip_runtime() or is_musa_runtime():
+        return 16
+    blackwell = get_jit_cuda_arch().major >= 10 and _jit_cuda_version() >= (12, 9)
+    return 32 if blackwell else 16
+
+
+@cache_once
+def get_device_properties(device: int | None = None) -> Any:
+    device = device if device is not None else torch.cuda.current_device()
+    return torch.cuda.get_device_properties(device)

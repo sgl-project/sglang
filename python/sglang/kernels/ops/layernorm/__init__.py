@@ -111,14 +111,9 @@ class RMSNormOp(BaseFusedOp):
         out: Optional[torch.Tensor] = None,
         enable_pdl: Optional[bool] = None,
     ) -> torch.Tensor:
-        import torch
-
         from sglang.kernels.ops.layernorm.norm import rmsnorm as jit_rmsnorm
 
-        if out is None:
-            out = torch.empty_like(input)
-        jit_rmsnorm(input, weight, out, eps)
-        return out
+        return jit_rmsnorm(input, weight, eps, out)
 
     def forward_aiter(
         self,
