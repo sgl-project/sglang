@@ -128,6 +128,19 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
+def _subsample_keeping_ends(values: list[int], limit: int) -> list[int]:
+    """At most `limit` evenly spaced entries, always including the first and the last.
+
+    The widest shape must survive: consumers treat it as the top of the measured range, and dropping
+    it would silently shrink what the curve covers.
+    """
+    if limit < 2 or len(values) <= limit:
+        return list(values)
+    step = (len(values) - 1) / (limit - 1)
+    picked = sorted({int(round(i * step)) for i in range(limit)} | {0, len(values) - 1})
+    return [values[i] for i in picked]
+
+
 def ragged_verify_compact_graphs_enabled(spec_algorithm: SpeculativeAlgorithm) -> bool:
     if not spec_algorithm.supports_ragged_verify():
         return False
@@ -512,6 +525,109 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         buckets = sorted({bs * self.captured_req_width for bs in self.capture_bs})
         assert buckets and buckets[0] > 0, f"{buckets=}"
         return buckets
+
+    def measure_captured_replay_seconds(
+        self, *, max_probes: int, warmup: int, reps: int
+    ) -> list[tuple[int, float, float]]:
+        """Replay cost of captured graphs, as (shape, median_seconds, spread_seconds) triples.
+
+        The shape key is the token count for compact ragged verify graphs and the batch size
+        otherwise, matching how each family is captured and keyed.
+
+        **The work is identical on every rank by construction**: the same subsampled shapes in the
+        same order, and a fixed replay count per shape. A captured graph contains the model's
+        collectives, so a rank that replays a different number of times leaves its peers waiting
+        forever. Nothing here may depend on a locally measured value -- an adaptive replay count or
+        a wall-clock early exit deadlocks tensor-parallel startup, which is not a hypothetical.
+
+        Cost is bounded by subsampling rather than by timing: at most `max_probes` shapes, always
+        including the widest, since callers use it as the top of their range. The total is
+        `max_probes * (warmup + reps)` graph replays, i.e. a fixed multiple of one decode step.
+
+        `spread_seconds` is the full range of the samples: how well this measurement resolves a cost
+        difference at all. Callers need it, because cost curves are nearly flat across the narrow
+        shapes and would otherwise encode replay noise as signal. The range rather than a percentile
+        stays meaningful at small sample counts, and it errs wide, which makes consumers flatten
+        rather than sharpen.
+
+        Returns an empty list when there is nothing to measure, so callers keep their cost model.
+        """
+        shapes = self.capture_num_tokens if self.ragged_verify_mode else self.capture_bs
+        if not shapes:
+            return []
+        probes = _subsample_keeping_ends(sorted(shapes), max_probes)
+
+        measurements: list[tuple[int, float, float]] = []
+        for shape in probes:
+            shape_key = self._make_graph_key(shape)
+            try:
+                self._stage_serving_shaped_layout(shape)
+                for _ in range(warmup):
+                    self.backend.replay_captured_shape(shape_key)
+                self.device_module.synchronize()
+                samples_ms = [self._time_one_replay_ms(shape_key) for _ in range(reps)]
+            except (NotImplementedError, KeyError):
+                # Backend cannot replay a bare shape, or this shape was never captured. Both are
+                # properties of the captured set, so every rank takes this branch at the same
+                # shape. A partial curve is worse than none, so give the caller nothing.
+                return []
+            finally:
+                self._restore_capture_shaped_layout(shape)
+            samples_ms.sort()
+            measurements.append(
+                (
+                    int(shape),
+                    samples_ms[len(samples_ms) // 2] / 1000.0,
+                    (samples_ms[-1] - samples_ms[0]) / 1000.0,
+                )
+            )
+        return measurements
+
+    def _stage_serving_shaped_layout(self, num_tokens: int) -> None:
+        """Point a captured verify graph at the row layout serving will actually use.
+
+        Capture packs a tier into `min(num_tokens, max_bs)` rows, so at the wide tiers it is many
+        rows of one or two tokens -- a shape no verify step ever runs. Serving refreshes
+        verify_lens / qo_indptr in place before every replay, so timing must do the same or it
+        prices the wrong work: for a tier of `m` tokens it would measure `min(m, max_bs)` rows where
+        a full verify step has `m / width`, and the cost of a row is not the cost of a token.
+
+        The chosen shape, `m / width` rows of `width` tokens, is a verify-all step at that width --
+        the same conditioning the offline profiler documents itself as measuring.
+        """
+        self._restage_ragged_layout(num_tokens, num_tokens // self.captured_req_width)
+
+    def _restore_capture_shaped_layout(self, num_tokens: int) -> None:
+        """Put the capture-time layout back, so timing leaves no state behind."""
+        self._restage_ragged_layout(num_tokens, self._ragged_capture_slots(num_tokens))
+
+    def _restage_ragged_layout(self, num_tokens: int, num_slots: int) -> None:
+        if not self.ragged_verify_mode or num_slots < 1:
+            return
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyLayout,
+            build_capture_verify_lens,
+        )
+
+        layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=build_capture_verify_lens(
+                num_tokens=num_tokens,
+                num_slots=num_slots,
+                num_draft_tokens=self.captured_req_width,
+            ),
+            device=self.device,
+            grid=self.capture_num_tokens,
+        )
+        self._stage_ragged_verify_layout(layout, num_tokens)
+
+    def _time_one_replay_ms(self, shape_key: ShapeKey) -> float:
+        start = self.device_module.Event(enable_timing=True)
+        end = self.device_module.Event(enable_timing=True)
+        start.record()
+        self.backend.replay_captured_shape(shape_key)
+        end.record()
+        end.synchronize()
+        return start.elapsed_time(end)
 
     def _autotune_buffers(self):
         """Reuse these static decode buffers (sized to max_bs) for the warmup
