@@ -353,6 +353,22 @@ _EXPOSED = {
     ("utils/common.py", "speculative_num_steps"),
     ("utils/cuda_vmm_transport_utils.py", "mm_feature_transport"),
     ("utils/hf_transformers/processor.py", "image_processor_backend"),
+    # The daemon command and constructor snapshot the resolved startup layout
+    # before the daemon's loading lifecycle can apply any runtime overrides.
+    ("weight_cache/daemon.py", "attn_cp_size"),
+    ("weight_cache/daemon.py", "deepep_mode"),
+    ("weight_cache/daemon.py", "dp_size"),
+    ("weight_cache/daemon.py", "dtype"),
+    ("weight_cache/daemon.py", "enable_dp_attention"),
+    ("weight_cache/daemon.py", "enable_dp_lm_head"),
+    ("weight_cache/daemon.py", "ep_size"),
+    ("weight_cache/daemon.py", "load_format"),
+    ("weight_cache/daemon.py", "model_path"),
+    ("weight_cache/daemon.py", "moe_a2a_backend"),
+    ("weight_cache/daemon.py", "moe_dense_tp_size"),
+    ("weight_cache/daemon.py", "moe_dp_size"),
+    ("weight_cache/daemon.py", "pp_size"),
+    ("weight_cache/daemon.py", "quantization"),
 }
 
 # Pairs whose resolution write only happens on a CUDA host (capability or
@@ -369,6 +385,11 @@ _EXPOSED_CUDA_ONLY: frozenset = frozenset()
 _OVERRIDDEN_AND_READ = {
     ("entrypoints/engine.py", "reasoning_parser"),
     ("entrypoints/engine.py", "tool_call_parser"),
+    ("weight_cache/daemon.py", "dp_size"),
+    ("weight_cache/daemon.py", "dtype"),
+    ("weight_cache/daemon.py", "ep_size"),
+    ("weight_cache/daemon.py", "load_format"),
+    ("weight_cache/daemon.py", "model_path"),
     ("configs/model_config.py", "dtype"),
     ("configs/model_config.py", "model_path"),
     ("disaggregation/decode_kvcache_offload_manager.py", "hicache_storage_backend"),
