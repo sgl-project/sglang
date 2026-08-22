@@ -431,6 +431,123 @@ MODELS = {
             "--dit-cpu-offload=false",
         ],
     },
+    "krea2-turbo": {
+        "path": "krea/Krea-2-Turbo",
+        "prompt": "A red fox sitting in fresh snow, golden hour, photorealistic.",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+            "--num-inference-steps=8",
+            "--guidance-scale=1.0",
+        ],
+    },
+    "krea2-raw": {
+        "path": "krea/Krea-2-Raw",
+        "prompt": "A red fox sitting in fresh snow, golden hour, photorealistic.",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+            "--num-inference-steps=50",
+            "--guidance-scale=4.5",
+        ],
+    },
+    "ideogram4-fast": {
+        "path": "fal/ideogram-v4-fast",
+        "prompt": "A vintage travel poster for Kyoto with crisp readable lettering.",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+        ],
+    },
+    "ideogram4-instant": {
+        "path": "fal/ideogram-v4-instant",
+        "prompt": "A vintage travel poster for Kyoto with crisp readable lettering.",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+        ],
+    },
+    "longlive2-t2v": {
+        "path": "Rabinovich/LongLive-2.0-5B-Diffusers",
+        "prompt": "A curious raccoon",
+        "extra_args": [
+            "--width=832",
+            "--height=480",
+            "--num-frames=61",
+            "--num-inference-steps=4",
+            "--guidance-scale=1.0",
+        ],
+    },
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
+    "longlive2-i2v": {
+        "path": "Rabinovich/LongLive-2.0-5B-Diffusers",
+        "prompt": "The cat starts walking slowly towards the camera.",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "extra_args": [
+            "--width=960",
+            "--height=928",
+            "--num-frames=61",
+            "--num-inference-steps=4",
+            "--guidance-scale=1.0",
+        ],
+    },
+    "fast-hunyuan": {
+        "path": "FastVideo/FastHunyuan-diffusers",
+        "prompt": "A curious raccoon",
+        "extra_args": [
+            "--width=1280",
+            "--height=720",
+            "--num-frames=125",
+            "--num-inference-steps=6",
+        ],
+    },
+    "turbowan21-t2v-1.3b": {
+        "path": "IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
+        "prompt": "A curious raccoon",
+        "extra_args": [
+            "--width=832",
+            "--height=480",
+            "--num-frames=81",
+            "--num-inference-steps=4",
+        ],
+    },
+    "helios-mid": {
+        "path": "BestWishYsh/Helios-Mid",
+        "prompt": "A curious raccoon",
+        "extra_args": [
+            "--width=640",
+            "--height=384",
+            "--num-frames=33",
+            "--num-inference-steps=20",
+        ],
+    },
+    "helios-distilled": {
+        "path": "BestWishYsh/Helios-Distilled",
+        "prompt": "A curious raccoon",
+        "extra_args": [
+            "--width=640",
+            "--height=384",
+            "--num-frames=33",
+            "--num-inference-steps=10",
+            "--guidance-scale=1.0",
+        ],
+    },
+    "joy-echo": {
+        "path": "jdopensource/JoyAI-Echo",
+        "prompt": "A curious raccoon",
+        "seed": 42,
+        "config_overrides": {
+            "enable_memory_bank": False,
+        },
+        "extra_args": [
+            "--width=640",
+            "--height=384",
+            "--num-frames=33",
+            "--num-inference-steps=8",
+            "--num-gpus=2",
+            "--ulysses-degree=2",
+        ],
+    },
     "cosmos3-edge-t2i": {
         "path": "nvidia/Cosmos3-Edge",
         "prompt": "A warehouse robot folds a blue cloth on a clean workbench.",
