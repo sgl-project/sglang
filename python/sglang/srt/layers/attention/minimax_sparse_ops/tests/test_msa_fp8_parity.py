@@ -16,8 +16,17 @@ Run: pytest python/sglang/srt/layers/attention/minimax_sparse_ops/tests/test_msa
 import pytest
 import torch
 
-from sglang.srt.layers.attention.minimax_sparse_ops.decode.topk_sparse import (
+from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
     flash_decode_with_gqa_share_sparse,
+)
+from sglang.kernels.ops.attention.minimax_sparse.page_table import (
+    build_page_table_snapshot,
+)
+from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
+    flash_prefill_with_gqa_share_sparse,
+)
+from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
+    minimax_sparse_prefill,
 )
 from sglang.srt.layers.attention.minimax_sparse_ops.msa import (
     build_msa_decode_cg_plan,
@@ -26,9 +35,6 @@ from sglang.srt.layers.attention.minimax_sparse_ops.msa import (
     msa_sparse_prefill_main,
     update_msa_decode_cg_meta,
 )
-from sglang.srt.layers.attention.minimax_sparse_ops.prefill.topk_sparse import (
-    flash_prefill_with_gqa_share_sparse,
-)
 
 DEVICE = "cuda"
 FP8 = torch.float8_e4m3fn
@@ -36,6 +42,20 @@ P = 128  # sparse block == page size
 # two independent e4m3-P quantizations (MSA + Triton)
 X_ATOL = 1e-1
 X_RTOL = 1e-1
+
+
+def _build_page_table(req_to_token, slot_ids, seq_lens, max_slots, page_size=1):
+    max_pages = (req_to_token.shape[1] + page_size - 1) // page_size
+    page_table = torch.empty(
+        (slot_ids.shape[0], max_pages),
+        dtype=torch.int32,
+        device=req_to_token.device,
+    )
+    build_page_table_snapshot(
+        page_table, req_to_token, slot_ids, seq_lens, page_size, max_slots
+    )
+    return page_table
+
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not msa_available(),
@@ -115,11 +135,12 @@ def test_msa_fp8_decode_vs_triton_fp8():
     q8, qr = qdq(q)
     k8, kr = qdq(k)
     v8, vr = qdq(v)
+    page_table = _build_page_table(r2t, sids, seq_lens, k.shape[0], P)
     o_msa = msa_sparse_decode_main(
-        q8, k8, v8, tidx, r2t, sids, seq_lens, block_size_k=P
+        q8, k8, v8, tidx, page_table, seq_lens, block_size_k=P
     )
     o_triton = flash_decode_with_gqa_share_sparse(
-        q8, None, k8, v8, r2t, seq_lens, sids, P, tidx
+        q8, None, k8, v8, page_table, seq_lens, P, tidx, page_size=P
     )
     assert o_msa.dtype == torch.bfloat16
     torch.testing.assert_close(
@@ -127,7 +148,7 @@ def test_msa_fp8_decode_vs_triton_fp8():
     )
     # bf16 MSA on the dequantized tensors bounds the pure fp8-kernel error
     o_bf16 = msa_sparse_decode_main(
-        qr, kr, vr, tidx, r2t, sids, seq_lens, block_size_k=P
+        qr, kr, vr, tidx, page_table, seq_lens, block_size_k=P
     )
     err = (o_msa.float() - o_bf16.float()).abs().mean()
     ref = o_bf16.float().abs().mean()
@@ -139,14 +160,14 @@ def test_msa_fp8_decode_scales():
     q8, qr = qdq(q)
     k8, kr = qdq(k)
     v8, vr = qdq(v)
+    page_table = _build_page_table(r2t, sids, seq_lens, k.shape[0], P)
     q_scale, k_scale, v_scale = 1.5, 0.5, 2.0
     o = msa_sparse_decode_main(
         q8,
         k8,
         v8,
         tidx,
-        r2t,
-        sids,
+        page_table,
         seq_lens,
         block_size_k=P,
         q_scale=q_scale,
@@ -159,8 +180,7 @@ def test_msa_fp8_decode_scales():
         (kr * k_scale).to(torch.bfloat16),
         (vr * v_scale).to(torch.bfloat16),
         tidx,
-        r2t,
-        sids,
+        page_table,
         seq_lens,
         block_size_k=P,
     )
@@ -174,6 +194,7 @@ def test_msa_fp8_decode_capture_replay_bitexact():
     q8, _ = qdq(q)
     k8, _ = qdq(k)
     v8, _ = qdq(v)
+    page_table = _build_page_table(r2t, sids, seq_lens, k.shape[0], P)
     bs = q8.shape[0]
     nb_max = r2t.shape[1] // P
     plan = build_msa_decode_cg_plan(
@@ -181,7 +202,7 @@ def test_msa_fp8_decode_capture_replay_bitexact():
     )
     kv_indices = torch.zeros(bs * nb_max, dtype=torch.int32, device=DEVICE)
     update_msa_decode_cg_meta(
-        plan, kv_indices, r2t, sids, seq_lens, P, tidx.shape[-1], 16, 1
+        plan, kv_indices, page_table, seq_lens, P, tidx.shape[-1], 16, 1
     )
 
     def run():
@@ -190,8 +211,7 @@ def test_msa_fp8_decode_capture_replay_bitexact():
             k8,
             v8,
             tidx,
-            r2t,
-            sids,
+            page_table,
             seq_lens,
             block_size_k=P,
             kv_indices=kv_indices,
@@ -241,6 +261,54 @@ def _prefill_setup(seq_lens_list, prefix_lens_list, topk=4):
     return q, k, v, r2t, sids, cu, seq_lens, prefix, tidx, max(q_lens)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, FP8], ids=["bf16", "fp8"])
+def test_msa_prefill_index_pipeline_vs_triton(dtype):
+    q, k, v, r2t, _, cu, seq_lens, prefix, _, max_q = _prefill_setup([1024], [512])
+    q = q.to(dtype)
+    k = k.to(dtype)
+    v = v.to(dtype)
+    idx_q = q[:, :2].contiguous()
+    page_table = page_table_from_r2t(r2t)
+    kwargs = dict(
+        q=q,
+        k_cache=k,
+        v_cache=v,
+        sink=None,
+        idx_q=idx_q,
+        idx_k_cache=k,
+        idx_v_cache=None,
+        idx_sink=None,
+        page_table=page_table,
+        cu_seqlens=cu,
+        seq_lens=seq_lens,
+        prefix_lens=prefix,
+        max_seqlen_q=max_q,
+        max_seqlen_k=int(seq_lens.max().item()),
+        block_size_q=1,
+        block_size_k=P,
+        topk=4,
+        init_blocks=0,
+        local_blocks=1,
+        disable_index_value=True,
+        page_size=P,
+    )
+
+    cache = {}
+    _, actual = minimax_sparse_prefill(**kwargs, use_msa=True, msa_meta_cache=cache)
+    _, expected = minimax_sparse_prefill(**kwargs, use_msa=False)
+    assert "index_plan" in cache and "prefill" in cache
+    torch.testing.assert_close(
+        actual.float(), expected.float(), atol=X_ATOL, rtol=X_RTOL
+    )
+
+    kv_indices_ptr = cache["kv_indices"].data_ptr()
+    score_ptr = cache["index_score"].data_ptr()
+    _, replay = minimax_sparse_prefill(**kwargs, use_msa=True, msa_meta_cache=cache)
+    assert cache["kv_indices"].data_ptr() == kv_indices_ptr
+    assert cache["index_score"].data_ptr() == score_ptr
+    assert torch.equal(actual, replay)
+
+
 @pytest.mark.parametrize(
     "seq_lens,prefix_lens,branch",
     [
@@ -256,16 +324,16 @@ def test_msa_fp8_prefill_vs_triton_fp8(seq_lens, prefix_lens, branch):
     q8, _ = qdq(q)
     k8, _ = qdq(k)
     v8, _ = qdq(v)
+    page_table = _build_page_table(r2t, sids, seq_lens_t, k.shape[0], P)
     o_msa = msa_sparse_prefill_main(
-        q8, k8, v8, tidx, r2t, sids, cu, seq_lens_t, prefix, block_size_k=P
+        q8, k8, v8, tidx, page_table, cu, seq_lens_t, prefix, block_size_k=P
     )
     o_triton = flash_prefill_with_gqa_share_sparse(
         q=q8,
         k_cache=k8,
         v_cache=v8,
         sink=None,
-        req_to_token=r2t,
-        slot_ids=sids,
+        page_table=page_table,
         topk_idx=tidx,
         block_size_q=1,
         block_size_k=P,
@@ -273,6 +341,7 @@ def test_msa_fp8_prefill_vs_triton_fp8(seq_lens, prefix_lens, branch):
         seq_lens=seq_lens_t,
         prefix_lens=prefix,
         max_seqlen_q=max_q,
+        page_size=P,
     )
     assert o_msa.dtype == torch.bfloat16
     torch.testing.assert_close(

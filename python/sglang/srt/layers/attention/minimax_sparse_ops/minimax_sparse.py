@@ -15,10 +15,12 @@ from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
 )
 from sglang.kernels.ops.attention.minimax_sparse.prefill.flash_with_topk_idx import (
     flash_prefill_with_topk_index,
+    topk_index_from_block_score,
 )
 from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
     flash_prefill_with_gqa_share_sparse,
 )
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 _msa_fallback_warned = False
@@ -46,8 +48,7 @@ def minimax_sparse_prefill(
         torch.Tensor
     ],  # [max_slots, 1, idx_head_dim] (paged index); None when disable_index_value
     idx_sink: Optional[torch.Tensor],  # [num_idx_heads, idx_head_dim]
-    req_to_token: torch.Tensor,  # [max_reqs, max_kv_len]
-    slot_ids: torch.Tensor,  # [batch_size, ]
+    page_table: torch.Tensor,  # [batch_size, max_pages] physical page ids
     cu_seqlens: torch.Tensor,  # [batch_size + 1, ] (Q-side cumulative)
     seq_lens: torch.Tensor,  # [batch_size, ] total K length (prefix + chunk)
     prefix_lens: torch.Tensor,  # [batch_size, ]
@@ -73,6 +74,8 @@ def minimax_sparse_prefill(
     idx_q_scale: Optional[float] = None,
     idx_k_scale: Optional[float] = None,
     idx_v_scale: Optional[float] = None,
+    page_size: int = 1,
+    msa_meta_cache: Optional[dict] = None,
 ):
     """Run MiniMax-M3 sparse prefill.
 
@@ -87,46 +90,88 @@ def minimax_sparse_prefill(
             cu_seqlens, max_seqlen_q, block_size_q, block_size_k, seqlens_cpu
         )
 
-    # All seqlen is less than topk, use full attention
-    # Step 1: Flash attention with topk index (using index head)
-    idx_o, topk_idx = flash_prefill_with_topk_index(
-        q=idx_q,
-        k_cache=idx_k_cache,
-        v_cache=idx_v_cache,
-        sink=idx_sink,
-        req_to_token=req_to_token,
-        slot_ids=slot_ids,
-        cu_seqlens=cu_seqlens,
-        seq_lens=seq_lens,
-        prefix_lens=prefix_lens,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        block_size_q=block_size_q,
-        block_size_k=block_size_k,
-        topk=topk,
-        init_blocks=init_blocks,
-        local_blocks=local_blocks,
-        sm_scale=idx_sm_scale,
-        score_type=score_type,
-        disable_index_value=disable_index_value,
-        cu_seqblocks_q=cu_seqblocks_q,
-        max_seqblock_q=max_seqblock_q,
-        all_seqblock_q=all_seqblock_q,
-        q_scale=idx_q_scale,
-        k_scale=idx_k_scale,
-        v_scale=idx_v_scale,
-    )
-    # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads
     num_idx_heads = idx_q.shape[1]
     num_kv_heads = k_cache.shape[1]
+    score = None
+    if (
+        use_msa
+        and envs.SGLANG_OPT_USE_MSA_PREFILL_INDEX_SCORE.get()
+        and disable_index_value
+        and idx_sink is None
+        and score_type == "max"
+        and page_size == block_size_k == 128
+    ):
+        from .msa import MSAUnavailableError, msa_sparse_prefill_index_score
+
+        try:
+            score = msa_sparse_prefill_index_score(
+                idx_q,
+                idx_k_cache,
+                page_table,
+                cu_seqlens,
+                seq_lens,
+                prefix_lens,
+                block_size_k,
+                sm_scale=idx_sm_scale,
+                q_scale=idx_q_scale,
+                k_scale=idx_k_scale,
+                meta_cache=msa_meta_cache,
+            )
+        except MSAUnavailableError as err:
+            _warn_msa_fallback(err)
+
+    if score is not None:
+        idx_o = None
+        topk_idx = topk_index_from_block_score(
+            score,
+            cu_seqlens,
+            prefix_lens,
+            cu_seqblocks_q,
+            max_seqblock_q,
+            all_seqblock_q,
+            block_size_q,
+            block_size_k,
+            topk,
+            init_blocks,
+            local_blocks,
+        )
+    else:
+        idx_o, topk_idx = flash_prefill_with_topk_index(
+            q=idx_q,
+            k_cache=idx_k_cache,
+            v_cache=idx_v_cache,
+            sink=idx_sink,
+            page_table=page_table,
+            cu_seqlens=cu_seqlens,
+            seq_lens=seq_lens,
+            prefix_lens=prefix_lens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            block_size_q=block_size_q,
+            block_size_k=block_size_k,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            sm_scale=idx_sm_scale,
+            score_type=score_type,
+            disable_index_value=disable_index_value,
+            cu_seqblocks_q=cu_seqblocks_q,
+            max_seqblock_q=max_seqblock_q,
+            all_seqblock_q=all_seqblock_q,
+            q_scale=idx_q_scale,
+            k_scale=idx_k_scale,
+            v_scale=idx_v_scale,
+            page_size=page_size,
+        )
+
+    # Reduce topk idx if num_idx_heads > num_kv_heads.
     idx_group_size = num_idx_heads // num_kv_heads
     if idx_group_size > 1:
         topk_idx = topk_index_reduce(
             topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
         )
-    # Step 3: Sparse attention using topk index (main head). The MSA path only
-    # replaces this step; the indexer above is unchanged. MSA has no attn-sink
-    # input, so keep the Triton path when sink is present.
+    # Step 3: Sparse attention using topk index (main head). MSA has no
+    # attn-sink input, so keep the Triton path when sink is present.
     if use_msa and sink is None:
         from .msa import MSAUnavailableError, msa_sparse_prefill_main
 
@@ -136,8 +181,7 @@ def minimax_sparse_prefill(
                 k_cache=k_cache,
                 v_cache=v_cache,
                 topk_idx=topk_idx,
-                req_to_token=req_to_token,
-                slot_ids=slot_ids,
+                page_table=page_table,
                 cu_seqlens=cu_seqlens,
                 seq_lens=seq_lens,
                 prefix_lens=prefix_lens,
@@ -146,6 +190,7 @@ def minimax_sparse_prefill(
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                meta_cache=msa_meta_cache,
             )
         except MSAUnavailableError as err:
             _warn_msa_fallback(err)
@@ -154,8 +199,7 @@ def minimax_sparse_prefill(
                 k_cache=k_cache,
                 v_cache=v_cache,
                 sink=sink,
-                req_to_token=req_to_token,
-                slot_ids=slot_ids,
+                page_table=page_table,
                 topk_idx=topk_idx,
                 block_size_q=block_size_q,
                 block_size_k=block_size_k,
@@ -169,6 +213,7 @@ def minimax_sparse_prefill(
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                page_size=page_size,
             )
     else:
         o = flash_prefill_with_gqa_share_sparse(
@@ -176,8 +221,7 @@ def minimax_sparse_prefill(
             k_cache=k_cache,
             v_cache=v_cache,
             sink=sink,
-            req_to_token=req_to_token,
-            slot_ids=slot_ids,
+            page_table=page_table,
             topk_idx=topk_idx,
             block_size_q=block_size_q,
             block_size_k=block_size_k,
@@ -191,6 +235,7 @@ def minimax_sparse_prefill(
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            page_size=page_size,
         )
     return idx_o, o
 
@@ -206,8 +251,7 @@ def minimax_sparse_decode(
     idx_v_cache: Optional[
         torch.Tensor
     ],  # [max_slots, 1, idx_head_dim] (paged); None when disable_index_value
-    req_to_token: torch.Tensor,  # [max_reqs, max_kv_len]
-    slot_ids: torch.Tensor,  # [batch_size, ]
+    page_table: torch.Tensor,  # [batch_size, max_pages] physical page ids
     seq_lens: torch.Tensor,  # [batch_size, ]
     max_seqlen: int,  # max of seq_lens, passed from caller to avoid sync during CUDA graph capture
     block_size_q: int,  # useless for now, will always be 1
@@ -241,10 +285,9 @@ def minimax_sparse_decode(
         sink=idx_sink,
         k_cache=idx_k_cache,
         v_cache=idx_v_cache,
-        req_to_token=req_to_token,
+        page_table=page_table,
         seq_lens=seq_lens,
         max_seqlen=max_seqlen,
-        slot_ids=slot_ids,
         block_size=block_size_k,
         topk=topk,
         init_blocks=init_blocks,
@@ -282,8 +325,7 @@ def minimax_sparse_decode(
                     k_cache=k_cache,
                     v_cache=v_cache,
                     topk_idx=topk_idx,
-                    req_to_token=req_to_token,
-                    slot_ids=slot_ids,
+                    page_table=page_table,
                     seq_lens=seq_lens,
                     block_size_k=block_size_k,
                     sm_scale=sm_scale,
@@ -300,15 +342,15 @@ def minimax_sparse_decode(
                     sink=sink,
                     k_cache=k_cache,
                     v_cache=v_cache,
-                    req_to_token=req_to_token,
+                    page_table=page_table,
                     seq_lens=seq_lens,
-                    slot_ids=slot_ids,
                     block_size=block_size_k,
                     topk_idx=topk_idx,
                     sm_scale=sm_scale,
                     q_scale=q_scale,
                     k_scale=k_scale,
                     v_scale=v_scale,
+                    page_size=page_size,
                 )
         else:
             o = flash_decode_with_gqa_share_sparse(
@@ -316,14 +358,14 @@ def minimax_sparse_decode(
                 sink=sink,
                 k_cache=k_cache,
                 v_cache=v_cache,
-                req_to_token=req_to_token,
+                page_table=page_table,
                 seq_lens=seq_lens,
-                slot_ids=slot_ids,
                 block_size=block_size_k,
                 topk_idx=topk_idx,
                 sm_scale=sm_scale,
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                page_size=page_size,
             )
     return idx_o, o
