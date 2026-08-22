@@ -36,6 +36,8 @@ def aggregate_scheduler_startup_times(
     startup_times: Iterable[Mapping | None],
 ) -> dict:
     """Return critical-path (max across ranks) startup durations."""
+    # Seeded because callers subscript these directly; a registry phase only
+    # appears once some rank has recorded it.
     result = {
         "load_weight": 0.0,
         "kv_cache_allocation": 0.0,
