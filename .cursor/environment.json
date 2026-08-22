@@ -1,0 +1,4 @@
+{
+  "name": "SGLang (CPU: lint + Rust services)",
+  "install": "bash .cursor/install.sh"
+}
