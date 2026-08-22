@@ -65,15 +65,30 @@ class BaseConnector(ABC):
     def _close_by_signal(self, existing_handler=None):
 
         def new_handler(signum, frame):
-            self.close()
-            if existing_handler:
-                existing_handler(signum, frame)
+            try:
+                self.close()
+            finally:
+                if existing_handler == signal.SIG_IGN:
+                    return
+
+                if callable(existing_handler):
+                    existing_handler(signum, frame)
+                    return
+
+                # A container's PID 1 ignores signals with a default
+                # disposition, so re-raising SIGTERM would not terminate it.
+                if os.getpid() == 1:
+                    os._exit(128 + signum)
+                    return
+
+                # Preserve the default signal disposition after cleanup.
+                signal.signal(signum, signal.SIG_DFL)
+                signal.raise_signal(signum)
 
         return new_handler
 
 
 class BaseKVConnector(BaseConnector):
-
     @abstractmethod
     def get(self, key: str) -> Optional[torch.Tensor]:
         raise NotImplementedError()
