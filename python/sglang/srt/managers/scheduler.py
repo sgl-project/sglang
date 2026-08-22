@@ -2175,6 +2175,7 @@ class Scheduler(
             disaggregation_mode=self.disaggregation_mode,
             ps=self.ps,
             server_args=self.server_args,
+            worker_generation=self.instance_id,
             max_total_num_tokens=self.max_total_num_tokens,
             max_running_requests=self.max_running_requests,
             pool_stats_observer=self.pool_stats_observer,

@@ -200,16 +200,6 @@ impl KvEventIndex {
             },
         };
 
-        if let Some(snapshot) = &cfg.snapshot {
-            if snapshot.protocol_version != 1 {
-                warn!(
-                    worker_url = %worker_url,
-                    protocol_version = snapshot.protocol_version,
-                    "kv-events: unsupported placement snapshot protocol; using legacy live-only indexing",
-                );
-            }
-        }
-
         // Hashing at different block sizes would silently destroy match
         // quality, so validate before creating any subscriber state.
         if let Err(error) = self.block_size_oracle.try_set(cfg.block_size) {
@@ -232,6 +222,16 @@ impl KvEventIndex {
                 "kv-events: external Indexer configured; discovered hash metadata without subscribing"
             );
             return;
+        }
+
+        if let Some(snapshot) = &cfg.snapshot {
+            if snapshot.protocol_version != 1 {
+                warn!(
+                    worker_url = %worker_url,
+                    protocol_version = snapshot.protocol_version,
+                    "kv-events: unsupported placement snapshot protocol; using legacy live-only indexing",
+                );
+            }
         }
 
         // Compute the DP ranks that will actually be subscribed (skip

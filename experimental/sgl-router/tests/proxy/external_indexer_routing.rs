@@ -11,7 +11,8 @@ use axum::http::{Request, StatusCode};
 use serde_json::json;
 use sgl_kv_indexer::pb::kv_indexer_client::KvIndexerClient;
 use sgl_kv_indexer::pb::{
-    ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType, TierType,
+    ConfigureExpectedWorkersRequest, ExpectedWorker, ReplaceExternalKvSnapshotRequest, TierHashes,
+    TierType,
 };
 use sgl_kv_indexer::{
     server_builder, GrpcPrefixIndex, InMemoryKvIndexerBackend, KvIndexerService, PrefixIndexConfig,
@@ -58,23 +59,58 @@ async fn external_indexer_routes_to_the_cached_worker() {
 
     let mut indexer = KvIndexerClient::connect(endpoint.clone()).await.unwrap();
     indexer
-        .apply_external_kv_batch(ApplyExternalKvBatchRequest {
-            worker_id: "cached-worker".into(),
-            seq: 1,
-            actions: vec![ExternalKvAction {
-                r#type: ExternalKvActionType::ActionReport as i32,
-                tier: TierType::TierHbm as i32,
-                hashes: hashes.clone(),
-                component_masks: Vec::new(),
-                block_sizes: Vec::new(),
-            }],
-            worker_address: cached.url.clone(),
-            cache_spec: None,
-            worker_epoch: String::new(),
-            enforce_sequence: false,
+        .configure_expected_workers(ConfigureExpectedWorkersRequest {
+            workers: vec![
+                ExpectedWorker {
+                    worker_id: "cached-worker".into(),
+                    worker_address: cached.url.clone(),
+                    ..Default::default()
+                },
+                ExpectedWorker {
+                    worker_id: "uncached-worker".into(),
+                    worker_address: uncached.url.clone(),
+                    ..Default::default()
+                },
+            ],
         })
         .await
         .unwrap();
+    for (worker_id, worker_address, worker_hashes, worker_generation) in [
+        (
+            "cached-worker",
+            cached.url.clone(),
+            hashes.clone(),
+            "cached-generation",
+        ),
+        (
+            "uncached-worker",
+            uncached.url.clone(),
+            Vec::new(),
+            "uncached-generation",
+        ),
+    ] {
+        indexer
+            .replace_external_kv_snapshot(ReplaceExternalKvSnapshotRequest {
+                worker_id: worker_id.into(),
+                worker_address,
+                worker_epoch: "epoch".into(),
+                applied_seq: 0,
+                hashes_by_tier: (!worker_hashes.is_empty())
+                    .then_some(TierHashes {
+                        tier: TierType::TierHbm as i32,
+                        hashes: worker_hashes,
+                        component_masks: Vec::new(),
+                        block_sizes: Vec::new(),
+                    })
+                    .into_iter()
+                    .collect(),
+                cache_spec: None,
+                stream_id: None,
+                worker_generation: worker_generation.into(),
+            })
+            .await
+            .unwrap();
+    }
 
     let registry = Arc::new(WorkerRegistry::default());
     for url in [&cached.url, &uncached.url] {
@@ -115,6 +151,10 @@ async fn external_indexer_routes_to_the_cached_worker() {
         .unwrap(),
     ));
     ctx.block_size_oracle = oracle;
+    ctx.worker_loads
+        .update(&cached.url, "cached-generation", 1, 0.1);
+    ctx.worker_loads
+        .update(&uncached.url, "uncached-generation", 0, 0.0);
 
     let app = build_router(Arc::new(ctx));
     let response = app

@@ -189,6 +189,7 @@ pub struct SelectionContext<'a> {
     routing_key: Option<&'a str>,
     request_tokens: Option<&'a [u32]>,
     external_prefix: Option<&'a ExternalPrefixSignal>,
+    worker_loads: Option<&'a crate::worker_load::WorkerLoadRegistry>,
 }
 
 impl<'a> SelectionContext<'a> {
@@ -199,6 +200,7 @@ impl<'a> SelectionContext<'a> {
             routing_key: None,
             request_tokens: None,
             external_prefix: None,
+            worker_loads: None,
         }
     }
 
@@ -213,6 +215,7 @@ impl<'a> SelectionContext<'a> {
             routing_key,
             request_tokens: None,
             external_prefix: None,
+            worker_loads: None,
         }
     }
 
@@ -229,6 +232,14 @@ impl<'a> SelectionContext<'a> {
         external_prefix: Option<&'a ExternalPrefixSignal>,
     ) -> Self {
         self.external_prefix = external_prefix;
+        self
+    }
+
+    pub fn with_worker_loads(
+        mut self,
+        worker_loads: Option<&'a crate::worker_load::WorkerLoadRegistry>,
+    ) -> Self {
+        self.worker_loads = worker_loads;
         self
     }
 
@@ -252,6 +263,10 @@ impl<'a> SelectionContext<'a> {
 
     pub fn external_prefix(&self) -> Option<&ExternalPrefixSignal> {
         self.external_prefix
+    }
+
+    pub fn worker_loads(&self) -> Option<&crate::worker_load::WorkerLoadRegistry> {
+        self.worker_loads
     }
 }
 

@@ -15,4 +15,5 @@ pub mod policies;
 pub mod proxy;
 pub mod server;
 pub mod tokenizer;
+pub mod worker_load;
 pub mod workers;
