@@ -1507,6 +1507,8 @@ class TestMoonEPArgs(CustomTestCase):
             moe_a2a_backend="moonep",
         )
 
+        # The dummy-model path skips the normal CUDA-graph resolution phase.
+        server_args.cuda_graph_config = CudaGraphConfig()
         server_args._handle_a2a_moe()
 
         from sglang.srt.arg_groups.overrides import resolved_view
@@ -1514,7 +1516,27 @@ class TestMoonEPArgs(CustomTestCase):
         self.assertEqual(resolved_view(server_args).moe_a2a_backend, "moonep")
         self.assertEqual(resolved_view(server_args).ep_size, server_args.tp_size)
         self.assertEqual(server_args.cuda_graph_config.decode.backend, Backend.DISABLED)
-        self.assertEqual(server_args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+        self.assertEqual(
+            server_args.cuda_graph_config.prefill.backend, Backend.DISABLED
+        )
+
+    def test_moonep_rejects_multi_flight_overlap_modes(self):
+        for flag, cli_flag in [
+            ("enable_two_batch_overlap", "--enable-two-batch-overlap"),
+            ("enable_single_batch_overlap", "--enable-single-batch-overlap"),
+        ]:
+            with self.subTest(flag=flag):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    moe_a2a_backend="moonep",
+                    **{flag: True},
+                )
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    f"single-flight.*{cli_flag}",
+                ):
+                    server_args._handle_a2a_moe()
 
 
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):
