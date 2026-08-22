@@ -11,7 +11,11 @@ from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     populate_req_to_expected_token_ids,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE, make_forward_batch
+from sglang.test.kv_canary.fixtures import (
+    DEFAULT_DEVICE,
+    DEFAULT_DEVICE_MODULE,
+    make_forward_batch,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="extra-a", runner_config="1-gpu-small")
@@ -92,7 +96,7 @@ class TestPopulateReqToExpectedTokenIds(CustomTestCase):
         populate_req_to_expected_token_ids(
             forward_batch=fb, req_to_verify_expected_tokens=pool
         )
-        torch.cuda.synchronize()
+        DEFAULT_DEVICE_MODULE.synchronize()
         self.assertTrue(torch.equal(pool, original))
 
     def test_no_op_when_pool_is_none(self) -> None:
@@ -117,7 +121,7 @@ class TestPopulateReqToExpectedTokenIds(CustomTestCase):
         populate_req_to_expected_token_ids(
             forward_batch=fb, req_to_verify_expected_tokens=pool
         )
-        torch.cuda.synchronize()
+        DEFAULT_DEVICE_MODULE.synchronize()
         self.assertTrue(torch.equal(pool, original))
 
     def test_raises_when_lens_length_mismatches_batch_size(self) -> None:
@@ -154,7 +158,7 @@ class TestPopulateReqToExpectedTokenIds(CustomTestCase):
         populate_req_to_expected_token_ids(
             forward_batch=fb, req_to_verify_expected_tokens=pool
         )
-        torch.cuda.synchronize()
+        DEFAULT_DEVICE_MODULE.synchronize()
 
         pool_cpu = pool.cpu()
         self.assertEqual(pool_cpu[1, :3].tolist(), [10, 20, 30])
