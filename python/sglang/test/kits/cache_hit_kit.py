@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+from typing import Optional
 
 import aiohttp
 import requests
@@ -242,6 +243,7 @@ def run_multiturn_cache_hit_test(
     dataset_path: str = "",
     max_parallel: int = 64,
     seed: int = 1,
+    page_size: Optional[int] = None,
 ) -> dict:
     """Run a multi-turn workload and verify cache hit rate.
 
@@ -263,7 +265,10 @@ def run_multiturn_cache_hit_test(
     np.random.seed(seed)
 
     generate_url = f"{base_url}/generate"
-    page_size = _get_page_size(base_url)
+    # A router /server_info does not expose the backend page size, so PD
+    # setups must pass the serving page size explicitly.
+    if page_size is None:
+        page_size = _get_page_size(base_url)
 
     # Flush cache for clean state
     requests.post(f"{base_url}/flush_cache")
