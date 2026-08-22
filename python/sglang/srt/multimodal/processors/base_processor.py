@@ -44,6 +44,7 @@ from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
     configure_media_url_security,
     envs,
+    ignore_external_stop_signals,
     is_cpu,
     is_npu,
     is_xpu,
@@ -351,6 +352,9 @@ class BaseMultimodalProcessor(ABC):
         self.cpu_executor = concurrent.futures.ProcessPoolExecutor(
             mp_context=mp.get_context(cpu_worker_start_method),
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
+            # Pool workers must survive group-delivered stop signals so requests
+            # still draining can finish multimodal preprocessing.
+            initializer=ignore_external_stop_signals,
         )
 
         # Mapping from attribute names to modality types

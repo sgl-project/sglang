@@ -585,6 +585,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Health check
         self.server_status = ServerStatus.Starting
         self.gracefully_exit = False
+        # Set by a repeated stop signal during drain: skip waiting for in-flight
+        # requests and shut down immediately.
+        self.drain_force_exit = False
         self.last_receive_tstamp = real_time()
 
         # Session
@@ -2138,7 +2141,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # due to the CPython limitation.
         if threading.current_thread() is threading.main_thread():
             signal_handler = self.signal_handler_class(self)
-            loop.add_signal_handler(signal.SIGTERM, signal_handler.sigterm_handler)
+            loop.add_signal_handler(
+                signal.SIGTERM, signal_handler.sigterm_handler, signal.SIGTERM
+            )
+            # SIGINT must take the same graceful-drain path. Left unhandled, it
+            # reaches the HTTP server's default handler (uvicorn installs one),
+            # which begins shutting the server down at signal time and severs
+            # every in-flight streaming response before the drain can run.
+            loop.add_signal_handler(
+                signal.SIGINT, signal_handler.sigterm_handler, signal.SIGINT
+            )
             # Update the signal handler for the process. It overrides the sigquit handler in the launch phase.
             loop.add_signal_handler(
                 signal.SIGQUIT, signal_handler.running_phase_sigquit_handler
@@ -3099,6 +3111,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         while not self.gracefully_exit:
             await asyncio.sleep(5)
 
+        # Optional upper bound on how long the drain may wait for in-flight
+        # requests. Unset or <= 0 means wait until they all finish (the
+        # orchestrator's SIGKILL is then the only backstop). The environ
+        # registry warns and falls back to the default on unparsable values,
+        # so a bad setting cannot kill this watchdog mid-drain.
+        drain_timeout_s = envs.SGLANG_GRACEFUL_SHUTDOWN_TIMEOUT.get()
+        drain_deadline = (
+            time.monotonic() + drain_timeout_s if drain_timeout_s > 0 else None
+        )
+
         # Drain requests
         while True:
             remain_num_req = len(self.rid_to_state)
@@ -3117,6 +3139,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # if force shutdown flag set, exit immediately
                 logger.error(
                     "Signal SIGTERM received while force shutdown flag set. Force exiting."
+                )
+                self.force_exit_handler()
+                break
+
+            elif self.drain_force_exit:
+                logger.error(
+                    f"Repeated stop signal received. Abandoning {remain_num_req} "
+                    "in-flight requests and exiting."
+                )
+                self.force_exit_handler()
+                break
+
+            elif drain_deadline is not None and time.monotonic() > drain_deadline:
+                logger.error(
+                    f"Graceful drain exceeded SGLANG_GRACEFUL_SHUTDOWN_TIMEOUT="
+                    f"{drain_timeout_s}s. Abandoning {remain_num_req} in-flight "
+                    "requests and exiting."
                 )
                 self.force_exit_handler()
                 break
@@ -3593,10 +3632,40 @@ def determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportM
 class SignalHandler:
     def __init__(self, tokenizer_manager: TokenizerManager):
         self.tokenizer_manager = tokenizer_manager
+        self._stop_signums_seen: set = set()
 
     def sigterm_handler(self, signum=None, frame=None):
+        if self.tokenizer_manager.gracefully_exit:
+            if signum is not None and signum in self._stop_signums_seen:
+                # The SAME signal arriving again is the operator insisting
+                # (e.g. Ctrl-C pressed twice). Stop waiting for in-flight
+                # requests and exit now.
+                logger.error(
+                    f"Repeated stop signal received during graceful drain. "
+                    f"{signum=}. Force exiting."
+                )
+                self.tokenizer_manager.drain_force_exit = True
+            else:
+                # Orchestrators deliver one stop event as a bundle of DISTINCT
+                # signals (e.g. Modal sends SIGTERM and SIGINT together); a
+                # signal not seen yet joins the stop event already draining.
+                # This is identity-based on purpose, with no time window:
+                # escalation is expressed by REPEATING a signal (Ctrl-C twice,
+                # `kill -TERM` twice), which is what interactive users and
+                # supervisors actually do, while a first-time signal of a new
+                # kind carries the same "stop" intent as the drain already in
+                # progress. A clock-based window would misread signal bundles
+                # under scheduler jitter.
+                if signum is not None:
+                    self._stop_signums_seen.add(signum)
+                logger.info(
+                    f"Additional stop signal {signum=} joined the active drain."
+                )
+            return
+        if signum is not None:
+            self._stop_signums_seen.add(signum)
         logger.warning(
-            f"SIGTERM received. {signum=} {frame=}. Draining requests and shutting down..."
+            f"Stop signal received. {signum=} {frame=}. Draining requests and shutting down..."
         )
         self.tokenizer_manager.gracefully_exit = True
 
