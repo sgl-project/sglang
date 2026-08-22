@@ -163,6 +163,8 @@ class CommonKVManager(BaseKVManager):
         self.enable_deferred_decode_kv_release = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
         )
+        self.enable_dcp_pack = envs.SGLANG_DISAGG_DCP_PACK.get()
+        self._dcp_pack_buffers = None
         # for p/d multi node infer
         self.bootstrap_host = server_args.host
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
@@ -308,6 +310,12 @@ class CommonKVManager(BaseKVManager):
             f"Unsupported PD DCP topology: {self.dcp_size} -> {dst_dcp_size}"
         )
 
+    def _pack_src_tensors(self, src_kv_ptrs: List[int]):
+        tensors = getattr(self.kv_args, "kv_data_tensors", None)
+        if tensors is None or len(tensors) != len(src_kv_ptrs):
+            return None
+        return tensors
+
     def prepare_dcp_token_item_lens(self, dst_page_item_lens: List[int]) -> List[int]:
         page_size = self.kv_args.page_size
         src_token_lens = [
@@ -320,6 +328,24 @@ class CommonKVManager(BaseKVManager):
                 f"src={src_token_lens}, dst={dst_token_lens}"
             )
         return src_token_lens
+
+    def _register_dcp_pack_memory(self, ptr: int, size: int) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support DCP pack buffer registration"
+        )
+
+    def _init_dcp_pack_buffers_once(self) -> None:
+        if self._dcp_pack_buffers is not None or not self.enable_dcp_pack:
+            return
+        if not self.kv_args.kv_item_lens:
+            return
+        from sglang.srt.disaggregation.common.dcp_pack import init_dcp_pack_buffers
+
+        self._dcp_pack_buffers = init_dcp_pack_buffers(
+            self._register_dcp_pack_memory,
+            self.kv_args,
+            len(self.transfer_queues),
+        )
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]

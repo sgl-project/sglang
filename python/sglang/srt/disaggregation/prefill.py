@@ -237,6 +237,14 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.kv_data_tensors = None
+        kv_pool = self.token_to_kv_pool
+        if hasattr(kv_pool, "full_kv_pool"):
+            kv_pool = kv_pool.full_kv_pool
+        if hasattr(kv_pool, "kv_buffer") and len(kv_pool.kv_buffer) == len(
+            kv_data_ptrs
+        ):
+            kv_args.kv_data_tensors = list(kv_pool.kv_buffer)
         kv_args.kv_layer_ids = (
             self.token_to_kv_pool.get_kv_layer_ids()
             if self.draft_token_to_kv_pool is None
