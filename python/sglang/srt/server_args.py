@@ -3442,9 +3442,21 @@ class ServerArgs:
             "Useful when each admission is disproportionately expensive, e.g. "
             "speculative decoding with a separate draft prefill pass. An "
             "explicit value always wins, capped by max-running-requests "
-            "(1 disables). When unset, DFlash workloads auto-enable the "
-            "formula; other workloads stay disabled. Not supported with "
-            "pipeline parallelism."
+            "(1 disables). When unset, DFlash workloads scale the formula "
+            "from active request demand; other workloads stay disabled. Not "
+            "supported with pipeline parallelism; bypassed when priority "
+            "preemption is enabled."
+        ),
+        NS("schedule"),
+    ] = None
+    min_free_slots_max_delay_passes: A[
+        Optional[int],
+        (
+            "Maximum scheduler passes to wait while accumulating the "
+            "requested free slots. Unset waits at most the observed running-"
+            "request target in scheduler passes; 0 disables waiting. Only "
+            "applies when the min-free-slots delay is explicitly or "
+            "automatically enabled."
         ),
         NS("schedule"),
     ] = None
@@ -3680,6 +3692,7 @@ class ServerArgs:
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
         self._validate_prefill_decode_interval()
+        self._validate_min_free_slots_max_delay_passes()
 
         # Reject an explicitly enabled but incompatible hardware runtime before
         # model path resolution, downloads, or the dummy-model short circuit.
@@ -8629,6 +8642,13 @@ class ServerArgs:
     def _validate_prefill_decode_interval(self):
         if self.prefill_decode_interval < 0:
             raise ValueError("--prefill-decode-interval must be non-negative.")
+
+    def _validate_min_free_slots_max_delay_passes(self):
+        if (
+            self.min_free_slots_max_delay_passes is not None
+            and self.min_free_slots_max_delay_passes < 0
+        ):
+            raise ValueError("--min-free-slots-max-delay-passes must be non-negative.")
 
     def _handle_other_validations(self):
         if self.default_chat_template_kwargs is not None and not isinstance(
