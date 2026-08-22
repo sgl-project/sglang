@@ -6,6 +6,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
+from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import per_tensor_quant_fp8
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -409,6 +410,7 @@ class _DeepEPDispatcherImplBase:
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        static_scale: Optional[torch.Tensor] = None,
     ):
         raise NotImplementedError
 
@@ -522,10 +524,25 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        static_scale: Optional[torch.Tensor] = None,
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
+        if static_scale is not None:
+            hidden_states_fp8 = torch.empty(
+                hidden_states.shape,
+                dtype=torch.float8_e4m3fn,
+                device=hidden_states.device,
+            )
+            if hidden_states.shape[0] > 0:
+                per_tensor_quant_fp8(
+                    hidden_states,
+                    hidden_states_fp8,
+                    static_scale,
+                    True,
+                )
+            hidden_states = hidden_states_fp8
+        elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
                 hidden_states,
@@ -688,6 +705,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        static_scale: Optional[torch.Tensor] = None,
     ):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
@@ -944,8 +962,9 @@ class DeepEPDispatcher(BaseDispatcher):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        static_scale: Optional[torch.Tensor] = None,
     ) -> DispatchOutput:
-        self.dispatch_a(hidden_states, topk_output)
+        self.dispatch_a(hidden_states, topk_output, static_scale=static_scale)
         if self._deepep_dispatch_hooks is not None:
             self._deepep_dispatch_hooks(self)
         ret = self.dispatch_b()
@@ -955,11 +974,13 @@ class DeepEPDispatcher(BaseDispatcher):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        static_scale: Optional[torch.Tensor] = None,
     ):
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
         inner_state = self._get_impl().dispatch_a(
             hidden_states=hidden_states,
             topk_output=topk_output,
+            static_scale=static_scale,
         )
         self._dispatch_intermediate_state = inner_state
 

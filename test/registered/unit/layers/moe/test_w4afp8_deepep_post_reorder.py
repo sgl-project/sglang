@@ -68,6 +68,7 @@ class TestW4AFP8DeepEPNormalPostReorder(CustomTestCase):
         strides = torch.zeros((num_experts, 3), dtype=torch.int64)
         expert_offsets = torch.zeros(num_experts + 1, dtype=torch.int32)
         problem_sizes = torch.zeros((num_experts, 3), dtype=torch.int32)
+        quant_mock = Mock()
         layer = SimpleNamespace(
             w13_weight=torch.zeros(
                 (num_experts, intermediate_size * 2, hidden_size // 2),
@@ -110,35 +111,45 @@ class TestW4AFP8DeepEPNormalPostReorder(CustomTestCase):
             patch.object(
                 w4a8_moe,
                 "per_tensor_quant_fp8",
-                new=lambda *args, **kwargs: None,
+                new=quant_mock,
             ),
             patch.object(w4a8_moe, "silu_and_mul", new=lambda *args, **kwargs: None),
         ):
-            output = w4a8_moe.cutlass_w4a8_moe_deepep_normal(
-                torch.ones((num_tokens, hidden_size), dtype=torch.bfloat16),
-                layer.w13_weight,
-                layer.w2_weight,
-                layer.w13_weight_scale_inv,
-                layer.w2_weight_scale_inv,
-                topk_weights,
-                topk_ids,
-                strides,
-                strides,
-                strides,
-                strides,
-                strides,
-                strides,
-                strides,
-                strides,
-                expert_offsets,
-                problem_sizes,
-                problem_sizes,
-                layer.w13_input_scale,
-                layer.w2_input_scale,
-            )
+            for input_dtype, expected_quant_calls in (
+                (torch.float8_e4m3fn, 1),
+                (torch.bfloat16, 2),
+            ):
+                with self.subTest(input_dtype=input_dtype):
+                    quant_mock.reset_mock()
+                    output = w4a8_moe.cutlass_w4a8_moe_deepep_normal(
+                        torch.ones((num_tokens, hidden_size), dtype=input_dtype),
+                        layer.w13_weight,
+                        layer.w2_weight,
+                        layer.w13_weight_scale_inv,
+                        layer.w2_weight_scale_inv,
+                        topk_weights,
+                        topk_ids,
+                        strides,
+                        strides,
+                        strides,
+                        strides,
+                        strides,
+                        strides,
+                        strides,
+                        strides,
+                        expert_offsets,
+                        problem_sizes,
+                        problem_sizes,
+                        layer.w13_input_scale,
+                        layer.w2_input_scale,
+                    )
 
-        self.assertEqual(output.shape, (num_tokens, hidden_size))
-        self.assertEqual(output.dtype, torch.bfloat16)
+                    self.assertEqual(output.shape, (num_tokens, hidden_size))
+                    self.assertEqual(output.dtype, torch.bfloat16)
+                    self.assertEqual(quant_mock.call_count, expected_quant_calls)
+                    self.assertEqual(
+                        quant_mock.call_args.args[0].shape[-1], intermediate_size
+                    )
 
 
 if __name__ == "__main__":

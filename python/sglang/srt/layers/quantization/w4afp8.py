@@ -7,6 +7,7 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -284,12 +285,13 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer.w2_input_scale = Parameter(new_w2_input_scale, requires_grad=False)
 
         if hasattr(layer, "dispatcher"):
-            # The normal kernel requantizes BF16 inputs with the checkpoint's
-            # static activation scale. The low-latency kernel instead consumes
-            # DeepEP's FP8 payload together with its per-token-group scales.
+            # DeepEP normal dispatch uses the checkpoint's static activation scale.
+            # Low-latency dispatch consumes DeepEP's per-token-group scales.
             layer.dispatcher.set_quant_config(
                 {
-                    "normal_dispatcher_output_dtype": "bf16",
+                    "normal_dispatcher_output_dtype": (
+                        "fp8" if get_moe_a2a_backend().is_deepep() else "bf16"
+                    ),
                     "low_latency_dispatcher_output_dtype": "fp8",
                 }
             )
@@ -385,47 +387,55 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer: DeepEPMoE,
         dispatch_output: DeepEPNormalDispatchOutput,
     ) -> torch.Tensor:
-        hidden_states, topk_idx, topk_weights = (
-            dispatch_output.hidden_states,
-            dispatch_output.topk_ids,
-            dispatch_output.topk_weights,
-        )
-        if isinstance(hidden_states, tuple):
-            hidden_states = hidden_states[0]
+        hidden_states = dispatch_output.hidden_states
+        hidden_states_scale = dispatch_output.hidden_states_scale
+        topk_idx = dispatch_output.topk_ids
+        topk_weights = dispatch_output.topk_weights
 
-        if hidden_states.dtype != torch.bfloat16:
+        num_tokens = hidden_states.shape[0]
+        if num_tokens == 0:
+            return hidden_states.to(torch.bfloat16)
+
+        if get_moe_a2a_backend().is_deepep():
+            if hidden_states.dtype != torch.float8_e4m3fn:
+                raise RuntimeError(
+                    "W4AFP8 DeepEP normal requires static FP8 dispatcher output, "
+                    f"but got {hidden_states.dtype}."
+                )
+            if hidden_states_scale is not None:
+                raise RuntimeError(
+                    "W4AFP8 DeepEP normal requires static FP8 without "
+                    "per-token-group scales."
+                )
+        elif hidden_states.dtype != torch.bfloat16:
             raise RuntimeError(
-                "W4AFP8 DeepEP normal requires BF16 dispatcher output, "
+                "W4AFP8 non-DeepEP normal requires BF16 dispatcher output, "
                 f"but got {hidden_states.dtype}."
             )
 
-        num_tokens = hidden_states.shape[0]
-        if num_tokens > 0:
-            from sglang.srt.layers.moe.cutlass_w4a8_moe import (
-                cutlass_w4a8_moe_deepep_normal,
-            )
+        from sglang.srt.layers.moe.cutlass_w4a8_moe import (
+            cutlass_w4a8_moe_deepep_normal,
+        )
 
-            return cutlass_w4a8_moe_deepep_normal(
-                hidden_states,
-                layer.w13_weight,
-                layer.w2_weight,
-                layer.w13_weight_scale_inv,
-                layer.w2_weight_scale_inv,
-                topk_weights,
-                topk_idx,
-                self.a_strides1,
-                self.b_strides1,
-                self.c_strides1,
-                self.a_strides2,
-                self.b_strides2,
-                self.c_strides2,
-                self.s_strides13,
-                self.s_strides2,
-                self.expert_offsets,
-                self.problem_sizes1,
-                self.problem_sizes2,
-                layer.w13_input_scale,
-                layer.w2_input_scale,
-            )
-        else:
-            return hidden_states
+        return cutlass_w4a8_moe_deepep_normal(
+            hidden_states,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight_scale_inv,
+            topk_weights,
+            topk_idx,
+            self.a_strides1,
+            self.b_strides1,
+            self.c_strides1,
+            self.a_strides2,
+            self.b_strides2,
+            self.c_strides2,
+            self.s_strides13,
+            self.s_strides2,
+            self.expert_offsets,
+            self.problem_sizes1,
+            self.problem_sizes2,
+            layer.w13_input_scale,
+            layer.w2_input_scale,
+        )
