@@ -57,6 +57,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def available_size(self):
         return (len(self.free_pages) + len(self.release_pages)) * self.page_size
 
+    def full_tokens_for_mamba_slots(self, slots: int) -> int:
+        """Full-side tokens to evict so `slots` mamba states fit. Zero unless the
+        two pools share one byte buffer, where freeing one is the only way to
+        fund the other."""
+        return 0
+
     def get_kvcache(self):
         return self._kvcache
 
