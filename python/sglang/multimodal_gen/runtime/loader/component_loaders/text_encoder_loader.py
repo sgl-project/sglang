@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     UnquantizedLinearMethod,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    ComponentCheckpointUnsupportedError,
     ComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
@@ -37,6 +38,10 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
     filter_files_not_needed_for_inference,
     pt_weights_iterator,
     safetensors_weights_iterator,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    host_copies_would_not_fit,
+    host_memory_available_bytes,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     EncoderTensorParallelMixin,
@@ -61,11 +66,12 @@ from sglang.srt.environ import envs
 logger = init_logger(__name__)
 
 
-def _configure_text_encoder_quantization(
+def _configure_encoder_quantization(
     model_config: EncoderConfig,
     model_cls: type[nn.Module],
     component_config: dict,
     component_model_path: str,
+    component_name: str,
 ) -> None:
     if getattr(model_cls, "manages_checkpoint_quantization", False):
         # Preserve model-owned formats such as Ideogram's bitsandbytes state.
@@ -73,27 +79,79 @@ def _configure_text_encoder_quantization(
         # themselves; running the generic lifecycle as well would process twice.
         return
 
-    quant_config = get_quant_config(
-        component_config,
-        component_model_path,
-    )
+    try:
+        quant_config = get_quant_config(
+            component_config,
+            component_model_path,
+        )
+    except (KeyError, ValueError) as error:
+        raise ComponentCheckpointUnsupportedError(
+            f"Cannot configure checkpoint quantization for {component_name!r}: {error}"
+        ) from error
     model_config.quant_config = quant_config
     if quant_config is None:
         return
-    if not issubclass(model_cls, TextEncoder):
-        raise ValueError(
-            "A quantized text-encoder checkpoint requires an in-tree native "
-            "TextEncoder; "
+    if not issubclass(model_cls, EncoderTensorParallelMixin):
+        raise ComponentCheckpointUnsupportedError(
+            f"A quantized {component_name!r} checkpoint requires an in-tree "
+            "native encoder; "
             f"got {model_cls.__name__}"
         )
-    quant_method = quant_config.get_name()
-    supported_methods = model_cls.supported_checkpoint_quantization_methods
-    if quant_method not in supported_methods:
-        raise ValueError(
-            f"{model_cls.__name__} does not support text-encoder checkpoints "
-            f"quantized with {quant_method!r}; supported methods: "
-            f"{sorted(supported_methods)}"
+
+    capability = model_cls.checkpoint_quantization_capability
+    if capability is None:
+        raise ComponentCheckpointUnsupportedError(
+            f"{model_cls.__name__} does not support quantized checkpoints for "
+            f"{component_name!r}: no checkpoint quantization capability is declared"
         )
+    if capability.backend != "diffusion":
+        raise ComponentCheckpointUnsupportedError(
+            f"{model_cls.__name__} declares the {capability.backend!r} checkpoint "
+            f"quantization backend for {component_name!r}, but the native encoder "
+            "loader currently supports only the 'diffusion' backend"
+        )
+
+    quant_method = quant_config.get_name()
+    if quant_method not in capability.methods:
+        raise ComponentCheckpointUnsupportedError(
+            f"{model_cls.__name__} does not support {component_name!r} checkpoints "
+            f"quantized with {quant_method!r}; supported methods for the "
+            f"{capability.backend!r} backend: {sorted(capability.methods)}"
+        )
+
+
+def _resolve_and_configure_encoder_quantization(
+    model_config: EncoderConfig,
+    component_config: dict,
+    component_model_path: str,
+    component_name: str,
+) -> type[nn.Module]:
+    architectures = getattr(model_config, "architectures", [])
+    try:
+        model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
+    except Exception as resolution_error:
+        try:
+            quant_config = get_quant_config(component_config, component_model_path)
+        except Exception as quantization_error:
+            raise ComponentCheckpointUnsupportedError(
+                f"Cannot parse checkpoint quantization for {component_name!r}: "
+                f"{quantization_error}"
+            ) from quantization_error
+        if quant_config is None:
+            raise
+        raise ComponentCheckpointUnsupportedError(
+            f"A quantized {component_name!r} checkpoint requires an in-tree "
+            f"native encoder; unsupported architectures: {architectures}"
+        ) from resolution_error
+
+    _configure_encoder_quantization(
+        model_config,
+        model_cls,
+        component_config,
+        component_model_path,
+        component_name,
+    )
+    return model_cls
 
 
 def _module_tensor_device(module: nn.Module) -> torch.device | None:
@@ -118,9 +176,10 @@ def _module_tensor_device(module: nn.Module) -> torch.device | None:
     return next(iter(devices), None)
 
 
-def _process_quantized_text_encoder_weights(
+def _process_quantized_encoder_weights(
     model: nn.Module,
     process_device: torch.device,
+    component_name: str,
 ) -> int:
     processed_layers = 0
     for module in model.modules():
@@ -144,10 +203,38 @@ def _process_quantized_text_encoder_weights(
                 module.to(origin_device)
     if processed_layers == 0:
         raise ValueError(
-            "The text-encoder checkpoint declares quantization, but the model "
-            "did not construct any quantized linear layers"
+            f"The {component_name!r} checkpoint declares quantization, but the "
+            "model did not construct any quantized linear layers"
         )
     return processed_layers
+
+
+def _checkpoint_bytes(model_path: str) -> int:
+    """On-disk size of a checkpoint, readable before any weight of it is."""
+    total = 0
+    for path in glob.glob(
+        os.path.join(str(model_path), "**", "*.safetensors"), recursive=True
+    ):
+        try:
+            total += os.path.getsize(path)
+        except OSError:
+            continue
+    return total
+
+
+def _keep_this_checkpoint_mapped(model_path: str) -> bool:
+    """Whether this encoder's weights should stay on their file mapping."""
+    checkpoint_bytes = _checkpoint_bytes(model_path)
+    if not host_copies_would_not_fit(checkpoint_bytes):
+        return False
+    logger.info(
+        "Text encoder checkpoint is %.2f GiB against %.2f GiB of host memory, "
+        "so its compatible weights stay on the checkpoint mapping instead of "
+        "being copied in.",
+        checkpoint_bytes / 1024**3,
+        host_memory_available_bytes() / 1024**3,
+    )
+    return True
 
 
 class TextEncoderLoader(ComponentLoader):
@@ -412,14 +499,11 @@ class TextEncoderLoader(ComponentLoader):
         )
         if post_diffusers_config_update is not None:
             post_diffusers_config_update()
-        model_cls, _ = ModelRegistry.resolve_model_cls(
-            getattr(encoder_config, "architectures", [])
-        )
-        _configure_text_encoder_quantization(
+        model_cls = _resolve_and_configure_encoder_quantization(
             encoder_config,
-            model_cls,
             model_config,
             component_model_path,
+            component_name,
         )
         encoder_dp_group = get_encoder_data_parallel_group()
         prefer_dp = (
@@ -485,13 +569,14 @@ class TextEncoderLoader(ComponentLoader):
         if quant_config is not None:
             if param_dtype not in quant_config.get_supported_act_dtypes():
                 raise ValueError(
-                    f"Text-encoder quantization method {quant_config.get_name()!r} "
+                    f"{component_name!r} quantization method "
+                    f"{quant_config.get_name()!r} "
                     f"does not support activation dtype {param_dtype}"
                 )
             if current_platform.is_mps():
                 raise ValueError(
-                    f"Text-encoder quantization method {quant_config.get_name()!r} "
-                    "is not supported on MPS"
+                    f"{component_name!r} quantization method "
+                    f"{quant_config.get_name()!r} is not supported on MPS"
                 )
             if current_platform.is_cuda():
                 capability = current_platform.get_device_capability()
@@ -500,7 +585,8 @@ class TextEncoderLoader(ComponentLoader):
                     and capability.to_int() < quant_config.get_min_capability()
                 ):
                     raise ValueError(
-                        f"Text-encoder quantization method {quant_config.get_name()!r} "
+                        f"{component_name!r} quantization method "
+                        f"{quant_config.get_name()!r} "
                         "requires CUDA compute capability "
                         f">= {quant_config.get_min_capability() / 10:.1f}; got "
                         f"{capability.to_int() / 10:.1f}"
@@ -530,7 +616,7 @@ class TextEncoderLoader(ComponentLoader):
             )
             component_starts_on_cpu = False
 
-        if component_starts_on_cpu and not current_platform.is_mps():
+        if component_starts_on_cpu:
             model_device = torch.device("cpu")
         else:
             model_device = local_torch_device
@@ -559,6 +645,18 @@ class TextEncoderLoader(ComponentLoader):
                 )
             model.bind_encoder_tp_group(encoder_tp_group)
 
+            if component_starts_on_cpu and (
+                current_platform.is_mps() or _keep_this_checkpoint_mapped(model_path)
+            ):
+                # The encoder is layered immediately after this loader returns,
+                # so compatible CPU safetensors can stay mapped instead of being
+                # copied. On MPS that is always the right call -- the memory is
+                # unified. On any host it becomes the only call once the
+                # checkpoint is larger than host memory, because the copy is
+                # what does not fit: H3's encoder is 62.13 GiB against a 32 GiB
+                # target.
+                model._keep_checkpoint_mapping = True
+
             weights_to_load = {name for name, _ in model.named_parameters()}
             loaded_weights = model.load_weights(
                 self._get_all_weights(
@@ -569,19 +667,24 @@ class TextEncoderLoader(ComponentLoader):
             )
 
             if quant_config is not None:
-                processed_layers = _process_quantized_text_encoder_weights(
+                processed_layers = _process_quantized_encoder_weights(
                     model,
                     local_torch_device,
+                    component_name,
                 )
                 logger.info(
-                    "Processed %d %s text-encoder linear layers",
+                    "Processed %d %s linear layers for %s",
                     processed_layers,
                     quant_config.get_name(),
+                    component_name,
                 )
 
             if component_starts_on_cpu:
                 if current_platform.is_mps():
-                    model = model.to(local_torch_device)
+                    logger.info(
+                        "Keeping %s on CPU for MPS layerwise offload",
+                        model.__class__.__name__,
+                    )
                 else:
                     model = model.to("cpu")
             else:

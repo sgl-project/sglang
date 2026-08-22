@@ -26,11 +26,13 @@ from sglang.kernels.ops.diffusion import (
     mount_fused_ln_modulate,
     mount_hunyuan_qknorm,
     mount_ltx2_rms_norm_modulate,
+    mount_sana_video_linear_attention,
     unmount_fused_gate_rmsnorm,
     unmount_fused_linear_gelu,
     unmount_fused_ln_modulate,
     unmount_hunyuan_qknorm,
     unmount_ltx2_rms_norm_modulate,
+    unmount_sana_video_linear_attention,
 )
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
@@ -181,6 +183,11 @@ _QUALITY_FUSION_HANDLERS: tuple[
         "HunyuanVideo strided QK RMSNorm",
         mount_hunyuan_qknorm,
         unmount_hunyuan_qknorm,
+    ),
+    (
+        "SANA-Video BF16-input linear attention",
+        mount_sana_video_linear_attention,
+        unmount_sana_video_linear_attention,
     ),
 )
 
@@ -544,7 +551,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             apply_attention_backend_override(layer, target)
         self.attn_backend = stage_backend
         self._attention_backend_active_override = target
-        logger.info(
+        logger.debug(
             "Attention backend for this batch: %s (%d layers switched)",
             target.name.lower() if target else "server default",
             len(layers),
@@ -1636,7 +1643,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # deallocate transformer if on mps
         pipeline = self.pipeline() if self.pipeline else None
-        if torch.backends.mps.is_available() and not is_warmup:
+        if (
+            torch.backends.mps.is_available()
+            and not is_warmup
+            and not is_layerwise_offloaded_module(self.transformer)
+        ):
             logger.info(
                 "Memory before deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),

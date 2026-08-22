@@ -146,8 +146,9 @@ When `torch.compile` is enabled, `--offload-during-compile` stays on by default.
 
 Breakable CUDA graph is a separate manual opt-in for supported image pipelines. If you enable `--enable-breakable-cuda-graph`, declare every served resolution in `--warmup-resolutions` so warmup captures matching graph signatures.
 
-> [!NOTE]
-> The preset is intentionally coarse. A future continuous value such as `0.0` to `1.0` could express the speed-memory tradeoff more precisely, but it would need model-specific memory models and clearer user expectations. Until then, use the preset plus explicit flags for overrides.
+<Note>
+The preset is intentionally coarse. A future continuous value such as `0.0` to `1.0` could express the speed-memory tradeoff more precisely, but it would need model-specific memory models and clearer user expectations. Until then, use the preset plus explicit flags for overrides.
+</Note>
 
 Examples:
 
