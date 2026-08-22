@@ -1488,7 +1488,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
         if self.enable_mamba_extra_buffer:
             mamba_ping_pong_track_buffer_to_free = (
-                self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.req_pool_idx]
+                self.req_index_to_mamba_ping_pong_track_buffer_mapping[
+                    req.req_pool_idx
+                ]
             )
             if mamba_ping_pong_track_buffer_to_keep is not None:
                 assert mamba_ping_pong_track_buffer_to_keep in [
@@ -1523,7 +1525,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
                         mamba_ping_pong_track_buffer_to_free != -1
                     ]
                 )
-            self.mamba_allocator.free(mamba_ping_pong_track_buffer_to_free)
+            self.mamba_allocator.free(mamba_ping_pong_track_buffer_to_free.clone())
             # Match the req.mamba_pool_idx=None clear above so the next
             # alloc() doesn't see a stale ping-pong reference on the req
             # and skip allocation (which would silently reuse a freed
