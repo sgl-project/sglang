@@ -21,6 +21,10 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
+from sglang.kernels.ops.attention.extend_attention_split_dim import (
+    can_use_split_dim_absorbed_extend,
+    split_dim_absorbed_extend_attention_fwd,
+)
 from sglang.kernels.ops.attention.prefill_attention import (
     context_attention_fwd,
 )
@@ -140,6 +144,21 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
         num_warps = 4 if Lq <= 64 else 8
 
     return BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps
+
+
+def _get_num_stages_for_extend_attention(
+    Lq: int, Lv: int, block_n: int | None = None
+) -> int:
+    if _is_gfx95 and Lq == 192 and Lv == 128:
+        return 2
+    if (
+        _is_gfx95
+        and Lq == 576
+        and Lv == 512
+        and (block_n == 32 or (block_n is None and _is_triton_ge_37))
+    ):
+        return 2
+    return 1
 
 
 def _compact_extend_q_tiles_per_head(
@@ -360,6 +379,10 @@ def _fwd_kernel(
     STORE_TRANSPOSE: tl.constexpr,
     HAS_SINK: tl.constexpr,
     USE_COMPACT_TILE_GRID: tl.constexpr,
+    USE_EXP2: tl.constexpr,
+    USE_FP8_PREFIX: tl.constexpr,
+    USE_FP8_EXTEND: tl.constexpr,
+    FP8_MAX: tl.constexpr,
     PAGE_SIZE: tl.constexpr = 1,
     SCORE_MOD: tl.constexpr = None,
     Aux0=None,
@@ -395,6 +418,8 @@ def _fwd_kernel(
         cur_head = tl.program_id(1)
         cur_block_m = tl.program_id(2)
     cur_kv_head = cur_head // kv_group_num
+    LOG2E: tl.constexpr = 1.4426950408889634
+    LN2: tl.constexpr = 0.6931471805599453
 
     cur_seq_extend_start_idx = tl.load(qo_indptr + cur_seq)
     cur_seq_len_extend = tl.load(qo_indptr + cur_seq + 1) - cur_seq_extend_start_idx
@@ -541,7 +566,10 @@ def _fwd_kernel(
                     other=0.0,
                 )
                 qk += tl.dot(qpe.to(kpe.dtype), kpe)
-            qk *= sm_scale * k_scale
+            if USE_EXP2:
+                qk *= sm_scale * k_scale * LOG2E
+            else:
+                qk *= sm_scale * k_scale
 
             if logit_cap > 0:
                 qk = logit_cap * tanh(qk / logit_cap)
@@ -571,8 +599,12 @@ def _fwd_kernel(
             row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
             n_e_max = tl.maximum(row_max_fixed, e_max)
 
-            re_scale = tl.exp(e_max - n_e_max)
-            p = tl.exp(qk - n_e_max[:, None])
+            if USE_EXP2:
+                re_scale = tl.exp2(e_max - n_e_max)
+                p = tl.exp2(qk - n_e_max[:, None])
+            else:
+                re_scale = tl.exp(e_max - n_e_max)
+                p = tl.exp(qk - n_e_max[:, None])
             deno = deno * re_scale + tl.sum(p, 1)
 
             if PAGE_SIZE == 1:
@@ -593,8 +625,12 @@ def _fwd_kernel(
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
             )
-            p = p.to(v.dtype)
-            acc = acc * re_scale[:, None] + tl.dot(p, v) * v_scale
+            if USE_FP8_PREFIX:
+                p_dot = (p * FP8_MAX).to(v.dtype)
+                acc = acc * re_scale[:, None] + tl.dot(p_dot, v) * (v_scale / FP8_MAX)
+            else:
+                p_dot = p.to(v.dtype)
+                acc = acc * re_scale[:, None] + tl.dot(p_dot, v) * v_scale
 
             e_max = n_e_max
 
@@ -672,7 +708,10 @@ def _fwd_kernel(
                 )
                 qk += tl.dot(qpe, kpe)
 
-            qk *= sm_scale
+            if USE_EXP2:
+                qk *= sm_scale * LOG2E
+            else:
+                qk *= sm_scale
 
             if logit_cap > 0:
                 qk = logit_cap * tanh(qk / logit_cap)
@@ -702,8 +741,12 @@ def _fwd_kernel(
             row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
             n_e_max = tl.maximum(row_max_fixed, e_max)
 
-            re_scale = tl.exp(e_max - n_e_max)
-            p = tl.exp(qk - n_e_max[:, None])
+            if USE_EXP2:
+                re_scale = tl.exp2(e_max - n_e_max)
+                p = tl.exp2(qk - n_e_max[:, None])
+            else:
+                re_scale = tl.exp(e_max - n_e_max)
+                p = tl.exp(qk - n_e_max[:, None])
             deno = deno * re_scale + tl.sum(p, 1)
 
             offs_v = (
@@ -714,20 +757,30 @@ def _fwd_kernel(
             v = tl.load(
                 V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
             )
-            p = p.to(v.dtype)
-            acc = acc * re_scale[:, None] + tl.dot(p, v)
+            if USE_FP8_EXTEND:
+                p_dot = (p * FP8_MAX).to(v.dtype)
+                acc = acc * re_scale[:, None] + tl.dot(p_dot, v) * (1.0 / FP8_MAX)
+            else:
+                p_dot = p.to(v.dtype)
+                acc = acc * re_scale[:, None] + tl.dot(p_dot, v)
 
             e_max = n_e_max
 
     if HAS_SINK:
         cur_sink = tl.load(sink_ptr + cur_head)
-        deno += tl.exp(cur_sink - e_max)
+        if USE_EXP2:
+            deno += tl.exp2(cur_sink * LOG2E - e_max)
+        else:
+            deno += tl.exp(cur_sink - e_max)
 
     if STORE_LSE:
         offs_lse = (
             cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m
         ) * stride_lse_bs + cur_head * stride_lse_h
-        lse = tl.log(deno) + e_max
+        if USE_EXP2:
+            lse = tl.log(deno) + e_max * LN2
+        else:
+            lse = tl.log(deno) + e_max
         tl.store(LSE_Extend + offs_lse, lse, mask=mask_m)
 
     offs_o = (
@@ -799,20 +852,124 @@ def extend_attention_fwd(
         v_extend.shape[-1],
     )
 
-    # Get block sizes and configuration
-    BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
-        _get_block_sizes_for_extend_attention(Lq, Lv)
-    )
-
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
+    zero_prefix_shape = (
+        head_num == 12
+        and k_extend.shape[1] == 12
+        and Lq == 192
+        and Lk == 192
+        and Lv == 128
+    )
+    absorbed_shape = (
+        head_num == 12
+        and k_extend.shape[1] == 1
+        and Lq == 576
+        and Lk == 576
+        and Lv == 512
+    )
+    kimi_k3_shape = zero_prefix_shape or absorbed_shape
+
+    # Match Aiter's opt-in behavior: cast Q, K, and V separately before the
+    # native-FP8 zero-prefix kernel at every sequence length.
+    use_fp8_zero_prefix = (
+        _is_gfx95
+        and envs.SGLANG_TRITON_FP8_PREFILL_ATTN.get()
+        and zero_prefix_shape
+        and q_extend.dtype == torch.bfloat16
+        and k_extend.dtype == torch.bfloat16
+        and v_extend.dtype == torch.bfloat16
+        and k_buffer.dtype == torch.float8_e4m3fn
+        and v_buffer.dtype == torch.float8_e4m3fn
+        and custom_mask is None
+        and is_causal
+        and sliding_window_size <= 0
+        and logit_cap <= 0
+        and xai_temperature_len <= 0
+        and sinks is None
+        and score_mod is None
+        and aux_tensors is None
+    )
+    if use_fp8_zero_prefix:
+        q_extend = q_extend.to(torch.float8_e4m3fn)
+        k_extend = k_extend.to(torch.float8_e4m3fn)
+        v_extend = v_extend.to(torch.float8_e4m3fn)
+
+    if can_use_split_dim_absorbed_extend(
+        q_extend,
+        k_extend,
+        v_extend,
+        o_extend,
+        k_buffer,
+        v_buffer,
+        lse=lse_extend,
+        sinks=sinks,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        custom_mask=custom_mask,
+        is_causal=is_causal,
+        sliding_window_size=sliding_window_size,
+        logit_cap=logit_cap,
+        xai_temperature_len=xai_temperature_len,
+        skip_prefix=skip_prefix,
+        skip_extend=skip_extend,
+        page_size=page_size,
+        score_mod=score_mod,
+        aux_tensors=aux_tensors,
+    ):
+        split_dim_absorbed_extend_attention_fwd(
+            q_extend,
+            k_extend,
+            v_extend,
+            o_extend,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            max_len_extend=max_len_extend,
+            sm_scale=sm_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            page_size=page_size,
+        )
+        return
+
+    # Get block sizes and configuration for the generic fallback.
+    BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
+        _get_block_sizes_for_extend_attention(Lq, Lv)
+    )
 
     USE_CUSTOM_MASK = custom_mask is not None
     # Skip custom mask for prefix part
     SKIP_PREFIX_CUSTOM_MASK = skip_prefix_custom_mask
 
     HAS_SINK = sinks is not None
+    USE_FP8_PREFIX = (
+        _is_gfx95
+        and kimi_k3_shape
+        and k_buffer.dtype == torch.float8_e4m3fn
+        and v_buffer.dtype == torch.float8_e4m3fn
+    )
+    USE_FP8_EXTEND = (
+        _is_gfx95
+        and zero_prefix_shape
+        and k_extend.dtype == torch.float8_e4m3fn
+        and v_extend.dtype == torch.float8_e4m3fn
+    )
+    FP8_MAX = (
+        torch.finfo(torch.float8_e4m3fn).max
+        if USE_FP8_PREFIX or USE_FP8_EXTEND
+        else 1.0
+    )
+    USE_EXP2 = (
+        _is_gfx95
+        and kimi_k3_shape
+        and logit_cap <= 0
+        and xai_temperature_len <= 0
+        and score_mod is None
+    )
     STORE_LSE = lse_extend is not None
     stride_lse_bs = lse_extend.stride(0) if STORE_LSE else 0
     stride_lse_h = lse_extend.stride(1) if STORE_LSE else 0
@@ -837,7 +994,9 @@ def extend_attention_fwd(
         grid = (compact_q_tiles, head_num)
     else:
         grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
-    num_stages = 1
+    num_stages = (
+        _get_num_stages_for_extend_attention(Lq, Lv, BLOCK_N) if kimi_k3_shape else 1
+    )
 
     extra_kargs = {}
     if _is_hip:
@@ -911,6 +1070,10 @@ def extend_attention_fwd(
         HAS_SINK=HAS_SINK,
         STORE_TRANSPOSE=_is_hip,
         USE_COMPACT_TILE_GRID=use_compact_tile_grid,
+        USE_EXP2=USE_EXP2,
+        USE_FP8_PREFIX=USE_FP8_PREFIX,
+        USE_FP8_EXTEND=USE_FP8_EXTEND,
+        FP8_MAX=FP8_MAX,
         PAGE_SIZE=page_size,
         SCORE_MOD=score_mod,
         Aux0=aux0,
