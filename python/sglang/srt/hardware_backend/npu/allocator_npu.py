@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -97,6 +98,14 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
                 self.page_size,
                 max_num_extend_tokens,
             )
+            if os.getenv("SGLANG_MF_ALLOC_SYNC", "0") == "1":
+                # Diagnostic sync ONLY between out_indices production and its
+                # first consumer (the row write), independent of debug_mode.
+                # If this alone stops the row corruption at DEBUG=0, the bug
+                # is a missing stream dependency on the async alloc kernel and
+                # the payload is torch.empty-recycled activations; the fix is
+                # then an event dependency, not this global sync.
+                torch.npu.synchronize()
 
         else:
             out_indices = torch.empty(

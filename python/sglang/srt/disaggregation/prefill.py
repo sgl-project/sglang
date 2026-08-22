@@ -1410,6 +1410,17 @@ class SchedulerDisaggregationPrefillMixin:
                         _cands.append((f"recent.k{_ri}", _rk, "p"))
                         _cands.append((f"recent.scale{_ri}", _rs, "p"))
                     try:
+                        from sglang.srt.hardware_backend.npu.dsv4.quant_retention import (
+                            payloads as _qp,
+                        )
+
+                        if _qp():  # empty unless SGLANG_MF_QUANT_RETAIN=1
+                            for _ri, (_qk, _qs) in enumerate(_qp()):
+                                _cands.append((f"dq.q{_ri}", _qk, "p"))
+                                _cands.append((f"dq.scale{_ri}", _qs, "p"))
+                    except Exception:
+                        pass
+                    try:
                         from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
                             Dsv4NpuRoPE,
                         )
