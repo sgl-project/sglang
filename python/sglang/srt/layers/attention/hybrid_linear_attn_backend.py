@@ -14,6 +14,9 @@ from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     track_mamba_states_all_layers,
     track_mamba_states_if_needed,
 )
+from sglang.kernels.ops.mamba.triton_ops.ssu_dispatch import (
+    CompactMambaPrefillCheckpoints,
+)
 from sglang.srt.configs.hybrid_arch import mamba2_config
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
@@ -808,7 +811,7 @@ class MambaAttnBackendBase(AttentionBackend):
     def _track_mamba_state_extend(
         self,
         forward_batch: ForwardBatch,
-        h: Optional[torch.Tensor],
+        h: Optional[torch.Tensor | CompactMambaPrefillCheckpoints],
         ssm_states: torch.Tensor,
         forward_metadata: ForwardMetadata,
     ):
@@ -819,10 +822,19 @@ class MambaAttnBackendBase(AttentionBackend):
             # were requested. Aligned-only tracking reads the final state below.
             if forward_metadata.track_ssm_h_src.numel() > 0:
                 assert h is not None
-                h = h.squeeze(0)
-                ssm_states[forward_metadata.track_ssm_h_dst] = h[
-                    forward_metadata.track_ssm_h_src
-                ].to(ssm_states.dtype, copy=False)
+                if isinstance(h, CompactMambaPrefillCheckpoints):
+                    if h.states.shape[0] != forward_metadata.track_ssm_h_dst.numel():
+                        raise ValueError(
+                            "compact Mamba checkpoint count does not match radix "
+                            "track destinations"
+                        )
+                    selected_states = h.states
+                else:
+                    h = h.squeeze(0)
+                    selected_states = h[forward_metadata.track_ssm_h_src]
+                ssm_states[forward_metadata.track_ssm_h_dst] = selected_states.to(
+                    ssm_states.dtype, copy=False
+                )
             if forward_metadata.track_ssm_final_src.numel() > 0:
                 ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
                     forward_metadata.track_ssm_final_src
@@ -916,7 +928,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         )
 
         if forward_batch.mamba_track_mask is not None:
-            if intermediate_states is not None:
+            if self.forward_metadata.num_prefills > 0:
                 self._track_mamba_state_extend(
                     forward_batch,
                     intermediate_states,
