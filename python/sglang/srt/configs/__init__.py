@@ -22,6 +22,7 @@ from sglang.srt.configs.interns2_mobius import (
     InternS2MobiusVisionConfig,
 )
 from sglang.srt.configs.interns2preview import InternS2PreviewConfig
+from sglang.srt.configs.spark3 import Spark3Config
 from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.jet_nemotron import JetNemotronConfig
 from sglang.srt.configs.jet_vlm import JetVLMConfig
@@ -115,6 +116,7 @@ __all__ = [
     "JetVLMConfig",
     "Step3p5Config",
     "MiniMaxM3VLConfig",
+    "Spark3Config",
     "Step3p7Config",
     "Qwen3ASRConfig",
     "InklingAudioConfig",
