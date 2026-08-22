@@ -1338,9 +1338,13 @@ class SchedulerDisaggregationPrefillMixin:
             # so dumping raw values adds no synchronization (any extra sync
             # masks the racing writer -- see doc §19). Unconditional.
             _neg = page_indices[page_indices < 0]
-            if _neg.size > 0 and rate_limited_hit("mf-raw", first=10, every=200):
+            _sent = page_indices == -965150
+            if (
+                _neg.size > 0 or bool(_sent.any())
+            ) and rate_limited_hit("mf-raw", first=10, every=200):
                 _slots = kv_indices.to(torch.int64)
                 _dirty = (_slots < 0) | (_slots >= 1 << 30)
+                _nsent = int((_slots == -123456789).sum())
                 _first = int(_dirty.nonzero()[0]) if bool(_dirty.any()) else -1
                 try:
                     from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
@@ -1410,6 +1414,17 @@ class SchedulerDisaggregationPrefillMixin:
                         _cands.append((f"recent.k{_ri}", _rk, "p"))
                         _cands.append((f"recent.scale{_ri}", _rs, "p"))
                     try:
+                        from sglang.srt.hardware_backend.npu.dsv4.quant_retention import (
+                            payloads as _qp,
+                        )
+
+                        if _qp():  # empty unless SGLANG_MF_QUANT_RETAIN=1
+                            for _ri, (_qk, _qs) in enumerate(_qp()):
+                                _cands.append((f"dq.q{_ri}", _qk, "p"))
+                                _cands.append((f"dq.scale{_ri}", _qs, "p"))
+                    except Exception:
+                        pass
+                    try:
                         from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
                             Dsv4NpuRoPE,
                         )
@@ -1438,13 +1453,15 @@ class SchedulerDisaggregationPrefillMixin:
                     logger.error("[mf-fp] fingerprint probe failed: %s", _e)
                 logger.error(
                     "[mf-raw] rid=%s slot=%s seg=[%d,%d): n_dirty=%d/%d "
-                    "first_dirty_off=%d slots[%d:%d]=%s floats=%s pages24=%s",
+                    "n_sentinel=%d first_dirty_off=%d slots[%d:%d]=%s "
+                    "floats=%s pages24=%s",
                     req.rid,
                     req.req_pool_idx,
                     seg_start,
                     seg_end,
                     int(_dirty.sum()),
                     _slots.numel(),
+                    _nsent,
                     _first,
                     max(0, _first - 4),
                     max(0, _first - 4) + 16,

@@ -33,6 +33,19 @@ from sglang.srt.utils.common import rate_limited_hit
 
 logger = logging.getLogger(__name__)
 
+from sglang.srt.hardware_backend.npu.dsv4.quant_retention import (
+    install as _install_quant_retention,
+)
+
+# Off by default: the wrapper perturbs timing/memory recycling enough to
+# mask the row clobber (a clean run with it installed vs dirty without is
+# itself diagnostic -- it pins the payload to the recycled dynamic_quant
+# output family). Enable with SGLANG_MF_QUANT_RETAIN=1 for fingerprinting.
+if os.getenv("SGLANG_MF_QUANT_RETAIN", "0") == "1" or os.getenv(
+    "SGLANG_MF_RETAIN_NOP", "0"
+) == "1":
+    _install_quant_retention()
+
 
 def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
     # n**-0.5 norm is baked in via the sqrt(2) division per doubling; _apply_hadamard is a plain matmul
