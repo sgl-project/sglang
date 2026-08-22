@@ -1994,15 +1994,15 @@ def _fp8_per_token_quant_to_per_tensor_quant_kernel(
             tl.store(output_ptrs + tok_idx * k, quantized)
 
 
-# Groups per program, i.e. G_BLOCK_SIZE * 128 hidden elements.  16 groups (2048
-# elements) pays off once there are enough experts to fill the machine on the
-# expert axis alone; below that the smaller tile keeps more programs resident.
-_REQUANT_G_BLOCK = 8
-_REQUANT_G_BLOCK_MANY_EXPERTS = 16
+# Hidden elements per program.  This is the tuned quantity -- 1024 elements over 4
+# warps is 8 B/thread, which is where Triton starts emitting vector accesses (8
+# warps, the historical value, drop to 4 B/thread and scalar b32) -- so it is kept
+# in elements rather than scale groups, and a different group width still gets the
+# tile that was measured.  2048 pays off once there are enough experts to fill the
+# machine on the expert axis alone.
+_REQUANT_TILE_ELEMS = 1024
+_REQUANT_TILE_ELEMS_MANY_EXPERTS = 2048
 _REQUANT_MANY_EXPERTS = 32
-# 4 warps put 8 B/thread in flight for a 1024-element tile, which is where Triton
-# starts emitting vector accesses; 8 warps (the historical value) drop to 4
-# B/thread and scalar b32 loads.
 _REQUANT_NUM_WARPS = 4
 _REQUANT_M_GRID_MAX = 32
 _REQUANT_M_GRID_MIN = 4
@@ -2015,8 +2015,15 @@ _REQUANT_TARGET_PROGRAMS = 1024
 _REQUANT_ROWS_SATURATED = 64
 
 
+def _floor_pow2(value: int) -> int:
+    return 1 << (max(1, value).bit_length() - 1)
+
+
 def requant_launch_geometry(
-    num_groups: int, num_experts: int, expected_rows: Optional[int] = None
+    num_groups: int,
+    num_experts: int,
+    group_size: int = 128,
+    expected_rows: Optional[int] = None,
 ) -> Tuple[int, int]:
     """Pick (groups per program, m-grid) for the per-token -> per-tensor requant.
 
@@ -2029,19 +2036,20 @@ def requant_launch_geometry(
     estimate already rounds up (it adds the expert count before dividing), so an
     exact average of 8 rows arrives as 9 and must not launch 16 programs.
     """
-    g_block = (
-        _REQUANT_G_BLOCK_MANY_EXPERTS
+    tile_elems = (
+        _REQUANT_TILE_ELEMS_MANY_EXPERTS
         if num_experts >= _REQUANT_MANY_EXPERTS
-        else _REQUANT_G_BLOCK
+        else _REQUANT_TILE_ELEMS
     )
     # Round down, so the tile never covers groups the payload does not have.
-    g_block = min(g_block, 1 << (max(1, num_groups).bit_length() - 1))
+    g_block = min(_floor_pow2(tile_elems // group_size), _floor_pow2(num_groups))
     if expected_rows is None:
         return g_block, _REQUANT_M_GRID_MAX
-    m_grid = min(_REQUANT_M_GRID_MAX, 1 << (max(1, expected_rows).bit_length() - 1))
+    m_grid = min(_REQUANT_M_GRID_MAX, _floor_pow2(expected_rows))
     if expected_rows < _REQUANT_ROWS_SATURATED:
-        cap = _REQUANT_TARGET_PROGRAMS // max(1, num_experts)
-        m_grid = min(m_grid, 1 << (max(1, cap).bit_length() - 1))
+        m_grid = min(
+            m_grid, _floor_pow2(_REQUANT_TARGET_PROGRAMS // max(1, num_experts))
+        )
     return g_block, max(_REQUANT_M_GRID_MIN, m_grid)
 
 
@@ -2055,12 +2063,20 @@ def fp8_per_token_to_per_tensor_quant_triton(
 ):
     K_SCALE_BLOCK_SIZE = 128
     assert len(x.shape) == 3 and x.size(2) % K_SCALE_BLOCK_SIZE == 0
+    # The [groups, group] tile indexes within a group with tl.arange, so the group
+    # width must be a power of two; a flat tile would only need it to divide k.
+    assert K_SCALE_BLOCK_SIZE & (K_SCALE_BLOCK_SIZE - 1) == 0
     assert x.is_contiguous()
     assert x_scale.size(2) == x.size(2) // K_SCALE_BLOCK_SIZE
     assert output_scale.numel() == 1
 
     num_groups = x.size(2) // K_SCALE_BLOCK_SIZE
-    g_block, m_grid = requant_launch_geometry(num_groups, x.size(0), expected_rows)
+    g_block, m_grid = requant_launch_geometry(
+        num_groups=num_groups,
+        num_experts=x.size(0),
+        group_size=K_SCALE_BLOCK_SIZE,
+        expected_rows=expected_rows,
+    )
     grid = (triton.cdiv(num_groups, g_block), m_grid, x.size(0))
     _fp8_per_token_quant_to_per_tensor_quant_kernel[grid](
         x,

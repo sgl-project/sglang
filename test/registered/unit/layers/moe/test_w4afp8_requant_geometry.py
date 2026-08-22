@@ -32,6 +32,23 @@ class TestRequantLaunchGeometry(CustomTestCase):
                 )
                 self.assertLessEqual(g_block, num_groups)
 
+    def test_tile_is_sized_in_elements_not_scale_groups(self):
+        """The tuned quantity is bytes per thread, so it must survive a group width.
+
+        Everything else in this file runs at the dispatcher's 128-wide groups; if
+        that width ever changes, the tile has to stay the size that was measured
+        rather than silently becoming half or double it.
+        """
+        for group_size in (64, 128, 256, 512):
+            for num_experts, want_elems in ((8, 1024), (56, 2048)):
+                g_block, _ = requant_launch_geometry(
+                    num_groups=7168 // group_size,
+                    num_experts=num_experts,
+                    group_size=group_size,
+                    expected_rows=16,
+                )
+                self.assertEqual(g_block * group_size, want_elems)
+
     def test_m_grid_never_exceeds_the_previous_fixed_grid(self):
         """The estimate only ever shrinks the grid, so no batch can regress."""
         for expected_rows in (1, 8, 32, 33, 1024):
