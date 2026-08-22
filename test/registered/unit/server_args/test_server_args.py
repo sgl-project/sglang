@@ -42,6 +42,29 @@ _mock_device = patch("sglang.srt.server_args.get_device", return_value="cuda")
 _mock_device.start()
 
 
+class TestDPPrefillLoadAwareRoutingArgs(CustomTestCase):
+    @staticmethod
+    def make_args(**overrides):
+        kwargs = dict(
+            model_path="dummy",
+            enable_dp_attention=True,
+            disaggregation_mode="prefill",
+            dp_size=4,
+            disable_radix_cache=True,
+            load_balance_method="total_tokens",
+            enable_dp_prefill_load_aware_routing=True,
+        )
+        kwargs.update(overrides)
+        return ServerArgs(**kwargs)
+
+    def test_accepts_cache_disabled_prefill_total_tokens(self):
+        self.make_args()._handle_other_validations()
+
+    def test_rejects_cache_enabled_mode(self):
+        with self.assertRaisesRegex(ValueError, "--disable-radix-cache"):
+            self.make_args(disable_radix_cache=False)._handle_other_validations()
+
+
 class TestPrepareServerArgs(CustomTestCase):
     def test_enable_w4a4_mxfp4_megamoe_sets_deepgemm_env(self):
         deepgemm_env = {

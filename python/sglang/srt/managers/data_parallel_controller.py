@@ -179,6 +179,9 @@ class DataParallelController:
         )
 
         self.dp_budget = DPBudget(get_parallel().dp_size)
+        self._dp_prefill_load_aware_routing = (
+            server_args.enable_dp_prefill_load_aware_routing
+        )
         self.load_snapshot_reader = create_load_snapshot_reader(
             port_args,
             caller="DataParallelController",
@@ -737,6 +740,8 @@ class DataParallelController:
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
+            if self._dp_prefill_load_aware_routing:
+                return False
             rank = req.routed_dp_rank
             if (
                 rank < 0
