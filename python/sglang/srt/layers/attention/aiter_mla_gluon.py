@@ -237,11 +237,7 @@ def prefer_mla_gluon_decode(
     """
     if not _mla_gluon_enabled():
         return False
-    if (
-        head_pad_mode == "zero"
-        and num_head == 12
-        and kv_cache_dtype == fp8_dtype
-    ):
+    if head_pad_mode == "zero" and num_head == 12 and kv_cache_dtype == fp8_dtype:
         return _gluon_runtime_ok()
     return False
 
