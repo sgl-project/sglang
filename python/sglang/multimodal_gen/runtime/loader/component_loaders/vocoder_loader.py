@@ -3,7 +3,7 @@ import re
 from safetensors.torch import load_file as safetensors_load_file
 
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
-    UnquantizedComponentLoader,
+    PlainStateDictComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
@@ -19,7 +19,7 @@ from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 logger = init_logger(__name__)
 
 
-class VocoderLoader(UnquantizedComponentLoader):
+class VocoderLoader(PlainStateDictComponentLoader):
     component_names = ["vocoder"]
     expected_library = "diffusers"
 

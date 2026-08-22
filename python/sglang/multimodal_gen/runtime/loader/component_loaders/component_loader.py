@@ -85,6 +85,11 @@ class ComponentLoader(ABC):
     # diffusers or transformers
     expected_library: str = ""
 
+    # --attention-backend primarily selects the DiT backend. Auxiliary
+    # components may fall back when that global choice is incompatible; an
+    # explicit --component-attention-backends entry remains strict.
+    allow_global_attention_backend_fallback = True
+
     _loaders_registered = False
 
     def __init_subclass__(cls, **kwargs):
@@ -129,9 +134,12 @@ class ComponentLoader(ABC):
         component_name: str,
         attn_backend: Any,
         component_attn_name: str | None,
+        allow_global_backend_fallback: bool,
     ) -> AutoModel:
         with component_attn_backend_context_manager(
-            attn_backend, component_name=component_attn_name
+            attn_backend,
+            component_name=component_attn_name,
+            allow_global_backend_fallback=allow_global_backend_fallback,
         ):
             load_kwargs = self.customized_load_kwargs_for_component(
                 server_args, component_name
@@ -148,9 +156,12 @@ class ComponentLoader(ABC):
         transformers_or_diffusers: str,
         attn_backend: Any,
         component_attn_name: str | None,
+        allow_global_backend_fallback: bool,
     ) -> AutoModel:
         with component_attn_backend_context_manager(
-            attn_backend, component_name=component_attn_name
+            attn_backend,
+            component_name=component_attn_name,
+            allow_global_backend_fallback=allow_global_backend_fallback,
         ):
             component = self.load_native(
                 component_model_path,
@@ -202,6 +213,7 @@ class ComponentLoader(ABC):
                 component_name,
                 attn_backend,
                 component_attn_name,
+                self.allow_global_attention_backend_fallback,
             )
             source = "sgl-diffusion"
         except (ComponentCheckpointUnsupportedError, ComponentResidencyError):
@@ -235,6 +247,7 @@ class ComponentLoader(ABC):
                 transformers_or_diffusers,
                 attn_backend,
                 component_attn_name,
+                self.allow_global_attention_backend_fallback,
             )
             source = "native"
             logger.warning(
@@ -432,27 +445,33 @@ class ComponentLoader(ABC):
         return GenericComponentLoader(transformers_or_diffusers, component_architecture)
 
 
-class UnquantizedComponentLoader(ComponentLoader):
-    """Base for native component loaders that materialize plain state dicts."""
+class PlainStateDictComponentLoader(ComponentLoader):
+    """Base for native loaders whose current materializer expects plain weights."""
 
     @staticmethod
-    def ensure_unquantized_checkpoint(config: object, component_name: str) -> None:
-        quant_spec = resolve_checkpoint_quant_spec(config)
+    def ensure_plain_state_dict_checkpoint(config: object, component_name: str) -> None:
+        try:
+            quant_spec = resolve_checkpoint_quant_spec(config)
+        except (TypeError, ValueError) as error:
+            raise ComponentCheckpointUnsupportedError(
+                f"Cannot parse checkpoint quantization metadata for "
+                f"{component_name!r}: {error}"
+            ) from error
         if quant_spec is None:
             return
 
         method = quant_spec.declared_method or "unspecified"
         raise ComponentCheckpointUnsupportedError(
             f"{component_name!r} checkpoint declares quantization metadata in "
-            f"{quant_spec.source} (quant_method={method!r}), but its native SGLang "
-            "loader only supports unquantized checkpoints."
+            f"{quant_spec.source} (quant_method={method!r}), which its current "
+            "plain state-dict materializer cannot restore."
         )
 
     def load_component_config(
         self, component_model_path: str, component_name: str
     ) -> dict[str, Any]:
         config = get_diffusers_component_config(component_path=component_model_path)
-        self.ensure_unquantized_checkpoint(config, component_name)
+        self.ensure_plain_state_dict_checkpoint(config, component_name)
         return config
 
 
@@ -529,6 +548,10 @@ class TokenizerLoader(ComponentLoader):
 class GenericComponentLoader(ComponentLoader):
     """Generic loader for components that don't have a specific loader."""
 
+    # An unknown out-of-tree component may itself be the primary transformer.
+    # Require it to opt into fallback through a registered component loader.
+    allow_global_attention_backend_fallback = False
+
     def __init__(
         self, library="transformers", component_architecture: str | None = None
     ) -> None:
@@ -549,6 +572,8 @@ class PipelineComponentLoader:
         transformers_or_diffusers: str,
         server_args: ServerArgs,
         component_architecture: str | None = None,
+        component_attn_backend: Any = None,
+        component_attn_name: str | None = None,
     ):
         """
         Load a pipeline component.
@@ -566,15 +591,21 @@ class PipelineComponentLoader:
         )
 
         try:
-            # Load the component
-            return loader.load(
-                component_model_path,
-                server_args,
-                component_name,
-                transformers_or_diffusers,
-            )
-        except Exception as e:
+            with component_attn_backend_context_manager(
+                component_attn_backend,
+                component_name=component_attn_name,
+                allow_global_backend_fallback=(
+                    loader.allow_global_attention_backend_fallback
+                ),
+            ):
+                return loader.load(
+                    component_model_path,
+                    server_args,
+                    component_name,
+                    transformers_or_diffusers,
+                )
+        except Exception:
             logger.error(
                 f"Error while loading component: {component_name}, {component_model_path=}"
             )
-            raise e
+            raise
