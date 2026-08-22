@@ -327,6 +327,11 @@ For MiniMax-H3, keep the native contract intact:
   `--model-variant`; do not point at a checkpoint subdirectory
 - use eager BF16/FP32 for consistency ground truth; current H3
   `torch.compile` changes numerical output
+- keep BCG off in the validated recipe. The support gate alone is not enough:
+  prompt-dependent packed-sequence host boundaries can differ between warmup
+  and serving and cause a signature miss. Any experimental fix must prove real
+  segment replay, byte-identical media, and an e2e win without excessive graph
+  memory
 - use Ulysses, not Ring, for H3's packed multi-segment attention; CFG parallel
   is invalid because the released pipeline has one denoising branch
 - keep the released overlapping tiled video-VAE decode. H3 rejects

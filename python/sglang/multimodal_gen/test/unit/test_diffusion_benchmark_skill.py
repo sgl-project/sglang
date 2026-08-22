@@ -37,7 +37,35 @@ def _load_benchmark_module(temp_root: Path):
     return module
 
 
+def _load_skill_env_module():
+    script_path = (
+        Path(__file__).resolve().parents[2]
+        / ".claude"
+        / "skills"
+        / "sglang-diffusion-benchmark-profile"
+        / "scripts"
+        / "diffusion_skill_env.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "test_diffusion_skill_env", script_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class TestDiffusionBenchmarkSkill(unittest.TestCase):
+    def test_skill_env_prefers_own_worktree_over_installed_package(self):
+        module = _load_skill_env_module()
+        installed = types.ModuleType("sglang")
+        installed.__file__ = "/sgl-workspace/sglang/python/sglang/__init__.py"
+
+        with patch.dict(sys.modules, {"sglang": installed}):
+            repo_root = module.get_repo_root()
+
+        self.assertEqual(repo_root, Path(__file__).resolve().parents[5])
+
     def test_nightly_presets_remain_aligned(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             module = _load_benchmark_module(Path(tmpdir))
