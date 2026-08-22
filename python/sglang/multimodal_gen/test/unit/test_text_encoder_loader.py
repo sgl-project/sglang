@@ -25,7 +25,6 @@ from sglang.multimodal_gen.runtime.models.encoders.base import (
 from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLEncoder,
 )
-from sglang.multimodal_gen.runtime.models.encoders.t5 import T5EncoderModel
 
 
 class TestTextEncoderClassResolution(unittest.TestCase):
@@ -224,16 +223,22 @@ class TestTextEncoderQuantization(unittest.TestCase):
                 "text_encoder",
             )
 
-    def test_t5_bitsandbytes_delegates_to_transformers(self):
-        bitsandbytes = mock.Mock()
-        bitsandbytes.get_name.return_value = "bitsandbytes"
-        self.get_quant_config.return_value = bitsandbytes
-        component_config = {"quantization_config": {"quant_method": "bitsandbytes"}}
+    def test_standard_bitsandbytes_delegates_to_transformers(self):
+        component_config = {
+            "quantization_config": {
+                "load_in_4bit": True,
+                "quant_method": "bitsandbytes",
+            }
+        }
 
-        for architecture in ("T5EncoderModel", "UMT5ForConditionalGeneration"):
+        for architecture in (
+            "T5EncoderModel",
+            "CLIPTextModel",
+            "ThirdPartyTextEncoder",
+        ):
             with self.subTest(architecture=architecture), self.assertRaisesRegex(
                 NativeComponentLoaderRequired,
-                "delegates 'bitsandbytes' checkpoint loading to Transformers",
+                "delegates serialized bitsandbytes checkpoint loading to Transformers",
             ):
                 _resolve_and_configure_encoder_quantization(
                     SimpleNamespace(architectures=[architecture], quant_config=None),
@@ -241,33 +246,42 @@ class TestTextEncoderQuantization(unittest.TestCase):
                     "/model/text_encoder",
                     "text_encoder",
                 )
+        self.get_quant_config.assert_not_called()
 
-    def test_t5_rejects_unlisted_quantization_method(self):
-        with self.assertRaisesRegex(
-            ComponentCheckpointUnsupportedError,
-            "supported methods.*bitsandbytes",
-        ):
-            _configure_encoder_quantization(
-                SimpleNamespace(quant_config=None),
-                T5EncoderModel,
-                {},
-                "/model/text_encoder",
-                "text_encoder",
-            )
-
-    def test_t5_rejects_nonstandard_bitsandbytes_metadata_location(self):
-        bitsandbytes = mock.Mock()
-        bitsandbytes.get_name.return_value = "bitsandbytes"
-        self.get_quant_config.return_value = bitsandbytes
-
+    def test_rejects_nonstandard_bitsandbytes_metadata_location(self):
         with self.assertRaisesRegex(
             ComponentCheckpointUnsupportedError,
             "requires a top-level quantization_config",
         ):
             _configure_encoder_quantization(
                 SimpleNamespace(quant_config=None),
-                T5EncoderModel,
-                {"compression_config": {"quant_method": "bitsandbytes"}},
+                TextEncoder,
+                {
+                    "compression_config": {
+                        "load_in_4bit": True,
+                        "quant_method": "bitsandbytes",
+                    }
+                },
+                "/model/text_encoder",
+                "text_encoder",
+            )
+
+    def test_rejects_bitsandbytes_8bit(self):
+        with self.assertRaisesRegex(
+            ComponentCheckpointUnsupportedError,
+            "supports only serialized BitsAndBytes 4-bit checkpoints",
+        ):
+            _resolve_and_configure_encoder_quantization(
+                SimpleNamespace(
+                    architectures=["ThirdPartyTextEncoder"], quant_config=None
+                ),
+                {
+                    "quantization_config": {
+                        "load_in_4bit": False,
+                        "load_in_8bit": True,
+                        "quant_method": "bitsandbytes",
+                    }
+                },
                 "/model/text_encoder",
                 "text_encoder",
             )
@@ -304,7 +318,12 @@ class TestTextEncoderQuantization(unittest.TestCase):
             _configure_encoder_quantization(
                 model_config,
                 TextEncoder,
-                {},
+                {
+                    "quantization_config": {
+                        "load_in_4bit": True,
+                        "quant_method": "bitsandbytes",
+                    }
+                },
                 "/model/text_encoder",
                 "text_encoder",
             )

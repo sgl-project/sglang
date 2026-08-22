@@ -423,12 +423,13 @@ the native encoder explicitly supports. Text-encoder FP8 is approximate, is
 not enabled by default, and is rejected by MiniMax-H3's strict
 `quality="high"` deployment contract.
 
-## T5 and UMT5 Text Encoder BnB4
+## Transformers Text Encoder BnB4
 
-T5 and UMT5 text encoders can load serialized BitsAndBytes 4-bit checkpoints
-with a standard top-level Transformers `quantization_config`. For example,
-replace FLUX's second text encoder with the official Diffusers component
-checkpoint:
+Text encoders that already have a Transformers loading path can load serialized
+BitsAndBytes 4-bit checkpoints with a standard top-level
+`quantization_config`. Plain checkpoints keep using an available native SGLang
+encoder. For example, replace FLUX's T5 text encoder with the official Diffusers
+component checkpoint:
 
 ```bash Command
 sglang serve \
@@ -439,7 +440,8 @@ sglang serve \
 ```
 
 The quantized encoder must stay resident. SGLang rejects component or layerwise
-offload for this path instead of silently dequantizing or changing its state.
+offload, nonstandard metadata locations, and native-only component fallbacks for
+this path instead of silently changing the checkpoint contract.
 
 ## Validated ModelOpt Checkpoints
 
