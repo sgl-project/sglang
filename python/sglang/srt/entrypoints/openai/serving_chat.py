@@ -2070,6 +2070,15 @@ class OpenAIServingChat(OpenAIServingBase):
         """Process for generating a new and unique `tool_call_id`"""
         if self.tool_call_parser == "kimi_k3":
             return f"{call_item.name}:{history_tool_calls_cnt + call_item.tool_index}"
+        if self.tool_call_parser == "kimi_k2_raw_id":
+            # RL training needs the model-emitted tool_call_id round-tripped verbatim,
+            # so we skip the history-based renumbering below and return whatever the
+            # detector captured. Fall back to the canonical Kimi-K2 reconstruction
+            # (without history offset) if for any reason the detector did not record
+            # a raw id — the raw id field is best-effort but the format is stable.
+            if call_item.tool_call_id:
+                return call_item.tool_call_id
+            return f"functions.{call_item.name}:{call_item.tool_index}"
         if self.tool_call_parser != "kimi_k2":
             # A simple uuid is sufficient for all models except for Kimi-K2.
             tool_call_id = f"call_{uuid.uuid4().hex[:24]}"

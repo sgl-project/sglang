@@ -29,7 +29,10 @@ from sglang.srt.function_call.hermes_detector import HermesDetector
 from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
 from sglang.srt.function_call.inkling_detector import InklingDetector
 from sglang.srt.function_call.internlm_detector import InternlmDetector
-from sglang.srt.function_call.kimik2_detector import KimiK2Detector
+from sglang.srt.function_call.kimik2_detector import (
+    KimiK2Detector,
+    KimiK2RawIdDetector,
+)
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.ling3_detector import Ling3Detector
@@ -78,6 +81,7 @@ class FunctionCallParser:
         "gpt-oss": GptOssDetector,
         "kimi_k2": KimiK2Detector,
         "kimi_k3": KimiK3Detector,
+        "kimi_k2_raw_id": KimiK2RawIdDetector,
         "lfm2": Lfm2Detector,
         "ling3": Ling3Detector,
         "llama3": Llama32Detector,
