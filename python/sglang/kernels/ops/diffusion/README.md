@@ -21,7 +21,7 @@ free to move; the facade is not. `test_import_surface.py` enforces this, with
 a small allowlist for tests that deliberately exercise one backend.
 
 Resolution is lazy (PEP 562): the backends have disjoint heavy dependencies
-(Triton, CUTLASS/CuTe-DSL, FlyDSL on ROCm, MLX on Apple), so an eager
+(Triton, CUTLASS/CuTe-DSL, and FlyDSL on ROCm), so an eager
 re-export would make all of them import-time requirements everywhere.
 
 ## Layout
@@ -117,6 +117,7 @@ Several norms look interchangeable and are not. Start here.
 | `fused_inplace_qknorm_rope` | JIT CUDA | one bf16 rounding step vs split baseline; `round_norm_before_rope=True` makes it exact |
 | `fused_qknorm_rope_pack_kv` | JIT CUDA | as above, also packs prefix K/V |
 | `fused_rope_rotate_half_bitexact` | Triton | bit-exact (elementwise only) |
+| `fused_interleaved_rope_fp64` | JIT CUDA | bit-exact vs paired SANA-Video fp64 RoPE |
 | `ltx2_qknorm_split_rope_cuda` | JIT CUDA | close; **validated on B200** |
 | `fused_ltx25_decoder_rope` | JIT CUDA | bit-exact paired 3D RoPE from cached compact axis tables |
 | `apply_rotary_embedding` | Triton (+fallbacks) | close; the generic entry point |
