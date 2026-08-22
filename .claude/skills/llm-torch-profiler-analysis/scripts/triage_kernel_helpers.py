@@ -747,7 +747,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
     ),
     FusionPatternSpec(
         pattern="NSA fused top-k transform / page-table build",
-        candidate_path="python/sglang/srt/layers/attention/nsa_backend.py",
+        candidate_path="python/sglang/srt/layers/attention/dsa_backend.py",
         active_keywords=(
             "fast_topk_transform_fused",
             "fast_topk_transform_ragged_fused",
@@ -762,7 +762,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
         pattern="NSA fused quantize + indexed K-cache store",
         candidate_path=(
             "python/sglang/kernels/ops/attention/fused_store_index_cache.py"
-            "<br>python/sglang/srt/layers/attention/nsa/nsa_indexer.py"
+            "<br>python/sglang/srt/layers/attention/dsa/dsa_indexer.py"
         ),
         active_keywords=("fused_store_index_k_cache",),
         split_groups=(

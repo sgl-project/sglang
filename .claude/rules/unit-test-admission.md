@@ -27,7 +27,7 @@ A new unit test case must fall into one of these categories:
    forgetting to sync -- registry completeness, field lifecycle, serialization
    compatibility. Enumerating assertions are fine here; the guarded failure
    mode is "someone extended X without updating Y". Example: the ratchet tests
-   (`test/registered/unit/test_module_state_ratchet.py`).
+   (`test/registered/unit/runtime_context/test_config_ratchets.py`).
 
 Not admissible:
 
