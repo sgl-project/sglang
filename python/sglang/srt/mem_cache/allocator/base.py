@@ -51,6 +51,13 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def size_full(self):
         return self.size
 
+    def prefill_compressed_headroom(
+        self, extend_tokens: int, reserve_tokens: int = 0
+    ) -> bool:
+        """Admission gate for auxiliary pools the full/swa budgets do not see.
+        Allocators without such pools always have headroom."""
+        return True
+
     def debug_print(self) -> str:
         return ""
 

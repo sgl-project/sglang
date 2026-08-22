@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.runtime_context import attention_backends, get_parallel
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -102,6 +103,28 @@ def write_cache_indices(
             )
             pt += extend_len
 
+    if _is_npu and envs.SGLANG_DEBUG_MEMORY_POOL.get():
+        # Post-write read-back: separates "written dirty" (writer inputs) from
+        # "written clean, clobbered later" (an OOB kernel during forward).
+        pt = 0
+        for i in range(req_pool_indices_cpu.shape[0]):
+            req_idx = req_pool_indices_cpu[i].item()
+            prefix_len = prefix_lens_cpu[i].item()
+            seq_len = seq_lens_cpu[i].item()
+            extend_len = extend_lens_cpu[i].item()
+            seg = req_to_token_pool.req_to_token[req_idx, prefix_len:seq_len]
+            if int(seg.min()) < 0:
+                logger.error(
+                    "[mf-write] row EXTEND seg dirty IMMEDIATELY post-write: "
+                    "req_slot=%d seg=[%d,%d) min=%d max=%d",
+                    req_idx,
+                    prefix_len,
+                    seq_len,
+                    int(seg.min()),
+                    int(seg.max()),
+                )
+            pt += extend_len
+
 
 def get_last_loc(
     req_to_token: torch.Tensor,
@@ -125,6 +148,16 @@ def get_last_loc(
         # int32-safe variant. Non-HIP hardware keeps the original
         # dispatcher below.
         return get_last_loc_triton_safe(
+            req_to_token, req_pool_indices_tensor, prefix_lens_tensor
+        )
+
+    if _is_npu and uses_triton_dispatch:
+        # Same failure class as HIP above: NPU triton mis-compiles the
+        # mixed-width store, producing out-of-range last_loc (observed on
+        # DSV4 prefill CP + EAGLE + page_size=128 as +/-1e9 garbage that
+        # flows through alloc_extend into req_to_token rows and the PD
+        # transfer page lists). The torch indexing impl is exact.
+        return get_last_loc_torch(
             req_to_token, req_pool_indices_tensor, prefix_lens_tensor
         )
 

@@ -1,5 +1,6 @@
 import ctypes
 import dataclasses
+import logging
 import struct
 import threading
 from collections import deque
@@ -12,6 +13,8 @@ from sglang.srt.observability.trace import (
     TraceNullContext,
     TraceReqContext,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
@@ -131,6 +134,54 @@ def group_concurrent_contiguous(
     dst_groups = [g.tolist() for g in dst_groups]
 
     return src_groups, dst_groups
+
+
+def debug_log_transfer_fragmentation(
+    tag: str,
+    src_indices: npt.NDArray[np.int32],
+    dst_indices: npt.NDArray[np.int32],
+    item_lens: Optional[List[int]] = None,
+    data_lens: Optional[List[int]] = None,
+) -> None:
+    """Log transfers that shatter into many small blocks (SGLANG_DEBUG_MEMORY_POOL).
+
+    The memfabric SDMA stream queues one task per block with a 2048-deep
+    submission queue; a scattered index list that fragments into thousands of
+    single-slot blocks wedges the stream permanently. This logs the block count
+    and whether source indices are merely scattered or actually out of range.
+    """
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_DEBUG_MEMORY_POOL.get():
+        return
+    if len(src_indices) == 0:
+        return
+    src_groups, _ = group_concurrent_contiguous(src_indices, dst_indices)
+    if len(src_groups) <= 256:
+        return
+    flat_src = np.asarray(src_indices, dtype=np.int64)
+    flat_dst = np.asarray(dst_indices, dtype=np.int64)
+    singletons = sum(1 for g in src_groups if len(g) == 1)
+    capacity = (
+        min(d // i for d, i in zip(data_lens, item_lens) if i > 0)
+        if data_lens and item_lens
+        else None
+    )
+    oor = int(np.count_nonzero(flat_src >= capacity)) if capacity else -1
+    logger.warning(
+        "[mf-trans] %s: %d indices -> %d blocks (single-slot=%d, "
+        "src_desc-runs=%d, dst_desc-runs=%d) src[min=%d max=%d cap=%s oor=%d]",
+        tag,
+        flat_src.size,
+        len(src_groups),
+        singletons,
+        1 + int(np.count_nonzero(np.diff(flat_src) <= 0)),
+        1 + int(np.count_nonzero(np.diff(flat_dst) <= 0)),
+        int(flat_src.min()),
+        int(flat_src.max()),
+        capacity if capacity is not None else "?",
+        oor,
+    )
 
 
 @dataclasses.dataclass(frozen=True)

@@ -132,20 +132,30 @@ def fused_hc_head(
 
     hc_mult_pow2 = max(1, triton.next_power_of_2(hc_mult))
 
-    grid = (T,)
-    _hc_head_kernel[grid](
-        x,
-        hc_fn,
-        hc_scale,
-        hc_base,
-        y,
-        hidden_size=hidden_size,
-        HC_MULT=hc_mult_pow2,
-        K_TOTAL=hc_mult * hidden_size,
-        BLOCK_K=BLOCK_K,
-        BLOCK_D=BLOCK_D,
-        norm_eps=norm_eps,
-        hc_eps=hc_eps,
-        num_warps=4,
-    )
+    # Ascend caps a kernel grid's dim-0 (coreDim) at 65535. A single prefill
+    # forward can exceed that (e.g. under prefill context parallelism the
+    # cross-rank all-gather reconstructs the full-order sequence, which pads to
+    # max_rank_len * cp_size and can land at 65536). Tile the one-CTA-per-token
+    # launch over <=65535-row slices; each slice is a contiguous view of the
+    # (T, hc_mult, hidden_size) / (T, hidden_size) tensors, so the per-token
+    # pointer arithmetic (pid * K_TOTAL / pid * hidden_size) stays correct. For
+    # T <= MAX_GRID_DIM this is a single launch identical to the untiled path.
+    MAX_GRID_DIM = 65535
+    for start in range(0, T, MAX_GRID_DIM):
+        n_rows = min(MAX_GRID_DIM, T - start)
+        _hc_head_kernel[(n_rows,)](
+            x[start : start + n_rows],
+            hc_fn,
+            hc_scale,
+            hc_base,
+            y[start : start + n_rows],
+            hidden_size=hidden_size,
+            HC_MULT=hc_mult_pow2,
+            K_TOTAL=hc_mult * hidden_size,
+            BLOCK_K=BLOCK_K,
+            BLOCK_D=BLOCK_D,
+            norm_eps=norm_eps,
+            hc_eps=hc_eps,
+            num_warps=4,
+        )
     return y

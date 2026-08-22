@@ -213,6 +213,17 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             f"on req finish."
         )
 
+    def prefill_compressed_headroom(
+        self, extend_tokens: int, reserve_tokens: int = 0
+    ) -> bool:
+        """Project one more request's c128 sidecar need (positions = raw //
+        128 plus one page of anchor/continuation slack) and compare against
+        current availability, so admission queues instead of the generic
+        Prefill-out-of-memory raise killing the scheduler."""
+        alloc = self.c128_attn_allocator
+        need = -(-extend_tokens // 128) + -(-reserve_tokens // 128)
+        return alloc.available_size() >= need + alloc.page_size
+
     def _alloc_c_extend(
         self,
         allocator: NPUPagedTokenToKVPoolAllocator,
@@ -247,6 +258,39 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         c_last_loc = get_last_loc(
             c_table, req_pool_indices, c_prefix, allocator.page_size
         ).to(last_loc_dtype)
+        # Page id 0 means the sidecar row is unwritten below this tail (radix
+        # reuse) or the req slot was recycled before free() zeroed it; either
+        # way anchoring the allocator at page 0 overlaps live slots. The
+        # computed form yields last_loc < page_size exactly for page id 0.
+        ps = allocator.page_size
+        invalid = c_last_loc < ps
+        c_last_loc = torch.where(
+            invalid,
+            torch.full_like(c_last_loc, -1),
+            c_last_loc,
+        )
+        # Unaligned invalid prefixes must anchor at a reserved fresh page's
+        # own in-page offset so slot(p) == p (mod ps) holds; last_loc = -1
+        # alone satisfies the paged allocator's invariant only when r == 0.
+        needs_anchor = invalid & (c_prefix % ps != 0)
+        k = int(needs_anchor.sum().item()) if needs_anchor.numel() else 0
+        if k > 0:
+            if allocator.need_sort and len(allocator.free_pages) < k:
+                allocator.merge_and_sort_free()
+            if len(allocator.free_pages) < k:
+                # Unreachable behind the _has_c128_sidecar_capacity gate
+                # (which budgets anchor pages); raise rather than return None
+                # and silently leak the full/SWA slots this caller already
+                # allocated.
+                raise self._pool_exhausted(
+                    ratio, "anchor", k, len(allocator.free_pages)
+                )
+            anchor_pages = allocator.free_pages[:k]
+            allocator.free_pages = allocator.free_pages[k:]
+            r = (c_prefix % ps)[needs_anchor].to(c_last_loc.dtype)
+            c_last_loc[needs_anchor] = (
+                anchor_pages.to(c_last_loc.dtype) * ps + r - 1
+            )
 
         result = allocator.alloc_extend(
             c_prefix,
@@ -270,6 +314,9 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         prefix_groups = (prefix_lens_cpu // ratio + page_size - 1) // page_size
         seq_groups = (seq_lens_cpu // ratio + page_size - 1) // page_size
         need = int((seq_groups - prefix_groups).clamp(min=0).sum().item())
+        # One anchor page per row whose fresh prefix is page-unaligned; see
+        # the needs_anchor reservation in _alloc_c_extend.
+        need += len(prefix_lens_cpu)
         return need <= self.c128_attn_allocator.available_size() // page_size
 
     def _alloc_compressed_kv(
@@ -472,6 +519,8 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         row = req_to_token_pool.req_to_c128_sidecar[int(req_pool_idx)]
         self.release_c128_pages(row[row > 0])
+        # Zero the row so a recycled req slot never exposes a stale page id
+        # to the next occupant's last_loc lookup.
         row.zero_()
         self.get_kvcache().clear_c128_req_state(int(req_pool_idx))
 

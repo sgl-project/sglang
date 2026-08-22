@@ -54,6 +54,7 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils.common import rate_limited_hit
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
@@ -1292,6 +1293,19 @@ class SchedulerDisaggregationPrefillMixin:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, seg_start:seg_end
             ]
+            if envs.SGLANG_DEBUG_MEMORY_POOL.get():
+                _dbg = kv_indices.to(torch.int64)
+                if int(_dbg.min()) < 0 and rate_limited_hit("mf-stage-before"):
+                    logger.error(
+                        "[mf-stage] req_to_token row corrupt BEFORE translate: "
+                        "rid=%s req_slot=%s seg=[%d,%d) min=%d max=%d",
+                        req.rid,
+                        req.req_pool_idx,
+                        seg_start,
+                        seg_end,
+                        int(_dbg.min()),
+                        int(_dbg.max()),
+                    )
             # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
             # physical ones. Per segment, since each is its own gather.
             kv_indices = (
@@ -1299,7 +1313,151 @@ class SchedulerDisaggregationPrefillMixin:
                     kv_indices
                 )
             )
+            if envs.SGLANG_DEBUG_MEMORY_POOL.get():
+                _dbg = kv_indices.to(torch.int64)
+                if int(_dbg.min()) < 0 and rate_limited_hit("mf-stage-after"):
+                    logger.error(
+                        "[mf-stage] indices corrupt AFTER translate: rid=%s "
+                        "req_slot=%s seg=[%d,%d) min=%d max=%d",
+                        req.rid,
+                        req.req_pool_idx,
+                        seg_start,
+                        seg_end,
+                        int(_dbg.min()),
+                        int(_dbg.max()),
+                    )
             page_indices = kv_to_page_indices(kv_indices, page_size)
+            # Zero-sync forensics: this D2H already happens in the normal path,
+            # so dumping raw values adds no synchronization (any extra sync
+            # masks the racing writer -- see doc §19). Unconditional.
+            _neg = page_indices[page_indices < 0]
+            if _neg.size > 0 and rate_limited_hit("mf-raw", first=10, every=200):
+                _slots = kv_indices.to(torch.int64)
+                _dirty = (_slots < 0) | (_slots >= 1 << 30)
+                _first = int(_dirty.nonzero()[0]) if bool(_dirty.any()) else -1
+                try:
+                    from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+                        get_scatter_oob_counts as _oob,
+                    )
+
+                    _c = _oob()
+                    if any(_c.values()):
+                        logger.error("[mf-scatter] clamped OOB scatters: %s", _c)
+                except Exception:
+                    pass
+                try:
+                    import torch as _t
+
+                    _kc = self.token_to_kv_pool_allocator.get_kvcache()
+                    _kv = kv_indices[_first : _first + 4].to(_t.int32)
+
+                    def _seq_hits_fp32(buf):
+                        if buf is None or buf.numel() < 4:
+                            return 0
+                        b = buf.view(-1)
+                        v = _kv.view(_t.float32)
+                        m = b == v[0]
+                        for k in range(1, 4):
+                            m &= _t.roll(b, -k) == v[k]
+                        return int(m.sum().item())
+
+                    def _seq_hits_pairs(buf):
+                        if buf is None or buf.numel() < 8:
+                            return 0
+                        b = buf.view(-1).view(_t.int16)
+                        h = _kv.view(_t.int16)  # 8 halves from 4 int32
+                        m = b == h[0]
+                        for k in range(1, 8):
+                            m &= _t.roll(b, -k) == h[k]
+                        return int(m.sum().item())
+
+                    _cands = []
+                    for _pn in ("compress_state_pools", "indexer_compress_state_pools"):
+                        for _pool in getattr(_kc, _pn, None) or []:
+                            _cands.append((_pn + ".kv_score", getattr(getattr(_pool, "kv_score_buffer", None), "kv_score", None), "f"))
+                    for _pn, _pool in (("swa", getattr(_kc, "swa_kv_pool", None)), ("c4", getattr(_kc, "c4_kv_pool", None)), ("c128", getattr(_kc, "c128_kv_pool", None))):
+                        _bufs = getattr(_pool, "kv_buffer", None) or []
+                        for _li, _lb in enumerate(_bufs):
+                            _cands.append((f"{_pn}.kv{_li}", _lb, "p"))
+                    _ip = getattr(_kc, "c4_indexer_kv_pool", None)
+                    for _li, _lb in enumerate(getattr(_ip, "index_scale_buffer", None) or []):
+                        _cands.append((f"indexer.scale{_li}", _lb, "p"))
+                    for _li, _lb in enumerate(getattr(_ip, "index_k_buffer", None) or []):
+                        _cands.append((f"indexer.k{_li}", _lb, "p"))
+                    _mb = getattr(self, "disagg_metadata_buffers", None)
+                    _cands.append(("meta.hidden", getattr(_mb, "output_hidden_states", None), "p"))
+                    _cands.append(("meta.topk_p", getattr(_mb, "output_topk_p", None), "f"))
+                    _cands.append(("req.hidden", getattr(req, "hidden_states_tensor", None), "p"))
+                    _ab = None
+                    try:
+                        from sglang.srt.model_executor.forward_context import (
+                            get_attn_backend as _gab,
+                        )
+
+                        _ab = _gab()
+                    except Exception:
+                        _ab = None
+                    for _ri, (_rk, _rs) in enumerate(
+                        getattr(_ab, "_mf_recent_payloads", None) or []
+                    ):
+                        _cands.append((f"recent.k{_ri}", _rk, "p"))
+                        _cands.append((f"recent.scale{_ri}", _rs, "p"))
+                    try:
+                        from sglang.srt.hardware_backend.npu.dsv4.quant_retention import (
+                            payloads as _qp,
+                        )
+
+                        if _qp():  # empty unless SGLANG_MF_QUANT_RETAIN=1
+                            for _ri, (_qk, _qs) in enumerate(_qp()):
+                                _cands.append((f"dq.q{_ri}", _qk, "p"))
+                                _cands.append((f"dq.scale{_ri}", _qs, "p"))
+                    except Exception:
+                        pass
+                    try:
+                        from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
+                            Dsv4NpuRoPE,
+                        )
+
+                        for _i, _inst in enumerate(Dsv4NpuRoPE._instances.values()):
+                            try:
+                                _inst.ensure_tables(torch.float32, _inst.freqs_cis.device, allow_build=True)
+                            except Exception:
+                                pass
+                            for _tn, _tb in (_inst._tables or {}).items():
+                                _cands.append((f"rope{_i}.cos", _tb[0], "p"))
+                                _cands.append((f"rope{_i}.sin", _tb[1], "p"))
+                    except Exception:
+                        pass
+                    for _name, _buf, _mode in _cands:
+                        if _buf is None:
+                            continue
+                        try:
+                            _n = _seq_hits_fp32(_buf) if _mode == "f" else _seq_hits_pairs(_buf)
+                        except Exception:
+                            _n = 0
+                        if _n:
+                            logger.error("[mf-fp] payload sequence FOUND x%d in %s", _n, _name)
+                    logger.error("[mf-fp] probed %d candidates", len(_cands))
+                except Exception as _e:
+                    logger.error("[mf-fp] fingerprint probe failed: %s", _e)
+                logger.error(
+                    "[mf-raw] rid=%s slot=%s seg=[%d,%d): n_dirty=%d/%d "
+                    "first_dirty_off=%d slots[%d:%d]=%s floats=%s pages24=%s",
+                    req.rid,
+                    req.req_pool_idx,
+                    seg_start,
+                    seg_end,
+                    int(_dirty.sum()),
+                    _slots.numel(),
+                    _first,
+                    max(0, _first - 4),
+                    max(0, _first - 4) + 16,
+                    _slots[max(0, _first - 4) : max(0, _first - 4) + 16].tolist(),
+                    kv_indices[max(0, _first - 4) : max(0, _first - 4) + 16]
+                    .view(torch.float32)
+                    .tolist(),
+                    page_indices[:24].tolist(),
+                )
             segment_is_last = last_chunk and is_final_segment
             if not req.disagg_kv_sender.should_send_kv_chunk(
                 len(page_indices), segment_is_last
