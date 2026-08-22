@@ -1336,15 +1336,13 @@ def test_mapped_layers_ship_through_the_courier(tmp_path, monkeypatch):
 def test_the_courier_kill_switch_forces_the_synchronous_path(tmp_path, monkeypatch):
     if not pathlib.Path("/proc/self/maps").exists():
         pytest.skip("needs /proc to tell a mapping from anonymous memory")
-    from sglang.srt.environ import envs
-
     # The switch is read when the courier would first be built, and
     # initialization itself prefetches -- so set it before the manager exists,
     # the way a deployment sets it before starting the server.
-    with envs.SGLANG_DISABLE_MAPPED_COURIER.override(True):
-        manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
-        manager.release_all()
-        manager.prefetch_layer(0, non_blocking=True)
+    monkeypatch.setenv("SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER", "1")
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    manager.release_all()
+    manager.prefetch_layer(0, non_blocking=True)
     assert not manager._courier_inflight and manager._mapped_courier is None
     assert (
         0 in manager._gpu_layers

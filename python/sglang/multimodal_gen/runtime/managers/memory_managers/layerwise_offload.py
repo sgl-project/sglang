@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import torch
 from torch.distributed.tensor import DTensor
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.loader.utils import MappedRegions
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
@@ -37,7 +38,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
 
@@ -1051,7 +1051,7 @@ class LayerwiseOffloadManager:
         """The courier, built on first use; None where it cannot help."""
         if self._mapped_courier is not None:
             return self._mapped_courier
-        if envs.SGLANG_DISABLE_MAPPED_COURIER.get():
+        if envs.SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER:
             return None
         if self.copy_stream is None or self._synchronous_mps:
             return None
