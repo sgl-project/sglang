@@ -127,8 +127,7 @@ def load_kv_cache_scales(
         else:
             logger.warning(
                 "Using FP8 KV cache but no scaling factors "
-                "provided. Defaulting to scaling factors of 1.0. "
-                "This may lead to less accurate results!"
+                "provided. Defaulting to scaling factors of 1.0."
             )
 
 

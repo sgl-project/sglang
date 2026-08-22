@@ -95,10 +95,6 @@ import { GLM5Deployment } from '/src/snippets/autoregressive/glm-5-deployment.js
 - For other configuration tips (MTP, DSA kernel, Context Parallel, HiSparse, NVFP4, Index Cache), see the [DeepSeek-V3.2 cookbook page](../DeepSeek/DeepSeek-V3_2). GLM-5 and DeepSeek-V3.2 share the same model structure, so the optimization techniques are common.
 - Use `--json-model-override-args '{"index_topk_pattern": "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"}'` for GLM-5-FP8 if you want to enable the [IndexCache](https://github.com/THUDM/IndexCache) method. This feature is supported through [this PR](https://github.com/sgl-project/sglang/pull/21405) and introduces only a small accuracy loss. However, if you are running rigorous accuracy evaluations, it is not recommended to enable this feature.
 
-<Warning>
-**FP8 KV Cache**: `--kv-cache-dtype fp8_e4m3` quantizes the KV cache to FP8 at runtime. Since these FP8 model checkpoints do not include pre-calibrated KV cache scaling factors, SGLang defaults to a scale of 1.0, which may cause noticeable accuracy degradation on reasoning-heavy tasks. It is not included in the generated commands above; add it manually only if memory constraints require the trade-off.
-</Warning>
-
 ## 4. Model Invocation
 
 Deploy GLM-5 with the following command (FP8 on H200, all features enabled):

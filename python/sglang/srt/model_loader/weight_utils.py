@@ -972,7 +972,7 @@ def _prefetch_all_checkpoints(
     succeeded_event = threading.Event()
     errors: List[Tuple[str, Exception]] = []
 
-    logger.info(
+    logger.debug(
         "Rank %d: prefetching %d/%d checkpoint shards into page cache "
         "(background, %d local ranks sharing the work, %d threads per rank)...",
         local_rank,
@@ -993,7 +993,7 @@ def _prefetch_all_checkpoints(
             if total_for_rank > 0 and next_log_pct <= 100:
                 pct = 100 * completed / total_for_rank
                 while pct >= next_log_pct and next_log_pct <= 100:
-                    logger.info(
+                    logger.debug(
                         "Rank %d: prefetching checkpoint files: %d%% (%d/%d)",
                         local_rank,
                         next_log_pct,
@@ -1044,7 +1044,7 @@ def _prefetch_all_checkpoints(
         start = time.perf_counter()
         _prefetch_all()
         succeeded_event.set()
-        logger.info(
+        logger.debug(
             "Rank %d: prefetching checkpoint files into page cache "
             "finished in %.2fs",
             local_rank,
