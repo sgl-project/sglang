@@ -964,6 +964,8 @@ class ChatCompletionRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def set_tool_choice_default(cls, values):
+        if not isinstance(values, dict):
+            return values
         if values.get("tool_choice") is None:
             if values.get("tools") is None and not _has_message_level_tools(
                 values.get("messages")
@@ -983,6 +985,8 @@ class ChatCompletionRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_reasoning_inputs(cls, values: Dict):
+        if not isinstance(values, dict):
+            return values
         r = values.get("reasoning")
         thinking = None
 
@@ -1042,8 +1046,10 @@ class ChatCompletionRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def set_json_schema(cls, values):
+        if not isinstance(values, dict):
+            return values
         response_format = values.get("response_format")
-        if not response_format:
+        if not isinstance(response_format, dict):
             return values
 
         if response_format.get("type") != "json_schema":
