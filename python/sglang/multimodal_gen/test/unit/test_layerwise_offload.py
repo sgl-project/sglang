@@ -205,6 +205,7 @@ def _server_args(**kwargs):
     defaults = dict(
         component_residency=None,
         disagg_role=RoleType.MONOLITHIC,
+        performance_mode="auto",
         _required_resident_components=set(),
         _component_layerwise_capabilities={},
         _explicit_arg_names=set(),
@@ -795,6 +796,12 @@ class _ResidentComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
     def __init__(self, n: int) -> None:
         super().__init__()
         self.blocks = torch.nn.ModuleList([_DummyBlock() for _ in range(n)])
+
+
+class _ParkableResidentComponent(_ResidentComponent):
+    def __init__(self, n: int) -> None:
+        super().__init__(n)
+        self.non_layer = torch.nn.Parameter(torch.ones(2))
 
 
 class _AuxiliaryResidentComponent(_ResidentComponent):
@@ -1684,3 +1691,97 @@ def test_layerwise_tuning_accepts_json_and_pair_forms():
     assert pair.layerwise_tuning_for("text_encoder", dit_group=False)[1] == 2.0
     as_json = _server_args(layerwise_resident_layers='{"vae": 6}')
     assert as_json.layerwise_tuning_for("vae", dit_group=False)[1] == 6.0
+
+
+def test_non_layer_parking_follows_memory_performance_mode(monkeypatch):
+    """The extra transfer per request only pays for itself under memory mode."""
+    _patch_fake_device(monkeypatch)
+    tight = _ResidentComponent(4)
+    tight.configure_layerwise_offload(_server_args(performance_mode="memory"))
+    assert tight.park_non_layer_weights_between_uses
+
+    relaxed = _ResidentComponent(4)
+    relaxed.configure_layerwise_offload(_server_args(performance_mode="speed"))
+    assert not relaxed.park_non_layer_weights_between_uses
+
+
+def test_parking_leaves_streamed_layer_weights_alone(monkeypatch):
+    """Only the parameters no manager streams are moved to the host."""
+    comp = _ParkableResidentComponent(4)
+    comp.configure_layerwise_offload(_server_args(performance_mode="memory"))
+    _headroom(monkeypatch, 0)
+    managed = comp._managed_layer_parameter_names()
+    assert managed, "the managers should own the block parameters"
+
+    comp.park_non_layer_weights()
+    parked = comp._parked_non_layer_weights
+    assert not (set(parked) & managed), "a streamed layer weight was parked"
+    for name, host_tensor in parked.items():
+        assert host_tensor.device.type == "cpu", name
+
+    comp.restore_non_layer_weights()
+    restored = dict(comp.named_parameters())
+    for name, host_tensor in parked.items():
+        assert restored[name].shape == host_tensor.shape
+
+
+def test_parking_is_a_no_op_outside_memory_mode(monkeypatch):
+    comp = _ParkableResidentComponent(4)
+    comp.configure_layerwise_offload(_server_args(performance_mode="speed"))
+    comp.park_non_layer_weights()
+    assert not comp._parked_non_layer_weights
+
+
+def _headroom(monkeypatch, gib):
+    monkeypatch.setattr(
+        layerwise_offload_mod.current_platform,
+        "get_available_gpu_memory",
+        lambda **_: float(gib),
+    )
+    module = layerwise_offload_mod.torch.get_device_module()
+    monkeypatch.setattr(module, "memory_reserved", lambda *_: 0, raising=False)
+    monkeypatch.setattr(module, "memory_allocated", lambda *_: 0, raising=False)
+
+
+def test_parking_is_skipped_when_the_card_has_room(monkeypatch):
+    """A component holding a sliver of a large headroom is left alone."""
+    comp = _ParkableResidentComponent(4)
+    comp.configure_layerwise_offload(_server_args(performance_mode="memory"))
+    _headroom(monkeypatch, 400)
+    comp.park_non_layer_weights()
+    assert not comp._parked_non_layer_weights
+
+
+def test_parking_happens_when_the_headroom_is_small(monkeypatch):
+    comp = _ParkableResidentComponent(4)
+    comp.configure_layerwise_offload(_server_args(performance_mode="memory"))
+    _headroom(monkeypatch, 0)
+    comp.park_non_layer_weights()
+    assert comp._parked_non_layer_weights
+
+
+def test_host_copies_are_given_back_when_room_appears(monkeypatch):
+    """Skipping must not leave host memory held for a park that will not happen."""
+    comp = _ParkableResidentComponent(4)
+    comp.configure_layerwise_offload(_server_args(performance_mode="memory"))
+    _headroom(monkeypatch, 0)
+    comp.park_non_layer_weights()
+    assert comp._parked_non_layer_weights
+    comp.restore_non_layer_weights()
+
+    _headroom(monkeypatch, 400)
+    comp.park_non_layer_weights()
+    assert not comp._parked_non_layer_weights, "host copies should be released"
+
+
+def test_park_placeholders_are_shared(monkeypatch):
+    """One stand-in per (device, dtype), not one allocation per parked weight."""
+    comp = _ParkableResidentComponent(4)
+    comp.configure_layerwise_offload(_server_args(performance_mode="memory"))
+    _headroom(monkeypatch, 0)
+    comp.park_non_layer_weights()
+    managed = comp._managed_layer_parameter_names()
+    stand_ins = {
+        id(p) for n, p in comp.named_parameters() if n not in managed and p.numel() == 1
+    }
+    assert len(stand_ins) <= len(comp._park_placeholders)
