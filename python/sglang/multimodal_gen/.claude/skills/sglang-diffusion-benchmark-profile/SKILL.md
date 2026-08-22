@@ -9,6 +9,7 @@ Use this skill when measuring denoise performance, finding the slow op, checking
 
 This skill is diagnosis-first. It owns:
 - checked-in denoise benchmark presets
+- same-GPU Eager/BCG x `quality=lossless|high` ABBA comparisons
 - perf dump collection and before/after comparison
 - `torch.profiler` trace capture and quick hotspot ranking
 - mapping hot kernels back to known fast paths and fusion families
@@ -29,7 +30,8 @@ Before running any benchmark, profiler, or kernel-validation command:
 - for downloaded checkpoints, use the preset helper's task-owned
   `--model-cache-root` together with `--cleanup-model-cache`; verify the JSONL
   ledger reports zero residual weight files before moving to the next model
-- choose idle GPU(s) before starting perf work
+- choose idle GPU(s) before starting perf work; for a comparison matrix, hold
+  the same GPU set and verify it has no foreign process at every run boundary
 
 ## Native Backend Gate
 
@@ -51,7 +53,7 @@ If any benchmark, perf-dump, or `torch.profiler` command prints one of those sig
 - [benchmark-and-profile.md](benchmark-and-profile.md) — canonical denoise benchmark, perf dump, and `torch.profiler` workflow; uses checked-in nightly-aligned presets plus current-source extras such as LongCat-Image, SANA-Video, LingBot Video MoE, Cosmos3 Edge/distilled, LTX-2.5 and its diffusion decoder, MiniMax-H3, FLUX.2 Klein, Ideogram4, ERNIE/GLM/SANA image models, FastWan2.2, `LTX-2.3`, HunyuanVideo, MOVA, Helios, image edit, and Hunyuan3D shape
 - [existing-fast-paths.md](existing-fast-paths.md) — map bottlenecks to existing fused kernels, packed QKV paths, fused `QK norm + RoPE`, distributed overlap patterns, and open optimization PRs before proposing new code
 - [scripts/diffusion_skill_env.py](scripts/diffusion_skill_env.py) — preflight helper: repo root discovery via `sglang.__file__`, write-access probe, benchmark/profile output directories, idle GPU selection
-- [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark preset runner via `sglang generate`; defaults to eager, supports opt-in `--torch-compile`, forces H3 to its eager consistency mode, enables synchronized stage attribution, validates nightly preset drift, and can clean an isolated model cache in a `finally` block with a JSONL ledger
+- [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark preset runner via `sglang generate`; defaults to eager/lossless, supports explicit quality and BCG comparators plus a same-GPU four-mode ABBA matrix, rejects invalid BCG capture/fallback logs, forces H3 to its eager consistency mode, enables synchronized stage attribution, validates nightly preset drift, and can clean one isolated model cache after the full matrix in a `finally` block with a JSONL ledger
 
 ## Opportunity Discovery Rule
 
@@ -90,6 +92,23 @@ Always rule out these existing families first:
 The checked-in helper defaults to eager. Use `--torch-compile` only for a
 controlled comparator, never for the eager ground truth. The legacy
 `--no-torch-compile` spelling remains accepted but is redundant.
+
+For kernel/BCG discovery, run `--quality-bcg-matrix`. It executes
+Eager/BCG as A-B-B-A at `lossless`, then repeats the pair at `high`, on one
+locked GPU set and one isolated checkpoint cache. A BCG row is invalid unless
+the log contains `[Diffusion BCG] captured` and contains no support-disable,
+capture-failure, or serving-signature-miss marker. `--warmup-resolutions`
+only declares width and height: a video request can still miss because its
+frame count differs from the model's synthetic warmup contract. Treat that as
+Eager fallback, not as a valid BCG measurement.
+
+Keep prompt, negative prompt, seed, shape, steps, guidance, dtype, topology,
+and residency fixed. Lossless comparisons require byte-identical artifacts.
+For `quality=high`, report aggregate and worst-frame SSIM/PSNR; the repository
+defaults are 0.95/28 dB for images and 0.92/24 dB for video unless the model's
+checked-in consistency metadata defines a different threshold. A performance
+PR needs repeated saved-request e2e improvement of at least 1.5%, a
+representative profile, and before/after image or video evidence.
 
 MiniMax-H3 is always an eager consistency case on current main. Use
 `--model minimax-h3-t2va`; its preset writes the H3 request fields through a
