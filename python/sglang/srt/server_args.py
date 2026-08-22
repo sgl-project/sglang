@@ -1908,6 +1908,11 @@ class ServerArgs:
         NS("exec.graph"),
     ] = False
     disable_cuda_graph: A[bool, Arg(no_cli=True), NS("exec.graph")] = False
+    disable_draft_cuda_graph: A[
+        bool,
+        "Disable cuda graph for draft model in speculative decoding.",
+        NS("exec.graph"),
+    ] = False
     disable_cuda_graph_padding: A[
         bool,
         "Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
