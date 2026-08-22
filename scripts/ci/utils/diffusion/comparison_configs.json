@@ -13,7 +13,7 @@
             "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup-mode server --dit-layerwise-offload false --tp-size 2",
+                    "serve_args": "--warmup-mode server --component-residency dit=resident --tp-size 2",
                     "extra_env": {}
                 }
             }
@@ -29,7 +29,7 @@
             "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup-mode server --dit-layerwise-offload false --tp-size 2",
+                    "serve_args": "--warmup-mode server --component-residency dit=resident --tp-size 2",
                     "extra_env": {}
                 }
             }

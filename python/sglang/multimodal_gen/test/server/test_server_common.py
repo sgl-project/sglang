@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server import conftest
 from sglang.multimodal_gen.test.server.realtime_consistency import (
+    RealtimeChunkStats,
     pop_realtime_key_frames,
     pop_realtime_perf_stats,
     validate_realtime_perf_stats,
@@ -51,10 +52,17 @@ from sglang.multimodal_gen.test.test_utils import (
     _consistency_gt_filenames,
     _get_consistency_gt_dir,
     action_gt_exists,
+    audio_gt_exists,
+    compare_audio_with_gt,
     compare_with_gt,
+    encode_audio_gt_wav,
+    extract_audio_pcm_from_video_bytes,
     extract_key_frames_from_video,
     get_action_consistency_gt_candidates,
     get_action_consistency_gt_remote_files,
+    get_audio_consistency_gt_candidates,
+    get_audio_consistency_gt_remote_files,
+    get_audio_consistency_thresholds,
     get_consistency_gt_candidates,
     get_consistency_gt_remote_files,
     get_consistency_threshold_path,
@@ -63,7 +71,9 @@ from sglang.multimodal_gen.test.test_utils import (
     gt_exists,
     image_bytes_to_numpy,
     load_action_consistency_gt,
+    load_audio_consistency_gt,
     load_consistency_gt,
+    save_audio_gt_artifact,
     save_consistency_failure_artifact,
     save_missing_consistency_gt_artifact,
     wait_for_req_perf_record,
@@ -403,18 +413,7 @@ class DiffusionServerBase:
         scenario = BASELINE_CONFIG.scenarios.get(case.id)
         missing_scenario = False
         if scenario is None:
-            # Create dummy scenario to allow metric collection
-            scenario = type(
-                "DummyScenario",
-                (),
-                {
-                    "expected_e2e_ms": 0,
-                    "expected_avg_denoise_ms": 0,
-                    "expected_median_denoise_ms": 0,
-                    "stages_ms": {},
-                    "denoise_step_ms": {},
-                },
-            )()
+            scenario = ScenarioConfig({}, {}, 0, 0, 0)
             if not is_baseline_generation_mode:
                 missing_scenario = True
 
@@ -450,6 +449,29 @@ class DiffusionServerBase:
                     )
                 return
 
+            if current_platform.is_cuda():
+                expected_load_peak_vram_mb = scenario.load_peak_vram_mb
+                expected_runtime_peak_vram_mb = scenario.runtime_peak_vram_mb
+                if (
+                    expected_load_peak_vram_mb is None
+                    or expected_runtime_peak_vram_mb is None
+                ):
+                    self._dump_baseline_for_testcase(case, summary, missing_scenario)
+                    pytest.fail(
+                        f"Testcase '{case.id}' is missing a load/runtime peak VRAM "
+                        f"baseline in {get_perf_baseline_path()}"
+                    )
+                try:
+                    validator.validate_peak_vram(
+                        summary,
+                        expected_load_peak_vram_mb,
+                        expected_runtime_peak_vram_mb,
+                    )
+                except AssertionError as e:
+                    logger.error(f"Peak VRAM validation failed for {case.id}:\n{e}")
+                    self._dump_baseline_for_testcase(case, summary, missing_scenario)
+                    raise
+
             # only run performance validation if run_perf_check is True
             try:
                 validator.validate(perf_record, case.sampling_params.num_frames)
@@ -458,12 +480,93 @@ class DiffusionServerBase:
                 self._dump_baseline_for_testcase(case, summary, missing_scenario)
                 raise
 
+        self._record_performance_result(case, summary)
+
+    def _validate_realtime_performance(
+        self,
+        ctx: ServerContext,
+        case: DiffusionTestCase,
+        chunk_stats: list[RealtimeChunkStats],
+    ) -> None:
+        validate_realtime_perf_stats(
+            case.id,
+            chunk_stats,
+            case.sampling_params.realtime_perf_thresholds,
+            ignore_initial_chunks=(
+                case.sampling_params.realtime_perf_ignore_initial_chunks
+            ),
+        )
+        if not case.run_perf_check or not current_platform.is_cuda():
+            return
+
+        request_id = next(
+            (stat.request_id for stat in reversed(chunk_stats) if stat.request_id),
+            None,
+        )
+        if request_id is None:
+            pytest.fail(f"{case.id}: realtime chunk stats are missing request IDs")
+
+        perf_record = wait_for_req_perf_record(
+            request_id,
+            ctx.perf_log_path,
+            timeout=30,
+        )
+        if perf_record is None:
+            pytest.fail(f"{case.id}: realtime request performance record is missing")
+
+        scenario = BASELINE_CONFIG.scenarios.get(case.id)
+        if scenario is None:
+            pytest.fail(f"Testcase '{case.id}' not found in {get_perf_baseline_path()}")
+
+        validator = PerformanceValidator(
+            scenario=scenario,
+            tolerances=BASELINE_CONFIG.tolerances,
+            step_fractions=BASELINE_CONFIG.step_fractions,
+        )
+        summary = validator.collect_metrics(perf_record)
+        self._print_performance_log(case, summary, scenario)
+        self._record_performance_result(case, summary)
+
+        if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
+            logger.info(
+                "%s realtime peak VRAM baseline: load=%.0fMiB, runtime=%.0fMiB",
+                case.id,
+                summary.load_peak_vram_mb,
+                summary.runtime_peak_vram_mb,
+            )
+            return
+
+        if scenario.load_peak_vram_mb is None or scenario.runtime_peak_vram_mb is None:
+            pytest.fail(
+                f"Testcase '{case.id}' is missing a load/runtime peak VRAM "
+                f"baseline in {get_perf_baseline_path()}; measured "
+                f"load={summary.load_peak_vram_mb:.0f}MiB, "
+                f"runtime={summary.runtime_peak_vram_mb:.0f}MiB"
+            )
+
+        try:
+            validator.validate_peak_vram(
+                summary,
+                scenario.load_peak_vram_mb,
+                scenario.runtime_peak_vram_mb,
+            )
+        except AssertionError as e:
+            logger.error(f"Peak VRAM validation failed for {case.id}:\n{e}")
+            raise
+
+    def _record_performance_result(
+        self,
+        case: DiffusionTestCase,
+        summary: PerformanceSummary,
+    ) -> None:
         result = {
             "test_name": case.id,
             "modality": case.server_args.modality,
             "e2e_ms": summary.e2e_ms,
             "avg_denoise_ms": summary.avg_denoise_ms,
             "median_denoise_ms": summary.median_denoise_ms,
+            "load_peak_vram_mb": summary.load_peak_vram_mb,
+            "runtime_peak_vram_mb": summary.runtime_peak_vram_mb,
             "stage_metrics": summary.stage_metrics,
             "sampled_steps": summary.sampled_steps,
         }
@@ -495,7 +598,9 @@ class DiffusionServerBase:
             (
                 f"  e2e={summary.e2e_ms:.2f}ms, "
                 f"avg_denoise={summary.avg_denoise_ms:.2f}ms, "
-                f"median_denoise={summary.median_denoise_ms:.2f}ms"
+                f"median_denoise={summary.median_denoise_ms:.2f}ms, "
+                f"load_peak_vram={summary.load_peak_vram_mb:.0f}MiB, "
+                f"runtime_peak_vram={summary.runtime_peak_vram_mb:.0f}MiB"
             ),
         ]
         if scenario is not None:
@@ -504,6 +609,16 @@ class DiffusionServerBase:
                 f"e2e={scenario.expected_e2e_ms:.2f}ms, "
                 f"avg_denoise={scenario.expected_avg_denoise_ms:.2f}ms, "
                 f"median_denoise={scenario.expected_median_denoise_ms:.2f}ms"
+            )
+        if (
+            scenario is not None
+            and scenario.load_peak_vram_mb is not None
+            and scenario.runtime_peak_vram_mb is not None
+        ):
+            lines.append(
+                "  peak_vram_baseline: "
+                f"load={scenario.load_peak_vram_mb:.0f}MiB, "
+                f"runtime={scenario.runtime_peak_vram_mb:.0f}MiB"
             )
         if summary.stage_metrics:
             stages = ", ".join(
@@ -543,6 +658,14 @@ class DiffusionServerBase:
             "expected_avg_denoise_ms": round(summary.avg_denoise_ms, 2),
             "expected_median_denoise_ms": round(summary.median_denoise_ms, 2),
         }
+
+        if current_platform.is_cuda():
+            baseline.update(
+                {
+                    "load_peak_vram_mb": round(summary.load_peak_vram_mb, 2),
+                    "runtime_peak_vram_mb": round(summary.runtime_peak_vram_mb, 2),
+                }
+            )
 
         if measured_full_time is not None:
             baseline["estimated_full_test_time_s"] = round(measured_full_time, 1)
@@ -612,6 +735,15 @@ class DiffusionServerBase:
                 logger.info(
                     "[Artifact] Saved missing consistency GT: %s", artifact_path
                 )
+            if case.sampling_params.expect_audio_output:
+                audio_path = save_audio_gt_artifact(
+                    os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR"),
+                    case.id,
+                    num_gpus,
+                    extract_audio_pcm_from_video_bytes(content),
+                )
+                if audio_path is not None:
+                    logger.info("[Artifact] Saved missing audio GT: %s", audio_path)
             if _get_consistency_gt_dir() is not None:
                 names = ", ".join(
                     get_consistency_gt_candidates(
@@ -737,6 +869,67 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             f"min_ssim={result.min_ssim:.4f}, "
             f"min_psnr={result.min_psnr:.4f}, "
             f"max_mean_abs_diff={result.max_mean_abs_diff:.4f})"
+        )
+
+        if case.sampling_params.expect_audio_output:
+            self._validate_audio_consistency(case, content)
+
+    def _validate_audio_consistency(
+        self,
+        case: DiffusionTestCase,
+        content: bytes,
+    ) -> None:
+        num_gpus = case.server_args.num_gpus
+        output_audio = extract_audio_pcm_from_video_bytes(content)
+        if not audio_gt_exists(case.id, num_gpus):
+            artifact_path = save_audio_gt_artifact(
+                os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR"),
+                case.id,
+                num_gpus,
+                output_audio,
+            )
+            if artifact_path is not None:
+                logger.info("[Artifact] Saved missing audio GT: %s", artifact_path)
+            names = ", ".join(get_audio_consistency_gt_candidates(case.id, num_gpus))
+            pytest.fail(f"Audio GT not found for {case.id}. Expected one of: {names}")
+
+        gt_audio = load_audio_consistency_gt(case.id, num_gpus)
+        result = compare_audio_with_gt(
+            output_audio,
+            gt_audio,
+            get_audio_consistency_thresholds(case.id),
+        )
+        if not result.passed:
+            gt_remote_info = "\n".join(
+                f"    - {filename}: {url}"
+                for filename, url in get_audio_consistency_gt_remote_files(
+                    case.id, num_gpus
+                )
+            )
+            pytest.fail(
+                f"Audio consistency check failed for {case.id}:\n"
+                f"  Metrics: spectral_similarity={result.spectral_similarity:.4f}, "
+                f"waveform_correlation={result.waveform_correlation:.4f}, "
+                f"rms_db_diff={result.rms_db_diff:.4f}, "
+                f"duration_diff={result.duration_diff:.4f}s\n"
+                f"  Thresholds: spectral_similarity>="
+                f"{result.thresholds.spectral_similarity_threshold}, "
+                f"waveform_correlation>="
+                f"{result.thresholds.waveform_correlation_threshold}, "
+                f"rms_db_diff<={result.thresholds.rms_db_diff_threshold}, "
+                f"duration_diff<={result.thresholds.duration_diff_threshold}s\n"
+                f"  Compared GT files and links:\n{gt_remote_info}"
+            )
+
+        logger.info(
+            "[Consistency] %s: PASSED audio GT check "
+            "(spectral_similarity=%.4f, waveform_correlation=%.4f, "
+            "rms_db_diff=%.4f, duration_diff=%.4fs)",
+            case.id,
+            result.spectral_similarity,
+            result.waveform_correlation,
+            result.rms_db_diff,
+            result.duration_diff,
         )
 
     def _extract_action_array(
@@ -865,16 +1058,22 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                 logger.warning(
                     f"{case.id}: expected 3 frames, got {len(frames)}, skipping frame save"
                 )
-                return
+            else:
+                # Save frames (reuse naming from _consistency_gt_filenames)
+                filenames = _consistency_gt_filenames(case.id, num_gpus, is_video=True)
+                from PIL import Image
 
-            # Save frames (reuse naming from _consistency_gt_filenames)
-            filenames = _consistency_gt_filenames(case.id, num_gpus, is_video=True)
-            from PIL import Image
+                for frame, fn in zip(frames, filenames):
+                    frame_path = out_dir / fn
+                    Image.fromarray(frame).save(frame_path)
+                    logger.info(f"Saved GT frame: {frame_path}")
 
-            for frame, fn in zip(frames, filenames):
-                frame_path = out_dir / fn
-                Image.fromarray(frame).save(frame_path)
-                logger.info(f"Saved GT frame: {frame_path}")
+            if case.sampling_params.expect_audio_output:
+                audio_path = out_dir / f"{case.id}_{num_gpus}gpu_audio.wav"
+                audio_path.write_bytes(
+                    encode_audio_gt_wav(extract_audio_pcm_from_video_bytes(content))
+                )
+                logger.info("Saved GT audio: %s", audio_path)
         else:
             # Save image
             from sglang.multimodal_gen.test.test_utils import detect_image_format
@@ -1372,15 +1571,13 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                 failures.append((name, str(exc)))
 
         if is_realtime_case:
+            chunk_stats = pop_realtime_perf_stats(case.id)
             run_case_check(
                 "performance",
-                lambda: validate_realtime_perf_stats(
-                    case.id,
-                    pop_realtime_perf_stats(case.id),
-                    case.sampling_params.realtime_perf_thresholds,
-                    ignore_initial_chunks=(
-                        case.sampling_params.realtime_perf_ignore_initial_chunks
-                    ),
+                lambda: self._validate_realtime_performance(
+                    diffusion_server,
+                    case,
+                    chunk_stats,
                 ),
             )
         else:
