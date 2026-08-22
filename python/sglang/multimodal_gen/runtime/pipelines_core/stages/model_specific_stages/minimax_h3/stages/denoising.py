@@ -691,6 +691,14 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                         self._profile_denoising_step,
                         batch=batch,
                     ),
+                    adaln_prepare_profiler=partial(
+                        self._profile_adaln_prepare,
+                        batch=batch,
+                    ),
+                    on_adaln_access=partial(
+                        self._record_adaln_access,
+                        batch=batch,
+                    ),
                 )
         finally:
             self._finish_active_component_use()
@@ -718,6 +726,48 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             ),
         ):
             yield
+
+    @contextmanager
+    def _profile_adaln_prepare(self, *, batch: Req):
+        with (
+            maybe_nvtx_range(
+                "MiniMaxH3AdalnPrepare",
+                self.current_use_nvtx,
+            ),
+            StageProfiler(
+                "MiniMaxH3AdalnPrepare",
+                logger=logger,
+                metrics=batch.metrics,
+                perf_dump_path_provided=batch.perf_dump_path is not None,
+            ),
+        ):
+            yield
+
+    @staticmethod
+    def _record_adaln_access(access, *, batch: Req) -> None:
+        if batch.metrics is None:
+            return
+        prefix = "minimax_h3_adaln"
+        batch.metrics.record_custom_metric(f"{prefix}.tier", access.tier)
+        batch.metrics.record_custom_metric(f"{prefix}.h2d_bytes", access.h2d_bytes)
+        batch.metrics.record_custom_metric(f"{prefix}.d2h_bytes", access.d2h_bytes)
+        batch.metrics.record_custom_metric(
+            f"{prefix}.h2d_transfers", access.h2d_transfers
+        )
+        batch.metrics.record_custom_metric(
+            f"{prefix}.d2h_transfers", access.d2h_transfers
+        )
+        for name in (
+            "gpu_hits",
+            "host_hits",
+            "host_misses",
+            "admissions",
+            "evictions",
+            "rebuilds",
+        ):
+            batch.metrics.record_custom_metric(
+                f"{prefix}.{name}", getattr(access, name)
+            )
 
     def _forward_dit(
         self,

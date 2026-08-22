@@ -52,6 +52,7 @@ class RequestMetrics:
         self.request_id = request_id
         self.stages: Dict[str, float] = {}
         self.steps: list[float] = []
+        self.custom_metrics: Dict[str, Any] = {}
         self.total_duration_ms: float = 0.0
         self.suppress_stage_breakdown: bool = False
         # memory tracking: {checkpoint_name: MemorySnapshot}
@@ -73,6 +74,11 @@ class RequestMetrics:
             return
         self.steps.append(duration_s * 1000)
 
+    def record_custom_metric(self, name: str, value: Any) -> None:
+        if self.suppress_stage_breakdown:
+            return
+        self.custom_metrics[name] = value
+
     def record_memory_snapshot(self, checkpoint_name: str, snapshot: MemorySnapshot):
         if self.suppress_stage_breakdown:
             return
@@ -84,6 +90,7 @@ class RequestMetrics:
             "request_id": self.request_id,
             "stages": self.stages,
             "steps": self.steps,
+            "custom_metrics": self.custom_metrics,
             "total_duration_ms": self.total_duration_ms,
             "memory_snapshots": {
                 name: snapshot.to_dict()
@@ -168,6 +175,7 @@ class RequestPerfRecord:
     stages: list[dict]
     steps: list[float]
     total_duration_ms: float
+    custom_metrics: dict[str, Any] = dataclasses.field(default_factory=dict)
     memory_snapshots: dict[str, dict] = dataclasses.field(default_factory=dict)
 
     def __init__(
@@ -178,6 +186,7 @@ class RequestPerfRecord:
         stages,
         steps,
         total_duration_ms,
+        custom_metrics=None,
         memory_snapshots=None,
         timestamp=None,
     ):
@@ -192,6 +201,7 @@ class RequestPerfRecord:
         self.stages = stages
         self.steps = steps
         self.total_duration_ms = total_duration_ms
+        self.custom_metrics = custom_metrics or {}
         self.memory_snapshots = memory_snapshots or {}
 
 
@@ -340,6 +350,7 @@ class PerformanceLogger:
             "total_duration_ms": metrics.total_duration_ms,
             "steps": formatted_steps,
             "denoise_steps_ms": denoise_steps_ms,
+            "custom_metrics": metrics.custom_metrics,
             "memory_checkpoints": memory_checkpoints,
             "meta": meta or {},
         }
@@ -381,6 +392,7 @@ class PerformanceLogger:
             stages=formatted_stages,
             steps=metrics.steps,
             total_duration_ms=metrics.total_duration_ms,
+            custom_metrics=metrics.custom_metrics,
             memory_snapshots=memory_checkpoints,
         )
 

@@ -310,9 +310,13 @@ class ServerArgs(DisaggServerArgsMixin):
     minimax_h3_adaln_cache_path: str | None = None
     # Rebuild AdaLN outputs per request from the checkpoint, no sidecar needed.
     minimax_h3_adaln_online: bool = False
+    # Maximum number of distinct timestep plans in one request-local GPU workspace.
+    minimax_h3_adaln_max_plans: int = 64
     # Widest timestep plan the rebuild slab is sized for; see
     # MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
     minimax_h3_adaln_plan_width: int = 4
+    # Byte budget in GiB for complete schedules cached in pinned host memory.
+    minimax_h3_adaln_host_cache_gb: float = 0.0
     # Per-component transformer weight overrides (key = model_index.json component name).
     # Pipelines use this when a checkpoint ships separate quantized weights for
     # secondary DiT components; the generic loader consumes it without model-specific
@@ -553,6 +557,7 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.served_model_name is None:
             self.served_model_name = self.model_id or self.model_path
         self._adjust_quant_config()
+        self._adjust_minimax_h3_adaln_graph_compatibility()
         self._adjust_breakable_cuda_graph_support()
         self._adjust_warmup()
         self._adjust_network_ports()
@@ -568,6 +573,7 @@ class ServerArgs(DisaggServerArgsMixin):
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
         self._validate_scheduler_rpc_timeout()
+        self._validate_minimax_h3_adaln_cache()
         self._validate_pipeline()
         self._validate_offload()
         self._validate_direct_gpu_weight_loading()
@@ -579,6 +585,19 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_batching()
         self._validate_breakable_cuda_graph()
         self.pipeline_config.validate_server_args(self)
+
+    def _validate_minimax_h3_adaln_cache(self) -> None:
+        if self.minimax_h3_adaln_max_plans <= 0:
+            raise ValueError("minimax_h3_adaln_max_plans must be positive")
+        if self.minimax_h3_adaln_plan_width <= 0:
+            raise ValueError("minimax_h3_adaln_plan_width must be positive")
+        if (
+            not math.isfinite(self.minimax_h3_adaln_host_cache_gb)
+            or self.minimax_h3_adaln_host_cache_gb < 0
+        ):
+            raise ValueError(
+                "minimax_h3_adaln_host_cache_gb must be finite and non-negative"
+            )
 
     def _validate_scheduler_rpc_timeout(self) -> None:
         timeout = self.scheduler_rpc_timeout
@@ -653,6 +672,29 @@ class ServerArgs(DisaggServerArgsMixin):
             "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image are "
             "currently supported.",
             pipeline_config_name,
+        )
+        self.enable_breakable_cuda_graph = False
+
+    def _adjust_minimax_h3_adaln_graph_compatibility(self) -> None:
+        """Disable BCG for the online AdaLN path until capture is supported.
+
+        MiniMax-H3 currently invalidates CUDA capture when its online AdaLN
+        path participates in the first forward. Allowing both flags would
+        defer a deterministic incompatibility to warmup/replay. Sidecar and
+        resident AdaLN paths remain unchanged.
+        """
+        if not self.enable_breakable_cuda_graph or not self.minimax_h3_adaln_online:
+            return
+        if (
+            type(getattr(self, "pipeline_config", None)).__name__
+            != "MiniMaxH3PipelineConfig"
+        ):
+            return
+        logger.warning(
+            "[Diffusion BCG] disabled for MiniMax-H3 online AdaLN: "
+            "the online path is not capture-safe yet; serving "
+            "continues eagerly. Use a sidecar or resident AdaLN path to "
+            "enable BCG."
         )
         self.enable_breakable_cuda_graph = False
 
@@ -1752,10 +1794,21 @@ class ServerArgs(DisaggServerArgsMixin):
             action=StoreBoolean,
             default=ServerArgs.minimax_h3_adaln_online,
             help=(
-                "Rebuild MiniMax H3 AdaLN outputs from the checkpoint per "
-                "request instead of keeping the 24.2 GiB of adaln_proj weights "
+                "Build MiniMax H3 AdaLN outputs from the checkpoint on demand "
+                "instead of keeping the 24.2 GiB of adaln_proj weights "
                 "resident. Works with any step count or schedule and needs no "
-                "prebuilt artifact. Requires unquantized weights."
+                "prebuilt artifact. Requires unquantized weights. Breakable "
+                "CUDA graph is disabled until this path is capture-safe."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-adaln-max-plans",
+            type=int,
+            default=ServerArgs.minimax_h3_adaln_max_plans,
+            help=(
+                "Maximum number of distinct timestep plans in the request-local "
+                "MiniMax H3 AdaLN GPU workspace. An N-step schedule normally "
+                "needs at most N plans. Lowering this value reduces GPU memory."
             ),
         )
         parser.add_argument(
@@ -1767,6 +1820,16 @@ class ServerArgs(DisaggServerArgsMixin):
                 "for. The default 4 covers every task; a deployment serving "
                 "only t2va (2) or fl2va (3) can shrink the slab proportionally. "
                 "A request exceeding it is rejected rather than truncated."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-adaln-host-cache-gb",
+            type=float,
+            default=ServerArgs.minimax_h3_adaln_host_cache_gb,
+            help=(
+                "Pinned host-memory budget in GiB for complete MiniMax H3 AdaLN "
+                "schedules. Zero disables the host LRU. A host hit copies only "
+                "the requested schedule to GPU and avoids checkpoint rebuild."
             ),
         )
         parser.add_argument(

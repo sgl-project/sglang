@@ -371,6 +371,8 @@ def minimax_h3_denoise_loop(
     audio_cond_noise_aug_for_inference: float = MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
     on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
+    adaln_prepare_profiler: Callable[[], AbstractContextManager] | None = None,
+    on_adaln_access: Callable[[Any], None] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).
 
@@ -452,7 +454,15 @@ def minimax_h3_denoise_loop(
     # Every step's timesteps are settled by now. Rebuilding AdaLN reads all
     # 24.2 GiB of adaln_proj whatever is missing, so fill the whole request in
     # one pass here instead of topping up step by step inside the loop.
-    model.prepare_adaln_plans([entry[0] for entry in timestep_plan])
+    adaln_prepare_cm = (
+        adaln_prepare_profiler()
+        if adaln_prepare_profiler is not None
+        else nullcontext()
+    )
+    with adaln_prepare_cm:
+        adaln_access = model.prepare_adaln_plans([entry[0] for entry in timestep_plan])
+    if adaln_access is not None and on_adaln_access is not None:
+        on_adaln_access(adaln_access)
 
     # match the scheduler's device-fp32 math once, then reuse one denoised
     # scratch per modality instead of allocating intermediates every step
