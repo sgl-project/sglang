@@ -133,6 +133,31 @@ if TYPE_CHECKING:
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
+def _full_batch_indexer_cache_inputs(
+    source_block_tables: torch.Tensor,
+    target_block_tables: torch.Tensor,
+    seqlens: torch.Tensor,
+    *,
+    batch_size: int,
+    next_n: int,
+) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """De-expand EAGLE metadata without partitioning Indexer computation."""
+    if (
+        batch_size <= 0
+        or next_n <= 0
+        or source_block_tables.dim() != 2
+        or target_block_tables.shape != source_block_tables.shape
+        or source_block_tables.shape[0] != batch_size * next_n
+        or seqlens.numel() != batch_size * next_n
+    ):
+        return None
+    return (
+        source_block_tables[::next_n],
+        target_block_tables[::next_n],
+        seqlens.view(batch_size, next_n)[:, -1],
+    )
+
+
 if _is_cuda:
     from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_first_quant
     from sglang.kernels.ops.quantization.dsv32 import (
@@ -179,6 +204,36 @@ def _broadcast_indexer_topk_from_rank0(
     else:
         _broadcast_indexer_topk_from_rank0_impl(topk_indices)
     return topk_indices
+
+
+def _prepare_paged_index_page_table(pool, page_table: torch.Tensor) -> torch.Tensor:
+    prepare = getattr(pool, "prepare_paged_index_page_table", None)
+    return prepare(page_table) if prepare is not None else page_table
+
+
+def _get_index_cache_write_targets(
+    pool, layer_id: int
+) -> tuple[tuple[torch.Tensor, int, int], ...]:
+    get_targets = getattr(pool, "get_index_k_write_targets", None)
+    if get_targets is not None:
+        return get_targets(layer_id)
+    return (
+        (
+            pool.get_index_k_with_scale_buffer(layer_id=layer_id),
+            0,
+            1,
+        ),
+    )
+
+
+def _synchronize_shared_cache_writes(pool) -> None:
+    from sglang.srt.layers.attention.dsa.shared_cache_access import (
+        get_dsa_shared_cache_access,
+    )
+
+    shared_access = get_dsa_shared_cache_access(pool)
+    if shared_access is not None and shared_access.uses_shared_indexer:
+        shared_access.publish_writes()
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
@@ -603,17 +658,22 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and out_cache_loc is not None
             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
         ):
-            fused_k_indexer_norm_rope_store(
-                key_raw,
-                pool.get_index_k_with_scale_buffer(layer_id=layer_id),
-                out_cache_loc,
-                self.k_norm.weight,
-                self.k_norm.bias,
-                self.k_norm.variance_epsilon,
-                self._indexer_cos_sin_cache,
-                positions,
-                page_size,
-            )
+            for buffer, owner_rank, owner_size in _get_index_cache_write_targets(
+                pool, layer_id
+            ):
+                fused_k_indexer_norm_rope_store(
+                    key_raw,
+                    buffer,
+                    out_cache_loc,
+                    self.k_norm.weight,
+                    self.k_norm.bias,
+                    self.k_norm.variance_epsilon,
+                    self._indexer_cos_sin_cache,
+                    positions,
+                    page_size,
+                    owner_rank=owner_rank,
+                    owner_size=owner_size,
+                )
             return
 
         # Fallback: separate K kernel + store kernel.
@@ -728,6 +788,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
     @staticmethod
     def _get_index_k_read_buffer(pool, layer_id: int) -> torch.Tensor:
+        if hasattr(pool, "get_paged_index_k_with_scale_buffer"):
+            return pool.get_paged_index_k_with_scale_buffer(layer_id)
         # Read path: prefer the owner-broadcast scratch buffer under DSA cache
         # layer split; fall back to the owned buffer for plain pools. Stores go
         # through get_index_k_with_scale_buffer() (owned buffer) instead.
@@ -809,10 +871,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if _is_hip and not _use_aiter_preshuffle:
             block_tables = metadata.get_page_table_1()
         else:
-            block_tables = metadata.get_page_table_64()
-
-        max_seq_len = block_tables.shape[1] * page_size
-        kv_cache_fp8 = self._get_index_k_read_buffer(get_token_to_kv_pool(), layer_id)
+            block_tables = metadata.get_prepared_paged_index_page_table()
+            if block_tables is None:
+                block_tables = _prepare_paged_index_page_table(
+                    get_token_to_kv_pool(), metadata.get_page_table_64()
+                )
 
         blocksize = page_size
         if (
@@ -832,6 +895,39 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         B = metadata.get_seqlens_int32().shape[0]
         next_n = q_offset // B if B > 0 else 0
+        pool = get_token_to_kv_pool()
+        from sglang.srt.layers.attention.dsa.shared_cache_access import (
+            get_dsa_shared_cache_access,
+        )
+
+        shared_access = get_dsa_shared_cache_access(pool)
+        cache_inputs = None
+        if (
+            shared_access is not None
+            and shared_access.uses_shared_indexer
+            and self.paged_mqa_logits_backend.is_deepgemm()
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+        ):
+            cache_inputs = _full_batch_indexer_cache_inputs(
+                block_tables,
+                metadata.get_page_table_64(),
+                seqlens_32,
+                batch_size=B,
+                next_n=next_n,
+            )
+        if cache_inputs is None:
+            kv_cache_fp8 = self._get_index_k_read_buffer(pool, layer_id)
+        else:
+            source_pages, target_pages, cache_lengths = cache_inputs
+            kv_cache_fp8, dense_pages = shared_access.materialize_indexer_pages(
+                layer_id, source_pages, target_pages, cache_lengths
+            )
+            block_tables = dense_pages.repeat_interleave(next_n, dim=0)
+
+        max_seq_len = block_tables.shape[1] * page_size
         use_cute_dsl = (
             self.paged_mqa_logits_backend.is_cutedsl()
             and not forward_batch.forward_mode.is_draft_extend_v2()
@@ -1490,13 +1586,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
-            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
-            fused_store_index_k_cache(
-                key,
-                buf,
-                out_cache_loc,
-                pool.page_size,
-            )
+            for buffer, owner_rank, owner_size in _get_index_cache_write_targets(
+                pool, layer_id
+            ):
+                fused_store_index_k_cache(
+                    key,
+                    buffer,
+                    out_cache_loc,
+                    pool.page_size,
+                    owner_rank=owner_rank,
+                    owner_size=owner_size,
+                )
             return
 
         # Fast path: AITER fused quant + cache store
@@ -1615,6 +1715,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 metadata,
                 return_indices,
             )
+            _synchronize_shared_cache_writes(get_token_to_kv_pool())
             topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
             return maybe_capture_indexer_topk(layer_id, topk_result)
 
@@ -1799,6 +1900,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
             else:
                 weights = self._get_logits_head_gate(x_for_gate, q_scale)
+
+        _synchronize_shared_cache_writes(get_token_to_kv_pool())
 
         if _is_cuda or _is_hip:
             # In piecewise/breakable CUDA graph, any access to seq_lens_cpu

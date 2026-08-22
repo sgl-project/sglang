@@ -1,0 +1,645 @@
+diff -ruN -U0 a/csrc/api/sparse_decode.h b/csrc/api/sparse_decode.h
+--- a/csrc/api/sparse_decode.h	2026-06-24 14:52:45
++++ b/csrc/api/sparse_decode.h	2026-08-13 19:50:27
+@@ -2,0 +3,2 @@
++#include <bit>
++
+@@ -72 +74,13 @@
+-                sm90::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, NUM_HEADS>(params);
++                if constexpr (MODEL_TYPE == ModelType::V32) {
++                    if (params.shared_kv_row_cache != nullptr) {
++                        if (params.shared_kv_current_rows != nullptr) {
++                            sm90::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, NUM_HEADS, true, true>(params);
++                        } else {
++                            sm90::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, NUM_HEADS, true, false>(params);
++                        }
++                    } else {
++                        sm90::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, NUM_HEADS, false, false>(params);
++                    }
++                } else {
++                    sm90::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel<MODEL_TYPE, NUM_HEADS, false, false>(params);
++                }
+@@ -196 +210,13 @@
+-    float sm_scale
++    float sm_scale,
++    const std::optional<at::Tensor> &shared_kv_row_cache = std::nullopt,
++    const std::optional<at::Tensor> &shared_kv_cache_tags = std::nullopt,
++    const std::optional<at::Tensor> &shared_kv_request_slots = std::nullopt,
++    int64_t shared_kv_cache_rows_per_request = 0,
++    int64_t shared_kv_num_request_slots = 0,
++    int64_t shared_kv_cache_epoch = 0,
++    const std::optional<at::Tensor> &shared_kv_cache_generation_tensor = std::nullopt,
++    int64_t shared_kv_local_row_begin = 0,
++    int64_t shared_kv_local_row_end = 0,
++    const std::optional<at::Tensor> &shared_kv_current_rows = std::nullopt,
++    const std::optional<at::Tensor> &shared_kv_current_row_ids = std::nullopt,
++    const std::optional<at::Tensor> &shared_kv_current_row_counts = std::nullopt
+@@ -219,0 +246,12 @@
++    bool have_shared_kv_cache = shared_kv_row_cache.has_value();
++    TORCH_CHECK(
++        have_shared_kv_cache == shared_kv_cache_tags.has_value(),
++        "shared_kv_row_cache and shared_kv_cache_tags must be provided together");
++    bool have_shared_kv_current_rows = shared_kv_current_rows.has_value();
++    TORCH_CHECK(
++        have_shared_kv_current_rows == shared_kv_current_row_ids.has_value() &&
++            have_shared_kv_current_rows == shared_kv_current_row_counts.has_value(),
++        "Shared-KV current rows, row IDs, and row counts must be provided together");
++    TORCH_CHECK(
++        !have_shared_kv_current_rows || have_shared_kv_cache,
++        "Shared-KV current rows require the Shared FlashMLA path");
+@@ -256,0 +295,7 @@
++    KU_CHECK_DEVICE(shared_kv_row_cache);
++    KU_CHECK_DEVICE(shared_kv_cache_tags);
++    KU_CHECK_DEVICE(shared_kv_request_slots);
++    KU_CHECK_DEVICE(shared_kv_cache_generation_tensor);
++    KU_CHECK_DEVICE(shared_kv_current_rows);
++    KU_CHECK_DEVICE(shared_kv_current_row_ids);
++    KU_CHECK_DEVICE(shared_kv_current_row_counts);
+@@ -270,0 +316,7 @@
++    KU_CHECK_DTYPE(shared_kv_row_cache, torch::kUInt8);
++    KU_CHECK_DTYPE(shared_kv_cache_tags, torch::kInt64);
++    KU_CHECK_DTYPE(shared_kv_request_slots, torch::kInt64);
++    KU_CHECK_DTYPE(shared_kv_cache_generation_tensor, torch::kInt32);
++    KU_CHECK_DTYPE(shared_kv_current_rows, torch::kUInt8);
++    KU_CHECK_DTYPE(shared_kv_current_row_ids, torch::kInt32);
++    KU_CHECK_DTYPE(shared_kv_current_row_counts, torch::kInt32);
+@@ -284,0 +337,7 @@
++    KU_CHECK_CONTIGUOUS(shared_kv_row_cache);
++    KU_CHECK_CONTIGUOUS(shared_kv_cache_tags);
++    KU_CHECK_CONTIGUOUS(shared_kv_request_slots);
++    KU_CHECK_CONTIGUOUS(shared_kv_cache_generation_tensor);
++    KU_CHECK_CONTIGUOUS(shared_kv_current_rows);
++    KU_CHECK_CONTIGUOUS(shared_kv_current_row_ids);
++    KU_CHECK_CONTIGUOUS(shared_kv_current_row_counts);
+@@ -311,0 +371,53 @@
++    if (have_shared_kv_cache) {
++        TORCH_CHECK(arch.is_sm90a(), "Shared-KV demand cache is SM90-only");
++        TORCH_CHECK(d_qk == 576, "Shared-KV demand cache only supports V3.2 KV rows");
++        TORCH_CHECK(!have_extra_kcache, "Shared-KV demand cache does not support extra KV");
++        TORCH_CHECK(shared_kv_row_cache->dim() == 2);
++        TORCH_CHECK(shared_kv_row_cache->size(1) == 656);
++        TORCH_CHECK(shared_kv_cache_tags->dim() == 2);
++        TORCH_CHECK(shared_kv_cache_rows_per_request > 0);
++        TORCH_CHECK(std::has_single_bit(static_cast<uint64_t>(shared_kv_cache_rows_per_request)));
++        TORCH_CHECK(shared_kv_num_request_slots > 0);
++        TORCH_CHECK(shared_kv_cache_tags->size(0) == shared_kv_num_request_slots);
++        TORCH_CHECK(shared_kv_cache_tags->size(1) == shared_kv_cache_rows_per_request);
++        TORCH_CHECK(
++            shared_kv_row_cache->size(0) ==
++            shared_kv_num_request_slots * shared_kv_cache_rows_per_request);
++        if (shared_kv_num_request_slots > 1) {
++            TORCH_CHECK(
++                shared_kv_request_slots.has_value(),
++                "request slots are required for a multislice Shared-KV cache");
++        }
++        if (shared_kv_request_slots.has_value()) {
++            TORCH_CHECK(shared_kv_request_slots->dim() == 1);
++            TORCH_CHECK(shared_kv_request_slots->size(0) == b);
++        }
++        if (shared_kv_cache_generation_tensor.has_value()) {
++            TORCH_CHECK(shared_kv_cache_generation_tensor->numel() == 1);
++        }
++        if (have_shared_kv_current_rows) {
++            TORCH_CHECK(
++                shared_kv_current_rows->dim() == 3 &&
++                    shared_kv_current_rows->size(0) == b * s_q &&
++                    shared_kv_current_rows->size(1) >= 1 &&
++                    shared_kv_current_rows->size(1) <= 4 &&
++                    shared_kv_current_rows->size(2) == 656,
++                "Shared-KV current rows must have shape [b * s_q, width, 656] with 1 <= width <= 4");
++            TORCH_CHECK(
++                shared_kv_current_row_ids->dim() == 2 &&
++                    shared_kv_current_row_ids->size(0) == b * s_q &&
++                    shared_kv_current_row_ids->size(1) == shared_kv_current_rows->size(1),
++                "Shared-KV current row IDs must match the current-row width");
++            TORCH_CHECK(
++                shared_kv_current_row_counts->dim() == 1 &&
++                    shared_kv_current_row_counts->size(0) == b * s_q,
++                "Shared-KV current row counts must have shape [b * s_q]");
++        }
++        TORCH_CHECK(shared_kv_cache_epoch > 0 && shared_kv_cache_epoch < (1ll << 31));
++        const int64_t total_rows = static_cast<int64_t>(num_blocks) * page_block_size;
++        TORCH_CHECK(
++            shared_kv_local_row_begin >= 0 &&
++            shared_kv_local_row_begin < shared_kv_local_row_end &&
++            shared_kv_local_row_end <= total_rows);
++    }
++
+@@ -413,0 +526,15 @@
++
++        have_shared_kv_cache ? shared_kv_row_cache->data_ptr<uint8_t>() : nullptr,
++        have_shared_kv_cache ? reinterpret_cast<uint64_t*>(shared_kv_cache_tags->data_ptr<int64_t>()) : nullptr,
++        shared_kv_request_slots.has_value() ? shared_kv_request_slots->data_ptr<int64_t>() : nullptr,
++        static_cast<uint32_t>(shared_kv_cache_epoch),
++        shared_kv_cache_generation_tensor.has_value()
++            ? shared_kv_cache_generation_tensor->data_ptr<int32_t>()
++            : nullptr,
++        static_cast<int>(shared_kv_cache_rows_per_request),
++        static_cast<int>(shared_kv_num_request_slots),
++        static_cast<int>(shared_kv_local_row_begin),
++        static_cast<int>(shared_kv_local_row_end),
++        have_shared_kv_current_rows ? shared_kv_current_rows->data_ptr<uint8_t>() : nullptr,
++        have_shared_kv_current_rows ? int64_stride_to_int(shared_kv_current_rows->stride(0)) : 0,
++        have_shared_kv_current_rows ? int64_stride_to_int(shared_kv_current_rows->stride(1)) : 0,
+diff -ruN -U0 a/csrc/params.h b/csrc/params.h
+--- a/csrc/params.h	2026-06-24 14:52:45
++++ b/csrc/params.h	2026-08-13 19:50:27
+@@ -2,0 +3,2 @@
++#include <cstdint>
++
+@@ -91,0 +94,12 @@
++
++    // SM90 Shared-KV demand-row cache. Null disables the path.
++    uint8_t* __restrict__ shared_kv_row_cache;  // [request_slots * rows_per_request, 656]
++    uint64_t* __restrict__ shared_kv_cache_tags;  // [request_slots, rows_per_request]
++    const int64_t* __restrict__ shared_kv_request_slots;  // Optional [b]
++    uint32_t shared_kv_cache_epoch;
++    const int32_t* __restrict__ shared_kv_cache_generation;  // Optional scalar
++    int shared_kv_cache_rows_per_request;
++    int shared_kv_num_request_slots;
++    int shared_kv_local_row_begin, shared_kv_local_row_end;
++    uint8_t* __restrict__ shared_kv_current_rows;  // [b * s_q, width <= 4, 656]
++    int shared_kv_current_rows_stride_q, shared_kv_current_rows_stride_slot;
+diff -ruN -U0 a/csrc/sm90/decode/sparse_fp8/components/shared_demand_cache.h b/csrc/sm90/decode/sparse_fp8/components/shared_demand_cache.h
+--- a/csrc/sm90/decode/sparse_fp8/components/shared_demand_cache.h	1970-01-01 08:00:00
++++ b/csrc/sm90/decode/sparse_fp8/components/shared_demand_cache.h	2026-08-13 19:49:46
+@@ -0,0 +1,139 @@
++#pragma once
++
++#include <cstdint>
++
++namespace sm90::decode::sparse_fp8::shared_demand_cache {
++
++static constexpr int ROW_BYTES = 656;
++static constexpr uint64_t READY_BIT = 1ull << 63;
++
++enum class Access : int {
++    DIRECT = 0,
++    HIT = 1,
++    FILL = 2,
++    FILLING_FALLBACK = 3,
++    COLLISION_FALLBACK = 4,
++};
++
++struct ProbeResult {
++    int slot;
++    Access access;
++};
++
++static __forceinline__ __device__ uint64_t load_acquire(
++    const uint64_t* ptr
++) {
++    uint64_t value;
++    asm volatile(
++        "ld.global.acquire.gpu.u64 %0, [%1];"
++        : "=l"(value)
++        : "l"(ptr)
++        : "memory"
++    );
++    return value;
++}
++
++static __forceinline__ __device__ uint64_t compare_exchange_acq_rel(
++    uint64_t* ptr,
++    uint64_t expected,
++    uint64_t desired
++) {
++    uint64_t old;
++    asm volatile(
++        "atom.global.acq_rel.gpu.cas.b64 %0, [%1], %2, %3;"
++        : "=l"(old)
++        : "l"(ptr), "l"(expected), "l"(desired)
++        : "memory"
++    );
++    return old;
++}
++
++static __forceinline__ __device__ void store_release(
++    uint64_t* ptr,
++    uint64_t value
++) {
++    asm volatile(
++        "st.global.release.gpu.u64 [%0], %1;"
++        :
++        : "l"(ptr), "l"(value)
++        : "memory"
++    );
++}
++
++static __forceinline__ __device__ uint64_t filling_tag(
++    uint32_t epoch,
++    uint32_t physical_row
++) {
++    return (static_cast<uint64_t>(epoch) << 32) |
++           (static_cast<uint64_t>(physical_row) + 1);
++}
++
++static __forceinline__ __device__ uint32_t slot_for_row(
++    uint32_t physical_row,
++    int cache_rows
++) {
++    return ((physical_row ^ (physical_row >> 13)) * 2654435761u) &
++           static_cast<uint32_t>(cache_rows - 1);
++}
++
++static __forceinline__ __device__ ProbeResult probe(
++    uint64_t* tags,
++    int rows_per_request,
++    uint32_t epoch,
++    uint32_t physical_row,
++    bool allow_stale_ready_hit
++) {
++    const uint64_t filling = filling_tag(epoch, physical_row);
++    const uint64_t ready = filling | READY_BIT;
++    const uint32_t slot = slot_for_row(physical_row, rows_per_request);
++    uint64_t* tag_ptr = tags + slot;
++    for (int attempt = 0; attempt < 3; ++attempt) {
++        const uint64_t observed = load_acquire(tag_ptr);
++        if (observed == ready) {
++            return {static_cast<int>(slot), Access::HIT};
++        }
++        const uint32_t observed_epoch = static_cast<uint32_t>(
++            (observed & ~READY_BIT) >> 32
++        );
++        const bool same_row =
++            static_cast<uint32_t>(observed) == physical_row + 1;
++        if (observed_epoch == epoch) {
++            return {
++                -1,
++                same_row
++                    ? Access::FILLING_FALLBACK
++                    : Access::COLLISION_FALLBACK
++            };
++        }
++        if (
++            allow_stale_ready_hit && same_row &&
++            (observed & READY_BIT) != 0
++        ) {
++            const uint64_t old = compare_exchange_acq_rel(
++                tag_ptr, observed, ready
++            );
++            if (old == observed) {
++                return {static_cast<int>(slot), Access::HIT};
++            }
++            continue;
++        }
++        const uint64_t old = compare_exchange_acq_rel(
++            tag_ptr, observed, filling
++        );
++        if (old == observed) {
++            return {static_cast<int>(slot), Access::FILL};
++        }
++    }
++    return {-1, Access::COLLISION_FALLBACK};
++}
++
++static __forceinline__ __device__ void publish_ready(
++    uint64_t* tags,
++    int slot,
++    uint32_t epoch,
++    uint32_t physical_row
++) {
++    store_release(tags + slot, filling_tag(epoch, physical_row) | READY_BIT);
++}
++
++}  // namespace sm90::decode::sparse_fp8::shared_demand_cache
+diff -ruN -U0 a/csrc/sm90/decode/sparse_fp8/components/shared_kv_adapter.h b/csrc/sm90/decode/sparse_fp8/components/shared_kv_adapter.h
+--- a/csrc/sm90/decode/sparse_fp8/components/shared_kv_adapter.h	1970-01-01 08:00:00
++++ b/csrc/sm90/decode/sparse_fp8/components/shared_kv_adapter.h	2026-08-13 19:50:27
+@@ -0,0 +1,173 @@
++#pragma once
++
++#include <cstdint>
++
++#include "shared_demand_cache.h"
++
++namespace sm90::decode::sparse_fp8::shared_kv_adapter {
++
++using Access = shared_demand_cache::Access;
++
++struct ResolvedRow {
++    fp8* source;
++    uint8_t* cache_row;
++    uint64_t* cache_tags;
++    int cache_slot;
++    Access access;
++    uint32_t epoch;
++    uint32_t physical_row;
++    unsigned row_group_mask;
++    bool publisher;
++
++    template <bool ENABLED, typename Fragment>
++    __forceinline__ __device__ void store_fragment(
++        int byte_offset,
++        const Fragment& fragment
++    ) const {
++        if constexpr (ENABLED) {
++            if (access == Access::FILL) {
++                *reinterpret_cast<Fragment*>(cache_row + byte_offset) = fragment;
++            }
++        }
++    }
++
++    template <bool ENABLED>
++    __forceinline__ __device__ void publish() const {
++        if constexpr (ENABLED) {
++            if (access == Access::FILL) {
++                __syncwarp(row_group_mask);
++                if (publisher) {
++                    shared_demand_cache::publish_ready(
++                        cache_tags,
++                        cache_slot,
++                        epoch,
++                        physical_row
++                    );
++                }
++            }
++        }
++    }
++};
++
++static __forceinline__ __device__ ResolvedRow direct(fp8* authoritative) {
++    return {
++        authoritative,
++        nullptr,
++        nullptr,
++        -1,
++        Access::DIRECT,
++        0,
++        0,
++        0,
++        false,
++    };
++}
++
++template <bool ENABLED>
++static __forceinline__ __device__ uint32_t epoch(
++    const SparseAttnDecodeParams& params
++) {
++    if constexpr (!ENABLED) {
++        return 0;
++    }
++    return params.shared_kv_cache_generation != nullptr
++        ? static_cast<uint32_t>(*params.shared_kv_cache_generation)
++        : params.shared_kv_cache_epoch;
++}
++
++template <bool USE_CURRENT_ROWS>
++static __forceinline__ __device__ int current_row_match(int token_index) {
++    if constexpr (USE_CURRENT_ROWS) {
++        if (token_index <= -2 && token_index >= -5) {
++            return -token_index - 2;
++        }
++    }
++    return -1;
++}
++
++template <bool ENABLED, bool USE_CURRENT_ROWS>
++static __forceinline__ __device__ ResolvedRow resolve(
++    const SparseAttnDecodeParams& params,
++    fp8* authoritative,
++    int token_index,
++    int current_match,
++    int batch_idx,
++    int s_q_idx,
++    int lane_idx,
++    uint32_t cache_epoch
++) {
++    if constexpr (!ENABLED) {
++        return direct(authoritative);
++    }
++
++    if constexpr (USE_CURRENT_ROWS) {
++        if (current_match >= 0) {
++            const int query_row = batch_idx * params.s_q + s_q_idx;
++            return direct(reinterpret_cast<fp8*>(
++                params.shared_kv_current_rows +
++                query_row * params.shared_kv_current_rows_stride_q +
++                current_match * params.shared_kv_current_rows_stride_slot
++            ));
++        }
++    }
++
++    int64_t request_slot = 1;
++    if (params.shared_kv_request_slots != nullptr) {
++        request_slot = params.shared_kv_request_slots[batch_idx];
++    }
++    const bool valid_request_slot =
++        request_slot > 0 && request_slot <= params.shared_kv_num_request_slots;
++    const bool remote_row =
++        token_index >= 0 &&
++        (token_index < params.shared_kv_local_row_begin ||
++         token_index >= params.shared_kv_local_row_end);
++    if (!valid_request_slot || !remote_row) {
++        return direct(authoritative);
++    }
++
++    int64_t request_base =
++        (request_slot - 1) * params.shared_kv_cache_rows_per_request;
++    const int probe_rows = params.shared_kv_cache_rows_per_request;
++
++    const int source_lane = lane_idx % 8;
++    const unsigned row_group_mask = 0x01010101u << source_lane;
++    uint64_t* request_tags = params.shared_kv_cache_tags + request_base;
++    int probe_slot = -1;
++    int probe_access = static_cast<int>(Access::DIRECT);
++    if (lane_idx < 8) {
++        const auto result = shared_demand_cache::probe(
++            request_tags,
++            probe_rows,
++            cache_epoch,
++            static_cast<uint32_t>(token_index),
++            params.shared_kv_cache_generation != nullptr
++        );
++        probe_slot = result.slot;
++        probe_access = static_cast<int>(result.access);
++    }
++    probe_slot = __shfl_sync(row_group_mask, probe_slot, source_lane);
++    probe_access = __shfl_sync(row_group_mask, probe_access, source_lane);
++
++    const auto access = static_cast<Access>(probe_access);
++    uint8_t* cache_row = nullptr;
++    if (probe_slot >= 0) {
++        cache_row = params.shared_kv_row_cache +
++            (request_base + probe_slot) * shared_demand_cache::ROW_BYTES;
++    }
++    fp8* source = access == Access::HIT
++        ? reinterpret_cast<fp8*>(cache_row)
++        : authoritative;
++    return {
++        source,
++        cache_row,
++        request_tags,
++        probe_slot,
++        access,
++        cache_epoch,
++        static_cast<uint32_t>(token_index),
++        row_group_mask,
++        lane_idx < 8,
++    };
++}
++
++}  // namespace sm90::decode::sparse_fp8::shared_kv_adapter
+diff -ruN -U0 a/csrc/sm90/decode/sparse_fp8/config.h b/csrc/sm90/decode/sparse_fp8/config.h
+--- a/csrc/sm90/decode/sparse_fp8/config.h	2026-06-24 14:52:45
++++ b/csrc/sm90/decode/sparse_fp8/config.h	2026-08-13 19:49:46
+@@ -15 +15,6 @@
+-template<ModelType MODEL_TYPE, int NUM_HEADS>
++template<
++    ModelType MODEL_TYPE,
++    int NUM_HEADS,
++    bool USE_SHARED_CACHE,
++    bool USE_CURRENT_ROWS
++>
+diff -ruN -U0 a/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu b/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu
+--- a/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu	2026-06-24 14:52:45
++++ b/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu	2026-08-13 19:49:46
+@@ -5 +5 @@
+-template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::MODEL1, 128>(const SparseAttnDecodeParams &params);
++template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::MODEL1, 128, false, false>(const SparseAttnDecodeParams &params);
+diff -ruN -U0 a/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu b/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu
+--- a/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu	2026-06-24 14:52:45
++++ b/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu	2026-08-13 19:49:46
+@@ -5 +5 @@
+-template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::MODEL1, 64>(const SparseAttnDecodeParams &params);
++template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::MODEL1, 64, false, false>(const SparseAttnDecodeParams &params);
+@@ -8 +7,0 @@
+-
+diff -ruN -U0 a/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu b/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu
+--- a/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu	2026-06-24 14:52:45
++++ b/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu	2026-08-13 19:49:46
+@@ -5 +5,3 @@
+-template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32, 128>(const SparseAttnDecodeParams &params);
++template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32, 128, false, false>(const SparseAttnDecodeParams &params);
++template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32, 128, true, false>(const SparseAttnDecodeParams &params);
++template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32, 128, true, true>(const SparseAttnDecodeParams &params);
+diff -ruN -U0 a/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu b/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu
+--- a/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu	2026-06-24 14:52:45
++++ b/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu	2026-08-13 19:49:46
+@@ -5 +5,3 @@
+-template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32, 64>(const SparseAttnDecodeParams &params);
++template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32, 64, false, false>(const SparseAttnDecodeParams &params);
++template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32, 64, true, false>(const SparseAttnDecodeParams &params);
++template void run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::V32, 64, true, true>(const SparseAttnDecodeParams &params);
+diff -ruN -U0 a/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh b/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh
+--- a/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh	2026-06-24 14:52:45
++++ b/csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh	2026-08-13 19:49:46
+@@ -16,0 +17 @@
++#include "components/shared_kv_adapter.h"
+@@ -86 +87,6 @@
+-template<ModelType MODEL_TYPE, int NUM_HEADS>
++template<
++    ModelType MODEL_TYPE,
++    int NUM_HEADS,
++    bool USE_SHARED_CACHE,
++    bool USE_CURRENT_ROWS
++>
+@@ -88 +94 @@
+-__device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params) {
++__device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, USE_SHARED_CACHE, USE_CURRENT_ROWS>::devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params) {
+@@ -463,0 +470,2 @@
++        const uint32_t shared_cache_epoch =
++            shared_kv_adapter::epoch<USE_SHARED_CACHE>(params);
+@@ -470 +478 @@
+-
++
+@@ -538,2 +546,8 @@
+-                    int block_index = token_index == -1 ? 0 : (int)((uint32_t)token_index/(uint32_t)page_block_size);   // Use uint32_t division and mod to improve performance
+-                    int rel_idx_in_block = (uint32_t)token_index % (uint32_t)page_block_size;   // NOTE When token_index is -1 (UINT_MAX), UINT_MAX%page_block_size < page_block_size, so there will be no illegal-memory-access error
++                    const int current_row_match =
++                        shared_kv_adapter::current_row_match<USE_CURRENT_ROWS>(
++                            token_index
++                        );
++                    const int kv_token_index =
++                        current_row_match >= 0 ? 0 : token_index;
++                    int block_index = kv_token_index == -1 ? 0 : (int)((uint32_t)kv_token_index/(uint32_t)page_block_size);   // Use uint32_t division and mod to improve performance
++                    int rel_idx_in_block = (uint32_t)kv_token_index % (uint32_t)page_block_size;   // NOTE When token_index is -1 (UINT_MAX), UINT_MAX%page_block_size < page_block_size, so there will be no illegal-memory-access error
+@@ -542,0 +557 @@
++                    auto shared_row = shared_kv_adapter::direct(nullptr);
+@@ -545,0 +561,14 @@
++                        shared_row = shared_kv_adapter::resolve<
++                            USE_SHARED_CACHE,
++                            USE_CURRENT_ROWS
++                        >(
++                            params,
++                            gK_base,
++                            token_index,
++                            current_row_match,
++                            batch_idx,
++                            s_q_idx,
++                            lane_idx,
++                            shared_cache_epoch
++                        );
++                        gK_base = shared_row.source;
+@@ -547,0 +577,6 @@
++                        if (lane_idx < 8) {
++                            shared_row.store_fragment<USE_SHARED_CACHE>(
++                                HEAD_DIM_NOPE,
++                                *reinterpret_cast<float4*>(scales_float)
++                            );
++                        }
+@@ -584,3 +619 @@
+-                        fp8x16 cur_fp8x16 = load_128b_from_gmem<fp8x16, L1CacheHint::EVICT_LAST, L2PrefetchHint::B256>(gK_nope + dim_idx*64);   // We use EVICT_LAST here since gK_base may not be aligned to 32B (for V3.2) and the performance is the best among all cache hints (for MODEL1)
+-                        bf16 scale = scales[MODEL_TYPE == ModelType::V32 ? dim_idx/2 : dim_idx];
+-                        auto dequant_and_save_bf16x8 = [&](const fp8x8 &data, int offset) {
++                        auto save_bf16x8 = [&](const bf16x8 &data, int offset) {
+@@ -588,2 +621 @@
+-                            bf16x8 cur_bf16x8 = cvt_fp8x8_bf16x8(data, __bfloat162bfloat162(*(__nv_bfloat16*)(&scale)));
+-                            *(__int128_t*)(sK_nope_base + smem_offset) = *(__int128_t*)&cur_bf16x8;
++                            *(__int128_t*)(sK_nope_base + smem_offset) = *(__int128_t*)&data;
+@@ -591 +623 @@
+-                                st_async_128b(sK_nope_peer_base + smem_offset, cur_bf16x8, peer_bar_k_remote_ready);
++                                st_async_128b(sK_nope_peer_base + smem_offset, data, peer_bar_k_remote_ready);
+@@ -593,0 +626,5 @@
++                        fp8x16 cur_fp8x16 = load_128b_from_gmem<fp8x16, L1CacheHint::EVICT_LAST, L2PrefetchHint::B256>(gK_nope + dim_idx*64);   // We use EVICT_LAST here since gK_base may not be aligned to 32B (for V3.2) and the performance is the best among all cache hints (for MODEL1)
++                        shared_row.store_fragment<USE_SHARED_CACHE>(
++                            (lane_idx / 8) * 16 + dim_idx * 64,
++                            *reinterpret_cast<uint128_t*>(&cur_fp8x16)
++                        );
+@@ -596,2 +633,4 @@
+-                        dequant_and_save_bf16x8(cur_fp8x16.lo, 0);
+-                        dequant_and_save_bf16x8(cur_fp8x16.hi, 8);
++                        bf16 scale = scales[MODEL_TYPE == ModelType::V32 ? dim_idx/2 : dim_idx];
++                        auto scale_bf16x2 = __bfloat162bfloat162(*(__nv_bfloat16*)(&scale));
++                        save_bf16x8(cvt_fp8x8_bf16x8(cur_fp8x16.lo, scale_bf16x2), 0);
++                        save_bf16x8(cvt_fp8x8_bf16x8(cur_fp8x16.hi, scale_bf16x2), 8);
+@@ -611,0 +651,7 @@
++                        shared_row.store_fragment<
++                            MODEL_TYPE == ModelType::V32 && USE_SHARED_CACHE
++                        >(
++                            HEAD_DIM_NOPE + NUM_SCALES * sizeof(float) +
++                                (lane_idx / 8) * 16 + dim_idx * 64,
++                            cur_bf16x8
++                        );
+@@ -623,0 +670,4 @@
++
++                    shared_row.publish<
++                        MODEL_TYPE == ModelType::V32 && USE_SHARED_CACHE
++                    >();
+@@ -686,2 +736,2 @@
+-template<ModelType MODEL_TYPE, int NUM_HEADS>
+-void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &params) {
++template<ModelType MODEL_TYPE, int NUM_HEADS, bool USE_SHARED_CACHE, bool USE_CURRENT_ROWS>
++void KernelTemplate<MODEL_TYPE, NUM_HEADS, USE_SHARED_CACHE, USE_CURRENT_ROWS>::run(const SparseAttnDecodeParams &params) {
+@@ -751 +801 @@
+-    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE, NUM_HEADS>, decltype(tma_params)>;
++    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE, NUM_HEADS, USE_SHARED_CACHE, USE_CURRENT_ROWS>, decltype(tma_params)>;
+@@ -782 +832 @@
+-template<ModelType MODEL_TYPE, int NUM_HEADS>
++template<ModelType MODEL_TYPE, int NUM_HEADS, bool USE_SHARED_CACHE, bool USE_CURRENT_ROWS>
+@@ -784 +834 @@
+-    KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(params);
++    KernelTemplate<MODEL_TYPE, NUM_HEADS, USE_SHARED_CACHE, USE_CURRENT_ROWS>::run(params);
+diff -ruN -U0 a/csrc/sm90/decode/sparse_fp8/splitkv_mla.h b/csrc/sm90/decode/sparse_fp8/splitkv_mla.h
+--- a/csrc/sm90/decode/sparse_fp8/splitkv_mla.h	2026-06-24 14:52:45
++++ b/csrc/sm90/decode/sparse_fp8/splitkv_mla.h	2026-08-13 19:49:46
+@@ -7 +7,6 @@
+-template<ModelType MODEL_TYPE, int NUM_HEADS>
++template<
++    ModelType MODEL_TYPE,
++    int NUM_HEADS,
++    bool USE_SHARED_CACHE,
++    bool USE_CURRENT_ROWS
++>
+@@ -11 +15,0 @@
+-

@@ -14,6 +14,147 @@ def transform_index_page_table_decode(**kwargs):
     return transform_index_page_table_decode_fast(**kwargs)
 
 
+@triton.jit
+def translate_owner_sharded_slots_kernel(
+    slots_ptr: torch.Tensor,
+    result_ptr: torch.Tensor,
+    num_slots,
+    OWNER_CP_SIZE: tl.constexpr,
+    OWNER_PAGE_SIZE: tl.constexpr,
+    OWNER_PAGES_PER_RANK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_slots
+    logical_slots = tl.load(slots_ptr + offsets, mask=mask, other=-1)
+    valid = logical_slots >= 0
+    safe_slots = tl.where(valid, logical_slots, 0)
+    logical_pages = safe_slots // OWNER_PAGE_SIZE
+    page_offsets = safe_slots % OWNER_PAGE_SIZE
+    owners = logical_pages % OWNER_CP_SIZE
+    owner_pages = logical_pages // OWNER_CP_SIZE
+    physical_pages = owners * OWNER_PAGES_PER_RANK + owner_pages
+    physical_slots = physical_pages * OWNER_PAGE_SIZE + page_offsets
+    tl.store(
+        result_ptr + offsets,
+        tl.where(valid, physical_slots, logical_slots),
+        mask=mask,
+    )
+
+
+@triton.jit
+def translate_owner_sharded_slots_with_current_kernel(
+    slots_ptr: torch.Tensor,
+    result_ptr: torch.Tensor,
+    current_row_locs_ptr: torch.Tensor,
+    num_slots,
+    OWNER_CP_SIZE: tl.constexpr,
+    OWNER_PAGE_SIZE: tl.constexpr,
+    OWNER_PAGES_PER_RANK: tl.constexpr,
+    CURRENT_ROWS_PER_REQUEST: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_slots
+    logical_slots = tl.load(slots_ptr + offsets, mask=mask, other=-1)
+    valid = logical_slots >= 0
+    safe_slots = tl.where(valid, logical_slots, 0)
+    logical_pages = safe_slots // OWNER_PAGE_SIZE
+    page_offsets = safe_slots % OWNER_PAGE_SIZE
+    owners = logical_pages % OWNER_CP_SIZE
+    owner_pages = logical_pages // OWNER_CP_SIZE
+    physical_pages = owners * OWNER_PAGES_PER_RANK + owner_pages
+    physical_slots = physical_pages * OWNER_PAGE_SIZE + page_offsets
+
+    current_row_markers = tl.full(offsets.shape, -1, tl.int32)
+    query_row = offsets // TOPK
+    current_row_position = query_row % CURRENT_ROWS_PER_REQUEST
+    current_row_begin = query_row - current_row_position
+    for current_row_slot in tl.static_range(0, 4):
+        if current_row_slot < CURRENT_ROWS_PER_REQUEST:
+            current_row_loc = tl.load(
+                current_row_locs_ptr + current_row_begin + current_row_slot,
+                mask=mask & (current_row_slot <= current_row_position),
+                other=-1,
+            )
+            is_current_row = valid & (logical_slots == current_row_loc)
+            current_row_markers = tl.where(
+                is_current_row, -2 - current_row_slot, current_row_markers
+            )
+    translated_slots = tl.where(
+        current_row_markers <= -2, current_row_markers, physical_slots
+    )
+    tl.store(
+        result_ptr + offsets,
+        tl.where(valid, translated_slots, logical_slots),
+        mask=mask,
+    )
+
+
+def translate_owner_sharded_slots(
+    slot_indices: torch.Tensor,
+    *,
+    owner_cp_size: int,
+    owner_page_size: int,
+    owner_pages_per_rank: int,
+    result: Optional[torch.Tensor] = None,
+    current_row_locs: Optional[torch.Tensor] = None,
+    current_rows_per_request: int = 0,
+) -> torch.Tensor:
+    """Translate logical slots to the rank-major Shared-KV VMM layout."""
+    assert slot_indices.dtype == torch.int32
+    assert slot_indices.is_contiguous()
+    assert owner_cp_size > 1
+    assert owner_page_size > 0
+    assert owner_pages_per_rank > 0
+    if result is None:
+        result = torch.empty_like(slot_indices)
+    else:
+        assert result.dtype == torch.int32
+        assert result.shape == slot_indices.shape
+        assert result.is_contiguous()
+    has_current_rows = current_row_locs is not None
+    if has_current_rows:
+        assert slot_indices.dim() == 2
+        assert current_row_locs is not None
+        assert current_row_locs.dtype in (torch.int32, torch.int64)
+        assert current_row_locs.is_contiguous()
+        assert current_row_locs.numel() == slot_indices.shape[0]
+        assert 1 <= current_rows_per_request <= 4
+        assert slot_indices.shape[0] % current_rows_per_request == 0
+    else:
+        assert current_rows_per_request == 0
+    if slot_indices.numel() == 0:
+        return result
+    block_size = 256
+    grid = (triton.cdiv(slot_indices.numel(), block_size),)
+    if has_current_rows:
+        translate_owner_sharded_slots_with_current_kernel[grid](
+            slot_indices,
+            result,
+            current_row_locs,
+            slot_indices.numel(),
+            OWNER_CP_SIZE=owner_cp_size,
+            OWNER_PAGE_SIZE=owner_page_size,
+            OWNER_PAGES_PER_RANK=owner_pages_per_rank,
+            CURRENT_ROWS_PER_REQUEST=current_rows_per_request,
+            TOPK=slot_indices.shape[1],
+            BLOCK_SIZE=block_size,
+        )
+    else:
+        translate_owner_sharded_slots_kernel[grid](
+            slot_indices,
+            result,
+            slot_indices.numel(),
+            OWNER_CP_SIZE=owner_cp_size,
+            OWNER_PAGE_SIZE=owner_page_size,
+            OWNER_PAGES_PER_RANK=owner_pages_per_rank,
+            BLOCK_SIZE=block_size,
+        )
+    return result
+
+
 def _allocate_prefill_result(
     topk_indices: torch.Tensor,
     real_num_tokens: int,
@@ -49,6 +190,9 @@ def transform_index_page_table_decode_kernel(
     result_ptr: torch.Tensor,
     page_size: tl.constexpr,
     page_table_row_stride: tl.constexpr,
+    OWNER_CP_SIZE: tl.constexpr,
+    OWNER_PAGE_SIZE: tl.constexpr,
+    OWNER_PAGES_PER_RANK: tl.constexpr,
 ):
     TOPK: tl.constexpr = 2048
     req_id = tl.program_id(0)
@@ -60,6 +204,13 @@ def transform_index_page_table_decode_kernel(
     loaded_topk_indices = tl.load(topk_indices_ptr + offset)
     mask = loaded_topk_indices >= 0
     loaded_kv_indices = tl.load(page_table_ptr + loaded_topk_indices, mask=mask)
+    if OWNER_CP_SIZE > 1:
+        logical_page = loaded_kv_indices // OWNER_PAGE_SIZE
+        page_offset = loaded_kv_indices % OWNER_PAGE_SIZE
+        owner_rank = logical_page % OWNER_CP_SIZE
+        owner_page = logical_page // OWNER_CP_SIZE
+        physical_page = owner_rank * OWNER_PAGES_PER_RANK + owner_page
+        loaded_kv_indices = physical_page * OWNER_PAGE_SIZE + page_offset
     tl.store(result_ptr + offset, loaded_kv_indices, mask=mask)
     tl.store(result_ptr + offset, -1, mask=~mask)
 
@@ -127,6 +278,9 @@ def transform_index_page_table_decode_fast(
     topk_indices: torch.Tensor,
     result: Optional[torch.Tensor] = None,
     page_size: int = 1,
+    owner_cp_size: int = 1,
+    owner_page_size: int = 1,
+    owner_pages_per_rank: int = 0,
 ) -> torch.Tensor:
     """
     Transform the page table according to topk indices for sparse topk attention.
@@ -140,6 +294,10 @@ def transform_index_page_table_decode_fast(
     assert page_size == 1
     assert page_table.shape[0] == topk_indices.shape[0]
     assert topk_indices.shape[1] == 2048
+    assert owner_cp_size >= 1
+    if owner_cp_size > 1:
+        assert owner_page_size > 0
+        assert owner_pages_per_rank > 0
     qo_len = topk_indices.shape[0]
     if result is None:
         result = torch.empty_like(topk_indices, dtype=torch.int32)
@@ -151,6 +309,9 @@ def transform_index_page_table_decode_fast(
         result,
         page_size,
         page_table_row_stride=page_table.stride(0),
+        OWNER_CP_SIZE=owner_cp_size,
+        OWNER_PAGE_SIZE=owner_page_size,
+        OWNER_PAGES_PER_RANK=owner_pages_per_rank,
     )
     return result
 

@@ -27,6 +27,7 @@ from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
 from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
+    translate_owner_sharded_slots,
 )
 from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
@@ -46,6 +47,9 @@ from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import DSAIndexerMetad
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
+)
+from sglang.srt.layers.attention.dsa.shared_cache_access import (
+    get_dsa_shared_cache_access,
 )
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_round_robin_split,
@@ -67,6 +71,12 @@ from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_position,
+)
+from sglang.srt.mem_cache.dsa_shared_demand import (
+    DSAFlashMLADemandCacheManager,
+    SlotDemandCache,
+    _expand_flashmla_shared_cache_request_slots,
+    resolve_flashmla_shared_max_current_rows,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_buffer
@@ -93,6 +103,56 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+def _translate_pool_main_page_table(
+    pool,
+    page_table: torch.Tensor,
+    *,
+    current_row_locs: Optional[torch.Tensor] = None,
+    current_rows_per_request: int = 0,
+) -> torch.Tensor:
+    shared_access = get_dsa_shared_cache_access(pool)
+    owner_translation_args = (
+        shared_access.main_owner_translation_args()
+        if shared_access is not None
+        else None
+    )
+    if owner_translation_args is not None:
+        return translate_owner_sharded_slots(
+            page_table,
+            result=torch.empty_like(page_table),
+            current_row_locs=current_row_locs,
+            current_rows_per_request=current_rows_per_request,
+            **owner_translation_args,
+        )
+    if current_row_locs is not None:
+        raise RuntimeError("Current-row markers require owner-sharded Main KV")
+    if shared_access is None:
+        return page_table
+    return shared_access.translate_main_slots(page_table).to(torch.int32)
+
+
+def _get_pool_main_owner_translation_args(pool) -> Optional[dict[str, int]]:
+    shared_access = get_dsa_shared_cache_access(pool)
+    if shared_access is None:
+        return None
+    return shared_access.main_owner_translation_args()
+
+
+def _prepare_pool_index_page_table(pool, page_table: torch.Tensor) -> torch.Tensor:
+    shared_access = get_dsa_shared_cache_access(pool)
+    return (
+        shared_access.prepare_indexer_pages(page_table)
+        if shared_access is not None
+        else page_table
+    )
+
+
+def _synchronize_pool_main_cache(pool) -> None:
+    shared_access = get_dsa_shared_cache_access(pool)
+    if shared_access is not None:
+        shared_access.publish_writes()
 
 
 def _all_gather_dsa_trtllm_fp8_kv(
@@ -131,6 +191,7 @@ def materialize_full_kv_cp(
 
 
 _is_hip = is_hip()
+
 
 if _is_hip:
     from sglang.kernels.ops.attention.dsa.triton_kernel import get_valid_kv_indices
@@ -221,6 +282,15 @@ class DSAMetadata:
     dsa_max_seqlen_q: Literal[1] = 1  # always 1 for decode, variable for extend
 
     flashmla_metadata: Optional[DSAFlashMLAMetadata] = None
+    # Stable req_pool_idx for every flattened FlashMLA Q row. Decode and EAGLE
+    # target verify use it to select a request-private Demand-cache slice.
+    shared_cache_request_slots: Optional[torch.Tensor] = None
+    # Shared-object Demand-cache current rows. ``locs`` stays in the logical
+    # scheduler slot namespace so the mandatory owner-translation kernel can
+    # replace exact causal matches with FlashMLA's -2..-5 shadow markers.
+    shared_mla_current_rows: Optional[object] = None
+    shared_mla_current_row_locs: Optional[torch.Tensor] = None
+    shared_mla_current_rows_per_request: int = 0
     # DeepGEMM schedule metadata for paged MQA logits (decode/target_verify/draft_extend only).
     # Precomputed once per forward batch and reused across layers.
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
@@ -231,6 +301,9 @@ class DSAMetadata:
     # DeepSeek-V4 top-k v2 plan (cluster-threshold metadata) for the folded
     # decode top-k transform. None unless the SGL top-k v2 path is enabled.
     topk_v2_plan: Optional[torch.Tensor] = None
+    # Backend-ready page-size-64 indexer table. Shared KV translates this once
+    # per forward/replay and all indexer layers reuse the stable buffer.
+    prepared_paged_index_page_table: Optional[torch.Tensor] = None
     # The sum of sequence lengths for key, prefill only
     seq_lens_sum: Optional[int] = None
     # The flattened 1D page table with shape (seq_lens_sum,), prefill only
@@ -432,6 +505,45 @@ class DeepseekSparseAttnBackend(
                 "--dsa-decode-backend flashmla_kv."
             )
 
+        max_current_rows = resolve_flashmla_shared_max_current_rows(
+            self.speculative_num_draft_tokens
+        )
+        self._shared_main_demand_cache = DSAFlashMLADemandCacheManager.create(
+            pool=self.token_to_kv_pool,
+            device=self.device,
+            enable_prefill=(
+                not skip_prefill
+                and self.dsa_prefill_impl in ("flashmla_kv", "flashmla_auto")
+                and self.dsa_kv_cache_store_fp8
+                and self.device_sm_major == 9
+                and self.kv_cache_dim == 656
+            ),
+            enable_decode=self.dsa_decode_impl == "flashmla_kv",
+            enable_current_rows=(
+                max_current_rows <= 4
+                and callable(
+                    getattr(
+                        self.token_to_kv_pool,
+                        "set_mla_kv_buffer_with_current_rows",
+                        None,
+                    )
+                )
+            ),
+            num_layers=model_runner.model_config.num_hidden_layers,
+            num_request_slots=self.req_to_token_pool.size,
+            max_current_rows=max_current_rows,
+        )
+        if get_dsa_shared_cache_access(self.token_to_kv_pool) is not None:
+            from sglang.srt.mem_cache.dsa_cache_shared import (
+                log_shared_dsa_capacity_accounting,
+            )
+
+            log_shared_dsa_capacity_accounting(
+                self.token_to_kv_pool,
+                main_demand_workspace_bytes=(
+                    self._shared_main_demand_cache.allocated_bytes
+                ),
+            )
         # Q8KV8 per-call device-tensor caches, populated lazily on the first
         # Q8KV8 dispatch (no-ops for other backends).
         self._q8kv8_identity_scale: Optional[torch.Tensor] = None
@@ -513,6 +625,27 @@ class DeepseekSparseAttnBackend(
         else:
             self.workspace_buffer = None
             self._multi_ctas_kv_counter_buffer = None
+
+    def _use_shared_decode_current_rows(self, forward_mode: ForwardMode) -> bool:
+        return bool(
+            self._shared_main_demand_cache.current_rows_by_layer
+            and self.dsa_decode_impl == "flashmla_kv"
+            and self.dsa_kv_cache_store_fp8
+            and self.use_fused_topk
+            and (forward_mode.is_decode_or_idle() or forward_mode.is_target_verify())
+        )
+
+    def _shared_decode_current_rows_per_request(self, forward_mode: ForwardMode) -> int:
+        if not self._use_shared_decode_current_rows(forward_mode):
+            return 0
+        return self._shared_main_demand_cache.current_rows_per_request(
+            target_verify=forward_mode.is_target_verify(),
+            decode=forward_mode.is_decode_or_idle(),
+        )
+
+    def _publish_shared_decode_step(self, layer: RadixAttention) -> None:
+        if layer.layer_id == self.token_to_kv_pool.start_layer:
+            _synchronize_pool_main_cache(self.token_to_kv_pool)
 
     def _make_aiter_dsa_decode_metadata_buffer(
         self,
@@ -744,6 +877,56 @@ class DeepseekSparseAttnBackend(
             return metadata.page_table_1.shape[1]
         return self.req_to_token.shape[1]
 
+    def _advance_flashmla_shared_decode_generation(
+        self, forward_mode: ForwardMode
+    ) -> None:
+        if (
+            forward_mode.is_decode_or_idle()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend_v2()
+        ):
+            self._shared_main_demand_cache.advance_decode_generation()
+
+    def _refresh_flashmla_shared_decode_request_lifecycle(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        if forward_batch.forward_mode.is_extend_without_speculative():
+            shared_access = get_dsa_shared_cache_access(self.token_to_kv_pool)
+            if shared_access is not None:
+                shared_access.invalidate_indexer_cache()
+        if (
+            not self._shared_main_demand_cache.has_decode_cache
+            or not forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return
+        request_slots = forward_batch.req_pool_indices_cpu
+        if request_slots is None:
+            # Correctness fallback for synthetic/custom ForwardBatch producers.
+            # Normal scheduling supplies the CPU mirror and avoids this sync.
+            request_slots = forward_batch.req_pool_indices.detach().to("cpu")
+        request_slots = request_slots.to(dtype=torch.int64).view(-1)
+        free_slots = getattr(self.req_to_token_pool, "free_slots", None)
+        if free_slots is None:
+            active_request_slots = request_slots
+        else:
+            free_slot_set = set(free_slots)
+            active_request_slots = torch.tensor(
+                [
+                    slot
+                    for slot in range(1, self.req_to_token_pool.size + 1)
+                    if slot not in free_slot_set
+                ],
+                dtype=torch.int64,
+                device="cpu",
+            )
+        request_generations = self.req_to_token_pool.req_generation[
+            active_request_slots
+        ]
+        self._shared_main_demand_cache.refresh_decode_requests(
+            active_request_slots=active_request_slots,
+            request_generations=request_generations,
+        )
+
     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:
         page_size = self.real_page_size
         if page_size == 1:
@@ -759,6 +942,7 @@ class DeepseekSparseAttnBackend(
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        self._advance_flashmla_shared_decode_generation(forward_batch.forward_mode)
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
@@ -775,6 +959,8 @@ class DeepseekSparseAttnBackend(
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        self._refresh_flashmla_shared_decode_request_lifecycle(forward_batch)
+        self._advance_flashmla_shared_decode_generation(forward_batch.forward_mode)
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
 
@@ -995,6 +1181,10 @@ class DeepseekSparseAttnBackend(
                         f"kv_cache_capacity={kv_cache_capacity}"
                     )
 
+                page_table_1_flattened = _translate_pool_main_page_table(
+                    self.token_to_kv_pool, page_table_1_flattened
+                )
+
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 topk_indices_offset = torch.repeat_interleave(
                     cu_seqlens_k[:-1],
@@ -1037,6 +1227,46 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
             )
 
+        real_page_table = self._transform_table_1_to_real(page_table)
+        prepared_paged_index_page_table = (
+            _prepare_pool_index_page_table(self.token_to_kv_pool, real_page_table)
+            if topk_transform_method == TopkTransformMethod.PAGED
+            else None
+        )
+        flashmla_metadata = (
+            self._compute_flashmla_metadata(
+                cache_seqlens=dsa_cache_seqlens_int32,
+                seq_len_q=1,
+            )
+            if use_flashmla_kv
+            else None
+        )
+        shared_cache_request_slots = None
+        if self._shared_main_demand_cache.has_decode_cache and (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            shared_cache_request_slots = _expand_flashmla_shared_cache_request_slots(
+                forward_batch.req_pool_indices,
+                num_query_rows=seqlens_expanded.shape[0],
+            )
+        shared_mla_current_rows = None
+        shared_mla_current_row_locs = None
+        shared_mla_current_rows_per_request = (
+            self._shared_decode_current_rows_per_request(forward_batch.forward_mode)
+        )
+        if shared_mla_current_rows_per_request:
+            shared_mla_current_rows = (
+                self._shared_main_demand_cache.current_rows_by_layer
+            )
+            shared_mla_current_row_locs = forward_batch.out_cache_loc[
+                : seqlens_expanded.shape[0]
+            ]
+            if shared_mla_current_row_locs.numel() != seqlens_expanded.shape[0]:
+                raise RuntimeError(
+                    "Shared MLA current-row locations do not cover query rows"
+                )
+
         metadata = DSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -1047,14 +1277,11 @@ class DeepseekSparseAttnBackend(
             seq_lens_sum=forward_batch.seq_lens_sum,
             page_table_1=page_table,
             page_table_1_flattened=page_table_1_flattened,
-            flashmla_metadata=(
-                self._compute_flashmla_metadata(
-                    cache_seqlens=dsa_cache_seqlens_int32,
-                    seq_len_q=1,
-                )
-                if use_flashmla_kv
-                else None
-            ),
+            flashmla_metadata=flashmla_metadata,
+            shared_cache_request_slots=shared_cache_request_slots,
+            shared_mla_current_rows=shared_mla_current_rows,
+            shared_mla_current_row_locs=shared_mla_current_row_locs,
+            shared_mla_current_rows_per_request=(shared_mla_current_rows_per_request),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
@@ -1062,7 +1289,8 @@ class DeepseekSparseAttnBackend(
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             dsa_seqlens_expanded=seqlens_expanded,
             dsa_extend_seq_lens_list=extend_seq_lens_cpu,
-            real_page_table=self._transform_table_1_to_real(page_table),
+            real_page_table=real_page_table,
+            prepared_paged_index_page_table=prepared_paged_index_page_table,
             dsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,
             indexer_k_start_end=indexer_k_start_end,
@@ -1365,6 +1593,9 @@ class DeepseekSparseAttnBackend(
             ]
         else:
             real_page_table = self._transform_table_1_to_real(page_table_1)
+        prepared_paged_index_page_table = _prepare_pool_index_page_table(
+            self.token_to_kv_pool, real_page_table
+        )
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
@@ -1380,6 +1611,28 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
             )
 
+        shared_cache_request_slots = None
+        if self._shared_main_demand_cache.has_decode_cache and (
+            forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
+        ):
+            shared_cache_request_slots = _expand_flashmla_shared_cache_request_slots(
+                req_pool_indices[:bs], num_query_rows=real_rows
+            )
+        shared_mla_current_rows = None
+        shared_mla_current_row_locs = None
+        shared_mla_current_rows_per_request = (
+            self._shared_decode_current_rows_per_request(forward_mode)
+        )
+        if shared_mla_current_rows_per_request:
+            if out_cache_loc is None:
+                raise RuntimeError(
+                    "Shared MLA current rows require CUDA-graph out_cache_loc"
+                )
+            shared_mla_current_rows = (
+                self._shared_main_demand_cache.current_rows_by_layer
+            )
+            shared_mla_current_row_locs = out_cache_loc[:real_rows]
+
         metadata = DSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -1389,6 +1642,10 @@ class DeepseekSparseAttnBackend(
             cu_seqlens_k=cu_seqlens_k,
             page_table_1=page_table_1,
             flashmla_metadata=flashmla_metadata,
+            shared_cache_request_slots=shared_cache_request_slots,
+            shared_mla_current_rows=shared_mla_current_rows,
+            shared_mla_current_row_locs=shared_mla_current_row_locs,
+            shared_mla_current_rows_per_request=(shared_mla_current_rows_per_request),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
@@ -1396,6 +1653,7 @@ class DeepseekSparseAttnBackend(
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             dsa_seqlens_expanded=seqlens_expanded,
             real_page_table=real_page_table,
+            prepared_paged_index_page_table=prepared_paged_index_page_table,
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
         )
@@ -1685,6 +1943,28 @@ class DeepseekSparseAttnBackend(
             )
         # NOTE(dark): (dsa-) cu_seqlens_q is always arange, no need to copy
 
+        shared_cache_request_slots = metadata.shared_cache_request_slots
+        if shared_cache_request_slots is not None:
+            expanded_request_slots = _expand_flashmla_shared_cache_request_slots(
+                req_pool_indices, num_query_rows=seqlens_expanded_size
+            )
+            shared_cache_request_slots.copy_(expanded_request_slots)
+
+        shared_current_row_locs = metadata.shared_mla_current_row_locs
+        if shared_current_row_locs is not None:
+            if out_cache_loc is None:
+                raise RuntimeError(
+                    "Shared MLA current rows require replay out_cache_loc"
+                )
+            replay_rows = out_cache_loc.numel()
+            if replay_rows > seqlens_expanded_size:
+                raise RuntimeError(
+                    "Shared MLA replay locations exceed captured query rows: "
+                    f"locations={replay_rows} rows={seqlens_expanded_size}"
+                )
+            shared_current_row_locs[:replay_rows].copy_(out_cache_loc)
+            shared_current_row_locs[replay_rows:seqlens_expanded_size].zero_()
+
         assert self.real_page_size == metadata.page_size
         if self.real_page_size > 1:
             if not used_fused_metadata_generation:
@@ -1694,6 +1974,17 @@ class DeepseekSparseAttnBackend(
                 metadata.real_page_table[:new_rows, :new_cols].copy_(real_table)
         else:
             assert metadata.real_page_table is metadata.page_table_1
+
+        prepared_page_table = metadata.prepared_paged_index_page_table
+        if (
+            prepared_page_table is not None
+            and prepared_page_table is not metadata.real_page_table
+        ):
+            prepared_page_table.copy_(
+                _prepare_pool_index_page_table(
+                    self.token_to_kv_pool, metadata.real_page_table
+                )
+            )
 
         if self.dsa_decode_impl == "flashmla_kv":
             flashmla_metadata = metadata.flashmla_metadata.slice(
@@ -1847,6 +2138,15 @@ class DeepseekSparseAttnBackend(
                 flashmla_metadata = metadata.flashmla_metadata.slice(slice(0, size + 1))
                 flashmla_metadata.copy_(precomputed.flashmla_metadata)
 
+        shared_cache_request_slots = metadata.shared_cache_request_slots
+        if shared_cache_request_slots is not None:
+            source_request_slots = precomputed.shared_cache_request_slots
+            if source_request_slots is None:
+                raise ValueError(
+                    "request-scoped FlashMLA cache requires precomputed request slots"
+                )
+            shared_cache_request_slots.copy_(source_request_slots)
+
         # Refresh DeepGEMM paged MQA schedule metadata for the actual seqlens of
         # this replay (the captured graph holds stale data otherwise, which can
         # deadlock the kernel when the runtime work decomposition diverges from
@@ -1867,6 +2167,17 @@ class DeepseekSparseAttnBackend(
                 object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
             else:
                 metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
+
+        prepared_page_table = metadata.prepared_paged_index_page_table
+        if (
+            prepared_page_table is not None
+            and prepared_page_table is not metadata.real_page_table
+        ):
+            prepared_page_table.copy_(
+                _prepare_pool_index_page_table(
+                    self.token_to_kv_pool, metadata.real_page_table
+                )
+            )
 
         self.forward_metadata = metadata
 
@@ -1891,14 +2202,26 @@ class DeepseekSparseAttnBackend(
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
 
+        is_persistent_decode_extend = (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        )
         dsa_impl = (
             self.dsa_decode_impl
-            if (
-                forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend_v2()
-            )
+            if is_persistent_decode_extend
             else self.dsa_prefill_impl
         )
+        shared_current_rows_layer_idx = (
+            layer.layer_id - self.token_to_kv_pool.start_layer
+        )
+        shared_current_rows = (
+            metadata.shared_mla_current_rows[shared_current_rows_layer_idx]
+            if metadata.shared_mla_current_rows is not None
+            and save_kv_cache
+            and k is not None
+            else None
+        )
+        shared_current_rows_per_request = metadata.shared_mla_current_rows_per_request
 
         if dsa_impl == "trtllm" and not self.use_mha:
             return self._forward_trtllm(
@@ -1926,12 +2249,24 @@ class DeepseekSparseAttnBackend(
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                self.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
-                    layer,
-                    cache_loc,
-                    k,
-                    k_rope,
-                )
+                if shared_current_rows is not None:
+                    self.token_to_kv_pool.set_mla_kv_buffer_with_current_rows(  # type: ignore
+                        layer,
+                        cache_loc,
+                        k,
+                        k_rope,
+                        shared_current_rows,
+                        query_rows=k.shape[0],
+                        rows_per_request=shared_current_rows_per_request,
+                    )
+                    self._publish_shared_decode_step(layer)
+                else:
+                    self.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
+                        layer,
+                        cache_loc,
+                        k,
+                        k_rope,
+                    )
 
         # Use MHA kernel if in MHA_ONE_SHOT mode
         if self.use_mha:
@@ -2009,6 +2344,29 @@ class DeepseekSparseAttnBackend(
             page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
                 page_table_1
             ).to(torch.int32)
+        elif topk_transform_method != TopkTransformMethod.RAGGED:
+            page_table_1 = _translate_pool_main_page_table(
+                self.token_to_kv_pool,
+                page_table_1,
+                current_row_locs=(
+                    metadata.shared_mla_current_row_locs
+                    if shared_current_rows is not None
+                    else None
+                ),
+                current_rows_per_request=(
+                    shared_current_rows_per_request
+                    if shared_current_rows is not None
+                    else 0
+                ),
+            )
+
+        reads_main_cache = not (
+            dsa_impl == "flashmla_sparse"
+            and topk_transform_method == TopkTransformMethod.RAGGED
+            and not any(forward_batch.extend_prefix_lens_cpu)
+        )
+        if reads_main_cache and shared_current_rows is None:
+            _synchronize_pool_main_cache(self.token_to_kv_pool)
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
@@ -2141,6 +2499,13 @@ class DeepseekSparseAttnBackend(
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            local_layer_id = layer.layer_id - self.token_to_kv_pool.start_layer
+            shared_demand_cache, persistent_shared_cache = (
+                self._shared_main_demand_cache.cache_for_layer(
+                    local_layer_id=local_layer_id,
+                    persistent=forward_batch.forward_mode.is_target_verify(),
+                )
+            )
             return self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -2150,6 +2515,14 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                shared_demand_cache=shared_demand_cache,
+                persistent=persistent_shared_cache,
+                shared_cache_request_slots=(
+                    metadata.shared_cache_request_slots
+                    if persistent_shared_cache
+                    else None
+                ),
+                shared_current_rows=shared_current_rows,
             )
         elif dsa_impl == "fa3":
             return self._forward_fa3(
@@ -2218,6 +2591,18 @@ class DeepseekSparseAttnBackend(
                 llama_4_scaling,
             )
 
+        shared_current_rows_layer_idx = (
+            layer.layer_id - self.token_to_kv_pool.start_layer
+        )
+        shared_current_rows = (
+            metadata.shared_mla_current_rows[shared_current_rows_layer_idx]
+            if metadata.shared_mla_current_rows is not None
+            and save_kv_cache
+            and k is not None
+            else None
+        )
+        shared_current_rows_per_request = metadata.shared_mla_current_rows_per_request
+
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -2226,14 +2611,28 @@ class DeepseekSparseAttnBackend(
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                self.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
-                    layer,
-                    cache_loc,
-                    k,
-                    k_rope,
-                )
+                if shared_current_rows is not None:
+                    self.token_to_kv_pool.set_mla_kv_buffer_with_current_rows(  # type: ignore
+                        layer,
+                        cache_loc,
+                        k,
+                        k_rope,
+                        shared_current_rows,
+                        query_rows=k.shape[0],
+                        rows_per_request=shared_current_rows_per_request,
+                    )
+                    self._publish_shared_decode_step(layer)
+                else:
+                    self.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
+                        layer,
+                        cache_loc,
+                        k,
+                        k_rope,
+                    )
 
         # Do absorbed multi-latent attention
+        if shared_current_rows is None:
+            _synchronize_pool_main_cache(self.token_to_kv_pool)
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -2265,10 +2664,30 @@ class DeepseekSparseAttnBackend(
         elif self.use_fused_topk:
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
+            owner_translation_args = _get_pool_main_owner_translation_args(
+                self.token_to_kv_pool
+            )
             page_table_1 = transform_index_page_table_decode(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
                 page_size=1,
+                **(owner_translation_args or {}),
+            )
+
+        if self.hisparse_coordinator is None and self.use_fused_topk:
+            page_table_1 = _translate_pool_main_page_table(
+                self.token_to_kv_pool,
+                page_table_1,
+                current_row_locs=(
+                    metadata.shared_mla_current_row_locs
+                    if shared_current_rows is not None
+                    else None
+                ),
+                current_rows_per_request=(
+                    shared_current_rows_per_request
+                    if shared_current_rows is not None
+                    else 0
+                ),
             )
 
         if self.dsa_decode_impl == "flashmla_sparse":
@@ -2296,6 +2715,31 @@ class DeepseekSparseAttnBackend(
         elif self.dsa_decode_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if self._shared_main_demand_cache.has_decode_cache:
+                local_layer_id = layer.layer_id - self.token_to_kv_pool.start_layer
+                selected_cache, persistent_shared_cache = (
+                    self._shared_main_demand_cache.cache_for_layer(
+                        local_layer_id=local_layer_id,
+                        persistent=True,
+                    )
+                )
+                return self._forward_flashmla_kv(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    sm_scale=layer.scaling,
+                    v_head_dim=layer.v_head_dim,
+                    layer=layer,
+                    metadata=metadata,
+                    page_table_1=page_table_1,
+                    shared_demand_cache=selected_cache,
+                    persistent=persistent_shared_cache,
+                    shared_cache_request_slots=(
+                        metadata.shared_cache_request_slots
+                        if persistent_shared_cache
+                        else None
+                    ),
+                    shared_current_rows=shared_current_rows,
+                )
             return self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -2305,6 +2749,8 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                shared_demand_cache=self._shared_main_demand_cache.prefill_cache,
+                shared_current_rows=shared_current_rows,
             )
         elif self.dsa_decode_impl == "tilelang":
             # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
@@ -2800,15 +3246,25 @@ class DeepseekSparseAttnBackend(
         layer,
         metadata: DSAMetadata,
         page_table_1,
+        shared_demand_cache: Optional[SlotDemandCache] = None,
+        persistent: bool = False,
+        shared_cache_request_slots: Optional[torch.Tensor] = None,
+        shared_current_rows: Optional[object] = None,
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
         cache_seqlens = metadata.dsa_cache_seqlens_int32
-        assert metadata.flashmla_metadata is not None
+        flashmla_metadata = metadata.flashmla_metadata
+        assert flashmla_metadata is not None
+
+        query_rows = q_all.shape[0]
+        if cache_seqlens.shape[0] != query_rows:
+            cache_seqlens = cache_seqlens[:query_rows]
+            flashmla_metadata = flashmla_metadata.slice(slice(0, query_rows + 1))
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
-        q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
-        num_q_heads = q_all.shape[2]
+        num_q_heads = q_all.shape[-2]
+        q_all = q_all.view(-1, 1, num_q_heads, layer.head_dim)
         target_q_heads = self.flashmla_kv_num_q_heads
         if target_q_heads != num_q_heads:
             # Pad q heads to match FlashMLA decode supported head-count variants.
@@ -2819,8 +3275,9 @@ class DeepseekSparseAttnBackend(
         else:
             q_input = q_all
 
-        kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
         assert self.real_page_size == 64, "only page size 64 is supported"
+
+        kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
 
         if not self.dsa_kv_cache_store_fp8:
             # inefficiently quantize the whole cache
@@ -2831,13 +3288,28 @@ class DeepseekSparseAttnBackend(
             indices.shape[-1] == self.dsa_index_topk
         )  # requirement of FlashMLA decode kernel
 
+        shared_cache_kwargs = {}
+        if shared_demand_cache is not None:
+            shared_cache_kwargs = shared_demand_cache.next_call_kwargs(
+                persistent=persistent,
+                request_slots=shared_cache_request_slots,
+            )
+        if shared_current_rows is not None:
+            query_rows = q_input.shape[0]
+            shared_cache_kwargs.update(
+                shared_kv_current_rows=(shared_current_rows.encoded_rows[:query_rows]),
+                shared_kv_current_row_ids=(
+                    shared_current_rows.physical_rows[:query_rows]
+                ),
+                shared_kv_current_row_counts=(shared_current_rows.counts[:query_rows]),
+            )
         o, _ = flash_mla_with_kvcache(
             q=q_input,
             k_cache=kv_cache,
             cache_seqlens=cache_seqlens,
             head_dim_v=v_head_dim,
-            tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
-            num_splits=metadata.flashmla_metadata.num_splits,
+            tile_scheduler_metadata=flashmla_metadata.flashmla_metadata,
+            num_splits=flashmla_metadata.num_splits,
             softmax_scale=sm_scale,
             indices=indices,
             # doc says it is not used, but if pass in None then error
@@ -2845,6 +3317,7 @@ class DeepseekSparseAttnBackend(
                 (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
             ),
             is_fp8_kvcache=True,
+            **shared_cache_kwargs,
         )
 
         if target_q_heads != num_q_heads:

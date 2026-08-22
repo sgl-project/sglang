@@ -3,7 +3,10 @@ from __future__ import annotations
 import torch
 
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
 )
@@ -130,6 +133,11 @@ def pcg_dsa_indexer_prefill_split(
             num_tokens=extend_num_tokens,
             topk_result=topk_result,
         )
+        from sglang.srt.layers.attention.dsa.dsa_indexer import (
+            _synchronize_shared_cache_writes,
+        )
+
+        _synchronize_shared_cache_writes(get_token_to_kv_pool())
         return
 
     # Fused path stores K (no-Hadamard) and computes q_fp8 + head gate in the
@@ -146,6 +154,11 @@ def pcg_dsa_indexer_prefill_split(
             num_tokens=extend_num_tokens,
             enable_dual_stream=False,
         )
+        from sglang.srt.layers.attention.dsa.dsa_indexer import (
+            _synchronize_shared_cache_writes,
+        )
+
+        _synchronize_shared_cache_writes(get_token_to_kv_pool())
         indexer._get_topk_ragged(
             False,
             forward_batch,
@@ -177,6 +190,11 @@ def pcg_dsa_indexer_prefill_split(
         act_quant=act_quant,
         out_cache_loc=forward_batch.out_cache_loc[:extend_num_tokens],
     )
+    from sglang.srt.layers.attention.dsa.dsa_indexer import (
+        _synchronize_shared_cache_writes,
+    )
+
+    _synchronize_shared_cache_writes(get_token_to_kv_pool())
     indexer._get_topk_ragged(
         False,
         forward_batch,

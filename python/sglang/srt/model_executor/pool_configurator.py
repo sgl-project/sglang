@@ -170,6 +170,49 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             if has_kv_on_another_pp_stage
             else kvc.server_args.max_total_tokens or kvc.model_config.context_len
         )
+        self._fixed_bytes = 0
+        self._indexer_pool_cache_num_layers = 0
+        self._indexer_pool_cache_page_size = kvc.page_size
+        self._indexer_pool_cache_bytes_per_token = 0
+        server_args = kvc.server_args
+        from sglang.srt.layers.cp.utils import (
+            is_glm_dsa_cache_shared_enabled,
+            is_glm_dsa_shared_indexer_enabled,
+        )
+
+        if is_glm_dsa_shared_indexer_enabled(kvc):
+            from sglang.srt.mem_cache.dsa_shared_demand import (
+                get_indexer_pool_cache_layer_ids,
+            )
+
+            self._indexer_pool_cache_num_layers = len(
+                get_indexer_pool_cache_layer_ids(
+                    kvc.model_config.hf_config,
+                    kvc.layer_info.start_layer,
+                    kvc.layer_info.end_layer,
+                )
+            )
+            index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
+            self._indexer_pool_cache_bytes_per_token = (
+                index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+            ) * DSATokenToKVPool.index_k_with_scale_buffer_dtype.itemsize
+        if (
+            is_glm_dsa_cache_shared_enabled(kvc)
+            and server_args.dsa_prefill_backend in ("flashmla_kv", "flashmla_auto")
+            and server_args.dsa_decode_backend == "flashmla_kv"
+        ):
+            from sglang.srt.mem_cache.dsa_shared_demand import (
+                get_flashmla_shared_demand_workspace_bytes,
+                resolve_flashmla_shared_max_current_rows,
+            )
+
+            self._fixed_bytes = get_flashmla_shared_demand_workspace_bytes(
+                num_layers=num_layers,
+                num_request_slots=server_args.max_running_requests,
+                max_current_rows=resolve_flashmla_shared_max_current_rows(
+                    server_args.speculative_num_draft_tokens
+                ),
+            )
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
         # Assumes draft and target share the same per-layer KV size (head_dim,
@@ -179,6 +222,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
             eagle_draft_num_layers = kvc.spec_aux_config.eagle_draft_num_layers
+            if eagle_draft_num_layers is None and is_glm_dsa_cache_shared_enabled(kvc):
+                eagle_draft_num_layers = kvc.model_config.num_nextn_predict_layers
             if (
                 eagle_draft_num_layers is not None
                 and int(eagle_draft_num_layers) > 0
@@ -193,11 +238,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_kv_size = self._cell_size - target_indexer_size
                     from sglang.srt.layers.cp.utils import (
                         get_glm_dsa_layer_split_effective_num_layers,
+                        get_glm_dsa_shared_effective_num_layers,
+                        is_glm_dsa_cache_shared_enabled,
                     )
 
                     target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
                         kvc, num_layers
                     )
+                    if is_glm_dsa_cache_shared_enabled(kvc):
+                        target_kv_num_layers = get_glm_dsa_shared_effective_num_layers(
+                            kvc, num_layers
+                        )
                     draft_kv_size = int(
                         target_kv_size * draft_num_layers / target_kv_num_layers
                     )
@@ -211,6 +262,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     self._cell_size = int(
                         self._cell_size * (1 + draft_num_layers / int(num_layers))
                     )
+
+        if server_args.enable_dsa_shared_kv_cache:
+            logger.info(
+                "Shared DSA pool accounting: target_shared=%s "
+                "cell_bytes_per_token=%s fixed_workspace_bytes=%s "
+                "indexer_pool_cache_layers=%s",
+                is_glm_dsa_cache_shared_enabled(kvc),
+                self._cell_size,
+                self._fixed_bytes,
+                self._indexer_pool_cache_num_layers,
+            )
 
         # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
         if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
@@ -232,6 +294,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
 
+    def _variable_bytes_for_tokens(self, num_tokens: int) -> int:
+        from sglang.srt.mem_cache.dsa_shared_demand import (
+            get_indexer_pool_cache_bytes,
+        )
+
+        return get_indexer_pool_cache_bytes(
+            num_tokens=num_tokens,
+            page_size=self._indexer_pool_cache_page_size,
+            num_layers=self._indexer_pool_cache_num_layers,
+            indexer_bytes_per_token=self._indexer_pool_cache_bytes_per_token or 1,
+        )
+
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
         # args to config cell size
@@ -239,11 +313,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         kv_cache_dtype = kvc.kv_cache_dtype
         from sglang.srt.layers.cp.utils import (
             get_glm_dsa_layer_split_effective_num_layers,
+            get_glm_dsa_shared_effective_num_layers,
+            is_glm_dsa_cache_shared_enabled,
         )
 
         effective_num_layers = get_glm_dsa_layer_split_effective_num_layers(
             kvc, num_layers
         )
+        dsa_shared_enabled = is_glm_dsa_cache_shared_enabled(kvc)
+        if dsa_shared_enabled:
+            effective_num_layers = get_glm_dsa_shared_effective_num_layers(
+                kvc, num_layers
+            )
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
@@ -370,11 +451,22 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             indexer_ratio = parse_hisparse_config(kvc.server_args).host_to_device_ratio
 
+        from sglang.srt.layers.cp.utils import (
+            get_glm_dsa_shared_effective_num_layers,
+            is_glm_dsa_shared_indexer_enabled,
+        )
         from sglang.srt.mem_cache.kv_cache_configurator import (
             _should_elide_dsa_index_k,
         )
 
-        if allocate_all_layers or not _should_elide_dsa_index_k(
+        if is_glm_dsa_shared_indexer_enabled(kvc) and not allocate_all_layers:
+            # Shared Indexer keeps every logical layer but page-owner-shards its
+            # authoritative storage across the CP group. Demand-cache workspace
+            # is accounted separately as a variable token cost.
+            num_indexer_layers = get_glm_dsa_shared_effective_num_layers(
+                kvc, num_layers
+            )
+        elif allocate_all_layers or not _should_elide_dsa_index_k(
             is_draft_worker=kvc.is_draft_worker
         ):
             num_indexer_layers = num_layers
@@ -415,11 +507,26 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        max_total_num_tokens = (
-            available_bytes // self._cell_size
-            if self._cell_size
-            else self._zero_kv_max_tokens
-        )
+        available_bytes = max(available_bytes - self._fixed_bytes, 0)
+        if not self._cell_size:
+            max_total_num_tokens = self._zero_kv_max_tokens
+        elif self._indexer_pool_cache_num_layers == 0:
+            max_total_num_tokens = available_bytes // self._cell_size
+        else:
+            upper_pages = available_bytes // self._cell_size // page_size
+            lower_pages = 0
+            while lower_pages < upper_pages:
+                candidate_pages = (lower_pages + upper_pages + 1) // 2
+                candidate_tokens = candidate_pages * page_size
+                used_bytes = (
+                    candidate_tokens * self._cell_size
+                    + self._variable_bytes_for_tokens(candidate_tokens)
+                )
+                if used_bytes <= available_bytes:
+                    lower_pages = candidate_pages
+                else:
+                    upper_pages = candidate_pages - 1
+            max_total_num_tokens = lower_pages * page_size
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 

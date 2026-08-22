@@ -32,6 +32,9 @@ class BaseIndexerMetadata(ABC):
                 The page size of the table is 64.
         """
 
+    def get_prepared_paged_index_page_table(self) -> Optional[torch.Tensor]:
+        return None
+
     @abstractmethod
     def get_page_table_1(self) -> torch.Tensor:
         """
@@ -104,6 +107,9 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
 
     def get_page_table_64(self) -> torch.Tensor:
         return self.attn_metadata.real_page_table
+
+    def get_prepared_paged_index_page_table(self) -> Optional[torch.Tensor]:
+        return self.attn_metadata.prepared_paged_index_page_table
 
     def get_page_table_1(self) -> torch.Tensor:
         return self.attn_metadata.page_table_1

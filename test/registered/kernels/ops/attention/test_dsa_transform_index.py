@@ -7,6 +7,7 @@ import sglang.kernels.ops.attention.dsa.transform_index as transform_index_modul
 from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode_fast,
     transform_index_page_table_prefill_fast,
+    translate_owner_sharded_slots,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -230,6 +231,96 @@ class TestDSATransformIndex(CustomTestCase):
     def test_decode_fast_correctness_and_strides(self):
         self._check_decode_case(17, 8192, provide_result=True)
         self._check_decode_case(17, 8192, zero_row_stride=True)
+
+    def test_decode_owner_sharded_translation(self):
+        page_table = torch.tensor(
+            [[0, 63, 64, 127, 128, 511, 512, 1023, 1024, -1]],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        topk_indices = torch.full((1, TOPK), -1, dtype=torch.int64, device=self.device)
+        topk_indices[0, :10] = torch.arange(10, device=self.device)
+
+        actual = transform_index_page_table_decode_fast(
+            page_table=page_table,
+            topk_indices=topk_indices,
+            owner_cp_size=8,
+            owner_page_size=64,
+            owner_pages_per_rank=32,
+        )
+        torch.cuda.synchronize()
+
+        expected_prefix = torch.tensor(
+            [0, 63, 2048, 2111, 4096, 14399, 64, 14463, 128, -1],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        torch.testing.assert_close(actual[0, :10], expected_prefix, rtol=0, atol=0)
+        self.assertTrue(torch.all(actual[0, 10:] == -1))
+
+    def test_owner_sharded_slots_translation(self):
+        logical_slots = torch.tensor(
+            [
+                [0, 63, 64, 127, 128, 511, 512, 1023, 1024, -1],
+                [1024, 0, 512, 64, 63, 128, 127, 511, 1023, -1],
+            ],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        actual = translate_owner_sharded_slots(
+            logical_slots,
+            owner_cp_size=8,
+            owner_page_size=64,
+            owner_pages_per_rank=32,
+        )
+        torch.cuda.synchronize()
+
+        expected = torch.tensor(
+            [
+                [0, 63, 2048, 2111, 4096, 14399, 64, 14463, 128, -1],
+                [128, 0, 64, 2048, 63, 4096, 2111, 14399, 14463, -1],
+            ],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_owner_sharded_slots_marks_causal_current_rows(self):
+        logical_slots = torch.tensor(
+            [
+                [10, 20, 30, 40, -1],
+                [10, 20, 30, 40, -1],
+                [10, 20, 30, 40, -1],
+                [10, 20, 30, 40, -1],
+            ],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        current_row_locs = torch.tensor(
+            [10, 20, 30, 40], dtype=torch.int64, device=self.device
+        )
+
+        actual = translate_owner_sharded_slots(
+            logical_slots,
+            owner_cp_size=8,
+            owner_page_size=64,
+            owner_pages_per_rank=32,
+            current_row_locs=current_row_locs,
+            current_rows_per_request=4,
+        )
+        torch.cuda.synchronize()
+
+        expected = torch.tensor(
+            [
+                [-2, 20, 30, 40, -1],
+                [-2, -3, 30, 40, -1],
+                [-2, -3, -4, 40, -1],
+                [-2, -3, -4, -5, -1],
+            ],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_decode_fast_extreme_shapes(self):
         self._check_decode_case(8192, 4096)

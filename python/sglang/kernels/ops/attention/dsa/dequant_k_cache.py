@@ -250,7 +250,8 @@ def _dequantize_k_cache_paged_kernel(
     DIM_ROPE: tl.constexpr,
 ):
     token_id = tl.program_id(0)
-    token_id_paged = tl.load(page_table_1_ptr + token_id).to(tl.int32)
+    # Page IDs fit int32, but Shared-VMM byte offsets can exceed 2 GiB.
+    token_id_paged = tl.load(page_table_1_ptr + token_id).to(tl.int64)
     raw_block_id = tl.program_id(1)
 
     if raw_block_id < NUM_NOPE_BLOCKS:

@@ -4,7 +4,7 @@ from typing import Optional, Tuple
 import torch
 
 try:
-    from sgl_kernel import flashmla_ops  # triggers TORCH extension registration
+    from sgl_kernel import flashmla_ops  # noqa: F401  # register TORCH extension
 except Exception as _e:
     _flashmla_import_error = _e
 else:
@@ -36,6 +36,64 @@ class FlashMLASchedMeta:
     config: Optional[Config] = None
     tile_scheduler_metadata: Optional[torch.Tensor] = None
     num_splits: Optional[torch.Tensor] = None
+
+
+def _validate_shared_kv_current_rows(
+    q: torch.Tensor,
+    current_rows: Optional[torch.Tensor],
+    current_row_ids: Optional[torch.Tensor],
+    current_row_counts: Optional[torch.Tensor],
+) -> bool:
+    provided = (
+        current_rows is not None,
+        current_row_ids is not None,
+        current_row_counts is not None,
+    )
+    assert all(provided) or not any(
+        provided
+    ), "Shared-KV current rows, row IDs, and row counts must be provided together"
+    if not all(provided):
+        return False
+
+    assert current_rows is not None
+    assert current_row_ids is not None
+    assert current_row_counts is not None
+    query_rows = q.shape[0] * q.shape[1]
+    assert current_rows.dtype == torch.uint8, "current rows must have dtype uint8"
+    assert current_rows.is_contiguous(), "current rows must be contiguous"
+    assert (
+        current_rows.ndim == 3 and current_rows.shape[0] == query_rows
+    ), "current rows must match the flattened FlashMLA query rows"
+    current_row_width = current_rows.shape[1]
+    assert (
+        1 <= current_row_width <= 4 and current_rows.shape[2] == 656
+    ), "current rows must have shape [query rows, width, 656] with 1 <= width <= 4"
+    assert current_row_ids.dtype == torch.int32, "current row IDs must have dtype int32"
+    assert current_row_ids.is_contiguous(), "current row IDs must be contiguous"
+    assert current_row_ids.shape == (
+        query_rows,
+        current_row_width,
+    ), "current row IDs must match the current-row width"
+    assert (
+        current_row_counts.dtype == torch.int32
+    ), "current row counts must have dtype int32"
+    assert current_row_counts.is_contiguous(), "current row counts must be contiguous"
+    assert current_row_counts.shape == (
+        query_rows,
+    ), "current row counts must have shape [query rows]"
+    # Counts are produced by the graph-stable SGLang metadata path whose
+    # rows-per-request contract is already bounded by the allocated width.
+    # Capturing this dynamic check would replay five tiny validation kernels for every
+    # model
+    # layer, so keep it as an eager/debug boundary check only.
+    if not torch.cuda.is_available() or not torch.cuda.is_current_stream_capturing():
+        torch._assert_async(
+            (
+                (current_row_counts >= 0) & (current_row_counts <= current_row_width)
+            ).all(),
+            "current row counts are outside the valid range for the allocated current-row width",
+        )
+    return True
 
 
 def get_mla_metadata(
@@ -103,6 +161,18 @@ def flash_mla_with_kvcache(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    shared_kv_row_cache: Optional[torch.Tensor] = None,
+    shared_kv_cache_tags: Optional[torch.Tensor] = None,
+    shared_kv_request_slots: Optional[torch.Tensor] = None,
+    shared_kv_cache_rows_per_request: int = 0,
+    shared_kv_num_request_slots: int = 0,
+    shared_kv_cache_epoch: int = 0,
+    shared_kv_cache_generation_tensor: Optional[torch.Tensor] = None,
+    shared_kv_local_row_begin: int = 0,
+    shared_kv_local_row_end: int = 0,
+    shared_kv_current_rows: Optional[torch.Tensor] = None,
+    shared_kv_current_row_ids: Optional[torch.Tensor] = None,
+    shared_kv_current_row_counts: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -129,6 +199,12 @@ def flash_mla_with_kvcache(
 
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
+    have_current_rows = _validate_shared_kv_current_rows(
+        q,
+        shared_kv_current_rows,
+        shared_kv_current_row_ids,
+        shared_kv_current_row_counts,
+    )
     if isinstance(tile_scheduler_metadata, FlashMLASchedMeta):
         return _flash_mla_with_kvcache_sched_meta(
             q=q,
@@ -147,7 +223,90 @@ def flash_mla_with_kvcache(
             extra_indices_in_kvcache=extra_indices_in_kvcache,
             topk_length=topk_length,
             extra_topk_length=extra_topk_length,
+            shared_kv_row_cache=shared_kv_row_cache,
+            shared_kv_cache_tags=shared_kv_cache_tags,
+            shared_kv_request_slots=shared_kv_request_slots,
+            shared_kv_cache_rows_per_request=shared_kv_cache_rows_per_request,
+            shared_kv_num_request_slots=shared_kv_num_request_slots,
+            shared_kv_cache_epoch=shared_kv_cache_epoch,
+            shared_kv_cache_generation_tensor=(shared_kv_cache_generation_tensor),
+            shared_kv_local_row_begin=shared_kv_local_row_begin,
+            shared_kv_local_row_end=shared_kv_local_row_end,
+            shared_kv_current_rows=shared_kv_current_rows,
+            shared_kv_current_row_ids=shared_kv_current_row_ids,
+            shared_kv_current_row_counts=shared_kv_current_row_counts,
         )
+
+    have_shared_cache = shared_kv_row_cache is not None
+    assert have_shared_cache == (shared_kv_cache_tags is not None)
+    assert (
+        have_shared_cache or not have_current_rows
+    ), "Shared-KV current rows require the Shared FlashMLA path"
+    if have_shared_cache:
+        assert indices is not None
+        assert not causal
+        assert is_fp8_kvcache
+        assert num_splits is not None
+        assert attn_sink is None
+        assert extra_k_cache is None
+        assert extra_indices_in_kvcache is None
+        assert extra_topk_length is None
+        assert shared_kv_cache_epoch > 0
+        if shared_kv_cache_generation_tensor is not None:
+            assert shared_kv_cache_generation_tensor.dtype == torch.int32
+            assert shared_kv_cache_generation_tensor.numel() == 1
+            assert shared_kv_cache_generation_tensor.is_contiguous()
+        assert shared_kv_local_row_end > shared_kv_local_row_begin
+        assert shared_kv_cache_rows_per_request > 0
+        assert (
+            shared_kv_cache_rows_per_request & (shared_kv_cache_rows_per_request - 1)
+            == 0
+        )
+        assert shared_kv_num_request_slots > 0
+        assert shared_kv_row_cache.ndim == 2
+        assert shared_kv_row_cache.shape == (
+            shared_kv_num_request_slots * shared_kv_cache_rows_per_request,
+            656,
+        )
+        assert shared_kv_cache_tags.shape == (
+            shared_kv_num_request_slots,
+            shared_kv_cache_rows_per_request,
+        )
+        if shared_kv_num_request_slots > 1:
+            assert (
+                shared_kv_request_slots is not None
+            ), "request slots are required for a multislice Shared-KV cache"
+        if shared_kv_request_slots is not None:
+            assert shared_kv_request_slots.dtype == torch.int64
+            assert shared_kv_request_slots.ndim == 1
+            assert shared_kv_request_slots.numel() == q.shape[0]
+        out, softmax_lse, _, _ = torch.ops.sgl_kernel.sparse_decode_shared_fwd.default(
+            q,
+            k_cache,
+            indices,
+            topk_length,
+            attn_sink,
+            tile_scheduler_metadata,
+            num_splits,
+            extra_k_cache,
+            extra_indices_in_kvcache,
+            extra_topk_length,
+            head_dim_v,
+            softmax_scale,
+            shared_kv_row_cache,
+            shared_kv_cache_tags,
+            shared_kv_request_slots,
+            shared_kv_cache_rows_per_request,
+            shared_kv_num_request_slots,
+            shared_kv_cache_epoch,
+            shared_kv_cache_generation_tensor,
+            shared_kv_local_row_begin,
+            shared_kv_local_row_end,
+            shared_kv_current_rows,
+            shared_kv_current_row_ids,
+            shared_kv_current_row_counts,
+        )
+        return out, softmax_lse
 
     assert num_splits is not None
     assert block_table is not None
@@ -157,6 +316,7 @@ def flash_mla_with_kvcache(
     assert extra_indices_in_kvcache is None
     assert topk_length is None
     assert extra_topk_length is None
+    assert not have_shared_cache
     if indices is not None:
         assert causal == False, "causal must be `false` if sparse attention is enabled."
     assert (descale_q is None) == (
@@ -216,6 +376,18 @@ def _flash_mla_with_kvcache_sched_meta(
     extra_indices_in_kvcache: Optional[torch.Tensor],
     topk_length: Optional[torch.Tensor],
     extra_topk_length: Optional[torch.Tensor],
+    shared_kv_row_cache: Optional[torch.Tensor],
+    shared_kv_cache_tags: Optional[torch.Tensor],
+    shared_kv_request_slots: Optional[torch.Tensor],
+    shared_kv_cache_rows_per_request: int,
+    shared_kv_num_request_slots: int,
+    shared_kv_cache_epoch: int,
+    shared_kv_cache_generation_tensor: Optional[torch.Tensor],
+    shared_kv_local_row_begin: int,
+    shared_kv_local_row_end: int,
+    shared_kv_current_rows: Optional[torch.Tensor],
+    shared_kv_current_row_ids: Optional[torch.Tensor],
+    shared_kv_current_row_counts: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert num_splits is None, "num_splits must be None with FlashMLASchedMeta"
 
@@ -265,21 +437,56 @@ def _flash_mla_with_kvcache_sched_meta(
     if topk is not None:
         assert not causal, "causal must be False when sparse attention is enabled"
         assert is_fp8_kvcache, "is_fp8_kvcache must be True for sparse attention"
-        out, lse, new_tile_scheduler_metadata, new_num_splits = (
-            torch.ops.sgl_kernel.sparse_decode_fwd.default(
-                q,
-                k_cache,
-                indices,
-                topk_length,
-                attn_sink,
-                sched_meta.tile_scheduler_metadata,
-                sched_meta.num_splits,
-                extra_k_cache,
-                extra_indices_in_kvcache,
-                extra_topk_length,
-                head_dim_v,
-                softmax_scale,
+        have_shared_cache = shared_kv_row_cache is not None
+        assert have_shared_cache == (shared_kv_cache_tags is not None)
+        if have_shared_cache:
+            assert extra_k_cache is None
+            assert extra_indices_in_kvcache is None
+            assert extra_topk_length is None
+            assert shared_kv_cache_epoch > 0
+            if shared_kv_cache_generation_tensor is not None:
+                assert shared_kv_cache_generation_tensor.dtype == torch.int32
+                assert shared_kv_cache_generation_tensor.numel() == 1
+                assert shared_kv_cache_generation_tensor.is_contiguous()
+            assert shared_kv_local_row_end > shared_kv_local_row_begin
+            assert shared_kv_cache_rows_per_request > 0
+            assert shared_kv_num_request_slots > 0
+            if shared_kv_num_request_slots > 1:
+                assert (
+                    shared_kv_request_slots is not None
+                ), "request slots are required for a multislice Shared-KV cache"
+            sparse_op = torch.ops.sgl_kernel.sparse_decode_shared_fwd.default
+            shared_args = (
+                shared_kv_row_cache,
+                shared_kv_cache_tags,
+                shared_kv_request_slots,
+                shared_kv_cache_rows_per_request,
+                shared_kv_num_request_slots,
+                shared_kv_cache_epoch,
+                shared_kv_cache_generation_tensor,
+                shared_kv_local_row_begin,
+                shared_kv_local_row_end,
+                shared_kv_current_rows,
+                shared_kv_current_row_ids,
+                shared_kv_current_row_counts,
             )
+        else:
+            sparse_op = torch.ops.sgl_kernel.sparse_decode_fwd.default
+            shared_args = ()
+        out, lse, new_tile_scheduler_metadata, new_num_splits = sparse_op(
+            q,
+            k_cache,
+            indices,
+            topk_length,
+            attn_sink,
+            sched_meta.tile_scheduler_metadata,
+            sched_meta.num_splits,
+            extra_k_cache,
+            extra_indices_in_kvcache,
+            extra_topk_length,
+            head_dim_v,
+            softmax_scale,
+            *shared_args,
         )
     else:
         assert block_table is not None and cache_seqlens is not None
