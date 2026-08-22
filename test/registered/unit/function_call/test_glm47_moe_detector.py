@@ -26,6 +26,24 @@ _NULLABLE_STRING_CASES = (
         "value",
         "value",
     ),
+    (
+        "anyof-nullable-null",
+        {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "null",
+        None,
+    ),
+    (
+        "anyof-nullable-string",
+        {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "value",
+        "value",
+    ),
+    (
+        "oneof-nullable-null",
+        {"oneOf": [{"type": "string"}, {"type": "null"}]},
+        "null",
+        None,
+    ),
 )
 
 
