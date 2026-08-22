@@ -11,6 +11,7 @@ stride (nope_dim + rope_dim*2) per token, and scales are stored in a
 separate region at the end of each page.
 """
 
+import functools
 import logging
 import math
 from typing import Optional
@@ -468,6 +469,30 @@ def _split_kv_pages_to_64(
         (num_dst_pages, _PBS_DST, 1, bpt),
         (_BYTES_PER_DST_PAGE_PADDED, bpt, bpt, 1),
     )
+
+
+@functools.lru_cache(maxsize=1)
+def sm120_flashmla_decode_max_tokens() -> int:
+    """Row count at or below which the flashinfer path takes the split-K decode
+    kernel instead of the paged/prefill kernel (the ``B <= _FI_DECODE_MAX_TOKENS``
+    fork below).
+
+    Callers that vary the query head count must stay STRICTLY ABOVE this value:
+    only the paged/prefill kernel is validated for h_q != 64.
+
+    Returns 0 when the backend is not flashinfer, where the triton and torch
+    fallbacks read h_q off the query shape and there is no floor to respect.
+    Returns a value no batch can exceed if the flashinfer symbol moves, which
+    pins callers to the padded width.
+    """
+    if _sm120_default_backend != "flashinfer":
+        return 0
+    try:
+        from flashinfer.mla._sparse_mla_sm120 import _DECODE_MAX_TOKENS
+
+        return int(_DECODE_MAX_TOKENS)
+    except Exception:
+        return 1 << 30
 
 
 def _flash_mla_flashinfer(
