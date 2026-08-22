@@ -16,11 +16,19 @@ GB300, 2x4 MNNVL:
   SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB=32768 \
   torchrun --nnodes=2 --nproc-per-node=4 ... bench_sp_collective.py --tune ...
 
-B300, 1x8 single node -- no multinode env vars, and leave the push size
-unforced so the sweep can pick it:
+B300, 1x8 single node -- no multinode env vars, but the push size MUST still be
+forced. It sizes the push workspace; it is not a parameter the sweep picks.
+Left at the default, every T >= 512 is skipped with "local shard N B exceeds
+push slot 786432 B", and the table silently covers only small batches:
 
+  SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB=32768 \
   torchrun --nnodes=1 --nproc-per-node=8 \
     benchmark/kernels/kimi_k3/bench_sp_collective.py --tune --output-auto
+
+The value used is recorded as push_slot_bytes in the table, but the runtime does
+NOT read it back -- it reads the same env var. A server consuming this table
+must set it to at least that value or the push strategies it selects will not
+fit.
 """
 
 from __future__ import annotations
@@ -38,6 +46,7 @@ from sglang.kernels.ops.kimi_k3 import sp_collective
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
+from sglang.srt.distributed.parallel_state import init_distributed_environment
 
 
 def parse_args() -> argparse.Namespace:
@@ -219,6 +228,20 @@ def validate_attn_res_carry(
         )
 
 
+def _symm_empty_like(x: torch.Tensor, group_name: str) -> torch.Tensor:
+    """Symmetric-memory tensor shaped like ``x``.
+
+    Replaces k3_ar_fusion.symm_alloc(), removed in favour of named persistent
+    buffers that size themselves from the server's schedule; a standalone
+    benchmark has no schedule to size them from.
+    """
+    from torch._C._distributed_c10d import _SymmetricMemory
+
+    return _SymmetricMemory.empty_strided_p2p(
+        (x.numel(),), [1], x.dtype, x.device, group_name
+    ).view_as(x)
+
+
 def main() -> None:
     args = parse_args()
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -228,6 +251,11 @@ def main() -> None:
     world = dist.get_world_size()
     device = torch.device("cuda", local_rank)
     cpu_group = dist.new_group(backend="gloo")
+    # CustomAllReduceV2's p2p probe reaches get_world_group(), so sglang's own
+    # parallel state must exist and not just torch's process group.
+    init_distributed_environment(
+        world_size=world, rank=rank, local_rank=local_rank, backend="nccl"
+    )
 
     # GroupCoordinator constructs custom-AR over its CPU group as well: the
     # topology probe and symmetric-memory rendezvous need a non-NCCL group,
@@ -341,10 +369,7 @@ def main() -> None:
         if "pull" in args.rs_strategies:
             import torch.distributed._symmetric_memory as torch_symm_mem
 
-            from sglang.srt.layers.k3_ar_fusion import symm_alloc
-
-            with symm_alloc():
-                rs_pull_input = torch.empty_like(rs_input)
+            rs_pull_input = _symm_empty_like(rs_input, cpu_group.group_name)
             rs_pull_input.copy_(rs_input)
             rs_pull_out = torch.empty_like(rs_ref)
             rs_pull_handle = torch_symm_mem.rendezvous(
@@ -363,10 +388,7 @@ def main() -> None:
         if "direct" in args.ag_strategies:
             import torch.distributed._symmetric_memory as torch_symm_mem
 
-            from sglang.srt.layers.k3_ar_fusion import symm_alloc
-
-            with symm_alloc():
-                ag_direct_out = torch.empty_like(ag_ref)
+            ag_direct_out = _symm_empty_like(ag_ref, cpu_group.group_name)
             ag_direct_handle = torch_symm_mem.rendezvous(
                 ag_direct_out, cpu_group.group_name
             )

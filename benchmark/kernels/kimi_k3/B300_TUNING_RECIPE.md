@@ -50,13 +50,24 @@ after, you book the node.
 One process per GPU, single node:
 
 ```bash
+SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB=32768 \
 torchrun --nnodes=1 --nproc-per-node=8 \
   benchmark/kernels/kimi_k3/bench_sp_collective.py --tune --output-auto
 ```
 
-No multinode env vars on B300, and leave the push size unforced so the sweep
-picks it. `--output-auto` writes to the exact path the runtime looks up;
-hand-naming the file reintroduces the silent-miss bug.
+No multinode env vars on B300, but the push size must still be forced: it sizes
+the push workspace and is not something the sweep picks. Unforced, every
+T >= 512 is skipped ("local shard N B exceeds push slot 786432 B") and you get a
+table covering only small batches without any error.
+
+`--output-auto` writes to the exact path the runtime looks up; hand-naming the
+file reintroduces the silent-miss bug. The measured device string is
+`NVIDIA B300 SXM6 AC`, not `NVIDIA B300`.
+
+**Deployment coupling:** the table records `push_slot_bytes`, but the runtime
+does not read it back -- it reads `SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB`.
+A server consuming this table must set that env var to at least the recorded
+value, or the push strategies the table selects will not fit.
 
 Every candidate is checked against NCCL before timing, so a table that selects
 `nccl` for some token bucket is a real result, not a failure.
