@@ -14,6 +14,7 @@ def set_mla_kv_buffer_kernel(
     cache_k_nope_ptr,
     cache_k_rope_ptr,
     loc_ptr,
+    reserved_skip_index,
     buffer_stride: tl.constexpr,
     nope_stride: tl.constexpr,
     rope_stride: tl.constexpr,
@@ -36,7 +37,7 @@ def set_mla_kv_buffer_kernel(
         tl.extra.cuda.gdc_wait()
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
-    is_valid = loc % DCP_WORLD_SIZE == DCP_RANK
+    is_valid = (loc != reserved_skip_index) & (loc % DCP_WORLD_SIZE == DCP_RANK)
     safe_loc = tl.where(is_valid, loc, 0)
     safe_loc = safe_loc // DCP_WORLD_SIZE
     dst_ptr = kv_buffer_ptr + safe_loc * buffer_stride + offs
@@ -92,6 +93,8 @@ def set_mla_kv_buffer_triton(
     loc: torch.Tensor,
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
+    *,
+    reserved_skip_index: int = 0,
 ):
     """Dispatch MLA paged-KV scatter writes to the fastest available path.
 
@@ -115,6 +118,9 @@ def set_mla_kv_buffer_triton(
 
     Name retained for caller compatibility; the implementation is no longer
     Triton-only.
+
+    Writes targeting ``reserved_skip_index`` are skipped. Slot 0 is reserved
+    for CUDA-graph padding by default; pass -1 to disable skipping.
     """
     from sglang.kernels.ops.kvcache.set_mla_kv_buffer import (
         can_use_set_mla_kv_buffer,
@@ -132,7 +138,13 @@ def set_mla_kv_buffer_triton(
         and can_use_set_mla_kv_buffer(nope_bytes, rope_bytes)
         and not get_parallel().dcp_enabled
     ):
-        jit_set_mla_kv_buffer(kv_buffer, loc, cache_k_nope, cache_k_rope)
+        jit_set_mla_kv_buffer(
+            kv_buffer,
+            loc,
+            cache_k_nope,
+            cache_k_rope,
+            reserved_skip_index=reserved_skip_index,
+        )
         return
 
     # Fallback: Triton with BLOCK = next_pow2(total_dim). One CTA per loc; the
@@ -151,6 +163,7 @@ def set_mla_kv_buffer_triton(
         cache_k_nope,
         cache_k_rope,
         loc,
+        reserved_skip_index,
         kv_buffer.stride(0),
         cache_k_nope.stride(0),
         cache_k_rope.stride(0),
@@ -169,6 +182,7 @@ def set_mla_kv_buffer_fp8_quant_kernel(
     cache_k_nope_ptr,
     cache_k_rope_ptr,
     loc_ptr,
+    reserved_skip_index,
     buffer_stride: tl.constexpr,
     nope_stride: tl.constexpr,
     rope_stride: tl.constexpr,
@@ -190,7 +204,9 @@ def set_mla_kv_buffer_fp8_quant_kernel(
         tl.extra.cuda.gdc_wait()
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
-    dst_ptr = kv_buffer_fp8_ptr + loc * buffer_stride + offs
+    is_valid = loc != reserved_skip_index
+    safe_loc = tl.where(is_valid, loc, 0)
+    dst_ptr = kv_buffer_fp8_ptr + safe_loc * buffer_stride + offs
 
     if base + BLOCK <= nope_dim:
         src = tl.load(
@@ -220,7 +236,7 @@ def set_mla_kv_buffer_fp8_quant_kernel(
         src = tl.where(is_nope, src_nope, src_rope)
 
     # Destination pointer is FP8-typed view; tl.store performs downcast.
-    tl.store(dst_ptr, src, mask=mask)
+    tl.store(dst_ptr, src, mask=mask & is_valid)
 
     if USE_GDC:
         tl.extra.cuda.gdc_launch_dependents()
@@ -232,8 +248,13 @@ def set_mla_kv_buffer_triton_fp8_quant(
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
     fp8_dtype: torch.dtype,
+    *,
+    reserved_skip_index: int = 0,
 ):
-    """Fuse BF16/FP16 MLA K quantization with paged KV write."""
+    """Fuse BF16/FP16 MLA K quantization with paged KV write.
+
+    Writes targeting ``reserved_skip_index`` are skipped. Pass -1 to disable.
+    """
     kv_buffer_fp8 = kv_buffer.view(fp8_dtype)
 
     nope_dim = cache_k_nope.shape[-1]
@@ -250,6 +271,7 @@ def set_mla_kv_buffer_triton_fp8_quant(
         cache_k_nope,
         cache_k_rope,
         loc,
+        reserved_skip_index,
         kv_buffer_fp8.stride(0),
         cache_k_nope.stride(0),
         cache_k_rope.stride(0),
@@ -266,6 +288,7 @@ def set_mla_kv_scale_buffer_kernel(
     cache_k_nope_ptr,
     cache_k_rope_ptr,
     loc_ptr,
+    reserved_skip_index,
     buffer_stride: tl.constexpr,
     nope_stride: tl.constexpr,
     rope_stride: tl.constexpr,
@@ -282,7 +305,9 @@ def set_mla_kv_scale_buffer_kernel(
     mask = offs < total_dim  # Make sure don't cross the boundary
 
     loc = tl.load(loc_ptr + pid_loc)
-    dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
+    is_valid = loc != reserved_skip_index
+    safe_loc = tl.where(is_valid, loc, 0)
+    dst_ptr = kv_buffer_ptr + safe_loc * buffer_stride + offs
 
     # Check each offs should read 'nope' or 'rope'
     is_nope = offs < nope_dim
@@ -297,7 +322,7 @@ def set_mla_kv_scale_buffer_kernel(
 
     # Combine nope + rope
     src = src_nope + src_rope
-    tl.store(dst_ptr, src, mask=mask)
+    tl.store(dst_ptr, src, mask=mask & is_valid)
 
 
 def set_mla_kv_scale_buffer_triton(
@@ -305,7 +330,10 @@ def set_mla_kv_scale_buffer_triton(
     loc: torch.Tensor,
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
+    *,
+    reserved_skip_index: int = 0,
 ):
+    """Write MLA scale rows while preserving the reserved padding slot."""
     nope_dim = cache_k_nope.shape[-1]
     rope_dim = cache_k_rope.shape[-1]
     total_dim = nope_dim + rope_dim
@@ -318,6 +346,7 @@ def set_mla_kv_scale_buffer_triton(
         cache_k_nope,
         cache_k_rope,
         loc,
+        reserved_skip_index,
         kv_buffer.stride(0),
         cache_k_nope.stride(0),
         cache_k_rope.stride(0),
