@@ -1,16 +1,19 @@
 import logging
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
+class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
     """Property tests for Scheduler.init_req_max_new_tokens.
 
     Rules enforced when clipping a request's max_new_tokens:
@@ -56,6 +59,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         scheduler.max_total_num_tokens = max_total_num_tokens
         scheduler.page_size = page_size
         scheduler.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
+        scheduler.enable_hisparse = False
         return scheduler
 
     def _new_req(self, max_new_tokens, input_len: int = 8, min_new_tokens: int = 0):
@@ -82,9 +86,12 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
 
         def satisfies_rules(candidate: int) -> bool:
             context_ok = input_len + candidate < scheduler.max_req_len
-            budget_ok = (
-                paged_input_len + candidate + page_size < scheduler.max_total_num_tokens
+            token_capacity = (
+                scheduler.tp_worker.model_runner.max_token_pool_size
+                if scheduler.enable_hisparse
+                else scheduler.max_total_num_tokens
             )
+            budget_ok = paged_input_len + candidate + page_size < token_capacity
             limit_ok = not limit_active or candidate <= limit
             requested_ok = requested is None or candidate <= requested
             return context_ok and budget_ok and limit_ok and requested_ok
@@ -150,6 +157,41 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             req = self._new_req(max_new_tokens=64, min_new_tokens=32)
             self.assertEqual(self._init_and_check(scheduler, req), 16)
             self.assertEqual(req.sampling_params.min_new_tokens, 16)
+
+    def test_hisparse_uses_host_backed_capacity_for_generation_budget(self):
+        scheduler = self._new_scheduler(
+            max_req_len=199, max_total_num_tokens=100, page_size=1
+        )
+        scheduler.enable_hisparse = True
+        scheduler.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(max_token_pool_size=200)
+        )
+        req = self._new_req(max_new_tokens=10, input_len=150)
+
+        self.assertEqual(self._init_and_check(scheduler, req), 10)
+
+    def test_worker_info_uses_logical_pool_capacity_for_request_limit(self):
+        worker = TpModelWorker.__new__(TpModelWorker)
+        worker.model_config = SimpleNamespace(context_len=1_000)
+        worker.ps = SimpleNamespace(attn_dcp_size=1)
+        worker._model_runner = SimpleNamespace(
+            effective_max_total_num_tokens=100,
+            max_token_pool_size=200,
+            max_total_num_tokens=100,
+            max_running_requests=8,
+            forward_stream=None,
+            req_to_token_pool=SimpleNamespace(size=8, max_context_len=1_000),
+            token_to_kv_pool=SimpleNamespace(size=200),
+        )
+        worker.random_seed = 0
+        worker.device = "cpu"
+
+        schedule = SimpleNamespace(max_prefill_tokens=128, max_queued_requests=None)
+        with patch("sglang.srt.managers.tp_worker.get_schedule", return_value=schedule):
+            worker_info = worker.get_worker_info()
+
+        self.assertEqual(worker_info[4], 199)
+        self.assertEqual(worker_info[5], 194)
 
     def test_admission_rules_sweep(self):
         for page_size in (1, 4, 16):
