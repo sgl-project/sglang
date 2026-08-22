@@ -55,6 +55,7 @@ dependencies = [
   "sentencepiece",
   "setproctitle",
   "sgl-kernel @ git+https://github.com/sgl-project/sgl-kernel-xpu.git",
+  "triton_kernels @ git+https://github.com/intel/intel-xpu-backend-for-triton.git@main#subdirectory=python/triton_kernels",
   "smg-grpc-servicer>=0.5.0",
   "soundfile==0.13.1",
   "tiktoken",
