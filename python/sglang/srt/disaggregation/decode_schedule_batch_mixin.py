@@ -10,6 +10,7 @@ from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.utils.common import is_pin_memory_available
 
 logger = logging.getLogger(__name__)
 
@@ -88,14 +89,24 @@ class ScheduleBatchDisaggregationDecodeMixin:
         # process_prebuilt through FutureMap, so merge/forward-entry rebuilds
         # input_ids from the relay.
         self.input_ids = None
-        self.req_pool_indices = torch.tensor(
-            req_pool_indices, dtype=torch.int64, device=self.device
+        # Direct CUDA construction from Python lists uses pageable synchronous
+        # H2D copies. Stage through pinned CPU tensors so admission does not wait
+        # for the preceding decode graph before submitting these small copies.
+        _pin = is_pin_memory_available(self.device)
+        self.req_pool_indices_cpu = torch.tensor(
+            req_pool_indices, dtype=torch.int64, pin_memory=_pin
         )
-        self.req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
-        self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        self.req_pool_indices = self.req_pool_indices_cpu.to(
+            self.device, non_blocking=True
+        )
+        self.seq_lens_cpu = torch.tensor(
+            seq_lens, dtype=torch.int64, pin_memory=_pin
+        )
+        self.seq_lens = self.seq_lens_cpu.to(self.device, non_blocking=True)
         self.orig_seq_lens = torch.tensor(
-            seq_lens, dtype=torch.int32, device=self.device
+            seq_lens, dtype=torch.int32, pin_memory=_pin
+        ).to(
+            self.device, non_blocking=True
         )
         self.out_cache_loc = out_cache_loc
         self.seq_lens_sum = sum(seq_lens)

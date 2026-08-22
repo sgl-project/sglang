@@ -170,6 +170,16 @@
     "change": "When Layer-3 host telemetry is explicitly enabled, split PREBUILT preparation at request metadata, device tensor metadata, and sampling metadata boundaries.",
     "scope": "Diagnostic source only; default-off execution passes no callback and retains the original work and ordering."
   },
+  "layer3_prebuilt_metadata_async_h2d_ab": {
+    "parent_commit": "3ae28c1ab4608da01ea1570e84199119d8fffac3",
+    "file": "python/sglang/srt/disaggregation/decode_schedule_batch_mixin.py",
+    "baseline_sha256": "bebdbee044ba79b130a230c378793912957053e3a476d2e59793fcecc0cf9bf6",
+    "candidate_sha256": "61d93f1b958874f3b19e00c9406304b8dc5d8e0865af9559cd566d69a827b8c7",
+    "change": "Apply the production pinned-host/non-blocking PREBUILT metadata copies on top of the existing Layer-3 prepare-substage telemetry so the service A/B remains single-variable relative to job 3233393.",
+    "source_evidence": "Job 3233393 attributes 2.198624/2.106208 ms per selected B10-B12 step to the tensor-metadata stage after admission-frequency weighting.",
+    "targeted_validation": "CMH job 3233760: 5 existing PREBUILT metadata tests pass; identical production transformation reduces host enqueue from 38.710445 to 0.032832 ms behind controlled prior GPU work. Same-source 3P2D C704 service A/B is pending.",
+    "scope": "Diagnostic A/B source only; final production source remains the top-only branch."
+  },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
     "tree": "b0161fbca98775c0f79999f4970de1f14a4426fb"
