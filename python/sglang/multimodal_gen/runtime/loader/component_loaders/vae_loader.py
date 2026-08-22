@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from safetensors.torch import load_file as safetensors_load_file
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
@@ -30,7 +31,11 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
+from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_enabled,
+    resolve_component_precision,
+    resolve_decode_precision,
+)
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.model_loader.checkpoint_quantization import (
     resolve_checkpoint_quant_spec,
@@ -124,6 +129,41 @@ def _should_use_channels_last_3d(
     ):
         return True
     return False
+
+
+def _hold_decoder_weights_in_decode_dtype(
+    vae, server_args: ServerArgs, component_name: str
+) -> None:
+    """Round decoder weights to their decode compute dtype at load.
+
+    The decode stage persists these frozen weights in the autocast dtype on
+    first use (``prepare_autocast_linear_weights``), so the rounding itself is
+    already part of the output. Doing it at load makes residency plans, host
+    pins, and every host-to-device copy carry the halved size: MiniMax-H3's
+    video decoder drops from 9.7 to ~4.9 GiB, which is the difference between
+    restreaming a third of it per tile and holding all 36 blocks on a 12 GiB
+    card for the decode.
+    """
+    if component_name not in ("vae", "video_vae"):
+        return
+    if envs.SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST:
+        return
+    prepare = getattr(vae, "prepare_decoder_autocast_weights", None)
+    if prepare is None:
+        return
+    dtype = resolve_decode_precision(server_args, component_name)
+    if dtype == torch.float32:
+        return
+    if not autocast_enabled(dtype, server_args.disable_autocast):
+        return
+    converted = prepare(dtype)
+    if converted:
+        logger.info(
+            "VAE: %s holds %d decoder weights in %s from load",
+            component_name,
+            converted,
+            dtype,
+        )
 
 
 def _match_checkpoint_dtypes(loaded: dict, target_state: dict) -> dict:
@@ -235,6 +275,7 @@ class VAELoader(ComponentLoader):
                     logger.info(
                         "VAE: converted %d Conv3d weights to channels_last_3d", n
                     )
+            _hold_decoder_weights_in_decode_dtype(vae, server_args, component_name)
             vae = current_platform.optimize_vae(vae)
             return vae
 
@@ -303,5 +344,6 @@ class VAELoader(ComponentLoader):
             if n > 0:
                 logger.info("VAE: converted %d Conv3d weights to channels_last_3d", n)
 
+        _hold_decoder_weights_in_decode_dtype(vae, server_args, component_name)
         vae = current_platform.optimize_vae(vae)
         return vae
