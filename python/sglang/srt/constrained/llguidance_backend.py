@@ -36,11 +36,15 @@ from sglang.srt.constrained.base_grammar_backend import (
     InvalidGrammarObject,
     register_vocab_mask_buffer,
 )
+from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
+    set_token_filter_torch,
+)
 from sglang.srt.constrained.utils import is_legacy_structural_tag
-from sglang.srt.utils import get_int_env_var
+from sglang.srt.utils import get_int_env_var, is_hip
 
 logger = logging.getLogger(__name__)
 _LLGUIDANCE_LOG_LEVEL = get_int_env_var("LLGUIDANCE_LOG_LEVEL", 1)
+_is_hip = is_hip()
 
 
 class GrammarDraftRow(NamedTuple):
@@ -231,6 +235,52 @@ class GuidanceBackend(BaseGrammarBackend):
         # Initialize the shared executor here so the first batched mask fill
         # does not pay its one-time setup cost on the request path.
         _get_or_init_mask_executor()
+
+    @property
+    def is_support_token_filter(self):
+        return True
+
+    def allocate_vocab_mask(
+        self, vocab_size: int, batch_size: int, device
+    ) -> torch.Tensor:
+        return allocate_token_bitmask(batch_size, self.llguidance_tokenizer.vocab_size)
+
+    @staticmethod
+    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
+        return vocab_mask.to(device, non_blocking=True)
+
+    @staticmethod
+    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+        apply_token_bitmask_inplace(logits, vocab_mask)
+
+    @staticmethod
+    def set_token_filter(
+        vocab_mask: torch.Tensor,
+        token_ids: List[int],
+        batch_idx: int,
+        is_allowed: bool = True,
+        reset_vocab_mask: bool = True,
+    ):
+        if _is_hip or vocab_mask.device.type != "cuda":
+            set_token_filter_torch(
+                vocab_mask,
+                token_ids,
+                batch_idx,
+                is_allowed=is_allowed,
+                reset_vocab_mask=reset_vocab_mask,
+            )
+        else:
+            from sglang.kernels.ops.grammar.token_filter_ops import (
+                set_token_filter_triton,
+            )
+
+            set_token_filter_triton(
+                vocab_mask,
+                token_ids,
+                batch_idx,
+                is_allowed=is_allowed,
+                reset_vocab_mask=reset_vocab_mask,
+            )
 
     def initialize_vocab_mask_buffer(
         self,
