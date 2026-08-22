@@ -137,7 +137,9 @@ def _estimate_masked_standard_layout_peak_bytes(
         down_scale_row_bytes = 0
     else:
         block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
-        packed_scales = quant_info.use_mxfp8 or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        packed_scales = (
+            quant_info.use_mxfp8 or deep_gemm_wrapper.DEEPGEMM_MASKED_FP8_PACKED_SCALES
+        )
         scale_item_bytes = (
             torch.uint8.itemsize if packed_scales else torch.float32.itemsize
         )
@@ -162,6 +164,13 @@ def _should_use_masked_standard_layout(
         raise ValueError(
             "SGLANG_DEEPGEMM_STANDARD_LAYOUT must be one of: auto, masked, compact"
         )
+    if deep_gemm_wrapper.DEEPGEMM_MASKED_FP8_BACKEND != "native":
+        if mode == "compact":
+            raise ValueError(
+                "FlashInfer batch masked FP8 backends require "
+                "SGLANG_DEEPGEMM_STANDARD_LAYOUT=masked or auto"
+            )
+        return True
     if mode != "auto":
         return mode == "masked"
 
@@ -585,7 +594,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             recipe_a, recipe_b = None, None
 
         # GroupGemm-0
-        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        if deep_gemm_wrapper.DEEPGEMM_MASKED_FP8_PACKED_SCALES:
             if hidden_states_scale.dtype != torch.int:
                 b, s_mn, s_k = hidden_states_scale.shape
                 assert (
@@ -594,7 +603,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 hidden_states_scale = _cast_to_e8m0_with_rounding_up(
                     hidden_states_scale
                 )
-        elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        elif deep_gemm_wrapper.DEEPGEMM_MASKED_NEED_TMA_ALIGNED_SCALES:
             hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 hidden_states_scale
             )
@@ -687,7 +696,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     down_input_scale
                 )
             )
-        elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        elif deep_gemm_wrapper.DEEPGEMM_MASKED_NEED_TMA_ALIGNED_SCALES:
             down_input_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 down_input_scale
             )
@@ -1354,10 +1363,24 @@ def _varlen_deep_gemm_silu_mul_quant(
             down_input_scale = down_input_scale.transpose(-1, -2)
         return down_input, down_input_scale
 
-    # Default plain-silu path: the unified JIT masked fused quant. It allocates
-    # the outputs itself, with scales directly in the layout deep_gemm consumes
-    # (packed-int32 col-major for UE8M0, TMA-aligned col-major fp32 otherwise),
-    # so the caller's get_mn_major transform short-circuits.
+    # Public batch APIs consume row-major float32 scales. Produce exact UE8M0
+    # powers of two directly so every MoE layer avoids a packed-scale expansion.
+    if (
+        deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        and not deep_gemm_wrapper.DEEPGEMM_MASKED_FP8_PACKED_SCALES
+    ):
+        return per_token_group_quant(
+            gateup_output,
+            group_size=group_size,
+            scale_ue8m0=True,
+            fuse_silu_and_mul=True,
+            masked_m=masked_m,
+            expected_m=ceil_div(num_real_tokens * topk, E) if num_real_tokens else None,
+            column_major_scales=False,
+            unpacked_ue8m0_scales=True,
+        )
+
+    # Native DeepGEMM keeps the packed UE8M0 layout used by its TMA path.
     expected_m = ceil_div(num_real_tokens * topk, E) if num_real_tokens else None
     return per_token_group_quant(
         gateup_output,
