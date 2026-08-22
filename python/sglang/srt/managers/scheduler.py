@@ -284,6 +284,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
+from sglang.srt.observability.startup_phase_registry import startup_phase
 from sglang.srt.observability.startup_time import build_scheduler_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -670,7 +671,6 @@ class Scheduler(
             draft_load_weight=(
                 0.0 if self.draft_worker is None else self.draft_worker.weight_load_time
             ),
-            kv_cache_allocation=self.kv_cache_allocation_time,
             scheduler_e2e=time.perf_counter() - self.scheduler_startup_begin,
             target_cuda_graph=self.tp_worker.graph_time_usage,
             draft_cuda_graph=(
@@ -942,7 +942,8 @@ class Scheduler(
         )
 
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
-        self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+        with startup_phase(draft=True):
+            self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
 
         if self.spec_algorithm.is_ngram():
             from sglang.srt.speculative.external_corpus_manager import (
@@ -1001,18 +1002,16 @@ class Scheduler(
         self.maybe_init_draft_worker()
 
         # Prepare KV cache pools for all workers
-        tic = time.perf_counter()
-        self.init_memory_pools()
-        self.kv_cache_allocation_time = time.perf_counter() - tic
+        with startup_phase("kv_cache_allocation"):
+            self.init_memory_pools()
 
         self.init_all_attention_backends()
         self.init_all_cuda_graphs()
 
         model_runner = self.tp_worker.model_runner
         if model_runner.token_to_kv_pool.post_capture_active:
-            tic = time.perf_counter()
-            model_runner.post_capture_resize_kv_pool()
-            self.kv_cache_allocation_time += time.perf_counter() - tic
+            with startup_phase("kv_cache_allocation"):
+                model_runner.post_capture_resize_kv_pool()
 
         if self.server_args.is_startup_weight_load_overlap:
             self.tp_worker.finalize_startup_weight_load()

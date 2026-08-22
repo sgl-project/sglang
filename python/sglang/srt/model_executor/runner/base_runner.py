@@ -46,6 +46,7 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
 )
+from sglang.srt.observability.startup_phase_registry import startup_phase
 from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.speculative.spec_info import create_dummy_verify_input
 from sglang.srt.utils import (
@@ -240,12 +241,13 @@ class BaseRunner(ABC):
         self._pre_initialize_fi_a2a_workspace()
 
         if should_run_flashinfer_autotune(self.model_runner):
-            buffers, batch_size = self._autotune_buffers()
-            assert (
-                buffers is not None
-            ), "_autotune_buffers() must return a reusable buffer set for autotune"
-            self._flashinfer_autotune(buffers=buffers, batch_size=batch_size)
-            maybe_flashinfer_autotune_extend(self, decode_num_tokens=batch_size)
+            with startup_phase("flashinfer_autotune"):
+                buffers, batch_size = self._autotune_buffers()
+                assert (
+                    buffers is not None
+                ), "_autotune_buffers() must return a reusable buffer set for autotune"
+                self._flashinfer_autotune(buffers=buffers, batch_size=batch_size)
+                maybe_flashinfer_autotune_extend(self, decode_num_tokens=batch_size)
 
         if (
             envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
