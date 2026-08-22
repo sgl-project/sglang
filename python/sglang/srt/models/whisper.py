@@ -18,8 +18,11 @@ from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.common import ceil_align
 
 
 class WhisperAttention(torch.nn.Module):
@@ -236,6 +239,7 @@ class WhisperDecoderLayer(torch.nn.Module):
         decoder_hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
+        skip_cross_attention: bool = False,
     ) -> torch.Tensor:
 
         residual = decoder_hidden_states
@@ -243,12 +247,18 @@ class WhisperDecoderLayer(torch.nn.Module):
         decoder_hidden_states = self.self_attn(decoder_hidden_states, forward_batch)
         decoder_hidden_states = residual + decoder_hidden_states
 
-        residual = decoder_hidden_states
-        decoder_hidden_states = self.encoder_attn_layer_norm(decoder_hidden_states)
-        decoder_hidden_states = self.encoder_attn(
-            decoder_hidden_states, forward_batch, encoder_hidden_states
-        )
-        decoder_hidden_states = residual + decoder_hidden_states
+        # Skip cross-attention when the batch carries no encoder output
+        # (``encoder_lens == 0``, e.g. the text-only warmup request). Attending
+        # to a zero-length encoder KV region is a no-op mathematically but the
+        # paged attention kernels hang on it (XPU backend), so bypass the whole
+        # additive block just like the other encoder-decoder models do.
+        if not skip_cross_attention:
+            residual = decoder_hidden_states
+            decoder_hidden_states = self.encoder_attn_layer_norm(decoder_hidden_states)
+            decoder_hidden_states = self.encoder_attn(
+                decoder_hidden_states, forward_batch, encoder_hidden_states
+            )
+            decoder_hidden_states = residual + decoder_hidden_states
 
         residual = decoder_hidden_states
         decoder_hidden_states = self.final_layer_norm(decoder_hidden_states)
@@ -345,6 +355,7 @@ class WhisperDecoder(torch.nn.Module):
         encoder_hidden_states: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
         position_ids=None,
+        skip_cross_attention: bool = False,
     ):
         inputs_embeds = self.embed_tokens(input_ids)
         position_ids = position_ids.clamp(max=self.max_target_positions - 1)
@@ -353,7 +364,10 @@ class WhisperDecoder(torch.nn.Module):
 
         for decoder_layer in self.layers:
             hidden_states = decoder_layer(
-                hidden_states, encoder_hidden_states, forward_batch
+                hidden_states,
+                encoder_hidden_states,
+                forward_batch,
+                skip_cross_attention=skip_cross_attention,
             )
 
         hidden_states = self.layer_norm(hidden_states)
@@ -427,9 +441,20 @@ class WhisperForConditionalGeneration(torch.nn.Module):
         # Prepend dummy encoder tokens so that prepare_encoder_info_extend
         # correctly allocates encoder KV cache locations in the KV pool.
         # These dummy tokens are stripped before the model forward receives input_ids.
+        #
+        # The encoder produces exactly ``max_source_positions`` KV vectors, but
+        # paged decode kernels require the decoder KV region to begin on a page
+        # boundary. Reserve a page-aligned number of encoder slots so the decoder
+        # starts page-aligned; the extra ``reserve - encoder_len`` slots are
+        # allocated but never written or read. ``num_image_tokens`` stays the
+        # *true* encoder length so cross-attention reads exactly the real encoder
+        # KV. ceil_align(x, 1) == x, so the reserve equals encoder_len for
+        # page_size == 1 (e.g. CUDA/flashinfer Whisper) — a no-op there.
         encoder_len = self.config.max_source_positions
+        page_size = get_global_server_args().page_size
+        encoder_reserve = ceil_align(encoder_len, page_size)
         mm_inputs.num_image_tokens = encoder_len
-        return array("q", [0]) * encoder_len + input_ids
+        return array("q", [0]) * encoder_reserve + input_ids
 
     def forward(
         self,
@@ -476,8 +501,28 @@ class WhisperForConditionalGeneration(torch.nn.Module):
                     -1, batched_output.shape[-1]
                 )
 
+        # Skip cross-attention when no request in the batch has encoder output
+        # (encoder_lens all zero) — e.g. the text-only warmup request. This
+        # mirrors mllama / moss_vl and avoids feeding a zero-length encoder KV
+        # region to the paged attention kernel, which hangs the XPU backend.
+        if get_is_capture_mode():
+            from sglang.srt.model_executor.cpu_graph_runner import (
+                get_capture_skip_cross_attention,
+            )
+
+            _override = get_capture_skip_cross_attention()
+            skip_cross_attention = _override if _override is not None else False
+        else:
+            skip_cross_attention = forward_batch.encoder_lens is not None and bool(
+                forward_batch.encoder_lens.max() == 0
+            )
+
         decoder_outputs = self.decoder(
-            input_ids, encoder_hidden_states, forward_batch, positions
+            input_ids,
+            encoder_hidden_states,
+            forward_batch,
+            positions,
+            skip_cross_attention=skip_cross_attention,
         )
 
         logits = self.logits_processor(
