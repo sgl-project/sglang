@@ -134,6 +134,16 @@ def _should_emit_normal_text_as_message(
     return True
 
 
+def _serialize_responses_event_data(event: Any) -> str:
+    if not hasattr(event, "response"):
+        return event.model_dump_json(indent=None)
+
+    payload = event.model_dump(mode="json")
+    # The SDK types this field as float; match SGLang's non-streaming wire format.
+    payload["response"]["created_at"] = int(payload["response"]["created_at"])
+    return orjson.dumps(payload).decode()
+
+
 class OpenAIServingResponses(OpenAIServingChat):
     """Handler for /v1/responses requests"""
 
@@ -1490,7 +1500,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             event_type = getattr(event, "type", "unknown")
             return (
                 f"event: {event_type}\n"
-                f"data: {event.model_dump_json(indent=None)}\n\n"
+                f"data: {_serialize_responses_event_data(event)}\n\n"
             )
 
         current_content_index = 0
@@ -1920,7 +1930,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             event_type = getattr(event, "type", "unknown")
             return (
                 f"event: {event_type}\n"
-                f"data: {event.model_dump_json(indent=None)}\n\n"
+                f"data: {_serialize_responses_event_data(event)}\n\n"
             )
 
         # The streaming Response* event models echo ``tools`` through a
