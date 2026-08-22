@@ -37,6 +37,8 @@ _DEEP_IMPORT_ALLOWLIST = {
     "python/sglang/multimodal_gen/test/unit/test_latent_upsampler_group_norm_silu.py",
     "test/registered/kernels/ops/diffusion/test_model_fast_paths.py",
     "test/registered/kernels/ops/diffusion/test_sites.py",
+    # This test exercises the pure-Torch fallback implementation directly.
+    "test/registered/unit/utils/test_diffusion_torch_fallback.py",
 }
 
 
@@ -141,7 +143,7 @@ def test_importing_the_package_does_not_import_any_leaf_module():
     """The reason ``__getattr__`` is lazy rather than a block of re-exports.
 
     The backends have disjoint, heavy, mutually-exclusive dependencies --
-    Triton (CUDA/ROCm), CUTLASS/CuTe-DSL, FlyDSL (gfx950), MLX (Apple).  If
+    Triton (CUDA/ROCm), CUTLASS/CuTe-DSL, and FlyDSL (gfx950).  If
     ``_EXPORTS`` ever degrades into eager ``from .norm.x import y`` lines, all
     of them become import-time requirements on every platform, which is how a
     CPU-only or Apple install starts failing at ``import sglang``.

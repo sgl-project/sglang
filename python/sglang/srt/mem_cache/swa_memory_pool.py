@@ -343,16 +343,17 @@ class SWAKVPool(BaseSWAKVPool):
                 filtered.append([])
                 continue
 
-            k_cpu = torch.cat([chunk[0] for chunk in layer_chunks], dim=0)
-            v_cpu = torch.cat([chunk[1] for chunk in layer_chunks], dim=0)
-            k_cpu = k_cpu[row_mask]
-            v_cpu = v_cpu[row_mask]
+            # A chunk is whatever the sub-pool produced: k/v, plus the block
+            # scales for a quantized pool. Filter every tensor it carries.
+            num_tensors = len(layer_chunks[0])
+            tensors = [
+                torch.cat([chunk[t] for chunk in layer_chunks], dim=0)[row_mask]
+                for t in range(num_tensors)
+            ]
 
             filtered_layer = []
-            for i in range(0, len(k_cpu), chunk_size):
-                filtered_layer.append(
-                    [k_cpu[i : i + chunk_size], v_cpu[i : i + chunk_size]]
-                )
+            for i in range(0, len(tensors[0]), chunk_size):
+                filtered_layer.append([t[i : i + chunk_size] for t in tensors])
             filtered.append(filtered_layer)
         return filtered
 

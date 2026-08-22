@@ -1823,10 +1823,11 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=None,
             help=(
-                "The attention backend to use. For SGLang-native pipelines, use "
-                "values like fa, torch_sdpa, sage_attn, etc. For diffusers pipelines, "
-                "use diffusers attention backend names such as flash, _flash_3_hub, "
-                "sage, or xformers."
+                "The global attention backend. Native DiT components treat it as "
+                "strict; auxiliary native components use a compatible fallback when "
+                "needed. Use --component-attention-backends for a component-scoped "
+                "choice. For diffusers pipelines, use names such as flash, "
+                "_flash_3_hub, sage, or xformers."
             ),
         )
         parser.add_argument(
