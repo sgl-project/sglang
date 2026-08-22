@@ -234,6 +234,19 @@ sglang serve --model-path meituan-longcat/LongCat-Image \
   --port 30010
 ```
 
+SANA-Video supports the same path for fixed-resolution serving. Its default
+text stage emits a fixed 300-token prompt shape, so the runtime reuses one
+graph across prompt lengths without padding it to a generic text bucket:
+
+```bash Command
+sglang serve \
+  --model-path Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
+  --enable-breakable-cuda-graph \
+  --warmup-resolutions 832x480 \
+  --enable-torch-compile false \
+  --port 30010
+```
+
 ### Component Residency
 
 Use `--component-residency COMPONENT=MODE` to assign one runtime residency mode to each native pipeline component:
