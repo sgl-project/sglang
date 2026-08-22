@@ -131,11 +131,11 @@ class MemoryOccupationController:
             for name in names:
                 module = modules[name]
                 src_device_map[name] = _get_module_device(module)
+                moved.append(name)
                 if device.startswith("cpu"):
                     _module_to_pinned_cpu(module)
                 else:
                     module.to(device, non_blocking=True)
-                moved.append(name)
                 _move_unregistered_tensors(module, device)
             torch.cuda.synchronize()
         except Exception as e:
