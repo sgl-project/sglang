@@ -87,6 +87,8 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
                     "--allowed-media-domains",
                     "Media.Example.com.",
                     "127.0.0.1",
+                    "--allow-private-media-networks",
+                    "--allow-local-media-paths",
                     "--media-url-max-file-size-mb",
                     "32",
                 ]
@@ -94,6 +96,8 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
             self.assertEqual(
                 sa.allowed_media_domains, ["127.0.0.1", "media.example.com"]
             )
+            self.assertTrue(sa.allow_private_media_networks)
+            self.assertTrue(sa.allow_local_media_paths)
             self.assertEqual(sa.media_url_max_file_size_mb, 32)
         finally:
             configure_media_url_security([], max_file_size_mb=64)

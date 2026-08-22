@@ -2859,6 +2859,17 @@ class ServerArgs:
         "allowlist. When unset, remote media from any domain is allowed.",
         NS("mm"),
     ] = dataclasses.field(default_factory=list)
+    allow_private_media_networks: A[
+        bool,
+        "Allow client-supplied HTTP(S) media URLs to resolve to non-public IP "
+        "addresses such as RFC1918, loopback, or link-local ranges.",
+        NS("mm"),
+    ] = False
+    allow_local_media_paths: A[
+        bool,
+        "Allow client-supplied file:// URIs and local filesystem media paths.",
+        NS("mm"),
+    ] = False
     media_url_max_file_size_mb: A[
         int,
         "Maximum size in MiB for one client-supplied remote media download. "
@@ -4171,6 +4182,8 @@ class ServerArgs:
         self.allowed_media_domains = configure_media_url_security(
             self.allowed_media_domains,
             self.media_url_max_file_size_mb,
+            allow_private_networks=self.allow_private_media_networks,
+            allow_local_file_paths=self.allow_local_media_paths,
         )
 
     def _handle_deprecated_args(self):

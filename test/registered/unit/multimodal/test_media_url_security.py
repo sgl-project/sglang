@@ -2,6 +2,7 @@
 
 import http.server
 import threading
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -163,6 +164,26 @@ class TestMediaURLSecurity(unittest.TestCase):
                 r"https://evil.example\@safe.example.org/media", timeout=5
             )
 
+    def test_non_public_destinations_require_explicit_opt_in(self):
+        configure_media_url_security(
+            [], max_file_size_mb=64, allow_private_networks=False
+        )
+        for url in (
+            self._url("/media"),
+            self._url("/media", host="localhost"),
+            "http://169.254.169.254/latest/meta-data",
+        ):
+            with self.subTest(url=url):
+                with self.assertRaisesRegex(ValueError, "non-public IP"):
+                    download_remote_media(url, timeout=5)
+
+        configure_media_url_security(
+            [], max_file_size_mb=64, allow_private_networks=True
+        )
+        self.assertEqual(
+            download_remote_media(self._url("/media"), timeout=5), b"remote-media"
+        )
+
     def test_all_common_loaders_share_the_policy(self):
         blocked = ValueError("media URL domain is not allowed")
         with patch(
@@ -177,6 +198,36 @@ class TestMediaURLSecurity(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "not allowed"):
                         loader("https://blocked.example/media")
             self.assertEqual(download.call_count, 3)
+
+    def test_local_media_paths_require_explicit_opt_in(self):
+        with tempfile.NamedTemporaryFile(suffix=".png") as image_file:
+            image_file.write(b"test-image")
+            image_file.flush()
+            local_path = image_file.name
+            file_uri = f"file://{local_path}"
+
+            configure_media_url_security(
+                [], max_file_size_mb=64, allow_local_file_paths=False
+            )
+            for loader, value in (
+                (get_image_bytes, local_path),
+                (get_image_bytes, file_uri),
+                (_normalize_video_input, local_path),
+                (_normalize_video_input, file_uri),
+                (load_audio, local_path),
+                (load_audio, file_uri),
+            ):
+                with self.subTest(loader=loader.__name__, value=value):
+                    with self.assertRaisesRegex(
+                        ValueError, "Local media paths are disabled"
+                    ):
+                        loader(value)
+
+            configure_media_url_security(
+                [], max_file_size_mb=64, allow_local_file_paths=True
+            )
+            self.assertEqual(get_image_bytes(local_path), b"test-image")
+            self.assertEqual(get_image_bytes(file_uri), b"test-image")
 
 
 if __name__ == "__main__":

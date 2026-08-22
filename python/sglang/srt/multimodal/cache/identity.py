@@ -128,16 +128,20 @@ def _read_media_bytes(media: str | bytes) -> bytes:
     if isinstance(media, bytes):
         return bytes(media)
 
-    from sglang.srt.utils import get_image_bytes, image_extension_names
+    from sglang.srt.utils import (
+        get_image_bytes,
+        image_extension_names,
+        resolve_local_media_path,
+    )
 
     if media.startswith("file://"):
-        media = unquote(urlparse(media).path)
+        media = resolve_local_media_path(media)
     elif media.startswith(("http://", "https://", "data:")):
         return get_image_bytes(media)
     # ``load_image`` accepts relative local paths only by image extension.
     # Match that contract instead of probing arbitrary base64 as a filename.
     if media.lower().endswith(image_extension_names) and Path(media).is_file():
-        return Path(media).read_bytes()
+        return Path(resolve_local_media_path(media)).read_bytes()
     return get_image_bytes(media)
 
 

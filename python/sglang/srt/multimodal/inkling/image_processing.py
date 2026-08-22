@@ -12,6 +12,8 @@ from numba import njit
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 from transformers.image_utils import ImageInput
 
+from sglang.srt.utils.common import resolve_local_media_path
+
 IMAGE_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
 IMAGE_STD = np.array([0.26862954, 0.2613026, 0.2757771], dtype=np.float32)
 PAD_RAW_VALUE = np.float32(-1.0 / 255.0)
@@ -85,7 +87,7 @@ def _load_image_bytes(image) -> bytes:
                 "InklingImageProcessor received a URL/data: image; resolve it to bytes "
                 "upstream (e.g. via SGLang load_mm_data) before preprocessing."
             )
-        path = image[len("file://") :] if image.startswith("file://") else image
+        path = resolve_local_media_path(image)
         with open(path, "rb") as f:
             return f.read()
 

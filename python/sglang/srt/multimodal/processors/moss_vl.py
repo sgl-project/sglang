@@ -20,7 +20,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils.common import download_remote_media
+from sglang.srt.utils.common import download_remote_media, resolve_local_media_path
 
 
 class MossVLImageProcessor(SGLangBaseProcessor):
@@ -419,10 +419,10 @@ class MossVLImageProcessor(SGLangBaseProcessor):
 
     def _normalize_video_string(self, value: str) -> Tuple[str, Optional[str]]:
         if value.startswith("file://"):
-            return self._resolve_file_url(value), None
+            return resolve_local_media_path(self._resolve_file_url(value)), None
 
         if os.path.isfile(value):
-            return value, None
+            return resolve_local_media_path(value), None
 
         if value.startswith(("http://", "https://")):
             timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
