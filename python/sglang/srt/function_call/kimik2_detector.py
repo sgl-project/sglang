@@ -88,8 +88,8 @@ class KimiK2Detector(BaseFormatDetector):
         self.tool_call_id_counter_regex = re.compile(r"^\d+$")
 
     def _parse_tool_call_id(
-        self, function_id: str, tools: List[Tool], function_args: str = None
-    ):
+        self, function_id: str, tools: List[Tool], function_args: Optional[str] = None
+    ) -> tuple[Optional[str], int]:
         """Parse a tool call ID into (function_name, call_index).
 
         Standard format: "functions.ReadFile:0" → ("ReadFile", 0)
@@ -113,7 +113,7 @@ class KimiK2Detector(BaseFormatDetector):
         logger.warning("Unexpected tool_call_id format: %s", function_id)
         return None, 0
 
-    def _infer_tool_name(self, tools: List[Tool], function_args: str = None):
+    def _infer_tool_name(self, tools: List[Tool], function_args: Optional[str] = None) -> Optional[str]:
         """Infer function name when the model omits it (bare counter ID).
 
         Matches argument keys against tool parameter schemas, preferring the
