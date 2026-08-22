@@ -348,7 +348,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._captured_ragged_layouts: dict[int, object] = {}
         if self.ragged_verify_mode and (
             self.enable_two_batch_overlap
-            or model_runner.server_args.enable_lora
+            or model_runner.lora_manager is not None
             or self.disable_padding
         ):
             raise ValueError(
@@ -381,7 +381,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.enable_torch_compile:
             set_torch_compile_config()
 
-        if self.model_runner.server_args.enable_lora:
+        if self.model_runner.lora_manager is not None:
             # Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
             # Phase 1 (MoE buffers) was handled earlier in ModelRunner via
             # lora_manager.init_cuda_graph_moe_buffers().
@@ -467,9 +467,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _record_in_graph_metadata_prep_done(self):
         # Purely a marker at this point in the graph; where the shared reads
         # actually end is the attn backend's call.
-        if not torch.cuda.is_current_stream_capturing():
+        if not self.device_module.is_current_stream_capturing():
             # Warmup shares this body. Breakable capture still plants: it opens
             # segment 1 on context entry and every segment re-arms the node.
+            # Routed through device_module so XPU (torch.xpu) is picked up
+            # instead of hitting torch.cuda dummy stubs on non-CUDA builds.
             return
         if self.in_graph_metadata_prep_done is None:
             self.in_graph_metadata_prep_done = make_external_event(self.device_module)
@@ -925,7 +927,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             spec_info,
         )
 
-        if self.model_runner.server_args.enable_lora:
+        if self.model_runner.lora_manager is not None:
             # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
             # `--enable-lora` is set to True (and return immediately if the LoRA id is empty for perf optimization).
             lora_ids = [None] * bs
