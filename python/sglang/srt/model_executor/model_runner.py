@@ -1634,14 +1634,14 @@ class ModelRunner:
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not get_schedule().disable_overlap_schedule
-        # In speculative decoding, num_tokens_per_bs > 1, so pass the actual
-        # number of tokens per DP rank in CUDA graph, not the batch size.
+        # In speculative decoding more than one token is captured per request, so
+        # pass the actual number of tokens per DP rank in CUDA graph, not the batch
+        # size — the width is captured_req_width.
+
         cuda_graph_num_tokens = None
-        if getattr(self.decode_cuda_graph_runner, "bs", None):
-            cuda_graph_num_tokens = (
-                self.decode_cuda_graph_runner.bs
-                * self.decode_cuda_graph_runner.num_tokens_per_bs
-            )
+        runner = self.decode_cuda_graph_runner
+        if getattr(runner, "bs", None):
+            cuda_graph_num_tokens = runner.bs * runner.captured_req_width
 
         if (
             not self.is_draft_worker
