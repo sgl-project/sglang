@@ -1033,6 +1033,13 @@ class Envs:
     # read by several call sites; do not use in new code.
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    # Opt-in: build the classic deepep dispatcher's buffer as a DeepEP v2
+    # ElasticBuffer (MoE-shape ctor, auto-QP sizing). Default keeps the
+    # legacy Buffer path byte-identical.
+    SGLANG_DEEPEP_USE_V2 = EnvBool(False)
+    # Measurement-only wall-clock timing around the V2 dispatch/combine call
+    # sites (synchronizes CUDA; never enable in a perf run).
+    SGLANG_DEEPEP_V2_TIMING = EnvBool(False)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP = EnvBool(True)
