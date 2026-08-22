@@ -462,6 +462,27 @@ for (const path of walkMdx(DIFFUSION_COOKBOOK)) {
   }
 }
 
+// ------------------------------------------------ uv --prerelease=allow guard
+// flash-attn-4 (a mandatory dependency since 0.5.10) only ships pre-releases,
+// and uv < 0.12 silently backtracks `uv pip install sglang` to 0.5.9 unless
+// --prerelease=allow is passed (#35912). Every cookbook install of sglang —
+// from PyPI, from git, or editable from source — must carry the flag.
+const COOKBOOK = join(SNIPPETS, "..", "..", "cookbook");
+const PAGE_TEMPLATES = ["page.mdx.tmpl", "diffusion-page.mdx.tmpl"]
+  .map((name) => join(dirname(COOKBOOK_MODEL_TEMPLATE), name));
+const installsSglang = (line) =>
+  /\buv pip install\b/.test(line) &&
+  (/[\s"']sglang/.test(line) || /-e\s+["']?python/.test(line));
+for (const path of [...walkMdx(COOKBOOK), ...PAGE_TEMPLATES]) {
+  const where = relative(join(SNIPPETS, "..", ".."), path);
+  readFileSync(path, "utf8").split("\n").forEach((line, i) => {
+    if (installsSglang(line) && !line.includes("--prerelease=allow")) {
+      fail(`${where}:${i + 1}`, "`uv pip install` of sglang needs `--prerelease=allow`; "
+        + "without it uv < 0.12 silently resolves sglang 0.5.9 (#35912)");
+    }
+  });
+}
+
 if (failures.length) {
   console.error(`FAIL (${failures.length})`);
   for (const f of failures) console.error("  - " + f);
