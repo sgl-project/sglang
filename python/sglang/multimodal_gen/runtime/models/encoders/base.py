@@ -157,9 +157,9 @@ def finalize_encoder_folding(
 
 @dataclass(frozen=True)
 class CheckpointQuantizationCapability:
-    """Quantized-checkpoint loading contract declared for an encoder."""
+    """Quantized-checkpoint contract implemented by a native encoder."""
 
-    backend: Literal["diffusion", "srt", "transformers"]
+    backend: Literal["diffusion", "srt"]
     methods: frozenset[str]
 
 

@@ -59,7 +59,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     load_dict,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
+from sglang.multimodal_gen.runtime.utils.precision import precision_to_dtype
 from sglang.multimodal_gen.runtime.utils.quantization_utils import get_quant_config
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.environ import envs
@@ -79,6 +79,43 @@ _TRANSFORMERS_ENCODER_ONLY_ARCHITECTURES = {
 }
 
 
+def _delegate_standard_bnb4_to_transformers(
+    component_config: dict,
+    component_name: str,
+) -> None:
+    """Use Transformers when it owns a standard serialized BnB4 checkpoint."""
+    try:
+        quant_spec = resolve_checkpoint_quant_spec(component_config)
+    except (TypeError, ValueError) as error:
+        raise ComponentCheckpointUnsupportedError(
+            f"Cannot parse checkpoint quantization for {component_name!r}: {error}"
+        ) from error
+    if quant_spec is None or quant_spec.declared_method != "bitsandbytes":
+        return
+    if quant_spec.source != "quantization_config":
+        raise ComponentCheckpointUnsupportedError(
+            f"Transformers-managed {component_name!r} quantization requires "
+            "a top-level quantization_config; "
+            f"got metadata from {quant_spec.source!r}"
+        )
+
+    load_in_4bit = quant_spec.config.get(
+        "load_in_4bit", quant_spec.config.get("_load_in_4bit")
+    )
+    load_in_8bit = quant_spec.config.get(
+        "load_in_8bit", quant_spec.config.get("_load_in_8bit", False)
+    )
+    if load_in_4bit is not True or load_in_8bit is True:
+        raise ComponentCheckpointUnsupportedError(
+            f"Transformers-managed {component_name!r} quantization supports only "
+            "serialized BitsAndBytes 4-bit checkpoints"
+        )
+    raise NativeComponentLoaderRequired(
+        f"{component_name!r} delegates serialized bitsandbytes checkpoint "
+        "loading to Transformers"
+    )
+
+
 def _configure_encoder_quantization(
     model_config: EncoderConfig,
     model_cls: type[nn.Module],
@@ -92,6 +129,10 @@ def _configure_encoder_quantization(
         # themselves; running the generic lifecycle as well would process twice.
         return
 
+    _delegate_standard_bnb4_to_transformers(
+        component_config,
+        component_name,
+    )
     try:
         quant_config = get_quant_config(
             component_config,
@@ -101,8 +142,8 @@ def _configure_encoder_quantization(
         raise ComponentCheckpointUnsupportedError(
             f"Cannot configure checkpoint quantization for {component_name!r}: {error}"
         ) from error
+    model_config.quant_config = quant_config
     if quant_config is None:
-        model_config.quant_config = None
         return
     if not issubclass(model_cls, EncoderTensorParallelMixin):
         raise ComponentCheckpointUnsupportedError(
@@ -117,6 +158,13 @@ def _configure_encoder_quantization(
             f"{model_cls.__name__} does not support quantized checkpoints for "
             f"{component_name!r}: no checkpoint quantization capability is declared"
         )
+    if capability.backend != "diffusion":
+        raise ComponentCheckpointUnsupportedError(
+            f"{model_cls.__name__} declares the {capability.backend!r} checkpoint "
+            f"quantization backend for {component_name!r}, but the native encoder "
+            "loader currently supports only the 'diffusion' backend"
+        )
+
     quant_method = quant_config.get_name()
     if quant_method not in capability.methods:
         raise ComponentCheckpointUnsupportedError(
@@ -124,26 +172,6 @@ def _configure_encoder_quantization(
             f"quantized with {quant_method!r}; supported methods for the "
             f"{capability.backend!r} backend: {sorted(capability.methods)}"
         )
-    if capability.backend == "transformers":
-        quant_spec = resolve_checkpoint_quant_spec(component_config)
-        if quant_spec is None or quant_spec.source != "quantization_config":
-            source = quant_spec.source if quant_spec is not None else "unknown"
-            raise ComponentCheckpointUnsupportedError(
-                f"Transformers-managed {component_name!r} quantization requires "
-                "a top-level quantization_config; "
-                f"got metadata from {source!r}"
-            )
-        raise NativeComponentLoaderRequired(
-            f"{model_cls.__name__} delegates {quant_method!r} checkpoint loading "
-            "to Transformers"
-        )
-    if capability.backend != "diffusion":
-        raise ComponentCheckpointUnsupportedError(
-            f"{model_cls.__name__} declares the {capability.backend!r} checkpoint "
-            f"quantization backend for {component_name!r}, but the native encoder "
-            "loader currently supports only the 'diffusion' backend"
-        )
-    model_config.quant_config = quant_config
 
 
 def _resolve_and_configure_encoder_quantization(
@@ -154,19 +182,12 @@ def _resolve_and_configure_encoder_quantization(
 ) -> type[nn.Module]:
     architectures = getattr(model_config, "architectures", [])
     try:
-        quant_spec = resolve_checkpoint_quant_spec(component_config)
-    except (TypeError, ValueError) as error:
-        raise ComponentCheckpointUnsupportedError(
-            f"Cannot parse checkpoint quantization for {component_name!r}: {error}"
-        ) from error
-    if quant_spec is not None:
-        architectures = [
-            _TRANSFORMERS_ENCODER_ONLY_ARCHITECTURES.get(arch, arch)
-            for arch in architectures
-        ]
-    try:
         model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
     except Exception as resolution_error:
+        _delegate_standard_bnb4_to_transformers(
+            component_config,
+            component_name,
+        )
         try:
             quant_config = get_quant_config(component_config, component_model_path)
         except Exception as quantization_error:
@@ -311,14 +332,18 @@ class TextEncoderLoader(ComponentLoader):
                 component_name,
             )
 
-        resolved_component_name = component_name or (
-            "text_encoder_2"
-            if component_model_path.rstrip("/").endswith("text_encoder_2")
-            else "text_encoder"
+        encoder_idx = (
+            self._extract_encoder_index(component_name or "text_encoder_2")
+            if component_name
+            else 1 if component_model_path.rstrip("/").endswith("text_encoder_2") else 0
         )
-        dtype = resolve_component_precision(
-            server_args,
-            resolved_component_name,
+        encoder_dtype = server_args.pipeline_config.text_encoder_precisions[encoder_idx]
+        dtype = precision_to_dtype(
+            encoder_dtype,
+            f"text_encoder_precisions[{encoder_idx}]",
+        )
+        resolved_component_name = component_name or (
+            "text_encoder" if encoder_idx == 0 else f"text_encoder_{encoder_idx + 1}"
         )
         transformers_model_class = self._resolve_transformers_text_encoder_class(
             component_model_path, server_args
