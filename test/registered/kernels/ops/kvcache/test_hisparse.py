@@ -101,6 +101,8 @@ def _run_kernel(
     req_pool_indices: torch.Tensor | None = None,
     num_real_reqs: int | None = None,
     output_fill_value: int = -1,
+    device_locs: torch.Tensor | None = None,
+    host_binding: torch.Tensor | None = None,
 ) -> torch.Tensor:
     batch_size = top_k_tokens.shape[0]
     if req_pool_indices is None:
@@ -130,6 +132,8 @@ def _run_kernel(
         page_size=1,
         block_size=256,
         num_real_reqs=torch.tensor([num_real_reqs], dtype=torch.int32, device=DEVICE),
+        device_locs=device_locs,
+        host_binding=host_binding,
     )
     torch.cuda.synchronize()
     return out
@@ -489,6 +493,205 @@ def test_load_cache_to_device_buffer_multiple_misses_copy_all_slots() -> None:
         assert torch.equal(
             state["device_buffer"][loc].cpu(), state["host_cache"][token]
         )
+
+
+def _pool_source(rows: list[list[int]]) -> torch.Tensor:
+    """`device_locs`: pool slot per position, or -1 once the pool gave it up."""
+    return torch.tensor(rows, dtype=torch.int32, device=DEVICE)
+
+
+def test_pass_through_returns_pool_slots_without_copying() -> None:
+    """A position the pool still owns costs no hot-buffer slot and no DMA.
+
+    This is the source the HiCache backing needs and the private-host backing
+    does not have: its staging frees every pool slot, so without the flag the
+    kernel would treat a live pool position as a miss, evict a resident to make
+    room, and DMA a host copy that is not even guaranteed to exist.
+    """
+    state = _make_state([[9, 7, 3, 5, 11]], [[0, 1, 2, 3, -1]], [8])
+    buffer_before = state["device_buffer"].clone()
+    lru_before = state["lru_slots"].clone()
+    tokens_before = state["device_buffer_tokens"].clone()
+
+    # Tokens 4..7 are NOT in the buffer (it holds 0..3), so without the pool
+    # source every lane would miss. Here the pool still owns all four.
+    device_locs = _pool_source([[-1] * 4 + [12, 13, 14, 15] + [-1] * 8])
+    out = _run_kernel(
+        top_k_tokens=torch.tensor([[4, 5, 6, 7]], dtype=torch.int32, device=DEVICE),
+        seq_len=9,
+        device_locs=device_locs,
+        **state,
+    )
+
+    # Pool slots come straight back...
+    assert torch.equal(out.cpu(), torch.tensor([[12, 13, 14, 15]], dtype=torch.int32))
+    # ... and nothing else moved: no bytes copied, no residency change, no LRU churn.
+    assert torch.equal(state["device_buffer"], buffer_before)
+    assert torch.equal(state["device_buffer_tokens"], tokens_before)
+    assert torch.equal(state["lru_slots"], lru_before)
+
+
+def test_pass_through_mixes_all_three_sources() -> None:
+    """One row, one lane per source: pool / buffer hit / host miss.
+
+    The mix is the interesting case -- a pool lane must consume neither the hash
+    entry nor the buffer slot that the other two need, so getting any one of the
+    three right in isolation does not imply the row is right.
+    """
+    state = _make_state([[9, 7, 3, 5, 11]], [[0, 1, 2, 3, -1]], [8])
+    # Positions: 5 -> pool slot 13; 2 -> resident in buffer slot 2 (loc 3);
+    # 6 and 7 -> given up by the pool, both have host copies.
+    device_locs = _pool_source([[-1] * 5 + [13] + [-1] * 10])
+
+    out = _run_kernel(
+        top_k_tokens=torch.tensor([[5, 2, 6, 7]], dtype=torch.int32, device=DEVICE),
+        seq_len=9,
+        device_locs=device_locs,
+        **state,
+    ).cpu()
+
+    assert out[0, 0].item() == 13, "pool lane must return the pool slot"
+    assert out[0, 1].item() == 3, "buffer-resident lane must return its slot"
+    # The two evicted lanes take distinct buffer slots and their bytes must land.
+    miss_slots = {out[0, 2].item(), out[0, 3].item()}
+    assert len(miss_slots) == 2, f"evicted lanes must get distinct slots: {miss_slots}"
+    resident = state["device_buffer_tokens"].cpu()[0, :HOT_BUFFER_SIZE].tolist()
+    for token in (6, 7):
+        assert token in resident, f"token {token} should be resident: {resident}"
+        loc = state["device_buffer_locs"].cpu()[0, resident.index(token)].item()
+        assert torch.equal(
+            state["device_buffer"][loc].cpu(), state["host_cache"][token]
+        ), f"token {token}'s bytes must be byte-exact from host"
+    # Position 2 must still be resident: a pool lane must not have evicted it.
+    assert 2 in resident, f"buffer hit was evicted by a pool lane: {resident}"
+
+
+def test_pass_through_masks_a_lane_the_selector_left_unfilled() -> None:
+    """An unfilled lane (position < 0) must come back masked, taking nothing.
+
+    The two-source kernel never sees one: it only reaches the slow path when
+    seq_len exceeds the hot buffer, hence exceeds top_k, so the selector filled
+    every lane. A pool-backed caller has no such floor (a short standard request
+    shares the batch), and an unfilled lane that falls through counts as a miss:
+    it would evict a resident, index the host table at a negative position, and
+    return a real slot for a position that does not exist.
+    """
+    state = _make_state([[9, 7, 3, 5, 11]], [[0, 1, 2, 3, -1]], [8])
+    buffer_before = state["device_buffer"].clone()
+    lru_before = state["lru_slots"].clone()
+    tokens_before = state["device_buffer_tokens"].clone()
+    device_locs = _pool_source([[-1] * 5 + [13] + [-1] * 10])
+
+    out = _run_kernel(
+        top_k_tokens=torch.tensor([[5, -1, -1, -1]], dtype=torch.int32, device=DEVICE),
+        seq_len=9,
+        device_locs=device_locs,
+        **state,
+    )
+
+    assert torch.equal(out.cpu(), torch.tensor([[13, -1, -1, -1]], dtype=torch.int32))
+    assert torch.equal(state["device_buffer"], buffer_before)
+    assert torch.equal(state["device_buffer_tokens"], tokens_before)
+    assert torch.equal(state["lru_slots"], lru_before)
+
+
+def test_late_bound_host_binding_matches_the_direct_tensor() -> None:
+    """Taking the host base from device memory must copy the same bytes.
+
+    A caller whose host tier is attached only after cuda-graph capture cannot pass
+    the pool as an argument -- the recorded launch would carry whatever address the
+    tensor had at capture time. Reading it from a persistent tensor at run time is
+    the alternative, and it is only useful if it addresses identically.
+    """
+    direct = _make_state([[9, 7, 3, 5, 11]], [[0, 1, 2, 3, -1]], [8])
+    late = _make_state([[9, 7, 3, 5, 11]], [[0, 1, 2, 3, -1]], [8])
+    top_k = torch.tensor([[4, 5]], dtype=torch.int32, device=DEVICE)
+
+    out_direct = _run_kernel(top_k_tokens=top_k.clone(), seq_len=9, **direct)
+    # The holder is filled before the launch here; in production it is filled once
+    # the host pool exists, after the graph that reads it was captured.
+    host_binding = torch.tensor(
+        [late["host_cache"].data_ptr(), ITEM_SIZE_BYTES],
+        dtype=torch.int64,
+        device=DEVICE,
+    )
+    out_late = _run_kernel(
+        top_k_tokens=top_k.clone(), seq_len=9, host_binding=host_binding, **late
+    )
+
+    assert torch.equal(out_direct.cpu(), out_late.cpu())
+    assert torch.equal(direct["device_buffer"].cpu(), late["device_buffer"].cpu())
+    for token in (4, 5):
+        resident = late["device_buffer_tokens"].cpu()[0, :HOT_BUFFER_SIZE].tolist()
+        loc = late["device_buffer_locs"].cpu()[0, resident.index(token)].item()
+        assert torch.equal(
+            late["device_buffer"][loc].cpu(), late["host_cache"][token]
+        ), f"token {token} must be byte-exact through the late-bound base"
+
+
+def test_late_bound_host_binding_honours_a_wider_row_stride() -> None:
+    """A host pool that interleaves layers within a token spaces its rows wider.
+
+    HiCache's default page_first layout stores [token, layer, cell], so one
+    layer's per-token rows are layer_num cells apart. Reusing item_size_bytes as
+    the source stride there reads a blend of neighbouring tokens -- plausible KV
+    bytes, no fault, wrong values. The stride travels with the base for the same
+    reason the base does: neither is known at capture time.
+    """
+    state = _make_state([[9, 7, 3, 5, 11]], [[0, 1, 2, 3, -1]], [8])
+    layers = 3
+    # [token, layer, cell]: layer 0's rows are `layers` cells apart. Every layer
+    # gets distinct bytes, so reading the wrong stride cannot coincide.
+    interleaved = torch.empty(
+        (HOST_CACHE_SIZE, layers, KV_DIM), dtype=DTYPE, device="cpu", pin_memory=True
+    )
+    interleaved.copy_(
+        torch.arange(interleaved.numel(), dtype=DTYPE).view_as(interleaved)
+    )
+    state["host_cache"] = interleaved
+    host_binding = torch.tensor(
+        [interleaved.data_ptr(), layers * ITEM_SIZE_BYTES],
+        dtype=torch.int64,
+        device=DEVICE,
+    )
+
+    out = _run_kernel(
+        top_k_tokens=torch.tensor([[4, 5]], dtype=torch.int32, device=DEVICE),
+        seq_len=9,
+        host_binding=host_binding,
+        **state,
+    )
+
+    resident = state["device_buffer_tokens"].cpu()[0, :HOT_BUFFER_SIZE].tolist()
+    for token in (4, 5):
+        loc = state["device_buffer_locs"].cpu()[0, resident.index(token)].item()
+        assert torch.equal(
+            state["device_buffer"][loc].cpu(), interleaved[token, 0:1]
+        ), f"token {token} must read layer 0's row, not a stride-1 blend"
+    assert (out.cpu() >= 0).all()
+
+
+def test_pass_through_skips_the_short_sequence_fast_path() -> None:
+    """The fast path reads device_buffer_locs[position], i.e. position == slot.
+
+    That holds only when the buffer carries the whole sequence, which a pool-backed
+    caller never guarantees. With the flag on, a seq_len below the buffer size must
+    still resolve through the pool rather than through that shortcut -- otherwise
+    every lane would come back with an unrelated slot.
+    """
+    state = _make_state([[9, 7, 3, 5, 11]], [[0, 1, 2, 3, -1]], [2])
+    # seq_len 3 <= HOT_BUFFER_SIZE would take the fast path and return
+    # device_buffer_locs[0..2] = [9, 7, 3]; the pool says otherwise.
+    device_locs = _pool_source([[14, 15, 12] + [-1] * 13])
+
+    out = _run_kernel(
+        top_k_tokens=torch.tensor([[0, 1, 2]], dtype=torch.int32, device=DEVICE),
+        seq_len=3,
+        device_locs=device_locs,
+        **state,
+    )
+
+    assert torch.equal(out.cpu(), torch.tensor([[14, 15, 12]], dtype=torch.int32))
 
 
 def test_load_cache_to_device_buffer_batched_with_padding() -> None:

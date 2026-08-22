@@ -35,6 +35,24 @@ class _RecordingDelayer:
         return self.allow
 
 
+class _RecordingHiSparseBudget:
+    """Duck-typed HiCacheAdmitBudget that records the max_new of every call."""
+
+    device_evictable_overhang = 0
+
+    def __init__(self):
+        self.probes = []
+        self.commits = []
+
+    def future_tokens(self, total_seq_len, max_new, commit, req=None):
+        (self.commits if commit else self.probes).append(max_new)
+        # Budget as standard, so the gate arithmetic stays the plain one.
+        return max_new
+
+    def admission_exhausted(self, total_seq_len, max_new, req=None):
+        return False
+
+
 class TestPrefillAdder(CustomTestCase):
     def setUp(self):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
@@ -889,6 +907,41 @@ class TestPrefillAdder(CustomTestCase):
                 size_swa=4096, sliding_window=128
             )._swa_req_never_fits(**req)
         )
+
+    def test_hisparse_probe_and_commit_agree_on_a_retracted_request(self):
+        """One max_new basis for the admission probe and the quota commit.
+
+        A request re-prefilled after retraction carries output_ids, so its
+        remaining output budget and the scheduler's own reservation basis
+        (`min(max_new_tokens, CLIP)`) differ. Billing the commit on the
+        reservation basis can report a candidate the probe called admissible as
+        standard -- `_infeasible()` is a threshold on
+        `total_seq_len + temp_buffer + max_new`, so the two values can land on
+        opposite sides of it. The round's quota then goes unspent while the
+        coordinator admits the request anyway, and later candidates in the same
+        round are offered headroom that is already promised.
+        """
+        budget = _RecordingHiSparseBudget()
+        self.mock_token_allocator.available_size.return_value = 100_000
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        adder = self.create_adder(self.create_running_batch(), hisparse_budget=budget)
+        req = self.create_mock_req(
+            "resumed", priority=0, max_new_tokens=512, output_len=100
+        )
+        req.full_untruncated_fill_ids = list(range(4096))
+        req.last_node = MagicMock()
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+        req.sampling_params = SimpleNamespace(max_new_tokens=512, ignore_eos=False)
+
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+        self.assertIn(req, adder.can_run_list)
+        self.assertEqual(budget.probes, [412])
+        self.assertEqual(budget.commits, [412])
 
 
 if __name__ == "__main__":

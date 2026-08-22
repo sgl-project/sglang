@@ -64,6 +64,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.hisparse_hicache_admission import HiCacheAdmitBudget
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 # Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
@@ -73,6 +74,23 @@ if TYPE_CHECKING:
 CLIP_MAX_NEW_TOKENS = int(
     os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
 )
+
+
+def remaining_max_new(req: Req) -> int:
+    """The request's remaining output budget, clipped.
+
+    The one basis every HiSparse admission decision uses -- probe, quota commit,
+    and the coordinator's decode reserve -- because `_infeasible()` is a
+    threshold on `total_seq_len + temp_buffer + max_new`, so two of them on
+    different bases can land on opposite sides of it. Differs from
+    `min(max_new_tokens, CLIP_MAX_NEW_TOKENS)`, the scheduler's own reservation
+    basis, only for a request re-prefilled after retraction.
+    """
+    return min(
+        max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+        CLIP_MAX_NEW_TOKENS,
+    )
+
 
 # Threshold for in-batch prefix cache.
 # If a request has a matched prefix length (against existing cache) less than this value,
@@ -527,6 +545,7 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        hisparse_budget: Optional[HiCacheAdmitBudget] = None,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -534,6 +553,9 @@ class PrefillAdder:
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
+        # Per-round quota snapshot from the HiSparse coordinator, which owns all
+        # of the logic. None when HiSparse is off or its backing rations nothing.
+        self._hisparse_budget = hisparse_budget
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.dllm_config = dllm_config
@@ -545,6 +567,12 @@ class PrefillAdder:
             self.rem_chunk_tokens -= num_mixed_decode_tokens
         self.rem_total_token_offset = num_mixed_decode_tokens
         self.cur_rem_token_offset = num_mixed_decode_tokens
+        # Tokens that count as evictable but cannot be reclaimed right now (a
+        # write_back demotion needs host space, and HiSparse vetoes the copy-less
+        # drop for a live request); budgeting against them ends in a hard prefill
+        # allocation failure.
+        if hisparse_budget is not None:
+            self.rem_total_token_offset += hisparse_budget.device_evictable_overhang
 
         self.req_states = None
         self.can_run_list = []
@@ -835,6 +863,42 @@ class PrefillAdder:
             return self._mamba_slot_cost
         return 0
 
+    def _future_tokens(self, req: Req, *, commit: bool, standard: int) -> int:
+        """Device tokens to reserve for this request's decode tail.
+
+        `standard` is what the scheduler reserves on its own. HiSparse admission
+        replaces it with an admission-aware count (an admitted request's prefix
+        leaves the pool), and commit=True also draws down the round's quota. Its
+        basis is `remaining_max_new` on both calls.
+        """
+        if self._hisparse_budget is None:
+            return standard
+        return self._hisparse_budget.future_tokens(
+            len(req.full_untruncated_fill_ids),
+            remaining_max_new(req),
+            commit=commit,
+            req=req,
+        )
+
+    def _hisparse_defers(self, req: Req, max_new: int) -> bool:
+        """Whether to keep a candidate queued until HiSparse can admit it.
+
+        Running it standard would pin its whole prefix on device for its lifetime
+        and starve the admitted requests of eviction headroom, so it waits for
+        quota (batch_is_full resets every pass, so it is retried) -- unless
+        nothing else is running, where standard is the progress guarantee (e.g. a
+        prompt larger than the whole expanded region).
+        """
+        if self._hisparse_budget is None:
+            return False
+        if not self._hisparse_budget.admission_exhausted(
+            len(req.full_untruncated_fill_ids), max_new
+        ):
+            return False
+        return len(self.can_run_list) > 0 or (
+            self.running_batch is not None and self.running_batch.batch_size() > 0
+        )
+
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
@@ -1041,7 +1105,14 @@ class PrefillAdder:
             0,
             req.extend_range.length,
             (
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                # Final chunk: commits the round's quota like the non-chunked path.
+                self._future_tokens(
+                    req,
+                    commit=True,
+                    standard=min(
+                        req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+                    ),
+                )
                 if not truncated
                 else 0
             ),
@@ -1223,14 +1294,14 @@ class PrefillAdder:
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
         # _update_prefill_budget also deducts.
-        max_new = min(
-            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
-        )
+        max_new = remaining_max_new(req)
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        total_tokens = cand_extend_input_len + max_new + self.page_size
+        cand_future = self._future_tokens(req, commit=False, standard=max_new)
+        if self._hisparse_defers(req, max_new):
+            return AddReqResult.OTHER
+        total_tokens = cand_extend_input_len + cand_future + self.page_size
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
         total_tokens += self._mamba_gap_budget_for_req(req)
@@ -1374,9 +1445,14 @@ class PrefillAdder:
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
-                    min(
-                        req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKENS,
+                    # Commits the round's quota; the cand_future probe above only read it.
+                    self._future_tokens(
+                        req,
+                        commit=True,
+                        standard=min(
+                            req.sampling_params.max_new_tokens,
+                            CLIP_MAX_NEW_TOKENS,
+                        ),
                     ),
                     req.retracted_stain,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),

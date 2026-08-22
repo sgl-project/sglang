@@ -185,7 +185,11 @@ __device__ __forceinline__ void copy_miss_item(
     void* __restrict__ device_buffer_v,
     int64_t src_loc,
     int64_t dst_loc,
-    int64_t item_size_bytes) {
+    int64_t item_size_bytes,
+    // Distance between consecutive host rows: item_size_bytes for a layer-first
+    // host pool, a multiple of the cell for one that interleaves layers within a
+    // token (HiCache's page_first). Either way the copy moves item_size_bytes.
+    int64_t host_row_bytes) {
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
   if constexpr (IsDsv4Layout) {
 #ifdef USE_ROCM
@@ -210,13 +214,14 @@ __device__ __forceinline__ void copy_miss_item(
         /*src_index=*/static_cast<int32_t>(src_loc));
 #endif
   } else {
-    // Generic path: device + host both linear, stride = item_size_bytes.
-    const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * item_size_bytes;
+    // Generic path: device linear at item_size_bytes, host linear at
+    // host_row_bytes (the same for a layer-first host pool).
+    const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * host_row_bytes;
     auto dst_k = static_cast<char*>(device_buffer_k) + dst_loc * item_size_bytes;
     transfer_item_warp(lane_id, src_k, dst_k, item_size_bytes);
 
     if constexpr (!IsMLA) {
-      const auto src_v = static_cast<const char*>(host_cache_v) + src_loc * item_size_bytes;
+      const auto src_v = static_cast<const char*>(host_cache_v) + src_loc * host_row_bytes;
       auto dst_v = static_cast<char*>(device_buffer_v) + dst_loc * item_size_bytes;
       transfer_item_warp(lane_id, src_v, dst_v, item_size_bytes);
     }
@@ -298,12 +303,17 @@ __device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int
 
 // Shared memory size calculation for dynamic allocation.
 // Layout: int32_t region (4-byte aligned) followed by int16_t region (2-byte aligned).
-template <int NUM_TOP_K, int HOT_BUFFER_SIZE>
+template <int NUM_TOP_K, int HOT_BUFFER_SIZE, bool HasPassThroughCounter = false>
 struct SmemLayout {
   static constexpr int HASH_SIZE = NUM_TOP_K * 2;
   static constexpr int NUM_BUFFER_CHUNKS = (HOT_BUFFER_SIZE + WARP_SIZE - 1) / WARP_SIZE;
-  // int32_t region: top_k_tokens + chunk_offset + evict_chunk_offset + hash_keys + total_hits + newest_hit
-  static constexpr int TOTAL_INT32 = NUM_TOP_K + (NUM_BUFFER_CHUNKS + 1) + (NUM_BUFFER_CHUNKS + 1) + HASH_SIZE + 2;
+  // Counters after the hash table: total_hits, newest_hit, and pass_through_hits
+  // only for a caller with a pool source, so the two-source instantiation
+  // requests exactly the shared memory it always did.
+  static constexpr int NUM_COUNTERS = HasPassThroughCounter ? 3 : 2;
+  // int32_t region: top_k_tokens + chunk_offset + evict_chunk_offset + hash_keys + counters
+  static constexpr int TOTAL_INT32 =
+      NUM_TOP_K + (NUM_BUFFER_CHUNKS + 1) + (NUM_BUFFER_CHUNKS + 1) + HASH_SIZE + NUM_COUNTERS;
   // int16_t region: lru_slots_out + hash_vals
   static constexpr int TOTAL_INT16 = HOT_BUFFER_SIZE + HASH_SIZE;
   static constexpr size_t BYTES = TOTAL_INT32 * sizeof(int32_t) + TOTAL_INT16 * sizeof(int16_t);
@@ -321,8 +331,22 @@ struct SmemLayout {
 // RecordMissPlan records this step's miss plan (miss_src/dst = host/device loc
 // per miss, miss_count per request) for shared-index skip layers to replay via
 // copy_cache_planned_kernel. SkipIO elides only the KV byte movement (timing
-// probe; output is garbage). Both are compile-time flags so the production
-// (false, false) instantiation stays byte-identical.
+// probe, or the plan-only half when the caller replays the plan itself).
+//
+// LateBoundHostBase reads the host pool's base address AND row stride out of a
+// two-element device tensor at run time instead of taking them as arguments,
+// which a caller whose host tier attaches AFTER cuda-graph capture needs:
+// neither value is known when the launch is recorded. Callers that own their
+// host pool from init pass the buffer, and their rows are one cell apart.
+//
+// PassThroughDeviceLocs adds a third source per top-k lane, for callers whose
+// logical KV pool can still own the position: device_locs[token] >= 0 means the
+// KV is live in the pool, so that slot is emitted as-is -- no hot-buffer slot, no
+// hash entry, no copy. Only positions the pool gave up (sentinel) fall through to
+// the buffer/host paths below.
+//
+// All four are compile-time flags, so the all-false private-host instantiation
+// stays byte-identical.
 template <
     int BLOCK_SIZE,
     int NUM_TOP_K,
@@ -331,6 +355,8 @@ template <
     bool IsDsv4Layout,
     bool RecordMissPlan,
     bool SkipIO,
+    bool PassThroughDeviceLocs,
+    bool LateBoundHostBase,
     typename SeqLensT,
     typename ReqPoolIndicesT>
 __global__ void load_cache_to_device_buffer_kernel(
@@ -338,6 +364,14 @@ __global__ void load_cache_to_device_buffer_kernel(
     int32_t* __restrict__ device_buffer_tokens,
     const int64_t* __restrict__ host_cache_locs,
     const int32_t* __restrict__ device_buffer_locs,
+    // [max_reqs, max_positions] pool slot per position, or < 0 once the pool has
+    // given the position up. Read only when PassThroughDeviceLocs.
+    const int32_t* __restrict__ device_locs,
+    int64_t device_locs_stride,
+    // [base address, row stride in bytes] of the host pool, read at run time.
+    // Only when LateBoundHostBase; otherwise host_cache_k below is the base and
+    // its rows are item_size_bytes apart.
+    const int64_t* __restrict__ host_binding,
     const void* __restrict__ host_cache_k,
     const void* __restrict__ host_cache_v,
     void* __restrict__ device_buffer_k,
@@ -367,6 +401,9 @@ __global__ void load_cache_to_device_buffer_kernel(
   const int bid = blockIdx.x;
   const int tid = threadIdx.x;
   int32_t* req_top_k_device_locs = top_k_device_locs + bid * top_k_device_locs_stride;
+  // Resolved once per block for the copy phase below.
+  const void* const host_base = LateBoundHostBase ? reinterpret_cast<const void*>(host_binding[0]) : host_cache_k;
+  const int64_t host_row_bytes = LateBoundHostBase ? host_binding[1] : item_size_bytes;
 
   // CUDA graph pads the batch to a captured size. Keep padded output rows
   // invalid without a separate fill kernel.
@@ -392,9 +429,12 @@ __global__ void load_cache_to_device_buffer_kernel(
   const int32_t* req_device_buffer_locs = device_buffer_locs + buffer_offset;
   const int64_t* req_host_cache_locs = host_cache_locs + rid * host_stride;
   int16_t* req_lru_slots = lru_slots + rid * lru_slot_stride_0;
+  const int32_t* req_device_locs = PassThroughDeviceLocs ? device_locs + rid * device_locs_stride : nullptr;
 
-  // Fast path: short sequences have all tokens in the device buffer in order.
-  if (seq_len <= HOT_BUFFER_SIZE) {
+  // Fast path: short sequences have all tokens in the device buffer in order,
+  // so position == buffer slot. A pass-through caller keeps most positions in the
+  // pool, leaving the buffer an unrelated subset, and would get wrong slots here.
+  if (!PassThroughDeviceLocs && seq_len <= HOT_BUFFER_SIZE) {
     const int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
     for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
       int32_t device_loc = -1;
@@ -417,7 +457,7 @@ __global__ void load_cache_to_device_buffer_kernel(
 
   // Dynamic shared memory layout: int32_t arrays first, then int16_t arrays.
   extern __shared__ char smem_raw[];
-  using Layout = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>;
+  using Layout = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE, PassThroughDeviceLocs>;
   constexpr int HASH_SIZE = Layout::HASH_SIZE;
 
   int32_t* smem_i32 = reinterpret_cast<int32_t*>(smem_raw);
@@ -432,6 +472,12 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Scalar counters
   int32_t& s_total_hits = s_hash_keys[HASH_SIZE];
   int32_t& s_newest_hit = s_hash_keys[HASH_SIZE + 1];
+  // Lanes retired by the pass-through pass (pool-resident, or masked because the
+  // selector left them unfilled). They mark themselves TOKEN_HIT, but the miss
+  // TOTAL below is recomputed from the counters rather than from that pass's
+  // ballot, so they need a counter too -- otherwise the copy phase reads host
+  // locations for positions it never planned. Last of the gated counters.
+  int32_t& s_pass_through_hits = s_hash_keys[HASH_SIZE + Layout::NUM_COUNTERS - 1];
 
   int16_t* smem_i16 = reinterpret_cast<int16_t*>(smem_i32 + Layout::TOTAL_INT32);
   // Compacted slot ordering: [hits fwd->  ...  <-evictables bwd]
@@ -443,6 +489,9 @@ __global__ void load_cache_to_device_buffer_kernel(
   if (tid == 0) {
     s_total_hits = 0;
     s_newest_hit = 0;
+    if constexpr (PassThroughDeviceLocs) {
+      s_pass_through_hits = 0;
+    }
   }
   for (int i = tid; i < HASH_SIZE; i += BLOCK_SIZE) {
     s_hash_keys[i] = HASH_EMPTY;
@@ -457,9 +506,38 @@ __global__ void load_cache_to_device_buffer_kernel(
   const int32_t newest_token = seq_len - 1;
 
   // Insert top-k tokens into shared-memory hash table.
+  int my_pass_through_count = 0;
   for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
     int32_t token_idx = req_top_k_tokens[i];
-    if (token_idx == newest_token) {
+    if constexpr (PassThroughDeviceLocs) {
+      // Still owned by the pool: emit its slot and take nothing. Marking it
+      // TOKEN_HIT keeps the miss pass from assigning it a buffer slot, and
+      // staying out of the hash keeps a buffer resident from claiming this lane.
+      if (token_idx < 0) {
+        // Lane the selector left unfilled -- routine below NUM_TOP_K positions,
+        // which only a pass-through caller sees (the fast path that used to
+        // absorb them is off). Retire it as masked; left as a miss it would send
+        // the copy phase into the host table at a negative position.
+        s_top_k_tokens[i] = TOKEN_HIT;
+        req_top_k_device_locs[i] = -1;
+        ++my_pass_through_count;
+        continue;
+      }
+      const int32_t pool_loc = req_device_locs[token_idx];
+      if (pool_loc >= 0) {
+        s_top_k_tokens[i] = TOKEN_HIT;
+        req_top_k_device_locs[i] = pool_loc;
+        ++my_pass_through_count;
+        continue;
+      }
+      // Sentinel: the pool gave this position up, so fall through to the
+      // buffer/host paths. Every selected position has a home by construction
+      // (the caller reserves host space before releasing a pool slot), so a
+      // broken invariant faults on the host index rather than degrading the
+      // output silently. The newest token is never given up, so its special case
+      // below is unreachable here and compiles out.
+    }
+    if (!PassThroughDeviceLocs && token_idx == newest_token) {
       // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and mark
       // it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
       s_top_k_tokens[i] = TOKEN_HIT;
@@ -476,6 +554,13 @@ __global__ void load_cache_to_device_buffer_kernel(
         slot = (slot + 1) % HASH_SIZE;
       }
       s_top_k_tokens[i] = token_idx;
+    }
+  }
+  // One atomic per thread, not per lane: with NUM_TOP_K in the thousands and most
+  // lanes pool-resident, per-lane atomics on one address serialize badly.
+  if constexpr (PassThroughDeviceLocs) {
+    if (my_pass_through_count > 0) {
+      atomicAdd(&s_pass_through_hits, my_pass_through_count);
     }
   }
   __syncthreads();
@@ -631,7 +716,12 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
   __syncthreads();
 
+  // Recomputed from the counters (not from the pass above, whose ballot total is
+  // only valid in warp 0) so every warp in the copy phase agrees on it.
   total_misses = NUM_TOP_K - s_total_hits - s_newest_hit;
+  if constexpr (PassThroughDeviceLocs) {
+    total_misses -= s_pass_through_hits;
+  }
   if constexpr (RecordMissPlan) {
     if (tid == 0) {
       miss_count_out[bid] = total_misses;
@@ -683,7 +773,15 @@ __global__ void load_cache_to_device_buffer_kernel(
       const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
 
       copy_miss_item<IsMLA, IsDsv4Layout>(
-          lane_id, host_cache_k, host_cache_v, device_buffer_k, device_buffer_v, src_loc, dst_loc, item_size_bytes);
+          lane_id,
+          host_base,
+          host_cache_v,
+          device_buffer_k,
+          device_buffer_v,
+          src_loc,
+          dst_loc,
+          item_size_bytes,
+          host_row_bytes);
     }
   }
 }
@@ -695,12 +793,16 @@ template <
     bool IsMLA,
     bool IsDsv4Layout,
     bool RecordMissPlan,
-    bool SkipIO>
+    bool SkipIO,
+    bool PassThroughDeviceLocs,
+    bool LateBoundHostBase>
 void load_cache_to_device_buffer(
     tvm::ffi::TensorView top_k_tokens,
     tvm::ffi::TensorView device_buffer_tokens,
     tvm::ffi::TensorView host_cache_locs,
     tvm::ffi::TensorView device_buffer_locs,
+    tvm::ffi::TensorView device_locs,
+    tvm::ffi::TensorView host_binding,
     tvm::ffi::TensorView host_cache_k,
     tvm::ffi::TensorView host_cache_v,
     tvm::ffi::TensorView device_buffer_k,
@@ -727,6 +829,13 @@ void load_cache_to_device_buffer(
   if (RecordMissPlan && miss_dst_out.strides()[0] != plan_stride) {
     throw std::runtime_error("load_cache_to_device_buffer: miss_src/miss_dst row strides differ");
   }
+  // 0-dim sentinel when the caller has no pool source (private-host backing).
+  const int32_t* const device_locs_ptr =
+      PassThroughDeviceLocs ? static_cast<const int32_t*>(device_locs.data_ptr()) : nullptr;
+  const int64_t device_locs_stride = PassThroughDeviceLocs ? device_locs.strides()[0] : 0;
+  // 0-dim sentinel when the caller owns its host pool up front.
+  const int64_t* const host_binding_arg =
+      LateBoundHostBase ? static_cast<const int64_t*>(host_binding.data_ptr()) : nullptr;
   const int64_t buffer_stride_0 = device_buffer_tokens.strides()[0];
   const int64_t lru_slot_stride_0 = lru_slots.strides()[0];
   const int64_t top_k_tokens_stride = top_k_tokens.strides()[0];
@@ -736,7 +845,7 @@ void load_cache_to_device_buffer(
   // Generic lambda: int32/int64 kernel variants are compiled for both
   // seq_lens and req_pool_indices; the correct combo is selected at runtime.
   auto launch = [&](auto kernel_fn, const auto* seq_lens_ptr, const auto* req_pool_indices_ptr) {
-    constexpr size_t smem_bytes = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::BYTES;
+    constexpr size_t smem_bytes = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE, PassThroughDeviceLocs>::BYTES;
 #ifndef USE_ROCM
     if constexpr (smem_bytes > 48u * 1024u) {
       cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
@@ -748,6 +857,9 @@ void load_cache_to_device_buffer(
         static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
         static_cast<const int64_t*>(host_cache_locs.data_ptr()),
         static_cast<const int32_t*>(device_buffer_locs.data_ptr()),
+        device_locs_ptr,
+        device_locs_stride,
+        host_binding_arg,
         host_cache_k.data_ptr(),
         (IsMLA || host_cache_v.ndim() == 0) ? (const void*)nullptr : host_cache_v.data_ptr(),
         device_buffer_k.data_ptr(),
@@ -785,6 +897,8 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             RecordMissPlan,
             SkipIO,
+            PassThroughDeviceLocs,
+            LateBoundHostBase,
             int64_t,
             int64_t>,
         static_cast<const int64_t*>(seq_lens.data_ptr()),
@@ -799,6 +913,8 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             RecordMissPlan,
             SkipIO,
+            PassThroughDeviceLocs,
+            LateBoundHostBase,
             int64_t,
             int32_t>,
         static_cast<const int64_t*>(seq_lens.data_ptr()),
@@ -813,6 +929,8 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             RecordMissPlan,
             SkipIO,
+            PassThroughDeviceLocs,
+            LateBoundHostBase,
             int32_t,
             int64_t>,
         static_cast<const int32_t*>(seq_lens.data_ptr()),
@@ -827,6 +945,8 @@ void load_cache_to_device_buffer(
             IsDsv4Layout,
             RecordMissPlan,
             SkipIO,
+            PassThroughDeviceLocs,
+            LateBoundHostBase,
             int32_t,
             int32_t>,
         static_cast<const int32_t*>(seq_lens.data_ptr()),
@@ -884,7 +1004,8 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void copy_cache_planned_kernel(
             device_buffer_v,
             src_row[m],
             static_cast<int64_t>(dst_row[m]),
-            item_size_bytes);
+            item_size_bytes,
+            /*host_row_bytes=*/item_size_bytes);
       }
       start += cnt;
     }
