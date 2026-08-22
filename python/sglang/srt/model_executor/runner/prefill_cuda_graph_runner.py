@@ -52,6 +52,12 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 )
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.layers.attention.linear.kda_route_telemetry import (
+    KDACudaGraphRoutePlans,
+    capture_kda_route_plan,
+    replay_kda_route_plan,
+    suppress_kda_route_recording,
+)
 from sglang.srt.layers.cp.bcg import (
     PrefillCPBCGInput,
 )
@@ -253,6 +259,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        self.kda_cuda_graph_route_plans = KDACudaGraphRoutePlans()
         # --- model flags ----------------------------------------------
         self.quant_config = getattr(model_runner.model, "quant_config", None)
         self.is_multimodal = model_runner.model_config.is_multimodal
@@ -366,7 +373,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # TcPiecewise does its compile pass during backend construction.
         # Wrap only that path with the prefill CUDA graph failure hint.
         try:
-            self.backend = resolve_prefill_backend(self)
+            with suppress_kda_route_recording():
+                self.backend = resolve_prefill_backend(self)
         except RuntimeError as e:
             if self.prefill_backend_name != Backend.TC_PIECEWISE:
                 raise
@@ -1419,18 +1427,24 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             post_warmup_hook = None
         else:
             post_warmup_hook = getattr(attn_backend, "on_after_cuda_graph_warmup", None)
-        self.backend.capture_one(
+        with capture_kda_route_plan(
             shape_key,
-            run_once,
-            # DP padding can install capture-only tensors on this dummy batch;
-            # BCG retains it so their recorded addresses remain valid.
-            capture_inputs=(
-                forward_batch
-                if forward_batch.global_num_tokens_gpu is not None
-                else None
-            ),
-            post_warmup_hook=post_warmup_hook,
-        )
+            "prefill",
+            capture_probe=self.backend.is_actual_capture_pass,
+            plans=self.kda_cuda_graph_route_plans,
+        ):
+            self.backend.capture_one(
+                shape_key,
+                run_once,
+                # DP padding can install capture-only tensors on this dummy batch;
+                # BCG retains it so their recorded addresses remain valid.
+                capture_inputs=(
+                    forward_batch
+                    if forward_batch.global_num_tokens_gpu is not None
+                    else None
+                ),
+                post_warmup_hook=post_warmup_hook,
+            )
 
     def load_batch(self, forward_batch: ForwardBatch, **kwargs) -> ForwardBatch:
         """Pad, populate static buffers, and build the static_forward_batch
@@ -1680,7 +1694,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     self.buffer_registry.get_slot("input_embeds").slice_for(
                         1, static_num_tokens
                     )[: ie.shape[0]].copy_(ie)
-            hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
+            hs = replay_kda_route_plan(
+                shape_key,
+                "prefill",
+                lambda: self.backend.replay(shape_key, static_forward_batch, **kwargs),
+                plans=self.kda_cuda_graph_route_plans,
+            )
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
         original_layer_forward = self.layer_model.forward
@@ -1716,10 +1735,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             num_tokens=static_num_tokens,
             raw_num_tokens=raw_num_tokens,
         ):
-            return self.backend.replay(
-                ShapeKey(size=static_num_tokens),
-                static_forward_batch,
-                **kwargs,
+            shape_key = ShapeKey(size=static_num_tokens)
+            return replay_kda_route_plan(
+                shape_key,
+                "prefill",
+                lambda: self.backend.replay(
+                    shape_key,
+                    static_forward_batch,
+                    **kwargs,
+                ),
+                plans=self.kda_cuda_graph_route_plans,
             )
 
     def _trim_logits_output(

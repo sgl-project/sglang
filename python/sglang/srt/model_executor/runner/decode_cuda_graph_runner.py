@@ -49,6 +49,12 @@ from sglang.srt.layers.attention.base_attn_backend import (
     SharedReadEnds,
 )
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.layers.attention.linear.kda_route_telemetry import (
+    KDACudaGraphRoutePlans,
+    capture_kda_route_plan,
+    replay_kda_route_plan,
+    suppress_kda_route_recording,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -56,6 +62,9 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
+from sglang.srt.mem_cache.allocator.mamba import (
+    MAMBA_STATE_INDEX_REPLAY_PROVENANCE,
+)
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_decode_registry,
@@ -193,6 +202,11 @@ def build_replay_fb_view(
             if buffers.mamba_track_indices is None
             else buffers.mamba_track_indices[:bs]
         ),
+        # Host request identities prove that the active request gather is not a
+        # top-k/duplicate expansion.  Mamba metadata binds this proof to its
+        # exact stable post-v2p index buffer; padding rows are not represented.
+        rids=getattr(forward_batch, "rids", None),
+        mamba_state_index_replay_provenance=MAMBA_STATE_INDEX_REPLAY_PROVENANCE,
         spec_info=forward_batch.spec_info,
     )
 
@@ -214,10 +228,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         speculative_num_draft_tokens: Optional[int] = None,
     ):
         super().__init__(model_runner)
+        self.kda_cuda_graph_route_plans = KDACudaGraphRoutePlans()
 
         # In-graph metadata prep: shared buffers -> in-graph private data
         self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
-
         # --- core state ------------------------------------------------
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
@@ -1145,6 +1159,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
+            forward_batch.mamba_state_index_replay_provenance = (
+                MAMBA_STATE_INDEX_REPLAY_PROVENANCE
+            )
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
             def run_once():
@@ -1217,18 +1234,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     "on_after_cuda_graph_warmup",
                     None,
                 )
-                maybe_flashinfer_autotune_speculative_draft(
-                    self,
-                    run_once,
-                    post_warmup_hook=post_warmup_hook,
-                    run_lm_head=True,
-                )
-                self.backend.capture_one(
+                with suppress_kda_route_recording():
+                    maybe_flashinfer_autotune_speculative_draft(
+                        self,
+                        run_once,
+                        post_warmup_hook=post_warmup_hook,
+                        run_lm_head=True,
+                    )
+                with capture_kda_route_plan(
                     shape_key,
-                    run_once,
-                    capture_inputs=None,
-                    post_warmup_hook=post_warmup_hook,
-                )
+                    "decode",
+                    capture_probe=self.backend.is_actual_capture_pass,
+                    plans=self.kda_cuda_graph_route_plans,
+                ):
+                    self.backend.capture_one(
+                        shape_key,
+                        run_once,
+                        capture_inputs=None,
+                        post_warmup_hook=post_warmup_hook,
+                    )
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
@@ -1413,7 +1437,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)
 
-            output = self.backend.replay(self._replay_graph_key, forward_batch)
+            output = replay_kda_route_plan(
+                self._replay_graph_key,
+                "decode",
+                lambda: self.backend.replay(self._replay_graph_key, forward_batch),
+                plans=self.kda_cuda_graph_route_plans,
+            )
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)

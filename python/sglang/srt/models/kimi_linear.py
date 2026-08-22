@@ -39,6 +39,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -408,9 +409,13 @@ class KimiDeltaAttention(nn.Module):
             forget_gate = forget_gate.unflatten(
                 -1, (-1, self.head_dim)
             )  # [T, H*K] -> [T, H, K]
-            if not forward_batch.forward_mode.is_target_verify():
-                # Only chunk_kda (extend) wants pre-activated beta; the verify
-                # kernel sigmoids it in-kernel like decode.
+            if (
+                not forward_batch.forward_mode.is_target_verify()
+                and not get_attn_backend().linear_attn_backend.kernel_dispatcher.extend_uses_cake_prefill
+            ):
+                # Triton and the other chunk backends take probabilities. Cake
+                # fuses sigmoid and consumes the original (possibly strided)
+                # projection logits without a materializing conversion.
                 beta = beta.float().sigmoid()
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)

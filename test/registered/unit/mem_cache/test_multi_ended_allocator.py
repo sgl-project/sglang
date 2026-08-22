@@ -29,6 +29,11 @@ import unittest
 
 import torch
 
+from sglang.srt.mem_cache.allocator.mamba import (
+    MAMBA_STATE_INDEX_INVARIANT,
+    MambaSlotAllocator,
+    _issue_state_index_contract,
+)
 from sglang.srt.mem_cache.multi_ended_allocator import (
     MultiEndedAllocator,
     UnifiedSWATokenToKVPoolAllocator,
@@ -37,6 +42,7 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
     MHASubPoolSpec,
     UnifiedKVPool,
+    UnifiedMambaSlotAllocator,
 )
 
 _DEV = "cpu"
@@ -63,6 +69,16 @@ def _make_mamba_spec(name, grow, layer_num=2):
         temporal_dtype=torch.float32,
         grow_direction=grow,
     )
+
+
+def _assert_kernel_state_indices(test, indices, *, valid_bs, state_slots):
+    """Assert the allocator-backed active-prefix and replay-padding contract."""
+    active = indices[:valid_bs]
+    padding = indices[valid_bs:]
+    test.assertTrue(bool((active >= 1).all().item()))
+    test.assertTrue(bool((active < state_slots).all().item()))
+    test.assertEqual(active.unique().numel(), active.numel())
+    test.assertTrue(bool((padding == -1).all().item()))
 
 
 class _FakeKVCache:
@@ -151,6 +167,96 @@ class TestUnifiedKVPoolViews(unittest.TestCase):
         temporal_view[2, 6] = -1.25
         self.assertTrue(torch.all(conv_views[0][1, 4] == 3.5))
         self.assertTrue(torch.all(temporal_view[2, 6] == -1.25))
+
+
+class TestStaticMambaStateIndexContract(unittest.TestCase):
+    def test_alloc_reuse_and_replay_padding_preserve_contract(self):
+        allocator = MambaSlotAllocator(size=16, device=_DEV)
+        self.assertIs(
+            allocator.state_index_invariant,
+            MAMBA_STATE_INDEX_INVARIANT,
+        )
+
+        first = allocator.alloc(8)
+        self.assertIsNotNone(first)
+        eager_indices = first.to(torch.int32)
+        _assert_kernel_state_indices(
+            self,
+            eager_indices,
+            valid_bs=eager_indices.numel(),
+            state_slots=allocator.size + 1,
+        )
+        eager_contract = _issue_state_index_contract(
+            allocator,
+            eager_indices,
+            active_prefix=eager_indices.numel(),
+            state_slots=allocator.size + 1,
+            active_request_ids=tuple(
+                f"static-eager-{i}" for i in range(eager_indices.numel())
+            ),
+        )
+        self.assertTrue(
+            eager_contract.matches(
+                eager_indices,
+                batch_size=eager_indices.numel(),
+                state_slots=allocator.size + 1,
+            )
+        )
+        replay_indices = torch.full((12,), 777, dtype=torch.int32)
+        replay_ptr = replay_indices.data_ptr()
+        replay_indices[:8].copy_(first.to(torch.int32))
+        replay_indices[8:].fill_(-1)
+        _assert_kernel_state_indices(
+            self,
+            replay_indices,
+            valid_bs=8,
+            state_slots=allocator.size + 1,
+        )
+        contract = _issue_state_index_contract(
+            allocator,
+            replay_indices,
+            active_prefix=8,
+            state_slots=allocator.size + 1,
+            active_request_ids=tuple(f"static-replay-{i}" for i in range(8)),
+        )
+        self.assertTrue(
+            contract.matches(
+                replay_indices,
+                batch_size=replay_indices.numel(),
+                state_slots=allocator.size + 1,
+            )
+        )
+
+        # Free an interior subset, reuse those slots, and refill the same
+        # graph-owned metadata buffer with a shorter active prefix.  The old
+        # active tail must be poisoned with -1 on the next replay.
+        reserved = allocator.alloc(8)
+        self.assertIsNotNone(reserved)
+        allocator.free(first[2:4])
+        replacement = allocator.alloc(2)
+        self.assertIsNotNone(replacement)
+        self.assertTrue(torch.equal(replacement, first[2:4]))
+        second = torch.cat((first[:2], first[4:7], replacement[:1]))
+        replay_indices[: second.numel()].copy_(second.to(torch.int32))
+        replay_indices[second.numel() :].fill_(-1)
+        self.assertEqual(replay_indices.data_ptr(), replay_ptr)
+        _assert_kernel_state_indices(
+            self,
+            replay_indices,
+            valid_bs=second.numel(),
+            state_slots=allocator.size + 1,
+        )
+        replay_contract = _issue_state_index_contract(
+            allocator,
+            replay_indices,
+            active_prefix=second.numel(),
+            state_slots=allocator.size + 1,
+            active_request_ids=tuple(
+                f"static-replay-next-{i}" for i in range(second.numel())
+            ),
+        )
+        self.assertEqual(replay_contract.active_prefix, second.numel())
+        self.assertIs(replay_contract.index_tensor, replay_indices)
 
 
 class TestMultiEndedAllocator(unittest.TestCase):
@@ -263,6 +369,119 @@ class TestMultiEndedAllocator(unittest.TestCase):
         self._free(mamba_alloc, mamba_kv, c)
         self._check_invariants(mamba_alloc, mamba_kv)
         self.assertEqual(mamba_alloc.allocated_count(), 0)
+
+    def test_unified_mamba_translation_replay_contract_after_compaction(self):
+        pool, _, mamba_alloc, _, mamba_kv = self._build_pair(
+            n_full_slots=48,
+            n_mamba_slots=24,
+        )
+        slot_allocator = UnifiedMambaSlotAllocator(
+            mamba_alloc,
+            max_size=pool.max_slots("mamba") - 1,
+            device=_DEV,
+        )
+        self.assertIs(
+            slot_allocator.state_index_invariant,
+            MAMBA_STATE_INDEX_INVARIANT,
+        )
+        virtual = slot_allocator.alloc(8)
+        self.assertIsNotNone(virtual)
+        physical = slot_allocator.translate(virtual)
+        mamba_kv.buf[physical] = virtual
+        eager_indices = physical.to(torch.int32)
+        _assert_kernel_state_indices(
+            self,
+            eager_indices,
+            valid_bs=eager_indices.numel(),
+            state_slots=pool.max_slots("mamba"),
+        )
+        eager_contract = _issue_state_index_contract(
+            slot_allocator,
+            eager_indices,
+            active_prefix=eager_indices.numel(),
+            state_slots=pool.max_slots("mamba"),
+            active_request_ids=tuple(
+                f"unified-eager-{i}" for i in range(eager_indices.numel())
+            ),
+        )
+        self.assertTrue(
+            eager_contract.matches(
+                eager_indices,
+                batch_size=eager_indices.numel(),
+                state_slots=pool.max_slots("mamba"),
+            )
+        )
+
+        replay_indices = torch.full((12,), 777, dtype=torch.int32)
+        replay_ptr = replay_indices.data_ptr()
+
+        def refill(active_virtual):
+            # Exact unified replay order: padded request rows gather virtual
+            # slot 0, the whole buffer is translated through the live v2p
+            # table, then the inactive tail is overwritten with -1.
+            gathered_virtual = torch.zeros((12,), dtype=torch.int64)
+            gathered_virtual[: active_virtual.numel()].copy_(active_virtual)
+            translated = slot_allocator.translate(gathered_virtual).to(torch.int32)
+            translated[active_virtual.numel() :].fill_(-1)
+            replay_indices.copy_(translated)
+            _assert_kernel_state_indices(
+                self,
+                replay_indices,
+                valid_bs=active_virtual.numel(),
+                state_slots=pool.max_slots("mamba"),
+            )
+            active_physical = replay_indices[: active_virtual.numel()].to(torch.int64)
+            self.assertTrue(
+                torch.equal(
+                    mamba_alloc.physical_to_virtual[active_physical],
+                    active_virtual,
+                )
+            )
+            contract = _issue_state_index_contract(
+                slot_allocator,
+                replay_indices,
+                active_prefix=active_virtual.numel(),
+                state_slots=pool.max_slots("mamba"),
+                active_request_ids=tuple(
+                    f"unified-replay-{i}" for i in range(active_virtual.numel())
+                ),
+            )
+            self.assertTrue(
+                contract.matches(
+                    replay_indices,
+                    batch_size=replay_indices.numel(),
+                    state_slots=pool.max_slots("mamba"),
+                )
+            )
+            return active_physical.clone(), contract
+
+        self.assertEqual(
+            slot_allocator.translate(torch.tensor([-1], dtype=torch.int64)).item(),
+            -1,
+        )
+        first_physical, first_contract = refill(virtual)
+
+        # Freeing interior virtual IDs compacts the physical band.  Surviving
+        # virtual IDs stay stable but at least one physical ID moves; replay
+        # must consult the live v2p table and refresh the same static buffer.
+        removed = virtual[2:4]
+        survivors = torch.cat((virtual[:2], virtual[4:]))
+        old_survivor_physical = slot_allocator.translate(survivors).clone()
+        self._free(mamba_alloc, mamba_kv, removed)
+        new_survivor_physical = slot_allocator.translate(survivors)
+        self.assertFalse(torch.equal(old_survivor_physical, new_survivor_physical))
+
+        replacement = slot_allocator.alloc(2)
+        self.assertIsNotNone(replacement)
+        replacement_physical = slot_allocator.translate(replacement)
+        mamba_kv.buf[replacement_physical] = replacement
+        second_virtual = torch.cat((survivors, replacement[:1]))
+        second_physical, second_contract = refill(second_virtual)
+
+        self.assertEqual(replay_indices.data_ptr(), replay_ptr)
+        self.assertFalse(torch.equal(first_physical, second_physical))
+        self.assertIs(first_contract.index_tensor, second_contract.index_tensor)
+        self.assertNotEqual(first_contract.active_prefix, second_contract.active_prefix)
 
     def test_byte_frontier_coordination(self):
         # full has 8 slots' worth of bytes; mamba's entry is larger, so a few

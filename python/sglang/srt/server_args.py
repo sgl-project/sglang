@@ -397,6 +397,7 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "triton",
     "cutedsl",
     "flashinfer",
+    "cake",
     "flashkda",
     "nvidia_kda",
     "ptx_kda",
@@ -5366,7 +5367,9 @@ class ServerArgs:
                 apply_kimi_k3_spec_backend_defaults,
             )
 
-            apply_kimi_k3_linear_attn_defaults(self)
+            apply_kimi_k3_linear_attn_defaults(
+                self, model_arch=model_arch, hf_config=hf_config
+            )
             apply_kimi_k3_spec_backend_defaults(self)
 
         if model_arch in [
@@ -6315,6 +6318,15 @@ class ServerArgs:
     def _handle_linear_attn_backend(self):
         import torch
 
+        # CAKE provides a matched KDA prefill/decode pair. Treat the shared
+        # backend flag as an explicit choice for both phases; per-phase flags
+        # still take precedence when the caller wants a mixed configuration.
+        if self.linear_attn_backend == "cake":
+            if self.linear_attn_decode_backend is None:
+                self.linear_attn_decode_backend = "cake"
+            if self.linear_attn_prefill_backend is None:
+                self.linear_attn_prefill_backend = "cake"
+
         # SM100+: default to FlashInfer GDN decode (and MTP verify, via pool API)
         # when the user hasn't explicitly chosen a decode backend and
         # mamba-ssm-dtype is bf16 (required by FlashInfer GDN on SM100+).
@@ -6358,13 +6370,13 @@ class ServerArgs:
             )
 
         if (
-            decode == "flashinfer"
+            decode in ("flashinfer", "cake")
             and self.mamba_ssm_dtype != "bfloat16"
             and is_cuda()
             and torch.cuda.get_device_capability()[0] >= 10
         ):
             raise ValueError(
-                "--linear-attn-decode-backend flashinfer on SM100+ requires "
+                f"--linear-attn-decode-backend {decode} on SM100+ requires "
                 "--mamba-ssm-dtype bfloat16, "
                 f"got {self.mamba_ssm_dtype!r}"
             )
@@ -6387,6 +6399,17 @@ class ServerArgs:
         # SM100+ FlashInfer GDN prefill requires CUDA 13+ (CuTe DSL kernel)
         # for correctness and best performance.
         prefill = self.linear_attn_prefill_backend or self.linear_attn_backend
+        if (
+            prefill == "cake"
+            and self.mamba_ssm_dtype != "bfloat16"
+            and is_cuda()
+            and torch.cuda.get_device_capability()[0] >= 10
+        ):
+            raise ValueError(
+                "--linear-attn-prefill-backend cake on SM100+ requires "
+                "--mamba-ssm-dtype bfloat16, "
+                f"got {self.mamba_ssm_dtype!r}"
+            )
         cuda_version = torch.version.cuda
         cuda_major = int(cuda_version.split(".")[0]) if cuda_version is not None else 0
         if (
@@ -8501,17 +8524,22 @@ class ServerArgs:
         # The Mamba/KDA state is stored in envelope-strided views; only
         # stride-audited kernels may read it (Stage 4 audit, per slot):
         # - decode: triton; flashinfer (recurrent_kda compiles the state slot
-        #   stride as a free int64); helion (specializes KDA state strides 0-3
-        #   and rejects a non-unit innermost stride); cutedsl (KDA fused sigmoid-
-        #   gating update is stride-safe) on KDA-hybrid models only.
-        # - prefill: triton; flashkda (the wrapper gathers/scatters a contiguous
-        #   per-slot copy); helion; cutedsl (kernel_h compiles h0/ht with dynamic
-        #   int64 strides), with the same KDA-only caveat.
+        #   stride as a free int64 — natively strided); cake (the covered
+        #   Kimi-K3 H=12 packed path indexes the pool directly with no
+        #   gather/scatter, while unsupported contracts fall back to triton);
+        #   helion (specializes KDA state strides 0-3 and rejects a non-unit
+        #   innermost stride); cutedsl (KDA fused sigmoid-gating update made
+        #   stride-safe) on KDA-hybrid models only — cutedsl_gdn still compiles
+        #   h0 against a contiguous dummy.
+        # - prefill: triton; cake/flashkda (wrappers gather/scatter a contiguous
+        #   per-slot copy, external kernels never see the pool); helion; cutedsl
+        #   (kernel_h compiles h0/ht with dynamic int64 strides), with the same
+        #   KDA-only caveat.
         # - mamba (mamba2/short-conv state): triton only.
         # use_mla_backend() distinguishes the KDA-hybrid family (K3/KimiLinear
-        # are MLA-hybrid) from GDN models (GQA-hybrid) for the KDA-only caveat.
-        decode_allowed = {"triton", "flashinfer"}
-        prefill_allowed = {"triton", "flashkda"}
+        # are MLA-hybrid) from GDN models (GQA-hybrid) for the cutedsl caveat.
+        decode_allowed = {"triton", "flashinfer", "cake"}
+        prefill_allowed = {"triton", "cake", "flashkda"}
         if self.use_mla_backend():
             decode_allowed.update({"cutedsl", "helion"})
             prefill_allowed.update({"cutedsl", "helion"})

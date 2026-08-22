@@ -26,9 +26,10 @@ if TYPE_CHECKING:
 
 
 class BaseCudaGraphBackend(ABC):
-    """Pure ABC: no state, no defaults. Each implementation owns its
-    per-backend state and binds the handles it needs from the
-    cuda_graph_runner passed to its __init__.
+    """Backend interface with no shared state.
+
+    Each implementation owns its per-backend state and binds the handles it
+    needs from the cuda_graph_runner passed to its __init__.
 
     Methods:
       - capture_session(stream) — context wrapping the runner's outer
@@ -64,6 +65,15 @@ class BaseCudaGraphBackend(ABC):
         capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None: ...
+
+    def is_actual_capture_pass(self) -> bool:
+        """Whether Python is executing the one pass that owns capture receipts.
+
+        Full graphs can use the physical current-stream state. Piecewise
+        backends override this because eager breaks execute between physical
+        graph segments while still belonging to the actual recording pass.
+        """
+        return bool(torch.cuda.is_current_stream_capturing())
 
     @abstractmethod
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool: ...
