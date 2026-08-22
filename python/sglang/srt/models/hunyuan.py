@@ -360,8 +360,12 @@ class HunYuanAttention(nn.Module):
             if self.use_qk_norm:
                 # q = self.query_layernorm(q.view(-1, self.num_heads, self.head_dim).contiguous())
                 # k = self.key_layernorm(k.view(-1, self.num_kv_heads, self.head_dim).contiguous())
-                q = self.query_layernorm(q.reshape(-1, self.head_dim).contiguous())
-                k = self.key_layernorm(k.reshape(-1, self.head_dim).contiguous())
+                q = self.query_layernorm(
+                    q.reshape(-1, self.head_dim).contiguous()
+                ).reshape(-1, self.q_size)
+                k = self.key_layernorm(
+                    k.reshape(-1, self.head_dim).contiguous()
+                ).reshape(-1, self.kv_size)
         elif self.attention_type == "cross":
             assert kv_states is not None
             ori_k, v = kv_states  # use last layer kv,
