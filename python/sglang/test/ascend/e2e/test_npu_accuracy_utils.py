@@ -5,12 +5,15 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
 import time
 from datetime import datetime
 from urllib.parse import urlparse
+
+import psutil
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
@@ -276,6 +279,51 @@ def assert_metrics(self, metrics):
         )
 
 
+def _kill_forkserver_group(orphans_only=False):
+    """Kill processes in the current process group except this process.
+
+    By default kills every process in the group (server and forkserver alike).
+    With orphans_only=True, only stray forkserver children reparented to PID 1,
+    together with their descendants, are killed; the directly spawned server is
+    left alive.
+    """
+    me = os.getpid()
+    try:
+        pgid = os.getpgid(me)
+    except ProcessLookupError:
+        logger.warning(f"Cannot resolve own process group for pid {me}")
+        return
+    if pgid != me:
+        logger.warning(
+            f"Skip process-group cleanup: pid {me} is not the group leader "
+            f"(pgid={pgid}), refusing to kill the parent suite"
+        )
+        return
+    logger.info(f"Cleaning up process group pgid={pgid}, orphans_only={orphans_only}")
+    for pid in psutil.pids():
+        if pid == me:
+            continue
+        try:
+            proc = psutil.Process(pid)
+            if proc.pgid() != pgid:
+                continue
+            ppid = proc.ppid()
+            if orphans_only and ppid != 1:
+                continue
+            logger.info(f"Killing leftover process pid={pid} ppid={ppid} pgid={pgid}")
+            if orphans_only:
+                kill_process_tree(pid)
+            else:
+                os.kill(pid, signal.SIGKILL)
+        except (
+            psutil.NoSuchProcess,
+            psutil.AccessDenied,
+            ProcessLookupError,
+            PermissionError,
+        ):
+            continue
+
+
 class TestNpuAccuracyTestCaseBase(CustomTestCase):
     model = None
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
@@ -422,6 +470,10 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
+        try:
+            os.setsid()
+        except OSError:
+            pass
         cls._setup_per_case_output()
         cls.base_url = DEFAULT_URL_FOR_TEST
         env = os.environ.copy()
@@ -444,13 +496,15 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            try:
-                kill_process_tree(cls.process.pid)
-            except Exception as e:
-                logger.error(f"Error during tearDown: {e}")
         cls._save_metrics_json()
         cls._backup_plog()
+        try:
+            if cls.benchmark_tool == EVALSCOPE:
+                _kill_forkserver_group()
+            elif hasattr(cls, "process") and cls.process:
+                kill_process_tree(cls.process.pid)
+        except Exception as e:
+            logger.error(f"Error during tearDown: {e}")
 
     def run_accuracy(self):
         parsed_url = urlparse(self.base_url)
@@ -571,6 +625,10 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
+        try:
+            os.setsid()
+        except OSError:
+            pass
         cls.local_ip = "127.0.0.1"
         cls.host = os.getenv("POD_IP")
         cls.port = SERVICE_PORT
@@ -584,7 +642,11 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        pass
+        try:
+            if cls.benchmark_tool == EVALSCOPE:
+                _kill_forkserver_group(orphans_only=True)
+        except Exception as e:
+            logger.error(f"Error during tearDown: {e}")
 
     @classmethod
     @check_role(allowed_roles=["master"])
@@ -672,6 +734,10 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
+        try:
+            os.setsid()
+        except OSError:
+            pass
         cls.process = None
         cls.local_ip = "127.0.0.1"
         cls.host = os.getenv("POD_IP")
@@ -690,11 +756,13 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        if cls.process:
-            try:
+        try:
+            if cls.benchmark_tool == EVALSCOPE:
+                _kill_forkserver_group()
+            elif cls.process:
                 kill_process_tree(cls.process.pid)
-            except Exception as e:
-                logger.error(f"Error during tearDown: {e}")
+        except Exception as e:
+            logger.error(f"Error during tearDown: {e}")
 
     @classmethod
     @check_role(allowed_roles=["router"])
