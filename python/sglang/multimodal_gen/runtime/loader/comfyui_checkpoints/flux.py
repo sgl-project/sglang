@@ -7,7 +7,7 @@ from typing import Any
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
-from sglang.multimodal_gen.runtime.loader.comfyui_checkpoint import (
+from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints.spec import (
     ComfyUICheckpointSpec,
     WeightIterator,
     register_comfyui_checkpoint,

@@ -7,7 +7,7 @@ from sglang.multimodal_gen.configs.models.dits.qwenimage import (
     QwenImageArchConfig,
     QwenImageDitConfig,
 )
-from sglang.multimodal_gen.runtime.loader.comfyui_checkpoint import (
+from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints.spec import (
     ComfyUICheckpointSpec,
     register_comfyui_checkpoint,
 )

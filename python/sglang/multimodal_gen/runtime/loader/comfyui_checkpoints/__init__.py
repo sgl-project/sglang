@@ -1,12 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
-"""ComfyUI checkpoint specs, one module per DiT family.
+"""ComfyUI single-file DiT checkpoints.
 
-Importing this package registers every spec. To support a new model, add a
-module here and import it below.
+``spec`` holds the shared checkpoint description and load path. Each sibling
+module registers one DiT family. Importing this package registers every spec.
 """
 
+from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints.spec import (
+    ComfyUICheckpointSpec,
+    ParamNamesMapping,
+    WeightIterator,
+    get_comfyui_checkpoint_spec,
+    get_registered_comfyui_pipeline_names,
+    is_comfyui_single_file,
+    load_comfyui_transformer,
+    register_comfyui_checkpoint,
+)
 from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (  # noqa: F401
     flux,
     qwen_image,
     zimage,
 )
+
+__all__ = [
+    "ComfyUICheckpointSpec",
+    "ParamNamesMapping",
+    "WeightIterator",
+    "get_comfyui_checkpoint_spec",
+    "get_registered_comfyui_pipeline_names",
+    "is_comfyui_single_file",
+    "load_comfyui_transformer",
+    "register_comfyui_checkpoint",
+]

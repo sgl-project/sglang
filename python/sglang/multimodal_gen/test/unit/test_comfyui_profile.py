@@ -19,7 +19,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
 )
-from sglang.multimodal_gen.runtime.loader.comfyui_checkpoint import (
+from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (
     get_comfyui_checkpoint_spec,
 )
 from sglang.multimodal_gen.registry import get_pipeline_class

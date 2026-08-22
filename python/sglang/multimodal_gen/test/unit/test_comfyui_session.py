@@ -2,7 +2,7 @@
 
 import torch
 
-from sglang.multimodal_gen.runtime.pipelines_core.comfyui_session import (
+from sglang.multimodal_gen.runtime.pipelines_core.comfyui_mode import (
     bind_comfyui_session,
     release_comfyui_session,
 )

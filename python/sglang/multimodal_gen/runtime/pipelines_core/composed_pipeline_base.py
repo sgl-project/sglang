@@ -33,13 +33,15 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentResidencyStrategy,
     get_global_component_residency_manager,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.comfyui_profile import (
+from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (
+    is_comfyui_single_file,
+    load_comfyui_transformer,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.comfyui_mode import (
     COMFYUI_REQUIRED_MODULES,
     create_comfyui_pipeline_stages,
     initialize_comfyui_pipeline,
     is_comfyui_mode,
-    is_comfyui_single_file,
-    load_comfyui_transformer,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,

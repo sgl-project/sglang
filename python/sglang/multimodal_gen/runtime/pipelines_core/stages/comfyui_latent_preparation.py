@@ -15,7 +15,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
-from sglang.multimodal_gen.runtime.pipelines_core.comfyui_session import (
+from sglang.multimodal_gen.runtime.pipelines_core.comfyui_mode import (
     bind_comfyui_session,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (

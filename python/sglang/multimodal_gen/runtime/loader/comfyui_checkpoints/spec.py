@@ -1,34 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
-"""ComfyUI profile: run a native pipeline as a DiT-only forward service.
+"""ComfyUI single-file DiT checkpoints: spec, registry, and load.
 
-When ``--comfyui-mode`` is set, ComfyUI owns the sampler loop and calls into
-SGLang once per step for the DiT forward. The pipeline therefore drops every
-module except the transformer, swaps in a pass-through scheduler so nothing
-touches the latents, and keeps only the two stages needed to run one forward.
+ComfyUI ships a DiT as one ``.safetensors`` file with no ``model_index.json``
+and its own parameter names. A spec supplies what the shared loader cannot
+infer: which DiT config to build, how names map onto SGLang, and how to
+reshape tensors whose layout differs. Per-model specs live in the sibling
+modules of this package.
 
-This is a profile of the regular pipelines, not a separate family: a model
-opts in by declaring a ``ComfyUICheckpointSpec``. Non-ComfyUI paths never reach
-this module.
+Everything else -- meta-device init, FSDP sharding, quantization, CPU
+offload -- goes through the regular transformer load path.
 """
 
+from __future__ import annotations
+
 import os
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.loader.comfyui_checkpoint import (
-    get_comfyui_checkpoint_spec,
-    get_registered_comfyui_pipeline_names,
-)
 from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
-from sglang.multimodal_gen.runtime.models.schedulers.scheduling_comfyui_passthrough import (
-    ComfyUIPassThroughScheduler,
-)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
@@ -40,53 +37,70 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-COMFYUI_REQUIRED_MODULES = ["transformer", "scheduler"]
+WeightIterator = Iterator[tuple[str, torch.Tensor]]
+
+# ComfyUI mapping entries reuse the param_names_mapping format:
+#   source_regex -> (target_template, merge_index, num_params_to_merge)
+ParamNamesMapping = dict[str, tuple[str, int | None, int | None]]
 
 
-def is_comfyui_mode(server_args: ServerArgs) -> bool:
-    return bool(server_args.comfyui_mode)
+@dataclass(frozen=True)
+class ComfyUICheckpointSpec:
+    """Per-model knowledge needed to load a ComfyUI checkpoint."""
+
+    dit_cls_name: str
+    build_dit_config: Callable[["ServerArgs"], Any]
+    param_names_mapping: ParamNamesMapping = field(default_factory=dict)
+    # Reshapes tensors that param_names_mapping cannot express. Receives the raw
+    # safetensors iterator plus the built dit config, yields SGLang-shaped pairs.
+    convert_weights: Callable[[WeightIterator, Any], WeightIterator] | None = None
+    # Set False for checkpoints that legitimately omit parameters the model
+    # declares, such as optional biases.
+    strict: bool = True
+    # Whether to layer param_names_mapping on top of the DiT config's own
+    # mapping. Keep it True when the two act on different names (the config
+    # rules then finish the job, e.g. merging split QKV back into a fused
+    # parameter). Set False when both claim the same source names, since name
+    # mapping is applied repeatedly until it reaches a fixed point and the
+    # config rules would rewrite names this spec already resolved.
+    inherit_config_mapping: bool = True
+
+
+_SPEC_REGISTRY: dict[str, ComfyUICheckpointSpec] = {}
+_SPECS_DISCOVERED = False
+
+
+def register_comfyui_checkpoint(
+    pipeline_name: str, spec: ComfyUICheckpointSpec
+) -> None:
+    _SPEC_REGISTRY[pipeline_name] = spec
+
+
+def _discover_checkpoint_specs() -> None:
+    global _SPECS_DISCOVERED
+    if _SPECS_DISCOVERED:
+        return
+    _SPECS_DISCOVERED = True
+    from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (  # noqa: F401
+        flux,
+        qwen_image,
+        zimage,
+    )
+
+
+def get_comfyui_checkpoint_spec(pipeline_name: str) -> ComfyUICheckpointSpec | None:
+    _discover_checkpoint_specs()
+    return _SPEC_REGISTRY.get(pipeline_name)
+
+
+def get_registered_comfyui_pipeline_names() -> list[str]:
+    _discover_checkpoint_specs()
+    return sorted(_SPEC_REGISTRY)
 
 
 def is_comfyui_single_file(model_path: str) -> bool:
     """ComfyUI ships DiTs as one safetensors file with no model_index.json."""
     return os.path.isfile(model_path) and model_path.endswith(".safetensors")
-
-
-def initialize_comfyui_pipeline(
-    pipeline: "ComposedPipelineBase", server_args: ServerArgs
-) -> None:
-    """Install the pass-through scheduler and finish deriving VAE geometry.
-
-    The VAE model itself is never loaded, but its config still carries the
-    compression ratios that RoPE frequency construction reads.
-    """
-    pipeline.modules["scheduler"] = ComfyUIPassThroughScheduler(num_train_timesteps=1000)
-
-    vae_config = getattr(server_args.pipeline_config, "vae_config", None)
-    if (
-        vae_config is not None
-        and hasattr(vae_config, "post_init")
-        and not hasattr(vae_config, "_post_init_called")
-    ):
-        vae_config.post_init()
-
-
-def create_comfyui_pipeline_stages(
-    pipeline: "ComposedPipelineBase", server_args: ServerArgs
-) -> None:
-    from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-        ComfyUILatentPreparationStage,
-        DenoisingStage,
-    )
-
-    transformer = pipeline.get_module("transformer")
-    scheduler = pipeline.get_module("scheduler")
-    pipeline.add_stages(
-        [
-            ComfyUILatentPreparationStage(scheduler=scheduler, transformer=transformer),
-            DenoisingStage(transformer=transformer, scheduler=scheduler),
-        ]
-    )
 
 
 def load_comfyui_transformer(
