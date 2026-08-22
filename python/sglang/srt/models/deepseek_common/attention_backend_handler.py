@@ -239,6 +239,7 @@ AttentionBackendRegistry.register("fa4", handle_attention_fa4)
 AttentionBackendRegistry.register("trtllm_mla", handle_attention_trtllm_mla)
 AttentionBackendRegistry.register("tokenspeed_mla", handle_attention_tokenspeed_mla)
 AttentionBackendRegistry.register("aiter", handle_attention_aiter)
+AttentionBackendRegistry.register("moonmath_mla", handle_attention_aiter)
 AttentionBackendRegistry.register("dsa", handle_attention_dsa)
 AttentionBackendRegistry.register(
     "nsa", handle_attention_dsa

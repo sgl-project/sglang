@@ -201,6 +201,7 @@ ATTENTION_BACKEND_CHOICES = [
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), Hopper (SM90) only, requires --page-size 64
     # AMD specific
     "aiter",
+    "moonmath_mla",
     "wave",
     # Other platforms
     "intel_amx",
@@ -221,6 +222,7 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "cutlass_mla",
     "trtllm_mla",
     "tokenspeed_mla",
+    "moonmath_mla",
 ]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
