@@ -16,6 +16,9 @@ Usage:
     # Opt in to a compile control (presets are eager by default)
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model flux --torch-compile
 
+    # Compare Eager/BCG at lossless/high with two ABBA pairs on one GPU set
+    python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model sana-video --quality-bcg-matrix --model-cache-root /task/model-caches --cleanup-model-cache
+
     # Clean an isolated model cache even if the run fails or is interrupted
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model longcat-image --model-cache-root /task/model-caches --cleanup-model-cache
 
@@ -74,8 +77,26 @@ DIFFUSERS_FALLBACK_SIGNALS = (
     "using diffusers backend",
     "loaded diffusers pipeline",
 )
+BENCHMARK_QUALITY_LEVELS = ("lossless", "high")
+BCG_CAPTURE_SIGNAL = "[diffusion bcg] captured"
+BCG_INVALID_SIGNALS = (
+    "[diffusion bcg] capture failed",
+    "[diffusion bcg] disabled",
+    "[diffusion bcg] serving signature missed",
+    "no graph will be captured",
+)
+QUALITY_BCG_ABBA_MATRIX = (
+    ("eager-lossless-a", "lossless", False),
+    ("bcg-lossless-a", "lossless", True),
+    ("bcg-lossless-b", "lossless", True),
+    ("eager-lossless-b", "lossless", False),
+    ("eager-high-a", "high", False),
+    ("bcg-high-a", "high", True),
+    ("bcg-high-b", "high", True),
+    ("eager-high-b", "high", False),
+)
 CATALOG_TABLE_WIDTH = 140
-RESULTS_TABLE_WIDTH = 105
+RESULTS_TABLE_WIDTH = 124
 MODEL_CACHE_MARKER = ".sglang-diffusion-benchmark-cache"
 MODEL_WEIGHT_SUFFIXES = {
     ".bin",
@@ -1078,6 +1099,9 @@ def build_sglang_cmd(
     perf_dump_path: str | None = None,
     warmup: bool = True,
     torch_compile: bool = False,
+    quality: str = "lossless",
+    breakable_cuda_graph: bool = False,
+    bcg_text_buckets: list[int] | None = None,
     seed: int = 42,
     save_output: bool = True,
     artifact_dir: Path | None = None,
@@ -1086,6 +1110,18 @@ def build_sglang_cmd(
     Build the `sglang generate` command for the given model.
     Matches the commands in benchmark-and-profile.md exactly.
     """
+    if quality not in BENCHMARK_QUALITY_LEVELS:
+        raise ValueError(
+            f"quality must be one of {BENCHMARK_QUALITY_LEVELS}, got {quality!r}"
+        )
+    if torch_compile and breakable_cuda_graph:
+        raise ValueError("torch.compile and breakable CUDA graph are comparators")
+    if bcg_text_buckets is not None:
+        if not breakable_cuda_graph:
+            raise ValueError("bcg_text_buckets requires breakable_cuda_graph=True")
+        if not bcg_text_buckets or any(bucket <= 0 for bucket in bcg_text_buckets):
+            raise ValueError("bcg_text_buckets must contain positive integers")
+
     cfg = MODELS[model_key]
 
     cmd = [
@@ -1119,11 +1155,29 @@ def build_sglang_cmd(
         cmd.append(f"--config={config_path}")
 
     cmd.extend(cfg["extra_args"])
+    cmd.append(f"--quality={quality}")
 
     if save_output:
         cmd.append("--save-output")
     if warmup:
         cmd.extend(["--warmup-mode", "request"])
+    if breakable_cuda_graph:
+        cmd.append("--enable-breakable-cuda-graph")
+        parsed_args = _parse_cli_args(cmd)
+        if (
+            "warmup-resolutions" not in parsed_args
+            and "width" in parsed_args
+            and "height" in parsed_args
+        ):
+            cmd.extend(
+                [
+                    "--warmup-resolutions",
+                    f"{parsed_args['width']}x{parsed_args['height']}",
+                ]
+            )
+        if bcg_text_buckets is not None:
+            cmd.append("--bcg-text-buckets")
+            cmd.extend(str(bucket) for bucket in bcg_text_buckets)
     if torch_compile and not cfg.get("force_eager", False):
         cmd.append("--enable-torch-compile")
     if perf_dump_path:
@@ -1138,7 +1192,11 @@ def _run_benchmark_once_impl(
     output_dir: Path,
     warmup: bool = True,
     torch_compile: bool = False,
+    quality: str = "lossless",
+    breakable_cuda_graph: bool = False,
+    bcg_text_buckets: list[int] | None = None,
     model_cache_dir: Path | None = None,
+    cuda_visible_devices: str | None = None,
 ) -> dict:
     """Run a single benchmark pass and return results dict."""
     perf_path = output_dir / f"{model_key}_{label}.json"
@@ -1148,6 +1206,9 @@ def _run_benchmark_once_impl(
         perf_dump_path=str(perf_path),
         warmup=warmup,
         torch_compile=torch_compile,
+        quality=quality,
+        breakable_cuda_graph=breakable_cuda_graph,
+        bcg_text_buckets=bcg_text_buckets,
         artifact_dir=output_dir,
     )
 
@@ -1178,7 +1239,9 @@ def _run_benchmark_once_impl(
         print("  fail early and report a misleading unsupported-model error.")
         return {"model": model_key, "label": label, "error": True, "elapsed_s": 0.0}
 
-    if not env.get("CUDA_VISIBLE_DEVICES"):
+    if cuda_visible_devices is not None:
+        env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
+    elif not env.get("CUDA_VISIBLE_DEVICES"):
         env["CUDA_VISIBLE_DEVICES"] = ",".join(
             str(index) for index in pick_idle_gpus(required_gpus_for_model(model_key))
         )
@@ -1199,12 +1262,20 @@ def _run_benchmark_once_impl(
         bufsize=1,
     )
     fallback_detected = False
+    bcg_capture_detected = False
+    bcg_invalid_signals: set[str] = set()
     assert process.stdout is not None
     try:
         for line in process.stdout:
             print(line, end="")
-            if any(signal in line.lower() for signal in DIFFUSERS_FALLBACK_SIGNALS):
+            lower_line = line.lower()
+            if any(signal in lower_line for signal in DIFFUSERS_FALLBACK_SIGNALS):
                 fallback_detected = True
+            if BCG_CAPTURE_SIGNAL in lower_line:
+                bcg_capture_detected = True
+            bcg_invalid_signals.update(
+                signal for signal in BCG_INVALID_SIGNALS if signal in lower_line
+            )
     except BaseException:
         if process.poll() is None:
             process.terminate()
@@ -1224,11 +1295,40 @@ def _run_benchmark_once_impl(
         )
         return {"model": model_key, "label": label, "error": True, "elapsed_s": elapsed}
 
+    if breakable_cuda_graph and (not bcg_capture_detected or bcg_invalid_signals):
+        reason = (
+            ", ".join(sorted(bcg_invalid_signals))
+            if bcg_invalid_signals
+            else "no '[Diffusion BCG] captured' marker"
+        )
+        print(
+            "  ERROR: BCG evidence is invalid: "
+            f"{reason}. Do not report this run as BCG performance."
+        )
+        return {
+            "model": model_key,
+            "label": label,
+            "quality": quality,
+            "breakable_cuda_graph": True,
+            "bcg_capture_detected": bcg_capture_detected,
+            "bcg_invalid_signals": sorted(bcg_invalid_signals),
+            "error": True,
+            "elapsed_s": elapsed,
+        }
+
     if returncode != 0:
         print(f"  ERROR: exit code {returncode}")
         return {"model": model_key, "label": label, "error": True, "elapsed_s": elapsed}
 
-    metrics = {"model": model_key, "label": label, "elapsed_s": elapsed, "error": False}
+    metrics = {
+        "model": model_key,
+        "label": label,
+        "quality": quality,
+        "breakable_cuda_graph": breakable_cuda_graph,
+        "bcg_capture_detected": bcg_capture_detected,
+        "elapsed_s": elapsed,
+        "error": False,
+    }
     if perf_path.exists():
         try:
             with open(perf_path) as f:
@@ -1293,6 +1393,9 @@ def run_benchmark_once(
     output_dir: Path,
     warmup: bool = True,
     torch_compile: bool = False,
+    quality: str = "lossless",
+    breakable_cuda_graph: bool = False,
+    bcg_text_buckets: list[int] | None = None,
     model_cache_root: Path | None = None,
     cleanup_model_cache: bool = False,
     cleanup_ledger_path: Path | None = None,
@@ -1310,6 +1413,9 @@ def run_benchmark_once(
             output_dir,
             warmup=warmup,
             torch_compile=torch_compile,
+            quality=quality,
+            breakable_cuda_graph=breakable_cuda_graph,
+            bcg_text_buckets=bcg_text_buckets,
             model_cache_dir=cache_dir,
         )
         exit_reason = "error" if result.get("error") else "success"
@@ -1338,6 +1444,73 @@ def run_benchmark_once(
             )
 
 
+def run_quality_bcg_matrix(
+    model_key: str,
+    label: str,
+    output_dir: Path,
+    warmup: bool = True,
+    bcg_text_buckets: list[int] | None = None,
+    model_cache_root: Path | None = None,
+    cleanup_model_cache: bool = False,
+    cleanup_ledger_path: Path | None = None,
+) -> list[dict]:
+    """Run Eager/BCG at lossless/high as two same-GPU ABBA pairs."""
+    cache_dir = None
+    exit_reason = "error"
+    if model_cache_root is not None:
+        cache_dir = _prepare_model_cache(
+            model_cache_root, model_key, f"{label}-quality-bcg-matrix"
+        )
+
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not cuda_visible_devices:
+        cuda_visible_devices = ",".join(
+            str(index) for index in pick_idle_gpus(required_gpus_for_model(model_key))
+        )
+
+    results: list[dict] = []
+    try:
+        for mode_label, quality, breakable_cuda_graph in QUALITY_BCG_ABBA_MATRIX:
+            result = _run_benchmark_once_impl(
+                model_key,
+                f"{label}-{mode_label}",
+                output_dir,
+                warmup=warmup,
+                quality=quality,
+                breakable_cuda_graph=breakable_cuda_graph,
+                bcg_text_buckets=(bcg_text_buckets if breakable_cuda_graph else None),
+                model_cache_dir=cache_dir,
+                cuda_visible_devices=cuda_visible_devices,
+            )
+            results.append(result)
+        exit_reason = (
+            "error" if any(result.get("error") for result in results) else "success"
+        )
+        return results
+    except KeyboardInterrupt:
+        exit_reason = "interrupted"
+        raise
+    finally:
+        if cleanup_model_cache and cache_dir is not None:
+            assert model_cache_root is not None
+            ledger_path = cleanup_ledger_path or output_dir / "cleanup.jsonl"
+            record = _cleanup_model_cache(
+                model_cache_root,
+                cache_dir,
+                ledger_path,
+                model_key,
+                f"{label}-quality-bcg-matrix",
+                exit_reason,
+            )
+            before = record["before"]
+            assert isinstance(before, dict)
+            print(
+                "  Cleaned isolated model cache after the full matrix: "
+                f"{before['total_bytes']} bytes, "
+                f"{before['weight_file_count']} weight files; ledger={ledger_path}"
+            )
+
+
 def print_results_table(results: list[dict]):
     """Print a compact table for one or more benchmark runs."""
     print()
@@ -1347,7 +1520,7 @@ def print_results_table(results: list[dict]):
     print("=" * RESULTS_TABLE_WIDTH)
 
     print(
-        f"{'Model':<24} {'Nightly':<28} {'Label':<12} {'Denoise(s)':>12} {'E2E(s)':>10} {'Peak Mem(GB)':>14}"
+        f"{'Model':<24} {'Nightly':<28} {'Label':<31} {'Denoise(s)':>12} {'E2E(s)':>10} {'Peak Mem(GB)':>14}"
     )
     print("-" * RESULTS_TABLE_WIDTH)
 
@@ -1359,7 +1532,7 @@ def print_results_table(results: list[dict]):
         e2e_text = f"{e2e_s:.2f}" if isinstance(e2e_s, float) else "n/a"
         mem_text = f"{peak_mem:.1f}" if isinstance(peak_mem, float) else "n/a"
         print(
-            f"{result['model']:<24} {model_nightly_case_id(result['model']):<28} {result['label']:<12} {denoise_text:>12} {e2e_text:>10} {mem_text:>14}"
+            f"{result['model']:<24} {model_nightly_case_id(result['model']):<28} {result['label']:<31} {denoise_text:>12} {e2e_text:>10} {mem_text:>14}"
         )
 
     print("-" * RESULTS_TABLE_WIDTH)
@@ -1407,6 +1580,34 @@ def main():
         help="Directory for perf dump JSON files",
     )
     parser.add_argument("--no-warmup", action="store_true", help="Skip warmup")
+    parser.add_argument(
+        "--quality",
+        choices=BENCHMARK_QUALITY_LEVELS,
+        default="lossless",
+        help="Request quality for a single run (default: lossless).",
+    )
+    parser.add_argument(
+        "--breakable-cuda-graph",
+        action="store_true",
+        help=(
+            "Run a BCG comparator. The result is invalid unless capture is "
+            "observed and no disable/failure/signature-miss marker appears."
+        ),
+    )
+    parser.add_argument(
+        "--bcg-text-buckets",
+        type=int,
+        nargs="+",
+        help="Optional positive text buckets for a BCG run or matrix.",
+    )
+    parser.add_argument(
+        "--quality-bcg-matrix",
+        action="store_true",
+        help=(
+            "Run lossless/high Eager-vs-BCG as two ABBA pairs on one GPU set "
+            "and one task-owned model cache."
+        ),
+    )
     compile_group = parser.add_mutually_exclusive_group()
     compile_group.add_argument(
         "--torch-compile",
@@ -1453,6 +1654,17 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     warmup = not args.no_warmup
     torch_compile = args.torch_compile and not args.no_torch_compile
+    if args.quality_bcg_matrix and torch_compile:
+        parser.error("--quality-bcg-matrix cannot be combined with --torch-compile")
+    if args.breakable_cuda_graph and torch_compile:
+        parser.error("--breakable-cuda-graph cannot be combined with --torch-compile")
+    if args.bcg_text_buckets and not (
+        args.breakable_cuda_graph or args.quality_bcg_matrix
+    ):
+        parser.error(
+            "--bcg-text-buckets requires --breakable-cuda-graph or "
+            "--quality-bcg-matrix"
+        )
     if args.cleanup_model_cache and not args.model_cache_root:
         parser.error("--cleanup-model-cache requires --model-cache-root")
     model_cache_root = (
@@ -1466,18 +1678,35 @@ def main():
     results = []
 
     for model_key in models_to_run:
-        results.append(
-            run_benchmark_once(
-                model_key,
-                args.label,
-                output_dir,
-                warmup=warmup,
-                torch_compile=torch_compile,
-                model_cache_root=model_cache_root,
-                cleanup_model_cache=args.cleanup_model_cache,
-                cleanup_ledger_path=cleanup_ledger_path,
+        if args.quality_bcg_matrix:
+            results.extend(
+                run_quality_bcg_matrix(
+                    model_key,
+                    args.label,
+                    output_dir,
+                    warmup=warmup,
+                    bcg_text_buckets=args.bcg_text_buckets,
+                    model_cache_root=model_cache_root,
+                    cleanup_model_cache=args.cleanup_model_cache,
+                    cleanup_ledger_path=cleanup_ledger_path,
+                )
             )
-        )
+        else:
+            results.append(
+                run_benchmark_once(
+                    model_key,
+                    args.label,
+                    output_dir,
+                    warmup=warmup,
+                    torch_compile=torch_compile,
+                    quality=args.quality,
+                    breakable_cuda_graph=args.breakable_cuda_graph,
+                    bcg_text_buckets=args.bcg_text_buckets,
+                    model_cache_root=model_cache_root,
+                    cleanup_model_cache=args.cleanup_model_cache,
+                    cleanup_ledger_path=cleanup_ledger_path,
+                )
+            )
 
     if results:
         print_results_table(results)

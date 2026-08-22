@@ -139,6 +139,50 @@ The helper defaults to eager. Add `--torch-compile` only for a labeled compile
 control. `--no-torch-compile` remains accepted for compatibility but is no
 longer required.
 
+Run one explicit quality or BCG comparator with `--quality lossless|high` and
+`--breakable-cuda-graph`. BCG and `torch.compile` are intentionally mutually
+exclusive in this helper. When a preset has explicit width and height, the
+helper declares that same `--warmup-resolutions` value automatically:
+
+```bash
+PYTHONPATH=python python3 "$BENCH_PY" \
+  --model longcat-image \
+  --quality high \
+  --breakable-cuda-graph \
+  --label bcg-high \
+  --output-dir "${BENCH_DIR}"
+```
+
+For optimization discovery, use the full repeated matrix. It runs
+Eager/BCG/BCG/Eager at `lossless`, then the same ABBA pair at `high`, while
+holding one GPU set and one isolated checkpoint cache. Cleanup occurs only
+after all eight runs, including on failure or interruption:
+
+```bash
+MODEL_CACHE_ROOT=/path/to/task-owned/model-caches
+PYTHONPATH=python python3 "$BENCH_PY" \
+  --model longcat-image \
+  --quality-bcg-matrix \
+  --label h200 \
+  --output-dir "${BENCH_DIR}" \
+  --model-cache-root "${MODEL_CACHE_ROOT}" \
+  --cleanup-model-cache
+```
+
+Before starting, confirm the chosen GPU set has no foreign process and remains
+unchanged through every run boundary. The helper rejects a BCG row unless its
+log contains `[Diffusion BCG] captured` and contains none of: support-gate
+disable, capture failure, `serving signature MISSED`, or a message that no
+graph will be captured. Do not average rejected rows with valid results.
+
+BCG signatures include more than width and height. The public
+`--warmup-resolutions` flag declares only `WxH`; synthetic warmup still uses
+the model's own frame-count and conditioning defaults. A short video preset
+can therefore capture a default temporal shape and miss the actual request
+even at the same resolution. The helper marks that row invalid. Use a request
+whose complete temporal/conditioning contract matches warmup, or fix the
+model's BCG warmup/padding contract before claiming a speedup.
+
 The helper sets `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1` for accurate stage
 attribution. Set it to `0` explicitly only when collecting an e2e-only run and
 do not compare its per-stage values with synchronized results.
@@ -533,6 +577,20 @@ Always keep:
 
 Never keep a perf dump produced after a diffusers-backend fallback.
 
+For `quality=lossless`, compare saved artifact hashes and require byte equality
+for a claimed lossless fast path or BCG change. For `quality=high`, keep the
+lossless artifact as ground truth and report both aggregate and worst-frame
+SSIM/PSNR. Repository defaults are SSIM 0.95 / PSNR 28 dB for images and SSIM
+0.92 / PSNR 24 dB for videos; checked-in model/hardware consistency metadata
+may override them. Always inspect the image or a start/middle/end video contact
+sheet in addition to scalar metrics.
+
+Use denoise timing to locate the opportunity, but gate a performance PR on
+repeated saved-request end-to-end time. The project threshold for this sweep is
+at least 1.5% mean e2e improvement on same-GPU ABBA runs. Attach one
+representative baseline/candidate profile plus before/after images or videos to
+the PR description.
+
 Stage durations are host wall times around asynchronous GPU launches unless
 `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1`. Without the sync, queued denoise
 work can leak into the next blocking stage and inflate `DecodingStage` by 2-3x.
@@ -672,10 +730,14 @@ This skill intentionally stops here. It tells you whether you are looking at:
 
 - [ ] fixed-shape baseline perf dump saved
 - [ ] fixed-shape new perf dump saved
-- [ ] request `quality` and `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING` match
+- [ ] Eager/BCG x `quality=lossless|high` matrix attempted on one GPU set
+- [ ] BCG rows show capture and no disable/failure/signature-miss marker
+- [ ] request shape, seed, steps, guidance, topology, residency, and synchronized stage profiling match
 - [ ] `compare_perf.py` table generated
 - [ ] one representative `torch.profiler` trace saved
 - [ ] hotspot classified against `existing-fast-paths.md`
-- [ ] reference image or video checked for correctness
+- [ ] lossless artifact hash is exact; high-quality aggregate and worst-frame SSIM/PSNR pass the checked-in threshold
+- [ ] reference image or start/middle/end video contact sheet checked visually
+- [ ] any PR claim has repeated saved-request e2e improvement >= 1.5%
 - [ ] task-owned checkpoint cache cleaned and ledger shows zero residual weight files
 - [ ] any remaining kernel work handed off with perf/profile evidence attached
