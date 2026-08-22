@@ -46,7 +46,13 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_stream,
+)
+from sglang.srt.true_on_policy import is_true_on_policy_enabled
 from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
 
 Step3p5Config = None
@@ -669,11 +675,7 @@ class Step3p5Model(nn.Module):
                 quant_config=quant_config,
                 enable_tp=not is_dp_attention_enabled(),
                 prefix=add_prefix("embed_tokens", prefix),
-                params_dtype=(
-                    torch.float32
-                    if get_exec().deterministic.rl_on_policy_target is not None
-                    else None
-                ),
+                params_dtype=torch.float32 if is_true_on_policy_enabled() else None,
             )
         else:
             self.embed_tokens = PPMissingLayer()

@@ -33,6 +33,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.true_on_policy import (
+    get_on_policy_rms_norm_kwargs,
+    is_true_on_policy_enabled,
+)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -226,7 +230,7 @@ def _forward_with_allreduce_fusion(
 
         if world_size > 1:
             if post_residual_addition is not None:
-                residual = residual + post_residual_addition
+                x = x + post_residual_addition
 
             # Prefer AITER fused AR+RMSNorm when enabled on AMD.
             if _use_aiter:
@@ -443,14 +447,33 @@ class RMSNorm(BaseFusedOp):
         eps: float = 1e-6,
         var_hidden_size: Optional[int] = None,
         cast_x_before_out_mul: bool = False,
-        fp32_residual: bool = False,
+        fp32_residual: bool = True,
         has_weight: bool = True,
-        weight_dtype: Optional = None,
-        override_orig_dtype: Optional = None,
+        weight_dtype: Optional[torch.dtype] = None,
+        override_orig_dtype: Optional[torch.dtype] = None,
         x_pad_to_multiple: int = 0,
         force_native: bool = False,
+        true_on_policy_weight_dtype: Optional[torch.dtype] = None,
+        true_on_policy_override_orig_dtype: Optional[torch.dtype] = None,
+        true_on_policy_fp32_residual: bool = False,
     ) -> None:
         super().__init__()
+        true_on_policy_kwargs = get_on_policy_rms_norm_kwargs(
+            weight_dtype=true_on_policy_weight_dtype,
+            override_orig_dtype=true_on_policy_override_orig_dtype,
+            fp32_residual=true_on_policy_fp32_residual,
+        )
+        if not cast_x_before_out_mul:
+            cast_x_before_out_mul = true_on_policy_kwargs.get(
+                "cast_x_before_out_mul", cast_x_before_out_mul
+            )
+        fp32_residual = true_on_policy_kwargs.get("fp32_residual", fp32_residual)
+        if weight_dtype is None:
+            weight_dtype = true_on_policy_kwargs.get("weight_dtype", weight_dtype)
+        if override_orig_dtype is None:
+            override_orig_dtype = true_on_policy_kwargs.get(
+                "override_orig_dtype", override_orig_dtype
+            )
         self.has_weight = has_weight
         self.cast_x_before_out_mul = cast_x_before_out_mul
         self.fp32_residual = fp32_residual
@@ -502,11 +525,17 @@ class RMSNorm(BaseFusedOp):
             return x
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
+        if (
+            self.weight.dtype != x.dtype
+            or self.cast_x_before_out_mul
+            or self.override_orig_dtype is not None
+        ):
+            return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
             if (
                 residual is not None
                 or self.cast_x_before_out_mul
-                or get_exec().deterministic.rl_on_policy_target == "fsdp"
+                or is_true_on_policy_enabled()
             ):
                 return self.forward_native(x, residual, post_residual_addition)
             original_shape = x.shape
@@ -704,10 +733,10 @@ class RMSNorm(BaseFusedOp):
                 )
             return result
         if residual is not None:
-            residual_out = torch.empty_like(x)
-            output = torch.empty_like(x)
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
+            residual_out = torch.empty_like(x)
+            output = torch.empty_like(x)
             fused_add_rms_norm(
                 output,
                 x,
@@ -754,10 +783,10 @@ class RMSNorm(BaseFusedOp):
             # NOTE: Remove this if aiter kernel supports discontinuous input
             x = x.contiguous()
         if residual is not None:
-            out = torch.empty_like(x)
-            residual_out = torch.empty_like(x)
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
+            out = torch.empty_like(x)
+            residual_out = torch.empty_like(x)
             fused_add_rms_norm(
                 out, x, residual_out, residual, self.weight.data, self.variance_epsilon
             )
@@ -800,15 +829,18 @@ class RMSNorm(BaseFusedOp):
         if not x.is_contiguous():
             x = x.contiguous()
         orig_dtype = self.override_orig_dtype or x.dtype
+
+        if residual is not None and not self.fp32_residual:
+            x = x + residual
+            if post_residual_addition is not None:
+                x = x + post_residual_addition
+            residual = x.clone()
         x = x.to(torch.float32)
-        if residual is not None:
+        if residual is not None and self.fp32_residual:
             x = x + residual.to(torch.float32)
             if post_residual_addition is not None:
                 x = x + post_residual_addition.to(torch.float32)
-            if self.fp32_residual:
-                residual = x.clone()
-            else:
-                residual = x.to(orig_dtype)
+            residual = x.to(orig_dtype)
 
         hidden_size = x.shape[-1]
         if hidden_size != self.hidden_size:
@@ -1119,7 +1151,7 @@ class GemmaRMSNorm(BaseFusedOp):
         orig_dtype = x.dtype
         if residual is not None:
             if post_residual_addition is not None:
-                residual = residual + post_residual_addition
+                x = x + post_residual_addition
             x = x + residual
             residual = x
 

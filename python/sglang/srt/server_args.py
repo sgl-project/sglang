@@ -329,7 +329,7 @@ add_radix_eviction_policy_choices = RADIX_EVICTION_POLICY_CHOICES.extend
 
 # --- Reinforcement learning ---
 
-RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
+RL_ON_POLICY_TARGET_CHOICES = ["fsdp", "fsdp_tp"]
 add_rl_on_policy_target_choices = RL_ON_POLICY_TARGET_CHOICES.extend
 
 # --- Linear attention ---
@@ -3476,6 +3476,17 @@ class ServerArgs:
         "Enable deterministic inference mode with batch invariant ops.",
         NS("exec.deterministic"),
     ] = False
+    enable_prefill_only_deterministic_inference: A[
+        bool,
+        "Enable prefill-only deterministic inference mode with batch invariant ops.",
+        NS("exec.deterministic"),
+    ] = False
+    true_on_policy_contract: A[
+        Optional[str],
+        "Internal true-on-policy parity contract selected by the launcher. "
+        "Normal users should prefer the Miles true_on_policy switch.",
+        NS("exec.deterministic"),
+    ] = None
     rl_on_policy_target: A[
         Optional[str],
         Arg(

@@ -11,7 +11,8 @@ from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_exec, publish_role
+from sglang.srt.runtime_context import publish_role
+from sglang.srt.true_on_policy import is_true_on_policy_enabled
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -94,10 +95,7 @@ class RotaryEmbedding(BaseFusedOp):
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
-        self._force_native = (
-            publish_role() is not None
-            and get_exec().deterministic.rl_on_policy_target is not None
-        )
+        self._force_native = publish_role() is not None and is_true_on_policy_enabled()
 
         cache = self._compute_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability.
@@ -135,10 +133,6 @@ class RotaryEmbedding(BaseFusedOp):
         # XXX (MUSA): Implement sgl_kernel.rotary_embedding support for MUSA backend
         if self._force_native or _is_musa:
             self._forward_method = self.forward_native
-            self._apply_rotary_emb_wrapped = torch.compile(
-                dynamic=True,
-                disable=_is_npu,
-            )(apply_rotary_emb)
         self.position_cos, self.position_sin = None, None
 
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:

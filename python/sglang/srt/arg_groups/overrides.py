@@ -1402,7 +1402,12 @@ def _page_size_default(view: Any) -> dict:
 @register_post_process
 def _data_parallelism_defaults(view: Any) -> dict:
     if view.dp_size == 1 and view.ep_join_mode != "scale":
-        return {"enable_dp_attention": False, "enable_dp_lm_head": False}
+        overrides = {"enable_dp_attention": False}
+        # Keep the dp LM head when attention context parallelism is enabled,
+        # even without data parallelism (context-parallel LM head).
+        if not (view.enable_dp_lm_head and view.attn_cp_size > 1):
+            overrides["enable_dp_lm_head"] = False
+        return overrides
     return {}
 
 
@@ -1435,9 +1440,10 @@ def _dp_lm_head_validation(view: Any) -> dict:
     dp LM head and the TP LM-head all-to-all path. Reads the mid-resolution
     values through the view."""
     if view.enable_dp_lm_head:
-        assert (
-            view.enable_dp_attention
-        ), "Please enable dp attention when setting enable_dp_lm_head. "
+        assert view.enable_dp_attention or view.attn_cp_size > 1, (
+            "Please enable dp attention when setting enable_dp_lm_head, "
+            "unless attention context parallelism is enabled."
+        )
     if view.enable_tp_lm_head_all_to_all:
         assert view.enable_dp_attention, (
             "Please enable dp attention when setting " "enable_tp_lm_head_all_to_all."

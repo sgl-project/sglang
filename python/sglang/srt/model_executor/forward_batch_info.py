@@ -56,6 +56,7 @@ from sglang.srt.runtime_context import (
     get_lora,
     get_parallel,
 )
+from sglang.srt.true_on_policy import is_true_on_policy_enabled
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -1188,7 +1189,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
         has_multimodal_input = any(mm is not None for mm in mm_inputs)
 
-        if rl_on_policy_target is not None or not has_multimodal_input:
+        if (
+            rl_on_policy_target is not None
+            or is_true_on_policy_enabled()
+            or not has_multimodal_input
+        ):
             # Text-only
             positions_1d = seq_lens_int64 - 1
             self.mrope_positions = positions_1d.unsqueeze(0).repeat(3, 1)
@@ -1249,7 +1254,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mm_input = mm_inputs[batch_idx]
             extend_seq_len = extend_lens[batch_idx]
             extend_prefix_len = prefix_lens[batch_idx]
-            if mm_input is None or rl_on_policy_target is not None:
+            if (
+                mm_input is None
+                or rl_on_policy_target is not None
+                or is_true_on_policy_enabled()
+            ):
                 # text only
                 mrope_positions = (
                     torch.arange(

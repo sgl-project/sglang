@@ -212,6 +212,7 @@ from sglang.srt.state_capturer.routed_experts import (
     get_global_experts_capturer,
     set_global_experts_capturer,
 )
+from sglang.srt.true_on_policy import is_tp_invariant_target
 from sglang.srt.utils import (
     cpu_has_amx_support,
     enable_show_time_cost,
@@ -776,6 +777,10 @@ class ModelRunner:
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()
+        if is_tp_invariant_target():
+            from sglang.srt.tp_invariant_ops import enable_tp_invariant_mode
+
+            enable_tp_invariant_mode()
 
     def get_pp_proxy_topk_size(self) -> Optional[int]:
         return misc_utils.resolve_pp_proxy_topk_size(

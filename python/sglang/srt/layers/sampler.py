@@ -19,6 +19,7 @@ from sglang.srt.layers.logprob_processor import (
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.true_on_policy import resolve_true_on_policy_runtime_policy
 from sglang.srt.utils.async_probe import sanitize_nan_logits
 from sglang.srt.utils.common import (
     get_bool_env_var,
@@ -91,13 +92,13 @@ class Sampler(nn.Module):
         if is_dp_attention_enabled():
             self.tp_sync_group = get_parallel().attn_tp_group.device_group
 
-        self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
+        true_on_policy = resolve_true_on_policy_runtime_policy(get_server_args())
         # In RL on-policy mode, deterministic inference is automatically enabled.
         self.enable_deterministic = (
             get_exec().deterministic.enable_deterministic_inference
         )
         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
-        self.use_log_softmax_logprob = self.rl_on_policy_target is not None
+        self.use_log_softmax_logprob = true_on_policy.enabled
         self.use_ascend_backend = get_exec().kernel.sampling_backend == "ascend"
 
         self.output_logprob_processor = OutputLogprobProcessor()
@@ -181,17 +182,13 @@ class Sampler(nn.Module):
             if return_logprob and SGLANG_RETURN_ORIGINAL_LOGPROB:
                 original_logprobs = torch.log_softmax(logits, dim=-1)
 
+            # Post process logits
+            logits.div_(sampling_info.temperatures)
+
             # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
             logprobs_via_logsoftmax_kernel = None
-            if self.rl_on_policy_target is not None:
-                # TODO: use more inplace ops to save memory
-                logits_div_temperature = (
-                    logits.bfloat16().div(sampling_info.temperatures).bfloat16()
-                )
-                logprobs_via_logsoftmax_kernel = torch.log_softmax(
-                    logits_div_temperature, dim=-1
-                )
-                del logits_div_temperature
+            if self.use_log_softmax_logprob:
+                logprobs_via_logsoftmax_kernel = torch.log_softmax(logits, dim=-1)
 
             if self.use_ascend_backend:
                 # Ascend backend: sample from logits directly.
@@ -217,8 +214,6 @@ class Sampler(nn.Module):
                     logprobs = logprobs_via_logsoftmax_kernel
             else:
                 # Standard path: do softmax and sample from probs.
-                logits.div_(sampling_info.temperatures)
-
                 # Deterministic inference must derive the returned logprobs
                 # from F.log_softmax — the same kernel prefill rescoring uses —
                 # not log(softmax(x)) below: the two disagree at ~1e-6 despite
@@ -509,13 +504,13 @@ class Sampler(nn.Module):
         """Handle the full Ascend backend sampling path.
 
         Ascend backend has fused kernels that handle softmax internally,
-        so we sample directly from temperature-scaled logits.
+        so we sample directly from temperature-scaled logits. Temperature
+        scaling is already applied by the caller before branch dispatch.
 
         Returns:
             A tuple of (batch_next_token_ids, logprobs). logprobs is None
             when return_logprob is False or SGLANG_RETURN_ORIGINAL_LOGPROB is set.
         """
-        logits.div_(sampling_info.temperatures)
         batch_next_token_ids = self._sample_from_logits(
             logits, sampling_info, simple_sampling_case, positions
         )

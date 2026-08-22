@@ -33,6 +33,10 @@ from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.true_on_policy.contracts import (
+    resolve_true_on_policy_runtime_policy,
+    validate_true_on_policy_contract,
+)
 from sglang.srt.utils.common import (
     parse_connector_type,
 )
@@ -518,20 +522,55 @@ def handle_deterministic_inference(server_args: Any):
     )
 
     cfg = resolving_view(server_args)
-    if cfg.rl_on_policy_target is not None:
-        logger.warning("Enable deterministic inference because of rl_on_policy_target.")
+    validate_true_on_policy_contract(cfg)
+
+    if cfg.enable_prefill_only_deterministic_inference:
         declare_resolution(
             server_args,
             "_handle_deterministic_inference",
             enable_deterministic_inference=True,
         )
 
+    if cfg.rl_on_policy_target is not None:
+        logger.warning(
+            "Enable deterministic inference because of legacy rl_on_policy_target."
+        )
+        declare_resolution(
+            server_args,
+            "_handle_deterministic_inference",
+            enable_deterministic_inference=True,
+        )
+
+    if cfg.true_on_policy_contract is not None:
+        logger.warning(
+            "Enable deterministic inference because of true_on_policy_contract."
+        )
+        declare_resolution(
+            server_args,
+            "_handle_deterministic_inference",
+            enable_deterministic_inference=True,
+        )
         # For VLM
         envs.SGLANG_VLM_CACHE_SIZE_MB.set(0)
-        # TODO remove this environment variable as a whole
-        envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(True)
+
+        if (
+            resolve_true_on_policy_runtime_policy(
+                cfg
+            ).disable_flashinfer_allreduce_fusion
+            and cfg.enable_flashinfer_allreduce_fusion
+        ):
+            declare_resolution(
+                server_args,
+                "_handle_deterministic_inference",
+                enable_flashinfer_allreduce_fusion=False,
+            )
+            logger.warning(
+                "Disable flashinfer allreduce fusion because of "
+                "true_on_policy_contract with TP rollout."
+            )
 
     if cfg.enable_deterministic_inference:
+        envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set("1")
         if cfg.enable_aiter_allreduce_fusion:
             logger.warning(
                 "Disable --enable-aiter-allreduce-fusion because deterministic inference is enabled."

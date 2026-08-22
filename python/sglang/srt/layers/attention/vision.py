@@ -19,11 +19,11 @@ from sglang.srt.environ import envs
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import (
     get_context,
-    get_exec,
     get_mm,
     get_parallel,
     get_platform,
 )
+from sglang.srt.true_on_policy import is_true_on_policy_enabled
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -1205,7 +1205,7 @@ class VisionAttention(nn.Module):
                 weight_dtype=torch.float32,
                 cast_x_before_out_mul=True,
             )
-            if get_exec().deterministic.rl_on_policy_target is not None
+            if is_true_on_policy_enabled()
             else {}
         )
         q_norm = RMSNorm(
@@ -1347,10 +1347,7 @@ class VisionAttention(nn.Module):
         if x.dim() == 2:
             x = x.unsqueeze(0)
         assert x.dim() == 3, x.shape
-        if (
-            get_exec().deterministic.rl_on_policy_target is not None
-            and position_embeddings is not None
-        ):
+        if is_true_on_policy_enabled() and position_embeddings is not None:
             assert isinstance(position_embeddings, tuple), (
                 "expected position_embeddings to be a tuple of two tensors,\n"
                 f"but got {type(position_embeddings)}, change if needed"
