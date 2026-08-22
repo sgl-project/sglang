@@ -1488,6 +1488,10 @@ class Envs:
     # ===================================================================
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
+    # Payload ceiling (and buffer size) for the Intel XPU symmetric-memory
+    # one-shot all-reduce; larger payloads fall back to the default collective.
+    # Tunable because the crossover depends on peer bandwidth (Xe Link vs PCIe).
+    SGLANG_XPU_SYMM_MEM_MAX_BYTES = EnvInt(512 * 1024)
 
     # ===================================================================
     # Plugin system
