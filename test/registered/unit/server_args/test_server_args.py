@@ -43,6 +43,64 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_enable_w4a4_mxfp4_megamoe_sets_deepgemm_env(self):
+        deepgemm_env = {
+            "DG_USE_FP4_ACTS": "0",
+            "DG_USE_MXF4_KIND": "0",
+        }
+        with patch.dict(os.environ, deepgemm_env, clear=False):
+            try:
+                args = prepare_server_args(
+                    ["--model-path", "dummy", "--enable-w4a4-mxfp4-megamoe"]
+                )
+            except SystemExit as exc:
+                self.fail(
+                    "--enable-w4a4-mxfp4-megamoe must be accepted by the CLI "
+                    f"parser, got SystemExit({exc.code})"
+                )
+
+            self.assertTrue(args.enable_w4a4_mxfp4_megamoe)
+            self.assertEqual(os.environ["DG_USE_FP4_ACTS"], "1")
+            self.assertEqual(os.environ["DG_USE_MXF4_KIND"], "1")
+
+    def test_w4a4_mxfp4_megamoe_disabled_preserves_deepgemm_env(self):
+        deepgemm_env = {
+            "DG_USE_FP4_ACTS": "0",
+            "DG_USE_MXF4_KIND": "0",
+        }
+        with patch.dict(os.environ, deepgemm_env, clear=False):
+            args = prepare_server_args(["--model-path", "dummy"])
+
+            self.assertFalse(args.enable_w4a4_mxfp4_megamoe)
+            self.assertEqual(os.environ["DG_USE_FP4_ACTS"], "0")
+            self.assertEqual(os.environ["DG_USE_MXF4_KIND"], "0")
+
+    def test_prefill_decode_interval(self):
+        args = ServerArgs(model_path="dummy", prefill_decode_interval=16)
+        self.assertEqual(args.prefill_decode_interval, 16)
+
+        with self.assertRaisesRegex(
+            ValueError, "--prefill-decode-interval must be non-negative"
+        ):
+            ServerArgs(model_path="dummy", prefill_decode_interval=-1)
+
+    def test_dsv4_prefill_backend_cli_choices(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        base_args = ["--model-path", "dummy-model"]
+
+        default_args = parser.parse_args(base_args)
+        self.assertEqual(default_args.dsv4_prefill_backend, "auto")
+
+        q8_args = parser.parse_args(
+            base_args + ["--dsv4-prefill-backend", "flashmla_sparse_q8"]
+        )
+        self.assertEqual(q8_args.dsv4_prefill_backend, "flashmla_sparse_q8")
+
+        with self.assertRaises(SystemExit):
+            parser.parse_args(base_args + ["--dsv4-prefill-backend", "flashmla_kv"])
+
     def test_return_hidden_states_mode_configuration(self):
         disabled = ServerArgs(model_path="dummy")
         self.assertFalse(disabled.enable_return_hidden_states)
@@ -516,11 +574,21 @@ class TestLoadBalanceMethod(unittest.TestCase):
         server_args = ServerArgs(
             model_path="dummy",
             disaggregation_mode="decode",
+            disaggregation_transfer_backend="mori",
+            dcp_size=4,
+        )
+        with self.assertRaisesRegex(
+            ValueError, "mooncake, nixl, or fake for synthetic benchmarking"
+        ):
+            server_args._handle_pd_disaggregation()
+
+    def test_pd_decode_dcp_allows_fake_transfer_backend(self):
+        server_args = self._load_balance_args(
+            disaggregation_mode="decode",
             disaggregation_transfer_backend="fake",
             dcp_size=4,
         )
-        with self.assertRaisesRegex(ValueError, "mooncake or nixl"):
-            server_args._handle_pd_disaggregation()
+        self.assertTrue(server_args.disable_radix_cache)
 
     def test_pd_decode_dcp_rejects_radix_cache(self):
         server_args = ServerArgs(
