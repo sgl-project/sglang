@@ -636,8 +636,8 @@ std::tuple<at::Tensor, at::Tensor> grouped_topk_cpu(
 
   CHECK_INPUT(gating_output);
 
-  const auto st = hidden_states.scalar_type();
-  CHECK_EQ(gating_output.scalar_type(), st);
+  const auto st = gating_output.scalar_type();
+  TORCH_CHECK(st == at::kFloat, "grouped_topk_cpu expects float32 gating_output, got: ", st);
 
   int64_t num_tokens = hidden_states.size(0);
   int64_t num_experts = gating_output.size(1);
@@ -645,42 +645,41 @@ std::tuple<at::Tensor, at::Tensor> grouped_topk_cpu(
   at::Tensor topk_weights = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kFloat));
   at::Tensor topk_ids = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kInt));
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "grouped_topk_kernel", [&] {
-    switch (num_experts) {
-      case 1:
-        LAUNCH_GROUPED_TOPK_KERNEL(1);
-        break;
-      case 2:
-        LAUNCH_GROUPED_TOPK_KERNEL(2);
-        break;
-      case 4:
-        LAUNCH_GROUPED_TOPK_KERNEL(4);
-        break;
-      case 8:
-        LAUNCH_GROUPED_TOPK_KERNEL(8);
-        break;
-      case 16:
-        LAUNCH_GROUPED_TOPK_KERNEL(16);
-        break;
-      case 32:
-        LAUNCH_GROUPED_TOPK_KERNEL(32);
-        break;
-      case 64:
-        LAUNCH_GROUPED_TOPK_KERNEL(64);
-        break;
-      case 128:
-        LAUNCH_GROUPED_TOPK_KERNEL(128);
-        break;
-      case 160:
-        LAUNCH_GROUPED_TOPK_KERNEL(160);
-        break;
-      case 256:
-        LAUNCH_GROUPED_TOPK_KERNEL(256);
-        break;
-      default:
-        TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
-    }
-  });
+  using scalar_t = float;
+  switch (num_experts) {
+    case 1:
+      LAUNCH_GROUPED_TOPK_KERNEL(1);
+      break;
+    case 2:
+      LAUNCH_GROUPED_TOPK_KERNEL(2);
+      break;
+    case 4:
+      LAUNCH_GROUPED_TOPK_KERNEL(4);
+      break;
+    case 8:
+      LAUNCH_GROUPED_TOPK_KERNEL(8);
+      break;
+    case 16:
+      LAUNCH_GROUPED_TOPK_KERNEL(16);
+      break;
+    case 32:
+      LAUNCH_GROUPED_TOPK_KERNEL(32);
+      break;
+    case 64:
+      LAUNCH_GROUPED_TOPK_KERNEL(64);
+      break;
+    case 128:
+      LAUNCH_GROUPED_TOPK_KERNEL(128);
+      break;
+    case 160:
+      LAUNCH_GROUPED_TOPK_KERNEL(160);
+      break;
+    case 256:
+      LAUNCH_GROUPED_TOPK_KERNEL(256);
+      break;
+    default:
+      TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
+  }
   return std::make_tuple(topk_weights, topk_ids);
 }
 
@@ -711,6 +710,7 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
   CHECK_INPUT(correction_bias);
 
   const auto st = gating_output.scalar_type();
+  TORCH_CHECK(st == at::kFloat, "biased_grouped_topk_cpu expects float32 gating_output, got: ", st);
   int64_t num_tokens = hidden_states.size(0);
   int64_t num_experts = gating_output.size(1);
   TORCH_CHECK(gating_output.size(0) == num_tokens, "Number of tokens mismatch");
