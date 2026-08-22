@@ -104,6 +104,42 @@ def _make_tools():
                 },
             ),
         ),
+        Tool(
+            type="function",
+            function=Function(
+                name="one_of_top_level",
+                description="Exercise a top-level oneOf parameters schema",
+                parameters={
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "properties": {"number": {"type": "number"}},
+                            "required": ["number"],
+                        },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "stringList": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                }
+                            },
+                            "required": ["stringList"],
+                        },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "numberList": {
+                                    "type": "array",
+                                    "items": {"type": "number"},
+                                }
+                            },
+                            "required": ["numberList"],
+                        },
+                    ]
+                },
+            ),
+        ),
     ]
 
 
@@ -466,6 +502,43 @@ class TestMinimaxM3Streaming(CustomTestCase):
                 non_stream, _ = _parse_segments(segments, self.tools)
                 stream = _stream_segments(segments, self.tools)
                 self.assertEqual(non_stream, stream)
+
+    def test_top_level_one_of_parameter_schema(self):
+        segments = (
+            "<tool_call>",
+            '<invoke name="one_of_top_level">',
+            "<number>42",
+            "</number>",
+            "</invoke>",
+            '<invoke name="one_of_top_level">',
+            "<stringList>",
+            "<item>12",
+            "</item>",
+            "<item>34",
+            "</item>",
+            "</stringList>",
+            "</invoke>",
+            '<invoke name="one_of_top_level">',
+            "<numberList>",
+            "<item>12",
+            "</item>",
+            "<item>34",
+            "</item>",
+            "</numberList>",
+            "</invoke>",
+            "</tool_call>",
+        )
+        self.assertEqual(
+            _stream_segments(segments, self.tools),
+            [
+                {"name": "one_of_top_level", "args": {"number": 42}},
+                {
+                    "name": "one_of_top_level",
+                    "args": {"stringList": ["12", "34"]},
+                },
+                {"name": "one_of_top_level", "args": {"numberList": [12, 34]}},
+            ],
+        )
 
     def test_streaming_sequential_tool_index(self):
         segments = (

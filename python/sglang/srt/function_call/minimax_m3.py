@@ -379,6 +379,15 @@ class MinimaxM3Detector(BaseFormatDetector):
             child_schema = properties[child_tag]
             return child_schema if isinstance(child_schema, dict) else None
 
+        one_of = parent_schema.get("oneOf")
+        if isinstance(one_of, list):
+            for option_schema in one_of:
+                child_schema = self._get_child_schema(
+                    option_schema, child_tag, parent_value
+                )
+                if child_schema is not None:
+                    return child_schema
+
         additional_properties = parent_schema.get("additionalProperties")
         if isinstance(additional_properties, dict):
             return additional_properties
