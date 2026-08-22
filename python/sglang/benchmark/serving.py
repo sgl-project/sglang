@@ -1092,6 +1092,20 @@ async def get_request(
             await asyncio.sleep(interval)
 
 
+def _expand_itl_per_token(
+    output: RequestFuncOutput, tokenizer: PreTrainedTokenizerBase
+) -> List[float]:
+    """Spread each streaming chunk's ITL over the tokens it carries.
+
+    A chunk holds ``accept_length`` tokens under speculative decoding.
+    """
+    per_token_itls: List[float] = []
+    for chunk_itl, text_chunk in zip(output.itl, output.text_chunks):
+        num_tokens = len(tokenizer.encode(text_chunk, add_special_tokens=False))
+        per_token_itls.extend([chunk_itl / num_tokens] * num_tokens)
+    return per_token_itls
+
+
 def calculate_metrics(
     input_requests: Optional[List[DatasetRow]],
     outputs: List[RequestFuncOutput],
@@ -1111,13 +1125,18 @@ def calculate_metrics(
     tpots: List[float] = []
     ttfts: List[float] = []
     e2e_latencies: List[float] = []
-    retokenized_itls: List[float] = []
 
     use_retokenized_itl = (
         accept_length is not None
         and accept_length > 0
         and backend in ("sglang-oai", "sglang-oai-chat")
     )
+
+    # Per-token ITL series, shared by the ITL stats and the peak throughput.
+    itls_per_output = [
+        _expand_itl_per_token(output, tokenizer) if use_retokenized_itl else output.itl
+        for output in outputs
+    ]
 
     for i in range(len(outputs)):
         if outputs[i].success:
@@ -1133,17 +1152,7 @@ def calculate_metrics(
                 total_input_vision += input_requests[i].vision_prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
-            if use_retokenized_itl:
-                for k, itl in enumerate(outputs[i].itl):
-                    num_tokens = len(
-                        tokenizer.encode(
-                            outputs[i].text_chunks[k], add_special_tokens=False
-                        )
-                    )
-                    adjusted_itl = itl / num_tokens
-                    retokenized_itls.extend([adjusted_itl] * num_tokens)
-            else:
-                itls += outputs[i].itl
+            itls += itls_per_output[i]
             ttfts.append(outputs[i].ttft)
 
             e2e_latencies.append(outputs[i].latency)
@@ -1174,13 +1183,13 @@ def calculate_metrics(
         tokens_per_second = np.zeros(duration_seconds)
         concurrent_requests_per_second = np.zeros(duration_seconds)
 
-        for output in outputs:
+        for i, output in enumerate(outputs):
             if not output.success:
                 continue
 
             token_times = [output.start_time + output.ttft]
             current_time = token_times[0]
-            for itl_value in output.itl:
+            for itl_value in itls_per_output[i]:
                 current_time += itl_value
                 token_times.append(current_time)
 
@@ -1224,7 +1233,6 @@ def calculate_metrics(
             else:
                 print("tip: install termplotlib and gnuplot to plot the metrics")
 
-    itls = retokenized_itls if use_retokenized_itl else itls
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
