@@ -593,7 +593,10 @@ class OpenAIServingResponses(OpenAIServingChat):
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
         processed_messages = self._process_messages(chat_request, is_multimodal)
 
-        if is_multimodal:
+        if is_multimodal and self.chat_encoding_spec == "kimi_k3":
+            request_prompts = [processed_messages.prompt_ids]
+            engine_prompts = [processed_messages.prompt_ids]
+        elif is_multimodal:
             request_prompts = [processed_messages.prompt]
             engine_prompts = [processed_messages.prompt]
         else:
