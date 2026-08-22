@@ -137,6 +137,7 @@ pub struct ServerArgs {
     /// the scheduler simply won't produce them, so the request would 200 with the
     /// field silently missing.
     pub enable_return_hidden_states: bool,
+    pub enable_custom_logit_processor: bool,
     /// Output slots reserved per request on top of its input (eagle stores draft
     /// tokens there). Not a `server_args` field — `TokenizerManager` derives it and
     /// `RustServer._build_server_args` stamps it in, so both sides count alike.
@@ -174,6 +175,7 @@ impl ServerArgs {
         preferred_sampling_params,
         allow_auto_truncate,
         enable_return_hidden_states,
+        enable_custom_logit_processor,
         num_reserved_tokens,
         version,
         max_total_num_tokens,
@@ -204,6 +206,7 @@ impl ServerArgs {
         preferred_sampling_params: Option<PreferredSamplingParams>,
         allow_auto_truncate: bool,
         enable_return_hidden_states: bool,
+        enable_custom_logit_processor: bool,
         num_reserved_tokens: u64,
         version: String,
         max_total_num_tokens: u64,
@@ -232,6 +235,7 @@ impl ServerArgs {
             preferred_sampling_params,
             allow_auto_truncate,
             enable_return_hidden_states,
+            enable_custom_logit_processor,
             num_reserved_tokens,
             version,
             max_total_num_tokens,
@@ -268,6 +272,7 @@ impl Default for ServerArgs {
             preferred_sampling_params: None,
             allow_auto_truncate: false,
             enable_return_hidden_states: false,
+            enable_custom_logit_processor: false,
             num_reserved_tokens: 0,
             version: String::new(),
             max_total_num_tokens: 0,

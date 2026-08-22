@@ -41,7 +41,7 @@ wire_struct! {
         session_id: (),
         session_params: (),
         lora_id: (),
-        custom_logit_processor: (),
+        custom_logit_processor: Option<&'a str>,
         positional_embed_overrides: (),
         /// PD-disaggregation block — the last fields emitted; everything after
         /// `disagg_prefill_dp_rank` in Python has a msgspec default and is
@@ -105,7 +105,7 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             session_id: (),
             session_params: (),
             lora_id: (),
-            custom_logit_processor: (),
+            custom_logit_processor: req.custom_logit_processor.as_deref(),
             positional_embed_overrides: (),
             bootstrap_host: req.bootstrap_host.as_deref(),
             bootstrap_port: req.bootstrap_port,
@@ -174,6 +174,7 @@ mod tests {
             logprob_start_len: -1,
             top_logprobs_num: 3,
             return_hidden_states: true,
+            custom_logit_processor: Some("not parsed by Rust".into()),
             stream: true,
             ..Default::default()
         };
@@ -210,6 +211,12 @@ mod tests {
             Some(true),
             "return_hidden_states at idx 16"
         );
+        assert_eq!(
+            arr[23].as_str(),
+            Some("not parsed by Rust"),
+            "custom_logit_processor at idx 23"
+        );
+        assert!(arr[24].is_nil(), "positional_embed_overrides at idx 24");
     }
 
     /// The PD block must land on Python's wire indices 25–31, with the filler
