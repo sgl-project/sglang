@@ -688,5 +688,6 @@ def alloc_for_spec_decode(
             len(reqs),
         )
 
-    for i, req in enumerate(reqs):
-        req.kv.kv_allocated_len = max(req.kv.kv_allocated_len, int(nxt_kv_lens_cpu[i]))
+    nxt_kv_lens_list = nxt_kv_lens_cpu.tolist()
+    for req, nxt_kv_len in zip(reqs, nxt_kv_lens_list, strict=True):
+        req.kv.kv_allocated_len = max(req.kv.kv_allocated_len, nxt_kv_len)
