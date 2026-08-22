@@ -188,7 +188,12 @@
     },
     "change": "Apply the complete production PREBUILT relay pinned-host/non-blocking H2D transformation on top of the existing Layer-3 prepare-substage telemetry.",
     "source_evidence": "Job 3233840 showed that the partial metadata candidate moved the 14-16 ms wait into process_prebuilt, so this A/B source also stages last-token and EAGLE relay tensors.",
-    "targeted_validation": "Existing PREBUILT and EAGLE disaggregation units, complete-relay CUDA enqueue mechanism gate, and same-source 3P2D C704 service A/B pending.",
+    "targeted_validation": {
+      "static": "py_compile, manifest parse, and diff-check pass",
+      "cmh_job_3234123": "9 existing PREBUILT and EAGLE/DSA disaggregation tests pass",
+      "mechanism": "At B12, EAGLE top-k6, hidden size7168, the production transformation reduces host blocking from 39.254300 to 0.877957 ms behind 38.660398 ms of prior GPU work and preserves every payload exactly",
+      "service": "same-source 3P2D C704 service A/B pending"
+    },
     "scope": "Diagnostic A/B source only; final production source remains the top-only branch."
   },
   "srt_slurm": {
