@@ -72,6 +72,17 @@ class InputValidationStage(PipelineStage):
 
         Batched requests pass one base seed per prompt through `extra`; each
         prompt expands to `num_outputs_per_prompt` consecutive seeds.
+
+        When ``batch.candidate_spec`` is set (see
+        ``runtime.pipelines_core.candidates.CandidateTrajectorySpec``), this
+        request's outputs are candidates for one logical prediction rather
+        than independent public outputs, and each prompt's
+        ``num_outputs_per_prompt`` generators are derived via the contract's
+        ``derive_candidate_generators`` (a splitmix64-style mixer of
+        ``(base_seed, candidate_id)``) instead of the naive
+        ``base_seed + i`` scheme used otherwise -- this is required for the
+        RFC's RNG-independence guarantee, not just a quality nicety: plain
+        addition can produce visibly correlated draws for nearby seeds.
         """
         seed = batch.seed
         num_videos_per_prompt = batch.num_outputs_per_prompt
@@ -80,6 +91,7 @@ class InputValidationStage(PipelineStage):
 
         prompt_count = len(batch.prompt) if isinstance(batch.prompt, list) else 1
         dynamic_batch_seeds = batch.extra.get("dynamic_batch_seeds")
+        base_seeds: list[int] | None = None
 
         if dynamic_batch_seeds is not None:
             if (
@@ -124,9 +136,22 @@ class InputValidationStage(PipelineStage):
         else:
             device_str = current_platform.device_type
 
-        batch.generator = [
-            torch.Generator(device_str).manual_seed(seed) for seed in seeds
-        ]
+        if batch.candidate_spec is not None and base_seeds is not None:
+            from sglang.multimodal_gen.runtime.pipelines_core.candidates import (
+                derive_candidate_generators,
+            )
+
+            batch.generator = [
+                gen
+                for base_seed in base_seeds
+                for gen in derive_candidate_generators(
+                    base_seed, batch.candidate_spec, device=device_str
+                )
+            ]
+        else:
+            batch.generator = [
+                torch.Generator(device_str).manual_seed(seed) for seed in seeds
+            ]
 
     def preprocess_condition_image(
         self,
