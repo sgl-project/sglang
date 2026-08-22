@@ -786,6 +786,103 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         )
 
 
+class UnifiedDraftKVPool(MHATokenToKVPool):
+    """The DRAFT model's KV pool when its KV is FUSED into the target's pages.
+
+    Per-layer `k_buffer` / `v_buffer` are dense views of the draft region
+    riding inside every page of the host sub-pool
+    (`UnifiedKVPool.build_dense_draft_views`): same pages, same slot ids, same
+    v2p table as the target — one allocation, one free, one relocation. Locs
+    arriving through the KVCache API are DRAFT-dense ids,
+
+        dense_d(t) = (t // ps) * (ps * draft_kernel_page_multiplier) + t % ps,
+
+    produced by the allocator's dense translate at the draft multiplier (the
+    id-space choke point binds it — see KVIndexTranslator). Relocation needs no
+    method here: compaction moves whole page envelopes on the HOST pool, which
+    carries the draft bytes; `move_kv_cache` raises so a stray per-slot move
+    fails loudly instead of corrupting the fused layout.
+    """
+
+    def __init__(
+        self,
+        *,
+        unified_buffer: UnifiedKVPool,
+        host_sub_pool_name: str,
+        host_allocator,
+        page_size: int = 1,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        spec = unified_buffer.mha_spec(host_sub_pool_name)
+        assert spec.draft_region is not None, (
+            f"UnifiedDraftKVPool: host sub-pool {host_sub_pool_name!r} carries "
+            "no fused draft region"
+        )
+        region = spec.draft_region
+        k_views, v_views = unified_buffer.build_dense_draft_views(host_sub_pool_name)
+        max_slots = unified_buffer.max_slots(host_sub_pool_name)
+
+        self._unified_buffer = unified_buffer
+        self._host_sub_pool_name = host_sub_pool_name
+        # The id-space choke point (KVIndexTranslator) probes these: the draft's
+        # dense translate is the HOST allocator's v2p at the DRAFT multiplier.
+        self.host_allocator = host_allocator
+        self.draft_kernel_page_multiplier = spec.draft_kernel_page_multiplier()
+        self._k_views = k_views
+        self._v_views = v_views
+        num_pages = max_slots // page_size
+        dense_size = num_pages * self.draft_kernel_page_multiplier * page_size
+
+        super().__init__(
+            size=dense_size - page_size,
+            page_size=page_size,
+            dtype=region.store_dtype,
+            head_num=region.head_num,
+            head_dim=region.head_dim,
+            layer_num=region.layer_num,
+            device=unified_buffer.device,
+            enable_memory_saver=False,  # buffer owned by UnifiedKVPool
+            v_head_dim=(
+                region.head_dim if region.v_head_dim is None else region.v_head_dim
+            ),
+            start_layer=start_layer,
+            end_layer=end_layer,
+            enable_kv_cache_copy=False,
+            # Same rationale as UnifiedMHATokenToKVPool: the env-driven layout
+            # selectors must not re-shape buffers this pool builds itself.
+            kv_cache_layout="page_major_dense",
+        )
+
+    def _create_buffers(self):
+        self.k_buffer = self._k_views
+        self.v_buffer = self._v_views
+
+    def _clear_buffers(self):
+        pass  # lifetime owned by UnifiedKVPool
+
+    def get_kv_size_bytes(self):
+        return 0, 0  # fused into the host pages; UnifiedKVPool logs the total
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        raise NotImplementedError(
+            "fused draft KV relocates with the HOST pool's whole-page move; a "
+            "draft-side per-slot move would corrupt the fused layout"
+        )
+
+    def get_contiguous_buf_infos(self):
+        raise NotImplementedError(
+            "fused draft KV has no per-layer contiguous regions; KV transfer / "
+            "disaggregation is unsupported."
+        )
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        raise NotImplementedError("CPU offloading is unsupported for fused draft KV.")
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        raise NotImplementedError("CPU offloading is unsupported for fused draft KV.")
+
+
 class UnifiedMLATokenToKVPool(MLATokenToKVPool):
     """MLA KV pool whose per-layer `kv_buffer` entries are kernel-facing views into a
     `UnifiedKVPool` (see `build_mla_views`).
@@ -1814,8 +1911,16 @@ def init_unified_swa_pools(
     unified_total_bytes: Optional[int] = None,
     model_context_len: Optional[int] = None,
     sliding_window_size: Optional[int] = None,
+    draft_kv_geometry: Optional[DenseDraftRegion] = None,
 ) -> UnifiedSWAPoolBundle:
-    """Build the SWA-hybrid unified-memory-pool stack."""
+    """Build the SWA-hybrid unified-memory-pool stack.
+
+    With ``draft_kv_geometry``, every FULL-side page fuses the draft model's
+    KV region after the host blocks (the draft is dense per token, so it
+    fuses into the full sub-pool); the draft worker binds a
+    `UnifiedDraftKVPool` over the same pages instead of allocating a pool of
+    its own.
+    """
     from sglang.srt.mem_cache.multi_ended_allocator import (
         UnifiedSWATokenToKVPoolAllocator,
     )
@@ -1840,6 +1945,7 @@ def init_unified_swa_pools(
         v_head_dim=v_head_dim,
         store_dtype=store_dtype,
         grow_direction="down",
+        draft_region=draft_kv_geometry,
     )
     swa_spec = MHASubPoolSpec(
         name="swa",
