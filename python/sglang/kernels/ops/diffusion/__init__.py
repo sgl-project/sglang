@@ -18,7 +18,7 @@ numerics and platform plumbing, ``sites`` the request-scoped mount policy, and
 ``README.md``: several norms look interchangeable and are not.
 
 Resolution is lazy (PEP 562).  The backends have disjoint, heavy dependencies
--- Triton, CUTLASS/CuTe-DSL, FlyDSL (ROCm), MLX (Apple) -- so an eager
+-- Triton, CUTLASS/CuTe-DSL, and FlyDSL (ROCm) -- so an eager
 re-export would turn every one of them into a hard import-time requirement on
 every platform.  ``_EXPORTS`` maps a symbol to its module and the import
 happens on first attribute access.
@@ -215,6 +215,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Bit-exact rotate-half RoPE.",
     ),
     (
+        "diffusion.interleaved_rope_fp64",
+        KernelBackend.JIT,
+        "rope.interleaved_rope_fp64_jit:fused_interleaved_rope_fp64",
+        _CUDA,
+        "Paired interleaved RoPE with fp64 Diffusers semantics.",
+    ),
+    (
         "diffusion.hunyuan_qkv_rope_pack",
         KernelBackend.TRITON,
         "rope.hunyuan_qkv_pack_triton:hunyuan_qkv_rope_pack",
@@ -400,6 +407,8 @@ _EXPORTS: dict[str, str] = {
     "fused_qknorm_rope_pack_kv": "rope.qknorm_rope_jit",
     "can_use_fused_rope_rotate_half": "rope.rope_rotate_half_bitexact",
     "fused_rope_rotate_half_bitexact": "rope.rope_rotate_half_bitexact",
+    "can_use_interleaved_rope_fp64": "rope.interleaved_rope_fp64_jit",
+    "fused_interleaved_rope_fp64": "rope.interleaved_rope_fp64_jit",
     "apply_rotary_embedding": "rope.rotary_triton",
     # Activation-function fusions
     "can_use_fused_bias_glu": "activation.sana_conv_post_triton",
