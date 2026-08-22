@@ -322,7 +322,13 @@ class TestConfigurationValidation:
     def test_policy_validation(self):
         """Test policy configuration validation."""
         # Valid policies
-        valid_policies = ["random", "round_robin", "cache_aware", "power_of_two"]
+        valid_policies = [
+            "random",
+            "round_robin",
+            "cache_aware",
+            "power_of_two",
+            "bounded_consistent_hashing",
+        ]
 
         for policy in valid_policies:
             args = RouterArgs(policy=policy)
@@ -331,7 +337,13 @@ class TestConfigurationValidation:
     def test_pd_policy_validation(self):
         """Test PD policy configuration validation."""
         # Valid PD policies
-        valid_policies = ["random", "round_robin", "cache_aware", "power_of_two"]
+        valid_policies = [
+            "random",
+            "round_robin",
+            "cache_aware",
+            "power_of_two",
+            "bounded_consistent_hashing",
+        ]
 
         for prefill_policy in valid_policies:
             for decode_policy in valid_policies:
