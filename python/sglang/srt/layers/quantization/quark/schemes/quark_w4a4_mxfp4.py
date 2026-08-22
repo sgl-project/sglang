@@ -22,13 +22,14 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
 from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hcu, is_hip
 from sglang.srt.utils.common import direct_register_custom_op, is_gfx95_supported
 
 NVFP4_BLOCK_SIZE = 16
 
 _is_hip = is_hip()
-if _is_hip:
+_is_hcu = is_hcu()
+if _is_hip and not _is_hcu:
     from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
         fused_gemm_afp4wfp4_split_cat as _fused_gemm_afp4wfp4_split_cat_orig,
     )
@@ -185,6 +186,12 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         is_checkpoint_mxfp4_serialized: bool = True,
         dequantization_config: QuantizationConfig | None = None,
     ):
+        if _is_hcu:
+            raise NotImplementedError(
+                "Quark W4A4 MXFP4 is not supported on HCU because "
+                "the required AITER kernels are unavailable."
+            )
+
         self.out_dtype = torch.get_default_dtype()
         self.qscheme = "per_group"
         self.weight_quant_spec = weight_quant_spec
