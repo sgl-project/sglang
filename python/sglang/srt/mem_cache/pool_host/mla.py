@@ -436,11 +436,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 )
             return
 
-        device_data_ptrs, device_kv_buffers = self._resolve_device_transfer_buffers(
-            device_pool
-        )
-
         if io_backend == "kernel":
+            device_data_ptrs, _ = self._resolve_device_transfer_buffers(device_pool)
             if self.layout == "layer_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_all_layer_mla(
@@ -484,6 +481,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":
+            _, device_kv_buffers = self._resolve_device_transfer_buffers(device_pool)
             if self.layout == "layer_first":
                 transfer_kv_direct(
                     src_layers=device_kv_buffers,
