@@ -8,17 +8,38 @@ zero-copy ``mlx_call`` helper is available for a complete MLX operation and
 keeps all borrowed DLPack inputs alive until the result has been evaluated.
 This lifetime boundary matters because MLX may donate a borrowed input buffer
 to a lazy operation.
+
+Bridge entry points are serialized because Torch and MLX use different stream
+abstractions over the same Metal command queues.  The lock covers producer
+fencing, MLX evaluation, and DLPack import.  It cannot cover arbitrary MPS
+work outside the function, so callers must serialize any overlapping use or
+mutation of source and returned MPS tensors as well.
 """
 
 from __future__ import annotations
 
-from functools import lru_cache
+from functools import lru_cache, wraps
+from threading import RLock
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
 import torch
 
 if TYPE_CHECKING:
     import mlx.core as mx
+
+
+_BRIDGE_LOCK = RLock()
+
+
+def _serialized_bridge(function: Callable[..., Any]) -> Callable[..., Any]:
+    """Serialize one complete Torch/MLX crossing, including result export."""
+
+    @wraps(function)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        with _BRIDGE_LOCK:
+            return function(*args, **kwargs)
+
+    return wrapper
 
 
 @lru_cache(maxsize=1)
@@ -91,15 +112,16 @@ class MlxTensorView:
     __slots__ = ("torch_tensor", "array")
 
     def __init__(self, tensor: torch.Tensor, *, synchronize: bool = True):
-        owner = tensor.detach()
-        if owner.device.type != "mps":
-            raise ValueError(
-                f"MlxTensorView requires a Torch MPS tensor, got {owner.device}"
-            )
-        if synchronize:
-            torch.mps.synchronize()
-        self.torch_tensor = owner
-        self.array = _torch_to_mlx(owner, copy=False, synchronize=False)
+        with _BRIDGE_LOCK:
+            owner = tensor.detach()
+            if owner.device.type != "mps":
+                raise ValueError(
+                    f"MlxTensorView requires a Torch MPS tensor, got {owner.device}"
+                )
+            if synchronize:
+                torch.mps.synchronize()
+            self.torch_tensor = owner
+            self.array = _torch_to_mlx(owner, copy=False, synchronize=False)
 
     @classmethod
     def _from_synchronized(cls, tensor: torch.Tensor) -> MlxTensorView:
@@ -125,6 +147,7 @@ class MlxTensorView:
         )
 
 
+@_serialized_bridge
 def borrow_torch_tensors(
     *tensors: torch.Tensor, synchronize: bool = True
 ) -> tuple[MlxTensorView, ...]:
@@ -146,6 +169,7 @@ def borrow_torch_tensors(
     return tuple(MlxTensorView._from_synchronized(tensor) for tensor in detached)
 
 
+@_serialized_bridge
 def torch_to_mlx(tensor: torch.Tensor) -> mx.array:
     """Convert a PyTorch tensor to an independent MLX array.
 
@@ -167,6 +191,7 @@ def torch_to_mlx(tensor: torch.Tensor) -> mx.array:
     return array
 
 
+@_serialized_bridge
 def mlx_call(
     operation: Callable[..., mx.array],
     *tensors: torch.Tensor | MlxTensorView,
@@ -178,7 +203,9 @@ def mlx_call(
     :func:`mlx_to_torch` evaluates and exports ``operation``'s result.  Keep
     the operation inside this call; returning a lazy MLX result for later use
     or stashing a borrowed input through a callback side effect would escape
-    the borrow scope.  The operation may allocate its own output normally.
+    the borrow scope.  The caller must also serialize any overlapping MPS work
+    outside this function, including use or mutation of source and returned
+    tensors.  The operation may allocate its own output normally.
     """
     mx = _mlx_core()
     target_device = _get_torch_device() if device is None else torch.device(device)
@@ -280,6 +307,7 @@ def _export_evaluated_mlx(
     return torch.utils.dlpack.from_dlpack(array)
 
 
+@_serialized_bridge
 def mlx_call_multi(
     operation: Callable[..., tuple[mx.array, ...]],
     *tensors: torch.Tensor | MlxTensorView,
@@ -292,7 +320,9 @@ def mlx_call_multi(
     ordinary outputs are evaluated with one ``mx.eval(*outputs)`` call before
     being exported through DLPack.  The imported arrays and detached Torch
     owners remain local until every output capsule has been consumed, which is
-    required when MLX lazily donates a borrowed input buffer.
+    required when MLX lazily donates a borrowed input buffer.  Callers must
+    serialize any overlapping MPS work outside this function, including use
+    or mutation of source and returned tensors.
 
     CPU targets retain the same float64 and negative-stride safeguards as
     :func:`mlx_to_torch`.  A negative-stride output necessarily needs one
@@ -370,6 +400,7 @@ def mlx_call_multi(
     return outputs
 
 
+@_serialized_bridge
 def mlx_to_torch(
     array: mx.array,
     device: torch.device | Literal["mps", "cpu"] | None = None,

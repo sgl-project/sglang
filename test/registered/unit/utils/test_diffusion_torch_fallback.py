@@ -56,7 +56,7 @@ class TestDiffusionTorchFallback(unittest.TestCase):
                     + bias.float()
                 ).to(dtype)
 
-                tolerance = 2e-2 if dtype != torch.float32 else 2e-5
+                tolerance = 0 if dtype != torch.float32 else 2e-5
                 torch.testing.assert_close(
                     rms.cpu(), rms_ref.cpu(), rtol=tolerance, atol=tolerance
                 )
@@ -68,6 +68,7 @@ class TestDiffusionTorchFallback(unittest.TestCase):
                 torch.testing.assert_close(out.cpu(), layer_ref.cpu())
 
     def test_norm_infer_preserves_input_dtype_with_fp32_parameters(self):
+        torch.manual_seed(0)
         for dtype in (torch.float16, torch.bfloat16):
             with self.subTest(dtype=dtype):
                 x = torch.randn(4, 32, device=self.device, dtype=dtype)
@@ -85,7 +86,7 @@ class TestDiffusionTorchFallback(unittest.TestCase):
 
                 self.assertEqual(result.dtype, dtype)
                 torch.testing.assert_close(
-                    result.cpu(), reference.cpu(), rtol=2e-2, atol=2e-2
+                    result.cpu(), reference.cpu(), rtol=0, atol=0
                 )
 
     def test_scale_shift_matches_broadcast_reference(self):

@@ -289,6 +289,8 @@ class TestTensorBridgeMetalSharing(unittest.TestCase):
         captured = {}
         events = []
         real_synchronize = torch.mps.synchronize
+        real_eval = mx.eval
+        real_from_dlpack = torch.utils.dlpack.from_dlpack
 
         def synchronize_then_record():
             real_synchronize()
@@ -299,15 +301,23 @@ class TestTensorBridgeMetalSharing(unittest.TestCase):
             captured["arrays"] = (x + 1, x * 2)
             return list(captured["arrays"])
 
+        def evaluate_and_record(*arrays):
+            events.append("eval")
+            return real_eval(*arrays)
+
+        def import_and_record(*args, **kwargs):
+            events.append("dlpack")
+            return real_from_dlpack(*args, **kwargs)
+
         with (
             mock.patch.object(
                 torch.mps, "synchronize", side_effect=synchronize_then_record
             ) as synchronize,
-            mock.patch.object(mx, "eval", wraps=mx.eval) as evaluate,
+            mock.patch.object(mx, "eval", side_effect=evaluate_and_record) as evaluate,
             mock.patch.object(
                 torch.utils.dlpack,
                 "from_dlpack",
-                wraps=torch.utils.dlpack.from_dlpack,
+                side_effect=import_and_record,
             ) as from_dlpack,
         ):
             first, second = mlx_call_multi(
@@ -317,7 +327,10 @@ class TestTensorBridgeMetalSharing(unittest.TestCase):
             )
 
         synchronize.assert_called_once_with()
-        self.assertEqual(events, ["fence returned", "operation"])
+        self.assertEqual(
+            events,
+            ["fence returned", "operation", "eval", "dlpack", "dlpack"],
+        )
         evaluate.assert_called_once()
         self.assertEqual(len(evaluate.call_args.args), 2)
         self.assertEqual(from_dlpack.call_count, 2)
@@ -348,6 +361,39 @@ class TestTensorBridgeMetalSharing(unittest.TestCase):
 
         torch.testing.assert_close(first.cpu(), expected + 3)
         torch.testing.assert_close(second.cpu(), expected - 3)
+
+    def test_concurrent_bridge_calls_are_serialized(self):
+        """Concurrent bridge entry points must not race Metal command buffers."""
+        script = """
+from concurrent.futures import ThreadPoolExecutor
+import torch
+from sglang.srt.utils.tensor_bridge import mlx_call
+
+source = torch.arange(8, device="mps", dtype=torch.float32)
+
+def worker(iterations):
+    for _ in range(iterations):
+        result = mlx_call(lambda x: x + 1, source, device="mps")
+        assert result.device.type == "mps"
+        del result
+    return True
+
+with ThreadPoolExecutor(max_workers=2) as pool:
+    futures = [pool.submit(worker, 64), pool.submit(worker, 64)]
+    assert all(future.result() for future in futures)
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"stdout={completed.stdout}\nstderr={completed.stderr}",
+        )
 
     def test_mlx_call_multi_rejects_non_sequence_output(self):
         source = torch.ones(2, device="mps", dtype=torch.float32)

@@ -72,9 +72,29 @@ def norm_infer_native(
     """Native fallback for norm_infer (layer norm / rms norm inference)."""
     normalized_shape = (x.shape[-1],)
     if is_rms_norm:
-        result = F.rms_norm(x, normalized_shape, weight, eps)
-        if bias is not None:
-            result = result + bias
+        # ``F.rms_norm`` returns in the input dtype before a separately added
+        # bias is applied. Promote the whole branch when a bias is present or
+        # parameters have a different dtype, retaining the old
+        # fp32-accumulate-then-cast contract. A bias triggers promotion even
+        # when its dtype matches the input; otherwise the normalized value is
+        # rounded before the affine add. Keep the native fast path for the
+        # common bias-free, same-dtype case.
+        needs_fp32 = bias is not None or (
+            weight is not None and weight.dtype != x.dtype
+        )
+        if needs_fp32:
+            result = F.rms_norm(
+                x.float(),
+                normalized_shape,
+                weight.float() if weight is not None else None,
+                eps,
+            )
+            if bias is not None:
+                result = result + bias.float()
+        else:
+            result = F.rms_norm(x, normalized_shape, weight, eps)
+            if bias is not None:
+                result = result + bias
     else:
         result = F.layer_norm(x, normalized_shape, weight, bias, eps)
     # Match the original fallback and Triton kernel contract even when a
