@@ -77,7 +77,8 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
       DType target_prob_single = target_probs[cur_prob_offset + draft_token_id];
       prob_acc += target_prob_single;
 
-      if (coin <= prob_acc / threshold_acc || target_prob_single >= threshold_single) {
+      const bool has_target_mass = target_prob_single > DType(0);
+      if (has_target_mass && (coin < prob_acc / threshold_acc || target_prob_single >= threshold_single)) {
         // accept token
         prob_acc = 0.;
         cur_prob_offset = (bx * num_draft_tokens + cur_index) * d;
