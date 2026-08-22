@@ -1243,7 +1243,13 @@ class Req(ReqDllmMixin):
         # overallocated range and are reclaimed by release_kv_cache. #22373.
         if get_serving().strip_thinking_cache and self.reasoning_tokens > 0:
             return min(self.kv_committed_len, len(self.origin_input_ids))
-        return self.kv_committed_len
+        # A verify step commits a whole accepted chunk, so output_ids can run
+        # past the stop position. The client never sees those tokens, so nothing
+        # can match them: keep them out of the key and let them be reclaimed.
+        return min(
+            self.kv_committed_len,
+            len(self.origin_input_ids) + len(self.output_ids_through_stop),
+        )
 
     def update_spec_correct_drafts_histogram(self, num_correct_drafts: int):
         """Record one step accepted draft count (excludes bonus token) into the histogram."""
