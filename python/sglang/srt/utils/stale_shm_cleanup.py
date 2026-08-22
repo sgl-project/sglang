@@ -12,6 +12,7 @@ because the sweep runs at CI job start right after killall.py. CI-only
 
 import logging
 import os
+import sys
 import uuid
 from pathlib import Path
 
@@ -19,6 +20,13 @@ logger = logging.getLogger(__name__)
 
 _SHM_DIR = Path("/dev/shm")
 _SGL_SHM_PREFIX = "sgl_shm"
+
+# CPython prepends "/" before handing the name to shm_open(). macOS caps the
+# whole thing at PSHMNAMLEN (31), so only 30 characters are usable; Linux
+# allows NAME_MAX (255). Overshooting raises ENAMETOOLONG inside the caller.
+_MAX_SHM_NAME_LEN = 30 if sys.platform == "darwin" else 255
+
+_truncated_kinds: set[str] = set()
 
 _ORPHAN_PREFIXES = (
     "sglang_loads_",  # managers/load_snapshot.py slot files
@@ -29,8 +37,36 @@ _ORPHAN_PREFIXES = (
 
 
 def make_shm_name(kind: str) -> str:
-    """Pid-stamped name (sgl_shm_<kind>_<pid>_<rand>) the sweep can reclaim."""
-    return f"{_SGL_SHM_PREFIX}_{kind}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    """Pid-stamped name (sgl_shm_<kind>_<pid>_<rand>) the sweep can reclaim.
+
+    ``kind`` is a human-readable tag and is truncated to whatever the platform
+    limit leaves over, so a long tag can never produce an unopenable name. The
+    pid and random suffix are preserved verbatim: the pid is what the cleanup
+    sweep parses back out in ``_creator_pid``, and the suffix is what keeps
+    concurrent callers from colliding.
+    """
+    suffix = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    # prefix + "_" + kind + "_" + suffix
+    budget = _MAX_SHM_NAME_LEN - (len(_SGL_SHM_PREFIX) + 2 + len(suffix))
+    if budget < 1:
+        raise ValueError(
+            f"Cannot build a shared-memory name within the {_MAX_SHM_NAME_LEN}"
+            f"-character platform limit (pid {os.getpid()} leaves no room for a tag)."
+        )
+    if len(kind) > budget:
+        if kind not in _truncated_kinds:
+            # Once per tag: this fires on every call otherwise, and the pid
+            # length makes the exact budget vary between processes.
+            _truncated_kinds.add(kind)
+            logger.debug(
+                "make_shm_name: truncating kind %r to %d chars to stay within the "
+                "%d-character shared-memory name limit on this platform.",
+                kind,
+                budget,
+                _MAX_SHM_NAME_LEN,
+            )
+        kind = kind[:budget]
+    return f"{_SGL_SHM_PREFIX}_{kind}_{suffix}"
 
 
 def _creator_pid(filename: str) -> int | None:
