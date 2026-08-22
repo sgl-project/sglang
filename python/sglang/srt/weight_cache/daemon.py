@@ -373,9 +373,15 @@ class WeightCacheDaemon:
         self.transport_backend = choose_daemon_transport_backend(state_tensors)
         self.state_entries = self.transport_backend.prepare_export(state_tensors)
 
-        # Log approximate serialized metadata size (not payload-backed bytes)
+        # Log approximate serialized metadata size (not payload-backed bytes).
+        # Only the handle blob carries real weight, so measure it directly:
+        # stringifying every entry would allocate a copy of all handles.
         total_bytes = sum(
-            len(str(entry).encode("utf-8")) for entry in self.state_entries.values()
+            len(handle)
+            for handle in (
+                entry.get("handle") for entry in self.state_entries.values()
+            )
+            if isinstance(handle, (str, bytes, bytearray))
         )
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id}] "

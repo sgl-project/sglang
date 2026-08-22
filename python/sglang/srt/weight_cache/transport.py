@@ -9,7 +9,7 @@ import os
 import socket
 import struct
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, NoReturn, Optional, Tuple
 
 import torch
 
@@ -134,29 +134,35 @@ class TorchIpcTransportBackend(WeightCacheTransportBackend):
 
 
 class VmmFdTransportBackend(WeightCacheTransportBackend):
+    """Placeholder for the CUDA VMM + fd-passing transport.
+
+    The backend is not wired up yet: can_export_state reports False so the
+    daemon keeps selecting torch_ipc, and every other entry point fails loudly
+    instead of silently returning None.
+    """
+
     name = VMM_FD_BACKEND
 
     def __init__(self):
-        self._state_tensors: Dict[str, torch.Tensor] = {}
-        self._mappings: list[Tuple[int, int]] = []
+        self._raise_not_implemented()
 
     @staticmethod
-    def _load_cuda_helpers():
-        pass
+    def _raise_not_implemented() -> NoReturn:
+        raise NotImplementedError(
+            f"weight cache transport backend {VMM_FD_BACKEND!r} is not "
+            f"implemented in this build"
+        )
 
     @classmethod
     def can_export_state(
         cls, state_tensors: Mapping[str, Tuple[torch.Tensor, bool]]
     ) -> bool:
-        pass
+        return False
 
     def prepare_export(
         self, state_tensors: Mapping[str, Tuple[torch.Tensor, bool]]
     ) -> Dict[str, Dict[str, Any]]:
-        pass
-
-    def _export_fd_for_tensor(self, tensor: torch.Tensor, name: str) -> int:
-        pass
+        self._raise_not_implemented()
 
     def send_fetch_state_response(
         self,
@@ -166,18 +172,15 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
         entries: Dict[str, Dict[str, Any]],
         pid: int,
     ) -> None:
-        pass
+        self._raise_not_implemented()
 
     def recv_fetch_state_response(
         self, sock: socket.socket, result: Dict[str, Any]
     ) -> Dict[str, Any]:
-        pass
+        self._raise_not_implemented()
 
     def import_tensor(self, entry: Dict[str, Any]) -> torch.Tensor:
-        pass
-
-    def __del__(self):
-        pass
+        self._raise_not_implemented()
 
 
 def choose_daemon_transport_backend(
