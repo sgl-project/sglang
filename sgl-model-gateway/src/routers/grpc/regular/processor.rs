@@ -106,6 +106,16 @@ impl ResponseProcessor {
             );
 
             let mut parser = pooled_parser.lock().await;
+            parser.reset();
+            if utils::should_mark_reasoning_started(
+                utils::resolve_user_thinking(
+                    original_request.chat_template_kwargs.as_ref(),
+                    tokenizer.thinking_key_name(),
+                ),
+                tokenizer.thinking_toggle(),
+            ) {
+                parser.mark_reasoning_started();
+            }
             match parser.detect_and_parse_reasoning(&processed_text) {
                 Ok(result) => {
                     if !result.reasoning_text.is_empty() {
