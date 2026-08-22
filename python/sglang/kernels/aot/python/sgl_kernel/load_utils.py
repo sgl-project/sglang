@@ -56,10 +56,18 @@ def _load_architecture_specific_ops():
     sgl_kernel_dir = Path(__file__).parent
     logger.debug(f"[sgl_kernel] sgl_kernel directory: {sgl_kernel_dir}")
 
-    # Determine which version to load based on GPU architecture
-    if compute_capability == 90:
+    # Determine which version to load based on GPU architecture.
+    # The sm90 artifact is the compatibility build: it carries gencode for
+    # sm_80/86/87/89 in addition to sm_90 (see ENABLE_BELOW_SM90 in
+    # CMakeLists.txt), so every GPU below SM100 must load it. Routing only
+    # cc==90 here sends sm_89 (Ada, e.g. L40S/RTX 4090) to the sm100
+    # directory, which fails whenever that artifact lacks below-SM90
+    # gencode.
+    if compute_capability is not None and compute_capability < 100:
         ops_subdir = "sm90"
-        variant_name = "SM90 (Hopper/H100 with fast math optimization)"
+        variant_name = (
+            f"SM{compute_capability} (sm90 build with fast math optimization)"
+        )
     elif compute_capability is not None:
         ops_subdir = "sm100"
         variant_name = f"SM{compute_capability} (precise math for compatibility)"
