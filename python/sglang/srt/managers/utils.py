@@ -383,11 +383,8 @@ def compute_num_reserved_tokens() -> int:
     The current eagle implementation stores draft tokens in the output token
     slots, so the context budget has to account for them; every other algorithm
     reserves nothing. Shared by `TokenizerManager` and the rust server's
-    `server_args` blob (`RustServer._build_server_args`), which needs the same
-    number to run the total-token check in Rust. Both stamp the number once at
-    launch, so it has to cover every step an adaptive-spec run may switch to:
-    it reads the bags for the candidate-table ceiling and the current
-    `topk * steps`, not the untouched startup record.
+    `server_args` handoff (`RustServer._build_server_args`), which needs the same
+    number to run the total-token check in Rust.
     """
     spec = get_spec()
     algorithm = SpeculativeAlgorithm.from_string(spec.speculative_algorithm)

@@ -20,8 +20,8 @@ pub enum Error {
     #[error("detokenize failed: {0}")]
     Detokenize(String),
 
-    /// Ingress ring full / scheduler not draining. Surfaced as backpressure.
-    #[error("ingress queue full")]
+    /// To-scheduler channel full. Surfaced as backpressure.
+    #[error("to_scheduler channel full")]
     QueueFull,
 
     /// Client went away mid-stream. Drives `Aborted`, not `Failed`.

@@ -319,6 +319,10 @@ RETRACTION_POLICY_CHOICES = ["length", "priority"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
+# Speculative algorithms whose verify forward presents a uniform per-request
+# token width, which is what the LoRA segment layout assumes.
+_LORA_SPEC_ALGORITHMS = ("EAGLE", "EAGLE3", "DFLASH", "DSPARK")
+
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
 
 ENCODER_TRANSFER_BACKEND_CHOICES = [
@@ -5541,15 +5545,6 @@ class ServerArgs:
             validate_deepseek_v4_cp(self)
             validate_deepseek_v4_mega_moe_token_budget(self)
 
-            # The SM120 marlin fallback moved to the resolution pipeline
-            # (arg_groups/overrides.py: _deepseek_v4_sm120_moe), invoked here
-            # at its legacy slot.
-            from sglang.srt.arg_groups.overrides import (
-                _deepseek_v4_sm120_moe,
-                run_post_process_pass,
-            )
-
-            run_post_process_pass(self, _deepseek_v4_sm120_moe)
             if is_sm120_supported():
                 # SM120 lacks tcgen05/TMEM: disable features that depend on
                 # DeepGEMM or require >99KB SMEM (topk_v2).
@@ -9456,10 +9451,7 @@ class ServerArgs:
                 )
 
             # Validate compatibility with speculative decoding
-            if self.speculative_algorithm not in ["NGRAM", None]:
-                raise ValueError(
-                    "Currently LoRA is only compatible with NGRAM speculative decoding."
-                )
+            self._check_lora_speculative_compatibility()
 
             # Parse lora_paths
             if isinstance(self.lora_paths, list):
@@ -9563,6 +9555,65 @@ class ServerArgs:
             assert (
                 self.lora_drain_wait_threshold >= 0.0
             ), "--lora-drain-wait-threshold must be non-negative."
+
+    def _check_lora_speculative_compatibility(self):
+        """Validate LoRA + speculative decoding combinations.
+
+        Adapters apply to the target only; a shared draft runs unadapted.
+        Matches resolved algorithm names (NEXTN has collapsed to EAGLE).
+        """
+        if self.speculative_algorithm in ["NGRAM", None]:
+            return
+
+        if self.speculative_algorithm not in _LORA_SPEC_ALGORITHMS:
+            promoted = (
+                " (NEXTN/EAGLE with a Gemma4 assistant draft is automatically "
+                "promoted to FROZEN_KV_MTP, which does not support LoRA)"
+                if self.speculative_algorithm == "FROZEN_KV_MTP"
+                else ""
+            )
+            raise ValueError(
+                "LoRA is only compatible with NGRAM, EAGLE, NEXTN, EAGLE3, "
+                "DFLASH, or DSPARK speculative decoding, not "
+                f"{self.speculative_algorithm}{promoted}."
+            )
+
+        ragged_mode = envs.SGLANG_RAGGED_VERIFY_MODE.get()
+
+        # Each entry: (is unsupported, why). Reasons are appended to a shared
+        # prefix so the message names the combination, not just the flag.
+        unsupported = [
+            (
+                self.speculative_algorithm == "DSPARK" and ragged_mode != "static",
+                f"does not support SGLANG_RAGGED_VERIFY_MODE={ragged_mode!r}: "
+                "the per-request verify lengths it schedules break the "
+                "uniform-width LoRA segment layout",
+            ),
+            (
+                self.speculative_adaptive,
+                "does not support --speculative-adaptive: the draft is built "
+                "from a static ServerArgs snapshot, and the runtime-state "
+                "swap does not rebuild LoRA cuda-graph metadata",
+            ),
+            (
+                "experimental_sgl_trtllm"
+                in (self.moe_runner_backend, self.speculative_moe_runner_backend),
+                "does not support the experimental_sgl_trtllm MoE runner: its "
+                "TopK reads the LoRA config per forward, which the draft "
+                "resolves against the target's after its own publish ended",
+            ),
+            (
+                envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get(),
+                "does not support SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1: LoRA "
+                "batch preparation would run on the plan stream, unordered "
+                "against in-flight forwards",
+            ),
+        ]
+        for is_unsupported, reason in unsupported:
+            if is_unsupported:
+                raise ValueError(
+                    f"LoRA with EAGLE/NEXTN/EAGLE3 speculative decoding {reason}."
+                )
 
     def validate_buckets_rule(self, arg_name: str, buckets_rule: List[str]):
         if not buckets_rule:
