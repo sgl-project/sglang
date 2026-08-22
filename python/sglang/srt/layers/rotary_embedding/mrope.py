@@ -283,20 +283,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         assert (
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for npu implementation"
-        if query.shape[1] > 4096:
-            return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
-        rotary_mode = "half" if self.is_neox_style else "interleave"
-        mrope_section = [0, 0, 0]
-        query_out, key_out = torch_npu.npu_mrope(
-            positions,
-            query,
-            key,
-            self.cos_sin_cache,
-            self.head_size,
-            mrope_section=mrope_section,
-            rotary_mode=rotary_mode,
-        )
-        return query_out, key_out
+        return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
 
     def forward_xpu(
         self,
