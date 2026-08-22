@@ -312,14 +312,19 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
     # The draft checkpoint reports the NextN architecture name.
     fused_shared_experts_architecture = "DeepseekV3ForCausalLMNextN"
 
-    # Support amd/DeepSeek-R1-0528-MXFP4 renaming: model.layers.61*.
-    # Ref: HF config.json for amd/DeepSeek-R1-0528-MXFP4
-    # https://huggingface.co/amd/DeepSeek-R1-0528-MXFP4/blob/main/config.json
-    hf_to_sglang_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "model.layers.61": "model.decoder",
-        },
-    )
+    # The NextN layer index is checkpoint-dependent (model.layers.{num_hidden_layers}).
+    @classmethod
+    def get_hf_to_sglang_mapper(cls, hf_config) -> WeightsMapper:
+        nextn_layer = f"model.layers.{hf_config.num_hidden_layers}"
+        return WeightsMapper(
+            orig_to_new_prefix={
+                f"{nextn_layer}.eh_proj": "model.eh_proj",
+                f"{nextn_layer}.enorm": "model.enorm",
+                f"{nextn_layer}.hnorm": "model.hnorm",
+                f"{nextn_layer}.shared_head": "model.shared_head",
+                nextn_layer: "model.decoder",
+            },
+        )
 
     def _resolve_nextn_quant_config(self, config, quant_config):
         if quant_config is None or quant_config.get_name() != "quark":
@@ -328,7 +333,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
 
         ckpt_prefix = f"model.layers.{config.num_hidden_layers}"
-        mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
+        mapped_prefix = self.get_hf_to_sglang_mapper(config)._map_name(ckpt_prefix)
         if should_ignore_layer(mapped_prefix, quant_config.exclude_layers):
             return None
         return quant_config
