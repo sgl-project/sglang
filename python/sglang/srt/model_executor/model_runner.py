@@ -1302,8 +1302,10 @@ class ModelRunner:
         """Load a new lora adapter whose weights are broadcast over the
         `_model_update_group` process group (no CUDA IPC).
         """
-        assert group_name in self._model_update_group, (
-            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
+        # v0.5.16 moved the update-group registry onto the WeightUpdater component.
+        update_groups = self.weight_updater._model_update_group
+        assert group_name in update_groups, (
+            f"Group {group_name} not in {list(update_groups.keys())}. "
             "Please call `init_weights_update_group` first."
         )
 
@@ -1320,7 +1322,7 @@ class ModelRunner:
                     torch.distributed.broadcast(
                         weight,
                         src=0,
-                        group=self._model_update_group[group_name],
+                        group=update_groups[group_name],
                         async_op=True,
                     )
                 )
