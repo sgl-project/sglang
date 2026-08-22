@@ -204,6 +204,7 @@ def apply_rotary_emb_flat_kernel(
     sfr_d,
     USE_POS: tl.constexpr,
     IS_INVERSE: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
     RD: tl.constexpr,
     RDH: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
@@ -219,16 +220,26 @@ def apply_rotary_emb_flat_kernel(
     rmask = row < n_rows
     tok = row // n_heads
     head = row % n_heads
+    # RD is ROPE_DIM rounded up to a power of two, so the columns from ROPE_DIM
+    # on are padding: clamp their addresses to stay inside x and freqs, and mask
+    # them out of the store below so they are neither rotated nor overwritten.
+    # Both are constexpr no-ops when ROPE_DIM is already a power of two.
     d = tl.arange(0, RD)
     base = tok[:, None] * sx_tok + head[:, None] * sx_head
-    xo = base + d[None, :] * sx_d
+    if ROPE_DIM == RD:
+        xo = base + d[None, :] * sx_d
+    else:
+        xo = base + tl.minimum(d, ROPE_DIM - 1)[None, :] * sx_d
     x = tl.load(x_ptr + xo, mask=rmask[:, None], other=0.0).to(tl.float32)
 
     if USE_POS:
         pos = tl.load(pos_ptr + tok, mask=rmask, other=0)
     else:
         pos = tok
-    cos_idx = (d // 2) * 2
+    if ROPE_DIM == RD:
+        cos_idx = (d // 2) * 2
+    else:
+        cos_idx = tl.minimum((d // 2) * 2, ROPE_DIM - 2)
     cos = tl.load(
         fr_ptr + pos[:, None] * sfr_pos + cos_idx[None, :] * sfr_d,
         mask=rmask[:, None],
@@ -251,7 +262,14 @@ def apply_rotary_emb_flat_kernel(
     x_rot = tl.reshape(x_neg, (BLOCK_ROWS, RD))
 
     out = x * cos + x_rot
-    tl.store(x_ptr + xo, out.to(x_ptr.dtype.element_ty), mask=rmask[:, None])
+    if ROPE_DIM == RD:
+        tl.store(x_ptr + xo, out.to(x_ptr.dtype.element_ty), mask=rmask[:, None])
+    else:
+        tl.store(
+            x_ptr + xo,
+            out.to(x_ptr.dtype.element_ty),
+            mask=rmask[:, None] & (d < ROPE_DIM)[None, :],
+        )
 
 
 # Use the batched / contiguous-load rope kernels (faster, coalesced) instead of the
@@ -311,6 +329,7 @@ def apply_rotary_emb_triton(
                 freqs_real.stride(1),
                 USE_POS=(positions is not None),
                 IS_INVERSE=inverse,
+                ROPE_DIM=rope_dim,
                 RD=RD,
                 RDH=RD // 2,
                 BLOCK_ROWS=FLAT_BLOCK_ROWS,
