@@ -1,7 +1,9 @@
 import unittest
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import torch
+import torch.nn as nn
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
@@ -13,9 +15,18 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     WanT2V480PConfig,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders import vae_loader
+from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    ComponentCheckpointUnsupportedError,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import (
     _backfill_ltx2_audio_vae_latent_stats,
+    _match_checkpoint_dtypes,
+    _require_native_loader_for_quantized_vae,
     _should_use_channels_last_3d,
+)
+from sglang.multimodal_gen.runtime.loader.utils import keep_checkpoint_mapped
+from sglang.multimodal_gen.runtime.managers.memory_managers import (
+    host_memory_budget,
 )
 from sglang.multimodal_gen.runtime.models.vaes import wanvae
 
@@ -24,9 +35,198 @@ class _FakeServerArgs:
     def __init__(self, pipeline_config, num_gpus=1):
         self.pipeline_config = pipeline_config
         self.num_gpus = num_gpus
+        self.model_paths = {}
+        self.revision = "test-revision"
+        self.trust_remote_code = True
+        self.layerwise_components = set()
+
+    def resolve_component_attention_backend(self, _component_name):
+        return None, None
+
+    def should_start_component_on_cpu(self, _component_name):
+        return False
+
+    def should_configure_layerwise_offload_for_lazy_component(self, component_name):
+        return component_name in self.layerwise_components
+
+
+class TestKeepCheckpointMapped(unittest.TestCase):
+    """The mapping is for hosts that cannot afford the whole deployment."""
+
+    def test_a_small_deployment_on_a_roomy_host_copies(self):
+        with unittest.mock.patch.object(
+            host_memory_budget, "host_memory_available_bytes", lambda: 64 * 1024**3
+        ):
+            self.assertFalse(
+                keep_checkpoint_mapped(weight_bytes=3 * 1024**3, component="vae (VAE)"),
+                "copies are the faster choice when the host has room: their "
+                "pages are resident where a mapping's first use pays a fault",
+            )
+
+    def test_a_deployment_larger_than_the_host_stays_mapped(self):
+        with unittest.mock.patch.object(
+            host_memory_budget, "host_memory_available_bytes", lambda: 19 * 1024**3
+        ):
+            self.assertTrue(
+                keep_checkpoint_mapped(
+                    weight_bytes=117 * 1024**3, component="vae (VAE)"
+                )
+            )
+
+
+class TestMatchCheckpointDtypes(unittest.TestCase):
+    """Assignment replaces a parameter, so only matching dtypes may stay mapped."""
+
+    def test_a_matching_tensor_is_left_alone(self):
+        loaded = {"w": torch.zeros(4, dtype=torch.float32)}
+        before = loaded["w"]
+        _match_checkpoint_dtypes(loaded, {"w": torch.zeros(4, dtype=torch.float32)})
+        self.assertIs(loaded["w"], before)
+
+    def test_a_mismatched_tensor_is_converted(self):
+        loaded = {"w": torch.zeros(4, dtype=torch.float32)}
+        _match_checkpoint_dtypes(loaded, {"w": torch.zeros(4, dtype=torch.bfloat16)})
+        self.assertEqual(loaded["w"].dtype, torch.bfloat16)
+
+    def test_a_tensor_the_module_does_not_want_is_left_alone(self):
+        loaded = {"extra": torch.zeros(4, dtype=torch.float32)}
+        before = loaded["extra"]
+        _match_checkpoint_dtypes(loaded, {})
+        self.assertIs(loaded["extra"], before)
 
 
 class TestVAELoader(unittest.TestCase):
+    def test_mps_layerwise_load_uses_residency_api(self):
+        loader = vae_loader.VAELoader()
+        server_args = _FakeServerArgs(QwenImagePipelineConfig())
+        server_args.layerwise_components.add("vae")
+
+        with patch.object(vae_loader.current_platform, "is_mps", return_value=True):
+            self.assertEqual(
+                loader.customized_load_kwargs_for_component(server_args, "vae"),
+                {"cpu_offload_flag": True},
+            )
+            self.assertEqual(
+                loader.customized_load_kwargs_for_component(server_args, "audio_vae"),
+                {},
+            )
+
+    def test_quantized_vae_admission_leaves_plain_configs_unchanged(self):
+        _require_native_loader_for_quantized_vae(
+            {"_class_name": "AutoencoderKL"}, "vae"
+        )
+
+        with self.assertRaisesRegex(
+            ComponentCheckpointUnsupportedError, "compression_config"
+        ):
+            _require_native_loader_for_quantized_vae(
+                {
+                    "_class_name": "AutoencoderKL",
+                    "compression_config": {"quant_method": "compressed-tensors"},
+                },
+                "vae",
+            )
+
+        with self.assertRaisesRegex(
+            ComponentCheckpointUnsupportedError,
+            r"text_config\.quantization_config",
+        ):
+            _require_native_loader_for_quantized_vae(
+                {
+                    "_class_name": "AutoencoderKL",
+                    "text_config": {
+                        "quantization_config": {
+                            "quant_method": "bitsandbytes",
+                            "load_in_4bit": True,
+                        }
+                    },
+                },
+                "vae",
+            )
+
+    def test_quantized_vae_routes_to_diffusers_native_loader(self):
+        loader = vae_loader.VAELoader()
+        server_args = _FakeServerArgs(QwenImagePipelineConfig())
+        native_vae = nn.Linear(1, 1)
+
+        with (
+            TemporaryDirectory() as component_path,
+            patch.object(
+                vae_loader,
+                "get_diffusers_component_config",
+                return_value={
+                    "_class_name": "AutoencoderKL",
+                    "quantization_config": {
+                        "quant_method": "bitsandbytes",
+                        "load_in_4bit": True,
+                    },
+                },
+            ),
+            patch(
+                "diffusers.AutoModel.from_pretrained",
+                return_value=native_vae,
+            ) as native_load,
+            patch.object(loader, "target_device", return_value=torch.device("cpu")),
+            patch.object(native_vae, "to", wraps=native_vae.to) as module_to,
+            patch.object(
+                vae_loader.current_platform,
+                "get_available_gpu_memory",
+                side_effect=[10.0, 9.0],
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "component_loader.get_memory_usage_of_component",
+                return_value=1.0,
+            ),
+        ):
+            loaded, consumed = loader.load(
+                component_path, server_args, "vae", "diffusers"
+            )
+
+        self.assertIs(loaded, native_vae)
+        self.assertFalse(loaded.training)
+        self.assertEqual(consumed, 1.0)
+        self.assertEqual(server_args.model_paths["vae"], component_path)
+        native_load.assert_called_once_with(
+            component_path,
+            revision="test-revision",
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+        )
+        module_to.assert_called_once_with(torch.device("cpu"))
+
+    def test_native_only_quantized_vae_fails_closed(self):
+        pipeline_config = QwenImagePipelineConfig()
+        pipeline_config.native_only_components = ("vae",)
+        server_args = _FakeServerArgs(pipeline_config)
+        loader = vae_loader.VAELoader()
+
+        with (
+            patch.object(
+                vae_loader,
+                "get_diffusers_component_config",
+                return_value={
+                    "_class_name": "AutoencoderKL",
+                    "quantization_config": {
+                        "quant_method": "bitsandbytes",
+                        "load_in_4bit": True,
+                    },
+                },
+            ),
+            patch("diffusers.AutoModel.from_pretrained") as native_load,
+            patch.object(
+                vae_loader.current_platform,
+                "get_available_gpu_memory",
+                return_value=10.0,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ComponentCheckpointUnsupportedError, "native-only SGLang"
+            ):
+                loader.load("/quantized/vae", server_args, "vae", "diffusers")
+
+        native_load.assert_not_called()
+
     def test_backfill_ltx2_audio_vae_latent_stats_maps_official_keys(self):
         loaded = {
             "per_channel_statistics.mean-of-means": torch.tensor([1.0, 2.0]),

@@ -101,6 +101,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 
 
@@ -996,9 +997,15 @@ class TestIdeogram4(unittest.TestCase):
                     sp_split_auto=False,
                 )
             )
-            with patch(
-                "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
-                return_value=1,
+            with (
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant.current_platform.get_device_capability",
+                    return_value=DeviceCapability(10, 0),
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
+                    return_value=1,
+                ),
             ):
                 with torch.device("meta"):
                     model = Ideogram4Transformer2DModel(
@@ -1058,6 +1065,10 @@ class TestIdeogram4(unittest.TestCase):
                 )
             )
             with (
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant.current_platform.get_device_capability",
+                    return_value=DeviceCapability(10, 0),
+                ),
                 patch(
                     "sglang.multimodal_gen.runtime.models.dits.ideogram.model_parallel_is_initialized",
                     return_value=True,
