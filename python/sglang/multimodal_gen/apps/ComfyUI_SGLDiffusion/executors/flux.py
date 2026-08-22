@@ -18,7 +18,9 @@ class FluxAdapter(ComfyUIModelAdapter):
     model_types = ("flux",)
     pipeline_class_name = "FluxPipeline"
 
-    def pack(self, x, timestep, context, y=None, guidance=None, **kwargs) -> PackedForward:
+    def pack(
+        self, x, timestep, context, y=None, guidance=None, **kwargs
+    ) -> PackedForward:
         packed = self._pack_latents(x)
         t5_seq = int(context.shape[-2]) if context.ndim >= 2 else int(context.shape[0])
         clip_batch = int(y.shape[0]) if y is not None else 1
@@ -31,7 +33,11 @@ class FluxAdapter(ComfyUIModelAdapter):
             height=x.shape[-2] * 8,
             width=x.shape[-1] * 8,
             guidance_scale=_flux_guidance_scale(guidance),
-            unpack_ctx={"height": x.shape[-2], "width": x.shape[-1], "channels": x.shape[1]},
+            unpack_ctx={
+                "height": x.shape[-2],
+                "width": x.shape[-1],
+                "channels": x.shape[1],
+            },
         )
 
     def unpack(self, noise_pred, packed, x):

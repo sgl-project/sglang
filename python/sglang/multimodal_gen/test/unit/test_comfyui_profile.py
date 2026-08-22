@@ -15,6 +15,7 @@ import torch
 from safetensors.torch import save_file
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
+from sglang.multimodal_gen.registry import get_pipeline_class
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
@@ -22,7 +23,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (
     get_comfyui_checkpoint_spec,
 )
-from sglang.multimodal_gen.registry import get_pipeline_class
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.server_args.server_args import set_global_server_args
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
@@ -67,8 +67,13 @@ def _write_comfyui_flux_checkpoint(path: str, config: FluxConfig) -> dict:
             put(f"double_blocks.{b}.{attn}.qkv.bias", qkv)
             put(f"double_blocks.{b}.{attn}.proj.weight", hidden, hidden)
             put(f"double_blocks.{b}.{attn}.proj.bias", hidden)
-            put(f"double_blocks.{b}.{attn}.norm.query_norm.scale", arch.attention_head_dim)
-            put(f"double_blocks.{b}.{attn}.norm.key_norm.scale", arch.attention_head_dim)
+            put(
+                f"double_blocks.{b}.{attn}.norm.query_norm.scale",
+                arch.attention_head_dim,
+            )
+            put(
+                f"double_blocks.{b}.{attn}.norm.key_norm.scale", arch.attention_head_dim
+            )
         for mlp in ("img_mlp", "txt_mlp"):
             put(f"double_blocks.{b}.{mlp}.0.weight", mlp_hidden, hidden)
             put(f"double_blocks.{b}.{mlp}.0.bias", mlp_hidden)

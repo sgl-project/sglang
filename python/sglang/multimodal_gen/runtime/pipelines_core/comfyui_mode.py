@@ -55,14 +55,16 @@ def is_comfyui_mode(server_args: ServerArgs) -> bool:
 
 
 def initialize_comfyui_pipeline(
-    pipeline: "ComposedPipelineBase", server_args: ServerArgs
+    pipeline: ComposedPipelineBase, server_args: ServerArgs
 ) -> None:
     """Install the pass-through scheduler and finish deriving VAE geometry.
 
     The VAE model itself is never loaded, but its config still carries the
     compression ratios that RoPE frequency construction reads.
     """
-    pipeline.modules["scheduler"] = ComfyUIPassThroughScheduler(num_train_timesteps=1000)
+    pipeline.modules["scheduler"] = ComfyUIPassThroughScheduler(
+        num_train_timesteps=1000
+    )
 
     vae_config = getattr(server_args.pipeline_config, "vae_config", None)
     if (
@@ -74,7 +76,7 @@ def initialize_comfyui_pipeline(
 
 
 def create_comfyui_pipeline_stages(
-    pipeline: "ComposedPipelineBase", server_args: ServerArgs
+    pipeline: ComposedPipelineBase, server_args: ServerArgs
 ) -> None:
     from sglang.multimodal_gen.runtime.pipelines_core.stages import (
         ComfyUILatentPreparationStage,

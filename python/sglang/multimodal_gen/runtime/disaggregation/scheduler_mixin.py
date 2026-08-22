@@ -51,13 +51,13 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     is_transfer_message,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import expand_request_outputs
-from sglang.multimodal_gen.runtime.pipelines_core import Req
-from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
-    clone_scheduler_runtime,
-)
 from sglang.multimodal_gen.runtime.ipc_cuda import (
     attach_cuda_tensors,
     detach_cuda_tensors,
+)
+from sglang.multimodal_gen.runtime.pipelines_core import Req
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    clone_scheduler_runtime,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket

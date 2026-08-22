@@ -5,6 +5,11 @@
 module registers one DiT family. Importing this package registers every spec.
 """
 
+from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (  # noqa: F401
+    flux,
+    qwen_image,
+    zimage,
+)
 from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints.spec import (
     ComfyUICheckpointSpec,
     ParamNamesMapping,
@@ -14,11 +19,6 @@ from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints.spec import (
     is_comfyui_single_file,
     load_comfyui_transformer,
     register_comfyui_checkpoint,
-)
-from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (  # noqa: F401
-    flux,
-    qwen_image,
-    zimage,
 )
 
 __all__ = [

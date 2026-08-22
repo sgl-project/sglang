@@ -49,7 +49,7 @@ class ComfyUICheckpointSpec:
     """Per-model knowledge needed to load a ComfyUI checkpoint."""
 
     dit_cls_name: str
-    build_dit_config: Callable[["ServerArgs"], Any]
+    build_dit_config: Callable[[ServerArgs], Any]
     param_names_mapping: ParamNamesMapping = field(default_factory=dict)
     # Reshapes tensors that param_names_mapping cannot express. Receives the raw
     # safetensors iterator plus the built dit config, yields SGLang-shaped pairs.
@@ -104,7 +104,7 @@ def is_comfyui_single_file(model_path: str) -> bool:
 
 
 def load_comfyui_transformer(
-    pipeline: "ComposedPipelineBase",
+    pipeline: ComposedPipelineBase,
     server_args: ServerArgs,
     loaded_modules: dict[str, torch.nn.Module] | None = None,
 ) -> dict[str, Any]:

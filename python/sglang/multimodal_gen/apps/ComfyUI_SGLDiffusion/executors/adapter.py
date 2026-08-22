@@ -14,7 +14,7 @@ from typing import Any
 
 import torch
 
-_ADAPTERS: dict[str, type["ComfyUIModelAdapter"]] = {}
+_ADAPTERS: dict[str, type[ComfyUIModelAdapter]] = {}
 
 
 @dataclass
@@ -44,10 +44,14 @@ class ComfyUIModelAdapter:
         for model_type in cls.model_types:
             _ADAPTERS[model_type] = cls
 
-    def pack(self, x: torch.Tensor, timestep: torch.Tensor, context, **kwargs) -> PackedForward:
+    def pack(
+        self, x: torch.Tensor, timestep: torch.Tensor, context, **kwargs
+    ) -> PackedForward:
         raise NotImplementedError
 
-    def unpack(self, noise_pred: torch.Tensor, packed: PackedForward, x: torch.Tensor) -> torch.Tensor:
+    def unpack(
+        self, noise_pred: torch.Tensor, packed: PackedForward, x: torch.Tensor
+    ) -> torch.Tensor:
         return noise_pred.to(x.device)
 
     def fill_req(self, req, packed: PackedForward) -> None:

@@ -14,7 +14,9 @@ from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints.spec import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
-def _dit_config_builder(zero_cond_t: bool) -> Callable[[ServerArgs], QwenImageDitConfig]:
+def _dit_config_builder(
+    zero_cond_t: bool,
+) -> Callable[[ServerArgs], QwenImageDitConfig]:
     def build(server_args: ServerArgs) -> QwenImageDitConfig:
         # ComfyUI checkpoints carry no config, so the architecture is pinned here.
         dit_config = QwenImageDitConfig(

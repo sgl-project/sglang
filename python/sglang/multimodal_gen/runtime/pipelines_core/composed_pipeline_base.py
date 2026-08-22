@@ -18,6 +18,10 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
     filter_modules_for_role,
 )
+from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (
+    is_comfyui_single_file,
+    load_comfyui_transformer,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
 )
@@ -29,10 +33,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentResidencyManager,
     ComponentResidencyStrategy,
     get_global_component_residency_manager,
-)
-from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (
-    is_comfyui_single_file,
-    load_comfyui_transformer,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.comfyui_mode import (
     COMFYUI_REQUIRED_MODULES,

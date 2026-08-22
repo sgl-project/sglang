@@ -1,7 +1,5 @@
 """Z-Image (lumina2) adapter for the ComfyUI DiT-forward contract."""
 
-import torch
-
 from .adapter import ComfyUIModelAdapter, PackedForward
 from .base import SGLDiffusionExecutor
 
