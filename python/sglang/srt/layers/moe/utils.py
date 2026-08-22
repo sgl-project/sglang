@@ -12,7 +12,13 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
-from sglang.srt.runtime_context import get_exec, get_flags, get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_flags,
+    get_forward,
+    get_model,
+    get_parallel,
+)
 from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
@@ -38,6 +44,7 @@ class MoeA2ABackend(Enum):
     FLASHINFER = "flashinfer"
     MEGAMOE = "megamoe"
     PPLX = "pplx"
+    FLASHINFER_MEGAMOE = "flashinfer_megamoe"
     CUSTOMIZED = "customized"
 
     @classmethod
@@ -79,6 +86,9 @@ class MoeA2ABackend(Enum):
     def is_pplx(self):
         return self == MoeA2ABackend.PPLX
 
+    def is_flashinfer_megamoe(self):
+        return self == MoeA2ABackend.FLASHINFER_MEGAMOE
+
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
 
@@ -105,6 +115,7 @@ class MoeRunnerBackend(Enum):
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
+    FLASHINFER_MEGAMOE = "flashinfer_megamoe"
     CUTLASS = "cutlass"
     MARLIN = "marlin"
     HUMMING = "humming"
@@ -149,6 +160,9 @@ class MoeRunnerBackend(Enum):
 
     def is_flashinfer_cutedsl(self):
         return self == MoeRunnerBackend.FLASHINFER_CUTEDSL
+
+    def is_flashinfer_megamoe(self):
+        return self == MoeRunnerBackend.FLASHINFER_MEGAMOE
 
     def is_flashinfer_mxfp4(self):
         return self == MoeRunnerBackend.FLASHINFER_MXFP4
@@ -222,6 +236,40 @@ class DispatcherOutputDtype(Enum):
     INT8 = "int8"
     NVFP4 = "nvfp4"
     MXFP8 = "mxfp8"
+
+
+class FlashinferA2ADispatchType(Enum):
+    BF16 = "bf16"
+    NVFP4 = "nvfp4"
+    MXFP8 = "mxfp8"
+
+
+def get_flashinfer_a2a_dispatch_type() -> FlashinferA2ADispatchType:
+    dispatch_type = get_exec().moe.flashinfer_a2a_dispatch_type
+
+    if dispatch_type is None:
+        if envs.SGLANG_MOE_NVFP4_DISPATCH.is_set():
+            return (
+                FlashinferA2ADispatchType.NVFP4
+                if envs.SGLANG_MOE_NVFP4_DISPATCH.get()
+                else FlashinferA2ADispatchType.BF16
+            )
+        return FlashinferA2ADispatchType.BF16
+
+    if dispatch_type != "auto":
+        return FlashinferA2ADispatchType(dispatch_type)
+
+    assert not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set()
+
+    quantization = get_model().quantization
+    if quantization == "mxfp8":
+        dispatch_type = "mxfp8"
+    elif quantization == "modelopt_fp4":
+        dispatch_type = "nvfp4"
+    else:
+        dispatch_type = "bf16"
+
+    return FlashinferA2ADispatchType(dispatch_type)
 
 
 def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
@@ -618,6 +666,11 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
     if get_moe_a2a_backend().is_pplx():
         # pplx's AllToAll.combine already sums each token's expert outputs back
         # to the source rank
+        return True
+    if get_moe_a2a_backend().is_flashinfer_megamoe():
+        # The mega kernel does its EP all-to-all + combine internally and
+        # returns per-rank outputs, so any further EP/TP all-reduce would
+        # double-count. Same opt-in as the flashinfer a2a dispatcher.
         return True
     return False
 
