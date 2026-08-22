@@ -1,0 +1,354 @@
+---
+title: "Request Quality"
+description: "Select the request-scoped quality level for SGLang Diffusion sampling."
+tag: "approx"
+---
+
+`quality` is a request-level sampling parameter with exactly two levels. `lossless` is the default and runs the model's reference path. `high` opts into whatever accelerated path that model owns — and what that path is, and how far it moves the output, is decided per model, not by this parameter.
+
+## Overview
+
+| Level | CLI | Meaning |
+|-------|-----|---------|
+| `lossless` | `--quality lossless` | Default. The quality-gated fast paths stay unmounted and the model runs its reference numerics. This is the level the CI consistency suite exercises. |
+| `high` | `--quality high` | Opt into the model-owned accelerated path. Not bit-exact. On many models it does nothing to the transformer, but it may still switch the VAE decoder path; on MiniMax-H3 it is a measured approximation. |
+
+There is no third level. `medium`, `low`, `standard`, and `hd` are rejected. The field is validated when the request is constructed, before any pipeline stage runs:
+
+```text
+quality must be one of ['lossless', 'high'], got 'hd'
+```
+
+`quality` is resolved per request, not latched at load or warmup. The denoising stage checks `batch.sampling_params.quality` at each batch boundary and mounts or unmounts the gated fusions only when the level changes; the decoding stage enables the VAE fast path for the duration of a single decode and always restores the previous state.
+
+There is no server-launch flag. `--quality` is registered by the sampling-parameter parser, which `sglang serve` does not use — so an operator cannot set a server default or a ceiling. The level is chosen by the caller, but server-side configuration can still neutralize it: MiniMax-H3's admission stage rejects `high` outright on any deployment that is not its audited one (see below), and a quantization config on the transformer makes the linear+GELU family refuse to mount.
+
+`quality` participates in the dynamic-batch signature. Requests at different levels are served correctly but can never merge into the same batch, so mixed-level traffic reduces batch merging.
+
+<Note>
+`quality` selects a model sampling level and can change generated content. `output_quality` and `output_compression` control only output-file compression — `maximum`, `high`, `medium`, and `low` map to encoder levels — and never touch the compute path. `--quality high` and `--output-quality high` are different flags that happen to share a word.
+</Note>
+
+## Where Quality Is Accepted
+
+| Entry point | Accepted values | Behavior |
+|-------------|-----------------|----------|
+| `POST /v1/images/generations`, `POST /v1/images/edits` | `lossless`, `high`, `auto` | `auto` and an omitted field both fall through to the `lossless` default. Nothing inspects the model to pick a level for you. |
+| `POST /v1/videos` | `lossless`, `high` | Read as a request extra with no normalization. `auto` is **not** normalized here and fails validation. |
+| Realtime video sessions | none | `quality` is never read. The session schema accepts unknown fields, so the value is silently dropped and every chunk runs `lossless`. |
+| `sglang generate` | `--quality {lossless,high}` | The parsed value becomes the request's level. |
+| `sglang serve --webui` | none | The WebUI has no quality control, and the `serve` parser that launches it does not register `--quality` at all. Every generation runs `lossless`. |
+
+<Note>
+The `quality` field on a video job response is a fixed OpenAI-shaped response field. It does not echo the requested level.
+</Note>
+
+OpenAI's own image vocabulary collides with this parameter in two directions: `hd` and `standard` fail with the validation error above, while `high` — a legal OpenAI value meaning "a nicer picture" — is the one string that opts an SGLang request into a non-bit-exact accelerated path.
+
+## What High Selects Per Model
+
+<Warning>
+`high` is not a single tradeoff, and it has two independent halves. On FLUX.1, Qwen-Image, and GLM-Image it mounts transformer kernel fusions that differ from the reference only at half-precision rounding level. On Ideogram 4 it instead mounts fused gate-RMSNorm chains, which compute normalization statistics in BF16 where the reference uses FP32. Separately, on any pipeline whose loaded VAE is `AutoencoderKLFlux2`, `AutoencoderKL`, or `AutoencoderKLWan` — FLUX.1, FLUX.2, Z-Image, SD3 and the Wan-VAE video pipelines among them — it additionally, or instead, switches the VAE decoder to a re-associated, re-laid-out fast path. On MiniMax-H3 it mounts Cache-DiT, which skips block computation and measurably changes the denoise trajectory. Validate at the level of the model you deploy, not at the level of the parameter.
+</Warning>
+
+### Transformer Paths
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "16%"}} />
+    <col style={{width: "34%"}} />
+    <col style={{width: "24%"}} />
+    <col style={{width: "26%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "normal", backgroundColor: "rgba(255,255,255,0.05)"}}>What <code>high</code> mounts</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Tradeoff class</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "normal", backgroundColor: "rgba(255,255,255,0.05)"}}>Measured against <code>lossless</code></th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>FLUX.1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fused linear + tanh-GELU (cublasLt GEMM epilogue); LayerNorm + modulate affine folding</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Same math, different rounding order at BF16/FP16</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No acceptance measurement in the tree</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen-Image</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fused linear + tanh-GELU</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Same math, different rounding order at BF16/FP16</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No acceptance measurement in the tree</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GLM-Image</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fused linear + tanh-GELU</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Same math, different rounding order at BF16/FP16</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No acceptance measurement in the tree</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Ideogram 4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fused gate RMSNorm chains (BF16-native Triton) only — no fused-GELU or LN+modulate sites are marked</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Approximate: norm statistics are computed in BF16 where the reference uses FP32 statistics</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No acceptance measurement in the tree</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-H3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No fusion sites at all. Mounts Cache-DiT with audited parameters instead — see below</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Approximate: block computation is skipped on cached steps, changing the denoise trajectory</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>SSIM 0.931 / PSNR 28.16 dB on the audited workload</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Every other DiT</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Nothing — no marked sites exist</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>No transformer-side effect; the VAE table below decides whether <code>high</code> still changes this model's output</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Not applicable</td>
+    </tr>
+  </tbody>
+</table>
+
+Details that change what you actually get:
+
+- **FLUX.1's LayerNorm fold is mostly inert.** The site first tries an ungated bit-exact kernel and only falls back to the `high` fold when that kernel declines. The fold also requires batch size 1, so it does nothing whenever the batch dimension exceeds one — CFG batching, multiple outputs per prompt, or two merged requests — even when mounted. In practice `high` on FLUX.1 reduces largely to the linear+GELU epilogue.
+- **Ideogram 4's fused chain steps aside inside a compiled graph.** With `--enable-torch-compile`, the transformer keeps the reference chain while the log still reports the family as mounted.
+- **Quantization and the linear+GELU family do not compose.** Any layer carrying a quantization config is refused, and mounting is all-or-nothing per fusion family, so on a quantized FLUX.1 / Qwen-Image / GLM-Image transformer that family stays on the reference path entirely.
+- **`lossless` does not mean "unfused".** Several bit-exact fused kernels (LayerNorm+modulate, RMSNorm scale/shift, modulate scale/shift) run unconditionally at both levels because they reproduce the eager chain's rounding exactly and therefore need no gate. `lossless` is a statement about numerics, not about which kernels run.
+- **`lossless` is not a master off switch.** It does not disable Cache-DiT, TeaCache, quantization, progressive resolution, approximate attention backends, or torch.compile — with one exception: on MiniMax-H3 an *explicitly sent* `quality` field, at either level, suppresses the environment-variable Cache-DiT path (see [MiniMax-H3](#minimax-h3) below). Otherwise it only keeps the quality-gated fusion families unmounted. Those levers are configured separately — see [Caching Acceleration](./caching-acceleration), [Quantization](./quantization), and [Progressive Resolution Generation](./progressive_resolution).
+
+### VAE Decoder Paths
+
+The VAE side of `quality` is keyed on the loaded VAE class, not on the transformer, so its model coverage is different from the table above: any checkpoint whose VAE resolves to one of these classes is included, and the pipeline names below are examples rather than an exhaustive list.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "22%"}} />
+    <col style={{width: "22%"}} />
+    <col style={{width: "38%"}} />
+    <col style={{width: "18%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>VAE class</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Pipelines</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "normal", backgroundColor: "rgba(255,255,255,0.02)"}}>What <code>high</code> enables during decode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Tradeoff class</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>AutoencoderKLFlux2</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>FLUX.2 (Ideogram 4 loads this VAE too, but its own decoding stage never enters the gate — see below)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>channels_last decoder dispatch, fused GroupNorm+SiLU, folded 2× upsample convolution, layout-safe attention with a folded value/output projection</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Re-associated and re-laid-out; not bit-exact</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>AutoencoderKL</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>FLUX.1, Z-Image, SD3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Same decoder rewrites as above</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Re-associated and re-laid-out; not bit-exact</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>AutoencoderKLWan</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Pipelines defaulting to the Wan VAE — Wan, Helios, Joy-Image, LingBot Video MoE, MOVA, Cosmos3 (MOVA and Cosmos3 override decoding and never enter the gate; Helios only partially)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Fused RMSNorm+SiLU on the decoder, on channels_last_3d activations</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Not bitwise identical to the reference chain</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Any other VAE</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Qwen-Image, HunyuanVideo, LTX-2, MiniMax-H3, SANA, and others</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Nothing — no gate is installed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Silent no-op</td>
+    </tr>
+  </tbody>
+</table>
+
+- Only the **decoder** is ever wrapped. Encoding (image-to-image and image-to-video conditioning) is never affected by `quality`.
+- The gate is entered only by the shared decoding stage. Any pipeline that supplies its own decoding stage bypasses it — Ideogram 4, MOVA, Cosmos3, LTX-2 / JoyEcho, MiniMax-H3, SANA-WM, and realtime or session decode among them. A few of those overrides delegate back to the shared stage on some paths and do reach the gate: Helios runs its chunked decode itself but falls back to `super().forward()` when there are no chunks or only one, and the realtime causal VAE stage falls back when a request carries no session. Confirm against the stage your pipeline actually builds rather than assuming.
+- Of the pipelines that bypass the gate, Ideogram 4, MOVA, and Cosmos3 still load a gated VAE class, so their startup log reports the fast paths as installed even though `high` can never reach them. LTX-2 and MiniMax-H3 use VAE classes that get no gate at all, so nothing is installed and nothing is logged. On any of them a startup log line is not evidence that `high` can reach the decoder.
+- Installation is skipped when spatial-parallel VAE decode is enabled, when Triton is unavailable, when any decoder **attention** block lacks a layout-safe rewrite, or (for Wan) when a residual block or the output head is non-standard — those cases log. It is also skipped with no log at all when the VAE or its decoder is not the exact expected class.
+- Any exception during installation is caught and logged as a warning with a traceback, leaving the unmodified VAE in place.
+- The Wan decoder fusion also steps aside while torch.compile is tracing, so a compiled Wan decode gets nothing from `high`.
+
+### MiniMax-H3
+
+MiniMax-H3 is the only model where `high` mounts Cache-DiT, and the only model with a recorded acceptance measurement.
+
+| `quality` | Mean inference latency | Speedup | SSIM vs `lossless` | PSNR vs `lossless` |
+| --- | ---: | ---: | ---: | ---: |
+| `lossless` | 75.10 s | 1.00× | 1.000 | exact |
+| `high` | 53.70 s | 1.40× | 0.931 | 28.16 dB |
+
+Workload: 1344×768, 124-frame, 24 fps T2VA at 50 inference steps, video flow shift 12, audio flow shift 3, three fixed prompt/seed pairs on 4×H200. Latency is averaged across the three prompts, and the quiet-scene point is itself the mean of two repeats; no run-to-run dispersion is reported, so treat 1.40× as a single-configuration point estimate. SSIM and PSNR compare decoded, frame-aligned video with the `lossless` result for the same prompt and seed — they measure trajectory deviation, not absolute perceptual quality, and they cover video only even though the level also changes the joint audio-video trajectory.
+
+`high` on MiniMax-H3 **fails closed**. An admission stage raises a `ValueError` before denoising unless both the deployment and the request shape match the audited configuration exactly:
+
+- Deployment: 4×H200 (compute capability 9.0), `--num-gpus 4`, `--sp-degree 4`, `--ulysses-degree 4`, ring degree 1, TP size 1, `--model-variant fl2va`, `--performance-mode speed`, backend `auto` or `sglang`, the default or `fa` attention backend with no per-component attention-backend overrides (`component_attention_backends` must be empty), and no quantization, torch.compile, regional compile, breakable CUDA graph, FSDP inference, or DiT layerwise offload.
+- Request: task `t2va`, 1344×768, 24 fps, 124 frames, 50 inference steps, flow shift 12.0, audio flow shift 3.0.
+
+Warmup batches skip this check, so a successful warmup does not prove a deployment is admissible.
+
+MiniMax-H3 is also the only model where `quality` arbitrates Cache-DiT mode. Sending the field explicitly — at **either** level — suppresses the process-wide `SGLANG_CACHE_DIT_ENABLED` path, so an explicit `quality: "lossless"` restores native denoising even when the environment variable is set. The suppression keys off whether the caller supplied the field, not its value. Nothing about this behavior generalizes to other models.
+
+## Behavior On Models That Do Not Support High
+
+An unsupported `high` request is a **silent no-op for the gate that refused it** — no warning, no error. A request is a whole-request no-op only when *every* gate the model owns declines: each transformer fusion family and the VAE. A model can miss every transformer gate and still take the VAE fast path — Z-Image, SD3, FLUX.2 and the Wan-VAE pipelines all do. Outside MiniMax-H3, nothing here fails the request.
+
+The independent ways a gate can decline:
+
+- The model marks no fusion sites, so every mount call returns immediately.
+- The model's VAE has no installed gate, so the decode context manager yields with no effect.
+- The model has its own decoding stage and never enters the gate.
+- A fusion family mounted successfully but its per-call guard declines every call — for example a non-CUDA or dtype-mismatched input, or the batch-size-1 requirement on the FLUX.1 LayerNorm fold.
+- A family was refused at mount time by a static guard (quantized layers, missing bias, non-half weights, unsupported hidden size, absent Triton).
+
+The only positive signal is a server info log emitted per family that actually mounted:
+
+```text
+Mounted fused linear+GELU (cublasLt epilogue) for quality=high
+```
+
+Absence of that line is the main indication that `high` did nothing. There is no capability query, no `supports_quality_high` field, and no endpoint that reports which models or sites are eligible. Some refusals do log: the static guards for the linear+GELU and gate-RMSNorm families log at info, and the VAE installer logs at info for spatial-parallel decode and at warning for missing Triton or non-rewritable attention blocks. The LayerNorm fold family logs nothing when it declines — it is mounted without a reject callback or logger.
+
+## Usage
+
+### Offline Generation
+
+```bash
+sglang generate \
+  --model-path black-forest-labs/FLUX.1-dev \
+  --prompt "A serene mountain lake at golden hour, photorealistic" \
+  --num-inference-steps 50 \
+  --seed 1234 \
+  --quality high \
+  --save-output
+```
+
+### Images API
+
+```python
+from openai import OpenAI
+
+client = OpenAI(api_key="sk-proj-1234567890", base_url="http://localhost:30010/v1")
+
+img = client.images.generate(
+    prompt="A serene mountain lake at golden hour, photorealistic",
+    size="1024x1024",
+    n=1,
+    response_format="b64_json",
+    quality="high",
+)
+```
+
+### Videos API
+
+`quality` rides on the video request as an extra field and is not normalized, so send `lossless` or `high` and nothing else. On MiniMax-H3, `high` additionally requires the exact audited request shape below — any deviation is rejected by the admission stage before denoising.
+
+```bash
+curl http://localhost:30010/v1/videos \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "MiniMaxAI/MiniMax-H3",
+    "prompt": "a fox walking through neon rain",
+    "task": "t2va",
+    "conditions": [],
+    "target": {
+      "short_edge": 768,
+      "aspect_ratio": "16:9",
+      "duration_seconds": 5.0
+    },
+    "seconds": 5,
+    "num_inference_steps": 50,
+    "flow_shift": 12.0,
+    "audio_flow_shift": 3.0,
+    "quality": "high"
+  }'
+```
+
+### Python API
+
+```python
+from sglang.multimodal_gen import DiffGenerator
+
+gen = DiffGenerator.from_pretrained(
+    model_path="black-forest-labs/FLUX.1-dev",
+    dit_cpu_offload=False,
+)
+result = gen.generate(sampling_params_kwargs={
+    "prompt": "A serene mountain lake at golden hour, photorealistic",
+    "num_inference_steps": 50,
+    "seed": 1234,
+    "quality": "high",
+})
+```
+
+## Verifying Drift Yourself
+
+Only MiniMax-H3 ships a measured acceptance figure. For every other model, measure `high` on your own workload before relying on it. Change one variable — the level — and hold the seed, prompt, step count, resolution, and server flags fixed.
+
+```bash
+# A: reference path
+sglang generate \
+  --model-path <MODEL_PATH_OR_ID> \
+  --prompt "A serene mountain lake at golden hour, photorealistic" \
+  --num-inference-steps 50 \
+  --seed 1234 \
+  --quality lossless \
+  --output-path ./quality_ab \
+  --output-file-name lossless \
+  --save-output
+
+# B: accelerated path — identical except for --quality
+sglang generate \
+  --model-path <MODEL_PATH_OR_ID> \
+  --prompt "A serene mountain lake at golden hour, photorealistic" \
+  --num-inference-steps 50 \
+  --seed 1234 \
+  --quality high \
+  --output-path ./quality_ab \
+  --output-file-name high \
+  --save-output
+```
+
+Compare the two outputs:
+
+```python
+import numpy as np
+from PIL import Image
+from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+
+a = np.asarray(Image.open("./quality_ab/lossless.png").convert("RGB"))
+b = np.asarray(Image.open("./quality_ab/high.png").convert("RGB"))
+
+psnr = peak_signal_noise_ratio(a, b, data_range=255)
+ssim = structural_similarity(a, b, channel_axis=2, data_range=255)
+```
+
+How to read the result:
+
+- **Byte-identical output means `high` did nothing.** Check the server or generator log for a `Mounted ... for quality=high` line before concluding the model is unaffected. No line means no transformer family mounted — and remember the VAE gate logs its install at load, not per request.
+- **Expect small differences where the path is a fusion, but do not assume they stay small.** Rounding-order changes usually move individual pixels, but they enter an iterative sampler and can compound across steps. Treat a composition change as a signal to measure more prompts, not as proof that an algorithmic approximation is involved.
+- **A different-but-plausible image means the trajectory moved** — from an approximation, or from rounding that compounded. Treat it the way the MiniMax-H3 numbers are framed: SSIM and PSNR describe deviation from the same-seed reference, not absolute quality.
+- **Run several prompts.** A single prompt is not enough to characterize drift; the MiniMax-H3 figures average a quiet scene, fast multi-subject action, and a moving close-up portrait.
+- **For video, compare frame-aligned output**, and review motion and temporal consistency rather than a single frame. If the model has an audio branch, review the audio too — image metrics will not see it.
+- **Benchmark latency separately from drift**, on a warmed-up server, and note that the first `high` request after a `lossless` one pays the mount cost.
+
+## Limitations
+
+- **No server-side default, override, or ceiling.** `quality` is caller-controlled. A deployment cannot pin it or cap it — except on MiniMax-H3, whose admission stage rejects requests that do not match its audited configuration. Server-side configuration can still neutralize `high` indirectly: quantization refuses the transformer linear+GELU family outright.
+- **Silent no-op is the default failure mode.** On every model except MiniMax-H3, a gate that cannot serve `high` declines without a warning or an error. There is no capability API to check in advance.
+- **Only MiniMax-H3 has a measured acceptance number.** No end-to-end test in the tree sets `quality="high"`; the consistency suite runs `lossless` only, and the kernel-level tests use loose tolerances rather than acceptance thresholds. Treat `high` on any other model as unmeasured until you validate it yourself.
+- **`lossless` is not pinned end-to-end either.** It keeps the gated fast paths unmounted, and the CI consistency suite compares it against CLIP/SSIM/PSNR thresholds rather than exact equality. Read it as "the reference numerics", not as a verified bit-exactness guarantee. The [MiniMax-H3 Cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3) describes `lossless` as bit-exact; that claim is scoped to that model's audited workload and CI ground truth, not to every model.
+- **Quantization disables the transformer linear+GELU family.** The two levers do not compose on quantized transformers.
+- **torch.compile removes some `high` wins.** Ideogram 4's fused RMSNorm chains and the Wan VAE fusion both step aside while compiling. The combination of a compiled decoder with the FLUX.2 and `AutoencoderKL` fast paths is not exercised in-tree; benchmark and compare before relying on it.
+- **Mixed levels reduce dynamic batching.** `quality` is part of the batch compatibility signature, so `lossless` and `high` requests never merge.
+- **Realtime sessions and the WebUI ignore the parameter.** Realtime accepts and silently drops it; the WebUI exposes no quality control, and the `serve` parser that launches it does not accept `--quality`. Both always run `lossless`.
+
+## References
+
+- [OpenAI-Compatible API](./api/openai_api)
+- [CLI Reference](./api/cli)
+- [Performance Optimization](./performance-optimization)
+- [Caching Acceleration](./caching-acceleration)
+- [Quantization](./quantization)
+- [MiniMax-H3 Cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3)

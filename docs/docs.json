@@ -1613,6 +1613,7 @@
                   "docs/sglang-diffusion/ring_sp_performance",
                   "docs/sglang-diffusion/encoder_parallel",
                   "docs/sglang-diffusion/dynamic_batching",
+                  "docs/sglang-diffusion/request_quality",
                   {
                     "group": "Caching Acceleration",
                     "root": "docs/sglang-diffusion/caching-acceleration",
