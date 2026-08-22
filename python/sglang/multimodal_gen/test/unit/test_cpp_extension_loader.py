@@ -3,7 +3,7 @@
 from pathlib import Path
 from unittest.mock import patch
 
-from sglang.kernels.ops.diffusion.ext.loader import load_extension_with_recovery
+from sglang.kernels.ops.diffusion import load_extension_with_recovery
 
 
 def test_stale_torch_lock_is_removed_before_loading(tmp_path: Path):
