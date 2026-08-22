@@ -21,11 +21,23 @@ def _http_post_and_await_recv_msg(
     timeout_s: float = RECV_MSG_ARRIVAL_TIMEOUT_S,
 ) -> None:
     _submit_post(ctx, path=path, json=json)
-    ctx._tokenizer_recv_proxy.wait_until_arrived(
-        predicate,
-        timeout_s=timeout_s,
-        description=description,
-    )
+    try:
+        ctx._tokenizer_recv_proxy.wait_until_arrived(
+            predicate,
+            timeout_s=timeout_s,
+            description=description,
+        )
+    except TimeoutError:
+        # The POST is fire-and-forget, so a rejected request (e.g. duplicate rid)
+        # would otherwise present as "nothing arrived on the socket" — pointing at
+        # the transport instead of the server's actual complaint.
+        failures = ctx._http_poster.take_failures()
+        if failures:
+            raise AssertionError(
+                f"POST {path} was rejected by the server, so no {description} "
+                f"could arrive: " + "; ".join(failures)
+            ) from None
+        raise
 
 
 def _http_post_fire_and_forget(

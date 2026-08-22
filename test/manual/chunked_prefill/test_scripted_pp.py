@@ -29,9 +29,16 @@ def _expected_chunks(prompt_len: int, chunk_size: int) -> int:
 
 
 def _drain_until_released(t, *handles):
+    # Include lock_refs in the exit condition (matching test_scripted_abort.py /
+    # test_scripted_regression.py / test_scripted_lifecycle.py): the radix
+    # lock_ref is dropped one iteration after the KV pages are, so waiting only
+    # on kv_pages returns while lock_refs is still 1 and the caller's
+    # `assert lock_refs == 0` then fails spuriously.
     for _ in range(16):
         if all(
-            h.kv_pages == 0 and (h.req is None or h.req.req_pool_idx is None)
+            h.kv_pages == 0
+            and h.lock_refs == 0
+            and (h.req is None or h.req.req_pool_idx is None)
             for h in handles
         ):
             return

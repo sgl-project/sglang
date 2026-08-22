@@ -40,11 +40,16 @@ class TestRegressionBasic(ScriptedTestCase):
         t.abort(r)
         yield from _drain_until_released(t, r)
 
+        # A fully-released req is dropped from the scheduler, so `r.req` is None;
+        # that is strictly stronger than "row released" and must satisfy the same
+        # assertions. Matches the `req is None or ...` idiom used by
+        # test_scripted_abort.py / test_scripted_lifecycle.py.
+        req = r.req
         assert r.kv_pages == 0
-        assert r.req.req_pool_idx is None
+        assert req is None or req.req_pool_idx is None
         assert r.lock_refs == 0
         assert not r.is_chunking
-        assert r.req.inflight_middle_chunks == 0
+        assert req is None or req.inflight_middle_chunks == 0
 
     def test_pause_covers_waiting_chunked(self):
         self.server.execute_script(self._script_pause_covers_waiting_chunked)
@@ -247,9 +252,14 @@ class TestRegressionBasic(ScriptedTestCase):
         t.abort(r)
         yield from _drain_until_released(t, r)
 
+        # `r.req is None` means the req was fully released and dropped from the
+        # scheduler — strictly stronger than "row released", so it satisfies the
+        # 96d4749094 guard. The engine-wide lock_ref check below is what actually
+        # proves nothing leaked, and it holds either way.
+        req = r.req
         assert (
-            r.req.req_pool_idx is None
-        ), f"96d4749094: abort must release row; got row_idx={r.req.req_pool_idx!r}"
+            req is None or req.req_pool_idx is None
+        ), f"96d4749094: abort must release row; got row_idx={req.req_pool_idx!r}"
         assert (
             r.kv_pages == 0
         ), f"96d4749094: abort must release KV; got kv_pages={r.kv_pages}"
@@ -257,7 +267,7 @@ class TestRegressionBasic(ScriptedTestCase):
             r.lock_refs == 0
         ), f"96d4749094: abort must release lock_ref; got lock_refs={r.lock_refs}"
         assert not r.is_chunking
-        assert r.req.inflight_middle_chunks == 0
+        assert req is None or req.inflight_middle_chunks == 0
         assert sum(t.get_all_node_lock_refs().values()) == baseline_refs
 
     def test_pause_retract_releases_waiting_chunked_resume(self):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import multiprocessing as mp
 import os
 import tempfile
@@ -14,6 +15,7 @@ from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import get_device
 from sglang.srt.utils.network import get_free_port, get_zmq_socket_on_host
 from sglang.test.scripted_runtime.io_struct import (
     HookReady,
@@ -31,6 +33,11 @@ LISTENER_ACCEPT_TIMEOUT_S: float = 300.0
 HTTP_READY_TIMEOUT_S: float = 300.0
 HTTP_READY_POLL_INTERVAL_S: float = 0.5
 SERVER_HOST: str = "127.0.0.1"
+
+# Devices whose kv-canary path is implemented — see _canary_launch_kwargs.
+_CANARY_SUPPORTED_DEVICES: frozenset[str] = frozenset({"cuda"})
+
+logger = logging.getLogger(__name__)
 
 
 class ScriptedHttpServer:
@@ -218,6 +225,39 @@ def _create_oob_error_file() -> Path:
     return Path(err_path)
 
 
+def _canary_launch_kwargs(device: str) -> Dict[str, Any]:
+    """kv-canary knobs for ``device``.
+
+    The canary is CUDA-only: its plan/verify/write kernels are JIT-compiled from
+    ``.cuh`` sources against the arch reported by ``torch.cuda``, and the runner
+    stages its device-to-host copies on a ``torch.cuda.Stream``. On a non-CUDA
+    device ``install_canary`` raises during ``ModelRunner.alloc_memory_pool``,
+    killing the server before it can complete the dispatch-loop handshake — the
+    test side then waits out the full ``LISTENER_ACCEPT_TIMEOUT_S``.
+
+    So leave the canary on wherever it works, and turn it off elsewhere rather
+    than losing the whole suite to a startup crash.
+    """
+    if device in _CANARY_SUPPORTED_DEVICES:
+        return dict(
+            kv_canary="raise",
+            kv_canary_real_data="partial",
+            kv_canary_sweep_interval=100,
+        )
+
+    logger.warning(
+        "scripted_runtime: device=%r does not support kv-canary (CUDA-only); "
+        "running without KV-cache corruption checking. Chunked-prefill "
+        "scheduling behavior is still fully exercised.",
+        device,
+    )
+    return dict(
+        kv_canary="none",
+        kv_canary_real_data="none",
+        kv_canary_sweep_interval=0,
+    )
+
+
 def _spawn_server_process(
     *,
     endpoint: str,
@@ -225,13 +265,14 @@ def _spawn_server_process(
     engine_kwargs: Dict[str, Any],
 ) -> Tuple[mp.process.BaseProcess, int]:
     mp_ctx = mp.get_context("spawn")
+    # ServerArgs resolves an unset --device via get_device(); mirror that here so
+    # an explicit device= and an auto-detected one pick the same canary knobs.
+    device = engine_kwargs.get("device") or get_device()
     launch_kwargs: Dict[str, Any] = dict(
         host=SERVER_HOST,
         port=get_free_port(),
-        kv_canary="raise",
-        kv_canary_real_data="partial",
-        kv_canary_sweep_interval=100,
         disable_prefill_cuda_graph=True,
+        **_canary_launch_kwargs(device.split(":")[0]),
     )
     launch_kwargs.update(engine_kwargs)
     http_port = launch_kwargs["port"]

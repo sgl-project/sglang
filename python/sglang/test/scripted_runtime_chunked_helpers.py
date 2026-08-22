@@ -40,6 +40,25 @@ def run_until_finished(handle, *, max_steps: int = DEFAULT_MAX_STEPS):
     yield from run_until(handle, lambda h: h.finished, max_steps=max_steps)
 
 
+# A finished req is dropped by the scheduler before the TokenizerManager clears
+# its rid from `rid_to_state` (that happens when the output stream drains). Within
+# that window the rid is finished scheduler-side but still registered
+# tokenizer-side, so resubmitting it is rejected as a duplicate. Measured on XPU:
+# a 5-step gap still races, 20 is comfortably clear.
+RID_RELEASE_SETTLE_STEPS: int = 40
+
+
+def run_until_finished_and_rid_released(
+    handle, *, max_steps: int = DEFAULT_MAX_STEPS
+):
+    """Like ``run_until_finished``, plus the settle time needed before the rid
+    can be reused. Use this instead of ``run_until_finished`` whenever a script
+    resubmits the same rid."""
+    yield from run_until_finished(handle, max_steps=max_steps)
+    for _ in range(RID_RELEASE_SETTLE_STEPS):
+        yield
+
+
 def run_until_all_finished(handles: List[Any], *, max_steps: int = DEFAULT_MAX_STEPS):
     done = [False] * len(handles)
     for _ in range(max_steps):
