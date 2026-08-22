@@ -346,6 +346,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
         self.pp_group = get_pp_group()
         self.determine_num_fused_shared_experts()
+        self.init_unified_loader_mappings()
         self.use_dsa = is_deepseek_dsa(config)
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.mla_enable_prefill_cp = is_mla_prefill_cp_enabled() and not self.use_dsa
