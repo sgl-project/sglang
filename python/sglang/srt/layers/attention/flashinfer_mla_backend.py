@@ -437,6 +437,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 # wrapper rejects the absorbed-MLA head dims (qk=576, vo=512).
                 and not is_in_tc_piecewise_cuda_graph()
                 and not is_in_breakable_cuda_graph()
+                # DP-attention padding appends rows beyond the real extend
+                # tokens; the ragged wrapper's qo_indptr is built from
+                # per-request extend lengths, so a padded rank must use the
+                # paged prefill path instead.
+                and not forward_batch.has_dp_padding_rows()
             )
 
             # build host indptr/len arrays for eager DRAFT_EXTEND_V2 fast plan path
