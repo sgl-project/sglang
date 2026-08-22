@@ -51,6 +51,32 @@ class TestModelConfigShapes(CustomTestCase):
         self.assertEqual(text_config.swa_head_dim, 128)
         self.assertEqual(text_config.swa_v_head_dim, 128)
 
+    def test_zero_num_attention_heads_raises(self):
+        # head_dim derivation used to hit `hidden_size // 0` -> ZeroDivisionError
+        # (head_dim: null is common in real configs, so the fallback fires).
+        text_config = _make_text_config(head_dim=None, num_attention_heads=0)
+        with self.assertRaises(ValueError):
+            self._derive_shapes(text_config)
+
+    def test_non_divisible_hidden_size_raises(self):
+        # num_attention_heads not dividing hidden_size used to silently truncate
+        # head_dim, surfacing later as a confusing weight-shape mismatch.
+        text_config = _make_text_config(head_dim=None, num_attention_heads=7)
+        with self.assertRaises(ValueError):
+            self._derive_shapes(text_config)
+
+    def test_explicit_head_dim_skips_derivation_guard(self):
+        # An explicit head_dim must be used as-is even if num_attention_heads is 0.
+        text_config = _make_text_config(
+            head_dim=128,
+            v_head_dim=128,
+            swa_head_dim=128,
+            swa_v_head_dim=128,
+            num_attention_heads=0,
+        )
+        model_config = self._derive_shapes(text_config)
+        self.assertEqual(model_config.head_dim, 128)
+
     def test_explicit_head_dims_are_preserved(self):
         text_config = _make_text_config(
             head_dim=128,
