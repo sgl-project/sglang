@@ -40,8 +40,10 @@ def _store_sf_interleaved_kernel(
     tok_offsets = tok_start + tl.arange(0, BLOCK_T)
     mask = tok_offsets < num_tokens
 
-    # Load slot indices
+    # Load slot indices. Slot 0 is the reserved CUDA-graph padding sink and
+    # must keep its zeros, so writes targeting it are skipped.
     slots = tl.load(loc_ptr + tok_offsets, mask=mask, other=0)
+    mask = mask & (slots != 0)
     page_offsets = slots % page_size
     page_idxs = slots // page_size
 
