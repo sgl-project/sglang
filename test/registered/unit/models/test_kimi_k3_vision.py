@@ -503,6 +503,12 @@ def test_kimi_k3_encoder_dp_defers_feature_materialization(monkeypatch):
 
 
 def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
+    """The owner-rank loader materializes exactly the requested images and
+    reads their grids by global image index: grid_thws_host is indexed by
+    global batch position while deferred groups carry shard-local positions,
+    so a shard like [1] must check and split by image 1's own grid. The
+    per-image grids must differ, or a wrong-row read compares equal and
+    passes silently."""
     from unittest.mock import patch as mock_patch
 
     from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
@@ -531,13 +537,15 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
             "pad_height": 0,
         },
     )
+    grids = [[1, 1, 1], [1, 1, 2]]
+    patch_counts = [grid[0] * grid[1] * grid[2] for grid in grids]
     items = [
         MultimodalDataItem(
             modality=Modality.IMAGE,
             offsets=[(index, index)],
             feature=torch.full((3, 2, 2), index, dtype=torch.uint8),
             model_specific_data={
-                "image_grid_thw": torch.tensor([[1, 1, 1]]),
+                "image_grid_thw": torch.tensor([grids[index]]),
                 DEFERRED_PREPROCESSING_KEY: deferred_config,
             },
         )
@@ -546,8 +554,14 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
     calls = []
 
     def fake_preprocess(images, resize_configs, *args, **kwargs):
-        calls.append([int(image[0, 0, 0]) for image in images])
-        return torch.tensor([[float(calls[-1][0]), 0.0]]), torch.tensor([[1, 1, 1]])
+        # Returns each requested image's true grid, in request order, with
+        # pixel rows tagged by image id so the split stays observable.
+        ids = [int(image[0, 0, 0]) for image in images]
+        calls.append(ids)
+        pixel_values = torch.cat(
+            [torch.full((patch_counts[i], 2), float(i)) for i in ids]
+        )
+        return pixel_values, torch.tensor([grids[i] for i in ids])
 
     # Configured TP size (the IPC consumer count) comes from the published
     # bags; the live topology is forced through the context's own override.
@@ -566,7 +580,10 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
 
     assert calls == [[1]]
     assert one.dtype == torch.float32
-    assert one.tolist() == [[1.0, 0.0]]
+    # Image 1's 2 patch rows, tagged with its id: checked and split by
+    # image 1's own grid, not by the row at its shard-local position.
+    assert one.shape == (2, 2)
+    assert (one == 1.0).all()
 
 
 def test_kimi_k3_scheduler_leaves_feature_placement_to_dp_owner():
