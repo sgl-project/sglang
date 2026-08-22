@@ -27,6 +27,7 @@ def policy_from_str(policy_str: Optional[str]) -> PolicyType:
         "random": PolicyType.Random,
         "round_robin": PolicyType.RoundRobin,
         "cache_aware": PolicyType.CacheAware,
+        "lmetric": PolicyType.LMetric,
         "power_of_two": PolicyType.PowerOfTwo,
         "bucket": PolicyType.Bucket,
         "manual": PolicyType.Manual,
@@ -155,6 +156,7 @@ class Router:
             - PolicyType.Random: Randomly select workers
             - PolicyType.RoundRobin: Distribute requests in round-robin fashion
             - PolicyType.CacheAware: Distribute requests based on cache state and load balance
+            - PolicyType.LMetric: Multiply estimated new prefill work by active worker load
             - PolicyType.PowerOfTwo: Select best of two random workers based on load (PD mode only)
         host: Host address to bind the router server. Supports IPv4, IPv6 (e.g., ::, ::1), or 0.0.0.0 for all interfaces. Default: '0.0.0.0'
         port: Port number to bind the router server. Default: 3001
