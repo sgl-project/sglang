@@ -97,6 +97,12 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
+
+
+def is_lingbot_block(name: str, _module: object) -> bool:
+    return "blocks" in name and name.split(".")[-1].isdigit()
+
+
 _is_cuda = current_platform.is_cuda()
 
 
@@ -574,11 +580,8 @@ class LingBotWorldTransformerBlock(nn.Module):
 
 
 class LingBotWorldTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
-    _fsdp_shard_conditions = LingBotWorldVideoConfig()._fsdp_shard_conditions
-    _compile_conditions = LingBotWorldVideoConfig()._compile_conditions
-    _supported_attention_backends = (
-        LingBotWorldVideoConfig()._supported_attention_backends
-    )
+    _fsdp_shard_conditions = [is_lingbot_block]
+    _compile_conditions = [is_lingbot_block]
     param_names_mapping = LingBotWorldVideoConfig().param_names_mapping
     reverse_param_names_mapping = LingBotWorldVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = LingBotWorldVideoConfig().lora_param_names_mapping
@@ -1133,11 +1136,8 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
 
 
 class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
-    _fsdp_shard_conditions = LingBotWorldVideoConfig()._fsdp_shard_conditions
-    _compile_conditions = LingBotWorldVideoConfig()._compile_conditions
-    _supported_attention_backends = (
-        LingBotWorldVideoConfig()._supported_attention_backends
-    )
+    _fsdp_shard_conditions = [is_lingbot_block]
+    _compile_conditions = [is_lingbot_block]
     param_names_mapping = LingBotWorldVideoConfig().param_names_mapping
     reverse_param_names_mapping = LingBotWorldVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = LingBotWorldVideoConfig().lora_param_names_mapping

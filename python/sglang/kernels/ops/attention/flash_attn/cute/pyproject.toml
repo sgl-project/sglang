@@ -22,17 +22,17 @@ classifiers = [
 ]
 
 dependencies = [
-    "nvidia-cutlass-dsl>=4.5.2",
+    "nvidia-cutlass-dsl==4.6.2",
     "torch",
     "einops",
     "typing_extensions",
     "apache-tvm-ffi>=0.1.5,<0.2",
     "torch-c-dlpack-ext",
-    "quack-kernels>=0.5.0",
+    "quack-kernels==0.6.4",
 ]
 
 [project.optional-dependencies]
-cu13 = ["nvidia-cutlass-dsl[cu13]>=4.5.2"]
+cu13 = ["nvidia-cutlass-dsl[cu13]==4.6.2"]
 dev = [
     "pytest",
     "pytest-xdist",

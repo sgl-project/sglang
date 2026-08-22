@@ -35,6 +35,13 @@ is_capture_mode = False
 # None = not dual, "lora" = capturing lora variant, "nolora" = capturing nolora variant.
 _capture_lora_variant: Optional[str] = None
 
+# When capturing dual DSA decode graphs (dense/sparse), tracks which variant is
+# being captured. Read by the DSA indexer's capture-time skip-logits branch to
+# force k-only ("dense") vs full indexer ("sparse").
+# None = not dual-capturing; the indexer then bakes in the full-indexer path,
+# which is correct for any kv_len.
+_capture_dsa_variant: Optional[str] = None
+
 
 def get_is_capture_mode() -> bool:
     return is_capture_mode or is_in_breakable_cuda_graph()
@@ -61,6 +68,17 @@ def get_capture_lora_variant() -> Optional[str]:
 def _set_capture_lora_variant(variant: Optional[str]) -> None:
     global _capture_lora_variant
     _capture_lora_variant = variant
+
+
+def get_capture_dsa_variant() -> Optional[str]:
+    """Return the DSA decode variant being captured ("dense"/"sparse"), or None
+    when dual-variant capture is not active."""
+    return _capture_dsa_variant
+
+
+def _set_capture_dsa_variant(variant: Optional[str]) -> None:
+    global _capture_dsa_variant
+    _capture_dsa_variant = variant
 
 
 @contextmanager

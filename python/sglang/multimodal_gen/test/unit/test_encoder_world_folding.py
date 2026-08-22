@@ -68,8 +68,23 @@ def _proposed_mode(tp, sp, cfg, dp=1, disagg=False, num_gpus=None, policy="auto"
 
 
 def test_pure_tp_not_folded():
-    # replica == tp: encoder already uses every replica GPU; nothing to fold.
+    # replica == tp under auto: each rank keeps a full encoder replica; auto
+    # never proposes folding here (the trade-off stays opt-in, see below).
     assert _proposed_mode(tp=2, sp=1, cfg=1) is None
+
+
+def test_explicit_fold_proposes_replica_for_any_shape():
+    # Encoder layout is independent of the DiT's parallelism: an operator's
+    # explicit fold is honored on every multi-rank replica instead of being
+    # silently ignored (pure TP) or narrowed to the SP group (dp > 1).
+    assert _proposed_mode(tp=2, sp=1, cfg=1, policy="fold") == "replica"
+    assert _proposed_mode(tp=1, sp=2, cfg=1, policy="fold") == "replica"
+    assert (
+        _proposed_mode(tp=2, sp=2, cfg=1, dp=2, num_gpus=8, policy="fold") == "replica"
+    )
+    # single-GPU replica: nothing to shard over
+    assert _proposed_mode(tp=1, sp=1, cfg=1, policy="fold") is None
+    assert _proposed_mode(tp=1, sp=1, cfg=1, dp=2, num_gpus=2, policy="fold") is None
 
 
 def test_single_gpu_not_folded():
@@ -121,10 +136,14 @@ def test_all_encoders_get_the_same_proposed_mode():
     assert img.parallel_folding_mode == "world"
 
 
-def test_adjust_proposes_regardless_of_policy():
-    # adjust reads the parallelism only; finalize owns the policy decision.
-    for policy in ("auto", "fold", "dp", "replicate"):
+def test_adjust_proposal_policy_dependence():
+    # adjust reads the parallelism only for auto/dp/replicate; finalize owns
+    # those policy decisions. An explicit fold is the one exception: it widens
+    # the proposal to the whole replica, because finalize cannot conjure a
+    # group that was never proposed (pure-TP replicas had none at all).
+    for policy in ("auto", "dp", "replicate"):
         assert _proposed_mode(tp=1, sp=2, cfg=1, policy=policy) == "world", policy
+    assert _proposed_mode(tp=1, sp=2, cfg=1, policy="fold") == "replica"
 
 
 def test_no_policy_touches_batching_max_size():
@@ -221,7 +240,7 @@ def _finalize(
     policy,
     mode="world",
     group_size=2,
-    batched=False,
+    prefer_dp=False,
     measured=True,
 ):
     monkeypatch.setattr(
@@ -234,7 +253,7 @@ def _finalize(
     )
     enc = _enc(hidden, heads, inter)
     enc.parallel_folding_mode = mode
-    finalize_encoder_folding(enc, policy, batched=batched)
+    finalize_encoder_folding(enc, policy, prefer_dp=prefer_dp)
     return enc.parallel_folding_mode
 
 
@@ -249,11 +268,13 @@ def test_finalize_auto_keeps_wide_clears_narrow(monkeypatch):
     assert _finalize(monkeypatch, 2560, 32, 9728, "auto") is None  # below threshold
 
 
-def test_finalize_auto_leaves_dp_capable_unsharded_when_batched(monkeypatch):
+def test_finalize_auto_leaves_dp_capable_unsharded_when_dp_preferred(monkeypatch):
     # with a batch, dp (one all_gather) beats folding (an all_reduce per layer)
-    assert _finalize(monkeypatch, 4096, 64, 10240, "auto", batched=True) is None
+    assert _finalize(monkeypatch, 4096, 64, 10240, "auto", prefer_dp=True) is None
+    # TP or DiT-DP makes encoder DP ineligible, so keep the useful fold
+    assert _finalize(monkeypatch, 4096, 64, 10240, "auto") == "world"
     # CLIP-L cannot dp either, so folding remains the only question
-    assert _finalize(monkeypatch, 768, 12, 3072, "auto", batched=True) is None
+    assert _finalize(monkeypatch, 768, 12, 3072, "auto", prefer_dp=True) is None
 
 
 def test_finalize_auto_needs_a_measured_topology(monkeypatch):

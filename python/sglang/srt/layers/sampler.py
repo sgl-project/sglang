@@ -15,7 +15,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.logprob_processor import (
     OutputLogprobProcessor,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.utils.async_probe import sanitize_nan_logits
@@ -45,6 +45,7 @@ if is_musa():
         top_p_renorm_prob,
     )
 
+_is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 if _use_aiter:
     from aiter import greedy_sample as _aiter_greedy_sample
@@ -74,12 +75,14 @@ class Sampler(nn.Module):
         if is_dp_attention_enabled():
             self.tp_sync_group = get_parallel().attn_tp_group.device_group
 
-        self.rl_on_policy_target = get_server_args().rl_on_policy_target
+        self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         # In RL on-policy mode, deterministic inference is automatically enabled.
-        self.enable_deterministic = get_server_args().enable_deterministic_inference
+        self.enable_deterministic = (
+            get_exec().deterministic.enable_deterministic_inference
+        )
         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
         self.use_log_softmax_logprob = self.rl_on_policy_target is not None
-        self.use_ascend_backend = get_server_args().sampling_backend == "ascend"
+        self.use_ascend_backend = get_exec().kernel.sampling_backend == "ascend"
 
         self.output_logprob_processor = OutputLogprobProcessor()
 
@@ -116,6 +119,9 @@ class Sampler(nn.Module):
                 to get the unique seed for each position.
         """
         logits = logits_output.next_token_logits
+
+        if _is_hip and logits.shape[0] == 0:
+            return torch.empty((0,), dtype=torch.int64, device=logits.device)
 
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
@@ -260,7 +266,7 @@ class Sampler(nn.Module):
                 positions=positions,
             )
         else:
-            backend = get_server_args().sampling_backend
+            backend = get_exec().kernel.sampling_backend
             if backend == "flashinfer":
                 assert (
                     sampling_info.sampling_seed is None
@@ -540,7 +546,7 @@ def create_sampler(backend: Optional[str] = None) -> "Sampler":
     """Create a sampler honoring custom backend registrations."""
 
     server_args = get_server_args()
-    backend = backend or (server_args.sampling_backend if server_args else None)
+    backend = backend or (get_exec().kernel.sampling_backend if server_args else None)
 
     if backend in _CUSTOM_SAMPLER_FACTORIES:
         sampler = _CUSTOM_SAMPLER_FACTORIES[backend]()
@@ -712,7 +718,9 @@ def multinomial_with_seed(
     # x is a uniform sample in [0, 1]. get gumbel noise from it.
     # which is equivalent to -log(-log(x))
     # keep everything in in-place operations to avoid unnecessary memory allocations.
-    x.log_().clamp_(min=torch.finfo(x.dtype).min).neg_()  # -log(x)
+    # clamp both ends: x == 1 gives gumbel +inf (NaN at -inf logprobs); the cap is
+    # the hash spacing so that bucket matches its neighbor instead of dominating
+    x.log_().clamp_(min=torch.finfo(x.dtype).min, max=-(2.0**-32)).neg_()
     x.log_().neg_()  # -log(-log(x)) == gumbel noise
 
     # add gumbel noise to logprobs

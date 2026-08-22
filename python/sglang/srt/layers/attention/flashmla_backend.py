@@ -20,7 +20,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +85,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
         self.v_head_dim = model_runner.model_config.v_head_dim
-        self.scaling = model_runner.model_config.scaling
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
@@ -94,7 +93,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             torch.float8_e5m2,
         }
 
-        self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+        self.num_draft_tokens = get_spec().speculative_num_draft_tokens
 
         self.cuda_graph_kv_indices = None
         self.cuda_graph_mla_metadata = None

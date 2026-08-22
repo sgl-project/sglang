@@ -207,11 +207,13 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
             dit_trajectory=RolloutDitTrajectory(
                 latents=torch.randn(1, 5, 4, 2, 2, 2),
                 timesteps=torch.tensor([1.0, 0.75, 0.5, 0.25]),
+                sigmas=torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0]),
             ),
         )
         _, _, env, dit_traj = _serialize_rollout_trajectory(
             rtd,
             serialized_dit_timesteps=_maybe_serialize(rtd.dit_trajectory.timesteps),
+            serialized_dit_sigmas=_maybe_serialize(rtd.dit_trajectory.sigmas),
         )
         self.assertIsNotNone(env)
         self.assertIn("pos_cond_kwargs", env)
@@ -219,8 +221,10 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
         self.assertIsNotNone(dit_traj)
         self.assertIn("latents", dit_traj)
         self.assertIn("timesteps", dit_traj)
+        self.assertIn("sigmas", dit_traj)
         self.assertTrue(dit_traj["latents"]["__tensor__"])
         self.assertTrue(dit_traj["timesteps"]["__tensor__"])
+        self.assertTrue(dit_traj["sigmas"]["__tensor__"])
 
 
 class TestBuildResponse(unittest.TestCase):
@@ -327,6 +331,7 @@ class TestBuildResponse(unittest.TestCase):
                 dit_trajectory=RolloutDitTrajectory(
                     latents=torch.randn(B, T + 1, D),
                     timesteps=torch.linspace(1.0, 0.0, T),
+                    sigmas=torch.linspace(1.0, 0.0, T + 1),
                 ),
             ),
         )
@@ -339,6 +344,10 @@ class TestBuildResponse(unittest.TestCase):
         ts1 = bytes_to_tensor(resps[1].dit_trajectory["timesteps"]["data"])
         self.assertEqual(ts0.shape, (T,))
         self.assertTrue(torch.equal(ts0, ts1))
+        sg0 = bytes_to_tensor(resps[0].dit_trajectory["sigmas"]["data"])
+        sg1 = bytes_to_tensor(resps[1].dit_trajectory["sigmas"]["data"])
+        self.assertEqual(sg0.shape, (T + 1,))
+        self.assertTrue(torch.equal(sg0, sg1))
         self.assertEqual(
             _maybe_deserialize(resps[1].dit_trajectory["latents"]).shape, (T + 1, D)
         )
