@@ -3,12 +3,12 @@
 CPU-only mocks — no aiter/Triton/GPU required.
 """
 
-import os
 import unittest
 from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -30,12 +30,12 @@ class TestMlaGluonCapability(CustomTestCase):
 
         reset_mla_gluon_state_for_test()
 
-    @mock.patch.dict(os.environ, {"SGLANG_AITER_MLA_GLUON": "0"}, clear=False)
     def test_env_disable_not_ready(self):
         from sglang.srt.layers.attention import aiter_mla_gluon as mod
 
-        mod.reset_mla_gluon_state_for_test()
-        cap = mod.probe_mla_gluon_capability(force_refresh=True)
+        with envs.SGLANG_AITER_MLA_GLUON.override(False):
+            mod.reset_mla_gluon_state_for_test()
+            cap = mod.probe_mla_gluon_capability(force_refresh=True)
         self.assertFalse(cap.ready)
         self.assertIn("SGLANG_AITER_MLA_GLUON=0", cap.missing_for_ready())
 
@@ -78,22 +78,25 @@ class TestMlaGluonCapability(CustomTestCase):
         from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
         from sglang.srt.layers.attention.aiter_mla_gluon import prefer_mla_gluon_decode
 
-        self.assertFalse(prefer_mla_gluon_decode(num_head=12, kv_cache_dtype=fp8_dtype))
+        self.assertFalse(
+            prefer_mla_gluon_decode(
+                head_pad_mode="zero", num_head=12, kv_cache_dtype=fp8_dtype
+            )
+        )
 
-    @mock.patch.dict(os.environ, {"SGLANG_AITER_MLA_GLUON_FORCE": "1"}, clear=False)
     @mock.patch(
-        "sglang.srt.layers.attention.aiter_mla_gluon._triton_cga_layout_ok",
-        return_value=False,
-    )
-    @mock.patch(
-        "sglang.srt.layers.attention.aiter_mla_gluon.mla_gluon_available",
+        "sglang.srt.layers.attention.aiter_mla_gluon._gluon_runtime_ok",
         return_value=True,
     )
-    def test_force_bypasses_cga_probe(self, _avail, _cga):
+    def test_prefer_false_when_zero_pad_but_not_h12(self, _ok):
         from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
         from sglang.srt.layers.attention.aiter_mla_gluon import prefer_mla_gluon_decode
 
-        self.assertTrue(prefer_mla_gluon_decode(num_head=16, kv_cache_dtype=fp8_dtype))
+        self.assertFalse(
+            prefer_mla_gluon_decode(
+                head_pad_mode="zero", num_head=10, kv_cache_dtype=fp8_dtype
+            )
+        )
 
 
 class TestMlaGluonDecodeFallback(CustomTestCase):

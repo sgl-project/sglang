@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -78,7 +78,7 @@ def _gluon_runtime_ok() -> bool:
 
 
 def _mla_gluon_enabled() -> bool:
-    return get_bool_env_var("SGLANG_AITER_MLA_GLUON", "True")
+    return envs.SGLANG_AITER_MLA_GLUON.get()
 
 
 def probe_mla_gluon_capability(*, force_refresh: bool = False) -> MlaGluonCapability:
@@ -226,19 +226,22 @@ def mla_gluon_decode(
         return None
 
 
-def prefer_mla_gluon_decode(*, num_head: int, kv_cache_dtype: torch.dtype) -> bool:
-    """Route h12 decode through Gluon when FP8 KV and runtime prerequisites hold."""
+def prefer_mla_gluon_decode(
+    *, head_pad_mode: str, num_head: int, kv_cache_dtype: torch.dtype
+) -> bool:
+    """Route Kimi-style h12 zero-pad MLA decode through Gluon when FP8 KV holds.
+
+    ``head_pad_mode == "zero"`` selects the legacy ``mla_decode_fwd`` padding
+    topology (N heads padded to 16). Gluon is only validated for ``num_head == 12``
+    today; other zero-pad head counts must stay on zero-pad + ``mla_decode_fwd``.
+    """
     if not _mla_gluon_enabled():
         return False
-    if get_bool_env_var("SGLANG_AITER_MLA_GLUON_FORCE", "False"):
-        if mla_gluon_available():
-            return True
-        logger.warning(
-            "SGLANG_AITER_MLA_GLUON_FORCE=1 but mla_gluon import failed; "
-            "falling back"
-        )
-        return False
-    if num_head == 12 and kv_cache_dtype == fp8_dtype:
+    if (
+        head_pad_mode == "zero"
+        and num_head == 12
+        and kv_cache_dtype == fp8_dtype
+    ):
         return _gluon_runtime_ok()
     return False
 
