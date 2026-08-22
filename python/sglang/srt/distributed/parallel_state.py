@@ -293,6 +293,7 @@ class GroupCoordinator:
         recovered_rank: bool = False,
         rank_offset: int = 0,
         max_world_size: Optional[int] = None,
+        use_quick_allreduce: Optional[bool] = None,
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -414,6 +415,9 @@ class GroupCoordinator:
         self.use_pynccl = use_pynccl
         self.use_pymscclpp = use_pymscclpp
         self.use_custom_allreduce = use_custom_allreduce
+        self.use_quick_allreduce = (
+            use_custom_allreduce if use_quick_allreduce is None else use_quick_allreduce
+        )
         self.use_torch_symm_mem_all_reduce = use_torch_symm_mem_all_reduce
         self.use_hpu_communicator = use_hpu_communicator
         self.use_xpu_communicator = use_xpu_communicator
@@ -484,7 +488,7 @@ class GroupCoordinator:
                     "warning, specify --disable-custom-all-reduce explicitly."
                 )
 
-            if is_hip():
+            if self.use_quick_allreduce and is_hip():
                 try:
                     # Initialize a custom quick all-reduce implementation for AMD
                     # when rocm >= gfx942. Quick reduce is designed as a
@@ -1884,6 +1888,7 @@ def init_model_parallel_group(
     backend: str,
     use_pynccl: Optional[bool] = None,
     use_custom_allreduce: Optional[bool] = None,
+    use_quick_allreduce: Optional[bool] = None,
     use_message_queue_broadcaster: bool = False,
     group_name: Optional[str] = None,
     use_mscclpp_allreduce: Optional[bool] = None,
@@ -1909,6 +1914,7 @@ def init_model_parallel_group(
         ),
         use_pymscclpp=use_mscclpp_allreduce,
         use_custom_allreduce=use_custom_allreduce,
+        use_quick_allreduce=use_quick_allreduce,
         use_torch_symm_mem_all_reduce=use_torch_symm_mem_allreduce,
         use_hpu_communicator=True,
         use_xpu_communicator=True,
@@ -2487,6 +2493,10 @@ def initialize_model_parallel(
             dcp_group_ranks,
             get_world_group().local_rank,
             backend,
+            # Current DCP paths use all-gather/reduce-scatter, all-to-all, or
+            # FP32 all-reduce. QuickAllReduce does not serve these collectives,
+            # but its communicator reserves a large workspace on every rank.
+            use_quick_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="dcp",
             recovered_rank=recovered_rank,
