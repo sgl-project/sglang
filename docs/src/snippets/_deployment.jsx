@@ -1839,7 +1839,7 @@ export const Deployment = ({ config, benchmarks }) => {
               {/* This is the verified operating point, not sizing advice — a
                   hardware whose validation ran on 8 GPUs is not "recommending"
                   8 over a smaller deployment. */}
-              <span>Verified recipe · {sel.hw.toUpperCase()}</span>
+              <span>{recommendedRecipe.unverified ? "Derived recipe" : "Verified recipe"} · {sel.hw.toUpperCase()}</span>
               <strong>
                 {[
                   `${recommendedRecipe.nodes * recommendedRecipe.gpus_per_node} GPUs`,
@@ -1851,10 +1851,10 @@ export const Deployment = ({ config, benchmarks }) => {
               </strong>
             </div>
             <div>
-              {renderStatus("verified")}
+              {renderStatus(recommendedRecipe.unverified ? "unverified" : "verified")}
               {recommendedInUse
                 ? <small>In use</small>
-                : <button type="button" className="sgd-builder-text-action" onClick={restoreRecommendedRecipe}>Use verified recipe</button>}
+                : <button type="button" className="sgd-builder-text-action" onClick={restoreRecommendedRecipe}>{recommendedRecipe.unverified ? "Use derived recipe" : "Use verified recipe"}</button>}
             </div>
           </section>
         )}
