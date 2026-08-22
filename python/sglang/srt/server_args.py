@@ -3584,11 +3584,29 @@ class ServerArgs:
     weight_cache_socket: A[
         Optional[str],
         Arg(
-            help="Unix socket path for weight cache daemon (client mode)."
-            "If not set, uses /tmp/sglang_weight_cache_rank{global_rank}.sock",
+            help="Explicit Unix socket override for weight cache client mode. "
+            "When unset, the client discovers an exact config/GPU match in the "
+            "node-local registry. The override bypasses registry discovery.",
         ),
         NS("model"),
     ] = None
+    weight_cache_runtime_dir: A[
+        Optional[str],
+        Arg(
+            help="Private node-local runtime directory for weight-cache registry "
+            "records and Unix sockets. Defaults to "
+            "/tmp/sglang-weight-cache-$UID.",
+        ),
+        NS("model"),
+    ] = None
+    weight_cache_namespace: A[
+        str,
+        Arg(
+            help="Optional namespace included in the weight-cache identity. Use "
+            "different values to isolate otherwise identical deployments.",
+        ),
+        NS("model"),
+    ] = "default"
     weight_cache_timeout: A[
         int,
         Arg(
@@ -3652,6 +3670,7 @@ class ServerArgs:
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
         self._validate_prefill_decode_interval()
+        self._validate_weight_cache_parallelism()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -7707,6 +7726,30 @@ class ServerArgs:
                 "not export the draft model's weights. Disable one of them "
                 "(--weight-cache-mode off) for this configuration."
             )
+        if self.weight_cache_mode == "daemon" and self.weight_cache_socket is not None:
+            raise ValueError(
+                "--weight-cache-socket is an explicit client-mode override and "
+                "cannot be combined with --weight-cache-mode daemon"
+            )
+        if self.weight_cache_mode != "off":
+            from sglang.srt.weight_cache.registry import normalize_namespace
+
+            normalize_namespace(self.weight_cache_namespace)
+
+    def _validate_weight_cache_parallelism(self) -> None:
+        """Reject explicitly configured unsupported cache topologies early.
+
+        Runtime config builders repeat this check after model-aware resolution.
+        """
+        if self.weight_cache_mode == "off":
+            return
+        from sglang.srt.weight_cache.protocol import check_ipc_parallelism
+
+        check_ipc_parallelism(
+            max(self.dp_size, self.moe_dp_size, self.dwdp_size),
+            max(self.ep_size, self.dwdp_size),
+            where="server_args",
+        )
 
     def _is_mistral_native_format(self) -> bool:
         """True iff the checkpoint requires load_format=mistral.

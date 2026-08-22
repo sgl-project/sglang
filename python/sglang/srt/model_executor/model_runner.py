@@ -1075,14 +1075,10 @@ class ModelRunner:
             weight_cache_socket=get_model().weight_cache_socket,
         )
 
-        # If the weight cache is enabled, override the load format to IPC_CACHE
-        # and derive the per-rank daemon socket. Idempotent across reloads.
+        # If the weight cache is enabled, override the load format to IPC_CACHE.
         maybe_enable_ipc_weight_cache(
             load_config=self.load_config,
             server_args=self.server_args,
-            tp_size=self.ps.tp_size,
-            pp_rank=self.ps.pp_rank,
-            tp_rank=self.ps.tp_rank,
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(

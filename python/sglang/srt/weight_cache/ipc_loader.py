@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """IPC Model Loader — loads model weights from a Weight Cache Daemon via CUDA IPC.
 
-Zero-copy mode: param.data points directly to IPC-mapped GPU memory. Only 1x GPU
-memory needed — engine and daemon share the same physical GPU memory via CUDA IPC.
-Engine depends on daemon staying alive.
+Zero-copy mode: param.data points directly to IPC-mapped GPU memory. Engine
+depends on daemon staying alive.
 """
 
 import logging
@@ -16,7 +15,6 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import (
     BaseModelLoader,
@@ -26,12 +24,21 @@ from sglang.srt.utils import MultiprocessingSerializer
 
 from .protocol import (
     CacheConfig,
+    check_ipc_parallelism,
     check_ipc_quant_support,
     compute_env_stamp,
     get_quant_method_name,
+    get_resolved_model_revision,
+    hash_loader_extra_config,
     hash_quant_config,
+    normalize_model_path_for_cache,
     recv_msg,
     send_msg,
+)
+from .registry import (
+    DaemonRegistration,
+    FileWeightCacheRegistry,
+    process_identity_is_alive,
 )
 
 logger = logging.getLogger(__name__)
@@ -66,7 +73,7 @@ class IpcModelLoader(BaseModelLoader):
     def __init__(
         self,
         load_config: LoadConfig,
-        socket_path: str,
+        socket_path: Optional[str],
         fallback_loader_cls=None,
         weight_cache_mode: str = "client",
         fallback_load_format: str = "auto",
@@ -76,6 +83,8 @@ class IpcModelLoader(BaseModelLoader):
         self.weight_cache_mode = weight_cache_mode
         self._fallback_loader_cls = fallback_loader_cls
         self._fallback_load_format = fallback_load_format
+        self._runtime_dir = load_config.weight_cache_runtime_dir
+        self._namespace = load_config.weight_cache_namespace
 
     def load_model(
         self,
@@ -99,23 +108,32 @@ class IpcModelLoader(BaseModelLoader):
         check_ipc_quant_support(quant_method, engine_quant_config, where="client")
 
         # Try to fetch state from daemon
-        cache_data = self._fetch_from_cache(model_config)
+        cache_data = self._fetch_from_cache(model_config, device_config)
 
         if cache_data is None:
             if self.weight_cache_mode == "daemon":
                 raise RuntimeError(
-                    f"[IpcModelLoader] Weight cache daemon not available at "
-                    f"{self.socket_path}. In daemon mode, fallback to disk "
-                    f"loading is disabled because the daemon process already "
-                    f"holds weights on the same GPU — loading from disk would "
-                    f"cause OOM. Please ensure the weight cache daemon is "
-                    f"running and the config matches."
+                    "[IpcModelLoader] No matching weight cache daemon is "
+                    "registered. In daemon mode, fallback to disk "
+                    "loading is disabled because the daemon process already "
+                    "holds weights on the same GPU — loading from disk would "
+                    "cause OOM. Please ensure the weight cache daemon is "
+                    "running and the config matches."
                 )
             logger.warning(
-                "[IpcModelLoader] Weight cache not available or config mismatch, "
-                "falling back to disk load"
+                "[IpcModelLoader] No weight cache is registered for this GPU and "
+                "config; falling back to disk load"
             )
             return self._fallback_load(model_config, device_config)
+
+        # Start monitoring before constructing the meta model or importing any
+        # tensor handles. The synchronous liveness check closes the post-
+        # handshake/pre-import window as far as PID identity probing allows;
+        # the thread then protects the lifetime of the mapped model.
+        daemon_metadata = cache_data["daemon"]
+        self._start_daemon_liveness_watchdog(
+            daemon_metadata["pid"], daemon_metadata["process_start_time"]
+        )
 
         entries = cache_data["entries"]
         logger.info(
@@ -148,10 +166,6 @@ class IpcModelLoader(BaseModelLoader):
         # meta storage. We must recreate them from the now-valid tensors.
         self._rebuild_stale_views(model)
 
-        # The model now points into the daemon's GPU memory via CUDA IPC. If the
-        # daemon dies, those pointers dangle, so watch it and fail loud.
-        self._start_daemon_liveness_watchdog(cache_data.get("pid"))
-
         logger.info(
             f"[IpcModelLoader] Loaded model via IPC (mode={self.weight_cache_mode}), "
             f"total={time.perf_counter() - tic:.2f}s"
@@ -159,42 +173,49 @@ class IpcModelLoader(BaseModelLoader):
 
         return model.eval()
 
-    def _start_daemon_liveness_watchdog(self, daemon_pid: Optional[int]) -> None:
-        """Fail loud if the serving daemon dies while we hold its weights.
+    def _start_daemon_liveness_watchdog(
+        self,
+        daemon_pid: Optional[int],
+        process_start_time: Optional[float],
+    ) -> None:
+        """Enforce today's producer-lifetime policy for imported weights.
 
-        In both client and (engine-spawned) daemon mode, the model's param.data
-        points into the daemon's GPU memory via CUDA IPC, and CUDA graphs may
-        capture those addresses. If the daemon exits, the pointers dangle:
-        forward passes would read freed GPU memory -> illegal-address crashes or
-        silent garbage. There is no safe in-place recovery, so a background
-        thread polls the daemon PID and, on death, SIGKILLs this process with a
-        clear message instead of letting it serve corrupt results.
+        PyTorch's documented CUDA-sharing contract requires the producer to stay
+        alive until consumers release their tensors, and the CUDA driver API does
+        not define continued use after the exporter frees the allocation. The
+        roadmap proposes future daemon re-adoption from live clients, but that
+        behavior is not implemented or proven for this transport yet. Until it
+        is, a background thread treats daemon exit as a policy violation and
+        terminates instead of continuing on an unverified mapping lifetime.
         """
-        if not daemon_pid or daemon_pid <= 0:
+        if (
+            not daemon_pid
+            or daemon_pid <= 0
+            or process_start_time is None
+            or process_start_time <= 0
+        ):
             logger.warning(
                 "[IpcModelLoader] Daemon did not report a PID; skipping the "
                 "daemon-liveness watchdog. A daemon crash will not be detected."
             )
             return
 
-        def _daemon_alive(pid: int) -> bool:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                return False
-            except PermissionError:
-                return True  # exists but owned by another user
-            return True
+        if not process_identity_is_alive(daemon_pid, process_start_time):
+            raise RuntimeError(
+                f"[IpcModelLoader] Weight cache daemon pid={daemon_pid} died "
+                "after the handshake and before tensor import"
+            )
 
         def _watch() -> None:
             while True:
                 time.sleep(_DAEMON_LIVENESS_POLL_INTERVAL)
-                if not _daemon_alive(daemon_pid):
+                if not process_identity_is_alive(daemon_pid, process_start_time):
                     logger.critical(
                         f"[IpcModelLoader] Weight cache daemon (pid={daemon_pid}) "
                         f"died while this engine holds its weights via CUDA IPC. "
-                        f"The mapped weight pointers are now dangling; continuing "
-                        f"would read freed GPU memory. Terminating this process."
+                        f"The current transport requires a live producer; "
+                        f"terminating rather than serving from mappings whose "
+                        f"post-exit lifetime is not supported."
                     )
                     os.kill(os.getpid(), signal.SIGKILL)
                     return
@@ -203,7 +224,8 @@ class IpcModelLoader(BaseModelLoader):
             target=_watch, name="weight-cache-daemon-watchdog", daemon=True
         ).start()
         logger.info(
-            f"[IpcModelLoader] Started daemon-liveness watchdog for pid={daemon_pid}"
+            f"[IpcModelLoader] Started daemon-liveness watchdog for pid={daemon_pid} "
+            f"start_time={process_start_time}"
         )
 
     def _resolve_engine_quant(self, model_config):
@@ -351,7 +373,8 @@ class IpcModelLoader(BaseModelLoader):
                     or imported_tensor.dtype != ref_param.dtype
                 ):
                     mismatched.append(
-                        f"  {name}: IPC={imported_tensor.shape}/{imported_tensor.dtype} "
+                        f"  {name}: IPC={imported_tensor.shape}/"
+                        f"{imported_tensor.dtype} "
                         f"vs model={ref_param.shape}/{ref_param.dtype}"
                     )
                     del imported_tensor
@@ -424,93 +447,199 @@ class IpcModelLoader(BaseModelLoader):
 
         return model
 
-    def _fetch_from_cache(self, model_config) -> Optional[dict]:
-        """Connect to daemon, validate config, fetch IPC handles.
+    def _build_engine_config(self, model_config, device_id: int) -> CacheConfig:
+        from sglang.srt.runtime_context import get_parallel
 
-        Returns the daemon response dict on success, None if the daemon is
-        genuinely absent (socket file doesn't exist). Raises on all other
-        failures so they are never silently swallowed as a disk-load fallback.
-        """
+        ps = get_parallel()
+        check_ipc_parallelism(ps.dp_size, ps.moe_ep_size, where="client")
+        quant_method, quant_config = self._resolve_engine_quant(model_config)
+        load_format = getattr(
+            self._fallback_load_format, "value", self._fallback_load_format
+        )
+        return CacheConfig(
+            model_path=normalize_model_path_for_cache(
+                getattr(model_config, "model_weights", model_config.model_path)
+            ),
+            model_arch=(
+                model_config.hf_config.architectures[0]
+                if model_config.hf_config.architectures
+                else ""
+            ),
+            tp_size=ps.tp_size,
+            tp_rank=ps.tp_rank,
+            pp_size=ps.pp_size,
+            pp_rank=ps.pp_rank,
+            dp_size=ps.dp_size,
+            ep_size=ps.moe_ep_size,
+            quant_method=quant_method,
+            quant_config_hash=hash_quant_config(quant_config),
+            dtype=str(model_config.dtype),
+            revision=model_config.revision or "",
+            resolved_revision=get_resolved_model_revision(model_config),
+            load_format=str(load_format),
+            model_loader_extra_config_hash=hash_loader_extra_config(
+                self.load_config.model_loader_extra_config
+            ),
+            trust_remote_code=self.load_config.weight_cache_trust_remote_code,
+            **compute_env_stamp(device_id),
+        )
+
+    @staticmethod
+    def _verify_response_identity(
+        result: dict,
+        *,
+        engine_config: CacheConfig,
+        device_uuid: str,
+        registration: Optional[DaemonRegistration],
+    ) -> None:
+        try:
+            returned_config = CacheConfig.from_dict(result["config"])
+            daemon = result["daemon"]
+            daemon_id = str(daemon["daemon_id"])
+            returned_device_uuid = str(daemon["device_uuid"])
+            fingerprint = str(daemon["config_fingerprint"])
+            pid = int(daemon["pid"])
+            process_start_time = float(daemon["process_start_time"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("daemon returned incomplete identity metadata") from exc
+
+        if not returned_config.matches(engine_config):
+            raise RuntimeError(
+                "daemon returned a CacheConfig different from the requested config"
+            )
+        if fingerprint != engine_config.fingerprint():
+            raise RuntimeError("daemon returned the wrong CacheConfig fingerprint")
+        if returned_device_uuid != device_uuid:
+            raise RuntimeError(
+                "daemon is attached to a different physical GPU: "
+                f"expected {device_uuid}, got {returned_device_uuid}"
+            )
+        if pid <= 0 or process_start_time <= 0:
+            raise RuntimeError("daemon returned invalid process identity metadata")
+
+        if registration is not None and (
+            daemon_id != registration.daemon_id
+            or pid != registration.pid
+            or abs(process_start_time - registration.process_start_time) >= 1e-3
+            or returned_device_uuid != registration.identity.device_uuid
+            or fingerprint != registration.identity.config_fingerprint
+        ):
+            raise RuntimeError(
+                "daemon response identity does not match the discovered registration"
+            )
+
+    def _fetch_from_cache(self, model_config, device_config) -> Optional[dict]:
+        """Discover/connect, bind the handshake to that daemon, then fetch."""
         import socket as socket_mod
+
+        from sglang.srt.platforms import current_platform
+
+        device_id = int(getattr(device_config, "gpu_id", 0))
+        socket_path = self.socket_path
+
+        # Preserve the explicit-override fast miss: it bypasses both registry
+        # access and parallel/config inspection when the named socket is absent.
+        if socket_path is not None:
+            try:
+                explicit_info = os.lstat(socket_path)
+            except FileNotFoundError:
+                logger.info(
+                    f"[IpcModelLoader] Daemon socket not found at {socket_path}."
+                )
+                return None
+            if (
+                not stat.S_ISSOCK(explicit_info.st_mode)
+                or explicit_info.st_uid != os.getuid()
+            ):
+                raise RuntimeError(
+                    f"[IpcModelLoader] Refusing to connect: {socket_path} is not "
+                    f"a socket owned by this user."
+                )
+
+        engine_config = self._build_engine_config(model_config, device_id)
+        device_uuid = current_platform.get_device_uuid(device_id)
+        registration = None
+
+        # An explicit socket is an intentional escape hatch and never touches
+        # the registry. Otherwise discovery is an exact CacheConfig + GPU match.
+        if socket_path is None:
+            registry = FileWeightCacheRegistry(
+                self._runtime_dir, namespace=self._namespace
+            )
+            registration = registry.discover(engine_config, device_uuid=device_uuid)
+            if registration is None:
+                logger.info(
+                    "[IpcModelLoader] No registered daemon matches config=%s "
+                    "device_uuid=%s namespace=%s",
+                    engine_config.fingerprint(),
+                    device_uuid,
+                    self._namespace,
+                )
+                return None
+            socket_path = registration.socket_path
 
         # Only connect to a real socket node owned by us: reject a symlink, a
         # plain file, or another user's socket planted at this /tmp path. An
         # absent socket means no daemon -> fall back to disk (return None).
         try:
-            st = os.lstat(self.socket_path)
+            st = os.lstat(socket_path)
         except FileNotFoundError:
-            logger.info(
-                f"[IpcModelLoader] Daemon socket not found at {self.socket_path}."
-            )
+            if registration is not None and process_identity_is_alive(
+                registration.pid, registration.process_start_time
+            ):
+                raise RuntimeError(
+                    "[IpcModelLoader] A discovered weight cache socket vanished "
+                    "while its daemon is still live or its liveness is "
+                    "indeterminate; refusing disk fallback during teardown"
+                )
+            logger.info(f"[IpcModelLoader] Daemon socket not found at {socket_path}.")
             return None
         if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
             raise RuntimeError(
-                f"[IpcModelLoader] Refusing to connect: {self.socket_path} is not "
+                f"[IpcModelLoader] Refusing to connect: {socket_path} is not "
                 f"a socket owned by this user."
             )
 
         sock = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
         try:
             sock.settimeout(30)
-            sock.connect(self.socket_path)
+            sock.connect(socket_path)
         except FileNotFoundError:
-            # Raced: socket removed between lstat and connect -> treat as absent.
             sock.close()
+            if registration is not None and process_identity_is_alive(
+                registration.pid, registration.process_start_time
+            ):
+                raise RuntimeError(
+                    "[IpcModelLoader] A discovered weight cache socket vanished "
+                    "during connect while its daemon is still live or its "
+                    "liveness is indeterminate; refusing disk fallback"
+                )
             return None
         except ConnectionRefusedError:
             sock.close()
+            if registration is not None and not process_identity_is_alive(
+                registration.pid, registration.process_start_time
+            ):
+                logger.info(
+                    "[IpcModelLoader] Discovered daemon died before connect; "
+                    "treating the refused socket as a cache miss."
+                )
+                return None
             raise RuntimeError(
-                f"[IpcModelLoader] Daemon socket exists at {self.socket_path} but "
+                f"[IpcModelLoader] Daemon socket exists at {socket_path} but "
                 f"refused the connection. The daemon may have crashed after "
                 f"creating the socket. Check daemon logs."
             )
         except Exception as e:
             sock.close()
             raise RuntimeError(
-                f"[IpcModelLoader] Failed to connect to daemon at "
-                f"{self.socket_path}: {e}"
+                f"[IpcModelLoader] Failed to connect to daemon at {socket_path}: {e}"
             ) from e
 
         try:
-            # Build engine's config fingerprint
-            from sglang.srt.runtime_context import get_parallel
-
-            ps = get_parallel()
-            tp_size = ps.tp_size
-            tp_rank = ps.tp_rank
-
-            pp_size = ps.pp_size
-            pp_rank = ps.pp_rank
-
-            ep_size = ps.moe_ep_size
-
-            dp_size = get_parallel().dp_size
-
-            quant_method, quant_config = self._resolve_engine_quant(model_config)
-
-            engine_config = CacheConfig(
-                model_path=model_config.model_path,
-                model_arch=(
-                    model_config.hf_config.architectures[0]
-                    if model_config.hf_config.architectures
-                    else ""
-                ),
-                tp_size=tp_size,
-                tp_rank=tp_rank,
-                pp_size=pp_size,
-                pp_rank=pp_rank,
-                dp_size=dp_size,
-                ep_size=ep_size,
-                quant_method=quant_method,
-                quant_config_hash=hash_quant_config(quant_config),
-                dtype=str(model_config.dtype),
-                revision=model_config.revision or "",
-                **compute_env_stamp(),
-            )
-
             logger.info(
                 f"[IpcModelLoader] Requesting weights from daemon at "
-                f"{self.socket_path} with config: "
+                f"{socket_path} with config: "
                 f"model={engine_config.model_path}, "
                 f"arch={engine_config.model_arch}, "
                 f"tp={engine_config.tp_size}/{engine_config.tp_rank}, "
@@ -529,6 +658,15 @@ class IpcModelLoader(BaseModelLoader):
                     f"  Daemon config: {daemon_config}"
                 )
 
+            # Validate the returned config and physical/process identity before
+            # importing any tensor mappings.
+            self._verify_response_identity(
+                result,
+                engine_config=engine_config,
+                device_uuid=device_uuid,
+                registration=registration,
+            )
+
             return result
 
         except RuntimeError:
@@ -536,7 +674,7 @@ class IpcModelLoader(BaseModelLoader):
         except Exception as e:
             raise RuntimeError(
                 f"[IpcModelLoader] Error communicating with daemon at "
-                f"{self.socket_path}: {e}"
+                f"{socket_path}: {e}"
             ) from e
         finally:
             sock.close()

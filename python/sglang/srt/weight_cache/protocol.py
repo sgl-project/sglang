@@ -9,29 +9,26 @@ import json
 import logging
 import os
 import pickle
-import signal
 import struct
 from typing import Any, Dict, Optional
 
 import msgspec
-
 from sglang.srt.utils.common import safe_pickle_loads
 
 logger = logging.getLogger(__name__)
 
-# Socket path template for weight cache daemons (keyed by global rank
-# = tp_size * pp_rank + tp_rank, so multi-node / multi-PP don't collide)
-WEIGHT_CACHE_SOCKET_TEMPLATE = "/tmp/sglang_weight_cache_rank{global_rank}.sock"
 
-# Ready file template — daemon writes this after loading completes
-WEIGHT_CACHE_READY_TEMPLATE = "/tmp/sglang_weight_cache_rank{global_rank}.ready"
+def normalize_model_path_for_cache(model_path: str) -> str:
+    """Canonicalize local paths while preserving model IDs and remote URIs."""
+    return os.path.realpath(model_path) if os.path.exists(model_path) else model_path
 
 
 class CacheConfig(msgspec.Struct):
     """Fingerprint of the cached weights. Used to validate compatibility
     between a daemon's cached state and a requesting engine process.
 
-    Any mismatch triggers a fallback to disk loading.
+    A mismatch is never a cache hit. If the mismatched daemon already occupies
+    the requested GPU, the client must fail rather than double-allocate weights.
     """
 
     model_path: str
@@ -46,16 +43,27 @@ class CacheConfig(msgspec.Struct):
     quant_config_hash: str  # SHA-256 hash of quantization config
     dtype: str  # e.g. "torch.float16"
     revision: str  # model revision the weights were loaded from ("" if unset)
+    resolved_revision: str  # immutable HF commit hash when available
     # Environment stamp: a daemon and a client that ran different post-processing
     # branches (different GPU compute capability or torch/kernel version) can
     # produce incompatible weights that would map cleanly yet serve garbage.
     # Comparing these turns that into a clean mismatch. See compute_env_stamp().
     device_capability: str  # local compute capability, e.g. "8.0" ("" if N/A)
     torch_version: str  # torch.__version__ of the process that built the weights
+    load_format: str  # disk/source loader whose output is cached
+    model_loader_extra_config_hash: str  # full SHA-256 of canonical loader options
+    trust_remote_code: bool  # remote model code can change loaded tensor layout
 
     def matches(self, other: "CacheConfig") -> bool:
         """Check if two configs are compatible for weight sharing."""
         return self == other
+
+    def fingerprint(self) -> str:
+        """Return the stable full SHA-256 identity of this cached shard config."""
+        encoded = json.dumps(
+            self.to_dict(), sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     def to_dict(self) -> Dict[str, Any]:
         return {f: getattr(self, f) for f in self.__struct_fields__}
@@ -88,19 +96,40 @@ def hash_quant_config(quant_config: Any) -> str:
                         k: v
                         for k, v in sorted(quant_config.__dict__.items())
                         if not k.startswith("_")
-                        and isinstance(
-                            v, (str, int, float, bool, type(None), list, dict)
-                        )
                     },
                     sort_keys=True,
                 )
             )
         else:
-            config_str = type(quant_config).__name__
+            raise TypeError(
+                f"unsupported quantization config type: {type(quant_config).__name__}"
+            )
         return hashlib.sha256(config_str.encode()).hexdigest()
-    except Exception:
-        config_str = type(quant_config).__name__
-        return hashlib.sha256(config_str.encode()).hexdigest()
+    except Exception as exc:
+        raise ValueError(
+            "quantization config cannot be serialized canonically; refusing "
+            "to create an unsafe weight-cache fingerprint"
+        ) from exc
+
+
+def hash_loader_extra_config(config: Any) -> str:
+    """Hash loader options canonically, failing closed on unsupported values."""
+    try:
+        value = json.loads(config) if isinstance(config, str) else config
+        encoded = json.dumps(value or {}, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "model loader extra config cannot be serialized canonically"
+        ) from exc
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def get_resolved_model_revision(model_config: Any) -> str:
+    """Return Transformers' resolved immutable model commit when available."""
+    hf_config = getattr(model_config, "hf_config", None)
+    return str(getattr(hf_config, "_commit_hash", "") or "")
 
 
 def get_quant_method_name(quant_config: Any) -> str:
@@ -114,6 +143,19 @@ def get_quant_method_name(quant_config: Any) -> str:
     if hasattr(quant_config, "name"):
         return quant_config.name
     return type(quant_config).__name__
+
+
+def check_ipc_parallelism(dp_size: int, ep_size: int, *, where: str) -> None:
+    """Reject DP/EP layouts until their cache identity semantics are defined."""
+    if dp_size == 1 and ep_size == 1:
+        return
+    raise ValueError(
+        f"[weight_cache:{where}] data/expert parallelism is not supported yet "
+        f"(dp_size={dp_size}, ep_size={ep_size}). CacheConfig does not yet "
+        "distinguish content-partitioning ranks from requester-only ranks, so "
+        "enabling the cache here could select the wrong shard or defeat "
+        "per-GPU sharing. Disable the weight cache for this configuration."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +279,7 @@ def _recv_exact(sock, n: int) -> Optional[bytes]:
     return bytes(buf)
 
 
-def compute_env_stamp() -> Dict[str, str]:
+def compute_env_stamp(device_id: int = 0) -> Dict[str, str]:
     """Local environment fingerprint for the IPC weight cache.
 
     Returns the device compute capability and torch version of the current
@@ -258,7 +300,7 @@ def compute_env_stamp() -> Dict[str, str]:
     try:
         from sglang.srt.platforms import current_platform
 
-        cap = current_platform.get_device_capability()
+        cap = current_platform.get_device_capability(device_id)
         if cap is not None:
             device_capability = f"{cap.major}.{cap.minor}"
     except Exception:
@@ -267,11 +309,10 @@ def compute_env_stamp() -> Dict[str, str]:
 
 
 def compute_global_rank(tp_size: int, pp_rank: int, tp_rank: int) -> int:
-    """Single source of truth for the daemon rank formula.
+    """Return a rank inside one PP×TP distributed job.
 
-    global_rank = tp_size * pp_rank + tp_rank, so each daemon gets a unique
-    socket/ready path even across PP stages and nodes. Every call site (engine,
-    loader, model_runner, daemon) must go through this so the copies can't drift.
+    This rank is useful for distributed coordination and logging, but it is not
+    a persistent cache or physical-device identity across independent jobs.
     """
     return tp_size * pp_rank + tp_rank
 
@@ -298,83 +339,3 @@ def compute_local_gpu_id(
         + (pp_rank % pp_size_per_node) * tp_size_per_node
         + (tp_rank % tp_size_per_node) * gpu_id_step
     )
-
-
-def get_socket_path(global_rank: int) -> str:
-    """Get the Unix socket path for a weight cache daemon.
-
-    global_rank = tp_size * pp_rank + tp_rank
-    """
-    return WEIGHT_CACHE_SOCKET_TEMPLATE.format(global_rank=global_rank)
-
-
-def get_ready_path(global_rank: int) -> str:
-    """Get the ready-file path for a weight cache daemon.
-
-    global_rank = tp_size * pp_rank + tp_rank
-    """
-    return WEIGHT_CACHE_READY_TEMPLATE.format(global_rank=global_rank)
-
-
-def _read_ready_pid(ready_path: str) -> Optional[int]:
-    """Read the daemon PID from a .ready file. Returns None if unreadable."""
-    try:
-        with open(ready_path) as f:
-            for line in f:
-                if line.startswith("pid="):
-                    return int(line.strip().split("=", 1)[1])
-    except (OSError, ValueError):
-        pass
-    return None
-
-
-def _is_pid_alive(pid: int) -> bool:
-    """Check whether a process is still running."""
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-
-
-def cleanup_stale_daemon_files(global_rank: int, *, force: bool = False) -> None:
-    """Validate and clean up .ready/.sock files for a daemon rank.
-
-    If the .ready file exists and the recorded PID is still alive, the daemon
-    is still running — raise RuntimeError so the caller doesn't clobber it,
-    unless ``force`` is set, in which case the running daemon is killed and its
-    files are taken over (stale-takeover path for a wedged/orphaned daemon).
-    If the PID is dead (or unreadable), the files are stale leftovers from a
-    crashed/killed daemon and are safe to remove.
-    """
-    ready_path = get_ready_path(global_rank)
-    socket_path = get_socket_path(global_rank)
-
-    if not os.path.exists(ready_path) and not os.path.exists(socket_path):
-        return
-
-    pid = _read_ready_pid(ready_path) if os.path.exists(ready_path) else None
-
-    if pid is not None and _is_pid_alive(pid):
-        if not force:
-            raise RuntimeError(
-                f"Weight cache daemon for rank {global_rank} is already running "
-                f"(pid={pid}, ready={ready_path}). Stop the existing daemon before "
-                f"launching a new one, or pass force=True (--force) to kill it and "
-                f"take over."
-            )
-        logger.warning(
-            f"[weight_cache] force takeover: killing existing daemon pid={pid} "
-            f"for rank {global_rank} and reclaiming its socket/ready files."
-        )
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-
-    for path in (ready_path, socket_path):
-        if os.path.exists(path):
-            os.unlink(path)
-            logger.info(f"Removed stale daemon file: {path}")

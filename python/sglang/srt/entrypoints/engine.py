@@ -715,19 +715,19 @@ class Engine(EngineScoreMixin, EngineBase):
             f"dist_init_method={dist_init_method}"
         )
 
-        # Validate and clean up stale .ready/.sock files from prior runs.
-        # If a daemon is still alive at this rank, raise instead of clobbering.
         from sglang.srt.weight_cache.protocol import (
-            cleanup_stale_daemon_files,
-            compute_global_rank,
             compute_local_gpu_id,
-            get_ready_path,
+        )
+        from sglang.srt.weight_cache.registry import (
+            FileWeightCacheRegistry,
+            new_daemon_id,
         )
 
-        for pp_rank in pp_rank_range:
-            for tp_rank in tp_rank_range:
-                global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
-                cleanup_stale_daemon_files(global_rank)
+        registry = FileWeightCacheRegistry(
+            server_args.weight_cache_runtime_dir,
+            namespace=server_args.weight_cache_namespace,
+        )
+        daemon_launches = []
 
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
@@ -739,6 +739,7 @@ class Engine(EngineScoreMixin, EngineBase):
                     base_gpu_id=server_args.base_gpu_id,
                     gpu_id_step=server_args.gpu_id_step,
                 )
+                child_daemon_id = new_daemon_id()
                 cmd = [
                     sys.executable,
                     "-m",
@@ -765,7 +766,16 @@ class Engine(EngineScoreMixin, EngineBase):
                     get_model().dtype,
                     "--dist-init-method",
                     dist_init_method,
+                    "--weight-cache-namespace",
+                    server_args.weight_cache_namespace,
+                    "--daemon-id",
+                    child_daemon_id,
                 ]
+                if server_args.weight_cache_runtime_dir:
+                    cmd += [
+                        "--weight-cache-runtime-dir",
+                        server_args.weight_cache_runtime_dir,
+                    ]
                 if get_model().quantization:
                     cmd += ["--quantization", get_model().quantization]
                 if (
@@ -783,8 +793,9 @@ class Engine(EngineScoreMixin, EngineBase):
 
                 proc = subprocess.Popen(cmd)
                 daemon_procs.append(proc)
+                daemon_launches.append((proc, child_daemon_id))
 
-        # Wait for all daemons to be ready (ready file exists). On any failure
+        # Wait for each exact child daemon registration. On any failure
         # (readiness timeout or a daemon exiting early) terminate the siblings
         # we already spawned before propagating, so a partial launch does not
         # leak GPU-resident daemons.
@@ -792,29 +803,26 @@ class Engine(EngineScoreMixin, EngineBase):
         check_interval = 2
         start_time = time.time()
         try:
-            for pp_rank in pp_rank_range:
-                for tp_rank in tp_rank_range:
-                    global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
-                    ready_path = get_ready_path(global_rank)
-                    while not os.path.exists(ready_path):
-                        time.sleep(check_interval)
-                        if time.time() - start_time > timeout:
-                            raise TimeoutError(
-                                f"Weight cache daemon for pp_rank={pp_rank} "
-                                f"tp_rank={tp_rank} did not become ready "
-                                f"within {timeout}s"
+            for proc, child_daemon_id in daemon_launches:
+                while registry.find_registration(
+                    daemon_id=child_daemon_id, pid=proc.pid
+                ) is None:
+                    time.sleep(check_interval)
+                    if time.time() - start_time > timeout:
+                        raise TimeoutError(
+                            f"Weight cache daemon pid={proc.pid} did not become "
+                            f"ready within {timeout}s"
+                        )
+                    for p in daemon_procs:
+                        if p.poll() is not None:
+                            raise RuntimeError(
+                                f"Weight cache daemon (pid={p.pid}) exited "
+                                f"prematurely with code {p.returncode}"
                             )
-                        # Check if daemon process is still alive
-                        for p in daemon_procs:
-                            if p.poll() is not None:
-                                raise RuntimeError(
-                                    f"Weight cache daemon (pid={p.pid}) exited prematurely "
-                                    f"with code {p.returncode}"
-                                )
-                    logger.info(
-                        f"Weight cache daemon for pp_rank={pp_rank} "
-                        f"tp_rank={tp_rank} is ready"
-                    )
+                logger.info(
+                    f"Weight cache daemon pid={proc.pid} daemon_id="
+                    f"{child_daemon_id} is ready"
+                )
         except BaseException:
             cls._terminate_weight_cache_daemons(daemon_procs)
             raise
@@ -829,11 +837,11 @@ class Engine(EngineScoreMixin, EngineBase):
     def _terminate_weight_cache_daemons(procs, timeout: float = 10.0):
         """Gracefully stop engine-spawned weight cache daemons.
 
-        Send SIGTERM first so each daemon's signal handler can unlink its
-        ``.sock``/``.ready`` files, then SIGKILL any straggler. This matters
+        Send SIGTERM first so each daemon's signal handler can release its
+        socket, claim, and registration, then SIGKILL any straggler. This matters
         because ``shutdown()`` otherwise reaps children via
-        ``kill_process_tree`` (SIGKILL), which would skip that cleanup and
-        leave stale files that make the next client-mode boot fail with a
+        ``kill_process_tree`` (SIGKILL), which would skip graceful cleanup
+        and leave stale state that makes the next client-mode boot fail with a
         confusing "socket exists but connection refused" instead of a clean
         "no daemon" path.
         """
@@ -842,6 +850,7 @@ class Engine(EngineScoreMixin, EngineBase):
         for p in procs:
             if p.poll() is None:
                 p.terminate()  # SIGTERM -> daemon cleanup handler runs
+        killed = []
         for p in procs:
             try:
                 p.wait(timeout=timeout)
@@ -851,6 +860,15 @@ class Engine(EngineScoreMixin, EngineBase):
                     f"{timeout}s of SIGTERM; sending SIGKILL."
                 )
                 p.kill()
+                killed.append(p)
+        for p in killed:
+            try:
+                p.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                logger.error(
+                    f"Weight cache daemon (pid={p.pid}) remained unreaped "
+                    "after SIGKILL."
+                )
 
     @classmethod
     def _launch_scheduler_processes(
@@ -1272,8 +1290,8 @@ class Engine(EngineScoreMixin, EngineBase):
                 self.send_to_rpc = None
 
             # Gracefully stop weight cache daemons *before* the blanket
-            # kill_process_tree below, so their SIGTERM handlers can unlink the
-            # .sock/.ready files instead of being SIGKILLed and leaving stale state.
+            # kill_process_tree below, so their SIGTERM handlers can unpublish
+            # registry state instead of being SIGKILLed and leaving stale state.
             daemon_procs = getattr(self, "_weight_cache_daemon_procs", None)
             if daemon_procs:
                 self._terminate_weight_cache_daemons(daemon_procs)
