@@ -103,6 +103,133 @@ def write_cache_indices(
             pt += extend_len
 
 
+def write_page_tail_indices(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    write_ends: torch.Tensor,
+    page_size: int,
+) -> None:
+    # The row write stops at the requested tokens, so the tail of the last page
+    # -- allocated, and consecutive with the last slot -- keeps stale indices.
+    if page_size == 1:
+        return
+
+    device = req_to_token.device
+    steps = torch.arange(page_size - 1, device=device, dtype=write_ends.dtype)
+    last_pos = (write_ends - 1).clamp(min=0)
+    last_val = req_to_token[req_pool_indices, last_pos]
+
+    positions = write_ends[:, None] + steps[None, :]
+    ceilings = ((write_ends + page_size - 1) // page_size * page_size)[:, None]
+    in_page = positions < ceilings
+
+    # Lanes past the ceiling fold onto the last real entry and rewrite it with
+    # its own value, keeping the scatter a fixed (bs, page_size - 1) shape.
+    positions = torch.where(in_page, positions, last_pos[:, None])
+    values = torch.where(
+        in_page,
+        last_val[:, None] + steps[None, :].to(last_val.dtype) + 1,
+        last_val[:, None],
+    )
+    req_to_token[req_pool_indices[:, None].expand_as(positions), positions] = values
+
+
+def write_page_tail_mapping(
+    allocator,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    write_ends: torch.Tensor,
+    page_size: int,
+) -> None:
+    """The SWA counterpart of write_page_tail_indices: publish full->swa for the
+    rest of the last page, so a decode step landing there finds a live mapping."""
+    if page_size == 1:
+        return
+
+    device = req_to_token.device
+    steps = torch.arange(page_size - 1, device=device, dtype=write_ends.dtype)
+    last_pos = (write_ends - 1).clamp(min=0)
+    last_full = req_to_token[req_pool_indices, last_pos].to(torch.int64)
+    last_swa = allocator.full_to_swa_index_mapping[last_full].to(torch.int64)
+
+    ceilings = ((write_ends + page_size - 1) // page_size * page_size)[:, None]
+    in_page = write_ends[:, None] + steps[None, :] < ceilings
+    # Lanes past the ceiling re-publish the last real pair, an idempotent write.
+    offsets = steps[None, :] + 1
+    full_indices = torch.where(
+        in_page, last_full[:, None] + offsets, last_full[:, None]
+    )
+    swa_indices = torch.where(in_page, last_swa[:, None] + offsets, last_swa[:, None])
+    allocator.set_full_to_swa_mapping(full_indices.reshape(-1), swa_indices.reshape(-1))
+
+
+def write_page_tail(
+    allocator,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    write_ends: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Publish the rest of the last page: row indices always, plus the full->swa
+    mapping when the allocator keeps one."""
+    from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+
+    write_page_tail_indices(req_to_token, req_pool_indices, write_ends, page_size)
+    if isinstance(allocator, SWATokenToKVPoolAllocator):
+        write_page_tail_mapping(
+            allocator, req_to_token, req_pool_indices, write_ends, page_size
+        )
+
+
+def uses_page_granular_decode(batch: ScheduleBatch, token_per_req: int) -> bool:
+    # Exact type, not isinstance: DSV4 bundles and hisparse device buffers do
+    # per-step work beyond handing out an index, so they keep the per-token path.
+    from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+
+    return (
+        _alloc_page_size(batch) > 1
+        and token_per_req == 1
+        and not batch.model_config.is_encoder_decoder
+        and type(batch.tree_cache.token_to_kv_pool_allocator)
+        in (PagedTokenToKVPoolAllocator, SWATokenToKVPoolAllocator)
+    )
+
+
+def publish_decode_pages(batch: ScheduleBatch, page_size: int) -> None:
+    """Hand a whole page to every request that opens one this step and write it
+    into the request's row, so the steps inside that page allocate nothing."""
+    openers = [
+        i for i, n in enumerate(batch.seq_lens_cpu.tolist()) if n % page_size == 0
+    ]
+    if not openers:
+        return
+
+    allocator = batch.tree_cache.token_to_kv_pool_allocator
+    num_tokens = len(openers) * page_size
+    evict_from_tree_cache(batch.tree_cache, num_tokens)
+    pages = allocator.alloc(num_tokens)
+    if pages is None:
+        error_msg = (
+            f"Decode out of memory. Try to lower your batch size.\n"
+            f"Try to allocate {num_tokens} tokens.\n"
+            f"{available_and_evictable_str(batch.tree_cache)}"
+        )
+        logger.error(error_msg)
+        batch.tree_cache.pretty_print()
+        raise RuntimeError(error_msg)
+
+    device = batch.device
+    opener_indices = torch.tensor(openers, dtype=torch.int64, device=device)
+    rows = batch.req_pool_indices[opener_indices]
+    starts = batch.seq_lens[opener_indices]
+    positions = starts[:, None] + torch.arange(page_size, device=device)
+    batch.req_to_token_pool.write(
+        (rows[:, None].expand_as(positions), positions),
+        pages.view(len(openers), page_size).to(torch.int32),
+    )
+
+
 def get_last_loc(
     req_to_token: torch.Tensor,
     req_pool_indices_tensor: torch.Tensor,
@@ -359,6 +486,13 @@ def alloc_for_extend(
         prefix_tensors,
         batch.req_to_token_pool,
     )
+    write_page_tail(
+        batch.tree_cache.token_to_kv_pool_allocator,
+        batch.req_to_token_pool.req_to_token,
+        req_pool_indices_device,
+        batch.seq_lens,
+        alloc_page_size,
+    )
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.
     if _is_npu:
@@ -522,7 +656,15 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     seq_lens_gpu = batch.seq_lens
     bs = seq_lens_gpu.shape[0]
 
-    if _alloc_page_size(batch) == 1:
+    page_granular = uses_page_granular_decode(batch, token_per_req)
+    if page_granular:
+        # The page is published whole when it opens, so this step's slot is
+        # already in the row -- gather it instead of allocating one.
+        publish_decode_pages(batch, _alloc_page_size(batch))
+        out_cache_loc = batch.req_to_token_pool.req_to_token[
+            batch.req_pool_indices, seq_lens_gpu
+        ].to(torch.int64)
+    elif _alloc_page_size(batch) == 1:
         # Non-paged allocation
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
     else:
@@ -541,23 +683,24 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             batch=batch,
         )
 
-    # Write to req_to_token_pool
-    if batch.model_config.is_encoder_decoder:
-        locs = batch.encoder_lens + seq_lens_gpu
-    else:
-        locs = seq_lens_gpu.clone()
+    if not page_granular:
+        # Write to req_to_token_pool
+        if batch.model_config.is_encoder_decoder:
+            locs = batch.encoder_lens + seq_lens_gpu
+        else:
+            locs = seq_lens_gpu.clone()
 
-    batch.req_to_token_pool.write(
-        (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
-    )
-
-    # DSV4-NPU hook: no-op on non-DSV4 paths.
-    if _is_npu:
-        maybe_write_dsv4_decode(
-            batch,
-            batch.seq_lens_cpu + token_per_req,
-            token_per_req,
+        batch.req_to_token_pool.write(
+            (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
         )
+
+        # DSV4-NPU hook: no-op on non-DSV4 paths.
+        if _is_npu:
+            maybe_write_dsv4_decode(
+                batch,
+                batch.seq_lens_cpu + token_per_req,
+                token_per_req,
+            )
 
     for req in batch.reqs:
         req.kv.kv_allocated_len += token_per_req

@@ -102,6 +102,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         class ReqToTokenPool:
             def __init__(self):
                 self.writes = []
+                self.req_to_token = torch.zeros((1, 1024), dtype=torch.int32)
 
             def alloc(self, reqs):
                 for item in reqs:
@@ -110,6 +111,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
 
             def write(self, indices, values):
                 self.writes.append((indices, values))
+                self.req_to_token[indices] = values.to(torch.int32)
 
         req_to_token_pool = ReqToTokenPool()
         allocator = SimpleNamespace(
