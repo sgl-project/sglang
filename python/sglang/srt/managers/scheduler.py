@@ -1130,6 +1130,7 @@ class Scheduler(
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self._symm_dp_scheduler_loop_entry_ns: Optional[int] = None
+        self._symm_dp_scheduler_stage_timing: Optional[dict[str, int]] = None
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
@@ -1699,9 +1700,7 @@ class Scheduler(
             if self.gracefully_exit:
                 break
 
-            self._symm_dp_scheduler_loop_entry_ns = (
-                symm_dp_scheduler_loop_entry_ns()
-            )
+            self._symm_dp_scheduler_loop_entry_ns = symm_dp_scheduler_loop_entry_ns()
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -1747,9 +1746,7 @@ class Scheduler(
             if self.gracefully_exit:
                 break
 
-            self._symm_dp_scheduler_loop_entry_ns = (
-                symm_dp_scheduler_loop_entry_ns()
-            )
+            self._symm_dp_scheduler_loop_entry_ns = symm_dp_scheduler_loop_entry_ns()
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -2040,6 +2037,9 @@ class Scheduler(
             get_require_mlp_sync=lambda: self.require_mlp_sync,
             get_telemetry_scheduler_loop_entry_ns=(
                 lambda: self._symm_dp_scheduler_loop_entry_ns
+            ),
+            get_telemetry_scheduler_stage_timing=(
+                lambda: self._symm_dp_scheduler_stage_timing
             ),
         )
 

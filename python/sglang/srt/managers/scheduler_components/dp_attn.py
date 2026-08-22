@@ -295,13 +295,17 @@ def prepare_mlp_sync_batch_raw(
     dwdp: bool = False,
     telemetry_adapter_entry_ns: Optional[int] = None,
     telemetry_scheduler_loop_entry_ns: Optional[int] = None,
+    telemetry_scheduler_stage_timing: Optional[dict[str, int]] = None,
 ):
     telemetry_entry_timing = None
     if telemetry_adapter_entry_ns is not None:
-        telemetry_entry_timing = {
-            "adapter_entry_ns": telemetry_adapter_entry_ns,
-            "prepare_raw_entry_ns": time.perf_counter_ns(),
-        }
+        telemetry_entry_timing = dict(telemetry_scheduler_stage_timing or {})
+        telemetry_entry_timing.update(
+            {
+                "adapter_entry_ns": telemetry_adapter_entry_ns,
+                "prepare_raw_entry_ns": time.perf_counter_ns(),
+            }
+        )
         if telemetry_scheduler_loop_entry_ns is not None:
             telemetry_entry_timing["scheduler_loop_entry_ns"] = (
                 telemetry_scheduler_loop_entry_ns
@@ -412,9 +416,7 @@ def prepare_mlp_sync_batch_raw(
 
     if not skip_all_gather:
         if telemetry_entry_timing is not None:
-            telemetry_entry_timing["all_gather_call_entry_ns"] = (
-                time.perf_counter_ns()
-            )
+            telemetry_entry_timing["all_gather_call_entry_ns"] = time.perf_counter_ns()
         mlp_sync_info.all_gather(
             device=device,
             group=group,
@@ -478,6 +480,7 @@ class SchedulerDPAttnAdapter:
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
     get_telemetry_scheduler_loop_entry_ns: Callable[[], Optional[int]]
+    get_telemetry_scheduler_stage_timing: Callable[[], Optional[dict[str, int]]]
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         telemetry_adapter_entry_ns = _symm_dp_adapter_entry_ns()
@@ -497,6 +500,9 @@ class SchedulerDPAttnAdapter:
             telemetry_adapter_entry_ns=telemetry_adapter_entry_ns,
             telemetry_scheduler_loop_entry_ns=(
                 self.get_telemetry_scheduler_loop_entry_ns()
+            ),
+            telemetry_scheduler_stage_timing=(
+                self.get_telemetry_scheduler_stage_timing()
             ),
         )
 

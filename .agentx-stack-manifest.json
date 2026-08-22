@@ -138,6 +138,19 @@
     "change": "For decode-cache-off paged PD allocation, stage the already-selected free-page IDs to pinned host memory before alloc_extend, while preserving allocation, request mapping, release-page, and merge ordering. Merge and unsupported paths retain the existing materialization.",
     "targeted_validation": "CMH job 3199523: 4096-token/page64 repeated alloc/free/merge page IDs, request mapping, and free-list exact; 93.75% fast-path coverage; stage 0.071624 ms/admission; concurrent graph -0.000071 ms; trace-reweighted mechanism saving estimate 0.651473 ms/step. Direct-code job 3199656 exposed and rejected a 55 ms cold int64-to-int32 GPU conversion; the final implementation keeps native int64 D2H and converts only 64 host page IDs. Production validation is pending."
   },
+  "layer3_pd_stage_host_telemetry": {
+    "parent_commit": "32dd37c79f2022e8dab09ecbb2611581a5a6a8dd",
+    "files": {
+      "python/sglang/srt/disaggregation/decode.py": "677e935ecb170d6e04d472ac02275cdc63bb49316305b5d6208b0b528a6359ec",
+      "python/sglang/srt/distributed/device_communicators/symm_mem_gather.py": "3dff551494b9debff9214e5e4d43e989a0f63aadcb79fc973e588166eb3871f1",
+      "python/sglang/srt/distributed/device_communicators/symm_mem_gather_telemetry.py": "7f5315058beb90e30d1354ac08d9226a93914e93a7e90c82bf7678237079f665",
+      "python/sglang/srt/managers/scheduler.py": "4c5b2885602e3900cf7a586f91628415e4bf25f1ea4e9e20c660661c2b9afdfb",
+      "python/sglang/srt/managers/scheduler_components/dp_attn.py": "c6a43c808b13102cee72f889133da595cfaaa7a6f720fab232ad4843357798fd",
+      "python/sglang/srt/managers/scheduler_components/profiler_manager.py": "6609f62ca764aec75578c01a99244c5e4a9fcde90dbb8edd004420cb7975ecda"
+    },
+    "change": "Add opt-in host-only timestamps for the disaggregated decode loop, prefill-DP lookup, request intake, transfer/admission polling, DP adapter entry, and generation-exact symmetric-memory peer readiness. Normal execution remains on the original gather implementation when telemetry is disabled.",
+    "scope": "Diagnostic source only; no performance or production optimization claim."
+  },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
     "tree": "b0161fbca98775c0f79999f4970de1f14a4426fb"

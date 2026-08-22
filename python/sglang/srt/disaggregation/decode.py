@@ -1327,11 +1327,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             seq_len = origin_input_len
 
             def _mamba_payload():
-                return [
-                    self._copy_state_index_to_host(
-                        decode_req.req.mamba_pool_idx
-                    )
-                ]
+                return [self._copy_state_index_to_host(decode_req.req.mamba_pool_idx)]
 
             def _swa_payload():
                 window_size = self.scheduler.sliding_window_size
@@ -1431,9 +1427,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 page_indices = (
                     staged_page_indices
                     if staged_page_indices is not None
-                    else kv_to_page_indices(
-                        kv_indices, kv_transfer_page_size
-                    ).astype(np.int32)
+                    else kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
+                        np.int32
+                    )
                 )
             device_page_indices = None
             if (
@@ -1932,9 +1928,7 @@ def alloc_for_decode_prealloc(
                     (1,), total_prefix_len, dtype=torch.int64, device=device
                 ),
                 prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
-                seq_lens=torch.full(
-                    (1,), fill_len, dtype=torch.int64, device=device
-                ),
+                seq_lens=torch.full((1,), fill_len, dtype=torch.int64, device=device),
                 seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                 last_loc=last_loc,
                 extend_num_tokens=delta_len,
@@ -2296,26 +2290,62 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
 
 class SchedulerDisaggregationDecodeMixin:
+    def _begin_symm_dp_scheduler_stage_timing(self: Scheduler) -> None:
+        loop_entry_ns = symm_dp_scheduler_loop_entry_ns()
+        self._symm_dp_scheduler_loop_entry_ns = loop_entry_ns
+        self._symm_dp_scheduler_stage_timing = (
+            None
+            if loop_entry_ns is None
+            else {
+                "scheduler_loop_entry_ns": loop_entry_ns,
+                "prealloc_before": len(self.disagg_decode_prealloc_queue.queue),
+                "transfer_before": len(self.disagg_decode_transfer_queue.queue),
+                "waiting_before": len(self.waiting_queue),
+                "running_before": self.running_batch.batch_size(),
+            }
+        )
+
+    def _mark_symm_dp_scheduler_stage(self: Scheduler, name: str) -> None:
+        timing = self._symm_dp_scheduler_stage_timing
+        if timing is not None:
+            timing[name] = time.perf_counter_ns()
+
+    def _mark_symm_dp_scheduler_queue_state(self: Scheduler) -> None:
+        timing = self._symm_dp_scheduler_stage_timing
+        if timing is not None:
+            timing.update(
+                {
+                    "prealloc_after": len(self.disagg_decode_prealloc_queue.queue),
+                    "transfer_after": len(self.disagg_decode_transfer_queue.queue),
+                    "waiting_after": len(self.waiting_queue),
+                    "running_after_queue": self.running_batch.batch_size(),
+                }
+            )
+
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
 
         while True:
-            self._symm_dp_scheduler_loop_entry_ns = (
-                symm_dp_scheduler_loop_entry_ns()
-            )
+            self._begin_symm_dp_scheduler_stage_timing()
 
             # Pending rooms from the prior cycle can overlap request intake and
             # the tail of the in-flight decode graph.
             if not self._engine_paused:
                 self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
+            self._mark_symm_dp_scheduler_stage("after_top_prefetch_ns")
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
+            self._mark_symm_dp_scheduler_stage("after_recv_requests_ns")
             self.process_input_requests(recv_reqs)
+            self._mark_symm_dp_scheduler_stage("after_process_input_requests_ns")
             if self._engine_paused:
                 continue
             self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
+            self._mark_symm_dp_scheduler_stage("after_bottom_prefetch_ns")
             self.process_decode_queue()
+            self._mark_symm_dp_scheduler_stage("after_process_decode_queue_ns")
+            self._mark_symm_dp_scheduler_queue_state()
 
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
@@ -2349,21 +2379,25 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
-            self._symm_dp_scheduler_loop_entry_ns = (
-                symm_dp_scheduler_loop_entry_ns()
-            )
+            self._begin_symm_dp_scheduler_stage_timing()
 
             # Pending rooms from the prior cycle can overlap request intake and
             # the tail of the in-flight decode graph.
             if not self._engine_paused:
                 self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
+            self._mark_symm_dp_scheduler_stage("after_top_prefetch_ns")
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
+            self._mark_symm_dp_scheduler_stage("after_recv_requests_ns")
             self.process_input_requests(recv_reqs)
+            self._mark_symm_dp_scheduler_stage("after_process_input_requests_ns")
             if self._engine_paused:
                 continue
             self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
+            self._mark_symm_dp_scheduler_stage("after_bottom_prefetch_ns")
             self.process_decode_queue()
+            self._mark_symm_dp_scheduler_stage("after_process_decode_queue_ns")
+            self._mark_symm_dp_scheduler_queue_state()
 
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(

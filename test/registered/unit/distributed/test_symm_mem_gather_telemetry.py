@@ -230,16 +230,51 @@ def test_disagg_decode_production_loop_samples_scheduler_entry(
         def recv_requests(self):
             raise StopLoop
 
-    class FakeScheduler:
+    class Queue:
+        queue = []
+
+        def prefetch_prefill_dp_rank_queries(self):
+            pass
+
+    class RunningBatch:
+        def batch_size(self):
+            return 0
+
+    class FakeScheduler(disagg_decode.SchedulerDisaggregationDecodeMixin):
         request_receiver = RequestReceiver()
+        disagg_decode_prealloc_queue = Queue()
+        disagg_decode_transfer_queue = Queue()
+        waiting_queue = []
+        running_batch = RunningBatch()
+        _engine_paused = False
         _symm_dp_scheduler_loop_entry_ns = None
+        _symm_dp_scheduler_stage_timing = None
 
     monkeypatch.setattr(
         disagg_decode, "symm_dp_scheduler_loop_entry_ns", lambda: 765_432
     )
     scheduler = FakeScheduler()
     with pytest.raises(StopLoop):
-        getattr(
-            disagg_decode.SchedulerDisaggregationDecodeMixin, event_loop_name
-        )(scheduler)
+        getattr(scheduler, event_loop_name)()
     assert scheduler._symm_dp_scheduler_loop_entry_ns == 765_432
+    timing = scheduler._symm_dp_scheduler_stage_timing
+    assert timing is not None
+    assert timing["scheduler_loop_entry_ns"] == 765_432
+    assert timing["after_top_prefetch_ns"] >= timing["scheduler_loop_entry_ns"]
+    assert {
+        key: timing[key]
+        for key in (
+            "prealloc_before",
+            "transfer_before",
+            "waiting_before",
+            "running_before",
+        )
+    } == {
+        key: 0
+        for key in (
+            "prealloc_before",
+            "transfer_before",
+            "waiting_before",
+            "running_before",
+        )
+    }
