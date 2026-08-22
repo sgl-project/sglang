@@ -1,7 +1,11 @@
 import unittest
+from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.attention.dsa_draft_extend import (
+    fused_dsa_uniform_draft_extend_metadata,
+)
 from sglang.kernels.ops.attention.dsa_metadata import (
     fused_dsa_decode_metadata,
     fused_dsa_draft_extend_metadata,
@@ -19,6 +23,10 @@ def _cu_seqlens(seqlens: torch.Tensor) -> torch.Tensor:
     out[:1].zero_()
     out[1:].copy_(torch.cumsum(seqlens.to(torch.int32), dim=0, dtype=torch.int32))
     return out
+
+
+def _qo_indptr(extend_seq_lens: torch.Tensor) -> torch.Tensor:
+    return _cu_seqlens(extend_seq_lens)
 
 
 def _dsa_seqlens(seqlens: torch.Tensor, topk: int) -> torch.Tensor:
@@ -260,9 +268,15 @@ class TestDSAMetadataKernels(CustomTestCase):
         max_extend_len: int,
         max_total_len: int,
         static_extend_len: bool,
+        total_len: Optional[int] = None,
+        pass_qo_indptr: bool = False,
     ):
         bs = len(seq_lens_values)
-        total_len = sum(extend_seq_lens_values)
+        # Rows claimed by a request; `total_len` may exceed it when a width-capped
+        # ragged layout leaves the graph tier's tail slack unclaimed.
+        covered_len = sum(extend_seq_lens_values)
+        total_len = covered_len if total_len is None else total_len
+        assert total_len >= covered_len
         pool_size = max(bs + 4, 8)
         seq_lens = torch.tensor(seq_lens_values, dtype=torch.int64, device=self.device)
         extend_seq_lens = torch.tensor(
@@ -287,7 +301,10 @@ class TestDSAMetadataKernels(CustomTestCase):
         )
         real_page_table = (
             torch.empty(
-                (max_total_len, (max_seqlen_k + real_page_size - 1) // real_page_size),
+                (
+                    max_total_len,
+                    (max_seqlen_k + real_page_size - 1) // real_page_size,
+                ),
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -315,6 +332,7 @@ class TestDSAMetadataKernels(CustomTestCase):
             max_extend_len=max_extend_len,
             max_total_len=max_total_len,
             static_extend_len=static_extend_len,
+            qo_indptr=(_qo_indptr(extend_seq_lens) if pass_qo_indptr else None),
         )
 
         expected_cache = seq_lens.to(torch.int32)
@@ -330,7 +348,7 @@ class TestDSAMetadataKernels(CustomTestCase):
                     seq_len.item() + 1,
                     dtype=torch.int32,
                     device=self.device,
-                )
+                ).clamp_min_(0)
             )
         expected_expanded = (
             torch.cat(expanded_parts, dim=0)
@@ -350,21 +368,46 @@ class TestDSAMetadataKernels(CustomTestCase):
         _assert_equal(cache_seqlens, expected_cache, "draft cache_seqlens")
         _assert_equal(cu_seqlens_k, _cu_seqlens(expected_cache), "draft cu_seqlens_k")
         _assert_equal(
-            page_table_1[:total_len][live_mask],
+            page_table_1[:covered_len][live_mask],
             expected_page_table[live_mask],
             "draft page_table_1 (live [:kv_len] prefix)",
         )
         _assert_equal(
-            seqlens_expanded[:total_len], expected_expanded, "draft seqlens_expanded"
+            seqlens_expanded[:covered_len], expected_expanded, "draft seqlens_expanded"
         )
         _assert_equal(
-            dsa_cache_seqlens[:total_len], expected_dsa, "draft dsa_cache_seqlens"
+            dsa_cache_seqlens[:covered_len], expected_dsa, "draft dsa_cache_seqlens"
         )
         _assert_equal(
-            dsa_cu_seqlens_k[: total_len + 1],
+            dsa_cu_seqlens_k[: covered_len + 1],
             _cu_seqlens(expected_dsa),
             "draft dsa_cu_seqlens_k",
         )
+        if total_len > covered_len:
+            # Unclaimed tail rows must be length 0 so consumers take the trivial
+            # all-(-1) path; their page-table rows are never read.
+            tail = torch.zeros(
+                total_len - covered_len, dtype=torch.int32, device=self.device
+            )
+            _assert_equal(
+                seqlens_expanded[covered_len:total_len], tail, "draft uncovered rows"
+            )
+            _assert_equal(
+                dsa_cache_seqlens[covered_len:total_len],
+                tail,
+                "draft uncovered dsa_cache_seqlens",
+            )
+            flat = torch.full(
+                (total_len - covered_len + 1,),
+                int(expected_dsa.sum()),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            _assert_equal(
+                dsa_cu_seqlens_k[covered_len : total_len + 1],
+                flat,
+                "draft uncovered dsa_cu_seqlens_k stays flat",
+            )
         if real_page_size > 1:
             # Real-page column real_col maps to source column real_col*real_page_size.
             real_width = real_page_table.shape[1]
@@ -374,7 +417,7 @@ class TestDSAMetadataKernels(CustomTestCase):
             ) < row_kv_lens.view(-1, 1)
             expected_real = _real_page_table(expected_page_table, real_page_size)
             _assert_equal(
-                real_page_table[:total_len][real_live_mask],
+                real_page_table[:covered_len][real_live_mask],
                 expected_real[real_live_mask],
                 "draft real_page_table (live [:kv_len] prefix)",
             )
@@ -440,6 +483,41 @@ class TestDSAMetadataKernels(CustomTestCase):
             max_total_len=16,
             static_extend_len=False,
         )
+
+    def test_ragged_staged_qo_indptr_matches_prefix_walk(self):
+        # DSA's ragged verify replay stages qo_indptr instead of letting every
+        # page program re-walk extend_seq_lens; both must agree.
+        for pass_qo_indptr in (False, True):
+            with self.subTest(pass_qo_indptr=pass_qo_indptr):
+                self._check_draft_extend(
+                    [12, 31, 80, 7],
+                    [1, 4, 2, 3],
+                    max_seqlen_k=193,
+                    dsa_index_topk=64,
+                    real_page_size=64,
+                    max_extend_len=4,
+                    max_total_len=16,
+                    static_extend_len=False,
+                    pass_qo_indptr=pass_qo_indptr,
+                )
+
+    def test_ragged_uncovered_tail_rows_are_inert(self):
+        # A width-capped ragged verify layout can leave the graph tier's tail
+        # slack claimed by no request; those rows must come out length 0.
+        for pass_qo_indptr in (False, True):
+            with self.subTest(pass_qo_indptr=pass_qo_indptr):
+                self._check_draft_extend(
+                    [12, 31, 80],
+                    [1, 2, 1],
+                    max_seqlen_k=193,
+                    dsa_index_topk=64,
+                    real_page_size=64,
+                    max_extend_len=4,
+                    max_total_len=12,
+                    static_extend_len=False,
+                    total_len=8,
+                    pass_qo_indptr=pass_qo_indptr,
+                )
 
     def test_empty_batch(self):
         self._check_decode(
@@ -521,6 +599,94 @@ class TestDSAMetadataKernels(CustomTestCase):
             max_total_len=bs,
             static_extend_len=True,
         )
+
+    def test_uniform_specialization_matches_generic_path(self):
+        def run_case(seq_lens_values, qo_len: int, real_page_size: int, uniform: bool):
+            bs = len(seq_lens_values)
+            total_len = bs * qo_len
+            max_seqlen_k = 193
+            seq_lens = torch.tensor(
+                seq_lens_values, dtype=torch.int64, device=self.device
+            )
+            extend_seq_lens = torch.full(
+                (bs,), qo_len, dtype=torch.int32, device=self.device
+            )
+            req_pool_indices = torch.arange(bs, dtype=torch.int64, device=self.device)
+            req_to_token = _make_req_to_token(max(bs, 1), max_seqlen_k, self.device)
+
+            def filled(*shape):
+                return torch.full(shape, -777, dtype=torch.int32, device=self.device)
+
+            cache_seqlens = filled(bs)
+            cu_seqlens_k = filled(bs + 1)
+            page_table_1 = filled(total_len, max_seqlen_k)
+            seqlens_expanded = filled(total_len)
+            dsa_cache_seqlens = filled(total_len)
+            dsa_cu_seqlens_k = filled(total_len + 1)
+            real_page_table = (
+                filled(
+                    total_len,
+                    (max_seqlen_k + real_page_size - 1) // real_page_size,
+                )
+                if real_page_size > 1
+                else page_table_1
+            )
+            kwargs = dict(
+                seq_lens=seq_lens,
+                req_pool_indices=req_pool_indices,
+                req_to_token=req_to_token,
+                cache_seqlens=cache_seqlens,
+                cu_seqlens_k=cu_seqlens_k,
+                page_table_1=page_table_1,
+                seqlens_expanded=seqlens_expanded,
+                dsa_cache_seqlens=dsa_cache_seqlens,
+                dsa_cu_seqlens_k=dsa_cu_seqlens_k,
+                real_page_table=real_page_table,
+                bs=bs,
+                max_seqlen_k=max_seqlen_k,
+                dsa_index_topk=64,
+                real_page_size=real_page_size,
+            )
+            if uniform:
+                fused_dsa_uniform_draft_extend_metadata(qo_len=qo_len, **kwargs)
+            else:
+                fused_dsa_draft_extend_metadata(
+                    extend_seq_lens=extend_seq_lens,
+                    total_len=total_len,
+                    max_extend_len=qo_len,
+                    max_total_len=total_len,
+                    static_extend_len=True,
+                    **kwargs,
+                )
+            return (
+                cache_seqlens,
+                cu_seqlens_k,
+                page_table_1,
+                seqlens_expanded,
+                dsa_cache_seqlens,
+                dsa_cu_seqlens_k,
+                real_page_table,
+            )
+
+        cases = [
+            ([], 1, 64),
+            ([1], 6, 64),
+            ([8, 31, 80], 1, 1),
+            ([12, 31, 80], 2, 64),
+            ([(i % 17) + 4 for i in range(16)], 4, 64),
+        ]
+        for seq_lens, qo_len, real_page_size in cases:
+            with self.subTest(
+                batch_size=len(seq_lens),
+                qo_len=qo_len,
+                real_page_size=real_page_size,
+            ):
+                generic = run_case(seq_lens, qo_len, real_page_size, uniform=False)
+                specialized = run_case(seq_lens, qo_len, real_page_size, uniform=True)
+                for index, (actual, expected) in enumerate(
+                    zip(specialized, generic, strict=True)
+                ):
+                    _assert_equal(actual, expected, f"uniform output {index}")
 
 
 if __name__ == "__main__":
