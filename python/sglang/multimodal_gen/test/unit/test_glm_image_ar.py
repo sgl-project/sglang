@@ -68,6 +68,9 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
             srt_encoder_timeout=100,
         )
 
+    def setUp(self):
+        set_global_server_args(self._server_args())
+
     @patch(
         "sglang.multimodal_gen.runtime.pipelines_core.stages."
         "model_specific_stages.glm_image.get_local_torch_device",
@@ -364,6 +367,84 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
             response["usage"]["prompt_tokens_details"], {"cached_tokens": 5}
         )
         self.assertNotIn("cached_tokens", response["usage"])
+
+    def test_grouped_srt_ar_uses_default_device(self):
+        set_global_server_args(self._server_args())
+        stage = GlmImageAR(processor=_FakeProcessor(), vision_language_encoder=None)
+        stage.generate_prior_tokens_batch = MagicMock(
+            return_value=(
+                [torch.zeros((1, 4096), dtype=torch.int64) for _ in range(2)],
+                [None, None],
+            )
+        )
+        batches = [
+            SimpleNamespace(
+                prompt="A simple product sketch",
+                image_path=None,
+                num_outputs_per_prompt=1,
+                seed=42,
+                height=1024,
+                width=1024,
+                metrics=None,
+                extra={},
+            ),
+            SimpleNamespace(
+                prompt="A bright package mockup",
+                image_path=None,
+                num_outputs_per_prompt=1,
+                seed=43,
+                height=1024,
+                width=1024,
+                metrics=None,
+                extra={},
+            ),
+        ]
+
+        prepared = stage.run_grouped_requests(batches, self._server_args())
+
+        call_kwargs = stage.generate_prior_tokens_batch.call_args.kwargs
+        self.assertIsNone(call_kwargs["device"])
+        self.assertEqual(
+            [batch.prior_token_id.device.type for batch in prepared], ["cpu", "cpu"]
+        )
+        self.assertEqual(
+            [batch.prior_token_id.shape for batch in prepared],
+            [(1, 4096), (1, 4096)],
+        )
+
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages."
+        "model_specific_stages.glm_image.get_local_torch_device",
+        return_value=torch.device("cuda"),
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages."
+        "model_specific_stages.glm_image.requests.post"
+    )
+    def test_single_srt_ar_prefetch_uses_cpu_batch_path(self, mock_post, _mock_device):
+        mock_post.return_value = _FakeBatchResponse([{"output_ids": list(range(1025))}])
+        stage = GlmImageAR(processor=_FakeProcessor(), vision_language_encoder=None)
+        batches = [
+            SimpleNamespace(
+                prompt="A simple product sketch",
+                image_path=None,
+                num_outputs_per_prompt=1,
+                seed=42,
+                height=1024,
+                width=1024,
+                metrics=None,
+                extra={},
+            )
+        ]
+
+        prepared = stage.prepare_external_ar_group(
+            batches, self._server_args(), device=torch.device("cpu")
+        )
+
+        payload = mock_post.call_args.kwargs["json"]
+        self.assertEqual(len(payload["input_ids"]), 1)
+        self.assertEqual(prepared[0].prior_token_id.device.type, "cpu")
+        self.assertEqual(prepared[0].prior_token_id.shape, (1, 4096))
 
 
 if __name__ == "__main__":
