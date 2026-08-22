@@ -13,8 +13,9 @@ import torch
 from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
     flash_decode_with_gqa_share_sparse,
 )
+from sglang.srt.utils import get_device
 
-DEVICE = "cuda"
+DEVICE = get_device()
 RTOL = 5e-3
 ATOL = 5e-3
 
