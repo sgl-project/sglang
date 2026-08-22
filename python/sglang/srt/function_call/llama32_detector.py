@@ -104,6 +104,9 @@ class Llama32Detector(BaseFormatDetector):
 
         # Only process if we found valid JSON objects
         calls = self.parse_base_json(all_actions, tools) if all_actions else []
+        if not calls:
+            return StreamingParseResult(normal_text=text, calls=[])
+
         # Use safe_idx to avoid idx containing the last part of an invalid JSON object
         trailing_text = (
             action_text[safe_idx:].strip() if safe_idx < action_text_len else ""
