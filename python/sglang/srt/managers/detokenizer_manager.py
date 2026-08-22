@@ -143,6 +143,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
         self.disable_tokenizer_batch_decode = server_args.disable_tokenizer_batch_decode
         self.is_tool_call_parser_gpt_oss = get_serving().tool_call_parser == "gpt-oss"
+        self.is_tool_call_parser_apertus2509 = (
+            get_serving().tool_call_parser == "apertus2509"
+        )
 
         self.soft_watchdog = Watchdog.create(
             debug_name="DetokenizerManager",
@@ -198,8 +201,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         if isinstance(matched, int) and isinstance(output, list):
             if no_stop_trim:
                 return output
-            # 200012 <|call|> is the tool call token and one of eos tokens for gpt-oss model
-            if output[-1] == 200012 and self.is_tool_call_parser_gpt_oss:
+            # These tool-call delimiters are also EOS tokens and must reach their parsers.
+            if (output[-1] == 200012 and self.is_tool_call_parser_gpt_oss) or (
+                output[-1] == 72 and self.is_tool_call_parser_apertus2509
+            ):
                 return output
             assert len(output) > 0
             # NOTE: We can always assume the last token is the matched stop token

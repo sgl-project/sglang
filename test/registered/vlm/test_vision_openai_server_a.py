@@ -17,6 +17,8 @@ from sglang.test.test_utils import (
 )
 from sglang.test.vlm_utils import (
     IMAGE_MAN_IRONING_URL,
+    AUDIO_TRUMP_SPEECH_URL,
+    IMAGE_SGL_LOGO_URL,
     AudioOpenAITestMixin,
     CustomTestCase,
     ImageOpenAITestMixin,
