@@ -5378,6 +5378,7 @@ class Scheduler(
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         assert recv_req.mode in ("in_place", "retract")
+
         self._engine_paused = True
 
         if recv_req.mode == "in_place":
