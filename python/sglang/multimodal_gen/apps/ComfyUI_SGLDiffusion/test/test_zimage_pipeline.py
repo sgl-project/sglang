@@ -1,4 +1,4 @@
-"""Test for ComfyUIZImagePipeline with pass-through scheduler."""
+"""Test for ZImagePipeline with pass-through scheduler."""
 
 import os
 import sys
@@ -12,7 +12,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 
 
 def test_comfyui_zimage_pipeline_direct() -> None:
-    """Test ComfyUIZImagePipeline with custom inputs."""
+    """Test ZImagePipeline with custom inputs."""
     model_path = os.environ.get(
         "SGLANG_TEST_ZIMAGE_MODEL_PATH",
         "Tongyi-MAI/Z-Image-Turbo",  # Supports both safetensors file and diffusers format
@@ -20,7 +20,7 @@ def test_comfyui_zimage_pipeline_direct() -> None:
 
     generator = DiffGenerator.from_pretrained(
         model_path=model_path,
-        pipeline_class_name="ComfyUIZImagePipeline",
+        pipeline_class_name="ZImagePipeline",
         num_gpus=1,
         sp_degree=1,
         comfyui_mode=True,
@@ -77,6 +77,7 @@ def test_comfyui_zimage_pipeline_direct() -> None:
     req.latents = latents
     req.timesteps = timesteps
     req.prompt_embeds = [context]
+    req.prompt_seq_lens = [[context_seq_len]]
     req.negative_prompt_embeds = None
     req.raw_latent_shape = torch.tensor(latents.shape, dtype=torch.long)
 

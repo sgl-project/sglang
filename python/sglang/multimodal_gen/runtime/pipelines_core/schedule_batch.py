@@ -147,7 +147,7 @@ class Req:
     raw_latent_shape: torch.Tensor | None = None
     did_sp_shard_latents: bool = False
     sp_video_start_frame: int = 0
-    noise_pred: torch.Tensor | None = None
+    noise_pred: torch.Tensor | list | tuple | None = None
     # vae-encoded condition image
     image_latent: torch.Tensor | list[torch.Tensor] | None = None
     condition_image_latent_ids: torch.Tensor | list[torch.Tensor] | None = None
@@ -465,7 +465,7 @@ class OutputBatch:
     metrics_list: Optional[list[Optional[RequestMetrics]]] = None
 
     # For ComfyUI integration: noise prediction from denoising stage
-    noise_pred: torch.Tensor | None = None
+    noise_pred: torch.Tensor | list | tuple | None = None
     peak_memory_mb: float = 0.0
     usage: dict[str, Any] | None = None
 

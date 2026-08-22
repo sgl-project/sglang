@@ -85,6 +85,7 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
     norm_eps: float = 1e-5
     qk_norm_eps: float = 1e-5
     final_norm_eps: float = 1e-5
+    qkv_checkpoint_grouped: bool = True
 
     def __post_init__(self) -> None:
         super().__post_init__()
