@@ -9,7 +9,7 @@ Use this skill when measuring denoise performance, finding the slow op, checking
 
 This skill is diagnosis-first. It owns:
 - checked-in denoise benchmark presets
-- same-GPU Eager/BCG x `quality=lossless|high` ABBA comparisons
+- same-GPU quality/BCG applicability checks with repeated lossless and high rows
 - perf dump collection and before/after comparison
 - `torch.profiler` trace capture and quick hotspot ranking
 - mapping hot kernels back to known fast paths and fusion families
@@ -53,7 +53,7 @@ If any benchmark, perf-dump, or `torch.profiler` command prints one of those sig
 - [benchmark-and-profile.md](benchmark-and-profile.md) — canonical denoise benchmark, perf dump, and `torch.profiler` workflow; uses checked-in nightly-aligned presets plus current-source extras such as LongCat-Image, SANA-Video, LingBot Video MoE, Cosmos3 Edge/distilled, LTX-2.5 and its diffusion decoder, MiniMax-H3, FLUX.2 Klein, Ideogram4, ERNIE/GLM/SANA image models, FastWan2.1/2.2, `LTX-2.3`, HunyuanVideo, MOVA, Helios, image edit, and Hunyuan3D shape
 - [existing-fast-paths.md](existing-fast-paths.md) — map bottlenecks to existing fused kernels, packed QKV paths, fused `QK norm + RoPE`, distributed overlap patterns, and open optimization PRs before proposing new code
 - [scripts/diffusion_skill_env.py](scripts/diffusion_skill_env.py) — preflight helper: repo root discovery from the skill's owning checkout before falling back to `sglang.__file__`, write-access probe, benchmark/profile output directories, idle GPU selection
-- [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark preset runner via `sglang generate`; defaults to eager/lossless, supports explicit quality and BCG comparators plus a same-GPU four-mode ABBA matrix, rejects invalid BCG capture/fallback logs, forces H3 to its eager consistency mode, enables synchronized stage attribution, validates nightly preset drift, and can clean one isolated model cache after the full matrix in a `finally` block with a JSONL ledger
+- [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark preset runner via `sglang generate`; defaults to eager/lossless, supports explicit quality and BCG comparators plus a same-GPU applicability matrix, rejects invalid BCG capture/fallback logs and late high-quality DiT fusion mounts, forces H3 to its eager consistency mode, enables synchronized stage attribution, validates nightly preset drift, and can clean one isolated model cache after the full matrix in a `finally` block with a JSONL ledger
 
 ## Opportunity Discovery Rule
 
@@ -93,14 +93,18 @@ The checked-in helper defaults to eager. Use `--torch-compile` only for a
 controlled comparator, never for the eager ground truth. The legacy
 `--no-torch-compile` spelling remains accepted but is redundant.
 
-For kernel/BCG discovery, run `--quality-bcg-matrix`. It executes
-Eager/BCG as A-B-B-A at `lossless`, then repeats the pair at `high`, on one
-locked GPU set and one isolated checkpoint cache. A BCG row is invalid unless
-the log contains `[Diffusion BCG] captured` and contains no support-disable,
-capture-failure, or serving-signature-miss marker. `--warmup-resolutions`
-only declares width and height: a video request can still miss because its
-frame count differs from the model's synthetic warmup contract. Treat that as
-Eager fallback, not as a valid BCG measurement.
+For kernel/BCG discovery, run `--quality-bcg-matrix`. It executes Eager/BCG as
+A-B-B-A at `lossless`, then repeats the pair at `high`, on one locked GPU set
+and one isolated checkpoint cache. The high+BCG rows are applicability checks,
+not presumed-valid performance cells. A BCG row is invalid unless the log
+contains `[Diffusion BCG] captured` and contains no support-disable,
+capture-failure, serving-signature-miss, or late quality-fusion marker. In
+particular, a request-scoped DiT fusion mounted after lossless warmup capture
+would be bypassed by replay; reject that row even when capture and signature
+checks pass. `--warmup-resolutions` only declares width and height: a video
+request can still miss because its frame count differs from the model's
+synthetic warmup contract. Treat that as Eager fallback, not as a valid BCG
+measurement.
 
 A zero process exit is not sufficient evidence: every accepted row must also
 contain its requested perf dump and a generated image, video, or audio file.
