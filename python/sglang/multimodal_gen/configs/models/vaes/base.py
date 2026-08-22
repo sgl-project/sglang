@@ -89,6 +89,7 @@ class VAEConfig(ModelConfig):
     use_tiling: bool = True
     use_temporal_tiling: bool = True
     use_parallel_tiling: bool = True
+    use_parallel_encode: bool = False
     use_temporal_scaling_frames: bool = True
     use_parallel_decode: bool = True
     parallel_decode_mode: str = AUTO_PARALLEL_DECODE_MODE
