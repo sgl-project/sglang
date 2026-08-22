@@ -445,7 +445,9 @@ def try_load_rank_local_tp_state_dict(
         else:
             supported, shard_dim = _resolve_tp_shard_dim(actual_param)
             output_sizes = _merged_output_sizes(actual_param)
-            if output_sizes is not None and any(size % tp_size for size in output_sizes):
+            if output_sizes is not None and any(
+                size % tp_size for size in output_sizes
+            ):
                 return None
         if not supported:
             return None

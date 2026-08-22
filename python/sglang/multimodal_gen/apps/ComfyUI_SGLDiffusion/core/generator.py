@@ -55,7 +55,11 @@ def _h3_detect_companion(gguf_ref: str) -> str:
             "minimax_h3_ref2va_bf16.safetensors",
         ]
     )
-    folders = [os.path.dirname(os.path.abspath(gguf_ref))] if os.path.dirname(gguf_ref) else []
+    folders = (
+        [os.path.dirname(os.path.abspath(gguf_ref))]
+        if os.path.dirname(gguf_ref)
+        else []
+    )
     try:
         import folder_paths
 
@@ -293,7 +297,9 @@ class SGLDiffusionGenerator:
                     proc.kill()
                     proc.join(timeout=2)
             except Exception:
-                logger.warning("Failed to terminate SGLD worker %r", proc, exc_info=True)
+                logger.warning(
+                    "Failed to terminate SGLD worker %r", proc, exc_info=True
+                )
 
     def close_generator(self):
         """Close and cleanup the generator and all associated resources."""
@@ -393,9 +399,7 @@ class SGLDiffusionGenerator:
             sgld_options.pop("transformer_weights_path", None)
         detect_path = model_path
         if _looks_like_gguf(model_path):
-            detect_path = _h3_detect_companion(
-                sgld_options["transformer_weights_path"]
-            )
+            detect_path = _h3_detect_companion(sgld_options["transformer_weights_path"])
         gather_options = {
             "model_path": detect_path,
             "model_options": model_options,

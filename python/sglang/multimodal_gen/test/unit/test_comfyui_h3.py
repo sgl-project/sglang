@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """MiniMax-H3 ComfyUI contracts: layout, adapter, step kwargs, profile, QKV."""
+
 from __future__ import annotations
 
 import math
@@ -308,7 +309,13 @@ def test_fl2va_first_last_used_prefix_matches_comfyui():
         frame_count=frame_count,
     )
     _assert_used_prefix_aligned(comfy, packed)
-    assert [k for _, _, k in comfy.segments] == ["text", "cond", "cond", "audio", "video"]
+    assert [k for _, _, k in comfy.segments] == [
+        "text",
+        "cond",
+        "cond",
+        "audio",
+        "video",
+    ]
 
 
 def test_ref2va_image_plus_video_audio_used_prefix_matches_comfyui():
@@ -423,7 +430,8 @@ def test_translated_layout_covers_keyframe_audio_and_arbitrary_idx():
 
 
 @pytest.mark.xfail(
-    strict=True, reason="D3: ComfyUI does not pad; SGLD pads seq_len to a multiple of 64"
+    strict=True,
+    reason="D3: ComfyUI does not pad; SGLD pads seq_len to a multiple of 64",
 )
 def test_gap_sgld_pads_seq_len_to_64():
     kwargs = dict(text_len=8, latent_t=2, latent_h=4, latent_w=4, audio_t=3)
@@ -583,12 +591,12 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.comfyui_step import (
     build_step_forward_kwargs,
     comfyui_payload_to_branch_inputs,
-    pack_comfy_output,
     pack_audio,
+    pack_comfy_output,
     patchify_video,
     serialize_comfyui_layout,
-    unpatchify_video,
     unpack_audio,
+    unpatchify_video,
 )
 
 
@@ -689,7 +697,9 @@ def test_pack_comfy_output_crops_to_unpadded_shape():
 
 
 def test_patchify_roundtrip():
-    video = torch.arange(1 * 24 * 2 * 4 * 4, dtype=torch.float32).reshape(1, 24, 2, 4, 4)
+    video = torch.arange(1 * 24 * 2 * 4 * 4, dtype=torch.float32).reshape(
+        1, 24, 2, 4, 4
+    )
     rows = patchify_video(video)
     restored = unpatchify_video(rows, 2, 2, 2)
     assert torch.equal(restored, video)
@@ -798,8 +808,12 @@ def test_per_frame_denoise_mask_overlays_only_video_targets():
     target_ts = unique[inverse[branch.img_target_seq_idx]]
     frame0 = target_ts[:4]
     frame1 = target_ts[4:]
-    assert torch.allclose(frame0, torch.full_like(frame0, 1.0 - 1.0 * sigma_v), atol=1e-5)
-    assert torch.allclose(frame1, torch.full_like(frame1, 1.0 - 0.25 * sigma_v), atol=1e-5)
+    assert torch.allclose(
+        frame0, torch.full_like(frame0, 1.0 - 1.0 * sigma_v), atol=1e-5
+    )
+    assert torch.allclose(
+        frame1, torch.full_like(frame1, 1.0 - 0.25 * sigma_v), atol=1e-5
+    )
 
 
 def test_ref2va_image_forward_kwargs_are_supported():
@@ -856,7 +870,9 @@ def test_optional_gpu_step_output_shapes():
 
 # --- profile ---
 
-from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import MiniMaxH3Pipeline
+from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
+    MiniMaxH3Pipeline,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.comfyui_mode import (
     create_comfyui_pipeline_stages,
 )
@@ -928,7 +944,9 @@ def test_h3_profile_hook_installs_step_stage(monkeypatch):
 def test_comfyui_transformer_load_uses_gguf_override(monkeypatch):
     from types import SimpleNamespace
 
-    from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import spec as comfyui_checkpoints_spec
+    from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (
+        spec as comfyui_checkpoints_spec,
+    )
 
     called = {}
 
