@@ -15,6 +15,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
     topk_ids_logical_to_physical,
 )
 from sglang.srt.layers.moe.topk import (
+    _RENORMALIZE_SUM_EPSILON,
     StandardTopKOutput,
     TopKConfig,
     _mask_topk_ids_padded_region,
@@ -156,7 +157,10 @@ class HashTopK(nn.Module):
             topk_weights[:, :-1] = scores.gather(1, topk_ids[:, :-1])
 
             if self.score_func != "softmax":
-                topk_weights[:, :-1] /= topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+                topk_weights[:, :-1] /= (
+                    topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+                    + _RENORMALIZE_SUM_EPSILON
+                )
 
             topk_ids[:, -1] = torch.randint(
                 low=self.num_experts,
@@ -173,7 +177,10 @@ class HashTopK(nn.Module):
             topk_ids[:, :] = self.tid2eid[input_ids]
             topk_weights[:, :] = scores.gather(1, topk_ids[:, :])
             if self.score_func != "softmax":
-                topk_weights[:, :] /= topk_weights[:, :].sum(dim=-1, keepdim=True)
+                topk_weights[:, :] /= (
+                    topk_weights[:, :].sum(dim=-1, keepdim=True)
+                    + _RENORMALIZE_SUM_EPSILON
+                )
 
         return topk_weights, topk_ids
 
