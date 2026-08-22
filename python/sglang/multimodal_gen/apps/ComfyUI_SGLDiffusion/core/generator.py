@@ -2,10 +2,10 @@
 Generator for SGLang Diffusion ComfyUI integration.
 """
 
+import atexit
 import logging
 import os
 
-import psutil
 from comfy import model_detection, model_management
 from comfy.patcher_extension import WrappersMP
 from comfy.utils import (
@@ -123,14 +123,26 @@ _EXECUTOR_CLASSES = (
 )
 
 
+_SHARED = None
+_ATEXIT_REGISTERED = False
+
+
 class SGLDiffusionGenerator:
-    """Generator for SGLang Diffusion models in ComfyUI."""
+    """Process-wide owner of the one live SGLD worker.
+
+    ComfyUI keeps one ``SGLDUNETLoader`` per node and may reuse a cached
+    ``MODEL`` after another graph has already replaced the worker.
+    ``sync_scheduler_client`` is also a process singleton, so a second
+    ``DiffGenerator`` cannot coexist. All loaders share this object; a
+    stale executor rebinds itself on the next forward.
+    """
 
     def __init__(self):
         self.model_path = None
         self.generator = None
         self.executor = None
         self.last_options = None
+        self._patcher = None
 
         # Native pipelines, run under comfyui_mode as a DiT-only forward service.
         self.pipeline_class_dict = {}
@@ -142,8 +154,28 @@ class SGLDiffusionGenerator:
                     executor_cls.adapter_cls.pipeline_class_name
                 )
 
-    def __del__(self):
-        self.close_generator()
+    @classmethod
+    def shared(cls):
+        global _SHARED, _ATEXIT_REGISTERED
+        if _SHARED is None:
+            _SHARED = cls()
+            if not _ATEXIT_REGISTERED:
+                atexit.register(cls._atexit_close)
+                _ATEXIT_REGISTERED = True
+        return _SHARED
+
+    @classmethod
+    def reset_shared(cls):
+        """Test helper: drop the process singleton after closing it."""
+        global _SHARED
+        if _SHARED is not None:
+            _SHARED.close_generator()
+            _SHARED = None
+
+    @classmethod
+    def _atexit_close(cls):
+        if _SHARED is not None:
+            _SHARED.close_generator()
 
     def init_generator(
         self, model_path: str, pipeline_class_name: str, kwargs: dict = None
@@ -185,55 +217,97 @@ class SGLDiffusionGenerator:
             cleaned[dest] = value
         return cleaned
 
-    def kill_generator(self):
-        """Kill worker processes manually because generator shutdown cannot terminate them."""
-        current_pid = os.getpid()
-        worker_processes = []
-        for proc in psutil.process_iter(["pid", "name", "cmdline"]):
-            try:
-                # Look for sglang-diffusionWorker processes
-                if proc.info["cmdline"]:
-                    cmdline = " ".join(proc.info["cmdline"])
-                    if "sgl_diffusion::" in cmdline:
-                        if proc.info["pid"] != current_pid:
-                            worker_processes.append(proc)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
+    def _worker_processes(self):
+        gen = self.generator
+        if gen is None:
+            return []
+        return list(getattr(gen, "local_scheduler_process", None) or [])
 
-        if worker_processes:
-            logger.info(
-                f"Found {len(worker_processes)} worker processes to terminate..."
+    def _is_live(self) -> bool:
+        """True when this owner still has a usable worker + scheduler client."""
+        if self.generator is None:
+            return False
+        try:
+            from sglang.multimodal_gen.runtime.scheduler_client import (
+                sync_scheduler_client,
             )
-            for proc in worker_processes:
-                try:
-                    logger.info(
-                        f"Terminating worker process {proc.info['pid']}: {proc.info['name']}"
-                    )
-                    proc.terminate()
-                    proc.wait(timeout=5)
-                except psutil.TimeoutExpired:
-                    logger.warning(
-                        f"Process {proc.info['pid']} did not terminate, forcing kill..."
-                    )
-                    try:
-                        proc.kill()
-                        proc.wait(timeout=2)
-                    except (psutil.NoSuchProcess, psutil.TimeoutExpired):
-                        pass
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
+        except ImportError:
+            return False
+        ctx = getattr(sync_scheduler_client, "context", None)
+        if ctx is None or getattr(ctx, "closed", False):
+            return False
+        workers = self._worker_processes()
+        if workers and not all(proc.is_alive() for proc in workers):
+            return False
+        return True
+
+    def _can_reuse(self, gather_options: dict) -> bool:
+        return (
+            self.last_options is not None
+            and self.last_options == gather_options
+            and self.generator is not None
+            and getattr(self, "_patcher", None) is not None
+            and self.executor is not None
+            and self._is_live()
+        )
+
+    def _owns_live(self, executor) -> bool:
+        return (
+            executor is not None
+            and self.generator is not None
+            and executor.generator is self.generator
+            and self._is_live()
+        )
+
+    def ensure_executor(self, executor) -> None:
+        """Rebuild the worker if this cached executor no longer owns it."""
+        if self._owns_live(executor):
+            return
+        reload = getattr(executor, "_sgld_reload", None)
+        if not reload:
+            raise RuntimeError(
+                "SGLD worker is down and this executor has no reload spec"
+            )
+        logger.info(
+            "Rebuilding SGLD worker for %s (previous worker was replaced or died)",
+            reload.get("model_path"),
+        )
+        self.load_model(**reload)
+        executor.generator = self.generator
+        lora = getattr(executor, "_lora_input", None)
+        if lora and lora.get("lora_nickname"):
+            executor.set_lora(**lora)
+
+    def kill_generator(self):
+        """Force-stop workers this owner started. Do not scan the process table."""
+        for proc in self._worker_processes():
+            if proc is None:
+                continue
+            try:
+                if not proc.is_alive():
+                    continue
+                logger.info("Terminating SGLD worker pid=%s", getattr(proc, "pid", "?"))
+                proc.terminate()
+                proc.join(timeout=5)
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join(timeout=2)
+            except Exception:
+                logger.warning("Failed to terminate SGLD worker %r", proc, exc_info=True)
 
     def close_generator(self):
         """Close and cleanup the generator and all associated resources."""
         if self.generator is not None:
-            self.generator.shutdown()
+            try:
+                self.generator.shutdown()
+            except Exception:
+                logger.warning("DiffGenerator.shutdown failed", exc_info=True)
             self.kill_generator()
-            # Clear other references
-            self.last_options = None
-            self.model_path = None
-            self.generator = None
-            self.executor = None
-            self._patcher = None
+        self.last_options = None
+        self.model_path = None
+        self.generator = None
+        self.executor = None
+        self._patcher = None
 
     def get_comfyui_model(self, model_path: str, model_options: dict = None):
         """Get ComfyUI model from model path."""
@@ -298,8 +372,14 @@ class SGLDiffusionGenerator:
         self, model_path: str, model_options: dict = None, sgld_options: dict = None
     ):
         """Load model and return model patcher."""
-        sgld_options = dict(sgld_options) if sgld_options else {}
-        model_options = dict(model_options) if model_options else {}
+        raw_sgld_options = dict(sgld_options) if sgld_options else {}
+        reload_kwargs = {
+            "model_path": model_path,
+            "model_options": dict(model_options) if model_options else {},
+            "sgld_options": raw_sgld_options,
+        }
+        sgld_options = dict(raw_sgld_options)
+        model_options = dict(reload_kwargs["model_options"])
         plugin_flags = {}
         if "enable_cache_dit" in sgld_options:
             plugin_flags["enable_cache_dit"] = sgld_options.pop("enable_cache_dit")
@@ -322,13 +402,7 @@ class SGLDiffusionGenerator:
             "sgld_options": sgld_options,
             "set_model_type": set_model_type,
         }
-        if (
-            self.last_options is not None
-            and self.last_options == gather_options
-            and self.generator is not None
-            and getattr(self, "_patcher", None) is not None
-            and self.executor is not None
-        ):
+        if self._can_reuse(gather_options):
             self.executor.enable_cache_dit = plugin_flags.get("enable_cache_dit")
             return self._patcher
 
@@ -354,6 +428,8 @@ class SGLDiffusionGenerator:
             self.generator, detect_path, comfyui_model, model_config
         )
         self.executor.enable_cache_dit = plugin_flags.get("enable_cache_dit")
+        self.executor._sgld_reload = reload_kwargs
+        self.executor._ensure_runtime = self.ensure_executor
         comfyui_model.diffusion_model = self.executor
 
         load_device = model_management.get_torch_device()
