@@ -276,7 +276,7 @@ def _split_dim_absorbed_extend_kernel(
     for start_n in range(0, extend_end, BLOCK_N):
         col = start_n + col_offsets
         col_mask = col < extend_end
-        token = (q_start + col).to(tl.int64) 
+        token = (q_start + col).to(tl.int64)
         k_base = token[None, :] * stride_kt
         k0 = tl.load(
             K_Extend + k_base + group[:, None],
