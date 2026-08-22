@@ -15,13 +15,18 @@ const CONSUMER_SINGLE = ["rtx4070", "rtx4080", "rtx4090"];
 const CONSUMER_VRAM_16_PLUS = ["rtx4080", "rtx4090"];
 
 function consumerFlags(s) {
-  const flags = ["--layerwise-offload-components dit,text_encoder,vae"];
-  if (CONSUMER_VRAM_16_PLUS.includes(s.hw)) {
-    // 9 GB of VAE blocks held on the device turn the 3.5 min streamed decode
-    // into 13 s. At 12 GB the decode's own activations need that room: the
-    // denoise completes and the decode OOMs, so the flag is 16 GB and up.
-    flags.push("--layerwise-resident-layers video_vae=36");
-    if (s.host_ram === "ram96") flags.push("--dit-layerwise-resident-layers 4");
+  // Two thirds of the video decoder held for the decode only: residency arms
+  // at the decoder's first block and releases when it finishes, so the
+  // denoise still runs on an empty card, and the decode drops from 209 s to
+  // ~60 s. All 36 blocks fit neither 12 GB nor a busy 16 GB -- the decode's
+  // own activations need the rest -- and measured on 16 GB they also slow the
+  // denoise; 24 is the measured setting for both.
+  const flags = [
+    "--layerwise-offload-components dit,text_encoder,vae",
+    "--layerwise-resident-layers video_vae=24",
+  ];
+  if (CONSUMER_VRAM_16_PLUS.includes(s.hw) && s.host_ram === "ram96") {
+    flags.push("--dit-layerwise-resident-layers 4");
   }
   return flags;
 }
@@ -38,11 +43,8 @@ function consumerHints(s) {
     }
     return hints;
   }
-  if (CONSUMER_VRAM_16_PLUS.includes(s.hw)) {
-    hints.push("measured: ~17-18 s per denoise step, 13 s decode with the VAE blocks held");
-  } else {
-    hints.push("measured: ~17-18 s per denoise step; the decode streams (~3.5 min); output verified end to end");
-  }
+  hints.push("measured: ~10.5-11.3 s per denoise step, ~60 s decode, 279-283 s per request; output verified end to end");
+  hints.push("run with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -- the decode sits close enough to the cap that fragmentation otherwise tips it over");
   if (midHost) {
     hints.push("48-64 GB hosts land between the 32 GB and 96 GB figures; this tier is not individually verified");
   } else {
