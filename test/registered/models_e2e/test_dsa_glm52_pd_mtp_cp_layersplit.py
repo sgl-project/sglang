@@ -22,6 +22,8 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 
 register_cuda_ci(est_time=750, stage="base-c", runner_config="8-gpu-b300")
 
+MODEL_LOADER_EXTRA_CONFIG = '{"enable_multithread_load": true, "num_threads": 6}'
+
 
 class TestGLM52DSACacheLayerSplit(PDDisaggregationServerBase, GSM8KMixin):
     model = "nvidia/GLM-5.2-NVFP4"
@@ -49,6 +51,8 @@ class TestGLM52DSACacheLayerSplit(PDDisaggregationServerBase, GSM8KMixin):
         "interleave",
         "--mem-fraction-static",
         "0.85",
+        "--model-loader-extra-config",
+        MODEL_LOADER_EXTRA_CONFIG,
         "--chunked-prefill-size",
         "4096",
         "--max-prefill-tokens",
@@ -73,6 +77,8 @@ class TestGLM52DSACacheLayerSplit(PDDisaggregationServerBase, GSM8KMixin):
         "fp8_e4m3",
         "--mem-fraction-static",
         "0.85",
+        "--model-loader-extra-config",
+        MODEL_LOADER_EXTRA_CONFIG,
         "--speculative-algorithm",
         "EAGLE",
         "--speculative-num-steps",
