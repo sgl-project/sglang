@@ -52,14 +52,17 @@ def make_backend(
     sglang_backend,
 ):
 
-    if current_platform.is_out_of_tree():
-        backend_cls = current_platform.get_piecewise_backend_cls()
-    elif is_xpu():
-        backend_cls = XPUPiecewiseBackend
-    elif is_npu():
-        backend_cls = NPUPiecewiseBackend
-    else:
-        backend_cls = CUDAPiecewiseBackend
+    # A platform-provided piecewise backend wins; in-tree platforms return
+    # None and fall back to the device-keyed defaults until they grow the
+    # hook (the is_npu branch moves into NpuSRTPlatform once it lands).
+    backend_cls = current_platform.get_piecewise_backend_cls()
+    if backend_cls is None:
+        if is_xpu():
+            backend_cls = XPUPiecewiseBackend
+        elif is_npu():
+            backend_cls = NPUPiecewiseBackend
+        else:
+            backend_cls = CUDAPiecewiseBackend
     return backend_cls(
         graph,
         compile_config,

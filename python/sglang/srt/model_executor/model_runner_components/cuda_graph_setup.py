@@ -460,10 +460,11 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         f"bs={capture_bs}, avail mem={before_mem:.2f} GB"
     )
 
-    if current_platform.is_out_of_tree():
-        GraphRunnerCls = current_platform.get_graph_runner_cls()
-        runner = GraphRunnerCls(model_runner)
-    else:
+    # A platform-provided graph runner wins; in-tree platforms return None
+    # and fall back to the device-keyed defaults until they grow the hook
+    # (the "npu" entry moves into NpuSRTPlatform once it lands).
+    GraphRunnerCls = current_platform.get_graph_runner_cls()
+    if GraphRunnerCls is None:
         graph_runners = defaultdict(
             model_runner._decode_cuda_graph_runner_cls,
             {
@@ -472,7 +473,8 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
                 "xpu": XPUGraphRunner,
             },
         )
-        runner = graph_runners[model_runner.device](model_runner)
+        GraphRunnerCls = graph_runners[model_runner.device]
+    runner = GraphRunnerCls(model_runner)
 
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
     memory_usage_gb = before_mem - after_mem
