@@ -1,5 +1,6 @@
 """CPU unit tests for MXFP8 activation-preparation dispatch."""
 
+import importlib
 import unittest
 from unittest.mock import patch
 
@@ -12,6 +13,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+per_token_group_quant_module = importlib.import_module(
+    "sglang.kernels.ops.quantization.per_token_group_quant"
+)
 
 
 class TestMxfp4FlashinferActivationPrep(CustomTestCase):
@@ -51,8 +56,8 @@ class TestMxfp4FlashinferActivationPrep(CustomTestCase):
         ), patch(
             "sglang.srt.layers.quantization.mxfp4._is_sm107_supported",
             return_value=False,
-        ), patch(
-            "sglang.kernels.ops.quantization.per_token_group_quant."
+        ), patch.object(
+            per_token_group_quant_module,
             "per_token_group_quant",
             return_value=(x_quant, x_scale),
         ) as quantize, patch(
