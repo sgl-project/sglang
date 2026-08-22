@@ -11,6 +11,7 @@
 // machine is the expectation, which the hints spell out per budget. Measured
 // on one RTX 4090 (denoise medians across interleaved runs, outputs verified
 // end to end); 48-64 GB hosts sit between the measured points.
+export const config = (() => {
 const CONSUMER_SINGLE = ["rtx4070", "rtx4080", "rtx4090"];
 const CONSUMER_VRAM_16_PLUS = ["rtx4080", "rtx4090"];
 
@@ -67,7 +68,7 @@ function consumerHints(s) {
   return hints;
 }
 
-export const config = {
+return {
   modelName: "MiniMax-H3",
 
   supportedHardware: [
@@ -85,8 +86,8 @@ export const config = {
   hardware: [
     { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "consumer" },
     { id: "rtx4090", label: "RTX 4090", vram: "24GB", vendor: "consumer" },
-    { id: "rtx4080", label: "16 GB class", vram: "16GB", vendor: "consumer" },
-    { id: "rtx4070", label: "12 GB class", vram: "12GB", vendor: "consumer" },
+    { id: "rtx4080", label: "RTX 4080", vram: "16GB", vendor: "consumer" },
+    { id: "rtx4070", label: "RTX 4070", vram: "12GB", vendor: "consumer" },
   ],
   groupHardware: false,
 
@@ -873,3 +874,4 @@ export const config = {
 
   cells: [],
 };
+})();
