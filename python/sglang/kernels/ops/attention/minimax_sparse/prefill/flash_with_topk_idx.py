@@ -484,6 +484,7 @@ def _index_block_score_only_kernel(
     page_size: tl.constexpr,  # paged-cache page size; block_size % page_size == 0
     PER_PAGE_SLOTS: tl.constexpr,  # derive slots from one base slot per page
     BLOCK_SIZE_KD: tl.constexpr,
+    IS_FP8: tl.constexpr,
 ):
     """Score-only variant of the index attention (ATOM-style).
 
@@ -580,6 +581,10 @@ def _index_block_score_only_kernel(
             mask=pos_mask[None, :],
             other=0.0,
         )
+        if IS_FP8:
+            # Widening dequant for an fp8 index-K cache with bf16 Q; exact
+            # no-op cast when Q is fp8 too. Compiled out for bf16 K.
+            k = k.to(q.dtype)
         qk = tl.dot(q, k) * sm_scale_log2e
         # single fused causal + K-boundary mask
         qk = tl.where(
@@ -718,6 +723,7 @@ def flash_prefill_with_topk_index(
             block_size=block_size_k,
             page_size=page_size,
             PER_PAGE_SLOTS=(block_size_k // page_size <= _MAX_PER_PAGE_SLOT_UNROLL),
+            IS_FP8=is_fp8,
         )
     else:
         _flash_attn_fwd_with_block_score_kernel[grid](

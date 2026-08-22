@@ -1478,7 +1478,11 @@ class KVCacheConfigurator:
             index_dtype=(
                 self.kv_cache_dtype
                 if m3_fp8_attn_gemm_enabled(self.server_args)
-                else self.model_dtype
+                else (
+                    torch.float8_e4m3fn
+                    if _is_hip and envs.SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE.get()
+                    else self.model_dtype
+                )
             ),
             head_num=self.model_config.get_num_kv_heads(
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
