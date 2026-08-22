@@ -1872,6 +1872,10 @@ class DeepseekV2AttentionMLA(
                     config=config,
                 )
 
+            if self.skip_topk:
+                for p in self.indexer.parameters():
+                    p._skip_weight_check = True
+
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
