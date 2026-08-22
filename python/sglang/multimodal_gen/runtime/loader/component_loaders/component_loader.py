@@ -34,11 +34,15 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    get_diffusers_component_config,
     get_hf_config,
     prepare_diffusers_component_path_for_loading,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
+from sglang.srt.model_loader.checkpoint_quantization import (
+    resolve_checkpoint_quant_spec,
+)
 
 logger = init_logger(__name__)
 
@@ -439,6 +443,36 @@ class ComponentLoader(ABC):
             component_name,
         )
         return GenericComponentLoader(transformers_or_diffusers, component_architecture)
+
+
+class PlainStateDictComponentLoader(ComponentLoader):
+    """Base for native loaders whose current materializer expects plain weights."""
+
+    @staticmethod
+    def ensure_plain_state_dict_checkpoint(config: object, component_name: str) -> None:
+        try:
+            quant_spec = resolve_checkpoint_quant_spec(config)
+        except (TypeError, ValueError) as error:
+            raise ComponentCheckpointUnsupportedError(
+                f"Cannot parse checkpoint quantization metadata for "
+                f"{component_name!r}: {error}"
+            ) from error
+        if quant_spec is None:
+            return
+
+        method = quant_spec.declared_method or "unspecified"
+        raise ComponentCheckpointUnsupportedError(
+            f"{component_name!r} checkpoint declares quantization metadata in "
+            f"{quant_spec.source} (quant_method={method!r}), which its current "
+            "plain state-dict materializer cannot restore."
+        )
+
+    def load_component_config(
+        self, component_model_path: str, component_name: str
+    ) -> dict[str, Any]:
+        config = get_diffusers_component_config(component_path=component_model_path)
+        self.ensure_plain_state_dict_checkpoint(config, component_name)
+        return config
 
 
 class ImageProcessorLoader(ComponentLoader):
