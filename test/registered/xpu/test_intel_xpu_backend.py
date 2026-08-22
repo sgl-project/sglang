@@ -73,12 +73,12 @@ class TestIntelXPUBackend(CustomTestCase):
         [
             "--json-model-override-args",
             '{"num_hidden_layers": 4}',
-            "--decode-attention-backend",
+            "--attention-backend",
             "intel_xpu",
         ],
         min_throughput=32,
     )
-    def test_mla_decode_attention_backend(self):
+    def test_mla_models_with_intel_xpu_attention_backend(self):
         return DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE
 
 
