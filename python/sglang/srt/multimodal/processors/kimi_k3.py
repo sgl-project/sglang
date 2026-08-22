@@ -11,7 +11,8 @@ at load time.
 import functools
 import math
 import re
-from typing import Dict, List, Optional, Union
+from dataclasses import dataclass
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import numpy as np
 import torch
@@ -72,6 +73,113 @@ def _encode_k3_special_tokens(tokenizer, text: str) -> list[int]:
         return list(tokenizer.encode(text))
 
 
+@dataclass(frozen=True)
+class _KimiK3VisualItem:
+    """One MoonViT input grid derived from an image or a video chunk."""
+
+    media_type: Literal["image", "video"]
+    frames: tuple[Any, ...]
+    source_index: int
+    in_patch_limit: int
+    timestamp_text: str = ""
+
+    @property
+    def size(self) -> tuple[int, int]:
+        return _get_image_dimensions(self.frames[0])
+
+
+def _format_k3_timestamp(timestamp: float, mode: str) -> str:
+    total_seconds = max(0, int(timestamp))
+    milliseconds = int((max(0.0, timestamp) % 1) * 1000)
+    hours = (total_seconds // 3600) % 24
+    minutes = (total_seconds // 60) % 60
+    seconds = total_seconds % 60
+    if mode == "hh:mm:ss.fff":
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
+    if mode == "mm:ss.fff":
+        return f"{(total_seconds // 60) % 60:02d}:{seconds:02d}.{milliseconds:03d}"
+    if mode == "mm:ss":
+        return f"{(total_seconds // 60) % 60:02d}:{seconds:02d}"
+    raise ValueError(f"Invalid Kimi-K3 timestamp mode: {mode}")
+
+
+def _video_frame_to_chw(frame):
+    if isinstance(frame, np.ndarray):
+        frame = torch.from_numpy(frame)
+    if isinstance(frame, torch.Tensor):
+        if frame.ndim != 3:
+            raise ValueError(f"Expected a 3D video frame, got shape {frame.shape}.")
+        if frame.shape[-1] in (1, 3, 4) and frame.shape[0] not in (1, 3, 4):
+            frame = frame.permute(2, 0, 1)
+        return frame.contiguous()
+    if isinstance(frame, Image.Image):
+        return frame
+    raise TypeError(f"Unsupported Kimi-K3 video frame type: {type(frame)}")
+
+
+def _split_k3_video(
+    video,
+    media_proc_cfg: dict,
+    source_index: int,
+) -> list[_KimiK3VisualItem]:
+    total_frames = len(video)
+    if total_frames <= 0:
+        raise ValueError("Kimi-K3 video input must contain at least one frame.")
+
+    avg_fps = float(getattr(video, "avg_fps", 0) or 0)
+    if avg_fps <= 0:
+        raise ValueError("Kimi-K3 video input must report a positive frame rate.")
+
+    sample_fps = min(float(media_proc_cfg.get("sample_fps", 8.0)), avg_fps)
+    sampled_nframes = max(round(total_frames * sample_fps / avg_fps), 1)
+    max_frames = media_proc_cfg.get("max_num_frames_each_video")
+    if max_frames is not None:
+        sampled_nframes = min(sampled_nframes, max(1, int(max_frames)))
+    sampled_nframes = min(sampled_nframes, total_frames)
+
+    frame_indices = (
+        np.linspace(0, total_frames - 1, sampled_nframes).round().astype(int).tolist()
+    )
+    if hasattr(video, "get_frames_as_tensor"):
+        decoded_frames = video.get_frames_as_tensor(frame_indices)
+    elif hasattr(video, "get_frames_at"):
+        decoded_frames = video.get_frames_at(frame_indices)
+    else:
+        decoded_frames = [video[index] for index in frame_indices]
+    frames = [_video_frame_to_chw(frame) for frame in decoded_frames]
+
+    temporal_merge = int(media_proc_cfg.get("temporal_merge_kernel_size", 4))
+    if temporal_merge < 1 or temporal_merge > 4:
+        raise ValueError("Kimi-K3 temporal_merge_kernel_size must be between 1 and 4.")
+
+    per_frame_limit = int(
+        media_proc_cfg.get("in_patch_limit_each_frame")
+        or media_proc_cfg["in_patch_limit"]
+    )
+    total_patch_limit = media_proc_cfg.get("in_patch_limit_video")
+    if total_patch_limit is not None:
+        per_frame_limit = min(
+            per_frame_limit,
+            max(1, round(int(total_patch_limit) / sampled_nframes)),
+        )
+
+    timestamp_mode = media_proc_cfg.get("timestamp_mode", "hh:mm:ss.fff")
+    chunks = []
+    for start in range(0, sampled_nframes, temporal_merge):
+        chunks.append(
+            _KimiK3VisualItem(
+                media_type="video",
+                frames=tuple(frames[start : start + temporal_merge]),
+                source_index=source_index,
+                in_patch_limit=per_frame_limit,
+                timestamp_text=_format_k3_timestamp(
+                    frame_indices[start] / avg_fps, timestamp_mode
+                ),
+            )
+        )
+    return chunks
+
+
 def _expand_k3_image_prompt_token_ids(
     input_ids: Union[List[int], torch.Tensor],
     image_token_id: int,
@@ -121,6 +229,62 @@ def _expand_k3_image_prompt_token_ids(
     return torch.tensor(output, dtype=torch.long).unsqueeze(0)
 
 
+def _expand_k3_visual_prompt_token_ids(
+    input_ids: Union[List[int], torch.Tensor],
+    image_token_id: int,
+    visual_items: list[_KimiK3VisualItem],
+    resize_configs: list[dict],
+    tokenizer,
+) -> torch.Tensor:
+    """Replace each source-media placeholder with its MoonViT grid(s)."""
+    if len(visual_items) != len(resize_configs):
+        raise ValueError("Expected one resize config for each Kimi-K3 visual item.")
+
+    if isinstance(input_ids, torch.Tensor):
+        input_ids = input_ids.detach().flatten().cpu().numpy()
+    input_ids = np.asarray(input_ids, dtype=np.int64)
+
+    groups: list[list[tuple[_KimiK3VisualItem, dict]]] = []
+    for item, config in zip(visual_items, resize_configs):
+        if item.source_index == len(groups):
+            groups.append([])
+        elif item.source_index != len(groups) - 1:
+            raise ValueError("Kimi-K3 visual items are not ordered by source media.")
+        groups[item.source_index].append((item, config))
+
+    placeholder_count = int(np.count_nonzero(input_ids == image_token_id))
+    if placeholder_count != len(groups):
+        raise ValueError(
+            f"Expected {len(groups)} visual placeholder token(s), "
+            f"found {placeholder_count}."
+        )
+
+    output = []
+    source_index = 0
+    for token_id in input_ids:
+        if token_id != image_token_id:
+            output.append(int(token_id))
+            continue
+
+        group = groups[source_index]
+        if group[0][0].media_type == "image" and len(group) != 1:
+            raise ValueError("A Kimi-K3 image source must produce exactly one grid.")
+        for item, config in group:
+            if item.media_type == "image":
+                width, height = item.size
+                media_prefix = f"<|media_begin|>image {width}x{height}<|media_content|>"
+            else:
+                media_prefix = (
+                    f"{item.timestamp_text}<|media_begin|>video<|media_content|>"
+                )
+            output.extend(_encode_k3_special_tokens(tokenizer, media_prefix))
+            output.extend([image_token_id] * int(config["num_tokens"]))
+            output.extend(_encode_k3_special_tokens(tokenizer, "<|media_end|>"))
+        source_index += 1
+
+    return torch.tensor(output, dtype=torch.long).unsqueeze(0)
+
+
 def _expand_k3_image_prompt_text(
     input_text: str,
     image_token: str,
@@ -162,6 +326,48 @@ def _k3_to_cuda_chw(image: Union[torch.Tensor, Image.Image]) -> torch.Tensor:
     return image
 
 
+def _gpu_preprocess_k3_visual_items(
+    visual_items: list[_KimiK3VisualItem],
+    resize_configs: list[dict],
+    image_scale: torch.Tensor,
+    image_bias: torch.Tensor,
+    patch_size: int,
+    transparent_bg_config: Optional[dict],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Preprocess image/video frames and restore each item's temporal grid."""
+    if len(visual_items) != len(resize_configs):
+        raise ValueError("Expected one resize config for each Kimi-K3 visual item.")
+
+    frames = []
+    frame_configs = []
+    for item, config in zip(visual_items, resize_configs):
+        frames.extend(item.frames)
+        frame_configs.extend([config] * len(item.frames))
+
+    pixel_values, frame_grids = _gpu_preprocess_images(
+        frames,
+        frame_configs,
+        image_scale,
+        image_bias,
+        patch_size,
+        to_chw=_k3_to_cuda_chw,
+        post_resize=lambda x: _fill_transparent_bg(x, transparent_bg_config),
+    )
+
+    grids = []
+    frame_index = 0
+    for item in visual_items:
+        item_grids = frame_grids[frame_index : frame_index + len(item.frames)]
+        frame_index += len(item.frames)
+        if len(item_grids) == 0 or not torch.all(item_grids[:, 0] == 1):
+            raise ValueError("Expected one spatial MoonViT grid per video frame.")
+        if not torch.all(item_grids[:, 1:] == item_grids[0, 1:]):
+            raise ValueError("Kimi-K3 video frames must share one spatial grid.")
+        grids.append((len(item.frames), *item_grids[0, 1:].tolist()))
+
+    return pixel_values, torch.tensor(grids, dtype=torch.int64)
+
+
 class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
     def __init__(self, hf_processor, image_token, image_token_id, config):
         self.preprocess_config = config
@@ -181,6 +387,21 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
 
     def preprocess_fingerprint_payload(self):
         return self.preprocess_config
+
+    def _normalize_visual_items(self, images) -> list[_KimiK3VisualItem]:
+        return [
+            (
+                image
+                if isinstance(image, _KimiK3VisualItem)
+                else _KimiK3VisualItem(
+                    media_type="image",
+                    frames=(image,),
+                    source_index=index,
+                    in_patch_limit=self._in_patch_limit,
+                )
+            )
+            for index, image in enumerate(images or [])
+        ]
 
     def _prepare_input_ids(
         self, input_text, resize_configs, original_input_ids, image_sizes
@@ -203,10 +424,58 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
         original_input_ids = kwargs.pop("sglang_original_input_ids", None)
         if images and torch.cuda.is_available():
             return self._gpu_call(text, images, original_input_ids)
+        if images and any(
+            isinstance(image, _KimiK3VisualItem) and image.media_type == "video"
+            for image in images
+        ):
+            raise RuntimeError("Kimi-K3 video preprocessing requires CUDA.")
         return self._cpu_call(text, images, original_input_ids, **kwargs)
 
     def _gpu_call(self, text, images, original_input_ids=None):
         input_text = text[0] if isinstance(text, list) else text
+
+        if any(isinstance(image, _KimiK3VisualItem) for image in images):
+            visual_items = self._normalize_visual_items(images)
+            resize_configs = []
+            for item in visual_items:
+                width, height = item.size
+                resize_configs.append(
+                    navit_resize_config(
+                        width,
+                        height,
+                        self._patch_size,
+                        self._merge_kernel_size,
+                        item.in_patch_limit,
+                        self._patch_limit_on_one_side,
+                        self._fixed_output_tokens,
+                    )
+                )
+
+            if original_input_ids is None:
+                original_input_ids = _encode_k3_special_tokens(
+                    self._hf_processor.tokenizer, input_text
+                )
+            input_ids = _expand_k3_visual_prompt_token_ids(
+                original_input_ids,
+                self._image_token_id,
+                visual_items,
+                resize_configs,
+                self._hf_processor.tokenizer,
+            )
+            image_scale, image_bias = self._get_gpu_norm_tensors()
+            pixel_values, grid_thws = _gpu_preprocess_k3_visual_items(
+                visual_items,
+                resize_configs,
+                image_scale,
+                image_bias,
+                self._patch_size,
+                self._transparent_bg_config,
+            )
+            return {
+                "input_ids": input_ids,
+                "pixel_values": pixel_values,
+                "image_grid_thw": grid_thws,
+            }
 
         resize_configs = []
         image_sizes = []
@@ -401,6 +670,28 @@ class KimiK3ImageProcessor(
         )
         super().__init__(hf_config, server_args, processor, *args, **kwargs)
         self.mm_tokens = mm_tokens
+        self.media_proc_cfg = dict(_processor.media_processor.media_proc_cfg)
+
+    @staticmethod
+    def _resolve_visual_modalities(request_obj, image_count, video_count):
+        modalities = []
+        for modality in getattr(request_obj, "modalities", None) or []:
+            if isinstance(modality, list):
+                modalities.extend(modality)
+            else:
+                modalities.append(modality)
+
+        if not modalities:
+            return ["image"] * image_count + ["video"] * video_count
+        if (
+            any(modality not in ("image", "video") for modality in modalities)
+            or modalities.count("image") != image_count
+            or modalities.count("video") != video_count
+        ):
+            raise ValueError(
+                "Kimi-K3 media order does not match the supplied image/video data."
+            )
+        return modalities
 
     def _should_defer_gpu_preprocessing(self, images) -> bool:
         """
@@ -663,11 +954,22 @@ class KimiK3ImageProcessor(
         self, image_data, input_text, request_obj, **kwargs
     ):
         """Compatibility path for precomputed inputs and lightweight test stubs."""
+        image_data = list(image_data or [])
+        video_data = list(getattr(request_obj, "video_data", None) or [])
         expected_image_count = len(image_data or [])
         placeholder_count = self.count_image_placeholders(
             input_text, self.mm_tokens.image_token_id
         )
-        if placeholder_count is not None:
+        if video_data:
+            base_output = await self.fast_load_mm_data(
+                prompt=input_text,
+                image_data=image_data,
+                video_data=video_data,
+                multimodal_tokens=self.mm_tokens,
+                discard_alpha_channel=False,
+                input_ids=input_text if placeholder_count is not None else None,
+            )
+        elif placeholder_count is not None:
             base_output = await self.fast_load_mm_data(
                 prompt=input_text,
                 image_data=image_data,
@@ -682,11 +984,52 @@ class KimiK3ImageProcessor(
                 multimodal_tokens=self.mm_tokens,
                 discard_alpha_channel=False,
             )
-        if len(base_output.images) != expected_image_count:
+        loaded_images = list(getattr(base_output, "images", None) or [])
+        loaded_videos = list(getattr(base_output, "videos", None) or [])
+        if len(loaded_images) != expected_image_count or len(loaded_videos) != len(
+            video_data
+        ):
             raise ValueError(
-                "Kimi image placeholders must map one-to-one to image data: "
-                f"expected {expected_image_count}, loaded {len(base_output.images)}"
+                "Kimi visual placeholders must map one-to-one to source media: "
+                f"expected {expected_image_count} image(s) and {len(video_data)} "
+                f"video(s), loaded {len(loaded_images)} image(s) and "
+                f"{len(loaded_videos)} video(s)"
             )
+
+        if video_data:
+            modalities = self._resolve_visual_modalities(
+                request_obj, expected_image_count, len(video_data)
+            )
+            image_iter = iter(loaded_images)
+            video_iter = iter(loaded_videos)
+            visual_items = []
+            for source_index, modality in enumerate(modalities):
+                if modality == "image":
+                    visual_items.append(
+                        _KimiK3VisualItem(
+                            media_type="image",
+                            frames=(next(image_iter),),
+                            source_index=source_index,
+                            in_patch_limit=int(self.media_proc_cfg["in_patch_limit"]),
+                        )
+                    )
+                    continue
+
+                video = next(video_iter)
+                try:
+                    visual_items.extend(
+                        _split_k3_video(video, self.media_proc_cfg, source_index)
+                    )
+                finally:
+                    close = getattr(video, "close", None)
+                    if close is not None:
+                        close()
+
+            # K3 uses the image placeholder id for every MoonViT grid. The T
+            # dimension distinguishes temporal video chunks from still images.
+            base_output.images = visual_items
+            base_output.videos = []
+
         if self._should_defer_gpu_preprocessing(base_output.images):
             return self._build_deferred_output(base_output)
         mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
@@ -713,24 +1056,47 @@ class KimiK3ImageProcessor(
         *args,
         **kwargs,
     ):
-        if request_obj.video_data or kwargs.get("audio_data"):
-            raise ValueError("Kimi-K3 supports image input only")
+        audio_data = kwargs.get("audio_data") or getattr(
+            request_obj, "audio_data", None
+        )
+        if audio_data:
+            raise ValueError(
+                "Kimi-K3 supports image and video input (without audio track) only"
+            )
 
+        image_data = list(image_data or [])
+        video_data = list(getattr(request_obj, "video_data", None) or [])
         expected_image_count = len(image_data or [])
+        expected_media_count = expected_image_count + len(video_data)
         placeholder_count = self.count_image_placeholders(
             input_text, self.mm_tokens.image_token_id
         )
         if placeholder_count is not None:
-            if placeholder_count != expected_image_count:
+            if placeholder_count != expected_media_count:
                 raise ValueError(
-                    "Kimi image placeholders must map one-to-one to image data: "
-                    f"expected {expected_image_count}, found {placeholder_count} token(s)"
+                    "Kimi visual placeholders must map one-to-one to source media: "
+                    f"expected {expected_media_count}, found {placeholder_count} "
+                    "token(s)"
                 )
+        elif video_data:
+            placeholder_count = input_text.count(self.mm_tokens.image_token)
+            if placeholder_count != expected_media_count:
+                raise ValueError(
+                    "Kimi visual placeholders must map one-to-one to source media: "
+                    f"expected {expected_media_count}, found {placeholder_count}."
+                )
+
+        if video_data:
+            self._resolve_visual_modalities(
+                request_obj, expected_image_count, len(video_data)
+            )
         if (
-            any(self._is_preprocessed_input(item) for item in image_data)
+            video_data
+            or any(self._is_preprocessed_input(item) for item in image_data)
             or not self.mm_preprocess_cache.enabled
         ):
-            # 1. keep preprocessed inputs and cache-off requests on the legacy path
+            # 1. keep video, preprocessed inputs, and cache-off requests on the
+            # uncached path. Image artifacts remain image-only.
             return await self._process_mm_data_uncached(
                 image_data, input_text, request_obj, **kwargs
             )
