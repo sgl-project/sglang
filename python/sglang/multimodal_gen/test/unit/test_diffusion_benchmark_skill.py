@@ -90,6 +90,17 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
                 "sana-video",
                 "lingbot-video-moe",
                 "fastwan21-t2v-1.3b",
+                "krea2-turbo",
+                "krea2-raw",
+                "ideogram4-fast",
+                "ideogram4-instant",
+                "longlive2-t2v",
+                "longlive2-i2v",
+                "fast-hunyuan",
+                "turbowan21-t2v-1.3b",
+                "helios-mid",
+                "helios-distilled",
+                "joy-echo",
                 "cosmos3-edge-t2i",
                 "cosmos3-super-t2i-distilled",
                 "ltx25",
@@ -112,6 +123,28 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
             self.assertIn("--num-frames=61", fastwan_cmd)
             self.assertIn("--num-inference-steps=3", fastwan_cmd)
             self.assertIn("--dit-layerwise-offload=false", fastwan_cmd)
+
+            krea_raw_cmd = module.build_sglang_cmd("krea2-raw")
+            self.assertIn("--num-inference-steps=50", krea_raw_cmd)
+            self.assertIn("--guidance-scale=4.5", krea_raw_cmd)
+
+            ideogram_cmd = module.build_sglang_cmd("ideogram4-instant")
+            self.assertFalse(
+                any(arg.startswith("--num-inference-steps") for arg in ideogram_cmd)
+            )
+
+            longlive_i2v_cmd = module.build_sglang_cmd("longlive2-i2v")
+            self.assertIn("--num-frames=61", longlive_i2v_cmd)
+            self.assertTrue(
+                any(arg.startswith("--image-path=") for arg in longlive_i2v_cmd)
+            )
+
+            joy_echo_cmd = module.build_sglang_cmd("joy-echo")
+            self.assertIn("--num-gpus=2", joy_echo_cmd)
+            self.assertIn("--ulysses-degree=2", joy_echo_cmd)
+            config_arg = next(arg for arg in joy_echo_cmd if arg.startswith("--config="))
+            config = json.loads(Path(config_arg.removeprefix("--config=")).read_text())
+            self.assertFalse(config["enable_memory_bank"])
 
     def test_quality_and_bcg_comparators_are_explicit_and_exclusive(self):
         with tempfile.TemporaryDirectory() as tmpdir:
