@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.utils.image_io import save_base64_image_to_pa
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     build_warmup_reqs,
+    lighten_warmup_req,
     should_include_warmup_image,
     supports_synthetic_warmup,
 )
@@ -101,6 +102,188 @@ def should_run_explicit_client_warmup(server_args: ServerArgs) -> bool:
     )
 
 
+def auto_residency_skip_reason(server_args: ServerArgs) -> str | None:
+    """Server-args-only gate for the warmup-calibrated residency promotion.
+
+    Only rules out paths the promotion was not designed for; the workers
+    re-check per component (explicit placement, FSDP modules, custom
+    strategies, missing sizes) and per measurement.
+    """
+    from sglang.multimodal_gen import envs
+    from sglang.multimodal_gen.configs.quantization.nunchaku import (
+        NunchakuSVDQuantArgs,
+    )
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+
+    if envs.SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY:
+        return "disabled via SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY"
+    if server_args.performance_mode != "auto":
+        return f"performance_mode={server_args.performance_mode}"
+    if not should_run_synthetic_server_warmup(server_args):
+        return "no synthetic server warmup to calibrate from"
+    if server_args.backend == "diffusers":
+        return "diffusers backend"
+    if server_args.enable_breakable_cuda_graph:
+        return "breakable CUDA graph captures during warmup"
+    if server_args.enable_torch_compile:
+        # Compile warmup runs a deliberately stripped memory layout: the DiT
+        # is temporarily layerwise-offloaded (offload_during_compile) and
+        # _move_resident_components_for_warmup evicts resident aux components
+        # for the denoise. Peaks measured there are far below a real
+        # request's, and the post-promotion re-warm (also a warmup layout)
+        # cannot catch the difference.
+        return "torch.compile warmup uses a stripped memory layout"
+    if envs.SGLANG_CACHE_DIT_ENABLED:
+        return "cache-dit enabled"
+    if server_args.batching_max_size > 1:
+        return "dynamic batching enabled"
+    if (server_args.dp_size or 1) > 1:
+        return "dp replicas warm up independently"
+    if (server_args.ulysses_degree or 1) > 1:
+        # Sequence-parallel workers can have a different execution order
+        # after residency changes; keep their configured placement until that
+        # interaction is explicitly calibrated and validated.
+        return "Ulysses sequence parallelism"
+    if server_args.use_fsdp_inference:
+        return "FSDP inference"
+    nunchaku = server_args.nunchaku_config
+    svdquant_enabled = nunchaku is not None and (
+        not isinstance(nunchaku, NunchakuSVDQuantArgs) or nunchaku.enable_svdquant
+    )
+    if (
+        server_args.quantization is not None
+        or server_args.transformer_weights_path
+        or svdquant_enabled
+    ):
+        # Residency changes shift the memory layout, which measurably moved
+        # fp8-quantized DiT outputs in the past (see PR #29649); keep
+        # quantized checkpoints on their configured strategy.
+        return "quantized checkpoint"
+    if not current_platform.is_cuda():
+        return "requires CUDA"
+    return None
+
+
+def _auto_residency_status(response: OutputBatch) -> str | None:
+    if isinstance(response.output, dict):
+        return response.output.get("status")
+    return None
+
+
+async def maybe_apply_auto_residency(
+    server_args: ServerArgs,
+    forward: Callable[[Req], Awaitable[OutputBatch]],
+) -> None:
+    """Promote implicitly offloaded components after warmup, then re-warm.
+
+    Runs between the synthetic warmup and the ready signal, so the residency
+    is frozen before ``/health`` turns 200. If a promotion (or the
+    post-promotion re-warmup) fails, the workers roll back and startup
+    continues on the original strategy; only a failed rollback raises, which
+    aborts startup.
+    """
+    from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+        AutoResidencyReq,
+    )
+    from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
+        PROMOTION_STATUS_PROMOTED,
+        PROMOTION_STATUS_ROLLBACK_FAILED,
+        PROMOTION_STATUS_ROLLED_BACK,
+    )
+
+    skip_reason = auto_residency_skip_reason(server_args)
+    if skip_reason is not None:
+        # Whoever asked for auto needs to hear why it did nothing; on any other
+        # server this is just a note about a mode they did not pick.
+        log = logger.info if server_args.performance_mode == "auto" else logger.debug
+        log("Auto residency: skipped (%s)", skip_reason)
+        return
+
+    logger.info(
+        "Server warmup complete; adjusting component residency for the "
+        "default workload (--performance-mode auto)."
+    )
+    # Same fail-open contract as the warmup itself: implicit warmups must
+    # never abort startup, explicit --warmup-resolutions ones must succeed.
+    fail_open = server_args.warmup_resolutions is None
+    try:
+        response = await forward(AutoResidencyReq(action="apply"))
+    except Exception as e:
+        if not fail_open:
+            raise
+        logger.warning(
+            "Auto residency apply request failed; continuing on the original "
+            "strategy: %s",
+            e,
+        )
+        return
+    status = _auto_residency_status(response)
+    if status == PROMOTION_STATUS_ROLLBACK_FAILED:
+        raise RuntimeError(f"auto residency rollback failed: {response.error}")
+    if response.error is not None:
+        logger.warning(
+            "Auto residency promotion not applied; continuing on the original "
+            "strategy: %s",
+            response.error,
+        )
+        return
+    if status != PROMOTION_STATUS_PROMOTED:
+        return
+
+    # Re-run the synthetic warmup under the final residency: it physically
+    # moves promoted components, rebuilds compile caches invalidated by the
+    # placement change, and proves the promoted layout fits before ready.
+    try:
+        await run_async_client_warmup(
+            server_args, forward, fail_open=False, rewarm=True
+        )
+    except Exception as e:
+        logger.warning(
+            "Post-promotion re-warmup failed (%s); rolling back auto residency", e
+        )
+        rollback = await forward(AutoResidencyReq(action="rollback"))
+        if (
+            rollback.error is not None
+            or _auto_residency_status(rollback) != PROMOTION_STATUS_ROLLED_BACK
+        ):
+            raise RuntimeError(
+                f"auto residency rollback failed: {rollback.error}"
+            ) from e
+        # restore warm caches for the original strategy before turning ready,
+        # keeping the caller's fail-open contract
+        await run_async_client_warmup(
+            server_args, forward, fail_open=fail_open, rewarm=True
+        )
+
+
+# Enough to clear a probe that overshot the card, few enough that a failure
+# which is not about probe size gives up quickly instead of walking the
+# workload down to nothing.
+MAX_WARMUP_DEGRADE_ATTEMPTS = 3
+
+
+def _is_out_of_memory(error: Any) -> bool:
+    text = str(error).lower()
+    return "out of memory" in text or "outofmemory" in text
+
+
+def _degrade_after_oom(server_args: ServerArgs, req: Req) -> Req | None:
+    """Next warmup probe to try after `req` ran the card out of memory.
+
+    Only memory failures are worth retrying smaller; anything else fails the
+    same way at every size and should surface instead of being shrunk away.
+    """
+    lighter = lighten_warmup_req(server_args, req)
+    if lighter is None:
+        return None
+    logger.warning(
+        "%s ran out of memory; retrying warmup at %s",
+        format_warmup_req(req),
+        format_warmup_req(lighter),
+    )
+    return lighter
+
+
 def format_warmup_req(req_or_group: Any) -> str:
     req = get_first_generation_req(req_or_group)
     prefix = (
@@ -131,6 +314,7 @@ def build_client_warmup_reqs(
     server_args: ServerArgs,
     *,
     warmup_input_path: str | None = None,
+    rewarm: bool = False,
 ) -> list[Req]:
     warmup_reqs = build_warmup_reqs(
         server_args,
@@ -143,6 +327,10 @@ def build_client_warmup_reqs(
     for req in warmup_reqs:
         if req.is_warmup:
             req.extra["warmup_total"] = warmup_total
+        if rewarm:
+            # a repeat pass after an auto-residency change: keep it out of
+            # the scheduler's warmup progress accounting (already at N/N)
+            req.extra["server_warmup_rewarm"] = True
     return warmup_reqs
 
 
@@ -151,6 +339,7 @@ async def run_async_client_warmup(
     forward: Callable[[Req], Awaitable[OutputBatch]],
     *,
     fail_open: bool = False,
+    rewarm: bool = False,
 ) -> None:
     try:
         warmup_input_path = None
@@ -158,9 +347,17 @@ async def run_async_client_warmup(
             warmup_input_path = prepare_warmup_image_path(server_args)
 
         for req in build_client_warmup_reqs(
-            server_args, warmup_input_path=warmup_input_path
+            server_args, warmup_input_path=warmup_input_path, rewarm=rewarm
         ):
             response = await forward(req)
+            for _ in range(MAX_WARMUP_DEGRADE_ATTEMPTS):
+                if response.error is None or not _is_out_of_memory(response.error):
+                    break
+                lighter = _degrade_after_oom(server_args, req)
+                if lighter is None:
+                    break
+                req = lighter
+                response = await forward(req)
             if response.error is not None:
                 raise RuntimeError(response.error)
     except Exception:
@@ -184,6 +381,14 @@ def run_sync_client_warmup(
         server_args, warmup_input_path=warmup_input_path
     ):
         response = forward(req)
+        for _ in range(MAX_WARMUP_DEGRADE_ATTEMPTS):
+            if response.error is None or not _is_out_of_memory(response.error):
+                break
+            lighter = _degrade_after_oom(server_args, req)
+            if lighter is None:
+                break
+            req = lighter
+            response = forward(req)
         if response.error is not None:
             raise RuntimeError(response.error)
 
@@ -273,6 +478,18 @@ class SchedulerWarmupMixin:
         is_warmup: bool,
     ) -> None:
         if not is_warmup:
+            return
+
+        req = get_first_generation_req(req_or_group)
+        if req is not None and req.extra.get("server_warmup_rewarm"):
+            # auto-residency re-warm passes repeat already-counted requests;
+            # advancing the bar again would log N+1/N in CI
+            if output_batch.error is not None:
+                logger.warning(
+                    "%s processing failed: %s",
+                    self._format_warmup_req(req_or_group),
+                    output_batch.error,
+                )
             return
 
         server_based_warmup = is_server_based_warmup(req_or_group)

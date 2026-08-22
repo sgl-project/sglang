@@ -1,4 +1,5 @@
 import bisect
+import math
 import queue
 import re
 import threading
@@ -169,19 +170,22 @@ def restore_host_resident_tables(
 def _install_host_gather_hooks(
     module: torch.nn.Module, device: torch.device | str
 ) -> None:
-    """Run this module's gather on the host, move only the result."""
+    """Run this module's gather beside its current weight, move only the result."""
 
-    def _inputs_to_host(_module, args, kwargs):
+    def _inputs_to_table(_module, args, kwargs):
         if not args or not torch.is_tensor(args[0]):
             return None
-        return (args[0].to("cpu"),) + args[1:], kwargs
+        # A runtime residency promotion can later materialize this table on
+        # the device.  Keep the gather input colocated with its current
+        # weight instead of unconditionally moving it back to the host.
+        return (args[0].to(_module.weight.device),) + args[1:], kwargs
 
     def _output_to_device(_module, _args, output):
         if not torch.is_tensor(output):
             return output
         return output.to(device, non_blocking=True)
 
-    module.register_forward_pre_hook(_inputs_to_host, with_kwargs=True)
+    module.register_forward_pre_hook(_inputs_to_table, with_kwargs=True)
     module.register_forward_hook(_output_to_device)
 
 
@@ -1315,6 +1319,22 @@ class LayerwiseOffloadManager:
 
         return updated_names
 
+    def offloaded_weight_bytes(self) -> int:
+        """Total bytes of this manager's offloadable weights, from metadata.
+
+        Size-only companion to ``iter_cpu_weights`` -- it never materializes
+        the per-weight buffer views, so it is safe to call per request.
+        """
+        total = 0
+        for layer_meta in self._weight_metadata.values():
+            for meta in layer_meta.values():
+                if meta.get("preserve_strides", False):
+                    numel = math.prod(meta["shape"])
+                else:
+                    numel = meta["numel"]
+                total += int(numel) * meta["dtype"].itemsize
+        return total
+
     def iter_cpu_weights(self):
         """Yield (name, tensor) pairs from consolidated CPU buffers.
 
@@ -1653,16 +1673,30 @@ class LayerwiseOffloadableModuleMixin:
         if self.layerwise_offload_managers is None:
             return
         for manager in self.layerwise_offload_managers:
-            if manager.enabled:
-                manager.remove_forward_hooks()
+            if not manager.enabled:
+                continue
+            manager.remove_forward_hooks()
+            try:
                 manager.load_all_layers()
-                manager.enabled = False
+            except Exception:
+                # Loading every layer is the step most likely to OOM. Re-arm
+                # this manager before re-raising: leaving it hook-less with
+                # enabled=True would let release_all() swap weights for (1,)
+                # placeholders that nothing ever streams back in, and
+                # enable_offload()'s already-armed guard would skip repair.
+                manager.release_all()
+                manager.register_forward_hooks()
+                raise
+            manager.enabled = False
 
     def enable_offload(self) -> None:
         """Re-enable layerwise offload: sync weights to CPU, release layers, and restore hooks."""
         if self.layerwise_offload_managers is None:
             return
         for manager in self.layerwise_offload_managers:
+            if manager.enabled:
+                # already armed; re-registering would double the forward hooks
+                continue
             if manager._configured:
                 manager.enabled = True
                 manager.sync_all_layers_to_cpu()

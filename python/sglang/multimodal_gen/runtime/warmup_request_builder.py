@@ -14,10 +14,15 @@ request transport path as real generation.
 """
 
 from copy import copy
+from dataclasses import replace
 from typing import Any
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    SamplingParams,
+    align_num_frames_for_num_gpus,
+    resolve_sequence_shard,
+)
 from sglang.multimodal_gen.registry import get_pipeline_config_classes
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import (
@@ -39,6 +44,10 @@ SERVER_WARMUP_IMAGE_MAX_AREA = 768 * 768
 SERVER_WARMUP_DIFFUSERS_IMAGE_MAX_AREA = 512 * 512
 SERVER_WARMUP_VIDEO_MAX_AREA = 832 * 480
 SERVER_WARMUP_MAX_VIDEO_FRAMES = 17
+# Second, smaller frame count used to calibrate auto residency: two workload
+# sizes let the estimator fit peak = constant + slope * units instead of
+# scaling one measured peak (whose constant part dominates under offload).
+SERVER_WARMUP_CALIBRATION_VIDEO_FRAMES = 9
 SERVER_WARMUP_IMAGE_STEPS = 2
 SERVER_WARMUP_VIDEO_STEPS = 2
 
@@ -220,6 +229,56 @@ def _fit_resolution_to_area(
     )
 
 
+def _halve_num_frames(server_args: ServerArgs, num_frames: int) -> int:
+    """Halve the latent frame count, keeping the model's frame arithmetic."""
+    if num_frames <= 1:
+        return num_frames
+    arch_config = getattr(
+        getattr(server_args.pipeline_config, "vae_config", None), "arch_config", None
+    )
+    ratio = getattr(arch_config, "temporal_compression_ratio", None)
+    if not ratio or ratio <= 1:
+        return max(1, num_frames // 2)
+    latent_frames = (num_frames - 1) // ratio + 1
+    # round up: halving 5 latent frames should land on 3 (9 frames), not 2 (5)
+    return ((latent_frames + 1) // 2 - 1) * ratio + 1
+
+
+def lighten_warmup_req(server_args: ServerArgs, req: Req) -> Req | None:
+    """Roughly halve a warmup probe, or None once it cannot shrink further.
+
+    Warmup peak memory tracks width * height * num_frames, so a card that could
+    not hold the full probe usually holds half of it while still walking the
+    same code path. Frames go first: they drive video activation size, and
+    cutting them leaves the spatial kernels at their serving shape.
+    """
+    params = req.sampling_params
+    if params is None:
+        return None
+
+    num_frames = getattr(params, "num_frames", None) or 1
+    lighter_frames = _halve_num_frames(server_args, num_frames)
+    if lighter_frames < num_frames:
+        return _replace_warmup_workload(req, num_frames=lighter_frames)
+
+    width = getattr(params, "width", None)
+    height = getattr(params, "height", None)
+    if not width or not height:
+        return None
+    alignment = _warmup_resolution_alignment(server_args)
+    lighter = _fit_resolution_to_area(width, height, width * height // 2, alignment)
+    # below the alignment floor the fit rounds back up; only take a real cut
+    if lighter[0] * lighter[1] >= width * height:
+        return None
+    return _replace_warmup_workload(req, width=lighter[0], height=lighter[1])
+
+
+def _replace_warmup_workload(req: Req, **changes: int) -> Req:
+    lighter = copy(req)
+    lighter.sampling_params = replace(req.sampling_params, **changes)
+    return lighter
+
+
 def _is_resolution_aligned(resolution: tuple[int, int], alignment: int) -> bool:
     width, height = resolution
     return width % alignment == 0 and height % alignment == 0
@@ -247,7 +306,78 @@ def _resolve_warmup_num_frames(
     else:
         warmup_num_frames = min(num_frames, SERVER_WARMUP_MAX_VIDEO_FRAMES)
 
-    return server_args.pipeline_config.adjust_num_frames(warmup_num_frames)
+    return _apply_warmup_frame_contract(
+        server_args, sampling_defaults, num_frames=warmup_num_frames
+    )
+
+
+def _apply_warmup_frame_contract(
+    server_args: ServerArgs, sampling_defaults: SamplingParams, *, num_frames: int
+) -> int:
+    """Re-apply the real-request frame contract to a warmup frame count.
+
+    Warmup requests skip ``SamplingParams._adjust``, so the builder must run
+    the model frame contract itself -- without this, e.g. LongLive2's capped
+    17 frames map to 5 latent frames (not divisible by its 8-frame causal
+    block) and every server warmup fails silently under fail-open. Pipelines
+    that align frames to ``num_gpus`` (rather than sharding the sequence dim)
+    get the same latent alignment real requests get.
+    """
+    num_frames = server_args.pipeline_config.adjust_num_frames(num_frames)
+    if (
+        sampling_defaults.adjust_frames
+        and not resolve_sequence_shard(
+            server_args.pipeline_config, sampling_defaults.enable_sequence_shard
+        )
+        and server_args.num_gpus > 1
+    ):
+        num_frames = align_num_frames_for_num_gpus(
+            num_frames,
+            num_gpus=server_args.num_gpus,
+            vae_config=server_args.pipeline_config.vae_config,
+            round_down=sampling_defaults.num_frames_round_down,
+        )
+    return num_frames
+
+
+def _resolve_calibration_num_frames(
+    server_args: ServerArgs,
+    sampling_defaults: SamplingParams,
+    *,
+    warmup_num_frames: int | None,
+    server_based_warmup: bool,
+) -> int | None:
+    """A second, smaller warmup frame count for auto-residency calibration.
+
+    Only produced when the main video warmup was frame-capped and the
+    auto-residency promotion is actually eligible to consume the measurement
+    (``auto_residency_skip_reason``): the estimator then has two workload
+    sizes to fit the constant/linear split of the peak. Returns None when a
+    second measurement adds no information (same adjusted frames) or would
+    never be read.
+    """
+    # local import: server_warmup imports this module at module level
+    from sglang.multimodal_gen.runtime.server_warmup import (
+        auto_residency_skip_reason,
+    )
+
+    if not server_based_warmup or not _is_video_warmup_task(server_args):
+        return None
+    if warmup_num_frames is None:
+        return None
+    if auto_residency_skip_reason(server_args) is not None:
+        return None
+    default_num_frames = sampling_defaults.num_frames or 1
+    if warmup_num_frames >= default_num_frames:
+        return None
+    calibration_num_frames = _apply_warmup_frame_contract(
+        server_args,
+        sampling_defaults,
+        num_frames=SERVER_WARMUP_CALIBRATION_VIDEO_FRAMES,
+    )
+    if calibration_num_frames == warmup_num_frames or calibration_num_frames <= 0:
+        return None
+    return calibration_num_frames
 
 
 def _effective_cfg_scale(sampling_defaults: SamplingParams) -> float | None:
@@ -360,6 +490,16 @@ def build_warmup_reqs(
         sampling_defaults,
         server_based_warmup=server_based_warmup,
     )
+    calibration_num_frames = (
+        _resolve_calibration_num_frames(
+            server_args,
+            sampling_defaults,
+            warmup_num_frames=warmup_num_frames,
+            server_based_warmup=server_based_warmup,
+        )
+        if warmup_resolutions is None
+        else None
+    )
 
     # build warmup reqs
     warmup_reqs = []
@@ -422,4 +562,46 @@ def build_warmup_reqs(
                 req.extra["server_based_warmup"] = True
             warmup_reqs.append(req)
 
+        if calibration_num_frames is not None and (width, height) == resolutions[0]:
+            # The calibration measurement runs AFTER the main warmup request:
+            # one-time allocations (compile scratch, cuDNN workspaces,
+            # allocator pool growth) then land in the larger measurement,
+            # which can only steepen the fitted slope -- the safe direction.
+            # Measuring the small shape first flattened the slope and
+            # under-estimated the default workload peak.
+            warmup_reqs.append(
+                _build_calibration_warmup_req(
+                    req_kwargs,
+                    calibration_num_frames=calibration_num_frames,
+                    warmup_steps=warmup_steps,
+                    return_warmup_result=return_warmup_result,
+                    server_based_warmup=server_based_warmup,
+                    server_args=server_args,
+                )
+            )
+
     return warmup_reqs
+
+
+def _build_calibration_warmup_req(
+    req_kwargs: dict,
+    *,
+    calibration_num_frames: int,
+    warmup_steps: int,
+    return_warmup_result: bool,
+    server_based_warmup: bool,
+    server_args: ServerArgs,
+) -> Req:
+    calibration_kwargs = req_kwargs.copy()
+    calibration_kwargs["sampling_params"] = copy(req_kwargs["sampling_params"])
+    calibration_kwargs["num_frames"] = calibration_num_frames
+    calibration_req = Req(**calibration_kwargs)
+    calibration_req.set_as_warmup(warmup_steps)
+    calibration_req.sampling_params.prepare_synthetic_warmup_request_for_queue(
+        calibration_req, server_args
+    )
+    if return_warmup_result:
+        calibration_req.extra["return_warmup_result"] = True
+    if server_based_warmup:
+        calibration_req.extra["server_based_warmup"] = True
+    return calibration_req
