@@ -1531,12 +1531,12 @@ class Scheduler(
         if not self._war_barrier_enabled:
             return
         runner = self.model_worker.war_fastpath_runner
-        ev = runner.war_fastpath_read_done_event
         runner.war_fastpath_read_done_event = None
-        if ev is not None and not envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
-            self.schedule_stream.wait_event(ev)
-        else:
-            self.schedule_stream.wait_stream(self.forward_stream)
+        # Host-side full-forward wait instead of a stream-side event wait:
+        # serializes replay completion per iteration, which empirically fixes
+        # an intermittent multi-node EP decode deadlock under the overlap
+        # scheduler in RL-style serving (post memory-saver resume windows).
+        self.forward_stream.synchronize()
 
     @DynamicGradMode()
     def event_loop_normal(self):
