@@ -706,6 +706,7 @@ class MqaAttentionBase(nn.Module):
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
         self._attn_sink_local: Optional[torch.Tensor] = None
+
         if fuse:
             self.wqkv_a = ReplicatedLinear(
                 self.hidden_size,
@@ -866,6 +867,17 @@ class MqaAttentionBase(nn.Module):
             sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
             self._attn_sink_local = sink
         return self._attn_sink_local[:kernel_num_heads]
+
+    def refresh_attn_sink_cache(self):
+        # RL weight updates rewrite attn_sink in place; the padded per-rank
+        # slice cached by _local_attn_sink must follow it.
+        if self._attn_sink_local is None:
+            return
+        rank = self.attn_tp_rank
+        num_heads = self.n_local_heads
+        self._attn_sink_local[:num_heads].copy_(
+            self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
+        )
 
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
@@ -3558,6 +3570,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             ):
                 self_attn.indexer.compressor.apply_ape_hotfix()
             layer.refresh_mhc_norm_weight_cache()
+            self_attn.refresh_attn_sink_cache()
 
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(
