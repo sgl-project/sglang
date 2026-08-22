@@ -56,6 +56,26 @@ class TestRMSNorm(CustomTestCase):
             ):
                 self._run_rms_norm_test(*params)
 
+    def test_rms_norm_cuda_uses_native_for_fp32_weight(self):
+        torch.manual_seed(0)
+
+        hidden_size = 256
+        layer = RMSNorm(
+            hidden_size,
+            cast_x_before_out_mul=True,
+            weight_dtype=torch.float32,
+            override_orig_dtype=torch.float32,
+        )
+        layer.weight.data.normal_(mean=1.0, std=0.1)
+        x = torch.randn(17, hidden_size, dtype=torch.bfloat16) / hidden_size
+
+        with torch.inference_mode():
+            ref_out = layer.forward_native(x)
+            out = layer(x)
+
+        self.assertEqual(out.dtype, torch.float32)
+        self.assertTrue(torch.equal(out, ref_out))
+
 
 class TestGemmaRMSNorm(CustomTestCase):
     DTYPES = [torch.half, torch.bfloat16]
