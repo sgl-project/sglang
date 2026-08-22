@@ -26,7 +26,12 @@ from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, Sequence
 import msgspec
 import torch
 
-from sglang.srt.disaggregation.kv_events import StorageMedium
+from sglang.srt.disaggregation.kv_events import (
+    KV_COMPONENT_FULL,
+    KV_COMPONENT_MAMBA,
+    KV_COMPONENT_SWA,
+    StorageMedium,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -376,6 +381,9 @@ class _InsertWalkState(msgspec.Struct):
     result: Optional[InsertResult] = None
     # Emitted actions awaiting the next barrier flush (or the final step).
     pending_actions: list[CacheAction | ComponentAction] = []
+    # Nodes that gained a component this insert, flushed as REPLACE GPU store
+    # snapshots in the TAIL step (component-placement mode only).
+    pending_store_event_nodes: list[UnifiedTreeNode] = []
 
 
 class UnifiedTreeCore(UnifiedTreeCoreInterface):
@@ -418,8 +426,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self.components_by_type.values()
         )
 
+        self._emit_component_placement = (
+            params.enable_kv_cache_events
+            and params.enable_kv_events_component_types
+            and len(self.component_types) > 1
+        )
         self.kv_events = KVCacheEventRecorder(
-            enabled=params.enable_kv_cache_events, page_size=self.page_size
+            enabled=params.enable_kv_cache_events,
+            page_size=self.page_size,
+            component_types_for_page=self._component_types_for_page,
         )
 
         self.reset()
@@ -1071,6 +1086,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 self._build_backup_kv_action(state.target_node)
             )
 
+        self._flush_insert_store_events(state)
+
     def _split_node(
         self, key: RadixKey, child: UnifiedTreeNode, split_len: int
     ) -> tuple[UnifiedTreeNode, Optional[CacheAction | ComponentAction]]:
@@ -1124,6 +1141,128 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_duplicate_tracking(new_node)
         return new_node, action
 
+    # ==== Component-placement KV events ====
+
+    _COMPONENT_TYPE_TO_WIRE = {
+        ComponentType.FULL: KV_COMPONENT_FULL,
+        ComponentType.SWA: KV_COMPONENT_SWA,
+        ComponentType.MAMBA: KV_COMPONENT_MAMBA,
+    }
+
+    def _component_types_for_page(
+        self,
+        node: UnifiedTreeNode,
+        medium: StorageMedium,
+        page_index: int,
+        num_pages: int,
+    ) -> Optional[list[str]]:
+        """Components resident on ``node`` at ``medium`` for page ``page_index``
+        (REPLACE snapshot), or ``None`` when component placement is off.
+
+        Presence is read live: device == ``value``, host == ``host_value``, so
+        tombstones stay unreported. Mamba is one per-leaf state, anchored to the
+        last page.
+        """
+        if not self._emit_component_placement:
+            return None
+
+        is_device = medium == StorageMedium.GPU
+        names: list[str] = []
+        for ct in self.component_types:
+            cd = node.component_data[ct]
+            present = cd.value is not None if is_device else cd.host_value is not None
+            if not present:
+                continue
+            if ct == ComponentType.MAMBA and page_index != num_pages - 1:
+                continue
+            names.append(self._COMPONENT_TYPE_TO_WIRE[ct])
+        return names
+
+    def _note_insert_store_node(self, node: UnifiedTreeNode) -> None:
+        """Register a node that gained a component this insert for a single
+        REPLACE GPU store at the TAIL flush, once all components committed.
+        No-op in legacy mode or outside an insert.
+
+        Gains defer (the set is not final until commits apply); losses restate
+        immediately via ``_restate_component_placement``.
+        """
+        if not self._emit_component_placement:
+            return
+        ws = self._ongoing_insert_walk_state
+        if ws is not None:
+            ws.pending_store_event_nodes.append(node)
+
+    def _flush_insert_store_events(self, state: _InsertWalkState) -> None:
+        """Emit the deferred REPLACE GPU stores for one insert, in the TAIL step.
+
+        Aux commit actions (SWARebuild / RecoverSWAWithLockedFull /
+        MambaEvictExcessPathStates) run before TAIL -- none is deferrable, so each
+        forces a barrier first -- hence every snapshot is final here (see
+        test_aux_commit_actions_are_not_deferrable). Covers walk/commit-noted
+        nodes plus the new-suffix chain (leaf + SWA-split tombstone parents);
+        prefix-split nodes are unchanged and skipped.
+        """
+        if not self._emit_component_placement:
+            return
+
+        pending = {n.id for n in state.pending_store_event_nodes}
+        if state.is_new_leaf:
+            cur = state.target_node
+            while cur is not state.node and cur is not self.root_node:
+                pending.add(cur.id)
+                cur = cur.parent
+        pending.discard(self.root_node.id)
+        # SWA splits the fresh leaf at commit time, so nodes are noted here in
+        # neither tree nor creation order; the emit must re-derive it.
+        self._record_store_events_root_first(
+            state.target_node, pending, StorageMedium.GPU
+        )
+
+    def _record_store_events_root_first(
+        self, tail: UnifiedTreeNode, node_ids: set[NodeId], medium: StorageMedium
+    ) -> None:
+        """Record a ``BlockStored`` for each of ``node_ids``, parents first.
+
+        All ids sit on the root -> ``tail`` path, so walk up and reverse for
+        depth order. Load-bearing: ``record_store`` seeds a node's hash chain
+        (and ``parent_block_hash``) off its parent's, so a child recorded first
+        would publish under a hash nothing else reproduces.
+        """
+        chain: list[UnifiedTreeNode] = []
+        node = tail
+        while node is not None and node is not self.root_node:
+            if node.id in node_ids:
+                chain.append(node)
+            node = node.parent
+        assert len(chain) == len(node_ids), (
+            f"{len(node_ids) - len(chain)} store-event node(s) are not on the "
+            f"root -> {tail.id} path"
+        )
+        for node in reversed(chain):
+            self.kv_events.record_store(node, medium=medium)
+
+    def _restate_component_placement(
+        self, node: UnifiedTreeNode, medium: StorageMedium
+    ) -> None:
+        """Re-emit a REPLACE snapshot after an aux component (SWA/Mamba) is
+        tombstoned on ``node`` while its base (FULL) still lives at ``medium``.
+
+        Avoids a ``BlockRemoved`` for a partial eviction: the block is still at
+        the tier, just with a smaller component set. No-op when FULL is gone (the
+        caller emits ``BlockRemoved``) or in legacy mode. Callers invoke it only
+        in partial-tombstone branches, after ``_cascade_evict``.
+        """
+        if not self._emit_component_placement:
+            return
+        cd = node.component_data[BASE_COMPONENT_TYPE]
+        base_present = (
+            cd.value is not None
+            if medium == StorageMedium.GPU
+            else cd.host_value is not None
+        )
+        if base_present:
+            self.kv_events.record_store(node, medium=medium)
+
     def _add_new_node(
         self,
         parent: UnifiedTreeNode,
@@ -1142,7 +1281,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
-        self.kv_events.record_store(new_node)
+        if self._emit_component_placement:
+            self._note_insert_store_node(new_node)
+        else:
+            self.kv_events.record_store(new_node)
         return new_node
 
     def _unevict_node_on_insert(
@@ -1161,7 +1303,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_duplicate_tracking(node)
         if node.parent is not None:
             self._update_evictable_leaf_sets(node.parent)
-        self.kv_events.record_store(node, medium=StorageMedium.GPU)
+        if self._emit_component_placement:
+            self._note_insert_store_node(node)
+        else:
+            self.kv_events.record_store(node, medium=StorageMedium.GPU)
 
     def _update_evictable_leaf_sets(self, node: UnifiedTreeNode) -> None:
         """Update both device and host leaf sets for a node."""
@@ -2002,8 +2147,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             [kv_xfer],
             cache_actions=cache_actions,
         )
-        for nid in kv_xfer.nodes_to_load or ():
-            self.kv_events.record_store(self.node_by_id(nid), medium=StorageMedium.GPU)
         for ct, xfers in comp_xfers.items():
             self.components_by_type[ct].commit_hicache_transfer(
                 node,
@@ -2011,6 +2154,19 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 xfers,
                 cache_actions=cache_actions,
             )
+
+        if self._emit_component_placement:
+            restored_ids = set(kv_xfer.nodes_to_load or ())
+            for xfers in comp_xfers.values():
+                for xfer in xfers:
+                    restored_ids.update(xfer.nodes_to_load or ())
+            self._record_store_events_root_first(node, restored_ids, StorageMedium.GPU)
+        else:
+            for nid in kv_xfer.nodes_to_load or ():
+                self.kv_events.record_store(
+                    self.node_by_id(nid), medium=StorageMedium.GPU
+                )
+
         self._update_evictable_leaf_sets(node)
         return cache_actions
 
@@ -2061,6 +2217,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             host_lru.remove_node(node)
         self.lru_lists[component_type].insert_mru(node)
         self.component_evictable_size_[component_type] += len(value)
+        self._note_insert_store_node(node)
 
     def get_component_device_value(
         self, node_id: NodeId, component_type: ComponentType
