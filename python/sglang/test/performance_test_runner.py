@@ -17,6 +17,14 @@ class PerformanceTestParams:
     dataset_name: str = "mmmu"  # For VLM perf test
     # MTP/EAGLE speculative decoding: minimum accept length threshold (None = no validation)
     spec_accept_length_threshold: Optional[float] = None
+    # Minimum output token throughput (tok/s) at the largest batch size (None = no validation)
+    baseline_output_throughput: Optional[float] = None
+    # Maximum first token latency in seconds at the largest batch size (None = no validation)
+    baseline_ftl_s: Optional[float] = None
+    # Maximum inter-token latency in milliseconds at the largest batch size (None = no validation)
+    baseline_itl_ms: Optional[float] = None
+    # Opt-in combined report layout with FTL/ITL and accuracy latency.
+    include_latency_breakdown: bool = False
 
 
 @dataclass
@@ -49,6 +57,11 @@ def run_performance_test(
     is_vlm: bool = False,
     dataset_name: str = "mmmu",
     spec_accept_length_threshold: Optional[float] = None,
+    skip_server_launch: bool = False,
+    baseline_output_throughput: Optional[float] = None,
+    baseline_ftl_s: Optional[float] = None,
+    baseline_itl_ms: Optional[float] = None,
+    emit_report: bool = True,
 ) -> PerformanceTestResult:
 
     # Set default for mutable argument
@@ -63,6 +76,12 @@ def run_performance_test(
     print(f"  Output lens: {output_lens}")
     if spec_accept_length_threshold is not None:
         print(f"  Spec accept length threshold: {spec_accept_length_threshold}")
+    if baseline_output_throughput is not None:
+        print(f"  Baseline output throughput: {baseline_output_throughput} tok/s")
+    if baseline_ftl_s is not None:
+        print(f"  Baseline FTL: {baseline_ftl_s} s")
+    if baseline_itl_ms is not None:
+        print(f"  Baseline ITL: {baseline_itl_ms} ms")
     print(f"{'='*60}\n")
 
     # Build extra args for benchmarks
@@ -80,10 +99,12 @@ def run_performance_test(
             variant=model.variant or "",
             extra_bench_args=extra_bench_args,
             env=model.env,
+            skip_server_launch=skip_server_launch,
         )
 
         if success and results:
-            perf_runner.add_report(results, variant=model.variant)
+            if emit_report:
+                perf_runner.add_report(results, variant=model.variant)
             print(f"✓ Performance test succeeded for {model.model_path}")
 
             # Fall back to the per-run accept lengths captured during benchmarking
@@ -122,6 +143,65 @@ def run_performance_test(
 
             # Extract aggregate metrics from the largest batch size result
             largest_batch_result = max(results, key=lambda r: r.batch_size)
+
+            # Validate output throughput against baseline if provided
+            if baseline_output_throughput is not None:
+                measured = largest_batch_result.output_throughput
+                if measured < baseline_output_throughput:
+                    tput_error = (
+                        f"Output throughput {measured:.1f} tok/s < "
+                        f"baseline {baseline_output_throughput:.1f} tok/s "
+                        f"(batch_size={largest_batch_result.batch_size})"
+                    )
+                    print(f"✗ {tput_error}")
+                    passed = False
+                    error_msg = (
+                        tput_error
+                        if error_msg is None
+                        else f"{error_msg}; {tput_error}"
+                    )
+                else:
+                    print(
+                        f"✓ Output throughput {measured:.1f} tok/s >= "
+                        f"baseline {baseline_output_throughput:.1f} tok/s"
+                    )
+
+            if baseline_ftl_s is not None:
+                measured = largest_batch_result.last_ttft
+                if measured > baseline_ftl_s:
+                    ftl_error = (
+                        f"FTL {measured:.2f} s > baseline {baseline_ftl_s:.2f} s "
+                        f"(batch_size={largest_batch_result.batch_size})"
+                    )
+                    print(f"✗ {ftl_error}")
+                    passed = False
+                    error_msg = (
+                        ftl_error if error_msg is None else f"{error_msg}; {ftl_error}"
+                    )
+                else:
+                    print(f"✓ FTL {measured:.2f} s <= baseline {baseline_ftl_s:.2f} s")
+
+            if baseline_itl_ms is not None:
+                measured = (
+                    1000
+                    * largest_batch_result.batch_size
+                    / largest_batch_result.output_throughput
+                )
+                if measured > baseline_itl_ms:
+                    itl_error = (
+                        f"ITL {measured:.2f} ms > baseline {baseline_itl_ms:.2f} ms "
+                        f"(batch_size={largest_batch_result.batch_size})"
+                    )
+                    print(f"✗ {itl_error}")
+                    passed = False
+                    error_msg = (
+                        itl_error if error_msg is None else f"{error_msg}; {itl_error}"
+                    )
+                else:
+                    print(
+                        f"✓ ITL {measured:.2f} ms <= baseline {baseline_itl_ms:.2f} ms"
+                    )
+
             return PerformanceTestResult(
                 model=model.model_path,
                 passed=passed,
