@@ -1,11 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Config for online INT8 ConvRot quantization via comfy_kitchen.
-
-A no-arg ``KitchenInt8Config()`` is the only supported form: weights load in
-their source dtype and are quantized in ``process_weights_after_loading``.
-
-Registered CLI name: ``kitchen_int8``.
-"""
+"""Config for online or serialized INT8 ConvRot via comfy_kitchen."""
 
 from __future__ import annotations
 
@@ -27,17 +21,14 @@ _SUPPORTED_GROUP_SIZES = (16, 64, 256)
 
 
 class KitchenInt8Config(QuantizationConfig):
-    """Config for online INT8 ConvRot quantization via comfy_kitchen.
-
-    A no-arg ``KitchenInt8Config()`` is the only supported form: weights load in
-    their source dtype and are quantized in ``process_weights_after_loading``.
-    """
+    """Dispatch online quantization or serialized Comfy ConvRot layers."""
 
     def __init__(
         self,
         group_size: int = 256,
         ignored_layers: list[str] | None = None,
         packed_modules_mapping: dict[str, list[str]] | None = None,
+        layer_markers: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         super().__init__()
         if group_size not in _SUPPORTED_GROUP_SIZES:
@@ -48,6 +39,30 @@ class KitchenInt8Config(QuantizationConfig):
         self.group_size = group_size
         self.ignored_layers = ignored_layers or []
         self.packed_modules_mapping = packed_modules_mapping or {}
+        self.layer_markers = layer_markers
+        self.is_checkpoint_int8_serialized = layer_markers is not None
+        self.checkpoint_uses_native_qkv_layout = self.is_checkpoint_int8_serialized
+        self._serialized_group_sizes: dict[str, int] = {}
+        if layer_markers is not None:
+            for prefix, marker in layer_markers.items():
+                if marker.get("format") != "int8_tensorwise":
+                    raise ValueError(
+                        f"Unsupported Comfy INT8 format for {prefix!r}: "
+                        f"{marker.get('format')!r}"
+                    )
+                if marker.get("convrot") is not True:
+                    raise ValueError(
+                        f"Serialized kitchen_int8 layer {prefix!r} must set "
+                        "convrot=true"
+                    )
+                marker_group_size = marker.get("convrot_groupsize")
+                if marker_group_size not in _SUPPORTED_GROUP_SIZES:
+                    raise ValueError(
+                        f"Serialized kitchen_int8 layer {prefix!r} must declare "
+                        f"convrot_groupsize in {_SUPPORTED_GROUP_SIZES}, got "
+                        f"{marker_group_size!r}"
+                    )
+                self._serialized_group_sizes[prefix] = marker_group_size
         # Which layers actually got quantized is worth stating plainly in the
         # log: a silent fallback to BF16 looks exactly like a slow kernel.
         self.selected: list[str] = []
@@ -89,6 +104,22 @@ class KitchenInt8Config(QuantizationConfig):
 
         if not isinstance(layer, LinearBase):
             return None
+        if self.layer_markers is not None:
+            marker_group_size = self._serialized_group_sizes.get(prefix)
+            if marker_group_size is None:
+                return UnquantizedLinearMethod()
+            if layer.input_size % marker_group_size:
+                raise ValueError(
+                    f"Serialized kitchen_int8 layer {prefix!r} has input size "
+                    f"{layer.input_size}, which is not divisible by its "
+                    f"ConvRot group size {marker_group_size}"
+                )
+            self.selected.append(prefix)
+            return KitchenInt8LinearMethod(
+                self,
+                group_size=marker_group_size,
+                is_checkpoint_serialized=True,
+            )
         if is_layer_skipped(
             prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
         ):
@@ -102,7 +133,11 @@ class KitchenInt8Config(QuantizationConfig):
             self.skipped.append(f"{prefix}(in={layer.input_size})")
             return UnquantizedLinearMethod()
         self.selected.append(prefix)
-        return KitchenInt8LinearMethod(self)
+        return KitchenInt8LinearMethod(
+            self,
+            group_size=self.group_size,
+            is_checkpoint_serialized=False,
+        )
 
     def note_quantized(self, saved_bytes: int) -> None:
         self._processed += 1

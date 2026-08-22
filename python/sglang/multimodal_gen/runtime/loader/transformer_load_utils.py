@@ -18,6 +18,9 @@ from diffusers.utils import SAFE_WEIGHTS_INDEX_NAME
 from torch import nn
 
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
+    KitchenInt8Config,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
     _patch_nunchaku_scales,
@@ -163,6 +166,17 @@ class TransformerQuantLoadSpec:
     @property
     def is_comfy_fp8(self) -> bool:
         return _get_quant_config_name(self.quant_config) == "comfy_fp8"
+
+    @property
+    def is_serialized_kitchen_int8(self) -> bool:
+        return (
+            isinstance(self.quant_config, KitchenInt8Config)
+            and self.quant_config.is_checkpoint_int8_serialized
+        )
+
+    @property
+    def uses_comfy_layer_markers(self) -> bool:
+        return self.is_comfy_fp8 or self.is_serialized_kitchen_int8
 
 
 class _TransformerQuantAdapter:
@@ -844,6 +858,9 @@ def _needs_device_weight_postprocess(
     quant_name = _get_quant_config_name(quant_config)
     if quant_name in ("modelopt_fp8", "comfy_fp8"):
         return True
+    if quant_name == "kitchen_int8":
+        assert isinstance(quant_config, KitchenInt8Config)
+        return not quant_config.is_checkpoint_int8_serialized
 
     serialized_flag_by_quant_name = {
         "fp8": "is_checkpoint_fp8_serialized",

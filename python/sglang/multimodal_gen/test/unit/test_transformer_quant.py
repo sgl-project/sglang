@@ -47,11 +47,15 @@ sys.modules.setdefault("partial_json_parser.core.options", partial_json_parser_o
 
 from sglang.multimodal_gen.runtime.layers.linear import (
     LinearBase,
+    ReplicatedLinear,
     UnquantizedLinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import (
     ComfyFp8Config,
     ComfyFullPrecisionFp8LinearMethod,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
+    KitchenInt8Config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
@@ -246,11 +250,19 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                 mock_download.reset_mock()
 
     def test_inspect_minimax_h3_safetensors_detects_curve_and_comfy_format(self):
-        marker = json.dumps({"format": "int8_tensorwise", "convrot": True}).encode()
+        marker = json.dumps(
+            {
+                "format": "int8_tensorwise",
+                "convrot": True,
+                "convrot_groupsize": 256,
+            }
+        ).encode()
         with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
             save_file(
                 {
                     "adaln_t_table": torch.zeros((1025, 8)),
+                    "blocks.0.mlp.fc1.weight": torch.ones((2, 256), dtype=torch.int8),
+                    "blocks.0.mlp.fc1.weight_scale": torch.ones((2, 1)),
                     "blocks.0.mlp.fc1.comfy_quant": torch.tensor(
                         list(marker), dtype=torch.uint8
                     ),
@@ -282,13 +294,60 @@ class TestTransformerQuantHelpers(unittest.TestCase):
 
         self.assertEqual(layer_markers["blocks.0.mlp.fc1"], {"format": "float8_e4m3fn"})
 
-    def test_minimax_h3_comfy_int8_fails_before_weight_loading(self):
-        with self.assertRaisesRegex(NotImplementedError, "regular-Hadamard"):
+    def test_minimax_h3_comfy_int8_resolves_serialized_kitchen(self):
+        config = resolve_minimax_h3_checkpoint_quantization(
+            {
+                "blocks.0.mlp.fc1": {
+                    "format": "int8_tensorwise",
+                    "convrot": True,
+                    "convrot_groupsize": 256,
+                }
+            }
+        )
+
+        self.assertIsInstance(config, KitchenInt8Config)
+        self.assertTrue(config.is_checkpoint_int8_serialized)
+        self.assertTrue(config.checkpoint_uses_native_qkv_layout)
+        self.assertFalse(KitchenInt8Config().checkpoint_uses_native_qkv_layout)
+        self.assertFalse(_needs_device_weight_postprocess(config))
+
+    @patch(
+        "sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8."
+        "_load_comfy_kitchen"
+    )
+    def test_serialized_kitchen_constructs_int8_weight_and_row_scale(self, _load):
+        config = KitchenInt8Config(
+            layer_markers={
+                "proj": {
+                    "format": "int8_tensorwise",
+                    "convrot": True,
+                    "convrot_groupsize": 256,
+                }
+            }
+        )
+
+        layer = ReplicatedLinear(
+            256,
+            3,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=config,
+            prefix="proj",
+        )
+
+        self.assertEqual(layer.weight.dtype, torch.int8)
+        self.assertEqual(layer.weight.shape, (3, 256))
+        self.assertEqual(layer.weight_scale.dtype, torch.float32)
+        self.assertEqual(layer.weight_scale.shape, (3, 1))
+
+    def test_serialized_kitchen_rejects_non_convrot_marker(self):
+        with self.assertRaisesRegex(ValueError, "convrot=true"):
             resolve_minimax_h3_checkpoint_quantization(
                 {
                     "blocks.0.mlp.fc1": {
                         "format": "int8_tensorwise",
-                        "convrot": True,
+                        "convrot": False,
+                        "convrot_groupsize": 256,
                     }
                 }
             )
@@ -305,6 +364,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         )
 
         self.assertIsInstance(config, ComfyFp8Config)
+        self.assertTrue(config.checkpoint_uses_native_qkv_layout)
         layer = LinearBase(input_size=1, output_size=1)
         self.assertIsInstance(
             config.get_quant_method(layer, "blocks.0.mlp.fc2"),

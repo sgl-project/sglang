@@ -88,6 +88,8 @@ class ComfyFullPrecisionFp8LinearMethod(LinearMethodBase):
 class ComfyFp8Config(QuantizationConfig):
     """Dispatch each Linear according to its serialized ``comfy_quant`` marker."""
 
+    checkpoint_uses_native_qkv_layout = True
+
     def __init__(self, layer_markers: dict[str, dict[str, Any]]) -> None:
         super().__init__()
         self.layer_markers = layer_markers
