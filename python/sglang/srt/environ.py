@@ -351,6 +351,9 @@ class Envs:
     # ===================================================================
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
+    # Set to true by the check-changes CI job when a PR touches nothing under
+    # rust/; default false so local and scheduled runs never skip the cargo tests.
+    SGLANG_SKIP_RUST_TESTS = EnvBool(False)
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
     # Expand jit_kernel test grids to their full parameter ranges (nightly).
     SGLANG_JIT_KERNEL_RUN_FULL_TESTS = EnvBool(False)
@@ -815,6 +818,10 @@ class Envs:
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
     SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
+    # Unified KV wired the fused qk-norm-rope kernel to decode only, so MTP
+    # target-verify kept running the norm+RoPE as separate kernels. Set to 0 to
+    # go back to the unfused chain on the verify path.
+    SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY = EnvBool(True)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
 
     # ===================================================================
@@ -1024,6 +1031,7 @@ class Envs:
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
+    SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP = EnvBool(True)
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default
     # static local-batch path.
     SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
@@ -1044,16 +1052,6 @@ class Envs:
     # DeepGEMM Mega MoE
     # ===================================================================
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
-    # When set, the mega-MoE x slot is packed E2M1 (FP4) instead of FP8 E4M3.
-    # Halves symm-buffer footprint and unlocks the MXF4 mainloop downstream.
-    # Setting this also exports DG_USE_FP4_ACTS=1 so DeepGEMM's symm-buffer
-    # sizing + fp8_fp4_mega_moe pick up the FP4 layout.
-    SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS = EnvBool(False)
-    # Switches the L1+L2 mainloops from kind::mxf8f6f4 (K=32 with-padding) to
-    # kind::mxf4 (K=64 dense) inside fp8_fp4_mega_moe. No effect unless
-    # SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS is also set; DeepGEMM asserts
-    # this combination on the host side.
-    SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels
@@ -1622,6 +1620,12 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     "SGLANG_CUTLASS_MOE": _DeprecatedEnv(
         note="Please use '--moe-runner-backend=cutlass' and/or "
         "'--speculative-moe-runner-backend=cutlass' instead."
+    ),
+    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS": _DeprecatedEnv(
+        note="Please use '--enable-w4a4-mxfp4-megamoe' instead."
+    ),
+    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND": _DeprecatedEnv(
+        note="Please use '--enable-w4a4-mxfp4-megamoe' instead."
     ),
     "SGLANG_DFLASH_PREFILL_REFILL_TARGET": _DeprecatedEnv(
         note="DFlash now auto-enables the min-free-slots delay; unset this env. "
