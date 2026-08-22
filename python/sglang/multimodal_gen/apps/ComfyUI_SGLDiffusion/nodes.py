@@ -220,7 +220,7 @@ class SGLDLoraLoader:
 
 class SGLDUNETLoader:
     def __init__(self):
-        self.generator = SGLDiffusionGenerator()
+        self.generator = SGLDiffusionGenerator.shared()
 
     @classmethod
     def INPUT_TYPES(s):

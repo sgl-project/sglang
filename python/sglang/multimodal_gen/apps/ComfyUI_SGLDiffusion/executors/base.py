@@ -28,6 +28,9 @@ class SGLDiffusionExecutor(torch.nn.Module):
         self.dtype = config.unet_config["dtype"]
         self.config = config
         self.loras = []
+        self._lora_input = None
+        self._sgld_reload = None
+        self._ensure_runtime = None
         if self.adapter_cls is None:
             raise TypeError(f"{type(self).__name__} must set adapter_cls")
         self.adapter = self.adapter_cls()
@@ -44,7 +47,13 @@ class SGLDiffusionExecutor(torch.nn.Module):
 
     def set_lora(self, lora_nickname=None, lora_path=None, strength=None, target=None):
         """Set LoRA adapter using SGLang Diffusion API."""
-        if len(lora_nickname) > 0:
+        self._lora_input = {
+            "lora_nickname": lora_nickname,
+            "lora_path": lora_path,
+            "strength": strength,
+            "target": target,
+        }
+        if lora_nickname and len(lora_nickname) > 0:
             self.generator.set_lora(
                 lora_nickname=lora_nickname,
                 lora_path=lora_path,
@@ -106,6 +115,9 @@ class SGLDiffusionExecutor(torch.nn.Module):
         }
 
     def _execute_packed(self, packed, x, timestep):
+        ensure = getattr(self, "_ensure_runtime", None)
+        if ensure is not None:
+            ensure(self)
         self._mark_and_maybe_drop(packed)
         sampling_params = SamplingParams.from_user_sampling_params_args(
             self.model_path,
