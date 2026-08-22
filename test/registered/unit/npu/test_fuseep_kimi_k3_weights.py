@@ -74,9 +74,7 @@ def test_mega_moe_w4a8_weights_use_gemm_layout(monkeypatch):
             requires_grad=False,
         ),
         w2_weight=torch.nn.Parameter(
-            torch.empty(
-                experts, hidden // 2, intermediate, dtype=torch.int8
-            ),
+            torch.empty(experts, hidden // 2, intermediate, dtype=torch.int8),
             requires_grad=False,
         ),
         w13_weight_scale=torch.nn.Parameter(

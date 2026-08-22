@@ -237,9 +237,7 @@ def _process_mega_moe_weights(layer: torch.nn.Module) -> None:
         bias = getattr(layer, bias_attrs[prefix])
 
         converted[f"{prefix}_weight"] = [
-            npu_format_cast(expert.transpose(-2, -1).contiguous()).view(
-                torch.int32
-            )
+            npu_format_cast(expert.transpose(-2, -1).contiguous()).view(torch.int32)
             for expert in weight.data.unbind(dim=0)
         ]
         converted[f"{prefix}_weight_scale"] = [
@@ -251,9 +249,7 @@ def _process_mega_moe_weights(layer: torch.nn.Module) -> None:
             for expert in scale.data.unbind(dim=0)
         ]
         converted[f"{prefix}_scale_bias"] = [
-            expert.reshape(expert.shape[0], -1)
-            .sum(dim=-1)
-            .to(torch.float32)
+            expert.reshape(expert.shape[0], -1).sum(dim=-1).to(torch.float32)
             for expert in bias.data.unbind(dim=0)
         ]
 

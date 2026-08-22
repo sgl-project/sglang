@@ -195,7 +195,7 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
 
         if not get_moe_a2a_backend().is_ascend_fuseep():
             return False
-        
+
         # Guard against double processing when called for multiple prefixes.
         if getattr(layer, "_fuseep_weights_processed", False):
             return True
