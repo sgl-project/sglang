@@ -88,6 +88,112 @@ def test_every_call_site_can_await():
     )
 
 
+def test_default_worker_count_stays_at_the_measured_optimum():
+    """Two workers, measured, not guessed.
+
+    Image preprocessing releases the GIL, so a second worker overlaps it with
+    the GPU; a third and fourth start spreading request arrivals far enough
+    apart to fragment the prefill batches. Measured at 32-way concurrency on an
+    H200 for one / two / four workers: PaddleOCR-VL 1080p pages 6.72 / 9.55 /
+    8.92 req/s, Qwen2.5-VL small images with 512-token outputs 12.54 / 12.60 /
+    12.25 req/s. Raising this needs a fresh sweep, not a hunch.
+    """
+    from sglang.srt.multimodal.processors.base_processor import (
+        BaseMultimodalProcessor,
+    )
+
+    assert BaseMultimodalProcessor.supports_mm_processor_concurrency is True
+    assert BaseMultimodalProcessor.auto_mm_processor_worker_num == 2
+
+
+def _process_mm_data_overrides():
+    """Yield (path, node) for every subclass override of `process_mm_data`."""
+    for path in sorted(_MULTIMODAL_ROOT.rglob("*.py")):
+        if path.name in _EXEMPT:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "process_mm_data":
+                yield path, node
+
+
+def test_overrides_take_the_worker_pools_processor_clone():
+    """An override that reaches for `self._processor` puts every worker thread on
+    one shared HF processor, which is exactly what the per-thread clone exists to
+    prevent. Either accept `processor=` and resolve it, or delegate to super.
+    """
+    offenders = []
+    for path, node in _process_mm_data_overrides():
+        args = [a.arg for a in node.args.args] + [a.arg for a in node.args.kwonlyargs]
+        body = ast.dump(node)
+        reaches_for_shared = "attr='_processor'" in body
+        resolves_injected = "_resolve_processor" in body
+        if reaches_for_shared and not resolves_injected:
+            offenders.append(f"{path.relative_to(_MULTIMODAL_ROOT)}:{node.lineno}")
+        elif "processor" not in args and not (
+            "'super'" in body or not reaches_for_shared
+        ):
+            offenders.append(f"{path.relative_to(_MULTIMODAL_ROOT)}:{node.lineno}")
+    assert not offenders, (
+        "these `process_mm_data` overrides bypass the worker pool's processor "
+        "clone; accept `processor=None` and resolve it with "
+        "`self._resolve_processor(processor)`: " + ", ".join(offenders)
+    )
+
+
+# Processors that build their whole preprocessing chain themselves and never
+# reach `process_and_combine_mm_data`, so the worker pool cannot help them. They
+# are not broken by concurrency either -- they simply do not participate. Listed
+# explicitly so that adding a processor forces a decision instead of silently
+# leaving it at one-worker speed.
+_NO_WORKER_POOL_ROUTE = {
+    "inkling.py",
+    "lightonocr.py",
+    "llava.py",
+    "mimo_v2.py",
+    "mimo_v2_asr.py",
+    "minicpmv4_6.py",
+    "moss_vl.py",
+    "nano_nemotron_vl.py",
+    "transformers_auto.py",
+    "voxtral.py",
+    "whisper.py",
+}
+
+
+def test_processors_outside_the_worker_pool_are_declared():
+    """A new processor must either route through the pool or be listed here.
+
+    Without this, a processor added on the old call site keeps preprocessing on
+    the event loop and nobody notices: there is no error, just one-worker
+    throughput. Whichever way the list moves, the change should be deliberate.
+    """
+    unrouted = set()
+    for path in sorted(_MULTIMODAL_ROOT.rglob("*.py")):
+        if path.name in _EXEMPT:
+            continue
+        source = path.read_text(encoding="utf-8")
+        entry_points = (
+            "async def process_mm_data_async" in source
+            or "async def _process_special_format" in source
+        )
+        if entry_points and "process_and_combine_mm_data_async" not in source:
+            unrouted.add(path.name)
+
+    newly_unrouted = unrouted - _NO_WORKER_POOL_ROUTE
+    assert not newly_unrouted, (
+        "these processors reach preprocessing without going through the worker "
+        "pool, so they will serve at one-worker speed; either route them through "
+        "`process_and_combine_mm_data_async` or add them to "
+        f"_NO_WORKER_POOL_ROUTE with a reason: {sorted(newly_unrouted)}"
+    )
+    now_routed = _NO_WORKER_POOL_ROUTE - unrouted
+    assert not now_routed, (
+        "these processors now reach the worker pool, so drop them from "
+        f"_NO_WORKER_POOL_ROUTE: {sorted(now_routed)}"
+    )
+
+
 def test_the_scan_actually_finds_call_sites():
     """Guard against the scan silently matching nothing after a rename."""
     assert len(list(_call_sites())) > 20
