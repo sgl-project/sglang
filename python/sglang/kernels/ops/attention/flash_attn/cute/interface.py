@@ -15,7 +15,9 @@ from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
     is_batch_invariant,
 )
-from sglang.kernels.ops.attention.flash_attn.cute.cache_utils import get_jit_cache
+from sglang.kernels.ops.attention.flash_attn.cute.cache_config import (
+    get_flash_attn_jit_cache,
+)
 from sglang.kernels.ops.attention.flash_attn.cute.testing import is_fake_mode
 
 if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
@@ -1851,9 +1853,9 @@ def _flash_attn_fwd(
     return out, lse
 
 
-_flash_attn_fwd.compile_cache = get_jit_cache("fwd")
-_flash_attn_fwd.compile_cache_shear_bias = get_jit_cache("fwd_shear_bias")
-_flash_attn_fwd.compile_cache_prepare_shear_bias = get_jit_cache(
+_flash_attn_fwd.compile_cache = get_flash_attn_jit_cache("fwd")
+_flash_attn_fwd.compile_cache_shear_bias = get_flash_attn_jit_cache("fwd_shear_bias")
+_flash_attn_fwd.compile_cache_prepare_shear_bias = get_flash_attn_jit_cache(
     "fwd_prepare_shear_bias"
 )
 
@@ -2521,7 +2523,7 @@ def _flash_attn_fwd_combine(
         )
 
 
-_flash_attn_fwd_combine.compile_cache = get_jit_cache("fwd_combine")
+_flash_attn_fwd_combine.compile_cache = get_flash_attn_jit_cache("fwd_combine")
 
 
 def flash_attn_combine(
