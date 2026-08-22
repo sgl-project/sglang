@@ -4,13 +4,13 @@ from typing import Optional
 
 import msgspec
 import torch
-import triton
-import triton.language as tl
 
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.kernels.ops.speculative.reject_sampling import (
+    chain_speculative_sampling_torch,
     chain_speculative_sampling_triton,
 )
+from sglang.kernels.ops.speculative.triton_compat import cdiv, jit, tl
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
@@ -119,22 +119,42 @@ def _accept_sampling_core(
     )
     uniform_samples = torch.rand((bs, gamma), dtype=torch.float32, device=device)
     uniform_samples_final = torch.rand((bs,), dtype=torch.float32, device=device)
-    chain_speculative_sampling_triton(
-        predicts=predicts,
-        accept_index=accept_index,
-        accept_token_num=accept_token_num,
-        candidates=candidates,
-        retrive_index=retrieve_index,
-        retrive_next_token=retrieve_next_token,
-        retrive_next_sibling=retrieve_next_sibling,
-        uniform_samples=uniform_samples,
-        uniform_samples_for_final_sampling=uniform_samples_final,
-        target_probs=target_probs,
-        draft_probs=draft_probs,
-        threshold_single=1.0,
-        threshold_acc=1.0,
-        deterministic=True,
-    )
+    if inputs_on_cuda(candidates):
+        chain_speculative_sampling_triton(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            uniform_samples=uniform_samples,
+            uniform_samples_for_final_sampling=uniform_samples_final,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            threshold_single=1.0,
+            threshold_acc=1.0,
+            deterministic=True,
+        )
+    else:
+        # Ascend NPU / CPU: no Triton; the torch reference writes the same
+        # buffers with the same acceptance and final-sampling semantics.
+        chain_speculative_sampling_torch(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            uniform_samples=uniform_samples,
+            uniform_samples_for_final_sampling=uniform_samples_final,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            threshold_single=1.0,
+            threshold_acc=1.0,
+            deterministic=True,
+        )
     correct_len = accept_token_num
     if cutoff_verify_lens is not None:
         correct_len, cap_trim_lens = CapCorrectLen.execute(
@@ -174,7 +194,7 @@ def accept_sampling(
     return correct_len, bonus, cap_trim_lens
 
 
-@triton.jit
+@jit
 def _gather_two_level_bonus_kernel(
     accept_index_ptr,
     predicts_ptr,
@@ -206,7 +226,7 @@ def gather_two_level_bonus_triton(
     correct_len = correct_len.contiguous()
     out = torch.empty(bs, dtype=torch.int64, device=accept_index.device)
     BLOCK = 256
-    grid = (triton.cdiv(bs, BLOCK),)
+    grid = (cdiv(bs, BLOCK),)
     _gather_two_level_bonus_kernel[grid](
         accept_index, predicts, correct_len, out, cols, bs, BLOCK=BLOCK
     )
@@ -316,7 +336,7 @@ def softmax_temp(
     return torch.softmax(scaled, dim=-1)
 
 
-@triton.jit
+@jit
 def _softmax_temp_kernel(
     logits_ptr,
     temp_ptr,
@@ -487,7 +507,7 @@ def select_mixed_accept(
     )
 
 
-@triton.jit
+@jit
 def _mixed_accept_select_kernel(
     greedy_mask_ptr,
     greedy_len_ptr,
@@ -536,7 +556,7 @@ def select_mixed_accept_triton(
     bonus = torch.empty(bs, dtype=sampling_bonus.dtype, device=device)
     cap_trim_lens = torch.empty(bs, dtype=sampling_trim.dtype, device=device)
     BLOCK = 256
-    _mixed_accept_select_kernel[(triton.cdiv(bs, BLOCK),)](
+    _mixed_accept_select_kernel[(cdiv(bs, BLOCK),)](
         greedy_mask,
         greedy_len,
         greedy_bonus,
@@ -622,7 +642,7 @@ def accept_greedy(
     return correct_len, bonus, cap_trim_lens
 
 
-@triton.jit
+@jit
 def _gather_row_bonus_kernel(
     table_ptr,
     idx_ptr,
@@ -644,7 +664,7 @@ def gather_row_bonus_triton(*, table: torch.Tensor, idx: torch.Tensor) -> torch.
     idx = idx.contiguous()
     out = torch.empty(bs, dtype=torch.int64, device=table.device)
     BLOCK = 256
-    grid = (triton.cdiv(bs, BLOCK),)
+    grid = (cdiv(bs, BLOCK),)
     _gather_row_bonus_kernel[grid](table, idx, out, cols, bs, BLOCK=BLOCK)
     return out
 
@@ -730,7 +750,7 @@ def finalize_accept_lens(
     )
 
 
-@triton.jit
+@jit
 def _finalize_accept_lens_kernel(
     correct_len_ptr,
     cap_trim_ptr,
@@ -764,7 +784,7 @@ def finalize_accept_lens_triton(
     new_seq_lens = torch.empty(bs, dtype=prefix_lens.dtype, device=device)
     cap_trim_out = torch.empty(bs, dtype=torch.int32, device=device)
     BLOCK = 256
-    _finalize_accept_lens_kernel[(triton.cdiv(bs, BLOCK),)](
+    _finalize_accept_lens_kernel[(cdiv(bs, BLOCK),)](
         correct_len,
         cap_trim_lens,
         prefix_lens,
@@ -824,7 +844,7 @@ def cap_correct_len(
     return capped, cap_trim_lens
 
 
-@triton.jit
+@jit
 def _cap_correct_len_kernel(
     correct_len_ptr,
     verify_lens_ptr,
@@ -857,7 +877,7 @@ def cap_correct_len_triton(
     capped = torch.empty_like(correct_len)
     trim = torch.empty_like(correct_len)
     BLOCK = 1024
-    grid = (triton.cdiv(n, BLOCK),)
+    grid = (cdiv(n, BLOCK),)
     _cap_correct_len_kernel[grid](
         correct_len, verify_lens, capped, trim, n, BLOCK=BLOCK
     )

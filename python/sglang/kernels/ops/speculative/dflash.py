@@ -1,9 +1,9 @@
 import torch
-import triton
-import triton.language as tl
+
+from sglang.kernels.ops.speculative.triton_compat import jit, next_power_of_2, tl
 
 
-@triton.jit
+@jit
 def _dflash_accept_bonus_contig_kernel(
     candidates_ptr,
     target_top1_ptr,
@@ -115,7 +115,7 @@ def _compute_dflash_accept_bonus_triton_unchecked(
             "DFLASH Triton accept_bonus requires contiguous new_seq_lens_out."
         )
 
-    block = triton.next_power_of_2(block_size)
+    block = next_power_of_2(block_size)
     num_warps = _pick_num_warps(block)
     _dflash_accept_bonus_contig_kernel[(batch_size,)](
         candidates,
@@ -140,7 +140,7 @@ def _compute_dflash_accept_bonus_triton_unchecked(
     )
 
 
-@triton.jit
+@jit
 def _prepare_dflash_draft_block_contig_kernel(
     bonus_tokens_ptr,
     prefix_lens_ptr,
@@ -221,7 +221,7 @@ def _prepare_dflash_draft_block_unchecked(
         )
 
     block_size = int(block_ids_out.shape[1])
-    block = triton.next_power_of_2(block_size)
+    block = next_power_of_2(block_size)
     num_warps = _pick_num_warps(block)
     _prepare_dflash_draft_block_contig_kernel[(batch_size,)](
         bonus_tokens,
@@ -246,7 +246,7 @@ def _prepare_dflash_draft_block_unchecked(
     )
 
 
-@triton.jit
+@jit
 def _selector_walk_kernel(
     scores_ptr,
     candidate_ptr,
