@@ -2336,6 +2336,11 @@ def _attention_backend_platform_fallbacks(view: Any) -> dict:
             "The current platform does not support Intel XMX, will fallback to triton backend."
         )
         return {"attention_backend": "triton"}
+    if view.attention_backend == "mps_paged" and not is_mps():
+        logger.warning(
+            "The mps_paged attention backend requires Apple Metal, will fallback to torch_native backend."
+        )
+        return {"attention_backend": "torch_native"}
     return {}
 
 

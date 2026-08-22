@@ -834,6 +834,11 @@ class Envs:
     SGLANG_USE_MLX = EnvBool(False)
     SGLANG_MLX_USE_CUSTOM_ROPE = EnvBool(False)
     SGLANG_MLX_FUSE_SWIGLU = EnvBool(False)
+    # Disable the Metal block paged attention decode kernel, sending the
+    # mps_paged backend down its SDPA decode path instead. Everything else
+    # (backend, paged allocator, page size) is unchanged, so this isolates the
+    # kernel's contribution when benchmarking.
+    SGLANG_MPS_DISABLE_PAGED_KERNEL = EnvBool(False)
     # Number of decode steps between periodic mx.clear_cache() calls.
     # Set to 0 to disable cache clearing entirely.
     SGLANG_MLX_CLEAR_CACHE_STEPS = EnvInt(256)

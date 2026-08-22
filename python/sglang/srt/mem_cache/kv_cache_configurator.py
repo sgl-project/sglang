@@ -85,6 +85,7 @@ from sglang.srt.utils.common import (
     get_device_memory_capacity,
     is_float4_e2m1fn_x2,
     is_hip,
+    is_mps,
     is_npu,
 )
 
@@ -1772,7 +1773,15 @@ class KVCacheConfigurator:
                             need_sort=need_sort,
                         )
                     else:
-                        token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                        if is_mps() and get_schedule().page_size > 1:
+                            from sglang.srt.hardware_backend.mlx.allocator_mps import (
+                                MpsPagedTokenToKVPoolAllocator,
+                            )
+
+                            paged_allocator_cls = MpsPagedTokenToKVPoolAllocator
+                        else:
+                            paged_allocator_cls = PagedTokenToKVPoolAllocator
+                        token_to_kv_pool_allocator = paged_allocator_cls(
                             sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
                             page_size=get_schedule().page_size
                             * get_parallel().attn_dcp_size,

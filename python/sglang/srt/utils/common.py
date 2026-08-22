@@ -1305,7 +1305,7 @@ def temp_set_env(*, allow_sglang: bool = False, **env_vars: Any):
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
+    return backend not in ["torch_native", "intel_amx", "mps_paged"]
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(

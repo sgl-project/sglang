@@ -110,3 +110,82 @@ def rope_pool_fused(
         num_kv_heads,
         float(rope_base),
     )
+
+
+def block_paged_attention_decode(
+    q: mx.array,
+    k_blocks: mx.array,
+    v_blocks: mx.array,
+    block_tables: mx.array,
+    seq_lens: mx.array,
+    *,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    block_size: int,
+    sm_scale: float,
+) -> mx.array:
+    """Decode attention over a block-table MLX KV layout.
+
+    Args:
+        q: Query tensor with shape `[batch, num_qo_heads, head_dim]`.
+        k_blocks: Key blocks with shape
+            `[num_blocks, block_size, num_kv_heads, head_dim]`.
+        v_blocks: Value blocks with the same shape as `k_blocks`.
+        block_tables: int32 physical block IDs with shape
+            `[batch, max_num_blocks]`; `-1` entries are padding.
+        seq_lens: int32 visible sequence lengths with shape `[batch]`.
+
+    Returns:
+        Attention output with shape `[batch, num_qo_heads, head_dim]`.
+    """
+    if q.ndim != 3:
+        raise ValueError("block_paged_attention_decode expects q to be 3-D")
+    if k_blocks.ndim != 4 or v_blocks.ndim != 4:
+        raise ValueError("block_paged_attention_decode expects K/V blocks to be 4-D")
+    if block_tables.ndim != 2 or seq_lens.ndim != 1:
+        raise ValueError(
+            "block_paged_attention_decode expects block_tables to be 2-D and seq_lens to be 1-D"
+        )
+
+    q_shape = tuple(q.shape)
+    k_shape = tuple(k_blocks.shape)
+    v_shape = tuple(v_blocks.shape)
+    if q_shape[1:] != (num_qo_heads, head_dim):
+        raise ValueError(
+            "q shape must be [batch, num_qo_heads, head_dim], " f"got {q.shape}"
+        )
+    if k_shape[1:] != (block_size, num_kv_heads, head_dim):
+        raise ValueError(
+            "k_blocks must have shape [num_blocks, block_size, num_kv_heads, head_dim], "
+            f"got {k_blocks.shape}"
+        )
+    if v_shape != k_shape:
+        raise ValueError(
+            f"v_blocks shape must match k_blocks shape, got {v_blocks.shape} vs {k_blocks.shape}"
+        )
+    if tuple(block_tables.shape)[0] != q_shape[0]:
+        raise ValueError("block_tables must have one row per batch item")
+    if tuple(seq_lens.shape) != (q_shape[0],):
+        raise ValueError("seq_lens must have one entry per batch item")
+    if num_qo_heads % num_kv_heads != 0:
+        raise ValueError("num_qo_heads must be divisible by num_kv_heads")
+    if head_dim > 256:
+        raise ValueError(
+            "block_paged_attention_decode currently supports head_dim <= 256"
+        )
+    if q.dtype != k_blocks.dtype or q.dtype != v_blocks.dtype:
+        raise ValueError("q/k_blocks/v_blocks dtypes must match")
+
+    return _metal.block_paged_attention_decode(
+        q,
+        k_blocks,
+        v_blocks,
+        block_tables,
+        seq_lens,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        block_size,
+        float(sm_scale),
+    )
