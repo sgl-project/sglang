@@ -4038,6 +4038,17 @@ class ServerArgs:
                 "--decode-context-parallel-size) must be >= 1, but got "
                 f"dcp_size={self.dcp_size}."
             )
+        if (
+            self.dcp_size > 1
+            and is_cuda()
+            and self.speculative_algorithm is not None
+        ):
+            logger.warning(
+                "Decode context parallel (--dcp-size > 1) with "
+                "speculative decoding is experimental: validated for DSA "
+                "models (GLM-5.x EAGLE/nextn) on the default kernel "
+                "stack; the dense-MLA draft path is not implemented."
+            )
         if self.dcp_comm_backend in ("a2a", "fi_a2a") and self.dcp_size <= 1:
             raise ValueError(
                 f"--dcp-comm-backend {self.dcp_comm_backend} only affects the "
