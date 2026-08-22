@@ -5,9 +5,10 @@ server. Integrated mode keeps ComfyUI's CLIP / VAE / sampler loop and uses
 SGLang only as a per-step DiT forward.
 
 Integrated mode no longer ships dedicated `comfyui_*` pipelines. It starts the
-native Flux / Qwen-Image / Z-Image pipeline under `--comfyui-mode`, loads a
-single-file ComfyUI `.safetensors` through a checkpoint spec, and translates
-each `apply_model` call through a small per-model adapter.
+native Flux / Qwen-Image / Z-Image / MiniMax-H3 pipeline under `--comfyui-mode`,
+loads a single-file ComfyUI `.safetensors` (or GGUF overlay) through a
+checkpoint spec, and translates each `apply_model` call through a small
+per-model adapter.
 
 ## Installation
 
@@ -23,6 +24,7 @@ The plugin supports two modes of operation: **Server Mode** (via HTTP API) and *
 - **Z-Image**: High-speed image generation models (e.g., `Z-Image-Turbo`)
 - **FLUX**: State-of-the-art text-to-image models (e.g., `FLUX.1-dev`)
 - **Qwen-Image**: Multi-modal image generation models (e.g., `Qwen-Image`,`Qwen-Image-2512`). *Note: Image editing support is currently experimental and may have some issues.*
+- **MiniMax-H3**: Joint video-and-audio DiT (`model_type=minimax_h3`). T2V / I2VA / FL2VA use an `fl2va` checkpoint; R2V needs `ref2va`. CLIP and VAE stay in ComfyUI.
 
 ### Mode 1: Server Mode (HTTP API)
 Connect to a standalone SGLang Diffusion server.
@@ -53,11 +55,9 @@ Reference workflow files are provided in the `workflows/` directory:
 - **`z-image_sgld.json`**: High-speed image generation using Z-Image.
 - **`sgld_text2img.json`**: Server-mode text-to-image generation with LoRA support.
 - **`sgld_image2video.json`**: Server-mode image-to-video generation.
-- **`minimax_h3_t2v_sgld.json`**: MiniMax-H3 text-to-video (SGLD DiT-forward).
-- **`minimax_h3_r2v_sgld.json`**: MiniMax-H3 reference-to-video.
+- **`minimax_h3_t2v_sgld.json`**: MiniMax-H3 T2V / I2VA / FL2VA (`fl2va` DiT).
+- **`minimax_h3_r2v_sgld.json`**: MiniMax-H3 reference-to-video (`ref2va` DiT).
 - **`minimax_h3_t2v_sgld_upscaler.json`**: H3 two-pass latent upscale (low-res then 3D ×2 refine).
-
-LoRA / GGUF / Cache-DiT / attention-backend / FaceRefine graphs used for support-matrix runs live under `scripts/comfyui_h3_workflows/` in the sglang tree, not in this plugin folder.
 
 For other workflows supporting the models, you can easily use SGLang by replacing the official `UNET Loader` node with the `SGLDUNETLoader` node. Similarly, for LoRA support, replace the official LoRA loader with the `SGLDiffusion LoRA Loader`.
 
