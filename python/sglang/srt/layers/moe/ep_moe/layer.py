@@ -318,6 +318,7 @@ class DeepEPMoE(FusedMoE):
                 dispatch_output,
                 weight_layout,
                 activation=self.moe_runner_config.activation,
+                zero_copy=dispatch_output.hidden_states_zero_copy,
             )
         else:
             raise NotImplementedError(

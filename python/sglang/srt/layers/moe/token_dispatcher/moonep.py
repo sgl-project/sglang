@@ -15,10 +15,11 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.topk import TopKOutput
-from sglang.srt.layers.moe.topk import TopKOutputChecker
+from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.utils import DeepEPMode
 
+
+_DECODE_TOKENS_PER_REQUEST_HEADROOM = 8
 
 _MOONEP_UNSUPPORTED_MESSAGE = (
     "MoonEP MoE A2A is recognized by SGLang, but the runtime dispatcher is not "
@@ -42,6 +43,9 @@ class MoonEPDispatchOutput(NamedTuple):
     plan: Any
     expert_ids: torch.Tensor
     num_tokens: int
+    hidden_states_zero_copy: bool = False
+    buffer_key: Optional[MoonEPBufferKey] = None
+    owner_id: Optional[int] = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -58,6 +62,9 @@ class MoonEPCombineInput(NamedTuple):
     route_weights_nvs: Optional[torch.Tensor]
     plan: Any
     num_tokens: int
+    hidden_states_zero_copy: bool = False
+    buffer_key: Optional[MoonEPBufferKey] = None
+    owner_id: Optional[int] = None
 
     @property
     def format(self) -> CombineInputFormat:
@@ -97,6 +104,15 @@ class MoonEPBufferKey:
     num_sms: int
 
 
+@dataclass
+class _MoonEPZeroCopyFlight:
+    key: MoonEPBufferKey
+    plan: Any
+    hidden_states_ptr: int
+    owner_id: int
+    state: str = "DISPATCH_VIEW_OWNED"
+
+
 class MoonEPBuffer:
     """Process-wide facade for MoonEP communication buffers.
 
@@ -118,8 +134,11 @@ class MoonEPBuffer:
             state = SimpleNamespace(
                 buffers={},
                 active_key=None,
+                zero_copy_flights={},
             )
             buffers["moonep_ep_state"] = state
+        elif not hasattr(state, "zero_copy_flights"):
+            state.zero_copy_flights = {}
         return state
 
     @staticmethod
@@ -226,6 +245,170 @@ class MoonEPBuffer:
         return state.buffers.get(key)
 
     @classmethod
+    def assert_idle(cls, key: MoonEPBufferKey) -> None:
+        flight = cls._state().zero_copy_flights.get(key)
+        if flight is not None:
+            raise RuntimeError(
+                "MoonEP buffer already owns a zero-copy flight "
+                f"(owner_id={flight.owner_id}, pointer={flight.hidden_states_ptr}); "
+                "dispatch/combine overlap is unsupported."
+            )
+
+    @classmethod
+    def begin_zero_copy_flight(
+        cls,
+        *,
+        key: MoonEPBufferKey,
+        buffer: Any,
+        plan: Any,
+        hidden_states: torch.Tensor,
+        owner_id: int,
+    ) -> None:
+        cls.assert_idle(key)
+        flight = _MoonEPZeroCopyFlight(
+            key=key,
+            plan=plan,
+            hidden_states_ptr=hidden_states.data_ptr(),
+            owner_id=owner_id,
+        )
+        # Record ownership before validating. If validation fails after dispatch
+        # has exposed the persistent view, the flight stays poisoned rather than
+        # allowing another communication call to overwrite unknown live state.
+        cls._state().zero_copy_flights[key] = flight
+        cls.validate_zero_copy_flight(
+            key=key,
+            buffer=buffer,
+            plan=plan,
+            hidden_states=hidden_states,
+            owner_id=owner_id,
+        )
+
+    @classmethod
+    def validate_zero_copy_flight(
+        cls,
+        *,
+        key: MoonEPBufferKey,
+        buffer: Any,
+        plan: Any,
+        hidden_states: torch.Tensor,
+        owner_id: int,
+        expected_state: Optional[str] = None,
+    ) -> None:
+        flight = cls._state().zero_copy_flights.get(key)
+        if flight is None:
+            raise RuntimeError("MoonEP zero-copy combine has no active flight.")
+        if flight.owner_id != owner_id:
+            raise RuntimeError(
+                "MoonEP zero-copy flight owner mismatch: "
+                f"expected {flight.owner_id}, got {owner_id}."
+            )
+        if flight.plan is not plan:
+            raise RuntimeError("MoonEP zero-copy flight plan mismatch.")
+        if flight.hidden_states_ptr != hidden_states.data_ptr():
+            raise RuntimeError(
+                "MoonEP zero-copy hidden-state pointer was replaced: "
+                f"expected {flight.hidden_states_ptr}, got {hidden_states.data_ptr()}."
+            )
+        if expected_state is not None and flight.state != expected_state:
+            raise RuntimeError(
+                "MoonEP zero-copy flight state mismatch: "
+                f"expected {expected_state}, got {flight.state}."
+            )
+
+        buffer_view = buffer.hidden_nvsh_buffer_view
+        if hidden_states.data_ptr() != buffer_view.data_ptr():
+            raise RuntimeError(
+                "MoonEP zero-copy hidden-state pointer does not alias the "
+                "buffer's persistent view."
+            )
+        if (
+            hidden_states.shape != buffer_view.shape
+            or hidden_states.dtype != buffer_view.dtype
+            or hidden_states.device != buffer_view.device
+            or not hidden_states.is_contiguous()
+        ):
+            raise RuntimeError(
+                "MoonEP zero-copy hidden-state view changed shape, dtype, "
+                "device, or contiguity during the flight."
+            )
+
+    @classmethod
+    def begin_zero_copy_output_write(
+        cls,
+        *,
+        key: MoonEPBufferKey,
+        plan: Any,
+        hidden_states: torch.Tensor,
+        owner_id: int,
+    ) -> None:
+        flight = cls._state().zero_copy_flights.get(key)
+        if flight is None:
+            raise RuntimeError("MoonEP zero-copy output write has no active flight.")
+        if (
+            flight.plan is not plan
+            or flight.hidden_states_ptr != hidden_states.data_ptr()
+            or flight.owner_id != owner_id
+        ):
+            raise RuntimeError(
+                "MoonEP zero-copy output write does not match its active flight."
+            )
+        if flight.state != "DISPATCH_VIEW_OWNED":
+            raise RuntimeError(
+                "MoonEP zero-copy output write was started more than once or "
+                "after combine."
+            )
+        flight.state = "OUTPUT_WRITE_STARTED"
+
+    @classmethod
+    def mark_zero_copy_output_written(
+        cls,
+        *,
+        key: MoonEPBufferKey,
+        plan: Any,
+        hidden_states: torch.Tensor,
+        owner_id: int,
+    ) -> None:
+        flight = cls._state().zero_copy_flights.get(key)
+        if flight is None:
+            raise RuntimeError("MoonEP zero-copy output has no active flight.")
+        if (
+            flight.plan is not plan
+            or flight.hidden_states_ptr != hidden_states.data_ptr()
+            or flight.owner_id != owner_id
+        ):
+            raise RuntimeError(
+                "MoonEP zero-copy output does not match its active flight."
+            )
+        if flight.state != "OUTPUT_WRITE_STARTED":
+            raise RuntimeError(
+                "MoonEP zero-copy output write did not start exactly once."
+            )
+        flight.state = "OUTPUT_WRITTEN"
+
+    @classmethod
+    def complete_zero_copy_flight(
+        cls,
+        *,
+        key: MoonEPBufferKey,
+        plan: Any,
+        hidden_states: torch.Tensor,
+        owner_id: int,
+    ) -> None:
+        flight = cls._state().zero_copy_flights.get(key)
+        if (
+            flight is None
+            or flight.plan is not plan
+            or flight.hidden_states_ptr != hidden_states.data_ptr()
+            or flight.owner_id != owner_id
+            or flight.state != "OUTPUT_WRITTEN"
+        ):
+            raise RuntimeError(
+                "MoonEP zero-copy flight changed before combine completion."
+            )
+        flight.state = "COMBINE_QUEUED"
+        del cls._state().zero_copy_flights[key]
+
+    @classmethod
     def get_moonep_buffer(
         cls,
         group: dist.ProcessGroup,
@@ -286,6 +469,7 @@ class MoonEPBuffer:
             return
 
         buffer = state.buffers.pop(key, None)
+        state.zero_copy_flights.pop(key, None)
         destroy = getattr(buffer, "destroy", None)
         if callable(destroy):
             destroy()
@@ -298,6 +482,7 @@ class MoonEPBuffer:
         for key in list(state.buffers):
             cls.destroy_buffer(key)
         state.active_key = None
+        state.zero_copy_flights.clear()
 
 
 def get_moonep_num_prefetch_slots(num_experts: int, num_ep_ranks: int) -> int:
@@ -419,6 +604,7 @@ def run_moonep_bf16_expert(
     weight_layout: MoonEPExpertWeightLayout,
     *,
     activation: str = "silu",
+    zero_copy: bool = False,
 ) -> MoonEPCombineInput:
     """Run a simple BF16 MoonEP expert core over ``cu_seqlens`` segments.
 
@@ -451,11 +637,25 @@ def run_moonep_bf16_expert(
             f"shape {cu_seqlens.shape}"
         )
     if route_weights_nvs is not None and route_weights_nvs.ndim != 1:
-        raise ValueError(
-            f"route_weights_nvs must be 1D, got {route_weights_nvs.shape}"
-        )
+        raise ValueError(f"route_weights_nvs must be 1D, got {route_weights_nvs.shape}")
 
-    output = torch.empty_like(hidden_states)
+    if zero_copy != dispatch_output.hidden_states_zero_copy:
+        raise RuntimeError(
+            "MoonEP BF16 runner mode must match the dispatch view's zero-copy "
+            "ownership metadata."
+        )
+    if zero_copy:
+        if dispatch_output.buffer_key is None or dispatch_output.owner_id is None:
+            raise RuntimeError(
+                "MoonEP BF16 zero-copy output is missing ownership metadata."
+            )
+        MoonEPBuffer.begin_zero_copy_output_write(
+            key=dispatch_output.buffer_key,
+            plan=dispatch_output.plan,
+            hidden_states=hidden_states,
+            owner_id=dispatch_output.owner_id,
+        )
+    output = hidden_states if zero_copy else torch.empty_like(hidden_states)
     prev = 0
     for group_id in range(cu_seqlens.numel()):
         cur = int(cu_seqlens[group_id].item())
@@ -488,12 +688,50 @@ def run_moonep_bf16_expert(
     if prev < hidden_states.shape[0]:
         output[prev:].zero_()
 
+    if zero_copy:
+        MoonEPBuffer.mark_zero_copy_output_written(
+            key=dispatch_output.buffer_key,
+            plan=dispatch_output.plan,
+            hidden_states=output,
+            owner_id=dispatch_output.owner_id,
+        )
+
     return MoonEPCombineInput(
         hidden_states=output,
         route_weights_nvs=route_weights_nvs,
         plan=dispatch_output.plan,
         num_tokens=dispatch_output.num_tokens,
+        hidden_states_zero_copy=dispatch_output.hidden_states_zero_copy,
+        buffer_key=dispatch_output.buffer_key,
+        owner_id=dispatch_output.owner_id,
     )
+
+
+def _resolve_decode_capacity(prefill_capacity: int) -> int | None:
+    """Token capacity for decode batches, or None to reuse the prefill one.
+
+    Decode is bounded by the number of running requests, which is orders of
+    magnitude below a prefill chunk, so giving it its own smaller buffer is
+    what keeps a decode step from running the MoE over a full chunk's worth of
+    padding. Both capacities are config-derived, so every rank picks the same
+    one without communicating.
+    """
+    override = envs.SGLANG_MOONEP_DECODE_MAX_DISPATCH_TOKENS_PER_RANK.get()
+    if override > 0:
+        capacity = override
+    else:
+        from sglang.srt.runtime_context import get_schedule
+
+        # None until the scheduler resolves it; fall back to one capacity then.
+        max_running = get_schedule().max_running_requests
+        if max_running is None:
+            return None
+        # Speculative decoding submits several tokens per request per step.
+        capacity = int(max_running) * _DECODE_TOKENS_PER_REQUEST_HEADROOM
+
+    token_padding = envs.SGLANG_MOONEP_TOKEN_PADDING.get()
+    capacity = -(-capacity // token_padding) * token_padding
+    return None if capacity >= prefill_capacity else capacity
 
 
 class MoonEPDispatcher(BaseDispatcher):
@@ -511,6 +749,7 @@ class MoonEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        zero_copy_supported: bool = True,
     ):
         super().__init__()
         self.group = group
@@ -523,9 +762,13 @@ class MoonEPDispatcher(BaseDispatcher):
         self.deepep_mode = deepep_mode
         self.async_finish = async_finish
         self.return_recv_hook = return_recv_hook
+        self.zero_copy_supported = zero_copy_supported
         self.expert_mask_gpu = None
         self.num_max_dispatch_tokens_per_rank = (
             envs.SGLANG_MOONEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+        )
+        self.decode_max_dispatch_tokens_per_rank = _resolve_decode_capacity(
+            self.num_max_dispatch_tokens_per_rank
         )
         self.num_prefetch_slots = None
 
@@ -533,7 +776,29 @@ class MoonEPDispatcher(BaseDispatcher):
     def _raise_unimplemented() -> NoReturn:
         raise NotImplementedError(_MOONEP_UNSUPPORTED_MESSAGE)
 
-    def _get_buffer(self):
+    def _phase_capacity(self) -> int:
+        """Static token capacity for the current phase.
+
+        MoonEP's buffers are statically shaped and ``dispatch`` asserts an
+        exact ``S x K`` input, so every batch is padded up to the capacity. One
+        capacity sized for prefill makes decode pay for it: at K3 a batch of 8
+        tokens would run the MoE over 16384, a ~2000x inflation.
+
+        The two capacities come from server args rather than the batch, because
+        the buffer is created collectively -- picking from a runtime token
+        count would let ranks disagree and deadlock. The phase flag is uniform
+        across the group for the same reason.
+        """
+        if self.decode_max_dispatch_tokens_per_rank is None:
+            return self.num_max_dispatch_tokens_per_rank
+
+        from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+
+        if get_is_extend_in_batch():
+            return self.num_max_dispatch_tokens_per_rank
+        return self.decode_max_dispatch_tokens_per_rank
+
+    def _get_buffer(self, capacity: int | None = None):
         if self.hidden_size is None or self.num_experts is None:
             raise ValueError(
                 "MoonEPDispatcher requires hidden_size and num_experts to "
@@ -544,9 +809,30 @@ class MoonEPDispatcher(BaseDispatcher):
             hidden_size=self.hidden_size,
             router_topk=self.router_topk,
             num_experts=self.num_experts,
-            num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+            num_max_dispatch_tokens_per_rank=(
+                self._phase_capacity() if capacity is None else capacity
+            ),
             num_prefetch_slots=self.num_prefetch_slots,
         )
+
+    def _get_buffer_and_key(
+        self, capacity: int | None = None
+    ) -> tuple[Any, MoonEPBufferKey]:
+        if self.hidden_size is None or self.num_experts is None:
+            raise ValueError(
+                "MoonEPDispatcher requires hidden_size and num_experts to "
+                "create a MoonEP buffer."
+            )
+        resolved_capacity = self._phase_capacity() if capacity is None else capacity
+        key = MoonEPBuffer.build_key(
+            group=self.group,
+            hidden_size=self.hidden_size,
+            router_topk=self.router_topk,
+            num_experts=self.num_experts,
+            num_max_dispatch_tokens_per_rank=resolved_capacity,
+            num_prefetch_slots=self.num_prefetch_slots,
+        )
+        return self._get_buffer(resolved_capacity), key
 
     def _get_rank(self) -> int:
         try:
@@ -559,9 +845,9 @@ class MoonEPDispatcher(BaseDispatcher):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        capacity: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         num_tokens = int(hidden_states.shape[0])
-        capacity = int(self.num_max_dispatch_tokens_per_rank)
         if num_tokens > capacity:
             raise ValueError(
                 "MoonEP runtime batch has more tokens than its static buffer "
@@ -587,34 +873,58 @@ class MoonEPDispatcher(BaseDispatcher):
         )
 
     def _tokens_per_expert(self, topk_ids: torch.Tensor) -> torch.Tensor:
+        """Local token count per expert.
+
+        ``torch.bincount`` would be the obvious call, but on CUDA it reads the
+        input's max back to the host to size its output, and a device-to-host
+        copy is illegal under CUDA graph capture. Scattering into a
+        fixed-length buffer keeps the whole thing on device.
+        """
         assert self.num_experts is not None
-        return torch.bincount(
-            topk_ids.reshape(-1).to(dtype=torch.int64),
-            minlength=self.num_experts,
-        ).to(dtype=torch.int32)
+        flat = topk_ids.reshape(-1).to(dtype=torch.int64)
+        counts = torch.zeros(
+            self.num_experts, dtype=torch.int32, device=topk_ids.device
+        )
+        counts.scatter_add_(0, flat, torch.ones_like(flat, dtype=torch.int32))
+        return counts
 
     def _expert_ids_from_plan(
         self,
         cu_seqlens: torch.Tensor,
         plan: Any,
     ) -> torch.Tensor:
+        """Which expert each VM group carries: its own id for the first
+        ``num_experts`` groups, the duplicated expert's id for the prefetch
+        slots after them, and -1 for groups that received no tokens.
+
+        Stays on device. The obvious loop costs one ``.item()`` per group --
+        896 host syncs per layer, ~82k per forward at K3's depth, which
+        dominates decode.
+        """
         assert self.num_experts is not None
+        num_experts = int(self.num_experts)
         num_groups = int(cu_seqlens.numel())
-        expert_ids = torch.full_like(cu_seqlens, -1)
         experts_to_copy = plan.experts_to_copy
         if experts_to_copy.ndim == 2:
             experts_to_copy = experts_to_copy[self._get_rank()]
 
-        prev = 0
-        for group_id in range(num_groups):
-            cur = int(cu_seqlens[group_id].item())
-            if cur > prev:
-                if group_id < self.num_experts:
-                    expert_ids[group_id] = group_id
-                else:
-                    expert_ids[group_id] = experts_to_copy[group_id - self.num_experts]
-            prev = cur
-        return expert_ids
+        num_slots = num_groups - num_experts
+        assert 0 <= num_slots <= int(experts_to_copy.numel()), (
+            f"MoonEP plan has {experts_to_copy.numel()} prefetch slots but "
+            f"cu_seqlens describes {num_slots}"
+        )
+        ids = torch.cat(
+            [
+                torch.arange(
+                    num_experts, device=cu_seqlens.device, dtype=cu_seqlens.dtype
+                ),
+                experts_to_copy[:num_slots].to(dtype=cu_seqlens.dtype),
+            ]
+        )
+        # cu_seqlens holds segment *ends*, so a group is live when its end
+        # moved past the previous one's.
+        starts = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens[:-1]])
+        return torch.where(cu_seqlens > starts, ids, torch.full_like(ids, -1))
 
     def dispatch(
         self,
@@ -631,21 +941,48 @@ class MoonEPDispatcher(BaseDispatcher):
             )
         if self.num_experts is None:
             raise ValueError("MoonEPDispatcher requires num_experts.")
+        zero_copy = envs.SGLANG_MOONEP_ZERO_COPY.get()
+        if zero_copy:
+            if not self.zero_copy_supported:
+                raise RuntimeError(
+                    "SGLANG_MOONEP_ZERO_COPY requires the unquantized BF16 "
+                    "correctness path or an explicitly selected DeepGEMM runner."
+                )
+            if torch.is_grad_enabled():
+                raise RuntimeError(
+                    "SGLANG_MOONEP_ZERO_COPY requires inference/no-grad execution."
+                )
 
+        # One capacity for both the padding and the buffer: MoonEP asserts the
+        # dispatch input matches the buffer's static S exactly.
+        capacity = self._phase_capacity()
         hidden_states, topk_ids, topk_weights, num_tokens = self._pad_to_capacity(
             hidden_states,
             topk_output.topk_ids,
             topk_output.topk_weights,
+            capacity,
         )
         tokens_per_expert = self._tokens_per_expert(topk_ids)
-        buffer = self._get_buffer()
+        buffer, buffer_key = self._get_buffer_and_key(capacity)
+        MoonEPBuffer.assert_idle(buffer_key)
         hidden_nvsh, route_weights_nvs, cu_seqlens, plan = buffer.dispatch(
             hidden_states,
             topk_weights,
             topk_ids,
             tokens_per_expert,
             async_finish=False,
+            zero_copy=zero_copy,
+            router_weights_zero_copy=False,
         )
+        owner_id = id(self) if zero_copy else None
+        if zero_copy:
+            MoonEPBuffer.begin_zero_copy_flight(
+                key=buffer_key,
+                buffer=buffer,
+                plan=plan,
+                hidden_states=hidden_nvsh,
+                owner_id=owner_id,
+            )
         return MoonEPDispatchOutput(
             hidden_states=hidden_nvsh,
             route_weights_nvs=route_weights_nvs,
@@ -653,6 +990,9 @@ class MoonEPDispatcher(BaseDispatcher):
             plan=plan,
             expert_ids=self._expert_ids_from_plan(cu_seqlens, plan),
             num_tokens=num_tokens,
+            hidden_states_zero_copy=zero_copy,
+            buffer_key=buffer_key if zero_copy else None,
+            owner_id=owner_id,
         )
 
     def dispatch_a(
@@ -674,12 +1014,45 @@ class MoonEPDispatcher(BaseDispatcher):
                 f"MoonEPDispatcher.combine expected MOONEP input, got "
                 f"{combine_input.format}"
             )
-        hidden_states, _route_weights_sk, _event = self._get_buffer().combine(
+        zero_copy = combine_input.hidden_states_zero_copy
+        if zero_copy:
+            if combine_input.buffer_key is None or combine_input.owner_id is None:
+                raise RuntimeError(
+                    "MoonEP zero-copy combine is missing buffer ownership metadata."
+                )
+            buffer_key = combine_input.buffer_key
+            buffer = MoonEPBuffer.get_existing_buffer(buffer_key)
+            if buffer is None:
+                raise RuntimeError(
+                    "MoonEP zero-copy combine buffer was destroyed during its flight."
+                )
+            MoonEPBuffer.validate_zero_copy_flight(
+                key=buffer_key,
+                buffer=buffer,
+                plan=combine_input.plan,
+                hidden_states=combine_input.hidden_states,
+                owner_id=combine_input.owner_id,
+                expected_state="OUTPUT_WRITTEN",
+            )
+        else:
+            buffer, buffer_key = self._get_buffer_and_key()
+            MoonEPBuffer.assert_idle(buffer_key)
+
+        hidden_states, _route_weights_sk, _event = buffer.combine(
             plan=combine_input.plan,
             hidden_nvsh=combine_input.hidden_states,
             route_weights_nvs=None,
             async_finish=False,
+            zero_copy=zero_copy,
+            router_weights_zero_copy=False,
         )
+        if zero_copy:
+            MoonEPBuffer.complete_zero_copy_flight(
+                key=buffer_key,
+                plan=combine_input.plan,
+                hidden_states=combine_input.hidden_states,
+                owner_id=combine_input.owner_id,
+            )
         return hidden_states[: combine_input.num_tokens].contiguous()
 
     def combine_a(
@@ -694,14 +1067,42 @@ class MoonEPDispatcher(BaseDispatcher):
     def prefetch_weight(
         self,
         plan: Any,
-        weight_layout: MoonEPExpertWeightLayout,
+        weight_layout: MoonEPExpertWeightLayout | None = None,
+        layer_id: int | None = None,
     ) -> None:
+        """Fill this rank's prefetch slots with the duplicated experts.
+
+        ``weight_layout`` is the BF16 PoC form: one contiguous ``[E+B]`` block
+        per projection, indexed by global expert id. ``layer_id`` selects the
+        symmetric-memory form, where the sources are VMM ranges shared by every
+        layer and the plan's expert ids have to be remapped to rows before the
+        copy can find them.
+        """
+        assert (weight_layout is None) != (layer_id is None), (
+            "MoonEPDispatcher.prefetch_weight takes exactly one of "
+            "weight_layout or layer_id"
+        )
+        if weight_layout is not None:
+            self._get_buffer().prefetch_weight(
+                plan=plan,
+                async_finish=False,
+                full_gate_weight=weight_layout.full_gate_weight,
+                full_up_weight=weight_layout.full_up_weight,
+                full_down_weight=weight_layout.full_down_weight,
+            )
+            return
+
+        from sglang.srt.layers.moe.token_dispatcher import moonep_weights
+
+        weight_pairs, scale_pairs = moonep_weights.prefetch_pairs(layer_id)
         self._get_buffer().prefetch_weight(
             plan=plan,
             async_finish=False,
-            full_gate_weight=weight_layout.full_gate_weight,
-            full_up_weight=weight_layout.full_up_weight,
-            full_down_weight=weight_layout.full_down_weight,
+            weight_pairs=weight_pairs,
+            scale_pairs=scale_pairs or None,
+            experts_to_copy=moonep_weights.expert_rows(
+                layer_id, plan.experts_to_copy[self._get_rank()]
+            ),
         )
 
     def register_deepep_dispatch_hook(self, hook):
