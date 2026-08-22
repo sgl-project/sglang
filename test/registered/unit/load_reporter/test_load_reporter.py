@@ -1731,8 +1731,21 @@ class TestCloseCancellationSafety:
 
 def make_standalone_server_args(
     *, port: Optional[int], sidecar_port: int
-) -> types.SimpleNamespace:
-    return make_server_args(
+) -> Any:
+    """Build resolved standalone gRPC arguments for runtime-context tests.
+
+    Args:
+        port: Optional load reporter listener port.
+        sidecar_port: HTTP sidecar listener port.
+
+    Returns:
+        A lightweight real ServerArgs instance whose config namespaces can be
+        published by the standalone gRPC entry point.
+    """
+    from sglang.srt.server_args import ServerArgs
+
+    return ServerArgs(
+        model_path="dummy",
         load_reporter_port=port,
         port=sidecar_port - 1,
         smg_http_sidecar_port=sidecar_port,
