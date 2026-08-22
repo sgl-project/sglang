@@ -7,6 +7,7 @@ import os
 
 import psutil
 from comfy import model_detection, model_management
+from comfy.patcher_extension import WrappersMP
 from comfy.utils import (
     calculate_parameters,
     load_torch_file,
@@ -360,5 +361,10 @@ class SGLDiffusionGenerator:
 
         self._patcher = SGLDModelPatcher(
             comfyui_model, load_device, offload_device, model_type=model_type
+        )
+        self._patcher.add_wrapper_with_key(
+            WrappersMP.SAMPLER_SAMPLE,
+            "sgld_session",
+            self.executor.sampler_sample_wrapper,
         )
         return self._patcher

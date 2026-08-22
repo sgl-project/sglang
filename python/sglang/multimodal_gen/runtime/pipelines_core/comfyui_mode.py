@@ -47,7 +47,9 @@ _CONDITIONING_FIELDS = (
     "negative_prompt_embeds_mask",
     "sigmas",
 )
-_SESSION_SKIP_EXTRA = frozenset({"comfyui_session_id"})
+_SESSION_SKIP_EXTRA = frozenset(
+    {"comfyui_session_id", "comfyui_cond_key", "comfyui_cache_fp"}
+)
 _SESSIONS: dict[str, dict[str, Any]] = {}
 _RUNS: dict[str, Any] = {}
 
@@ -111,40 +113,70 @@ def session_id_from_req(req) -> str | None:
     return sid if sid else None
 
 
+def _session_family(session_id: str) -> str:
+    return session_id.split(":", 1)[0]
+
+
+def _evict_other_runs(session_id: str) -> None:
+    """Drop older ``{uuid}:{run}`` slots for this executor."""
+    prefix = _session_family(session_id) + ":"
+    for store in (_SESSIONS, _RUNS):
+        for key in list(store):
+            if key.startswith(prefix) and key != session_id:
+                store.pop(key, None)
+
+
 def bind_comfyui_session(req):
-    """Restore cached conditioning, then refresh the cache from whatever is set."""
+    """Restore cached conditioning, then refresh the cache from whatever is set.
+
+    Conditioning is stored per ``comfyui_cond_key`` so CFG pos/neg do not
+    overwrite each other. Packed extras are restored only when
+    ``comfyui_cache_fp`` matches; a mismatch must not revive a stale layout.
+    """
     sid = session_id_from_req(req)
     if not sid:
         return req
 
-    cached = _SESSIONS.get(sid)
+    _evict_other_runs(sid)
     extra = dict(getattr(req, "extra", None) or {})
-    if cached:
-        for name, value in cached.items():
-            if name == "_extra":
-                continue
-            current = getattr(req, name, None)
-            if _is_empty(current):
-                setattr(req, name, value)
+    cond_key = extra.get("comfyui_cond_key") or "_"
+    cached = _SESSIONS.get(sid) or {}
+    cond_snap = (cached.get("_conds") or {}).get(cond_key) or {}
+    current_fp = extra.get("comfyui_cache_fp")
+    cached_fp = cached.get("_fp")
+    extra_ok = current_fp is None or cached_fp is None or current_fp == cached_fp
+
+    for name, value in cond_snap.items():
+        if _is_empty(getattr(req, name, None)):
+            setattr(req, name, value)
+    if extra_ok:
         for key, value in (cached.get("_extra") or {}).items():
             if _is_empty(extra.get(key)):
                 extra[key] = value
-        req.extra = extra
+    req.extra = extra
 
-    snapshot = {}
+    new_cond = {}
     for name in _CONDITIONING_FIELDS:
         value = getattr(req, name, None)
         if not _is_empty(value):
-            snapshot[name] = value
-    extra_snapshot = {}
+            new_cond[name] = value
     extra = getattr(req, "extra", None) or {}
+    extra_snapshot = {}
     for key, value in extra.items():
         if key in _SESSION_SKIP_EXTRA or _is_empty(value):
             continue
         extra_snapshot[key] = value
+    conds = dict(cached.get("_conds") or {})
+    if new_cond:
+        conds[cond_key] = new_cond
+    snapshot: dict[str, Any] = {"_conds": conds}
     if extra_snapshot:
         snapshot["_extra"] = extra_snapshot
-    if snapshot:
+    if current_fp is not None:
+        snapshot["_fp"] = current_fp
+    elif extra_ok and cached_fp is not None:
+        snapshot["_fp"] = cached_fp
+    if conds or extra_snapshot:
         _SESSIONS[sid] = snapshot
     return req
 

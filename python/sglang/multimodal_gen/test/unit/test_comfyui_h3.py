@@ -447,33 +447,64 @@ from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
 )
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.minimax_h3 import (
     MiniMaxH3Adapter,
+    drop_h3_pinned_sampling_fields,
+    worker_transformer_options,
 )
+from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 
 
-def test_begin_run_bumps_on_spatial_change_even_if_sigma_is_not_first() -> None:
+def test_begin_sampler_run_bumps_id_and_clears_sent_conds() -> None:
     class _State:
+        session_id = "abc"
         _run_id = 0
-        _conditioning_sent = True
-        _last_spatial = None
+        _sent_conds = {("old",)}
 
-    opts = {"transformer_options": {"sample_sigmas": torch.tensor([0.45, 0.0])}}
+        begin_sampler_run = SGLDiffusionExecutor.begin_sampler_run
+        comfyui_session_id = SGLDiffusionExecutor.comfyui_session_id
+
     state = _State()
-    # timestep 200 → 0.2, not the first sigma, but the canvas is new
-    SGLDiffusionExecutor._begin_run_if_needed(
-        state, torch.tensor([200.0]), opts, spatial=(5, 15, 27)
-    )
+    SGLDiffusionExecutor.begin_sampler_run(state)
     assert state._run_id == 1
-    assert state._conditioning_sent is False
-    state._conditioning_sent = True
-    SGLDiffusionExecutor._begin_run_if_needed(
-        state, torch.tensor([100.0]), opts, spatial=(5, 15, 27)
-    )
-    assert state._run_id == 1
-    SGLDiffusionExecutor._begin_run_if_needed(
-        state, torch.tensor([100.0]), opts, spatial=(5, 30, 54)
-    )
+    assert state._sent_conds == set()
+    assert SGLDiffusionExecutor.comfyui_session_id(state) == "abc:1"
+    SGLDiffusionExecutor.begin_sampler_run(state)
     assert state._run_id == 2
-    assert state._conditioning_sent is False
+    assert SGLDiffusionExecutor.comfyui_session_id(state) == "abc:2"
+
+
+def test_h3_sampling_params_kwargs_omit_pinned_fields() -> None:
+    kwargs = drop_h3_pinned_sampling_fields(
+        {
+            "prompt": " ",
+            "guidance_scale": 4.5,
+            "height": 48,
+            "width": 28,
+            "num_frames": 1,
+            "num_inference_steps": 1,
+            "save_output": False,
+            "suppress_logs": True,
+        }
+    )
+    MiniMaxH3SamplingParams(**kwargs)
+    assert "guidance_scale" not in kwargs
+    assert "num_frames" not in kwargs
+
+
+def test_worker_transformer_options_drop_comfy_objects() -> None:
+    class ModelSampling:
+        pass
+
+    opts = worker_transformer_options(
+        {
+            "minimax_h3_sigma_shift_video": 12.0,
+            "sample_sigmas": torch.tensor([1.0, 0.0]),
+            "model_sampling": ModelSampling(),
+            "patches": {"x": 1},
+        }
+    )
+    assert opts["minimax_h3_sigma_shift_video"] == 12.0
+    assert "model_sampling" not in opts
+    assert "patches" not in opts
 
 
 def test_minimax_h3_is_registered() -> None:
@@ -505,6 +536,8 @@ def test_h3_pack_fills_extra_req_and_unpack_restores_shapes() -> None:
     assert "layout" not in packed.extra_req["h3_payload"]
     assert "h3_layout" not in packed.extra_req
     assert torch.equal(packed.extra_req["h3_sample_sigmas"], sample_sigmas)
+    assert packed.extra_req["comfyui_cache_fp"]["spatial"] == (2, 4, 4)
+    assert packed.extra_req["comfyui_cache_fp"]["sigmas"] == (1.0, 0.0, 3)
     assert packed.prompt_embeds[0].shape == (8, 16)
     assert packed.timesteps is timestep
 
