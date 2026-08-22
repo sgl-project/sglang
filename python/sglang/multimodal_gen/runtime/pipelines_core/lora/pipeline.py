@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from safetensors.torch import load_file
+from safetensors.torch import load_file, safe_open
 from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -57,6 +57,30 @@ def _swap_peft_swiglu_fc1_lora_b(
         return weight
     value, gate = weight.chunk(2, dim=0)
     return torch.cat([gate, value], dim=0)
+
+
+def _lora_alpha_from_safetensors_header(lora_local_path: str) -> int | None:
+    # load_file drops the header's __metadata__, so alpha is only reachable by
+    # reopening the file. A header is not a config file: it cannot fail a load.
+    if not lora_local_path.endswith(".safetensors"):
+        return None
+    with safe_open(lora_local_path, framework="pt") as adapter_file:
+        metadata = adapter_file.metadata() or {}
+    alpha = metadata.get("alpha")
+    if alpha is None:
+        return None
+    try:
+        parsed_alpha = float(alpha)
+    except ValueError:
+        parsed_alpha = 0.0
+    if parsed_alpha <= 0.0 or not parsed_alpha.is_integer():
+        logger.warning(
+            "Ignoring unusable LoRA alpha %r in %s",
+            alpha,
+            os.path.basename(lora_local_path),
+        )
+        return None
+    return int(parsed_alpha)
 
 
 def stack_or_compose_fused_lora(
@@ -844,6 +868,8 @@ class LoRAPipeline(ComposedPipelineBase):
         adapter_lora_alpha = lora_alpha
         if adapter_lora_alpha is None:
             adapter_lora_alpha = get_peft_lora_alpha(adapter_config)
+        if adapter_lora_alpha is None:
+            adapter_lora_alpha = _lora_alpha_from_safetensors_header(lora_local_path)
 
         if lora_nickname in self.lora_adapters:
             self.lora_adapters[lora_nickname].clear()
