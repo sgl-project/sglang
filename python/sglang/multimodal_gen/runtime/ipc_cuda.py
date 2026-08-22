@@ -66,7 +66,7 @@ class CudaIpcRef:
     event_sync_required: bool
 
     @classmethod
-    def from_tensor(cls, tensor: torch.Tensor) -> "CudaIpcRef":
+    def from_tensor(cls, tensor: torch.Tensor) -> CudaIpcRef:
         if not tensor.is_cuda:
             raise TypeError("CudaIpcRef only shares CUDA tensors")
         tensor = tensor.detach().contiguous()
@@ -100,7 +100,9 @@ class CudaIpcRef:
     def materialize(self) -> torch.Tensor:
         dtype = getattr(torch, self.dtype)
         if self.handle is None or self.storage_size_bytes == 0:
-            return torch.empty(self.shape, dtype=dtype, device=f"cuda:{self.device_index}")
+            return torch.empty(
+                self.shape, dtype=dtype, device=f"cuda:{self.device_index}"
+            )
 
         local = _PRODUCER_TENSORS.pop(
             _producer_key(self.handle, self.storage_offset_bytes), None
@@ -234,11 +236,13 @@ def _detach(value: Any, prefix: str, tensors: dict[str, torch.Tensor]) -> Any:
         return None
     if isinstance(value, list):
         return [
-            _detach(item, _join(prefix, str(i)), tensors) for i, item in enumerate(value)
+            _detach(item, _join(prefix, str(i)), tensors)
+            for i, item in enumerate(value)
         ]
     if isinstance(value, tuple):
         return tuple(
-            _detach(item, _join(prefix, str(i)), tensors) for i, item in enumerate(value)
+            _detach(item, _join(prefix, str(i)), tensors)
+            for i, item in enumerate(value)
         )
     if isinstance(value, dict):
         return {
@@ -261,11 +265,13 @@ def _attach(value: Any, prefix: str, tensors: dict[str, torch.Tensor]) -> Any:
         return tensors[prefix]
     if isinstance(value, list):
         return [
-            _attach(item, _join(prefix, str(i)), tensors) for i, item in enumerate(value)
+            _attach(item, _join(prefix, str(i)), tensors)
+            for i, item in enumerate(value)
         ]
     if isinstance(value, tuple):
         return tuple(
-            _attach(item, _join(prefix, str(i)), tensors) for i, item in enumerate(value)
+            _attach(item, _join(prefix, str(i)), tensors)
+            for i, item in enumerate(value)
         )
     if isinstance(value, dict):
         return {

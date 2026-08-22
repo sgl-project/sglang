@@ -21,7 +21,11 @@ class QwenImageAdapter(ComfyUIModelAdapter):
             prompt_seq_lens=[[seq]],
             height=orig_shape[-2] * 8,
             width=orig_shape[-1] * 8,
-            unpack_ctx={"num_embeds": latents.shape[1], "orig_shape": orig_shape, "x": x},
+            unpack_ctx={
+                "num_embeds": latents.shape[1],
+                "orig_shape": orig_shape,
+                "x": x,
+            },
         )
 
     def unpack(self, noise_pred, packed, x):

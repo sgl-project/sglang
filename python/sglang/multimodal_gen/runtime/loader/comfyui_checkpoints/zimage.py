@@ -25,7 +25,9 @@ def _convert_weights(weights: WeightIterator, dit_config: Any) -> WeightIterator
     """Split ComfyUI's merged attention qkv into to_q / to_k / to_v."""
     arch_config = dit_config.arch_config
     q_size = arch_config.dim
-    k_size = (arch_config.dim // arch_config.num_attention_heads) * arch_config.n_kv_heads
+    k_size = (
+        arch_config.dim // arch_config.num_attention_heads
+    ) * arch_config.n_kv_heads
 
     for name, tensor in weights:
         match = re.match(

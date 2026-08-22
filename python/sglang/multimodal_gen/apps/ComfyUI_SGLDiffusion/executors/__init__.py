@@ -26,7 +26,12 @@ __all__ = [
 
 
 def __getattr__(name):
-    if name in {"QwenImageExecutor", "QwenImageEditExecutor", "QwenImageAdapter", "QwenImageEditAdapter"}:
+    if name in {
+        "QwenImageExecutor",
+        "QwenImageEditExecutor",
+        "QwenImageAdapter",
+        "QwenImageEditAdapter",
+    }:
         from .qwen_image import (
             QwenImageAdapter,
             QwenImageEditAdapter,
