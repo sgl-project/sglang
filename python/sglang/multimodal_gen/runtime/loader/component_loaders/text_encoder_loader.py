@@ -62,7 +62,14 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     load_dict,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.quantization_utils import get_quant_config
+from sglang.multimodal_gen.runtime.utils.quantization_utils import (
+    get_quant_config,
+    get_quant_config_from_safetensors_metadata,
+)
+from sglang.multimodal_gen.runtime.weights.source import (
+    materialize_weight,
+    resolve_weight,
+)
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.environ import envs
 
@@ -93,11 +100,29 @@ def _delegate_standard_bnb4_to_transformers(
         )
 
 
+def _get_encoder_quant_config(
+    component_config: dict,
+    component_model_path: str,
+    component_weights_path: str,
+):
+    quant_config = get_quant_config(component_config, component_model_path)
+    if (
+        quant_config is None
+        and component_weights_path != component_model_path
+        and component_weights_path.endswith(".safetensors")
+    ):
+        quant_config = get_quant_config_from_safetensors_metadata(
+            component_weights_path
+        )
+    return quant_config
+
+
 def _configure_encoder_quantization(
     model_config: EncoderConfig,
     model_cls: type[nn.Module],
     component_config: dict,
     component_model_path: str,
+    component_weights_path: str,
     component_name: str,
 ) -> None:
     if getattr(model_cls, "manages_checkpoint_quantization", False):
@@ -111,9 +136,10 @@ def _configure_encoder_quantization(
         component_name,
     )
     try:
-        quant_config = get_quant_config(
+        quant_config = _get_encoder_quant_config(
             component_config,
             component_model_path,
+            component_weights_path,
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ComponentCheckpointUnsupportedError(
@@ -129,32 +155,12 @@ def _configure_encoder_quantization(
             f"got {model_cls.__name__}"
         )
 
-    capability = model_cls.checkpoint_quantization_capability
-    if capability is None:
-        raise ComponentCheckpointUnsupportedError(
-            f"{model_cls.__name__} does not support quantized checkpoints for "
-            f"{component_name!r}: no checkpoint quantization capability is declared"
-        )
-    if capability.backend != "diffusion":
-        raise ComponentCheckpointUnsupportedError(
-            f"{model_cls.__name__} declares the {capability.backend!r} checkpoint "
-            f"quantization backend for {component_name!r}, but the native encoder "
-            "loader currently supports only the 'diffusion' backend"
-        )
-
-    quant_method = quant_config.get_name()
-    if quant_method not in capability.methods:
-        raise ComponentCheckpointUnsupportedError(
-            f"{model_cls.__name__} does not support {component_name!r} checkpoints "
-            f"quantized with {quant_method!r}; supported methods for the "
-            f"{capability.backend!r} backend: {sorted(capability.methods)}"
-        )
-
 
 def _resolve_and_configure_encoder_quantization(
     model_config: EncoderConfig,
     component_config: dict,
     component_model_path: str,
+    component_weights_path: str,
     component_name: str,
 ) -> type[nn.Module]:
     architectures = getattr(model_config, "architectures", [])
@@ -166,7 +172,11 @@ def _resolve_and_configure_encoder_quantization(
             component_name,
         )
         try:
-            quant_config = get_quant_config(component_config, component_model_path)
+            quant_config = _get_encoder_quant_config(
+                component_config,
+                component_model_path,
+                component_weights_path,
+            )
         except Exception as quantization_error:
             raise ComponentCheckpointUnsupportedError(
                 f"Cannot parse checkpoint quantization for {component_name!r}: "
@@ -184,6 +194,7 @@ def _resolve_and_configure_encoder_quantization(
         model_cls,
         component_config,
         component_model_path,
+        component_weights_path,
         component_name,
     )
     return model_cls
@@ -244,8 +255,27 @@ def _process_quantized_encoder_weights(
     return processed_layers
 
 
+def _require_quantized_encoder_layers(
+    model: nn.Module,
+    component_name: str,
+) -> None:
+    if any(
+        isinstance(module, LinearBase)
+        and module.quant_method is not None
+        and not isinstance(module.quant_method, UnquantizedLinearMethod)
+        for module in model.modules()
+    ):
+        return
+    raise ComponentCheckpointUnsupportedError(
+        f"The native {type(model).__name__} implementation does not construct "
+        f"quantized linear layers for {component_name!r}"
+    )
+
+
 def _checkpoint_bytes(model_path: str) -> int:
     """On-disk size of a checkpoint, readable before any weight of it is."""
+    if os.path.isfile(model_path):
+        return os.path.getsize(model_path)
     total = 0
     for path in glob.glob(
         os.path.join(str(model_path), "**", "*.safetensors"), recursive=True
@@ -277,6 +307,23 @@ class TextEncoderLoader(ComponentLoader):
 
     component_names = ["text_encoder"]
     expected_library = "transformers"
+
+    @staticmethod
+    def resolve_model_weights_path(
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+    ) -> str:
+        weights_override = server_args.component_weights_paths.get(component_name)
+        if weights_override is None:
+            return component_model_path
+        model_weights_path = materialize_weight(resolve_weight(weights_override))
+        logger.info(
+            "Using weight-file override for %s: %s",
+            component_name,
+            model_weights_path,
+        )
+        return model_weights_path
 
     @dataclasses.dataclass
     class Source:
@@ -324,8 +371,19 @@ class TextEncoderLoader(ComponentLoader):
         # model_name_or_path = (self._maybe_download_from_modelscope(
         #     model_name_or_path, revision) or model_name_or_path)
 
-        is_local = os.path.isdir(model_name_or_path)
-        assert is_local, "Model path must be a local directory"
+        if os.path.isfile(model_name_or_path):
+            if model_name_or_path.endswith(".safetensors"):
+                return os.path.dirname(model_name_or_path), [model_name_or_path], True
+            if fall_back_to_pt and model_name_or_path.endswith((".bin", ".pt")):
+                return os.path.dirname(model_name_or_path), [model_name_or_path], False
+            raise ValueError(
+                "Native encoder weight overrides currently support one "
+                f"safetensors, bin, or pt file, got {model_name_or_path!r}"
+            )
+        if not os.path.isdir(model_name_or_path):
+            raise ValueError(
+                f"Model path must be a local file or directory: {model_name_or_path!r}"
+            )
 
         use_safetensors = False
         index_file = SAFE_WEIGHTS_INDEX_NAME
@@ -451,6 +509,11 @@ class TextEncoderLoader(ComponentLoader):
         component_starts_on_cpu: bool | None = None,
     ):
         """Load the text encoders based on the model path, and inference args."""
+        component_weights_path = self.resolve_model_weights_path(
+            component_model_path,
+            server_args,
+            component_name,
+        )
         diffusers_pretrained_config = get_config(
             component_model_path, trust_remote_code=True
         )
@@ -482,6 +545,7 @@ class TextEncoderLoader(ComponentLoader):
             encoder_config,
             model_config,
             component_model_path,
+            component_weights_path,
             component_name,
         )
         encoder_dp_group = get_encoder_data_parallel_group()
@@ -503,7 +567,7 @@ class TextEncoderLoader(ComponentLoader):
         ]
         # TODO(will): add support for other dtypes
         return self.load_model(
-            component_model_path,
+            component_weights_path,
             encoder_config,
             server_args,
             encoder_dtype,
@@ -623,6 +687,9 @@ class TextEncoderLoader(ComponentLoader):
                     "EncoderTensorParallelMixin"
                 )
             model.bind_encoder_tp_group(encoder_tp_group)
+
+            if quant_config is not None:
+                _require_quantized_encoder_layers(model, component_name)
 
             if component_starts_on_cpu and (
                 current_platform.is_mps() or _keep_this_checkpoint_mapped(model_path)
