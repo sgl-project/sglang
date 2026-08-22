@@ -357,6 +357,7 @@ def silu_and_mul_triton(
     ).multi_processor_count
     grid_size = min(num_sms * 4, max_grid_size)
 
+    use_pdl = is_arch_support_pdl()
     _silu_and_mul_triton_kernel[(grid_size,)](
         gateup_out_ptr=gateup_output,
         topk_weights_ptr=topk_weights,
@@ -370,7 +371,8 @@ def silu_and_mul_triton(
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         EVEN_N=N % BLOCK_SIZE_N == 0,
         INT64_INDEX=gateup_output.nbytes >= 2**31,
-        **({"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
+        USE_PDL=use_pdl,
+        **({"launch_pdl": True} if use_pdl else {}),
     )
 
     return down_input

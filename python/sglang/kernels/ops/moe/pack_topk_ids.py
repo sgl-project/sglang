@@ -53,15 +53,15 @@ class PackTopkIds:
 
         BLOCK_SIZE = 1024
         grid = (triton.cdiv(numel, BLOCK_SIZE),)
-        pdl_kwargs = (
-            {"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}
-        )
+        use_pdl = is_arch_support_pdl()
+        pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
         _pack_topk_ids_triton_kernel[grid](
             topk_ids,
             topk_weights,
             out,
             numel,
             BLOCK_SIZE=BLOCK_SIZE,
+            USE_PDL=use_pdl,
             **pdl_kwargs,
         )
         return out
