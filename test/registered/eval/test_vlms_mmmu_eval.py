@@ -27,6 +27,7 @@ MODEL_THRESHOLDS = {
     ModelLaunchSettings("deepseek-ai/deepseek-vl2-small"): (0.320, 56.1),
     ModelLaunchSettings("deepseek-ai/Janus-Pro-7B"): (0.285, 40.3),
     ModelLaunchSettings("google/gemma-4-E4B-it"): (0.26, 24.0),
+    ModelLaunchSettings("google/gemma-4-12B-it"): (0.150, 100.0),
     ModelLaunchSettings("google/gemma-4-26B-A4B-it", extra_args=["--tp=2"]): (
         0.27,
         32.0,
