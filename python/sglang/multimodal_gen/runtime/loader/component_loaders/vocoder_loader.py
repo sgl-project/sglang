@@ -3,7 +3,7 @@ import re
 from safetensors.torch import load_file as safetensors_load_file
 
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
-    ComponentLoader,
+    PlainStateDictComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
@@ -12,9 +12,6 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 )
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-    get_diffusers_component_config,
-)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
@@ -22,14 +19,14 @@ from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 logger = init_logger(__name__)
 
 
-class VocoderLoader(ComponentLoader):
+class VocoderLoader(PlainStateDictComponentLoader):
     component_names = ["vocoder"]
     expected_library = "diffusers"
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
-        config = get_diffusers_component_config(component_path=component_model_path)
+        config = self.load_component_config(component_model_path, component_name)
         class_name = config.pop("_class_name", None) or self.component_architecture
         assert (
             class_name is not None
