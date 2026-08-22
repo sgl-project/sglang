@@ -506,6 +506,9 @@ class ExecGraph(msgspec.Struct):
         "Disable the decode-phase CUDA graph. Convenience for --cuda-graph-backend-decode=disabled.",
     ] = False
     disable_cuda_graph: A[bool, Arg(no_cli=True)] = False
+    disable_draft_cuda_graph: A[
+        bool, "Disable cuda graph for draft model in speculative decoding."
+    ] = False
     disable_cuda_graph_padding: A[
         bool,
         "Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
