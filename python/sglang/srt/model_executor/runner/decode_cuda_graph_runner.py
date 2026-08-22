@@ -504,7 +504,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # Reads end at the in-graph marker: wire it through, don't re-record.
             self.model_runner.shared_read_done_event = self.in_graph_metadata_prep_done
         else:
-            read_done = self.device_module.Event()
+            read_done = self.model_runner.shared_read_done_events.next()
             read_done.record()
             self.model_runner.shared_read_done_event = read_done
 
