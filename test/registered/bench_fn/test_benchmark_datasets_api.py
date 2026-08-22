@@ -25,6 +25,7 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
+import sglang.benchmark.serving as serving
 from sglang.benchmark.datasets import DATASET_MAPPING, get_dataset
 from sglang.benchmark.datasets.agentic_trace import (
     DEFAULT_AGENTIC_OUTPUT_LEN,
@@ -61,6 +62,39 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
+
+
+class TestBenchmarkArgNormalization(CustomTestCase):
+    def test_set_global_args_normalizes_direct_callers(self):
+        args = SimpleNamespace()
+        had_global_args = hasattr(serving, "args")
+        original_args = getattr(serving, "args", None)
+
+        try:
+            serving.set_global_args(args)
+
+            self.assertIs(serving.args, args)
+            self.assertEqual(args.max_concurrency, None)
+            self.assertEqual(args.warmup_requests, 1)
+            self.assertFalse(args.output_details)
+            self.assertFalse(args.tokenize_prompt)
+            self.assertFalse(args.plot_throughput)
+            self.assertEqual(args.top_logprobs_num, 0)
+            self.assertEqual(args.token_ids_logprob, None)
+            self.assertEqual(args.logprob_start_len, -1)
+            self.assertFalse(args.return_logprob)
+            self.assertEqual(args.temperature, 0.0)
+            self.assertEqual(args.top_p, 1.0)
+            self.assertFalse(args.use_trace_timestamps)
+            self.assertEqual(args.mooncake_slowdown_factor, 1.0)
+            self.assertEqual(args.mooncake_num_rounds, 1)
+            self.assertEqual(args.served_model_name, None)
+            self.assertFalse(args.cache_report)
+        finally:
+            if had_global_args:
+                serving.args = original_args
+            else:
+                del serving.args
 
 
 class _DummyTokenTensor:
