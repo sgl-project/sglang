@@ -133,5 +133,100 @@ class TestModelOptNvfp4(CustomTestCase):
             )
 
 
+class TestModelOptFp4Config(CustomTestCase):
+    @staticmethod
+    def _flat_config(input_group_size=16, weight_group_size=16):
+        return {
+            "config_groups": {
+                "group_0": {
+                    "input_activations": {"group_size": input_group_size},
+                    "weights": {"group_size": weight_group_size},
+                }
+            },
+            "ignore": ["lm_head"],
+            "kv_cache_scheme": {"type": "float", "num_bits": 8},
+            "quant_algo": "NVFP4",
+        }
+
+    def test_parses_flat_config(self):
+        result = ModelOptFp4Config.from_config(self._flat_config())
+
+        self.assertEqual(result.group_size, 16)
+        self.assertEqual(result.kv_cache_quant_algo, "FP8")
+        self.assertEqual(result.exclude_modules, ["lm_head"])
+
+    def test_parses_legacy_config(self):
+        result = ModelOptFp4Config.from_config(
+            {
+                "quantization": {
+                    "exclude_modules": ["lm_head"],
+                    "group_size": 16,
+                    "kv_cache_quant_algo": "FP8",
+                    "quant_algo": "NVFP4",
+                }
+            }
+        )
+
+        self.assertEqual(result.group_size, 16)
+        self.assertEqual(result.kv_cache_quant_algo, "FP8")
+        self.assertEqual(result.exclude_modules, ["lm_head"])
+
+    def test_missing_group_size_defaults_to_nvfp4_block_size(self):
+        config = self._flat_config()
+        del config["config_groups"]["group_0"]["input_activations"]["group_size"]
+        del config["config_groups"]["group_0"]["weights"]["group_size"]
+
+        result = ModelOptFp4Config.from_config(config)
+
+        self.assertEqual(result.group_size, 16)
+
+    def test_accepts_equal_group_sizes_across_groups(self):
+        config = self._flat_config()
+        config["config_groups"]["group_1"] = {
+            "group_size": 16,
+            "weights": {"group_size": 16},
+        }
+
+        result = ModelOptFp4Config.from_config(config)
+
+        self.assertEqual(result.group_size, 16)
+
+    def test_rejects_inconsistent_group_sizes(self):
+        across_groups = self._flat_config()
+        across_groups["config_groups"]["group_1"] = {"weights": {"group_size": 32}}
+        top_level = self._flat_config()
+        top_level["group_size"] = 32
+
+        for name, config in (
+            ("within_group", self._flat_config(input_group_size=32)),
+            ("across_groups", across_groups),
+            ("top_level", top_level),
+        ):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(
+                    ValueError, r"Inconsistent group_size values: \[16, 32\]"
+                ):
+                    ModelOptFp4Config.from_config(config)
+
+    def test_rejects_unsupported_group_size(self):
+        config = self._flat_config(input_group_size=32, weight_group_size=32)
+
+        with self.assertRaisesRegex(
+            ValueError, "ModelOpt NVFP4 requires group_size=16, got 32"
+        ):
+            ModelOptFp4Config.from_config(config)
+
+    def test_rejects_non_integer_group_sizes(self):
+        for value in ("32", 32.0, True):
+            with self.subTest(value=value):
+                config = self._flat_config(input_group_size=value)
+                del config["config_groups"]["group_0"]["weights"]["group_size"]
+
+                with self.assertRaisesRegex(
+                    ValueError, "group_size must be an integer"
+                ):
+                    ModelOptFp4Config.from_config(config)
+
+
 if __name__ == "__main__":
     unittest.main()
