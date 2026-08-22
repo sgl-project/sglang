@@ -305,7 +305,7 @@ def _kill_forkserver_group(orphans_only=False):
             continue
         try:
             proc = psutil.Process(pid)
-            if proc.pgid() != pgid:
+            if os.getpgid(pid) != pgid:
                 continue
             ppid = proc.ppid()
             if orphans_only and ppid != 1:
