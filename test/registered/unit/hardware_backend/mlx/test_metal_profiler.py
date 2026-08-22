@@ -212,7 +212,10 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
             gpu_id = 0
 
         mgr = SchedulerProfilerManager(
-            ps=FakePS(), dp_tp_cpu_group=None, get_forward_ct=lambda: 0
+            ps=FakePS(),
+            dp_tp_cpu_group=None,
+            get_forward_ct=lambda: 0,
+            send_response=lambda output, recv_req: None,
         )
         mgr._init_profile(output_dir, None, None, None, None, None, False, "test")
         return mgr
@@ -271,6 +274,9 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
                 mgr._stop_profile()
                 self.assertFalse(mgr.profile_in_progress)
                 capture_ctx.__exit__.assert_called_once()
+                # The trace is written by the flush thread, which needs the output
+                # directory to outlive it.
+                mgr.drain_pending_flushes()
 
 
 if __name__ == "__main__":
