@@ -513,7 +513,13 @@ class Envs:
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
-    # Size the KV pool after CUDA-graph capture.
+
+    # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
+    # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
+    # of the occupancy-starved mha_batch_prefill FMHA. Independent kill-switch
+    # for the new path; pairs with SGLANG_AITER_UNIFIED_VERIFY. Default on.
+    SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
+    # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
 
     # ===================================================================
