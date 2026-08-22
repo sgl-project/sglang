@@ -16,7 +16,6 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.runtime_context import get_exec, get_platform
 from sglang.srt.utils import is_flashinfer_available, log_info_on_rank0
-from sglang.srt.utils.common import check_pkg_version_at_least
 
 # Suppress TRT-LLM CUTLASS trace logs without overriding user configuration.
 os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
@@ -40,25 +39,10 @@ class Mxfp4FlashinferCutlassMoEMethod:
             raise RuntimeError("Mxfp4FlashinferCutlassMoEMethod requires FlashInfer.")
         self._use_mxfp8_act_scaling = get_platform().is_sm120
         precision = get_exec().moe.flashinfer_mxfp4_moe_precision
+        # precision=fp8 is an SM90 knob (Humming W4A8); on SM120 the MXFP8
+        # activation path already computes in FP8, so the flag is simply inert
+        # there rather than an error -- one config can move across hardware.
         self._use_sm90_humming = not self._use_mxfp8_act_scaling and precision == "fp8"
-        if self._use_mxfp8_act_scaling and precision == "fp8":
-            raise ValueError(
-                "flashinfer_mxfp4_moe_precision=fp8 selects the SM90 Humming "
-                "path; use `default` for the SM120 MXFP8 path."
-            )
-        if self._use_sm90_humming:
-            # TODO: Remove this feature-specific check once the global
-            # FlashInfer dependency is upgraded to >= 0.6.18 (0.6.17
-            # intentionally reverted the per-expert Humming API of #3738; the
-            # corrected ABI of #4431 ships from 0.6.18). The weight processor
-            # imports the API directly, so a build that misreports its version
-            # still fails loudly there.
-            if not check_pkg_version_at_least("flashinfer_python", "0.6.18"):
-                raise RuntimeError(
-                    "`--flashinfer-mxfp4-moe-precision fp8` (SM90 Humming) "
-                    "requires FlashInfer >= 0.6.18; upgrade flashinfer-python "
-                    "or use `default`/`bf16` for the W4A16 path."
-                )
         self._fp8 = fp8_method
         self.prefix = prefix
         self._swiglu_limit_tensor: torch.Tensor | None = None

@@ -17,21 +17,17 @@ from contextlib import nullcontext
 
 import pytest
 import torch
-from packaging.version import Version
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-large")
 
 flashinfer_fused_moe = pytest.importorskip("flashinfer.fused_moe")
-from flashinfer import __version__ as flashinfer_version
 
-# Full Version compare (mirrors the production gate): the release tuple would
-# drop prerelease markers and accept 0.6.18rc*/dev*.
 HAS_CORRECTED_HUMMING_API = hasattr(
     flashinfer_fused_moe,
     "preprocess_moe_weights_for_sm90_mixed_gemm_humming",
-) and Version(flashinfer_version) >= Version("0.6.18")
+)
 preprocess_humming = getattr(
     flashinfer_fused_moe,
     "preprocess_moe_weights_for_sm90_mixed_gemm_humming",
@@ -881,27 +877,6 @@ def test_dsv4_process_weights_humming_matches_flashinfer_direct():
     assert torch.equal(layer.w2_weight_scale_inv, ref_w2_s)
     assert torch.equal(layer.w13_humming_residual_scale, ref_w13_residual * 64.0)
     assert torch.equal(layer.w2_humming_residual_scale, ref_w2_residual * 64.0)
-
-
-@pytest.mark.skipif(
-    HAS_CORRECTED_HUMMING_API,
-    reason="the installed FlashInfer already has the corrected Humming API",
-)
-def test_dsv4_humming_rejects_flashinfer_before_0_6_18():
-    """Released FlashInfer 0.6.17 reverted #3738 and must fail at init."""
-    from types import SimpleNamespace
-
-    from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
-        Mxfp4FlashinferCutlassMoEMethod,
-    )
-    from sglang.srt.runtime_context import get_context
-
-    with get_context().override_server_args(flashinfer_mxfp4_moe_precision="fp8"):
-        with pytest.raises(RuntimeError, match="FlashInfer >= 0.6.18"):
-            Mxfp4FlashinferCutlassMoEMethod(
-                SimpleNamespace(process_weights_after_loading=lambda layer: None),
-                "test",
-            )
 
 
 class _MockDispatchOutput:

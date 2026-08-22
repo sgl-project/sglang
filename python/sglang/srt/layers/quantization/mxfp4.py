@@ -66,7 +66,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
     use_intel_amx_backend,
 )
-from sglang.srt.utils.common import check_pkg_version_at_least, get_bool_env_var
+from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
 
 has_triton_kernels = is_triton_kernels_available()
@@ -142,23 +142,8 @@ if is_flashinfer_available():
         interleave_moe_scales_for_sm90_mixed_gemm = None
         interleave_moe_weights_for_sm90_mixed_gemm = None
         _FI_HAS_SM90_CUTLASS_MXFP4 = False
-
-    # FlashInfer #3738 originally exposed routed-row residual scales. #4431
-    # changed the contract to per-local-expert scales so downstream runtimes do
-    # not duplicate FlashInfer's expert permutation on every forward. The old
-    # implementation shipped briefly in 0.6.16 and was reverted from 0.6.17;
-    # only enable the corrected ABI starting with the 0.6.18 release line.
-    # check_pkg_version_at_least does a full Version compare (prerelease-
-    # aware, so 0.6.18rc*/dev* stay excluded) and returns False when the
-    # package is absent. The weight processor imports the Humming API
-    # directly, so a build that misreports its version still fails loudly
-    # there.
-    _FI_HAS_SM90_CUTLASS_MXFP4_FP8 = check_pkg_version_at_least(
-        "flashinfer_python", "0.6.18"
-    )
 else:
     _FI_HAS_SM90_CUTLASS_MXFP4 = False
-    _FI_HAS_SM90_CUTLASS_MXFP4_FP8 = False
 
 _flashinfer_mxfp4_permute_indices_cache: dict[torch.Size, torch.Tensor] = {}
 _flashinfer_mxfp4_permute_indices_device_cache: dict[
@@ -430,19 +415,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         #                           Humming W4A8 (PR #3738/#4431)
         self._fi_kernel: Optional[str] = None
         if self.use_flashinfer:
+            # precision=fp8 is an SM90 knob (Humming W4A8). The Blackwell
+            # paths already run MXFP8 activations, so the flag is inert there
+            # rather than an error -- one config can move across hardware.
             if get_platform().is_sm100:
-                if self.flashinfer_mxfp4_moe_precision == "fp8":
-                    raise ValueError(
-                        "flashinfer_mxfp4_moe_precision=fp8 selects the SM90 "
-                        "Humming path; use `default` for the SM100 MXFP8 path."
-                    )
                 self._fi_kernel = "trtllm_sm100"
             elif get_platform().is_sm120:
-                if self.flashinfer_mxfp4_moe_precision == "fp8":
-                    raise ValueError(
-                        "flashinfer_mxfp4_moe_precision=fp8 selects the SM90 "
-                        "Humming path; use `default` for the SM120 MXFP8 path."
-                    )
                 self._fi_kernel = "cutlass_sm120"
             elif get_platform().is_sm90:
                 if not _FI_HAS_SM90_CUTLASS_MXFP4:
@@ -453,14 +431,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         "or pick a different backend (e.g. marlin / triton_kernel)."
                     )
                 self._use_sm90_humming = self.flashinfer_mxfp4_moe_precision == "fp8"
-                if self._use_sm90_humming and not _FI_HAS_SM90_CUTLASS_MXFP4_FP8:
-                    raise RuntimeError(
-                        "flashinfer_mxfp4_moe_precision=fp8 on SM90 requires "
-                        "the corrected per-expert Humming API from FlashInfer "
-                        ">= 0.6.18. FlashInfer 0.6.17 intentionally reverted "
-                        "PR #3738; upgrade FlashInfer or use `default`/`bf16` "
-                        "for the existing W4A16 path."
-                    )
                 self._fi_kernel = "cutlass_sm90"
             else:
                 raise NotImplementedError(
