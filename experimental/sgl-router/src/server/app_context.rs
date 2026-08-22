@@ -11,7 +11,7 @@ use crate::proxy::Proxy;
 use crate::server::admission::AdmissionQueue;
 use crate::server::cache_sim_tee::CacheSimTee;
 use crate::server::metrics::MetricsRegistry;
-use crate::server::s3_export::S3ExportSink;
+use crate::server::token_export::TokenExportSink;
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::WorkerRegistry;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,10 +48,9 @@ pub struct AppContext {
     /// unset. The chat/completions handler offers to it after tokenizing;
     /// see [`crate::server::cache_sim_tee`].
     pub cache_sim_tee: Option<Arc<CacheSimTee>>,
-    /// Best-effort S3 token-export sink. `None` when
-    /// `observability.token_export_s3_uri` is unset or AWS credentials are
-    /// missing. Zero overhead on the hot path when `None`.
-    pub s3_export_sink: Option<Arc<S3ExportSink>>,
+    /// Best-effort object-storage token-export sink. Zero overhead on the hot
+    /// path when neither S3 nor GCS export is configured.
+    pub token_export_sink: Option<Arc<TokenExportSink>>,
     /// KV-event index, when cache-aware-zmq routing is active.
     ///
     /// Injected rather than constructed here for the same reason as the
@@ -152,13 +151,31 @@ impl AppContext {
         // Read the pod name for object-key deduplication; fall back to
         // "unknown-pod" when the downward-API env var is not injected.
         let pod = std::env::var("POD_NAME").unwrap_or_else(|_| "unknown-pod".to_string());
-        let s3_export_sink = config
+        let s3_uri = config
             .observability
             .token_export_s3_uri
-            .as_ref()
-            .map(|u| u.trim())
-            .filter(|u| !u.is_empty())
-            .and_then(|uri| S3ExportSink::spawn(uri, pod, Arc::clone(&metrics), max_captures));
+            .as_deref()
+            .map(str::trim)
+            .filter(|uri| !uri.is_empty());
+        let gcs_uri = config
+            .observability
+            .token_export_gcs_uri
+            .as_deref()
+            .map(str::trim)
+            .filter(|uri| !uri.is_empty());
+        let token_export_sink = match (s3_uri, gcs_uri) {
+            (Some(uri), None) => {
+                TokenExportSink::spawn_s3(uri, pod, Arc::clone(&metrics), max_captures)
+            }
+            (None, Some(uri)) => {
+                TokenExportSink::spawn_gcs(uri, pod, Arc::clone(&metrics), max_captures)
+            }
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                tracing::error!("S3 and GCS token export cannot both be enabled");
+                None
+            }
+        };
         Self {
             config,
             tokenizers,
@@ -170,7 +187,7 @@ impl AppContext {
             admission,
             itl,
             cache_sim_tee,
-            s3_export_sink,
+            token_export_sink,
             kv_index: OnceLock::new(),
             ready: AtomicBool::new(false),
         }
@@ -265,7 +282,7 @@ impl AppContext {
             metrics,
             itl: ItlTable::new(),
             cache_sim_tee: None,
-            s3_export_sink: None,
+            token_export_sink: None,
             // Unset: a stub has no KV index, so `kv_bootstrap_settled()`
             // reports true and the readiness gate is inert unless a test
             // attaches one.

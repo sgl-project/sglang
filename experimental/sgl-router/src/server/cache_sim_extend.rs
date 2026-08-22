@@ -179,7 +179,7 @@ pub(crate) fn spawn_extend_tee(
     slug: Option<String>,
     key_id: Option<String>,
 ) {
-    if ctx.cache_sim_tee.is_none() && ctx.s3_export_sink.is_none() {
+    if ctx.cache_sim_tee.is_none() && ctx.token_export_sink.is_none() {
         return;
     }
     tokio::spawn(async move {
@@ -267,7 +267,7 @@ pub(crate) fn spawn_extend_tee(
                         per_choice_output,
                     );
                 }
-                if let Some(sink) = ctx.s3_export_sink.as_ref() {
+                if let Some(sink) = ctx.token_export_sink.as_ref() {
                     sink.offer_extend(
                         &model,
                         &ids,

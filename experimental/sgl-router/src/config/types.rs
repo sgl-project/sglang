@@ -294,9 +294,11 @@ pub struct ObservabilityConfig {
     /// Excess streams simply aren't captured. Only meaningful with
     /// `cache_sim_url`.
     pub cache_sim_max_concurrent_captures: usize,
-    /// `s3://bucket/prefix/` target; when set, enables the token-export tee;
-    /// when absent, the tee is disabled. See `crate::server::s3_export`.
+    /// `s3://bucket/prefix/` target; when set, enables the token-export tee.
     pub token_export_s3_uri: Option<String>,
+    /// `gs://bucket/prefix/` target authenticated with Google Application
+    /// Default Credentials; mutually exclusive with `token_export_s3_uri`.
+    pub token_export_gcs_uri: Option<String>,
 }
 
 /// Default concurrent-capture budget: 256 × 16 MiB = 4 GiB ceiling on aggregate
@@ -329,6 +331,7 @@ impl Default for ObservabilityConfig {
             cache_sim_url: None,
             cache_sim_max_concurrent_captures: default_cache_sim_max_concurrent_captures(),
             token_export_s3_uri: None,
+            token_export_gcs_uri: None,
         }
     }
 }

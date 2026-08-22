@@ -260,6 +260,11 @@ async fn main() -> Result<()> {
     // `/readyz` needs the index to know whether peer bootstrap has settled, and
     // `/internal/kv_snapshot` needs it to serve siblings.
     ctx.attach_kv_index(Arc::clone(&kv_index));
+    if let Some(sink) = ctx.token_export_sink.as_ref() {
+        sink.preflight()
+            .await
+            .context("initialize token export credentials")?;
+    }
     ctx.mark_ready();
 
     let app = sgl_router::server::app::build_router(ctx.clone());
@@ -282,14 +287,18 @@ async fn main() -> Result<()> {
     let server_result = serve.await.context("axum serve");
 
     // After stopping accepting new connections and draining in-flight requests,
-    // flush the S3 token-export queue/buffers before exiting so a rolling
+    // flush the token-export queue/buffers before exiting so a rolling
     // restart does not lose records. Cap, not floor: the total shutdown must
     // stay within the pod termination grace period, which operators size off
     // shutdown_drain_secs.
-    if let Some(sink) = ctx.s3_export_sink.as_ref() {
+    if let Some(sink) = ctx.token_export_sink.as_ref() {
         let budget = std::time::Duration::from_secs(cfg.server.shutdown_drain_secs.min(60));
-        sgl_router::server::shutdown::await_with_timeout(sink.drain(), budget, "s3 export drain")
-            .await;
+        sgl_router::server::shutdown::await_with_timeout(
+            sink.drain(),
+            budget,
+            "token export drain",
+        )
+        .await;
     }
 
     // Best-effort: cancel discovery + manager + janitor on shutdown.
