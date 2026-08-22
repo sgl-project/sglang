@@ -121,6 +121,15 @@ class RadixLinearAttention(nn.Module):
             )
 
 
+def _trim_linear_attention_gate_tokens(
+    a: torch.Tensor, b: torch.Tensor, num_tokens: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Trim KDA singleton-batch or GDN token-leading gate tensors."""
+    if a.ndim >= 3 and a.shape[0] == 1:
+        return a[:, :num_tokens], b[:, :num_tokens]
+    return a[:num_tokens], b[:num_tokens]
+
+
 @register_custom_op(mutates_args=["output"])
 @register_split_op()
 def unified_linear_attention_with_output(
@@ -144,12 +153,17 @@ def unified_linear_attention_with_output(
     # this backend call so model/backend state is still written to the same batch.
     forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
 
+    # GDN gates are token-leading [T, ...], while KDA gates carry a singleton
+    # batch dimension [1, T, ...]. Trim the actual token dimension rather than
+    # treating both layouts as token-leading.
+    a, b = _trim_linear_attention_gate_tokens(a, b, real_num_tokens)
+
     ret = get_attn_backend().forward(
         layer=attention_layer,
         forward_batch=forward_batch,
         mixed_qkv=mixed_qkv[:real_num_tokens],
-        a=a[:real_num_tokens],
-        b=b[:real_num_tokens],
+        a=a,
+        b=b,
     )
     forward_batch.out_cache_loc = original_out_cache_loc
 

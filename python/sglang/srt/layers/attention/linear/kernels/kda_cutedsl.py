@@ -130,9 +130,8 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
         q_n = self._l2norm_fn(q[0].contiguous()).to(torch.bfloat16)
         k_n = self._l2norm_fn(k[0].contiguous()).to(torch.bfloat16)
         v_in = v[0].contiguous().to(torch.bfloat16)
-        # Trim g/beta to q's real token count: the [:real_num_tokens] slice in
-        # unified_linear_attention_with_output narrows their batch dim (a no-op),
-        # not tokens, so padded rows survive and break the kernel's shape check.
+        # Align g/beta with q's token count for direct callers that retain
+        # graph-bucket padding in their gate buffers.
         num_tokens = q_n.shape[0]
         g_in = g[0][:num_tokens]  # raw forget gate; activated inside chunk_kda_cutedsl
         beta_in = beta[0][:num_tokens].to(torch.float32)
