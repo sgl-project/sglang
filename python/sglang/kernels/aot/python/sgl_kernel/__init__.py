@@ -29,6 +29,7 @@ else:
         merge_state_v2,
     )
     from sgl_kernel.cutlass_moe import (
+        cutlass_mxfp4a8_moe_mm,
         cutlass_w4a8_moe_mm,
         get_cutlass_w4a8_moe_mm_data,
     )
