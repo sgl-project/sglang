@@ -4621,9 +4621,9 @@ class ServerArgs:
             self.cuda_graph_config.prefill.backend == Backend.BREAKABLE
             and self.get_model_config().is_multimodal_piecewise_cuda_graph_supported
             and not self.get_model_config().is_multimodal_breakable_cuda_graph_supported
-            # Keep trtllm_mla on the preferred breakable path, which now serves
-            # MLA by falling back to the flashinfer MLA impl for extend.
-            and self._resolved_attention_backends()[0] != "trtllm_mla"
+            # Only trtllm_mla configs that still need the FlashInfer paged-MLA
+            # fallback (see trtllm_mla_backend.py) stay excluded.
+            and self._trtllm_mla_has_varlen_absorbed()
         ):
             logger.info(
                 "Using tc_piecewise CUDA graph for validated multimodal "
@@ -4637,6 +4637,15 @@ class ServerArgs:
             self._disable_breakable_cudagraph_if_incompatible()
         elif self.cuda_graph_config.prefill.backend == Backend.FULL:
             self._disable_full_prefill_cudagraph_if_incompatible()
+
+    def _trtllm_mla_has_varlen_absorbed(self) -> bool:
+        if self._resolved_attention_backends()[0] != "trtllm_mla":
+            return True
+        from sglang.srt.layers.attention.trtllm_mla_backend import (
+            varlen_absorbed_mla_supported,
+        )
+
+        return varlen_absorbed_mla_supported(self.kv_cache_dtype)
 
     def _apply_cuda_graph_disaggregation_roles(self):
         if self.disaggregation_mode == "prefill":
