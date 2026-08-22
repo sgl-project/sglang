@@ -114,7 +114,7 @@ Several norms look interchangeable and are not. Start here.
 
 | Entry point | Backend | Contract |
 |---|---|---|
-| `fused_inplace_qknorm_rope` | JIT CUDA | one bf16 rounding step vs split baseline; `round_norm_before_rope=True` makes it exact |
+| `fused_inplace_qknorm_rope` | JIT CUDA | one bf16 rounding step vs split baseline; `round_norm_before_rope=True` makes it exact; supports compact and full-width NeoX/interleaved caches |
 | `fused_qknorm_rope_pack_kv` | JIT CUDA | as above, also packs prefix K/V |
 | `fused_rope_rotate_half_bitexact` | Triton | bit-exact (elementwise only) |
 | `fused_interleaved_rope_fp64` | JIT CUDA | bit-exact vs paired SANA-Video fp64 RoPE |
