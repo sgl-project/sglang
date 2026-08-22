@@ -391,6 +391,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # MoE runner, so it needs the same unpadded checkpoint layout and
         # DeepGEMM scale preparation even when the runner is flashinfer_mxfp4.
         self.use_mega_moe = get_moe_a2a_backend().is_megamoe()
+        if self.use_humming and self.use_mega_moe:
+            raise ValueError(
+                "MXFP4 MoE cannot combine --moe-runner-backend humming with "
+                "--moe-a2a-backend megamoe: MegaMoE calls DeepGEMM directly on "
+                "its own weight layout, which the Humming bridge cannot serve."
+            )
         self.flashinfer_mxfp4_moe_precision = (
             get_exec().moe.flashinfer_mxfp4_moe_precision
         )
@@ -598,7 +604,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
-        if self.use_humming and not self.use_mega_moe:
+        if self.use_humming:
             if self.with_bias:
                 raise NotImplementedError(
                     "The native MXFP4 Humming MoE bridge does not support bias."

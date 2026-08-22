@@ -57,6 +57,42 @@ class TestKimiK3Humming(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     HummingRunnerCore(self._situ_config(**overrides))
 
+    def test_humming_rejects_megamoe_a2a_backend(self):
+        """Selecting both backends must fail before any weight is allocated.
+
+        The two come from independent CLI options. Allowed through, the layer
+        gets MegaMoE weights while inference dispatches to Humming, which reads
+        tensors that were never built.
+        """
+        from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+        with (
+            patch(
+                "sglang.srt.layers.quantization.mxfp4.get_moe_runner_backend",
+                return_value=SimpleNamespace(
+                    is_triton_kernels=lambda: False,
+                    is_flashinfer_mxfp4=lambda: False,
+                    is_marlin=lambda: False,
+                    is_humming=lambda: True,
+                    is_deep_gemm=lambda: False,
+                ),
+            ),
+            patch(
+                "sglang.srt.layers.quantization.mxfp4.get_moe_a2a_backend",
+                return_value=SimpleNamespace(is_megamoe=lambda: True),
+            ),
+            # Without this the constructor dies on the unpublished config bag
+            # instead, and the test would pass even with the guard removed.
+            patch(
+                "sglang.srt.layers.quantization.mxfp4.get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(flashinfer_mxfp4_moe_precision="default")
+                ),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "humming.*megamoe"):
+                Mxfp4MoEMethod(prefix="layers.0.mlp.experts")
+
     def test_explicit_humming_quantization_selection(self):
         self.assertEqual(
             HummingConfig.override_quantization_method(
