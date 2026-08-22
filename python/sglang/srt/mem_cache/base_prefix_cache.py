@@ -45,6 +45,7 @@ class PrefixCacheTrait(Protocol):
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     page_size: int
     disable: bool
+    enable_partial_prefix_reuse: bool
 
 
 @dataclasses.dataclass
@@ -168,6 +169,16 @@ class InitLoadBackParams:
     req: Optional[Req] = None
 
 
+@dataclasses.dataclass(frozen=True)
+class PartialPrefixMatch:
+    """Read-only metadata for a token-level match beyond the tree boundary."""
+
+    exact_match_len: int
+    source_indices: torch.Tensor
+    source_node: Any
+    match_kind: str
+
+
 class MatchResult(NamedTuple):
     """Result of a prefix match operation.
 
@@ -195,6 +206,9 @@ class MatchResult(NamedTuple):
                                 exists a mamba state.
         full_kv_hit_length: Longest Full-KV prefix available on either device or
                             host, independent of other components.
+        partial_prefix_match: Optional token-level match beyond the page-aligned
+                            tree boundary. Its source slots remain read-only
+                            until materialized into a private request page.
     """
 
     device_indices: torch.Tensor
@@ -207,6 +221,7 @@ class MatchResult(NamedTuple):
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
     full_kv_hit_length: int = 0
+    partial_prefix_match: Optional[PartialPrefixMatch] = None
     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
 
@@ -229,11 +244,14 @@ def zero_match_result(
         swa_host_hit_length=0,
         mamba_host_hit_length=0,
         full_kv_hit_length=0,
+        partial_prefix_match=None,
     )
 
 
 class BasePrefixCache(ABC, PrefixCacheTrait):
     """Cache can be indexed by either rid or key."""
+
+    enable_partial_prefix_reuse = False
 
     metrics_collector: Optional[RadixCacheMetricsCollector] = (
         None  # metrics collector for the cache
@@ -280,6 +298,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def supports_fast_match_prefix(self) -> bool:
         return False
+
+    def materialize_partial_prefix(self, req: Req, match_result: MatchResult) -> bool:
+        """Materialize an optional request-private partial-page prefix."""
+        return False
+
+    def abort_partial_prefix(self, req: Req) -> None:
+        """Roll back request-private partial-prefix state after admission fails."""
+
+    def release_partial_prefix_source(self, req: Req) -> None:
+        """Release the temporary source lifetime lock after the copy is safe."""
 
     def resolve_node_handle(self, node_handle: Any) -> Any:
         """Map a node handle to its node -- e.g. UnifiedRadixCache looks up the
