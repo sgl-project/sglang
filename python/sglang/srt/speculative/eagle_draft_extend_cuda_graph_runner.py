@@ -35,7 +35,11 @@ from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backen
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
-from sglang.srt.runtime_context import get_flags, get_spec
+from sglang.srt.runtime_context import (
+    configured_pp_size,
+    get_flags,
+    get_spec,
+)
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -95,7 +99,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.device_module = torch.get_device_module(self.device)
         self.tp_size = model_runner.ps.tp_size
         self.attn_dp_size = model_runner.ps.attn_dp_size
-        self.pp_size = model_runner.server_args.pp_size
+        self.pp_size = configured_pp_size()
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)

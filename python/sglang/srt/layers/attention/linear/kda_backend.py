@@ -31,6 +31,9 @@ elif is_cpu():
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import (
+    get_spec,
+)
 
 
 class KDAKernelDispatcher:
@@ -384,7 +387,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # traversal). Reject EAGLE tree verify (topk > 1) early at setup, keyed on the
         # verify backend (not decode). The kernel keeps a per-call
         # retrieve_parent_token backstop that also covers ngram tree.
-        speculative_topk = model_runner.server_args.speculative_eagle_topk or 1
+        speculative_topk = get_spec().speculative_eagle_topk or 1
         if verify_backend.is_flashinfer() and speculative_topk > 1:
             raise ValueError(
                 "KDA FlashInfer speculative decoding only supports topk=1 "

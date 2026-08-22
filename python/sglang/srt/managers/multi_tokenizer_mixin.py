@@ -61,6 +61,9 @@ from sglang.srt.managers.load_snapshot import (
     zmq_reader_owner,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.runtime_context import (
+    get_disagg,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
@@ -667,7 +670,7 @@ class TokenizerWorker(TokenizerManager):
 
         # For PD disaggregation
         self.disaggregation_transfer_backend = TransferBackend(
-            self.server_args.disaggregation_transfer_backend
+            get_disagg().disaggregation_transfer_backend
         )
 
         # Register this worker with the router for pause/continue broadcasting
