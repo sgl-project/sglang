@@ -401,11 +401,18 @@ class DataParallelController:
         for sock in sockets:
             sock.close()
 
-        # Start all threads
-        for thread in threads:
-            thread.start()
-        for event in ready_events:
-            event.wait()
+        # Same-GPU replicas profile and reserve memory independently. Starting
+        # them one at a time makes the second replica see the first replica's
+        # realized footprint; normal multi-GPU DP keeps its concurrent startup.
+        if server_args.is_same_gpu_dp():
+            for thread, event in zip(threads, ready_events):
+                thread.start()
+                event.wait()
+        else:
+            for thread in threads:
+                thread.start()
+            for event in ready_events:
+                event.wait()
 
     def launch_tensor_parallel_group_thread(
         self,

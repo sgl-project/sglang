@@ -27,6 +27,7 @@ import logging
 import multiprocessing as mp
 import os
 import random
+import shutil
 import signal
 import subprocess
 import sys
@@ -1088,6 +1089,7 @@ class Engine(EngineScoreMixin, EngineBase):
         load_plugins()
 
         server_args.check_server_args()
+        _log_same_gpu_replica_mps_status(server_args)
 
         # Allocate ports for inter-process communications
         if port_args is None:
@@ -1646,6 +1648,26 @@ class Engine(EngineScoreMixin, EngineBase):
         self.collective_rpc("save_sharded_model", **kwargs)
 
     # score() and async_score() are provided by EngineScoreMixin
+
+
+def _log_same_gpu_replica_mps_status(server_args: ServerArgs):
+    """Explain the optional NVIDIA MPS integration for same-GPU replicas."""
+    if not server_args.is_same_gpu_dp() or server_args.device != "cuda":
+        return
+
+    if shutil.which("nvidia-cuda-mps-control") is None:
+        logger.warning(
+            "Same-GPU replicas will use normal CUDA scheduling because "
+            "nvidia-cuda-mps-control is not available. This is supported; "
+            "install and start NVIDIA CUDA MPS externally for the best chance "
+            "of improved multi-process scheduling performance."
+        )
+    else:
+        logger.info(
+            "Same-GPU replicas are enabled. NVIDIA CUDA MPS is optional and "
+            "managed externally; verify scheduler attachment with "
+            "nvidia-cuda-mps-control after startup."
+        )
 
 
 def _set_envs_and_config(server_args: ServerArgs):
