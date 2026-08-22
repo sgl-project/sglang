@@ -135,19 +135,31 @@ PYTHONPATH=python python3 "$BENCH_PY" \
   --output-dir "${BENCH_DIR}"
 ```
 
+The helper defaults to eager. Add `--torch-compile` only for a labeled compile
+control. `--no-torch-compile` remains accepted for compatibility but is no
+longer required.
+
 The helper sets `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1` for accurate stage
 attribution. Set it to `0` explicitly only when collecting an e2e-only run and
 do not compare its per-stage values with synchronized results.
 
-Keep `torch.compile` off when the task requires it:
+For downloaded checkpoints, isolate and clean the model cache after the preset
+finishes. Cleanup also runs after an error or interruption, and appends a JSONL
+record with pre/post byte and weight-file counts:
 
 ```bash
+MODEL_CACHE_ROOT=/path/to/task-owned/model-caches
 PYTHONPATH=python python3 "$BENCH_PY" \
-  --model flux \
+  --model longcat-image \
   --label baseline \
   --output-dir "${BENCH_DIR}" \
-  --no-torch-compile
+  --model-cache-root "${MODEL_CACHE_ROOT}" \
+  --cleanup-model-cache
 ```
+
+The helper refuses to reuse an existing per-run cache directory and never
+redirects `SGLANG_CACHE_DIR`, so compiled kernel caches remain separate. Never
+point this option at a shared Hugging Face or ModelScope cache.
 
 Run the `LTX-2.3` one-stage skill preset:
 
@@ -177,7 +189,7 @@ PYTHONPATH=python python3 "$BENCH_PY" \
 ```
 
 Run the current-source MiniMax-H3 T2VA preset. The helper forces eager mode
-for this model even when its global compile default is enabled:
+for this model even when `--torch-compile` is requested:
 
 ```bash
 export CUDA_VISIBLE_DEVICES=$(python3 "$ENV_PY" print-idle-gpus --count 4)
@@ -215,8 +227,8 @@ Use the preset categories this way:
 
 | Preset | Model | Nightly | Notes |
 | --- | --- | --- | --- |
-| `flux` | `black-forest-labs/FLUX.1-dev` | Yes: `flux1_dev_t2i_1024` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2, `--dit-layerwise-offload false`; no explicit steps/guidance override |
-| `flux2` | `black-forest-labs/FLUX.2-dev` | Yes: `flux2_dev_t2i_1024` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2, `--dit-layerwise-offload false`; no explicit steps/guidance override |
+| `flux` | `black-forest-labs/FLUX.1-dev` | Yes: `flux1_dev_t2i_1024` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2, resident DiT; no explicit steps/guidance override |
+| `flux2` | `black-forest-labs/FLUX.2-dev` | Yes: `flux2_dev_t2i_1024` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2, resident DiT; no explicit steps/guidance override |
 | `qwen` | `Qwen/Qwen-Image-2512` | Yes: `qwen_image_2512_t2i_1024` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2; no explicit steps/guidance override |
 | `qwen-edit` | `Qwen/Qwen-Image-Edit-2511` | Yes: `qwen_image_edit_2511` | Uses the nightly cat image and edit prompt, 2 GPUs, TP size 2 |
 | `zimage` | `Tongyi-MAI/Z-Image-Turbo` | Yes: `zimage_turbo_t2i_1024` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2; no explicit steps/guidance override |
@@ -226,7 +238,14 @@ Use the preset categories this way:
 | `ideogram4-fp8` | `ideogram-ai/ideogram-4-fp8` | Yes: `ideogram4_fp8_t2i_2gpu` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2, FlashAttention backend; sampling preset owns steps/guidance |
 | `cosmos3-super-t2v` | `nvidia/Cosmos3-Super` | Yes: `cosmos3_super_t2v_2gpu` | Prompt, 1280x720, 81 frames, seed 42, 2 GPUs, TP size 2, guardrails disabled for benchmark isolation |
 | `wan-i2v` | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Yes: `wan22_i2v_a14b_720p` | Nightly cat image and motion prompt, 1280x720, 81 frames, 4 GPUs, CFG parallel, Ulysses degree 2, text encoder CPU offload and pinned CPU memory |
-| `minimax-h3-t2va` | `MiniMaxAI/MiniMax-H3` | No | Current-source H3 FL2VA-partition T2VA baseline: 1344x768 resolved canvas, 5 seconds / 124 frames at 24 fps, 50 joint video-audio steps, 4 GPUs, TP2 + Ulysses2, eager BF16/FP32. The helper writes H3's `task`, `conditions`, `target`, and audio/video flow shifts to a generated config. |
+| `minimax-h3-t2va` | `MiniMaxAI/MiniMax-H3` | Yes: `minimax_h3_t2va_5s` | H3 FL2VA-partition T2VA baseline: 1344x768 resolved canvas, 5 seconds / 124 frames at 24 fps, 50 joint video-audio steps, 4 GPUs, TP2 + Ulysses2, eager BF16/FP32. The helper writes H3's request contract to a generated config. |
+| `longcat-image` | `meituan-longcat/LongCat-Image` | No | Eager DiT baseline at 1024x1024, 50 steps, guidance 4.5; prompt rewrite is disabled so Qwen2.5-VL does not contaminate the DiT A/B. |
+| `sana-video` | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` | No | CI-sized eager T2V baseline: 832x480, 17 frames, 8 steps, guidance 6.0. Compare `quality=lossless` and `quality=high`; high enables the BF16-input first linear-attention GEMM while retaining FP32 output and the FP32 second GEMM. |
+| `lingbot-video-moe` | `robbyant/lingbot-video-moe-30b-a3b` | No | One-GPU eager baseline using the CI structured-JSON caption, 384x640, 17 frames, 12 steps, and text-encoder CPU offload. |
+| `cosmos3-edge-t2i` | `nvidia/Cosmos3-Edge` | No | One-GPU eager T2I baseline at Edge's native 640x640 shape, 35 steps, guidance 7.0. |
+| `cosmos3-super-t2i-distilled` | `nvidia/Cosmos3-Super-Text2Image-4Step` | No | Four-GPU eager distilled T2I baseline. The checkpoint owns its fixed sigma schedule; the preset does not override the step count. |
+| `ltx25` | `Lightricks/LTX-2.5-Diffusers` | No | One-stage distilled eager baseline at 960x544, 121 frames, 8 steps, guidance 1.0. |
+| `ltx25-diffusion-decoder` | `Lightricks/LTX-2.5-Diffusers` | No | Same fixed DiT workload with `--use-diffusion-decoder`; attribute decoder time separately and confirm NATTEN `na3d` is active. |
 | `ltx2` | `Lightricks/LTX-2` | No | Current-source two-stage LTX-2 preset with 2 GPUs, CFG parallel, 768x512, 121 frames |
 | `qwen-image` | `Qwen/Qwen-Image` | No | Current-source extra covering the base Qwen-Image native path, separate from the nightly `Qwen-Image-2512` case |
 | `qwen-edit-2509` | `Qwen/Qwen-Image-Edit-2509` | No | Current-source extra for the pre-2511 edit-plus path; uses the cat image, 1024x1024 |
@@ -658,4 +677,5 @@ This skill intentionally stops here. It tells you whether you are looking at:
 - [ ] one representative `torch.profiler` trace saved
 - [ ] hotspot classified against `existing-fast-paths.md`
 - [ ] reference image or video checked for correctness
+- [ ] task-owned checkpoint cache cleaned and ledger shows zero residual weight files
 - [ ] any remaining kernel work handed off with perf/profile evidence attached

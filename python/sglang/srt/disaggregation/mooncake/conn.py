@@ -27,6 +27,7 @@ from sglang.srt.disaggregation.common.staging_handler import (
     STAGING_WATERMARK_WAIT_S,
     DecodeStagingContext,
     PrefillStagingContext,
+    StagingManagerMixin,
     StagingTransferInfo,
 )
 from sglang.srt.disaggregation.common.utils import (
@@ -192,7 +193,7 @@ class KVArgsRegisterInfo:
         )
 
 
-class MooncakeKVManager(CommonKVManager):
+class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
 
     def __init__(
@@ -360,40 +361,6 @@ class MooncakeKVManager(CommonKVManager):
             self.kv_args,
         )
         self.kv_buffer_tensors = None
-
-    def _handle_staging_req(self, msg):
-        from sglang.srt.disaggregation.common.staging_handler import (
-            handle_staging_req,
-        )
-
-        room = int(msg[1].decode("ascii"))
-        session_id = msg[4].decode("ascii")
-        handler = self._staging_handler
-        assert (
-            handler is not None
-        ), "STAGING_REQ received before staging handler initialized"
-        decode_req = handler._room_to_decode_req.get(room)
-        if decode_req is None:
-            logger.warning(
-                "STAGING_REQ received for unregistered room=%s, skipping",
-                room,
-            )
-            return
-        prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
-        handle_staging_req(
-            msg,
-            self._staging_ctx.allocator,
-            self.kv_args,
-            self.attn_tp_size,
-            prefill_tp,
-            getattr(self, "kv_buffer_tensors", None),
-            self._staging_ctx.room_receivers,
-            self._staging_ctx.room_bootstrap,
-        )
-
-        receiver = self._staging_ctx.room_receivers.get(room)
-        if receiver is not None:
-            handler.register_wm_subscriber(receiver, session_id)
 
     def _is_watermark_ready(
         self, session_id: str, alloc_round: int, alloc_end: int
@@ -1255,6 +1222,8 @@ class MooncakeKVManager(CommonKVManager):
             StateType.DSA,
             StateType.SWA_RING,
             StateType.C128_STATE,
+            StateType.BLOCK_SCALE,
+            StateType.BLOCK_SCALE_SWA,
         )
 
     def _requires_exact_state_index_match(self, st: StateType) -> bool:

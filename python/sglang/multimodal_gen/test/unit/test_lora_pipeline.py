@@ -6,10 +6,10 @@ from unittest.mock import patch
 import torch
 
 from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
-from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 
-_RANK_PATCH = "sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline.dist.get_rank"
+_RANK_PATCH = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline.dist.get_rank"
 
 
 class _TestLoRAPipeline(LoRAPipeline):
@@ -142,20 +142,71 @@ def test_lora_alpha_override_updates_cached_adapter_scale():
     assert layer.lora_alpha == 8
 
 
-def test_pinned_lora_weight_limits_snapshot_download(tmp_path):
+def test_lora_tree_url_selects_one_pinned_weight(tmp_path):
     weight_name = "adapter-v4.safetensors"
-    weight_path = tmp_path / weight_name
+    adapter_dir = tmp_path / "adapters"
+    adapter_dir.mkdir()
+    weight_path = adapter_dir / weight_name
     weight_path.touch()
+    model_info = SimpleNamespace(
+        sha="immutable-sha",
+        siblings=[
+            SimpleNamespace(rfilename="adapters/adapter-v3.safetensors"),
+            SimpleNamespace(rfilename="adapters/adapter-v4.safetensors"),
+        ],
+    )
 
     download_target = (
         "sglang.multimodal_gen.runtime.utils.hf_diffusers_utils.maybe_download_model"
     )
-    with patch(download_target, return_value=str(tmp_path)) as download:
-        actual = maybe_download_lora("org/multi-adapter", weight_name=weight_name)
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.weights.source.HfApi.model_info",
+            return_value=model_info,
+        ),
+        patch(download_target, return_value=str(tmp_path)) as download,
+    ):
+        actual = maybe_download_lora(
+            "https://huggingface.co/org/multi-adapter/tree/main/adapters",
+            weight_name=weight_name,
+        )
+
+    assert actual == str(weight_path)
+    assert download.call_args.args[0] == "org/multi-adapter"
+    assert download.call_args.kwargs["revision"] == "immutable-sha"
+    assert download.call_args.kwargs["allow_patterns"] == [
+        "*.json",
+        f"adapters/{weight_name}",
+    ]
+
+
+def test_lora_exact_file_url_needs_no_weight_name(tmp_path):
+    weight_path = tmp_path / "adapter.safetensors"
+    weight_path.touch()
+    model_info = SimpleNamespace(
+        sha="immutable-sha",
+        siblings=[
+            SimpleNamespace(rfilename="adapter.safetensors"),
+            SimpleNamespace(rfilename="other.safetensors"),
+        ],
+    )
+
+    download_target = (
+        "sglang.multimodal_gen.runtime.utils.hf_diffusers_utils.maybe_download_model"
+    )
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.weights.source.HfApi.model_info",
+            return_value=model_info,
+        ),
+        patch(download_target, return_value=str(tmp_path)) as download,
+    ):
+        actual = maybe_download_lora(
+            "https://huggingface.co/org/multi-adapter/resolve/main/adapter.safetensors"
+        )
 
     assert actual == str(weight_path)
     assert download.call_args.kwargs["allow_patterns"] == [
         "*.json",
-        weight_name,
-        f"**/{weight_name}",
+        "adapter.safetensors",
     ]

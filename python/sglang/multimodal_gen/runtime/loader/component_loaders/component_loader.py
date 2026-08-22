@@ -10,9 +10,15 @@ from abc import ABC
 from typing import Any, Type
 
 import torch
+import transformers
 from diffusers import AutoModel
 from torch import nn
-from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
+from transformers import (
+    AutoImageProcessor,
+    AutoProcessor,
+    AutoTokenizer,
+    PretrainedConfig,
+)
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
@@ -34,11 +40,15 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    get_diffusers_component_config,
     get_hf_config,
     prepare_diffusers_component_path_for_loading,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
+from sglang.srt.model_loader.checkpoint_quantization import (
+    resolve_checkpoint_quant_spec,
+)
 
 logger = init_logger(__name__)
 
@@ -49,6 +59,37 @@ class ComponentCheckpointUnsupportedError(ValueError):
 
 class NativeComponentLoaderRequired(RuntimeError):
     """The customized loader must defer to the native library loader."""
+
+
+def uses_native_transformers_bnb4(config: object, component_name: str) -> bool:
+    """Validate a serialized BnB4 checkpoint owned by Transformers."""
+    try:
+        quant_spec = resolve_checkpoint_quant_spec(config)
+    except (TypeError, ValueError) as error:
+        raise ComponentCheckpointUnsupportedError(
+            f"Cannot parse checkpoint quantization for {component_name!r}: {error}"
+        ) from error
+    if quant_spec is None or quant_spec.declared_method != "bitsandbytes":
+        return False
+    if quant_spec.source != "quantization_config":
+        raise ComponentCheckpointUnsupportedError(
+            f"Transformers-managed {component_name!r} quantization requires "
+            "a top-level quantization_config; "
+            f"got metadata from {quant_spec.source!r}"
+        )
+
+    load_in_4bit = quant_spec.config.get(
+        "load_in_4bit", quant_spec.config.get("_load_in_4bit")
+    )
+    load_in_8bit = quant_spec.config.get(
+        "load_in_8bit", quant_spec.config.get("_load_in_8bit", False)
+    )
+    if load_in_4bit is not True or load_in_8bit is True:
+        raise ComponentCheckpointUnsupportedError(
+            f"Transformers-managed {component_name!r} quantization supports only "
+            "serialized BitsAndBytes 4-bit checkpoints"
+        )
+    return True
 
 
 def _load_auto_tokenizer_with_roberta_processing_compat(*args, **kwargs):
@@ -80,6 +121,11 @@ class ComponentLoader(ABC):
 
     # diffusers or transformers
     expected_library: str = ""
+
+    # --attention-backend primarily selects the DiT backend. Auxiliary
+    # components may fall back when that global choice is incompatible; an
+    # explicit --component-attention-backends entry remains strict.
+    allow_global_attention_backend_fallback = True
 
     _loaders_registered = False
 
@@ -125,9 +171,12 @@ class ComponentLoader(ABC):
         component_name: str,
         attn_backend: Any,
         component_attn_name: str | None,
+        allow_global_backend_fallback: bool,
     ) -> AutoModel:
         with component_attn_backend_context_manager(
-            attn_backend, component_name=component_attn_name
+            attn_backend,
+            component_name=component_attn_name,
+            allow_global_backend_fallback=allow_global_backend_fallback,
         ):
             load_kwargs = self.customized_load_kwargs_for_component(
                 server_args, component_name
@@ -144,9 +193,12 @@ class ComponentLoader(ABC):
         transformers_or_diffusers: str,
         attn_backend: Any,
         component_attn_name: str | None,
+        allow_global_backend_fallback: bool,
     ) -> AutoModel:
         with component_attn_backend_context_manager(
-            attn_backend, component_name=component_attn_name
+            attn_backend,
+            component_name=component_attn_name,
+            allow_global_backend_fallback=allow_global_backend_fallback,
         ):
             component = self.load_native(
                 component_model_path,
@@ -198,6 +250,7 @@ class ComponentLoader(ABC):
                 component_name,
                 attn_backend,
                 component_attn_name,
+                self.allow_global_attention_backend_fallback,
             )
             source = "sgl-diffusion"
         except (ComponentCheckpointUnsupportedError, ComponentResidencyError):
@@ -231,6 +284,7 @@ class ComponentLoader(ABC):
                 transformers_or_diffusers,
                 attn_backend,
                 component_attn_name,
+                self.allow_global_attention_backend_fallback,
             )
             source = "native"
             logger.warning(
@@ -284,14 +338,18 @@ class ComponentLoader(ABC):
             load_kwargs["torch_dtype"] = precision
 
         if transformers_or_diffusers == "transformers":
-            from transformers import AutoModel
-
             config = get_hf_config(
                 component_model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
             )
-            return AutoModel.from_pretrained(
+            if uses_native_transformers_bnb4(config, component_name or "component"):
+                server_args.require_component_resident(
+                    component_name or "component",
+                    feature_name="Transformers bitsandbytes component",
+                )
+            model_class = self.resolve_native_transformers_model_class(config)
+            return model_class.from_pretrained(
                 component_model_path,
                 config=config,
                 trust_remote_code=server_args.trust_remote_code,
@@ -312,6 +370,9 @@ class ComponentLoader(ABC):
             )
         else:
             raise ValueError(f"Unsupported library: {transformers_or_diffusers}")
+
+    def resolve_native_transformers_model_class(self, config: PretrainedConfig) -> type:
+        return transformers.AutoModel
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
@@ -428,6 +489,36 @@ class ComponentLoader(ABC):
         return GenericComponentLoader(transformers_or_diffusers, component_architecture)
 
 
+class PlainStateDictComponentLoader(ComponentLoader):
+    """Base for native loaders whose current materializer expects plain weights."""
+
+    @staticmethod
+    def ensure_plain_state_dict_checkpoint(config: object, component_name: str) -> None:
+        try:
+            quant_spec = resolve_checkpoint_quant_spec(config)
+        except (TypeError, ValueError) as error:
+            raise ComponentCheckpointUnsupportedError(
+                f"Cannot parse checkpoint quantization metadata for "
+                f"{component_name!r}: {error}"
+            ) from error
+        if quant_spec is None:
+            return
+
+        method = quant_spec.declared_method or "unspecified"
+        raise ComponentCheckpointUnsupportedError(
+            f"{component_name!r} checkpoint declares quantization metadata in "
+            f"{quant_spec.source} (quant_method={method!r}), which its current "
+            "plain state-dict materializer cannot restore."
+        )
+
+    def load_component_config(
+        self, component_model_path: str, component_name: str
+    ) -> dict[str, Any]:
+        config = get_diffusers_component_config(component_path=component_model_path)
+        self.ensure_plain_state_dict_checkpoint(config, component_name)
+        return config
+
+
 class ImageProcessorLoader(ComponentLoader):
     """Loader for image processor."""
 
@@ -501,6 +592,10 @@ class TokenizerLoader(ComponentLoader):
 class GenericComponentLoader(ComponentLoader):
     """Generic loader for components that don't have a specific loader."""
 
+    # An unknown out-of-tree component may itself be the primary transformer.
+    # Require it to opt into fallback through a registered component loader.
+    allow_global_attention_backend_fallback = False
+
     def __init__(
         self, library="transformers", component_architecture: str | None = None
     ) -> None:
@@ -521,6 +616,8 @@ class PipelineComponentLoader:
         transformers_or_diffusers: str,
         server_args: ServerArgs,
         component_architecture: str | None = None,
+        component_attn_backend: Any = None,
+        component_attn_name: str | None = None,
     ):
         """
         Load a pipeline component.
@@ -538,15 +635,21 @@ class PipelineComponentLoader:
         )
 
         try:
-            # Load the component
-            return loader.load(
-                component_model_path,
-                server_args,
-                component_name,
-                transformers_or_diffusers,
-            )
-        except Exception as e:
+            with component_attn_backend_context_manager(
+                component_attn_backend,
+                component_name=component_attn_name,
+                allow_global_backend_fallback=(
+                    loader.allow_global_attention_backend_fallback
+                ),
+            ):
+                return loader.load(
+                    component_model_path,
+                    server_args,
+                    component_name,
+                    transformers_or_diffusers,
+                )
+        except Exception:
             logger.error(
                 f"Error while loading component: {component_name}, {component_model_path=}"
             )
-            raise e
+            raise

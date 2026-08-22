@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Weight Cache Daemon — a persistent process that holds post-quantized,
-TP-sharded model weights in GPU memory and serves them via CUDA IPC handles.
+TP-sharded model weights in GPU memory and serves them via pluggable transport backends.
 
 Each GPU runs one daemon process for its TP rank. The daemon:
 1. Loads model weights from disk (full pipeline: disk → TP shard → quantize)
 2. Exports every parameter/buffer as a CUDA IPC handle
-3. Serves handles over a Unix socket to requesting engine processes
+3. Serves transport entries over a Unix socket to requesting engine processes
 4. Validates CacheConfig compatibility before serving
 
 Usage:
@@ -39,7 +39,7 @@ import os
 import signal
 import socket
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -47,7 +47,6 @@ import torch.distributed as dist
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import publish
-from sglang.srt.utils import MultiprocessingSerializer
 
 from .protocol import (
     CacheConfig,
@@ -63,6 +62,7 @@ from .protocol import (
     recv_msg,
     send_msg,
 )
+from .transport import choose_daemon_transport_backend
 
 logger = logging.getLogger(__name__)
 
@@ -121,8 +121,9 @@ class WeightCacheDaemon:
 
         self.model = None
         self.config: Optional[CacheConfig] = None
-        # name -> {"handle": base64_str, "shape": list, "dtype": str, "is_param": bool}
+        # name -> transport-specific tensor entry metadata (shape/dtype/is_param + payload metadata)
         self.state_entries: Dict[str, Dict[str, Any]] = {}
+        self.transport_backend = None
 
     def _init_distributed(self, server_args, model_config):
         """Initialize the distributed backend required for model loading.
@@ -344,12 +345,7 @@ class WeightCacheDaemon:
                     )
 
     def _export_state(self):
-        """Export model parameters and buffers as CUDA IPC handles.
-
-        This includes both persistent buffers (in state_dict) and non-persistent
-        buffers (e.g. rotary embedding cos_sin_cache) so the engine can fully
-        reconstruct the model state via zero-copy IPC.
-        """
+        """Export model state entries through the selected transport backend."""
         self.state_entries.clear()
 
         # remove_duplicate=False so tied weights are recognized as parameters
@@ -360,45 +356,37 @@ class WeightCacheDaemon:
             name for name, _ in self.model.named_parameters(remove_duplicate=False)
         )
         state_dict_names = set(self.model.state_dict().keys())
+        state_tensors: Dict[str, Tuple[torch.Tensor, bool]] = {}
 
         # Export all items from state_dict (parameters + persistent buffers)
         for name, tensor in self.model.state_dict().items():
-            ipc_handle = MultiprocessingSerializer.serialize(
-                tensor.data, output_str=True
-            )
-            self.state_entries[name] = {
-                "handle": ipc_handle,
-                "shape": list(tensor.shape),
-                "dtype": str(tensor.dtype).replace("torch.", ""),
-                "is_param": name in param_names,
-            }
+            state_tensors[name] = (tensor.data, name in param_names)
 
         # Also export non-persistent buffers (not in state_dict but needed
         # for inference, e.g. rotary embedding cos_sin_cache)
         non_persistent_count = 0
         for name, buf in self.model.named_buffers():
             if name not in state_dict_names:
-                ipc_handle = MultiprocessingSerializer.serialize(
-                    buf.data, output_str=True
-                )
-                self.state_entries[name] = {
-                    "handle": ipc_handle,
-                    "shape": list(buf.shape),
-                    "dtype": str(buf.dtype).replace("torch.", ""),
-                    "is_param": False,
-                }
+                state_tensors[name] = (buf.data, False)
                 non_persistent_count += 1
 
-        # Log total size
+        self.transport_backend = choose_daemon_transport_backend(state_tensors)
+        self.state_entries = self.transport_backend.prepare_export(state_tensors)
+
+        # Log approximate serialized metadata size (not payload-backed bytes).
+        # Only the handle blob carries real weight, so measure it directly:
+        # stringifying every entry would allocate a copy of all handles.
         total_bytes = sum(
-            entry["handle"].__len__() if hasattr(entry["handle"], "__len__") else 0
-            for entry in self.state_entries.values()
+            len(handle)
+            for handle in (entry.get("handle") for entry in self.state_entries.values())
+            if isinstance(handle, (str, bytes, bytearray))
         )
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id}] "
             f"Exported {len(self.state_entries)} tensors "
             f"({non_persistent_count} non-persistent buffers), "
-            f"serialized handle size ~{total_bytes / 1024 / 1024:.1f} MB"
+            f"transport={self.transport_backend.name}, "
+            f"metadata size ~{total_bytes / 1024 / 1024:.1f} MB"
         )
 
     def serve(self):
@@ -497,19 +485,17 @@ class WeightCacheDaemon:
 
             logger.info(
                 f"[WeightCacheDaemon gpu={self.gpu_id}] "
-                f"Serving {len(self.state_entries)} IPC handles to engine"
+                f"Serving {len(self.state_entries)} tensors via "
+                f"{self.transport_backend.name} transport"
             )
-            send_msg(
+            self.transport_backend.send_fetch_state_response(
                 conn,
-                {
-                    "status": "ok",
-                    "config": self.config.to_dict(),
-                    "entries": self.state_entries,
-                    # PID so the client can watch daemon liveness: if this
-                    # process dies while clients hold IPC mappings, their
-                    # param.data (and any CUDA-graph-captured addresses) dangle.
-                    "pid": os.getpid(),
-                },
+                config=self.config.to_dict(),
+                entries=self.state_entries,
+                # PID so the client can watch daemon liveness: if this
+                # process dies while clients hold IPC mappings, their
+                # param.data (and any CUDA-graph-captured addresses) dangle.
+                pid=os.getpid(),
             )
 
         elif req.get("type") == "ping":

@@ -55,6 +55,7 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.model_executor.cuda_graph_config import (
     ALLOWED_BACKENDS_PER_PHASE,
@@ -102,7 +103,6 @@ from sglang.srt.utils.common import (
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
-from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -206,6 +206,17 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
+]
+
+# trtllm_mha is valid for decode-only dense-MQA drafts. DFLASH rejects it
+# earlier when its per-layer attention requirements are not met.
+DRAFT_ATTENTION_BACKEND_CHOICES = [
+    "flashinfer",
+    "fa3",
+    "fa4",
+    "triton",
+    "ascend",
+    "trtllm_mha",
 ]
 
 # Attention backends whose kernels read the chunked prefix-cache layout.
@@ -319,6 +330,10 @@ RETRACTION_POLICY_CHOICES = ["length", "priority"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
+# Speculative algorithms whose verify forward presents a uniform per-request
+# token width, which is what the LoRA segment layout assumes.
+_LORA_SPEC_ALGORITHMS = ("EAGLE", "EAGLE3", "DFLASH", "DSPARK")
+
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
 
 ENCODER_TRANSFER_BACKEND_CHOICES = [
@@ -400,6 +415,10 @@ def add_quantization_method_choices(choices):
 
 def add_attention_backend_choices(choices):
     ATTENTION_BACKEND_CHOICES.extend(choices)
+
+
+def add_draft_attention_backend_choices(choices):
+    DRAFT_ATTENTION_BACKEND_CHOICES.extend(choices)
 
 
 def add_chunked_prefix_cache_attention_backend(backend_name):
@@ -2386,6 +2405,13 @@ class ServerArgs:
         ),
         NS("exec.moe"),
     ] = "none"
+    enable_w4a4_mxfp4_megamoe: A[
+        bool,
+        "Enable the W4A4 MXFP4 MegaMoE path by setting DeepGEMM's "
+        "DG_USE_FP4_ACTS=1 and DG_USE_MXF4_KIND=1. Use with "
+        "--moe-a2a-backend megamoe.",
+        NS("exec.moe"),
+    ] = False
     moe_runner_backend: A[
         str,
         Arg(
@@ -3647,11 +3673,17 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
-        self._handle_moe_runner_backend_alias()
+        from sglang.srt.arg_groups.mega_moe_hook import handle_mega_moe
+
+        handle_mega_moe(self)
         self._handle_return_hidden_states_mode()
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
         self._validate_prefill_decode_interval()
+
+        # Reject an explicitly enabled but incompatible hardware runtime before
+        # model path resolution, downloads, or the dummy-model short circuit.
+        self._handle_hardware_runtime_validation()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -3819,20 +3851,6 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
-
-    def _handle_moe_runner_backend_alias(self):
-        if self.moe_runner_backend != "megamoe":
-            return
-
-        if self.moe_a2a_backend not in ("none", "megamoe"):
-            logger.warning(
-                "--moe-runner-backend megamoe is an alias for "
-                "--moe-a2a-backend megamoe; overriding "
-                "--moe-a2a-backend %s.",
-                self.moe_a2a_backend,
-            )
-        self.moe_runner_backend = "auto"
-        self.moe_a2a_backend = "megamoe"
 
     def _handle_return_hidden_states_mode(self):
         if self.return_hidden_states_mode not in (None, "last", "full"):
@@ -4401,6 +4419,13 @@ class ServerArgs:
                     "torch_native" if is_host_cpu_arm64() else "intel_amx"
                 )
             self.sampling_backend = "pytorch"
+
+    def _handle_hardware_runtime_validation(self):
+        # This is intentionally independent of self.device: setting
+        # SGLANG_USE_MLX opts into the MLX backend and must fail immediately if
+        # the environment cannot honor that request. With the flag unset,
+        # use_mlx() remains lazy and does not import MLX.
+        use_mlx()
 
     def _handle_npu_backends(self):
         if self.device == "npu":
@@ -5361,6 +5386,7 @@ class ServerArgs:
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
             "LongcatFlashForCausalLM",
+            "Dots3NoteForCausalLM",
         ]:
             # Set attention backend for DeepSeek
             if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
@@ -5536,15 +5562,6 @@ class ServerArgs:
             validate_deepseek_v4_cp(self)
             validate_deepseek_v4_mega_moe_token_budget(self)
 
-            # The SM120 marlin fallback moved to the resolution pipeline
-            # (arg_groups/overrides.py: _deepseek_v4_sm120_moe), invoked here
-            # at its legacy slot.
-            from sglang.srt.arg_groups.overrides import (
-                _deepseek_v4_sm120_moe,
-                run_post_process_pass,
-            )
-
-            run_post_process_pass(self, _deepseek_v4_sm120_moe)
             if is_sm120_supported():
                 # SM120 lacks tcgen05/TMEM: disable features that depend on
                 # DeepGEMM or require >99KB SMEM (topk_v2).
@@ -5656,17 +5673,11 @@ class ServerArgs:
             # enable_multi_layer_eagle for EAGLE moved to the override registry
             # (arg_groups/overrides.py: _mimo_v2_overrides).
 
-            if self.enable_hierarchical_cache:
-                if not envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
-                    raise ValueError(
-                        "Hierarchical cache for MiMoV2 requires the unified "
-                        "radix tree. Set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 "
-                        "to enable --enable-hierarchical-cache for this model."
-                    )
-
-                # MiMoV2 has head_dim != v_head_dim, so the host KV pool uses
-                # asymmetric K/V allocation. Both kernel/page_first and
-                # direct/page_first_direct have split K/V transfer paths.
+            # MiMoV2 hierarchical cache runs on the unified radix tree, which
+            # is the default tree cache now. MiMoV2 has head_dim != v_head_dim,
+            # so the host KV pool uses asymmetric K/V allocation. Both
+            # kernel/page_first and direct/page_first_direct have split K/V
+            # transfer paths.
         elif (
             "Step3p5ForCausalLM" in model_arch
             or "Step3p7ForConditionalGeneration" in model_arch
@@ -7860,6 +7871,7 @@ class ServerArgs:
             "Qwen3OmniMoeForConditionalGeneration",
             "Qwen2AudioForConditionalGeneration",
             "Qwen2_5OmniForConditionalGeneration",
+            "Dots3NoteForCausalLM",
             "KimiVLForConditionalGeneration",
             "KimiK25ForConditionalGeneration",
             "KimiK3ForConditionalGeneration",
@@ -7867,7 +7879,8 @@ class ServerArgs:
         ]:
             raise ValueError(
                 f"Model type {model_arch} is not supported for encoder disaggregation. "
-                f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, Qwen2Audio, Qwen2.5Omni, Kimi, MiMoV2."
+                f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, "
+                f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2."
             )
 
     def _validate_ib_devices(self, device_str: Optional[str]) -> Optional[str]:
@@ -9457,10 +9470,7 @@ class ServerArgs:
                 )
 
             # Validate compatibility with speculative decoding
-            if self.speculative_algorithm not in ["NGRAM", None]:
-                raise ValueError(
-                    "Currently LoRA is only compatible with NGRAM speculative decoding."
-                )
+            self._check_lora_speculative_compatibility()
 
             # Parse lora_paths
             if isinstance(self.lora_paths, list):
@@ -9564,6 +9574,65 @@ class ServerArgs:
             assert (
                 self.lora_drain_wait_threshold >= 0.0
             ), "--lora-drain-wait-threshold must be non-negative."
+
+    def _check_lora_speculative_compatibility(self):
+        """Validate LoRA + speculative decoding combinations.
+
+        Adapters apply to the target only; a shared draft runs unadapted.
+        Matches resolved algorithm names (NEXTN has collapsed to EAGLE).
+        """
+        if self.speculative_algorithm in ["NGRAM", None]:
+            return
+
+        if self.speculative_algorithm not in _LORA_SPEC_ALGORITHMS:
+            promoted = (
+                " (NEXTN/EAGLE with a Gemma4 assistant draft is automatically "
+                "promoted to FROZEN_KV_MTP, which does not support LoRA)"
+                if self.speculative_algorithm == "FROZEN_KV_MTP"
+                else ""
+            )
+            raise ValueError(
+                "LoRA is only compatible with NGRAM, EAGLE, NEXTN, EAGLE3, "
+                "DFLASH, or DSPARK speculative decoding, not "
+                f"{self.speculative_algorithm}{promoted}."
+            )
+
+        ragged_mode = envs.SGLANG_RAGGED_VERIFY_MODE.get()
+
+        # Each entry: (is unsupported, why). Reasons are appended to a shared
+        # prefix so the message names the combination, not just the flag.
+        unsupported = [
+            (
+                self.speculative_algorithm == "DSPARK" and ragged_mode != "static",
+                f"does not support SGLANG_RAGGED_VERIFY_MODE={ragged_mode!r}: "
+                "the per-request verify lengths it schedules break the "
+                "uniform-width LoRA segment layout",
+            ),
+            (
+                self.speculative_adaptive,
+                "does not support --speculative-adaptive: the draft is built "
+                "from a static ServerArgs snapshot, and the runtime-state "
+                "swap does not rebuild LoRA cuda-graph metadata",
+            ),
+            (
+                "experimental_sgl_trtllm"
+                in (self.moe_runner_backend, self.speculative_moe_runner_backend),
+                "does not support the experimental_sgl_trtllm MoE runner: its "
+                "TopK reads the LoRA config per forward, which the draft "
+                "resolves against the target's after its own publish ended",
+            ),
+            (
+                envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get(),
+                "does not support SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1: LoRA "
+                "batch preparation would run on the plan stream, unordered "
+                "against in-flight forwards",
+            ),
+        ]
+        for is_unsupported, reason in unsupported:
+            if is_unsupported:
+                raise ValueError(
+                    f"LoRA with EAGLE/NEXTN/EAGLE3 speculative decoding {reason}."
+                )
 
     def validate_buckets_rule(self, arg_name: str, buckets_rule: List[str]):
         if not buckets_rule:

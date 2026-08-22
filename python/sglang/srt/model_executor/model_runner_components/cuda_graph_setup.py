@@ -271,7 +271,7 @@ def capture_prefill_graph(
         return result(eager_runner)
 
     if (
-        model_runner.server_args.enable_lora
+        model_runner.lora_manager is not None
         and not model_runner.lora_manager.supports_prefill_cuda_graph
     ):
         logger.warning(

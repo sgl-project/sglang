@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    hf_hub_download,
     maybe_download_model,
     snapshot_download,
 )
@@ -61,6 +62,11 @@ _PRECISION_VARIANT_SUFFIX_RE = re.compile(
     r"^(?P<stem>.+?)(?P<precision>\.(?:fp16|bf16|fp32))(?P<shard>-\d+-of-\d+)?(?P<ext>\.safetensors)$"
 )
 _MIXED_SAFETENSORS_RE = re.compile(r".*-mixed(?:-\d+-of-\d+)?\.safetensors$")
+_HF_SAFETENSORS_URL_RE = re.compile(
+    r"https?://huggingface\.co/(?P<repo>[^/]+/[^/]+)/"
+    r"(?:blob|resolve)/(?P<revision>[^/]+)/(?P<filename>.+\.safetensors)$",
+    re.IGNORECASE,
+)
 
 
 def _get_quant_config_name(config: Optional[QuantizationConfig]) -> Optional[str]:
@@ -153,6 +159,10 @@ class TransformerQuantLoadSpec:
     @property
     def is_modelopt_fp4(self) -> bool:
         return _get_quant_config_name(self.quant_config) == "modelopt_fp4"
+
+    @property
+    def is_comfy_fp8(self) -> bool:
+        return _get_quant_config_name(self.quant_config) == "comfy_fp8"
 
 
 class _TransformerQuantAdapter:
@@ -567,7 +577,31 @@ def resolve_transformer_safetensors_to_load(
 
     if quantized_path:
         original_quantized_path = quantized_path
-        quantized_path = maybe_download_model(original_quantized_path)
+        direct_url = _HF_SAFETENSORS_URL_RE.fullmatch(original_quantized_path)
+        if direct_url is not None:
+            quantized_path = hf_hub_download(
+                repo_id=direct_url.group("repo"),
+                filename=direct_url.group("filename"),
+                revision=direct_url.group("revision"),
+            )
+        else:
+            parts = original_quantized_path.strip("/").split("/")
+            is_hub_file = (
+                not os.path.exists(original_quantized_path)
+                and not os.path.isabs(original_quantized_path)
+                and not original_quantized_path.startswith((".", "~"))
+                and len(parts) > 2
+                and original_quantized_path.endswith(".safetensors")
+            )
+            quantized_path = (
+                hf_hub_download(
+                    repo_id="/".join(parts[:2]),
+                    filename="/".join(parts[2:]),
+                    revision=server_args.revision,
+                )
+                if is_hub_file
+                else maybe_download_model(original_quantized_path)
+            )
         logger.info("using quantized transformer weights from: %s", quantized_path)
         if os.path.isfile(quantized_path) and quantized_path.endswith(".safetensors"):
             safetensors_list = [quantized_path]
@@ -694,8 +728,11 @@ def resolve_transformer_quant_load_spec(
     cls_name: str,
     component_name: str | None = None,
     gguf_file: str | None = None,
+    checkpoint_quant_config: QuantizationConfig | None = None,
 ) -> TransformerQuantLoadSpec:
     if gguf_file is not None:
+        if checkpoint_quant_config is not None:
+            raise ValueError("GGUF and safetensors quantization metadata conflict")
         return _resolve_gguf_quant_load_spec(
             gguf_file=gguf_file,
             server_args=server_args,
@@ -703,7 +740,19 @@ def resolve_transformer_quant_load_spec(
             component_name=component_name,
         )
 
-    if getattr(model_cls, "handles_checkpoint_quantization", False):
+    if checkpoint_quant_config is not None:
+        if server_args.quantization is not None:
+            raise ValueError(
+                "Checkpoint quantization is encoded in per-layer metadata; do not "
+                "also set --quantization"
+            )
+        if server_args.nunchaku_config is not None:
+            raise ValueError(
+                "Per-layer checkpoint quantization and Nunchaku are mutually "
+                "exclusive"
+            )
+        quant_config = checkpoint_quant_config
+    elif getattr(model_cls, "handles_checkpoint_quantization", False):
         quant_config = None
     else:
         quant_config = _resolve_quant_config(
@@ -793,7 +842,7 @@ def _needs_device_weight_postprocess(
 ) -> bool:
     """Return whether post-load weight processing needs CUDA/NPU tensors."""
     quant_name = _get_quant_config_name(quant_config)
-    if quant_name == "modelopt_fp8":
+    if quant_name in ("modelopt_fp8", "comfy_fp8"):
         return True
 
     serialized_flag_by_quant_name = {

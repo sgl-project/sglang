@@ -2,11 +2,13 @@
 title: "Quantization"
 tag: "approx"
 metatags:
-    description: "Configure transformer and native text-encoder checkpoint quantization, plus Quant-VideoGen causal KV-cache quantization in SGLang-Diffusion."
+    description: "Configure quantized component repositories, transformer and native text-encoder checkpoint quantization, plus Quant-VideoGen causal KV-cache quantization in SGLang-Diffusion."
 ---
 
-SGLang-Diffusion supports quantized transformer checkpoints and selected
-quantized native text-encoder checkpoints. Transformer and text-encoder
+SGLang-Diffusion treats component path selection and quantized checkpoint
+materialization as separate capabilities. Every loaded component can use an
+independent checkpoint path, but that checkpoint is quantized only when its
+selected loader supports the serialized format. Transformer, encoder, and VAE
 precision are resolved independently.
 
 ## Quick Reference
@@ -14,10 +16,13 @@ precision are resolved independently.
 Use these paths:
 
 - `--model-path`: the base or original model
+- `--component-paths.<component>` / `--<component>-path`: replace a component from `model_index.json` or a native registered module with an independent repo or local directory
 - `--transformer-path`: a quantized transformers-style transformer component directory that already contains its own `config.json`
-- `--transformer-weights-path`: quantized transformer weights provided as a single safetensors file, a sharded safetensors directory, a local path, or a Hugging Face repo ID
-- `--quantization`: apply online quantization to unquantized models at load time (activations are quantized dynamically)
-- `--quantization-ignored-layers` layer name patterns to keep unquantized (e.g. `attention.to_`)
+- `--transformer-weights-path`: replacement transformer weights in safetensors
+  format (file, directory, or Hub repository/file) or a supported GGUF file
+  (local or Hub)
+- `--quantization`: override the quantization method used by the transformer loader
+- `--quantization-ignored-layers`: transformer layer name patterns to keep unquantized during online quantization (e.g. `attention.to_`)
 - `--component-paths.text_encoder`: replace a native text encoder with a checkpoint whose `quantization_config` is auto-detected
 - `--text-encoder-path`: shorter alias for `--component-paths.text_encoder`
 - `--kv-cache-quant`: compress completed causal KV-cache chunks for supported realtime models
@@ -44,6 +49,39 @@ NOTE: Some model-specific integrations also accept a quantized repo or local
 directory directly as `--model-path`, but that is a compatibility path. If a
 repo contains multiple candidate checkpoints, pass
 `--transformer-weights-path` explicitly.
+
+MiniMax-H3 auto-detects the per-layer metadata in Comfy's
+`pruned_fp8_scaled` safetensors. Pass one selected FL2VA or Ref2VA file by local
+path, `owner/repo/path/file.safetensors`, or direct Hugging Face file URL; do
+not combine it with `--quantization`. MiniMax-H3 GGUF usage is documented in
+the [MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#pre-quantized-gguf-transformer).
+
+## Quantized Component Repositories
+
+Every loaded component can point to an independent repository, but path routing
+does not imply that every loader can materialize every quantization format.
+SGLang resolves quantized component checkpoints through one of three explicit
+paths:
+
+- load through an SGLang quantization implementation;
+- delegate a standard component to Transformers or Diffusers;
+- fail closed in a native plain-state loader when the format cannot be restored.
+
+| Component path | Quantized checkpoint behavior |
+| --- | --- |
+| `transformer`, `transformer_2`, `unconditional_transformer`, `audio_dit`, `video_dit` | Uses the SGLang transformer quantization adapters documented below. |
+| `text_encoder*`, `image_encoder*` | Requires the native encoder class to declare support for the detected format. MiniMax-H3 FP8 and model-managed integrations such as Ideogram are supported; unknown combinations fail closed. |
+| `vae`, `video_vae`, `audio_vae` | A standard top-level Diffusers `quantization_config` is delegated to `AutoModel.from_pretrained`. Native-only VAEs and nested/compression metadata fail closed. |
+| Library-managed Transformers or Diffusers components | Delegates to the upstream `from_pretrained` path and inherits its format support and validation behavior. The local PE model uses this path; compatible formats remain model-specific. |
+| Native auxiliary components that load raw state dicts | Quantized checkpoints are rejected before model construction until that component has a quantized materialization implementation. This includes connectors, duration heads, bridges, diffusion decoders, sound tokenizers, spatial upsamplers, and vocoders. |
+
+`--quantization` is the explicit override for the transformer loader; it is not
+the boundary of component quantization support. Other pre-quantized component
+repositories select their format through their own metadata and the capability
+of the selected loader. A generic string override without a matching
+materialization backend would advertise support that the component does not
+have, while a quantized weight file without matching config metadata cannot be
+identified or restored generically.
 
 ## Quant Families
 
@@ -91,7 +129,7 @@ backend.
       <td><code>fp8</code> (offline quantization)</td>
       <td>Quantized transformer component folder, or safetensors with <code>quantization_config</code> metadata</td>
       <td><code>--transformer-path</code> or <code>--transformer-weights-path</code></td>
-      <td>ALL</td>
+      <td>Native DiTs whose linear layers support the selected FP8 method; validate quality per model</td>
       <td>None</td>
       <td>Component-folder and single-file flows are both supported</td>
     </tr>
@@ -110,6 +148,22 @@ backend.
       <td>FLUX.1, FLUX.2, Wan2.2, Qwen Image, Qwen Image 2512, Qwen Image Edit, Qwen Image Edit 2511</td>
       <td>None</td>
       <td>Mixed override repos keep the base model separate; full Qwen Image exports can be loaded directly as <code>--model-path</code>; raw exports such as <code>black-forest-labs/FLUX.2-dev-NVFP4</code> still use the weights-path flow</td>
+    </tr>
+    <tr>
+      <td><code>gguf</code></td>
+      <td>One selected GGUF DiT file</td>
+      <td><code>--transformer-weights-path</code></td>
+      <td>MiniMax-H3 original or pruned FL2VA / Ref2VA DiTs</td>
+      <td>None</td>
+      <td>CUDA only; auto-detected; supports standard and K-quant GGML types; FSDP and the separate Qwen3-VL text-encoder GGUF files are not supported</td>
+    </tr>
+    <tr>
+      <td><code>comfy-fp8</code></td>
+      <td>One selected Comfy safetensors file with per-layer <code>comfy_quant</code> metadata</td>
+      <td><code>--transformer-weights-path</code></td>
+      <td>MiniMax-H3 pruned FL2VA / Ref2VA DiTs</td>
+      <td>None</td>
+      <td>CUDA; auto-detected; TP, sequence parallelism, and component/layerwise offload are supported, while FSDP is not. Checkpoint-marked <code>fc2</code> layers retain FP8 storage and use compute-dtype matmul.</td>
     </tr>
     <tr>
       <td><code>qvg-kv</code></td>
@@ -244,11 +298,15 @@ support LongLive2 pinned sinks, global sinks, or dynamically growing caches.
 
 ## Online Quantization
 
-Online quantization applies quantization to unquantized models at load time. This is useful for when pre-quantized checkpoints are not available.
+This section describes the online methods currently implemented by the
+transformer loader. They are useful when a pre-quantized transformer checkpoint
+is not available. Encoders, VAEs, and auxiliary components are independent:
+their repositories may still carry serialized quantized weights, which are
+restored when the selected component loader supports that format.
 
 ### FP8 Online Quantization
 
-Apply FP8 quantization to any unquantized model:
+Apply FP8 quantization to a supported unquantized DiT checkpoint:
 
 ```bash
 sglang generate \
@@ -260,7 +318,7 @@ sglang generate \
 
 MiniMax-H3 supports this path while preserving its required FP32 patch,
 timestep, and output projections. See the
-[MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#7-runtime-feature-recipes)
+[MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#7-feature-contracts-and-advanced-recipes)
 for its distributed serving recipe.
 
 ### MXFP4 Online Quantization
@@ -310,7 +368,7 @@ projections take that path.
 <Warning>
 `kitchen_int8` is approximate and is not a consistency ground-truth mode.
 The BF16 path is unchanged when `comfy-kitchen` is not installed. See the
-[MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#7-runtime-feature-recipes)
+[MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#7-feature-contracts-and-advanced-recipes)
 for the 24 GB offload recipe, including why `vae` must stay out of
 `--layerwise-offload-components`.
 </Warning>
@@ -322,8 +380,9 @@ thresholds with `SGLANG_KITCHEN_INT8_MAX_ROWS` and
 
 ### Skipping Layers
 
-By default, online quantization quantizes every linear layer in
-the transformer. However, `--quantization-ignored-layers` can be used to keep specific layers in their original precision:
+By default, transformer online quantization quantizes every supported linear
+layer in that component. However, `--quantization-ignored-layers` can keep
+specific transformer layers in their original precision:
 
 ```bash
 sglang generate \
@@ -341,7 +400,7 @@ sglang generate \
   --save-output
 ```
 
-Each pattern is matched against the full layer prefix (e.g. `layers.0.attention.to_q`). A layer is skipped and left unquantizd if its prefix contains any of the given patterns.
+Each pattern is matched against the full layer prefix (e.g. `layers.0.attention.to_q`). A layer is skipped and left unquantized if its prefix contains any of the given patterns.
 
 ## MiniMax-H3 Text Encoder FP8
 
@@ -363,6 +422,27 @@ needed: SGLang detects the checkpoint metadata and only enables formats that
 the native encoder explicitly supports. Text-encoder FP8 is approximate, is
 not enabled by default, and is rejected by MiniMax-H3's strict
 `quality="high"` deployment contract.
+
+## Transformers Component BnB4
+
+Model components that already have a native Transformers loading path can load
+serialized BitsAndBytes 4-bit checkpoints with a standard top-level
+`quantization_config`. Plain checkpoints keep using an available native SGLang
+implementation. For example, replace FLUX's T5 component with the official
+Diffusers checkpoint:
+
+```bash Command
+sglang serve \
+  --model-path black-forest-labs/FLUX.1-dev \
+  --component-paths.text_encoder_2 \
+    diffusers/FLUX.1-dev-bnb-4bit/text_encoder_2
+```
+
+The quantized component must stay resident. SGLang rejects component or
+layerwise offload, nonstandard metadata locations, and native-only component
+fallbacks for this path instead of silently changing the checkpoint contract.
+Diffusion DiT components declared under the Diffusers library use the separate
+quantization backends documented above.
 
 ## Validated ModelOpt Checkpoints
 
