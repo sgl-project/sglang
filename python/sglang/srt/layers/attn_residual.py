@@ -554,7 +554,10 @@ class AttnResidual:
             return None
         if prefix_sum is not None and prefix_sum.shape != hidden_states.shape:
             prefix_sum = prefix_sum[rows]
-        prefix = hidden_states if prefix_sum is None else prefix_sum.add(hidden_states)
+        # hidden_states is dead after this aggregation. Reuse it as the
+        # materialized prefix so the direct-AG kernel can fold the pending add
+        # without allocating or launching a standalone torch add.
+        prefix = hidden_states
         bank = self.block_residual[rows]
         cw = get_cw(score_proj, score_norm, dtype=torch.bfloat16)
         assert score_norm.variance_epsilon == out_norm.variance_epsilon
@@ -568,6 +571,8 @@ class AttnResidual:
             nvb,
             score_norm.variance_epsilon,
             write_prefix=write,
+            residual=prefix_sum,
+            prefix_out=prefix,
         )
         if normed is None:
             return None

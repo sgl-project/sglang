@@ -305,11 +305,13 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
 #pragma unroll
           for (uint32_t r = 0; r < an; ++r) {
             const auto row = base_row + r;
-            const auto src = row == kNumRows ? params.prefix_sum + token * kDim  //
+            const auto* prefix = params.prefix_out == nullptr ? params.prefix_sum : params.prefix_out;
+            const auto src = row == kNumRows ? prefix + token * kDim  //
                                              : params.bank + token * params.stride_bm + row * kDim;
-            // Only prefix_sum is written by the immediately-preceding kernel;
-            // one wait before the first token's prefix load covers the rest.
-            if (token == blockIdx.x && row == kNumRows) PDLWaitPrimary<true>();
+            // The pending-add prelude performs the PDL wait when prefix_out is
+            // present. Otherwise one wait before the first prefix load covers
+            // the immediately preceding producer kernel.
+            if (token == blockIdx.x && row == kNumRows && params.prefix_out == nullptr) PDLWaitPrimary<true>();
             ptx::cp_async_bulk_1d_load(&smem->buf[slot][r], src, kRowBytes, &smem->bar_full[slot]);
           }
         }
@@ -664,6 +666,35 @@ __global__ void __launch_bounds__(Trait::kNumThreads, kOccupancy)
   }
   __syncthreads();
 
+  // Materialize the pending local add into caller-owned storage before the
+  // TMA producer consumes the prefix. The output may alias prefix_sum because
+  // every vector is loaded completely before its unique destination store.
+  if (params.residual != nullptr) {
+    if (threadIdx.x == 0) device::PDLWaitPrimary<true>();
+    __syncthreads();
+    using add_vec_t = device::AlignedVector<bf16x2_t, 4>;
+    using SumOp = device::ReductionTrait<device::ReductionOp::SUM, bf16x2_t>;
+    constexpr uint32_t kRowVecs = Trait::kDim * sizeof(bf16_t) / sizeof(add_vec_t);
+    for (auto token = blockIdx.x; token < params.num_tokens; token += gridDim.x) {
+      const auto* input = params.prefix_sum + static_cast<int64_t>(token) * Trait::kDim;
+      const auto* residual = params.residual + static_cast<int64_t>(token) * Trait::kDim;
+      auto* prefix = params.prefix_out + static_cast<int64_t>(token) * Trait::kDim;
+      for (uint32_t vid = threadIdx.x; vid < kRowVecs; vid += blockDim.x) {
+        add_vec_t vec;
+        add_vec_t res;
+        vec.load(input, vid);
+        res.load(residual, vid);
+#pragma unroll
+        for (uint32_t j = 0; j < 4; ++j) {
+          vec[j] = SumOp::reduce(vec[j], res[j]);
+        }
+        vec.store(prefix, vid);
+      }
+    }
+    __threadfence();
+    __syncthreads();
+  }
+
   extern __shared__ char smem_raw[];
   Trait::forward(params, reinterpret_cast<typename Trait::Smem*>(smem_raw));
 
@@ -865,6 +896,8 @@ struct AttnResFusedTmaKernel {
   static void run_direct_ag(
       CommunicatorRef ref,
       const tvm::ffi::TensorView prefix_sum,
+      std::optional<tvm::ffi::TensorView> residual,
+      const tvm::ffi::TensorView prefix_out,
       const tvm::ffi::TensorView bank,
       const tvm::ffi::TensorView cw,
       const tvm::ffi::TensorView ow,
@@ -885,6 +918,10 @@ struct AttnResFusedTmaKernel {
     device.set_options<kDLCUDA>();
 
     TensorMatcher({T_, H_}).with_dtype<bf16_t>().with_device(device).verify(prefix_sum);
+    TensorMatcher({T_, H_}).with_dtype<bf16_t>().with_device(device).verify(prefix_out);
+    if (residual.has_value()) {
+      TensorMatcher({T_, H_}).with_dtype<bf16_t>().with_device(device).verify(residual.value());
+    }
     TensorMatcher({T_, NB_, H_}).with_dtype<bf16_t>().with_device(device).verify(bank);
     TensorMatcher({H_}).with_dtype<bf16_t>().with_device(device).verify(cw).verify(ow);
     TensorMatcher({GT_, H_}).with_dtype<bf16_t>().with_device(device).verify(out);
@@ -924,8 +961,8 @@ struct AttnResFusedTmaKernel {
         .out = static_cast<bf16_t*>(out.data_ptr()),
         .prefix_dst = write_prefix ? static_cast<bf16_t*>(bank.data_ptr()) + nvb * H : nullptr,
         .input_mc = nullptr,
-        .residual = nullptr,
-        .prefix_out = nullptr,
+        .residual = residual.has_value() ? static_cast<const bf16_t*>(residual.value().data_ptr()) : nullptr,
+        .prefix_out = residual.has_value() ? static_cast<bf16_t*>(prefix_out.data_ptr()) : nullptr,
         .sem_local = data.pull_semaphores[data.rank],
         .sem_mc = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(sem_mc_ptr)),
         .output_mc = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(output_mc_ptr)),

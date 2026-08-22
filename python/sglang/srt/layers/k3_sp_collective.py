@@ -419,6 +419,8 @@ def attn_res_all_gather(
     eps: float,
     *,
     write_prefix: bool = False,
+    residual: Optional[torch.Tensor] = None,
+    prefix_out: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     """Fused local attention-residual aggregation + direct multicast AG."""
     state = _init_state()
@@ -436,6 +438,10 @@ def attn_res_all_gather(
         or not bank.is_contiguous()
         or cw.shape != (_HIDDEN_SIZE,)
         or ow.shape != (_HIDDEN_SIZE,)
+        or (residual is not None and residual.shape != prefix.shape)
+        or (residual is not None and not residual.is_contiguous())
+        or (prefix_out is not None and prefix_out.shape != prefix.shape)
+        or (prefix_out is not None and not prefix_out.is_contiguous())
     ):
         return None
     from sglang.kernels.ops.kimi_k3 import attn_res, sp_collective
@@ -465,5 +471,7 @@ def attn_res_all_gather(
         output_mc_ptr=k3_ar_fusion.get_mc_ptr(output),
         max_blocks=dispatch.max_blocks,
         write_prefix=write_prefix,
+        residual=residual,
+        prefix_out=prefix_out,
     )
     return output
