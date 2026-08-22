@@ -2455,6 +2455,7 @@ class Scheduler(
             tree_cache=self.tree_cache,
             server_args=self.server_args,
             is_generation=self.is_generation,
+            is_multimodal_gen=getattr(self.model_config, "is_multimodal_gen", False),
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
             enable_hicache_storage=lambda: (
