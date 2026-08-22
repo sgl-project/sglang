@@ -739,6 +739,14 @@ torch::Tensor int8_scaled_mm(
           out, mat_a, mat_b, scales_a, scales_b, bias);
     }
 #endif
+  } else if (sm_version == 120 || sm_version == 121) {
+    if (out_dtype == torch::kBFloat16) {
+      sm89_dispatch_shape<cutlass::bfloat16_t, cutlass::arch::Sm80, cutlass::gemm::GemmShape<16, 8, 32>>(
+          out, mat_a, mat_b, scales_a, scales_b, bias);
+    } else {
+      sm89_dispatch_shape<cutlass::half_t, cutlass::arch::Sm80, cutlass::gemm::GemmShape<16, 8, 32>>(
+          out, mat_a, mat_b, scales_a, scales_b, bias);
+    }
   } else {
     TORCH_CHECK_NOT_IMPLEMENTED(false, "No implemented int8_scaled_mm for current compute capability.");
   }
