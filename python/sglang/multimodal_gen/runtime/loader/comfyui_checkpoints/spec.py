@@ -241,6 +241,25 @@ def load_comfyui_transformer(
                 safetensors_weights_iterator([model_path]), dit_config
             )
 
+        # GGUF already sets AdaLN curve from tensor meta. Pruned BF16
+        # safetensors keep the same adaln_t_table; without this the DiT is
+        # built as the unpruned MLP and load fails on that extra parameter.
+        if spec.dit_cls_name == "MiniMaxH3DiTModel":
+            from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
+                inspect_minimax_h3_safetensors,
+            )
+
+            adaln_curve_shape, _ = inspect_minimax_h3_safetensors([model_path])
+            if adaln_curve_shape is not None:
+                (
+                    dit_config.arch_config.adaln_curve_grid,
+                    dit_config.arch_config.time_embed_dim,
+                ) = adaln_curve_shape
+                logger.info(
+                    "MiniMax-H3 ComfyUI checkpoint uses AdaLN curve %s",
+                    adaln_curve_shape,
+                )
+
         logger.info(
             "Loading %s from ComfyUI checkpoint %s, param_dtype: %s",
             spec.dit_cls_name,
