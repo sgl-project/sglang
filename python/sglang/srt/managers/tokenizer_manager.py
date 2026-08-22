@@ -1179,6 +1179,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"model's context length ({self.context_len} tokens)."
                 )
 
+        # NVBug 6632748: reject out-of-range prompt token ids here, before they can
+        # reach the embedding index_select and trip a device-side assert that kills
+        # the whole server. This guard existed but had zero callers. Applies to both
+        # GenerateReqInput and EmbeddingReqInput -- embeddings do the same lookup.
+        if input_ids:
+            self._validate_input_ids_in_vocab(input_ids, self.model_config.vocab_size)
+
         # Validate total tokens (input + max_new_tokens)
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
         if (
@@ -1313,20 +1320,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _validate_input_ids_in_vocab(
         self, input_ids: Union[List[int], List[List[int]]], vocab_size: int
     ) -> None:
+        # Reject BOTH ends of the range: a negative id indexes the embedding from
+        # the far end and reaches the same index_select as an oversized one, so
+        # checking only `>= vocab_size` leaves half the hole open. This matches
+        # _validate_token_ids_logprob, which already checks both bounds.
+        def _check(seq) -> None:
+            for token_id in seq:
+                if not isinstance(token_id, int) or isinstance(token_id, bool):
+                    raise ValueError("input_ids must contain only integers.")
+                if token_id < 0 or token_id >= vocab_size:
+                    raise ValueError(
+                        f"The input_ids contain an out-of-vocabulary token id "
+                        f"{token_id}; valid range is [0, {vocab_size})."
+                    )
+
+        if not input_ids:
+            return
         # Handle both single sequence and batch of sequences
         if isinstance(input_ids[0], list):
-            # Batch of sequences
             for seq in input_ids:
-                if any(id >= vocab_size for id in seq):
-                    raise ValueError(
-                        f"The input_ids {seq} contains values greater than the vocab size ({vocab_size})."
-                    )
+                _check(seq)
         else:
-            # Single sequence
-            if any(id >= vocab_size for id in input_ids):
-                raise ValueError(
-                    f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
-                )
+            _check(input_ids)
 
     def _create_tokenized_object(
         self,
