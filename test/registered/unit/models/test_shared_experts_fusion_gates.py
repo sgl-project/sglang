@@ -517,6 +517,28 @@ class TestWrapperEntryClassGates(_FusionGateCase):
             seen["quant"], "the MTP module ships unquantized in that checkpoint"
         )
 
+    def test_qwen3_5_mtp_exposes_its_fused_quantization_mapping(self):
+        from sglang.srt.layers.quantization.compressed_tensors.utils import (
+            should_ignore_layer,
+        )
+        from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
+
+        ignore = [
+            "mtp.layers.0.self_attn.q_proj",
+            "mtp.layers.0.self_attn.k_proj",
+            "mtp.layers.0.self_attn.v_proj",
+            "mtp.layers.0.mlp.gate_proj",
+            "mtp.layers.0.mlp.up_proj",
+        ]
+        mapping = Qwen3_5ForCausalLMMTP.packed_modules_mapping
+
+        self.assertTrue(
+            should_ignore_layer("mtp.layers.0.self_attn.qkv_proj", ignore, mapping)
+        )
+        self.assertTrue(
+            should_ignore_layer("mtp.layers.0.mlp.gate_up_proj", ignore, mapping)
+        )
+
 
 class TestFamiliesWithoutAGate(_FusionGateCase):
     def test_qwen2_moe_style_families_follow_the_intent(self):
