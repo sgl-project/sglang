@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.layers.lora.linear import (
     replace_submodule,
     wrap_with_lora_layer,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
@@ -574,6 +575,26 @@ class LoRAPipeline(ComposedPipelineBase):
             )
         return merge_mode
 
+    @staticmethod
+    def _uses_unmergeable_quantized_weights(
+        lora_layers: dict[str, BaseLayerWithLoRA],
+    ) -> bool:
+        """Whether any base layer keeps weights in a layout LoRA cannot merge.
+
+        `Fp8LinearMethod.process_weights_after_loading` replaces the logical
+        weight with a transposed, packed tensor plus a separate scale. Adding
+        a LoRA delta to that storage neither matches the logical shape nor
+        updates the scale, so those layers must apply LoRA dynamically.
+
+        Only the online FP8 method is listed here because it is the one whose
+        failure has been reproduced. Other quantization methods may have the
+        same constraint; see the discussion in the linked issue.
+        """
+        return any(
+            isinstance(getattr(layer.base_layer, "quant_method", None), Fp8LinearMethod)
+            for layer in lora_layers.values()
+        )
+
     def _should_merge_lora_for_layers(
         self,
         module_name: str,
@@ -582,8 +603,15 @@ class LoRAPipeline(ComposedPipelineBase):
     ) -> bool:
         if merge_mode == "dynamic":
             return False
+        uses_quantized_weights = self._uses_unmergeable_quantized_weights(lora_layers)
         uses_dtensor_weights = self._uses_dtensor_weights(lora_layers)
         if merge_mode == "auto":
+            if uses_quantized_weights:
+                logger.info(
+                    "Using dynamic LoRA for %s because its quantized weights cannot be merged in place.",
+                    module_name,
+                )
+                return False
             if uses_dtensor_weights:
                 logger.info(
                     "Using dynamic LoRA for %s because FSDP-sharded weights would require a full-gather merge.",
@@ -591,6 +619,13 @@ class LoRAPipeline(ComposedPipelineBase):
                 )
                 return False
             return True
+        if uses_quantized_weights:
+            # Fail before any layer is mutated: a partial merge would leave
+            # the model in an inconsistent state.
+            raise ValueError(
+                f"Direct LoRA weight merge is not supported for the quantized "
+                f"weights of {module_name}. Use --lora-merge-mode dynamic."
+            )
         if uses_dtensor_weights:
             logger.warning(
                 "Merging LoRA for %s with FSDP-sharded weights may require full-gather and can OOM.",

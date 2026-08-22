@@ -3,9 +3,12 @@ from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
+from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 
@@ -210,3 +213,97 @@ def test_lora_exact_file_url_needs_no_weight_name(tmp_path):
         "*.json",
         "adapter.safetensors",
     ]
+
+
+def _quantized_layer() -> BaseLayerWithLoRA:
+    """A layer whose weights went through online FP8 post-load quantization."""
+    layer = _make_layer()
+    layer.base_layer.quant_method = object.__new__(Fp8LinearMethod)
+    return layer
+
+
+class _OtherQuantMethod:
+    """A quantization method this policy does not (yet) classify."""
+
+
+def _other_quantized_layer() -> BaseLayerWithLoRA:
+    layer = _make_layer()
+    layer.base_layer.quant_method = _OtherQuantMethod()
+    return layer
+
+
+def _unquantized_layer() -> BaseLayerWithLoRA:
+    layer = _make_layer()
+    layer.base_layer.quant_method = UnquantizedLinearMethod()
+    return layer
+
+
+def test_auto_uses_dynamic_for_quantized_linear():
+    """Online FP8 stores a transposed, separately scaled weight, so a static
+    merge would corrupt it even if the shapes happened to line up."""
+    layer = _quantized_layer()
+    pipeline = _make_pipeline(layer)
+
+    assert (
+        pipeline._should_merge_lora_for_layers("transformer", {"linear": layer}, "auto")
+        is False
+    )
+
+
+def test_auto_still_merges_unquantized_linear():
+    layer = _unquantized_layer()
+    pipeline = _make_pipeline(layer)
+
+    assert (
+        pipeline._should_merge_lora_for_layers("transformer", {"linear": layer}, "auto")
+        is True
+    )
+
+
+def test_explicit_merge_rejects_quantized_linear():
+    layer = _quantized_layer()
+    pipeline = _make_pipeline(layer)
+
+    with pytest.raises(ValueError, match="dynamic"):
+        pipeline._should_merge_lora_for_layers(
+            "transformer", {"linear": layer}, "merge"
+        )
+
+
+def test_dynamic_remains_dynamic_for_quantized_linear():
+    layer = _quantized_layer()
+    pipeline = _make_pipeline(layer)
+
+    assert (
+        pipeline._should_merge_lora_for_layers(
+            "transformer", {"linear": layer}, "dynamic"
+        )
+        is False
+    )
+
+
+def test_explicit_merge_fails_before_mutating_any_layer():
+    """A partial merge would leave the model in an inconsistent state."""
+    layer = _quantized_layer()
+    pipeline = _make_pipeline(layer)
+    original = layer.base_layer.weight.detach().clone()
+
+    with pytest.raises(ValueError, match="dynamic"):
+        pipeline._should_merge_lora_for_layers(
+            "transformer", {"linear": layer}, "merge"
+        )
+
+    assert torch.equal(layer.base_layer.weight, original)
+    assert not pipeline.is_lora_merged
+
+
+def test_auto_still_merges_unclassified_quant_methods():
+    """Only FP8 is known to break; other methods keep their existing path so
+    this change cannot regress a configuration that works today."""
+    layer = _other_quantized_layer()
+    pipeline = _make_pipeline(layer)
+
+    assert (
+        pipeline._should_merge_lora_for_layers("transformer", {"linear": layer}, "auto")
+        is True
+    )
