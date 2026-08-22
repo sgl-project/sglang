@@ -31,7 +31,7 @@ class TestGLM52DSACacheLayerSplit(PDDisaggregationServerBase, GSM8KMixin):
     # Full GSM8K test set (1319 questions) with a tight accuracy floor.
     gsm8k_accuracy_thres = 0.935
     gsm8k_num_questions = 1319
-    gsm8k_num_threads = 200
+    gsm8k_num_threads = 48
     gsm8k_num_shots = 20
 
     # Prefill worker: interleave prefill-CP + DSA cache layer split on 4 GPUs
