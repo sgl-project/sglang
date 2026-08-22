@@ -346,6 +346,10 @@ def _page_split_kernel(
         tl.store(dst_base + DST_SCALE_OFF + offs, vals, mask=mask)
 
 
+# Indices handled per ``_page_mark_kernel`` program.
+_PAGE_MARK_BLOCK = 1024
+
+
 @triton.jit
 def _page_mark_kernel(
     indices_ptr,
@@ -358,16 +362,17 @@ def _page_mark_kernel(
 
     ``indices`` are token indices into the pbs=SRC_PBS SWA pool; -1 = invalid.
     Each valid token marks ``mask[token // SRC_PBS] = 1``. Concurrent stores of
-    the same value 1 are safe (no atomic needed).
+    the same value 1 are safe (no atomic needed), so handling ``BLOCK`` indices
+    per program is equivalent to handling one index per program.
     """
     pid = tl.program_id(0)
-    if pid >= N_idx:
-        return
-    idx = tl.load(indices_ptr + pid)
-    if idx < 0:
-        return
-    page = idx // SRC_PBS
-    tl.store(mask_ptr + page, 1)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    in_range = offs < N_idx
+    idx = tl.load(indices_ptr + offs, mask=in_range, other=-1)
+    valid = in_range & (idx >= 0)
+    # Masked-off lanes are never dereferenced; keep the address in range anyway.
+    page = tl.where(valid, idx // SRC_PBS, 0)
+    tl.store(mask_ptr + page, tl.full([BLOCK], 1, tl.int8), mask=valid)
 
 
 def _split_kv_pages_to_64(
@@ -437,12 +442,12 @@ def _split_kv_pages_to_64(
         idx_flat = touched_indices.reshape(-1).contiguous()
         if idx_flat.dtype != torch.int32:
             idx_flat = idx_flat.to(torch.int32)
-        _page_mark_kernel[(idx_flat.numel(),)](
+        _page_mark_kernel[(triton.cdiv(idx_flat.numel(), _PAGE_MARK_BLOCK),)](
             idx_flat,
             mask,
             idx_flat.numel(),
             src_pbs,  # SRC_PBS
-            1024,  # BLOCK (unused, kept for JIT signature)
+            _PAGE_MARK_BLOCK,  # BLOCK
         )
         mask_ptr = mask
 
