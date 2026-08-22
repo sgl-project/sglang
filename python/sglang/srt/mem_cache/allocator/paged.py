@@ -274,7 +274,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """Fixed-shape counterpart of free(): a page's tokens sit consecutively
         in the kv row, so page representatives are stride slices -- no
         torch.unique, whose data-dependent output shape forces a device sync.
-        Contract: see base; a page must be freed by only one call per group."""
+        Grouped frees deduplicate these representatives with legacy frees."""
         if free_index.numel() == 0:
             return
 
@@ -318,14 +318,17 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_page_reps_group = []
 
     def free_group_end(self):
-        super().free_group_end()
+        self.is_not_in_free_group = True
+        page_ids = []
+        if self.free_group:
+            page_ids.append(torch.cat(self.free_group) // self.page_size)
+            self.free_group = []
         if self.free_page_reps_group:
-            self._release_page_ids(
-                torch.cat(self.free_page_reps_group) // self.page_size
-            )
+            page_ids.extend(rep // self.page_size for rep in self.free_page_reps_group)
             self.free_page_reps_group = []
+        if page_ids:
+            self._release_page_ids(torch.unique(torch.cat(page_ids)))
         if self.debug_mode:
-            # the no-double-free contract can only break across a group's calls
             self._debug_check_no_duplicate_pages()
 
     def clear(self):

@@ -95,29 +95,18 @@ class TestFreeSegment(unittest.TestCase):
         freed_pages = alloc.free_pages[: expected_pages.numel()]
         self.assertTrue(torch.equal(torch.sort(freed_pages)[0], expected_pages))
 
-    def test_group_end_debug_assert_catches_cross_call_double_free(self):
-        # legacy free() + free_segment() on the same page in one group must
-        # trip free_group_end's debug assert
-        alloc = _make_allocator()
-        alloc.debug_mode = True
-        row = _make_kv_row(alloc, PAGE_SIZE)
-        alloc.free_group_begin()
-        alloc.free(row)
-        alloc.free_segment(row, start_pos=0)
-        with self.assertRaises(AssertionError):
-            alloc.free_group_end()
-
-    def test_group_end_debug_assert_covers_release_pages(self):
-        # need_sort routes frees into release_pages; the duplicate check must
-        # not go vacuous there (PD disaggregation runs with need_sort=True).
-        alloc = _make_allocator(need_sort=True)
-        alloc.debug_mode = True
-        row = _make_kv_row(alloc, PAGE_SIZE)
-        alloc.free_group_begin()
-        alloc.free(row)
-        alloc.free_segment(row, start_pos=0)
-        with self.assertRaises(AssertionError):
-            alloc.free_group_end()
+    def test_group_end_deduplicates_legacy_and_segment_frees(self):
+        for need_sort in (False, True):
+            with self.subTest(need_sort=need_sort):
+                alloc = _make_allocator(need_sort=need_sort)
+                alloc.debug_mode = True
+                row = _make_kv_row(alloc, PAGE_SIZE)
+                before = alloc.available_size()
+                alloc.free_group_begin()
+                alloc.free(row)
+                alloc.free_segment(row, start_pos=0)
+                alloc.free_group_end()
+                self.assertEqual(alloc.available_size(), before + PAGE_SIZE)
 
     def test_overallocated_tail_uses_allocator_page_size_under_dcp(self):
         # Scaled-down DCP example: the configured logical page is 1 while the
