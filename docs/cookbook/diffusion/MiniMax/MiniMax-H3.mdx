@@ -1341,22 +1341,22 @@ measured under. Under that budget its manager holds anonymous memory at
 staging buffers, which overlaps the copies sglang's checkpoint-mapping path
 currently makes synchronously:
 
-| 12 GB VRAM + 32 GB host | denoise | request (warm) | host anonymous |
+| 12 GB VRAM + 32 GB host | denoise | whole request | host anonymous |
 | --- | ---: | ---: | ---: |
-| sglang, Recipe A + in-flight PRs | **11.0–12.0 s/it** | ~7.5 min | 20.4 GiB |
-| ComfyUI, bf16, 32 GiB world | 13.0 s/it | 295–312 s | 30.3 GiB |
-| sglang, Recipe A today | 17–18 s/it | ~9.5–10 min | 24.5 GiB |
+| sglang, Recipe A | **10.5–11.3 s/it** | **279–283 s** | ≤ 27 GiB |
+| ComfyUI, bf16, 32 GiB world | 13.0 s/it | 290–348 s (warm) | 30.3 GiB |
 
-The first row alternated with the ComfyUI row on the same GPU in the same
-bandwidth window, two rounds each; its medians won both (11.0 and 12.0 against
-13.0 both times). It is Recipe A plus three in-flight changes: the VAE staying
-on its checkpoint mapping (#35862), per-layer pinning with net-cost accounting
-(#35867, 13 of 50 DiT layers pinned inside this budget), and a courier thread
-that ships the still-mapped layers through pinned slots so their copies stop
-stalling the compute thread (#35882). Output equivalence was checked: the
-courier's video SSIM against baseline equals baseline's own run-to-run SSIM,
-and the audio stream is bit-identical. Until those merge, the last row is what
-this page's Recipe A measures.
+Two interleaved rounds on the same GPU in the same load window, both engines
+under the same 32 GiB psutil convention, both on the unpruned bf16 weights,
+outputs verified; every ComfyUI warm request came in above every sglang one.
+The request breaks down as ~15 s of text encoding, 200–215 s of denoise, and
+54–64 s of decode. Three merged or in-flight changes carry it: the VAE staying
+on its checkpoint mapping (#35862 with the root fix in #35946), per-layer
+pinning with net-cost accounting (#35867, merged), and the courier thread that
+ships still-mapped layers through pinned slots (#35882) — plus the
+decode-scoped `video_vae=24` residency in the recipe above. Output equivalence
+was checked: the courier's video SSIM against baseline equals baseline's own
+run-to-run SSIM, and the audio stream is bit-identical.
 
 ComfyUI's requests are also shorter after the denoise: its decode runs the VAE
 whole once the DiT is unloaded, where Recipe A streams the decoder's blocks —
