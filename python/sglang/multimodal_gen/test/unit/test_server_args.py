@@ -1487,6 +1487,20 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
 
+    def test_cache_dit_allows_explicit_dit_layerwise_offload(self):
+        with patch.dict(os.environ, {"SGLANG_CACHE_DIT_ENABLED": "true"}):
+            args = self._from_dict_with_pipeline_config(
+                QwenImagePipelineConfig(),
+                kwargs={
+                    "model_path": "/data/my-model",
+                    "performance_mode": "manual",
+                    "dit_layerwise_offload": True,
+                },
+            )
+
+        self.assertTrue(args.is_dit_layerwise_offload_selected)
+        self.assertEqual(args.layerwise_offload_components, ["dit"])
+
     def test_auto_multi_gpu_sana_wm_realtime_disables_cfg_parallel(self):
         args = self._from_dict_with_pipeline_config(
             SanaWMRealtimeConfig(),
