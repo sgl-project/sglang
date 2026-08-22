@@ -380,8 +380,12 @@ void rotary_emb_kernel_impl(
 
 }  // anonymous namespace
 
-extern at::Tensor
-weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, bool is_vnni);
+extern at::Tensor weight_packed_linear(
+    at::Tensor& mat1,
+    at::Tensor& mat2,
+    const std::optional<at::Tensor>& bias,
+    bool is_vnni,
+    std::optional<at::ScalarType> out_dtype = c10::nullopt);
 
 extern at::Tensor int8_scaled_mm_with_quant(
     at::Tensor& mat1,

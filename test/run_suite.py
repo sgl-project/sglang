@@ -330,9 +330,9 @@ def run_a_suite(args):
         for f in glob.glob(
             os.path.join(script_dir, "registered", "**", "*.py"), recursive=True
         )
-        # conftest.py / __init__.py are pytest+package structure, never
-        # registered tests, and must not be executed as one.
-        if os.path.basename(f) not in ("conftest.py", "__init__.py")
+        if not f.endswith("/conftest.py")
+        and not f.endswith("/__init__.py")
+        and not f.endswith("/cpu/quant_utils.py")
     ]
 
     # Strict: all discovered files must have proper registration
