@@ -52,7 +52,7 @@ If any benchmark, perf-dump, or `torch.profiler` command prints one of those sig
 
 - [benchmark-and-profile.md](benchmark-and-profile.md) — canonical denoise benchmark, perf dump, and `torch.profiler` workflow; uses checked-in nightly-aligned presets plus current-source extras such as LongCat-Image, SANA-Video, LingBot Video MoE, Cosmos3 Edge/distilled, LTX-2.5 and its diffusion decoder, MiniMax-H3, FLUX.2 Klein, Ideogram4, ERNIE/GLM/SANA image models, FastWan2.1/2.2, `LTX-2.3`, HunyuanVideo, MOVA, Helios, image edit, and Hunyuan3D shape
 - [existing-fast-paths.md](existing-fast-paths.md) — map bottlenecks to existing fused kernels, packed QKV paths, fused `QK norm + RoPE`, distributed overlap patterns, and open optimization PRs before proposing new code
-- [scripts/diffusion_skill_env.py](scripts/diffusion_skill_env.py) — preflight helper: repo root discovery via `sglang.__file__`, write-access probe, benchmark/profile output directories, idle GPU selection
+- [scripts/diffusion_skill_env.py](scripts/diffusion_skill_env.py) — preflight helper: repo root discovery from the skill's owning checkout before falling back to `sglang.__file__`, write-access probe, benchmark/profile output directories, idle GPU selection
 - [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark preset runner via `sglang generate`; defaults to eager/lossless, supports explicit quality and BCG comparators plus a same-GPU four-mode ABBA matrix, rejects invalid BCG capture/fallback logs, forces H3 to its eager consistency mode, enables synchronized stage attribution, validates nightly preset drift, and can clean one isolated model cache after the full matrix in a `finally` block with a JSONL ledger
 
 ## Opportunity Discovery Rule
@@ -116,7 +116,12 @@ representative profile, and before/after image or video evidence.
 
 MiniMax-H3 is always an eager consistency case on current main. Use
 `--model minimax-h3-t2va`; its preset writes the H3 request fields through a
-generated config and suppresses the helper's global compile default.
+generated config and suppresses the helper's global compile default. Do not
+turn the model's nominal BCG support gate into a performance claim: prompt-
+dependent packed-sequence host boundaries can differ between warmup and the
+serving request. A valid H3 BCG experiment must prove that every captured
+segment replays, keeps the MP4 byte-identical, and does not trade latency for
+the extra graph memory.
 
 For FLUX-family manual profiling runs with a quantized transformer override:
 - use `sglang generate` directly
