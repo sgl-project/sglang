@@ -1,6 +1,13 @@
 # ComfyUI SGLDiffusion Plugin
 
-A ComfyUI plugin for integrating with SGLang Diffusion server, supporting image and video generation capabilities.
+A ComfyUI plugin for SGLang Diffusion. Server mode talks to a standalone HTTP
+server. Integrated mode keeps ComfyUI's CLIP / VAE / sampler loop and uses
+SGLang only as a per-step DiT forward.
+
+Integrated mode no longer ships dedicated `comfyui_*` pipelines. It starts the
+native Flux / Qwen-Image / Z-Image pipeline under `--comfyui-mode`, loads a
+single-file ComfyUI `.safetensors` through a checkpoint spec, and translates
+each `apply_model` call through a small per-model adapter.
 
 ## Installation
 
@@ -29,11 +36,13 @@ Connect to a standalone SGLang Diffusion server.
 4. **LoRA Support**: Use `SGLDiffusion Server Set LoRA` and `SGLDiffusion Server Unset LoRA`.
 
 ### Mode 2: Integrated Mode (Tight Integration)
-Leverage SGLang's high-performance sampling directly within ComfyUI while using ComfyUI's front-end nodes (CLIP, VAE, etc.).
+ComfyUI keeps CLIP, VAE, and the sampler loop. SGLang loads only the DiT and
+runs one forward per sampler step (pass-through scheduler, no text encode /
+decode on the worker).
 
 1. **Load Model**: Use the `SGLDiffusion UNET Loader` node to load your diffusion model.
 2. **Configure Options**: Use the `SGLDiffusion Options` node to set runtime parameters like `num_gpus`, `tp_size`, `model_type`, or `enable_torch_compile`.
-3. **Sample**: Connect the loaded model to standard ComfyUI samplers. SGLang will handle the sampling process efficiently.
+3. **Sample**: Connect the loaded model to standard ComfyUI samplers. Each step is packed by a model adapter and sent to the SGLang scheduler.
 4. **LoRA Support**: Use the `SGLDiffusion LoRA Loader` for native LoRA integration.
 
 ## Adding a Model
@@ -85,4 +94,45 @@ To use these workflows:
 
 ## Current Implementation
 
-This plugin provides a high-performance backend for diffusion models in ComfyUI. By leveraging SGLang's optimized kernels and parallelization techniques (Tensor Parallelism, TeaCache, etc.), it significantly accelerates the sampling process, especially for large models like FLUX.
+SGLang's optimized kernels and parallelism (TP / SP, compile, cache) run on the
+DiT only. Text encoding and VAE stay in ComfyUI.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  subgraph comfy [ComfyUI process]
+    CLIP[CLIP / text encode]
+    VAE[VAE]
+    SAMPLER[Sampler loop]
+    EXEC["SGLDiffusionExecutor"]
+    ADAPT["Model adapter<br/>pack / unpack"]
+    CLIP --> SAMPLER
+    SAMPLER --> EXEC --> ADAPT
+  end
+
+  ADAPT -->|CUDA IPC spill| R0
+
+  subgraph sgl [SGLang]
+    R0[Rank-0 scheduler]
+    R0 -->|comfyui_mode and multi-rank| NCCL["Detach CUDA tensors<br/>NCCL broadcast"]
+    R0 -->|otherwise| PYO["Original SP / CFG / TP<br/>broadcast_pyobj"]
+    NCCL --> PIPE
+    PYO --> PIPE
+    PIPE["Native pipeline<br/>--comfyui-mode"]
+    SPEC["Checkpoint spec<br/>single .safetensors"] --> PIPE
+    PIPE --> STAGE["Latent prep + session cache<br/>+ DenoisingStage"]
+  end
+
+  STAGE -->|noise_pred IPC| EXEC
+  STAGE --> VAE
+```
+
+Per sampler step:
+
+1. The adapter turns ComfyUI `apply_model` tensors into an SGLang `Req`.
+2. Local ZMQ pickle replaces CUDA tensors with IPC handles so latents stay on GPU.
+3. Rank 0 materializes the handles. Multi-rank `--comfyui-mode` then detaches CUDA tensors and broadcasts them over NCCL; the general SP / CFG / TP path is still the original whole-list `broadcast_pyobj`.
+4. The worker pipeline is the native model class with modules trimmed to `transformer` + pass-through scheduler. A single-file checkpoint goes through `comfyui_checkpoints`. After the first step, conditioning stays in a worker session; later steps send latents and the timestep.
+
+Adding a model means a checkpoint spec plus a `ComfyUIModelAdapter`. There is no extra ComfyUI pipeline class.
