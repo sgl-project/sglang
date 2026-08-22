@@ -12,12 +12,6 @@ from sglang.kernels.ops.attention.deepseek_v4_rope import (
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
 from sglang.srt.layers.attention.dsv4.compressor import Compressor as _CompressorBase
-from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
-
-try:
-    from sglang.kernels.ops.attention.deepseek_v4_rope import fused_softmax_pool_triton
-except ImportError:
-    fused_softmax_pool_triton = None
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
     KVAndScore,

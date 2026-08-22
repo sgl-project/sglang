@@ -747,7 +747,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
     ),
     FusionPatternSpec(
         pattern="NSA fused top-k transform / page-table build",
-        candidate_path="python/sglang/srt/layers/attention/nsa_backend.py",
+        candidate_path="python/sglang/srt/layers/attention/dsa_backend.py",
         active_keywords=(
             "fast_topk_transform_fused",
             "fast_topk_transform_ragged_fused",
