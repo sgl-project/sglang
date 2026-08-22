@@ -68,6 +68,18 @@ class DllmConfig:
             # Parse common algorithm configurations
             block_size = algorithm_config.get("block_size", block_size)
 
+        checkpoint_block_size = getattr(model_config.hf_config, "block_size", None)
+        if (
+            getattr(model_config.hf_config, "expert_capacity", None) is not None
+            and block_size != checkpoint_block_size
+        ):
+            raise ValueError(
+                "LLaDA2 block routing requires the dLLM block size to match the "
+                f"checkpoint block_size ({checkpoint_block_size}), got {block_size}. "
+                "Remove the block_size override from --dllm-algorithm-config or "
+                "set it to the checkpoint value."
+            )
+
         return DllmConfig(
             algorithm=server_args.dllm_algorithm,
             algorithm_config=algorithm_config,

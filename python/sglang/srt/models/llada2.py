@@ -61,7 +61,12 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
-from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TritonKernelTopKOutput
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
+    TopK,
+    TritonKernelTopKOutput,
+    capture_routed_experts_if_allowed,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -106,7 +111,21 @@ def _require_block_routing_ep1(moe_ep_size: int) -> None:
 def _get_effective_moe_runner_backend(experts):
     """Return the runner selected by the quant method, including auto selection."""
     quant_method = getattr(experts, "quant_method", None)
+
+    # UnquantizedFusedMoEMethod keeps a Triton fallback in ``runner`` but
+    # forward_cuda executes this AITER runner first whenever auto selection
+    # created it. Resolve the runner that actually executes, not the fallback.
+    aiter_runner = getattr(quant_method, "_aiter_runner", None)
+    backend = getattr(aiter_runner, "runner_backend", None)
+    if backend is not None:
+        return backend
+
     backend = getattr(quant_method, "_moe_runner_backend", None)
+    if backend is not None:
+        return backend
+
+    runner = getattr(quant_method, "runner", None)
+    backend = getattr(runner, "runner_backend", None)
     if backend is not None:
         return backend
 
@@ -749,6 +768,13 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         topk_ids: torch.Tensor,
     ):
         """Convert block-routing results to the selected MoE runner format."""
+        # Block routing computes its own top-k and therefore bypasses TopK.forward,
+        # which normally invokes these diagnostics before producing runner output.
+        capture_routed_experts_if_allowed(
+            self.topk.topk_config, self.layer_id, topk_ids
+        )
+        get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+
         runner_backend = _get_effective_moe_runner_backend(self.experts)
         if not runner_backend.is_triton_kernels():
             if (

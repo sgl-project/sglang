@@ -200,18 +200,22 @@ class TestBlockTopkTriton(CustomTestCase):
         logits = torch.full((8, 4), -20.0, dtype=torch.float32, device="cuda")
         bias = torch.zeros((4,), dtype=torch.float32, device="cuda")
 
-        # These adjacent FP32 logits exercise a capacity-1 boundary where
-        # approximate sigmoid implementations can round differently. Both
-        # routing phases must agree that expert 1 has the higher score.
-        logits[:, 0] = 0.49701982736587524
-        logits[:, 1] = 0.49701985716819763
+        # Keep the scores close while ensuring the device's FP32 sigmoid can
+        # represent their difference on both CUDA and ROCm. Derive the expected
+        # winner from that same device reference instead of assuming that two
+        # adjacent logits remain distinct after sigmoid.
+        logits[:, 0] = 0.4970
+        logits[:, 1] = 0.4971
+        reference_scores = torch.sigmoid(logits[0, :2].float())
+        self.assertGreater(reference_scores[1].item(), reference_scores[0].item())
+        expected_id = torch.argmax(reference_scores).to(torch.int32)
 
         weights, ids = block_topk_triton(
             logits, bias, block_size=8, expert_capacity=1, top_k=1
         )
 
-        self.assertTrue(torch.equal(ids, torch.ones_like(ids)))
-        expected_weight = torch.sigmoid(logits[0, 1].cpu()).item()
+        self.assertTrue(torch.equal(ids, torch.full_like(ids, expected_id)))
+        expected_weight = reference_scores[expected_id.long()]
         torch.testing.assert_close(
             weights,
             torch.full_like(weights, expected_weight),
