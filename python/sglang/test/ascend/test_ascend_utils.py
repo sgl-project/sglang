@@ -73,6 +73,9 @@ DEEPSEEK_CODER_V2_LITE_WEIGHTS_PATH = os.path.join(
 DEEPSEEK_CODER_1_3_B_BASE_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "deepseek-ai/deepseek-coder-1.3b-base"
 )
+DEEPSEEK_OCR_2_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "deepseek-ai/DeepSeek-OCR-2"
+)
 DOTS_OCR_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "rednote-hilab/dots.ocr")
 ECO_TECH_QWEN3_32B_W4A4_LAOS_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Eco-Tech/Qwen3-32B-w4a4-LAOS"
