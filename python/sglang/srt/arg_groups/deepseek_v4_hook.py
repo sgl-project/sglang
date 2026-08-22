@@ -135,6 +135,36 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
 
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
 
+    if server_args.dsv4_attn_backend == "trtllm":
+        from sglang.srt.utils.common import is_sm100_supported
+
+        assert (
+            server_args.device == "cuda" and is_sm100_supported()
+        ), "--dsv4-attn-backend trtllm requires an SM100/SM103 (Blackwell) GPU."
+        # "auto" is declared-but-unmaterialized here; the resolution pipeline
+        # (_deepseek_v4_kv_cache_dtype above) turns it into fp8_e4m3 on cuda.
+        assert server_args.kv_cache_dtype in ("auto", "fp8_e4m3"), (
+            "--dsv4-attn-backend trtllm requires kv_cache_dtype=fp8_e4m3, "
+            f"got {server_args.kv_cache_dtype}."
+        )
+        assert (
+            not server_args.enable_hisparse
+        ), "--dsv4-attn-backend trtllm does not support enable_hisparse."
+        assert not (
+            server_args.attn_cp_size > 1
+            or server_args.dcp_size > 1
+            or server_args.enable_prefill_cp
+            or server_args.enable_prefill_context_parallel
+            or server_args.enable_dsa_prefill_context_parallel
+        ), (
+            "--dsv4-attn-backend trtllm does not support context parallelism "
+            "(prefill CP, attention CP, or decode CP)."
+        )
+        logger.info(
+            "DeepSeek V4 attention: trtllm backend enabled "
+            "(uniform-FP8 KV pool, decode + sparse prefill)."
+        )
+
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 256
         logger.warning(
@@ -150,6 +180,27 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             assert (
                 server_args.speculative_eagle_topk == 1
             ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
+
+    # FIXME(follow-up): remove once the overlap+speculative corruption is
+    # root-caused (tracked in the PR #30805 follow-up list).
+    # TEMPORARY containment: trtllm + speculative decoding under the overlap
+    # scheduler intermittently corrupts an int32 table consumed by the
+    # trtllm-gen sparse kernel (illegal memory access in
+    # fmhaSm100fKernel...VarSeq during concurrent GSM8K-style bursts). This
+    # reproduces with both TP-only and DP-attention recipes; disabling overlap
+    # prevents the corruption while the root cause is investigated.
+    if (
+        server_args.dsv4_attn_backend == "trtllm"
+        and server_args.speculative_algorithm is not None
+        and not server_args.disable_overlap_schedule
+    ):
+        logger.warning(
+            "Disabling the overlap scheduler for the trtllm DeepSeek-V4 "
+            "backend with speculative decoding (temporary "
+            "containment for an intermittent trtllm-gen kernel memory fault; "
+            "see the dsv4 trtllm PR discussion)."
+        )
+        server_args.disable_overlap_schedule = True
 
 
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:

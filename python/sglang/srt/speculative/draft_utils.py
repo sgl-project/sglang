@@ -381,8 +381,8 @@ class DraftBackendFactory:
                 DeepseekV4MultiStepBackend,
             )
         else:
-            from sglang.srt.layers.attention.deepseek_v4_backend import (
-                DeepseekV4MultiStepBackend,
+            from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+                create_deepseek_v4_multistep_backend as DeepseekV4MultiStepBackend,
             )
 
         return (
@@ -521,11 +521,13 @@ class DraftBackendFactory:
                 "dsv4",
                 DeepseekV4HipRadixBackend(self.draft_model_runner, skip_prefill=False),
             )
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            DeepseekV4AttnBackend,
+        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+            create_deepseek_v4_attn_backend,
         )
 
         return (
             "dsv4",
-            DeepseekV4AttnBackend(self.draft_model_runner, skip_prefill=False),
+            create_deepseek_v4_attn_backend(
+                self.draft_model_runner, skip_prefill=False
+            ),
         )
