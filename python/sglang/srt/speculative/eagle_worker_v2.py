@@ -1062,7 +1062,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
 class EAGLEWorkerV2(BaseSpecWorker):
     def iter_runners(self) -> List[Tuple[str, "ModelRunner"]]:
-        return [("draft", self.draft_runner)]
+        return [("draft", self.draft_worker.draft_runner)]
 
     def __init__(
         self,
