@@ -315,7 +315,8 @@ def _page_split_kernel(
     are copied; untouched pages are skipped so the kernel no longer rewrites the
     entire KV pool every decode step.
     """
-    pid = tl.program_id(0)
+    # int64 so the byte-offset products below cannot wrap past 2**31 on large pools
+    pid = tl.program_id(0).to(tl.int64)
     page_idx = pid // RATIO
     sub = pid % RATIO
 
