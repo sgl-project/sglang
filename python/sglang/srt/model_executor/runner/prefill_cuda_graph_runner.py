@@ -193,6 +193,39 @@ def _slice_output_rows(output: Any, num_tokens: int) -> Any:
     raise TypeError(f"Unsupported full prefill CUDA graph output: {type(output)}")
 
 
+def _refresh_deepstack_replay_slot(
+    slot: torch.Tensor, deepstack_embeds: Optional[torch.Tensor]
+) -> None:
+    """Sync the captured DeepStack slot for this replay.
+
+    Absence zeroes the slot so previous rows cannot bleed through the LM's
+    ``add_``; a non-empty tensor that does not fit raises instead — replaying
+    with zeros would silently serve the request without its visual part.
+    """
+    if deepstack_embeds is None or deepstack_embeds.numel() == 0:
+        slot.zero_()
+        return
+
+    num_tokens = slot.shape[0]
+    if (
+        deepstack_embeds.shape[0] > num_tokens
+        or deepstack_embeds.shape[1:] != slot.shape[1:]
+        or deepstack_embeds.dtype != slot.dtype
+        or deepstack_embeds.device != slot.device
+    ):
+        raise RuntimeError(
+            "input_deepstack_embeds does not fit the captured BCG replay slot: "
+            f"got shape={tuple(deepstack_embeds.shape)}, "
+            f"dtype={deepstack_embeds.dtype}, device={deepstack_embeds.device}; "
+            f"slot holds up to {num_tokens} rows of {tuple(slot.shape[1:])} "
+            f"{slot.dtype} on {slot.device}."
+        )
+
+    num_rows = deepstack_embeds.shape[0]
+    slot[:num_rows].copy_(deepstack_embeds)
+    slot[num_rows:].zero_()
+
+
 @dataclass(frozen=True)
 class _ChunkedPrefixCaptureBuffers:
     """Runner-owned tensors shared by every prefix and token-bucket variant.
@@ -295,6 +328,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         self.mamba_track_enabled = self._is_mamba_track_enabled()
 
+        deepstack_replay_width = (
+            self.model_runner.model_config.hidden_size
+            * getattr(self.model_runner.model, "num_deepstack_embeddings", 0)
+            if getattr(self.model_runner.model, "supports_bcg_deepstack_replay", False)
+            else 0
+        )
+
         # --- buffers ---------------------------------------------------
         # `hidden_size` here sizes only the multimodal `input_embeds` buffer,
         # which `general_mm_embed_routine` copies the merged text+media
@@ -311,6 +351,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_size=input_embeds_hidden_size,
             dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
+            deepstack_replay_width=deepstack_replay_width,
         )
         self.buffers.share_buffers()
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers
@@ -324,6 +365,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             is_multimodal=self.is_multimodal,
             hidden_size=input_embeds_hidden_size,
             embed_dtype=self.model_runner.dtype,
+            deepstack_replay_width=deepstack_replay_width,
             enable_mamba_track=self.mamba_track_enabled,
             enable_num_token_non_padded=enable_num_token_non_padded(),
             require_gathered_buffer=require_gathered_buffer(model_runner.server_args),
@@ -678,11 +720,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self._uses_eager_prefill_tail():
                 # BCG / Full: capture the transformer body only.
                 positions = self._get_layer_model_positions(forward_batch)
+                extra_kwargs = {}
+                if self.buffer_registry.has_slot("input_deepstack_embeds"):
+                    extra_kwargs["input_deepstack_embeds"] = (
+                        self.buffer_registry.get_slot(
+                            "input_deepstack_embeds"
+                        ).slice_for(1, num_tokens)
+                    )
                 return self.layer_model.forward(
                     forward_batch.input_ids,
                     positions,
                     forward_batch,
                     forward_batch.input_embeds,
+                    **extra_kwargs,
                 )
             # tc_piecewise: compile/capture the outer model.forward path.
             return self.model_runner.model.forward(
@@ -1680,6 +1730,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     self.buffer_registry.get_slot("input_embeds").slice_for(
                         1, static_num_tokens
                     )[: ie.shape[0]].copy_(ie)
+            if self.buffer_registry.has_slot("input_deepstack_embeds"):
+                _refresh_deepstack_replay_slot(
+                    slot=self.buffer_registry.get_slot(
+                        "input_deepstack_embeds"
+                    ).slice_for(1, static_num_tokens),
+                    deepstack_embeds=layer_kwargs.get("input_deepstack_embeds"),
+                )
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
