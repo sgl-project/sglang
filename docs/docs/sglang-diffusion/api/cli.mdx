@@ -139,7 +139,7 @@ or a native pipeline's registered module name.
 For a native text encoder:
 
 - `--component-paths.text_encoder {MODEL}` replaces the text-encoder checkpoint; `--text-encoder-path {MODEL}` is its shorter alias
-- Quantization metadata is auto-detected from that checkpoint. Each native encoder must explicitly support the serialized format; this is not blanket quantization support for every component, and unsupported combinations fail before weight loading.
+- Quantization metadata is auto-detected from that checkpoint. The native loader accepts compatible serialized formats without a model-name allowlist and rejects implementations that do not construct the required quantized layers.
 
 The same contract applies to every weighted component: path routing is generic,
 while quantized materialization is capability-based. Native auxiliary loaders
@@ -230,6 +230,19 @@ model-specific padding. For a 1024x1024 deployment, use:
 sglang serve --model-path meituan-longcat/LongCat-Image \
   --enable-breakable-cuda-graph \
   --warmup-resolutions 1024x1024 \
+  --enable-torch-compile false \
+  --port 30010
+```
+
+SANA-Video supports the same path for fixed-resolution serving. Its default
+text stage emits a fixed 300-token prompt shape, so the runtime reuses one
+graph across prompt lengths without padding it to a generic text bucket:
+
+```bash Command
+sglang serve \
+  --model-path Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
+  --enable-breakable-cuda-graph \
+  --warmup-resolutions 832x480 \
   --enable-torch-compile false \
   --port 30010
 ```

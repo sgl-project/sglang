@@ -4125,10 +4125,13 @@ class MLATokenToKVPool(KVCache):
         loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
+        layer_id_override: Optional[int] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
-        layer_id = layer.layer_id
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         assert not self.dsa_kv_cache_store_fp8
         parallel = get_parallel()
         if parallel.dcp_enabled:
@@ -4201,6 +4204,7 @@ class MLATokenToKVPool(KVCache):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        layer_id_override: Optional[int] = None,
     ):
         # loc is widened under DCP; the kernel divides by the world size itself.
         maybe_detect_oob(
@@ -4209,7 +4213,9 @@ class MLATokenToKVPool(KVCache):
             (self.size + self.page_size) * get_parallel().attn_dcp_size,
             "set_mla_kv_buffer (MLA)",
         )
-        layer_id = layer.layer_id
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         self._write_mla_kv_buffer(
             self.kv_buffer[layer_id - self.start_layer],
             loc,
