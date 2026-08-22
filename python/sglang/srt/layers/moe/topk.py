@@ -780,6 +780,8 @@ def fused_topk_cpu(
         raise ValueError("packed_out is not supported for CPU fused topk")
     if num_token_non_padded is not None:
         raise ValueError("num_token_non_padded is not supported for CPU fused topk")
+    if correction_bias is not None and correction_bias.dtype != torch.float32:
+        correction_bias = correction_bias.to(torch.float32)
 
     if scoring_func == "softmax":
         topk_weights, topk_ids = torch.ops.sgl_kernel.topk_softmax_cpu(

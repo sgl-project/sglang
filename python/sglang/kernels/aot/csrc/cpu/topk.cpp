@@ -556,6 +556,9 @@ std::tuple<at::Tensor, at::Tensor> topk_softmax_cpu(
   const float* correction_bias_ptr = nullptr;
   if (correction_bias.has_value()) {
     const auto& correction_bias_tensor = correction_bias.value();
+    if (correction_bias_tensor.dim() == 2 && correction_bias_tensor.size(0) == 1) {
+      correction_bias_tensor.squeeze_(0);
+    }
     CHECK_INPUT_SHAPE_DTYPE<false>(correction_bias_tensor, {num_experts}, at::kFloat);
     correction_bias_ptr = correction_bias_tensor.data_ptr<float>();
   }
