@@ -1204,6 +1204,11 @@ class Envs:
     # Eager forward wraps the ForwardBatch's own tensors instead of copying them
     # into the CUDA graph buffer registry (no per-iter device-to-device copy).
     SGLANG_EAGER_INPUT_NO_COPY = EnvBool(False)
+    # Apply the same no-copy wrap only for graph-captured speculative draft
+    # loops that route per-step forwards through the eager path. Those batches
+    # point at graph-stable input buffers, so staging would bake redundant
+    # per-step copy kernels into the graph.
+    SGLANG_EAGER_INPUT_NO_COPY_IN_DRAFT_CAPTURE = EnvBool(True)
 
     # ===================================================================
     # Tokenizer, request state, embeddings, and reasoning controls
