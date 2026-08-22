@@ -11,6 +11,7 @@ from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
+    LinearAttnBackends,
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
 )
@@ -71,6 +72,7 @@ def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
     if (
         get_exec().mamba.linear_attn_prefill_backend is not None
         or get_exec().mamba.linear_attn_backend != "triton"
+        or get_exec().deterministic.enable_deterministic_inference
         or get_memory().enable_page_major_kv_layout
         or sm_major not in (9, 10)
     ):
@@ -111,6 +113,18 @@ def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
 
     rank0_log(f"Defaulting SM{sm_major}0 GDN prefill backend to FlashInfer.")
     return "flashinfer"
+
+
+def _validate_gdn_linear_attn_backends(backends: LinearAttnBackends) -> None:
+    if (
+        get_exec().deterministic.enable_deterministic_inference
+        and backends.prefill.is_flashinfer()
+    ):
+        raise ValueError(
+            "FlashInfer GDN prefill is not supported with "
+            "--enable-deterministic-inference. Use "
+            "--linear-attn-prefill-backend triton."
+        )
 
 
 class GDNKernelDispatcher:
@@ -359,6 +373,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
     needs_cpu_seq_lens: bool = False
 
     def __init__(self, model_runner: ModelRunner):
+        _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
         super().__init__(model_runner)
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
