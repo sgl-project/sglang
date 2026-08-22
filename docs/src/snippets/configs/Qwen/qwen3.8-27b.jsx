@@ -273,7 +273,8 @@ export const config = {
     rtx5090: "lmsysorg/sglang:dev-qwen38-27b-dflash2",
     // Multi-arch: this tag ships both linux/amd64 and linux/arm64, so it pulls
     // natively on DGX Spark (GB10 is aarch64).
-    "dgx-spark": "lmsysorg/sglang:qwen38-27b",
+    // Multi-arch (linux/amd64 + linux/arm64), so GB10 pulls it natively.
+    "dgx-spark": "lmsysorg/sglang:dev-qwen38-27b-dflash2",
     gb300:   "lmsysorg/sglang:dev",
   },
 
