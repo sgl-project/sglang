@@ -20,8 +20,13 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import (
     _backfill_ltx2_audio_vae_latent_stats,
+    _match_checkpoint_dtypes,
     _require_native_loader_for_quantized_vae,
     _should_use_channels_last_3d,
+)
+from sglang.multimodal_gen.runtime.loader.utils import keep_checkpoint_mapped
+from sglang.multimodal_gen.runtime.managers.memory_managers import (
+    host_memory_budget,
 )
 from sglang.multimodal_gen.runtime.models.vaes import wanvae
 
@@ -33,6 +38,7 @@ class _FakeServerArgs:
         self.model_paths = {}
         self.revision = "test-revision"
         self.trust_remote_code = True
+        self.layerwise_components = set()
 
     def resolve_component_attention_backend(self, _component_name):
         return None, None
@@ -40,8 +46,71 @@ class _FakeServerArgs:
     def should_start_component_on_cpu(self, _component_name):
         return False
 
+    def should_configure_layerwise_offload_for_lazy_component(self, component_name):
+        return component_name in self.layerwise_components
+
+
+class TestKeepCheckpointMapped(unittest.TestCase):
+    """The mapping is for hosts that cannot afford the whole deployment."""
+
+    def test_a_small_deployment_on_a_roomy_host_copies(self):
+        with unittest.mock.patch.object(
+            host_memory_budget, "host_memory_available_bytes", lambda: 64 * 1024**3
+        ):
+            self.assertFalse(
+                keep_checkpoint_mapped(weight_bytes=3 * 1024**3, component="vae (VAE)"),
+                "copies are the faster choice when the host has room: their "
+                "pages are resident where a mapping's first use pays a fault",
+            )
+
+    def test_a_deployment_larger_than_the_host_stays_mapped(self):
+        with unittest.mock.patch.object(
+            host_memory_budget, "host_memory_available_bytes", lambda: 19 * 1024**3
+        ):
+            self.assertTrue(
+                keep_checkpoint_mapped(
+                    weight_bytes=117 * 1024**3, component="vae (VAE)"
+                )
+            )
+
+
+class TestMatchCheckpointDtypes(unittest.TestCase):
+    """Assignment replaces a parameter, so only matching dtypes may stay mapped."""
+
+    def test_a_matching_tensor_is_left_alone(self):
+        loaded = {"w": torch.zeros(4, dtype=torch.float32)}
+        before = loaded["w"]
+        _match_checkpoint_dtypes(loaded, {"w": torch.zeros(4, dtype=torch.float32)})
+        self.assertIs(loaded["w"], before)
+
+    def test_a_mismatched_tensor_is_converted(self):
+        loaded = {"w": torch.zeros(4, dtype=torch.float32)}
+        _match_checkpoint_dtypes(loaded, {"w": torch.zeros(4, dtype=torch.bfloat16)})
+        self.assertEqual(loaded["w"].dtype, torch.bfloat16)
+
+    def test_a_tensor_the_module_does_not_want_is_left_alone(self):
+        loaded = {"extra": torch.zeros(4, dtype=torch.float32)}
+        before = loaded["extra"]
+        _match_checkpoint_dtypes(loaded, {})
+        self.assertIs(loaded["extra"], before)
+
 
 class TestVAELoader(unittest.TestCase):
+    def test_mps_layerwise_load_uses_residency_api(self):
+        loader = vae_loader.VAELoader()
+        server_args = _FakeServerArgs(QwenImagePipelineConfig())
+        server_args.layerwise_components.add("vae")
+
+        with patch.object(vae_loader.current_platform, "is_mps", return_value=True):
+            self.assertEqual(
+                loader.customized_load_kwargs_for_component(server_args, "vae"),
+                {"cpu_offload_flag": True},
+            )
+            self.assertEqual(
+                loader.customized_load_kwargs_for_component(server_args, "audio_vae"),
+                {},
+            )
+
     def test_quantized_vae_admission_leaves_plain_configs_unchanged(self):
         _require_native_loader_for_quantized_vae(
             {"_class_name": "AutoencoderKL"}, "vae"
