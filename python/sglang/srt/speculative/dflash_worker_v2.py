@@ -374,7 +374,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             if self.use_bounded_swa_draft_cache:
                 logger.info(
                     "DFLASH bounded all-SWA draft KV cache: attention_window=%d, "
-                    "capacity_per_request=%d (2W policy), pool_tokens=%d.",
+                    "capacity_per_request=%d (window + alignment + overlap), "
+                    "pool_tokens=%d.",
                     self.bounded_swa_window_tokens,
                     self.bounded_swa_capacity_per_request,
                     self.bounded_swa_pool_tokens,
