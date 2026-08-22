@@ -16,7 +16,8 @@ Usage:
     # Opt in to a compile control (presets are eager by default)
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model flux --torch-compile
 
-    # Compare Eager/BCG at lossless/high with two ABBA pairs on one GPU set
+    # Check Eager/BCG at lossless/high on one GPU set; high+BCG is invalid when
+    # request-scoped DiT fusions mount only after lossless graph capture.
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model sana-video --quality-bcg-matrix --model-cache-root /task/model-caches --cleanup-model-cache
 
     # Clean an isolated model cache even if the run fails or is interrupted
@@ -84,7 +85,9 @@ BCG_INVALID_SIGNALS = (
     "[diffusion bcg] disabled",
     "[diffusion bcg] serving signature missed",
     "no graph will be captured",
+    "quality='high' cannot be used with breakable cuda graphs",
 )
+BCG_LATE_QUALITY_FUSION_SIGNAL = "quality fusion mounted after BCG capture"
 QUALITY_BCG_ABBA_MATRIX = (
     ("eager-lossless-a", "lossless", False),
     ("bcg-lossless-a", "lossless", True),
@@ -1409,6 +1412,14 @@ def _run_benchmark_once_impl(
                 fallback_detected = True
             if BCG_CAPTURE_SIGNAL in lower_line:
                 bcg_capture_detected = True
+            if (
+                quality == "high"
+                and breakable_cuda_graph
+                and bcg_capture_detected
+                and "mounted " in lower_line
+                and "for quality=high" in lower_line
+            ):
+                bcg_invalid_signals.add(BCG_LATE_QUALITY_FUSION_SIGNAL)
             bcg_invalid_signals.update(
                 signal for signal in BCG_INVALID_SIGNALS if signal in lower_line
             )
@@ -1616,7 +1627,11 @@ def run_quality_bcg_matrix(
     cleanup_model_cache: bool = False,
     cleanup_ledger_path: Path | None = None,
 ) -> list[dict]:
-    """Run Eager/BCG at lossless/high as two same-GPU ABBA pairs."""
+    """Run the quality/BCG applicability matrix on one fixed GPU set.
+
+    A high+BCG cell is intentionally retained as a compatibility check. It is
+    invalid when request-scoped DiT fusions mount after graph capture.
+    """
     cache_dir = None
     exit_reason = "error"
     if model_cache_root is not None:

@@ -141,8 +141,10 @@ longer required.
 
 Run one explicit quality or BCG comparator with `--quality lossless|high` and
 `--breakable-cuda-graph`. BCG and `torch.compile` are intentionally mutually
-exclusive in this helper. When a preset has explicit width and height, the
-helper declares that same `--warmup-resolutions` value automatically:
+exclusive in this helper. A high+BCG command is only a compatibility probe:
+it is invalid if request-scoped DiT fusions mount after the lossless warmup
+graphs were captured. When a preset has explicit width and height, the helper
+declares that same `--warmup-resolutions` value automatically:
 
 ```bash
 PYTHONPATH=python python3 "$BENCH_PY" \
@@ -154,9 +156,12 @@ PYTHONPATH=python python3 "$BENCH_PY" \
 ```
 
 For optimization discovery, use the full repeated matrix. It runs
-Eager/BCG/BCG/Eager at `lossless`, then the same ABBA pair at `high`, while
-holding one GPU set and one isolated checkpoint cache. Cleanup occurs only
-after all eight runs, including on failure or interruption:
+Eager/BCG/BCG/Eager at `lossless`, then the same sequence at `high`, while
+holding one GPU set and one isolated checkpoint cache. The high+BCG cells test
+whether the combination is actually supported; do not average them when the
+runtime rejects the combination or the helper detects a late quality-fusion
+mount. Cleanup occurs only after all eight runs, including on failure or
+interruption:
 
 ```bash
 MODEL_CACHE_ROOT=/path/to/task-owned/model-caches
@@ -172,8 +177,9 @@ PYTHONPATH=python python3 "$BENCH_PY" \
 Before starting, confirm the chosen GPU set has no foreign process and remains
 unchanged through every run boundary. The helper rejects a BCG row unless its
 log contains `[Diffusion BCG] captured` and contains none of: support-gate
-disable, capture failure, `serving signature MISSED`, or a message that no
-graph will be captured. Do not average rejected rows with valid results.
+disable, capture failure, `serving signature MISSED`, a message that no graph
+will be captured, or a request-scoped high-quality DiT fusion mounted after
+capture. Do not average rejected rows with valid results.
 
 BCG signatures include more than width and height. The public
 `--warmup-resolutions` flag declares only `WxH`; synthetic warmup still uses
@@ -750,8 +756,8 @@ This skill intentionally stops here. It tells you whether you are looking at:
 
 - [ ] fixed-shape baseline perf dump saved
 - [ ] fixed-shape new perf dump saved
-- [ ] Eager/BCG x `quality=lossless|high` matrix attempted on one GPU set
-- [ ] BCG rows show capture and no disable/failure/signature-miss marker
+- [ ] quality/BCG applicability matrix attempted on one GPU set
+- [ ] BCG rows show capture and no disable/failure/signature-miss/late-quality-fusion marker
 - [ ] request shape, seed, steps, guidance, topology, residency, and synchronized stage profiling match
 - [ ] `compare_perf.py` table generated
 - [ ] one representative `torch.profiler` trace saved

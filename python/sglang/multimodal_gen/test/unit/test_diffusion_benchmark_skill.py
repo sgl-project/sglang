@@ -142,7 +142,9 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
             joy_echo_cmd = module.build_sglang_cmd("joy-echo")
             self.assertIn("--num-gpus=2", joy_echo_cmd)
             self.assertIn("--ulysses-degree=2", joy_echo_cmd)
-            config_arg = next(arg for arg in joy_echo_cmd if arg.startswith("--config="))
+            config_arg = next(
+                arg for arg in joy_echo_cmd if arg.startswith("--config=")
+            )
             config = json.loads(Path(config_arg.removeprefix("--config=")).read_text())
             self.assertFalse(config["enable_memory_bank"])
 
@@ -311,6 +313,37 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
             self.assertTrue(result["error"])
             self.assertEqual(
                 result["missing_artifacts"], ["perf dump", "generated output"]
+            )
+
+    def test_high_bcg_rejects_quality_fusion_mounted_after_capture(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_root = Path(tmpdir)
+            module = _load_benchmark_module(temp_root)
+            output_dir = temp_root / "outputs"
+            output_dir.mkdir()
+
+            with patch.object(module.subprocess, "Popen") as popen:
+                popen.return_value.stdout = iter(
+                    (
+                        "[Diffusion BCG] captured 3 segment(s)\n",
+                        "Mounted LTX-2 fused RMSNorm+modulate for quality=high\n",
+                    )
+                )
+                popen.return_value.wait.return_value = 0
+                result = module._run_benchmark_once_impl(
+                    "longcat-image",
+                    "bcg-high",
+                    output_dir,
+                    warmup=False,
+                    quality="high",
+                    breakable_cuda_graph=True,
+                    cuda_visible_devices="0",
+                )
+
+            self.assertTrue(result["error"])
+            self.assertEqual(
+                result["bcg_invalid_signals"],
+                [module.BCG_LATE_QUALITY_FUSION_SIGNAL],
             )
 
     def test_quality_bcg_matrix_reuses_one_gpu_set_and_cleans_once(self):

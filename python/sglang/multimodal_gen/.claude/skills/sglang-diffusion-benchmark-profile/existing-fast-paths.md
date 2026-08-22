@@ -297,6 +297,20 @@ framework-specific optimization workflow.
 - Scope: this is a mainline SANA model fast path. Query projection in cross-attention remains separate because it uses denoising hidden states, while K/V share step-invariant encoder hidden states.
 - Workflow rule: if a SANA trace shows separate self-attention `to_q`, `to_k`, `to_v` GEMMs, or separate cross-attention `to_k` and `to_v` GEMMs, treat that as a regressed existing packed-projection path before proposing a new GEMM fusion.
 
+**Request-Scoped DiT Fusions with Breakable CUDA Graphs**
+
+- `quality=high` DiT sites are mounted at a request boundary. BCG warmup uses
+  the model's lossless sampling default unless a quality-aware graph variant
+  was captured explicitly.
+- A graph captured before the high-quality mount retains the lossless module
+  branches. Replaying it after the mount silently bypasses the requested high
+  kernels even when the tensor signature matches.
+- Workflow rule: a high+BCG cell is valid only when the model has no
+  request-scoped DiT quality sites, or when logs prove those sites were mounted
+  before the matching graph capture. A mount after `[Diffusion BCG] captured`
+  invalidates the row; do not use its latency or output as high-quality
+  evidence.
+
 **Recent Model Audit Boundaries**
 
 - LongCat-Image supports breakable CUDA graph at fixed, captured resolutions.
