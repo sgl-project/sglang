@@ -318,12 +318,14 @@ class EncoderPreprocessor:
                     else False
                 )
                 img, _ = load_image(data, gpu_image_decode)
-                if (
-                    discard_alpha_channel
-                    and not isinstance(img, torch.Tensor)
-                    and img.mode != "RGB"
-                ):
-                    img = img.convert("RGB")
+                if not isinstance(img, torch.Tensor):
+                    try:
+                        if discard_alpha_channel and img.mode != "RGB":
+                            img = img.convert("RGB")
+                        else:
+                            img.load()
+                    except (OSError, SyntaxError) as e:
+                        raise ValueError(f"Could not decode image: {e}") from e
                 if (
                     media_metadata
                     and self.encoder_media_processor_config.preserve_media_metadata
