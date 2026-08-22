@@ -191,11 +191,6 @@ class TestHummingFp8Dispatch(CustomTestCase):
 
                 with (
                     patch.object(
-                        humming_runner.envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION,
-                        "get",
-                        return_value=True,
-                    ),
-                    patch.object(
                         runner,
                         "apply_activation",
                         side_effect=AssertionError("SiLU fused path was not selected"),

@@ -417,8 +417,7 @@ class HummingRunnerCore(MoeRunnerCore):
         groups = intermediate // 128
         num_threads = intermediate // 8
         use_fused_masked_act_quant = (
-            envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
-            and w2_meta.a_dtype == dtypes.float8e4m3
+            w2_meta.a_dtype == dtypes.float8e4m3
             and w2_meta.input_scale_group_size == 128
             and self.activation == "silu"
             and gate_up.dtype == torch.bfloat16
