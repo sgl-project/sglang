@@ -274,7 +274,7 @@ def run_evalscope(
             logger.info("Process killed")
         _kill_evalscope_session(process)
         raise
-    
+
     except Exception as e:
         logger.error(f"Error executing command: {e}")
         process.terminate()
