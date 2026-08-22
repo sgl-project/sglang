@@ -748,9 +748,20 @@ def fused_topk_softmax_torch_raw_logits(
 
     _, topk_ids = torch.topk(gating_output, k=topk, dim=-1, sorted=False)
     logits = gating_output.float()
-    topk_weights = logits.gather(1, topk_ids)
     if renormalize:
+        # Softmax restricted to the selected experts: identical to gathering the
+        # full softmax and renormalizing over the selection, as the HF reference
+        # computes it for norm_topk_prob=True.
+        topk_weights = logits.gather(1, topk_ids)
         topk_weights = F.softmax(topk_weights, dim=-1, dtype=torch.float32)
+    else:
+        # The HF reference for norm_topk_prob=False (e.g. Qwen2MoE) applies
+        # softmax over ALL experts and gathers the top-k WITHOUT renormalizing
+        # over the selection. Downstream consumers (packed trtllm-gen combine
+        # scale, GGUF-quantized gates) apply these weights directly as
+        # probabilities, so returning the raw gathered logits here silently
+        # corrupts the MoE output.
+        topk_weights = F.softmax(logits, dim=-1).gather(1, topk_ids)
 
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
