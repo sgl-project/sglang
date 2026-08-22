@@ -239,7 +239,7 @@ struct NormReduce<M, at::BFloat16, D> {
 };
 #endif
 
-template <NormMode M, typename scalar_t, bool has_residual>
+template <NormMode M, typename scalar_t, bool has_residual, typename param_t = scalar_t>
 struct NormReduceGeneric {
   static inline void apply(
       scalar_t* __restrict__ out,
@@ -314,7 +314,7 @@ struct NormReduceGeneric {
       x_fvec0 = x_fvec0 * scale_fvec;
       x_fvec1 = x_fvec1 * scale_fvec;
       if constexpr (NormTraits<M>::has_weight) {
-        auto [w_fvec0, w_fvec1] = load_float_vec2(static_cast<const scalar_t*>(params.weight) + d);
+        auto [w_fvec0, w_fvec1] = load_float_vec2(static_cast<const param_t*>(params.weight) + d);
         if constexpr (NormTraits<M>::has_shift) {
           w_fvec0 = NormTraits<M>::apply_shift(w_fvec0, shift_fvec);
           w_fvec1 = NormTraits<M>::apply_shift(w_fvec1, shift_fvec);
@@ -324,7 +324,7 @@ struct NormReduceGeneric {
       }
       if constexpr (NormTraits<M>::has_bias) {
         if (use_bias) {
-          auto [b_fvec0, b_fvec1] = load_float_vec2(static_cast<const scalar_t*>(params.bias) + d);
+          auto [b_fvec0, b_fvec1] = load_float_vec2(static_cast<const param_t*>(params.bias) + d);
           x_fvec0 = NormTraits<M>::apply_bias(x_fvec0, b_fvec0);
           x_fvec1 = NormTraits<M>::apply_bias(x_fvec1, b_fvec1);
         }
@@ -349,7 +349,7 @@ struct NormReduceGeneric {
       }
       x_val *= rsqrt_var;
       if constexpr (NormTraits<M>::has_weight) {
-        float w_val = static_cast<float>(static_cast<const scalar_t*>(params.weight)[d]);
+        float w_val = static_cast<float>(static_cast<const param_t*>(params.weight)[d]);
         if constexpr (NormTraits<M>::has_shift) {
           w_val = NormTraits<M>::apply_shift(w_val, params.shift);
         }
@@ -357,7 +357,7 @@ struct NormReduceGeneric {
       }
       if constexpr (NormTraits<M>::has_bias) {
         if (use_bias) {
-          float b_val = static_cast<float>(static_cast<const scalar_t*>(params.bias)[d]);
+          float b_val = static_cast<float>(static_cast<const param_t*>(params.bias)[d]);
           x_val = NormTraits<M>::apply_bias(x_val, b_val);
         }
       }
@@ -391,7 +391,7 @@ struct NormReduceGeneric {
             apply(out + p.output_offset(b, h, t), input + p.input_offset(b, h, t), gate_ptr, p)); \
     return
 
-template <NormMode M, typename scalar_t>
+template <NormMode M, typename scalar_t, typename param_t = scalar_t>
 void norm4d_kernel_impl(
     scalar_t* __restrict__ out,
     const scalar_t* __restrict__ input,
@@ -399,7 +399,8 @@ void norm4d_kernel_impl(
     const scalar_t* __restrict__ gate = nullptr) {
 #if defined(CPU_CAPABILITY_AVX512)
   // fast path only applies to bfloat16 when D in {32, 64, 128, 256, 512}
-  if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+  // it loads weight/bias as bfloat16, so fp32 params fall through to the generic path
+  if constexpr (std::is_same_v<scalar_t, at::BFloat16> && std::is_same_v<param_t, at::BFloat16>) {
     switch (p.D) {
       LAUNCH_PARALLEL_LOOP_HD(32);
       LAUNCH_PARALLEL_LOOP_HD(64);
@@ -416,11 +417,11 @@ void norm4d_kernel_impl(
   LAUNCH_PARALLEL_LOOP(
       const scalar_t* __restrict__ gate_ptr{nullptr}; if constexpr (NormTraits<M>::has_gate) {
         gate_ptr = gate + p.output_offset(b, h, t);
-      } NormReduceGeneric<M, scalar_t, false>::
+      } NormReduceGeneric<M, scalar_t, false, param_t>::
           apply(out + p.output_offset(b, h, t), input + p.input_offset(b, h, t), gate_ptr, nullptr, p, p.D));
 }
 
-template <NormMode M, typename scalar_t>
+template <NormMode M, typename scalar_t, typename param_t = scalar_t>
 void fused_add_norm4d_kernel_impl(
     scalar_t* __restrict__ out,
     const scalar_t* __restrict__ input,
@@ -430,7 +431,7 @@ void fused_add_norm4d_kernel_impl(
   LAUNCH_PARALLEL_LOOP(
       const int64_t out_offset = output_uses_input_stride ? p.input_offset(b, h, t) : p.output_offset(b, h, t);
       scalar_t* __restrict__ residual_ptr = residual + p.output_offset(b, h, t);
-      NormReduceGeneric<M, scalar_t, true>::apply(
+      NormReduceGeneric<M, scalar_t, true, param_t>::apply(
           out + out_offset, input + p.input_offset(b, h, t), nullptr, residual_ptr, p, p.D));
 }
 
@@ -736,11 +737,13 @@ at::Tensor gemma4_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps,
 at::Tensor
 layernorm_cpu(const at::Tensor& input, const at::Tensor& weight, const std::optional<at::Tensor>& bias, double eps) {
   const auto st = input.scalar_type();
+  // affine params may stay fp32 while activations are reduced precision
+  const auto param_st = weight.scalar_type();
   const int64_t hidden_size = input.size(-1);
   CHECK_INPUT_ND<2, 3>(input);
-  CHECK_INPUT_SHAPE_DTYPE<false>(weight, {hidden_size}, st);
+  CHECK_INPUT_SHAPE_DTYPE<false>(weight, {hidden_size}, param_st);
   if (bias.has_value()) {
-    CHECK_INPUT_SHAPE_DTYPE<false>(bias.value(), {hidden_size}, st);
+    CHECK_INPUT_SHAPE_DTYPE<false>(bias.value(), {hidden_size}, param_st);
   }
 
   NormParams p{input, static_cast<float>(eps)};
@@ -748,8 +751,9 @@ layernorm_cpu(const at::Tensor& input, const at::Tensor& weight, const std::opti
   p.bias = bias.has_value() ? bias.value().data_ptr() : nullptr;
 
   at::Tensor output = at::empty_like(input);
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "layernorm_kernel", [&] {
-    norm4d_kernel_impl<NormMode::LayerNorm, scalar_t>(output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), p);
+  CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(st, param_st, [&] {
+    norm4d_kernel_impl<NormMode::LayerNorm, scalar_t, param_t>(
+        output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), p);
   });
   return output;
 }
@@ -834,13 +838,15 @@ at::Tensor fused_add_layernorm_cpu(
     const std::optional<at::Tensor>& bias,
     double eps) {
   const auto st = input.scalar_type();
+  // affine params may stay fp32 while activations are reduced precision
+  const auto param_st = weight.scalar_type();
   const int64_t hidden_size = input.size(-1);
   CHECK_INPUT_ND<2, 3>(input);
   CHECK_EQ(input.sizes(), residual.sizes());
   CHECK_EQ(st, residual.scalar_type());
-  CHECK_INPUT_SHAPE_DTYPE<false>(weight, {hidden_size}, st);
+  CHECK_INPUT_SHAPE_DTYPE<false>(weight, {hidden_size}, param_st);
   if (bias.has_value()) {
-    CHECK_INPUT_SHAPE_DTYPE<false>(bias.value(), {hidden_size}, st);
+    CHECK_INPUT_SHAPE_DTYPE<false>(bias.value(), {hidden_size}, param_st);
   }
 
   NormParams p{input, static_cast<float>(eps)};
@@ -848,8 +854,8 @@ at::Tensor fused_add_layernorm_cpu(
   p.bias = bias.has_value() ? bias.value().data_ptr() : nullptr;
 
   at::Tensor output = at::empty_like(input);
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_add_layernorm_kernel", [&] {
-    fused_add_norm4d_kernel_impl<NormMode::LayerNorm, scalar_t>(
+  CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(st, param_st, [&] {
+    fused_add_norm4d_kernel_impl<NormMode::LayerNorm, scalar_t, param_t>(
         output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), residual.data_ptr<scalar_t>(), p);
   });
   return output;

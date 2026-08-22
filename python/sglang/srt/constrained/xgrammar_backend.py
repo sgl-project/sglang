@@ -37,13 +37,19 @@ from sglang.srt.constrained.base_grammar_backend import (
     InvalidGrammarObject,
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_hip
 from sglang.srt.utils.common import is_pin_memory_available
 
 _is_hip = is_hip()
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_hip:
     from sgl_kernel import apply_token_bitmask_inplace_cuda
+elif _is_cpu and _is_cpu_amx_available:
+    apply_token_bitmask_inplace_cpu = (
+        torch.ops.sgl_kernel.apply_token_bitmask_inplace_cpu
+    )
 else:
     from sglang.kernels.ops.grammar.bitmask_ops import (
         apply_token_bitmask_inplace_triton,
@@ -134,11 +140,14 @@ class XGrammarGrammar(BaseGrammarObject):
 
             torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
         elif logits.device.type == "cpu":
-            # Used by the MLX backend, which builds its additive mask rows
-            # on the CPU before inserting them into the lazy graph.
-            from xgrammar import apply_token_bitmask_inplace
+            if _is_cpu and _is_cpu_amx_available:
+                apply_token_bitmask_inplace_cpu(logits, vocab_mask)
+            else:
+                # Used by the MLX backend, which builds its additive mask rows
+                # on the CPU before inserting them into the lazy graph.
+                from xgrammar import apply_token_bitmask_inplace
 
-            apply_token_bitmask_inplace(logits, vocab_mask, backend="cpu")
+                apply_token_bitmask_inplace(logits, vocab_mask, backend="cpu")
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 

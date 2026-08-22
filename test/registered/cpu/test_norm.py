@@ -344,13 +344,18 @@ class TestLayerNorm:
     @pytest.mark.parametrize("batch_size", [32, 121])
     @pytest.mark.parametrize("hidden_size", [128, 4096, 533])
     @pytest.mark.parametrize("has_bias", [False, True], ids=["no-bias", "bias"])
+    @pytest.mark.parametrize(
+        "param_is_float", [False, True], ids=["param-same-dtype", "param-fp32"]
+    )
     def test_layernorm(
         self,
         batch_size: int,
         hidden_size: int,
         has_bias: bool,
+        param_is_float: bool,
         dtype: torch.dtype,
     ) -> None:
+        param_dtype = torch.float32 if param_is_float else dtype
         x_list = [
             torch.randn([batch_size, hidden_size], dtype=dtype),
             torch.randn([batch_size, 3, hidden_size], dtype=dtype),
@@ -358,8 +363,8 @@ class TestLayerNorm:
 
         for x in x_list:
             x = make_non_contiguous(x)
-            weight = torch.randn(hidden_size, dtype=dtype)
-            bias = torch.randn(hidden_size, dtype=dtype) if has_bias else None
+            weight = torch.randn(hidden_size, dtype=param_dtype)
+            bias = torch.randn(hidden_size, dtype=param_dtype) if has_bias else None
 
             ln_out = torch.ops.sgl_kernel.layernorm_cpu(x, weight, bias, eps)
             ref_ln_out = self._forward_native(x, weight, eps, residual=None, bias=bias)
