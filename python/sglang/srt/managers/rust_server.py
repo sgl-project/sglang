@@ -801,6 +801,7 @@ class RustServer:
             ),
             allow_auto_truncate=sa.allow_auto_truncate,
             enable_return_hidden_states=sa.enable_return_hidden_states,
+            enable_custom_logit_processor=sa.enable_custom_logit_processor,
             # Not a `server_args` field: `TokenizerManager` derives it, and the
             # rust ingress needs the same number for its total-token check.
             num_reserved_tokens=compute_num_reserved_tokens(),
