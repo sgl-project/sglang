@@ -99,15 +99,7 @@ def _server_args_for_transformer_component(
     server_args: ServerArgs, component_name: str
 ) -> ServerArgs:
     """Mask global quantized override flags for secondary transformer components."""
-    if component_name not in ("transformer_2", "unconditional_transformer"):
-        return server_args
-
-    # Some pipelines have secondary DiT components with their own quantized
-    # weight file. Keep the mapping model-owned and the loader generic.
-    component_weights_paths = getattr(
-        server_args, "component_transformer_weights_paths", {}
-    )
-    component_weights_path = component_weights_paths.get(component_name)
+    component_weights_path = server_args.component_weights_paths.get(component_name)
     if component_weights_path is not None:
         component_server_args = copy.copy(server_args)
         component_server_args.transformer_weights_path = component_weights_path
@@ -118,6 +110,9 @@ def _server_args_for_transformer_component(
             component_weights_path,
         )
         return component_server_args
+
+    if component_name not in ("transformer_2", "unconditional_transformer"):
+        return server_args
 
     if (
         server_args.transformer_weights_path is None
@@ -139,6 +134,8 @@ def _server_args_for_transformer_component(
 class TransformerLoader(ComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
 
+    allow_global_attention_backend_fallback = False
+
     component_names = [
         "transformer",
         "unconditional_transformer",
@@ -150,8 +147,11 @@ class TransformerLoader(ComponentLoader):
     def customized_load_kwargs_for_component(
         self, server_args: ServerArgs, component_name: str
     ) -> dict[str, bool]:
-        if current_platform.is_mps() and self._is_component_set_as_layerwise_load(
-            server_args, component_name
+        if (
+            current_platform.is_mps()
+            and server_args.should_configure_layerwise_offload_for_lazy_component(
+                component_name
+            )
         ):
             logger.info(
                 "Loading %s on CPU first for MPS layerwise offload", component_name

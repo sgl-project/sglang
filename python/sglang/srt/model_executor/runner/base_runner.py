@@ -574,7 +574,7 @@ class BaseRunner(ABC):
             )
 
         # Optional LoRA metadata.
-        if mr.server_args.enable_lora:
+        if mr.lora_manager is not None:
             lora_ids = [None] * batch_size
         else:
             lora_ids = None
