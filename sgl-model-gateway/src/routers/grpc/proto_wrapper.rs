@@ -3,6 +3,8 @@
 //! This module provides unified enums that wrap proto types from both SGLang and vLLM,
 //! allowing the router to work with either backend transparently.
 
+use std::sync::Arc;
+
 use futures_util::StreamExt;
 use smg_grpc_client::{
     sglang_proto::{self as sglang, generate_complete::MatchedStop},
@@ -10,6 +12,8 @@ use smg_grpc_client::{
     vllm_engine::AbortOnDropStream as VllmStream,
     vllm_proto as vllm,
 };
+
+use crate::core::Worker;
 
 /// Unified ProtoRequest
 #[derive(Clone)]
@@ -99,6 +103,23 @@ pub enum ProtoGenerateResponse {
 }
 
 impl ProtoGenerateResponse {
+    /// Whether a legacy/custom SGLang producer sent an in-band error.
+    ///
+    /// Official `smg-grpc-servicer` releases supported by SGLang report
+    /// errors with gRPC status instead. The pinned legacy client schema still
+    /// exposes this variant, so treat it as a failed attempt without inferring
+    /// provenance from its untyped string fields.
+    fn legacy_in_band_attempt_outcome(&self) -> Option<AttemptOutcome> {
+        match self {
+            Self::Sglang(response) => matches!(
+                response.response,
+                Some(sglang::generate_response::Response::Error(_))
+            )
+            .then_some(AttemptOutcome::AttemptFailure),
+            Self::Vllm(_) => None,
+        }
+    }
+
     /// Get the response variant (chunk, complete, or error)
     ///
     /// Consumes self to avoid cloning large proto messages in hot streaming path
@@ -363,33 +384,154 @@ impl ProtoGenerateError {
     }
 }
 
-/// Unified stream wrapper
-pub enum ProtoStream {
+/// Terminal outcome of a selected single-worker attempt, decided at body terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptOutcome {
+    /// The consumer accepted the fully drained response body.
+    Success,
+    /// The selected upstream attempt ended with a transport/protocol error.
+    ///
+    /// This is an attempt result, not a claim about which component caused it.
+    AttemptFailure,
+    /// The downstream stopped before an upstream terminal verdict was known.
+    Abandoned,
+}
+
+impl AttemptOutcome {
+    fn publish_to(self, worker: &dyn Worker) {
+        match self {
+            Self::Success => worker.record_outcome(true),
+            Self::AttemptFailure => worker.record_outcome(false),
+            Self::Abandoned => {}
+        }
+    }
+}
+
+/// Single-owner right to publish the breaker outcome of one selected attempt.
+///
+/// The right starts Detached, is transferred to the finally selected worker at
+/// stream-start success, and is consumed exactly once by the first legal
+/// body-terminal observation. Duplicate and late observations are absorbed.
+enum BreakerReceipt {
+    /// No breaker publication will happen (e.g. dual PD legs stay detached).
+    Detached,
+    /// The stream holds the publication right for this selected worker.
+    Active(Arc<dyn Worker>),
+    /// The right has been consumed; later observations are no-ops.
+    Resolved,
+}
+
+impl BreakerReceipt {
+    /// Consume the receipt, publishing `outcome` at most once (absorbing).
+    fn resolve(&mut self, outcome: AttemptOutcome) {
+        if let BreakerReceipt::Active(worker) = std::mem::replace(self, BreakerReceipt::Resolved) {
+            outcome.publish_to(worker.as_ref());
+        }
+    }
+}
+
+/// Unified stream wrapper carrying the breaker publication receipt.
+pub struct ProtoStream {
+    inner: ProtoStreamInner,
+    receipt: BreakerReceipt,
+}
+
+enum ProtoStreamInner {
     Sglang(SglangStream),
     Vllm(VllmStream),
 }
 
 impl ProtoStream {
-    /// Get next item from stream
-    pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
-        match self {
-            Self::Sglang(stream) => stream
-                .next()
-                .await
-                .map(|result| result.map(|r| ProtoGenerateResponse::Sglang(Box::new(r)))),
-            Self::Vllm(stream) => stream
-                .next()
-                .await
-                .map(|result| result.map(ProtoGenerateResponse::Vllm)),
+    pub(crate) fn sglang(stream: SglangStream) -> Self {
+        Self {
+            inner: ProtoStreamInner::Sglang(stream),
+            receipt: BreakerReceipt::Detached,
         }
     }
 
-    /// Mark stream as completed (no abort needed)
-    pub fn mark_completed(&mut self) {
-        match self {
-            Self::Sglang(stream) => stream.mark_completed(),
-            Self::Vllm(stream) => stream.mark_completed(),
+    pub(crate) fn vllm(stream: VllmStream) -> Self {
+        Self {
+            inner: ProtoStreamInner::Vllm(stream),
+            receipt: BreakerReceipt::Detached,
         }
+    }
+
+    /// Attach the selected worker breaker publication right (crate-private).
+    ///
+    /// Called exactly once by the dispatch stage after stream-start success
+    /// and final worker selection; attaching twice is a programming error.
+    pub(crate) fn attach_breaker_receipt(
+        &mut self,
+        worker: Arc<dyn Worker>,
+    ) -> Result<(), &'static str> {
+        if !matches!(self.receipt, BreakerReceipt::Detached) {
+            return Err("breaker receipt is already attached or resolved");
+        }
+        self.receipt = BreakerReceipt::Active(worker);
+        Ok(())
+    }
+
+    /// Get next item from stream.
+    ///
+    /// Transport and legacy in-band failures resolve the receipt before they
+    /// are returned. The consumer acknowledges a successfully drained body
+    /// through `mark_completed`.
+    pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+        let item = match &mut self.inner {
+            ProtoStreamInner::Sglang(stream) => stream
+                .next()
+                .await
+                .map(|result| result.map(|r| ProtoGenerateResponse::Sglang(Box::new(r)))),
+            ProtoStreamInner::Vllm(stream) => stream
+                .next()
+                .await
+                .map(|result| result.map(ProtoGenerateResponse::Vllm)),
+        };
+        match &item {
+            None => {}
+            Some(Err(_)) => {
+                self.receipt.resolve(AttemptOutcome::AttemptFailure);
+            }
+            Some(Ok(response)) => {
+                if let Some(outcome) = response.legacy_in_band_attempt_outcome() {
+                    self.receipt.resolve(outcome);
+                }
+            }
+        }
+        item
+    }
+
+    /// Mark stream as completed (no abort needed).
+    ///
+    /// This is the consumer's enforced terminal declaration: it publishes one
+    /// success and suppresses the dependency's abort-on-drop behavior.
+    pub fn mark_completed(&mut self) {
+        self.receipt.resolve(AttemptOutcome::Success);
+        self.mark_inner_completed();
+    }
+
+    /// Reject a fully drained body that violates the consumer contract.
+    ///
+    /// The selected attempt failed, but the transport stream is already at a
+    /// clean terminal, so suppress the dependency's now-unnecessary abort.
+    pub(crate) fn reject_completed_body(&mut self) {
+        self.receipt.resolve(AttemptOutcome::AttemptFailure);
+        self.mark_inner_completed();
+    }
+
+    fn mark_inner_completed(&mut self) {
+        match &mut self.inner {
+            ProtoStreamInner::Sglang(stream) => stream.mark_completed(),
+            ProtoStreamInner::Vllm(stream) => stream.mark_completed(),
+        }
+    }
+}
+
+impl Drop for ProtoStream {
+    fn drop(&mut self) {
+        // Downstream drop consumes the receipt without publishing an outcome;
+        // inner abort-on-drop remains an independent responsibility.
+        self.receipt.resolve(AttemptOutcome::Abandoned);
     }
 }
 
@@ -518,3 +660,6 @@ impl ProtoEmbedError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
