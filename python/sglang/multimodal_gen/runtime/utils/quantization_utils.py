@@ -13,6 +13,7 @@ from sglang.multimodal_gen.runtime.layers.quantization import (
     get_quantization_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
 from sglang.srt.model_loader.checkpoint_quantization import (
     resolve_checkpoint_quant_spec,
 )
@@ -106,7 +107,8 @@ def _resolve_quant_method_name(quant_cfg: dict) -> str:
     quant_method = quant_cfg.get("quant_method")
     if quant_method == "bitsandbytes":
         return "bitsandbytes"
-    if quant_method != "modelopt":
+    modelopt_methods = {"modelopt", "modelopt_fp8", "modelopt_fp4"}
+    if quant_method not in modelopt_methods:
         return quant_method
 
     quant_algo = (
@@ -114,14 +116,37 @@ def _resolve_quant_method_name(quant_cfg: dict) -> str:
         or quant_cfg.get("quantization", {}).get("quant_algo")
         or ""
     ).upper()
+    if quant_method != "modelopt" and not quant_algo:
+        # Preserve explicit legacy configs that select the backend directly.
+        # When an algorithm is present below, validate that it agrees.
+        return quant_method
     if quant_algo == "MIXED_PRECISION":
         raise ValueError(
             "ModelOpt mixed precision is not supported by the current SGLang diffusion runtime."
         )
-    if "FP8" in quant_algo:
-        return "modelopt_fp8"
-    if "FP4" in quant_algo or "NVFP4" in quant_algo:
-        return "modelopt_fp4"
+    canonical_method = canonicalize_modelopt_quant_algo(quant_algo)
+    if (
+        quant_method != "modelopt"
+        and canonical_method is not None
+        and quant_method != canonical_method
+    ):
+        raise ValueError(
+            f"ModelOpt config declares quant_method={quant_method!r}, but "
+            f"quant_algo={quant_algo!r} maps to {canonical_method!r}."
+        )
+    supported_algorithms = {
+        "FP8": "modelopt_fp8",
+        "NVFP4": "modelopt_fp4",
+    }
+    runtime_method = supported_algorithms.get(quant_algo)
+    if runtime_method is not None:
+        return runtime_method
+    if canonical_method is not None:
+        raise ValueError(
+            f"ModelOpt quant_algo={quant_algo!r} maps to {canonical_method!r}, but "
+            "that checkpoint algorithm is not supported by the SGLang diffusion runtime. "
+            "Supported ModelOpt checkpoint algorithms are FP8 and NVFP4."
+        )
     raise ValueError(f"Unsupported ModelOpt quant_algo for diffusion: {quant_algo}")
 
 

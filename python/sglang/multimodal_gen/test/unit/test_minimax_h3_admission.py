@@ -254,6 +254,7 @@ def _quality_server_args():
         is_dit_layerwise_offload_selected=False,
         performance_mode="speed",
         quantization=None,
+        transformer_weights_path=None,
         regional_compile=False,
         ring_degree=1,
         sp_degree=4,
@@ -261,6 +262,24 @@ def _quality_server_args():
         ulysses_degree=4,
         use_fsdp_inference=False,
     )
+
+
+def test_high_quality_deployment_rejects_transformer_weight_override():
+    config = MiniMaxH3PipelineConfig()
+    server_args = _quality_server_args()
+    server_args.transformer_weights_path = "model.gguf"
+
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(current_platform, "get_device_name", return_value="NVIDIA H200"),
+        patch.object(
+            current_platform,
+            "get_device_capability",
+            return_value=_HopperCapability(),
+        ),
+        pytest.raises(ValueError, match="transformer_weights_path"),
+    ):
+        config.validate_quality_deployment(server_args)
 
 
 def test_high_quality_request_warns_when_bcg_suppresses_cache_dit():

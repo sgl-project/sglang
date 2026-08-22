@@ -38,7 +38,10 @@ from jsonschema import Draft202012Validator, SchemaError
 
 from sglang.srt.entrypoints.openai import chat_encoding, encoding_dsv4, encoding_dsv32
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionMessageContentTextPart,
+    ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageGenericParam,
+    ChatCompletionMessageUserParam,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
@@ -203,6 +206,38 @@ def neutralize_kimi_k3_image_placeholder_value(value: Any) -> Any:
             for key, item in value.items()
         }
     return value
+
+
+def _extract_video_question(request: ChatCompletionRequest) -> Optional[str]:
+    """Return text paired with a video in the last user turn."""
+    for message in reversed(request.messages or []):
+        if not isinstance(message, ChatCompletionMessageUserParam):
+            continue
+        content = message.content
+        if not isinstance(content, list):
+            continue
+        has_video = any(
+            isinstance(part, ChatCompletionMessageContentVideoPart) for part in content
+        )
+        if not has_video:
+            continue
+        return "".join(
+            part.text
+            for part in content
+            if isinstance(part, ChatCompletionMessageContentTextPart)
+        )
+    return None
+
+
+def _build_video_config(request: ChatCompletionRequest) -> Optional[Dict[str, Any]]:
+    """Build request-scoped video processor config without model-specific fields."""
+    config = dict(request.video_config or {})
+    question = _extract_video_question(request)
+    if question is not None:
+        # Internal metadata derived from the message must not be overridden by
+        # a model-specific public processor option.
+        config["_question"] = question
+    return config or None
 
 
 class OpenAIServingChat(OpenAIServingBase):
@@ -1045,6 +1080,7 @@ class OpenAIServingChat(OpenAIServingBase):
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
             images_config=getattr(request, "images_config", None),
+            video_config=_build_video_config(request),
             image_max_dynamic_patch=img_max_dynamic_patch,
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
@@ -1819,7 +1855,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Build sglext at response level (from first ret_item, as these are per-request)
         first_ret = ret[0]
-        routed_experts = process_routed_experts_from_ret(first_ret, request)
+        routed_experts = (
+            None
+            if request.return_meta_info
+            else process_routed_experts_from_ret(first_ret, request)
+        )
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
@@ -2267,6 +2307,13 @@ class OpenAIServingChat(OpenAIServingBase):
             request.skip_special_tokens = False
         elif self.reasoning_parser == "muse":
             request.skip_special_tokens = False
+
+    def supports_native_reasoning_history(self) -> bool:
+        """Whether the chat encoder takes history as ``reasoning_content`` rather
+        than via :meth:`wrap_reasoning_history`; see
+        :func:`chat_encoding.spec_owns_reasoning_history` for why.
+        """
+        return chat_encoding.spec_owns_reasoning_history(self.chat_encoding_spec)
 
     def wrap_reasoning_history(self, reasoning_text: str) -> str:
         """Wrap prior-turn reasoning in the detector's own start/end tokens.

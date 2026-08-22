@@ -27,6 +27,7 @@ import msgspec
 
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
     MINIMAX_H3_SUPPORTED_FPS,
+    warn_unverified_short_edge,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES,
@@ -100,11 +101,13 @@ def _validate_base_short_edge(value: Any) -> int:
     try:
         short_edge = int(value)
     except (TypeError, ValueError) as exc:
-        raise ValueError("target.short_edge must be 768") from exc
-    if short_edge != MINIMAX_H3_BASE_SHORT_EDGE or value != short_edge:
         raise ValueError(
-            f"target.short_edge must be 768 for MiniMax H3 shape policy v2, got {value!r}"
-        )
+            f"target.short_edge must be an integer, got {value!r}"
+        ) from exc
+    if short_edge != value or short_edge <= 0:
+        raise ValueError(f"target.short_edge must be a positive integer, got {value!r}")
+    if short_edge != MINIMAX_H3_BASE_SHORT_EDGE:
+        warn_unverified_short_edge(short_edge)
     return short_edge
 
 

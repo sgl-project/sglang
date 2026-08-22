@@ -1490,6 +1490,14 @@ def mamba_checkpoint_grid(tree_page: int) -> int:
     return math.lcm(mamba_cache_chunk_size(), tree_page)
 
 
+def mamba_track_grid(tree_page: int) -> int:
+    """The same granularity for a decode-donated checkpoint, which additionally
+    has to land on the requested ``mamba_track_interval``."""
+    return math.lcm(
+        mamba_checkpoint_grid(tree_page), get_exec().mamba.mamba_track_interval
+    )
+
+
 def max_speculative_num_draft_tokens() -> int | None:
     """The largest draft-token count speculative decoding may use.
 

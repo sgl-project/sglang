@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 End-to-end denoise-stage benchmark presets for SGLang Diffusion.
 
@@ -11,6 +12,12 @@ Usage:
 
     # Tag the run for later compare_perf.py usage
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model flux --label tuned
+
+    # Opt in to a compile control (presets are eager by default)
+    python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model flux --torch-compile
+
+    # Clean an isolated model cache even if the run fails or is interrupted
+    python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model longcat-image --model-cache-root /task/model-caches --cleanup-model-cache
 
     # All preset models
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --all
@@ -33,17 +40,17 @@ import argparse
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Optional
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from diffusion_skill_env import (  # noqa: E402
+from diffusion_skill_env import (
     ensure_dir,
     get_assets_dir,
     get_output_dir,
@@ -69,6 +76,15 @@ DIFFUSERS_FALLBACK_SIGNALS = (
 )
 CATALOG_TABLE_WIDTH = 140
 RESULTS_TABLE_WIDTH = 105
+MODEL_CACHE_MARKER = ".sglang-diffusion-benchmark-cache"
+MODEL_WEIGHT_SUFFIXES = {
+    ".bin",
+    ".ckpt",
+    ".gguf",
+    ".pt",
+    ".pth",
+    ".safetensors",
+}
 NIGHTLY_PRESET_ORDER = (
     "flux",
     "flux2",
@@ -81,6 +97,58 @@ NIGHTLY_PRESET_ORDER = (
     "ideogram4-fp8",
     "cosmos3-super-t2v",
     "wan-i2v",
+    "minimax-h3-t2va",
+)
+
+LINGBOT_VIDEO_PROMPT = json.dumps(
+    {
+        "comprehensive_description": {
+            "scene_content_description": (
+                "A small silver robot arm on a white table slowly reaches "
+                "toward a red cube. The background is a plain, softly lit "
+                "laboratory wall."
+            ),
+            "camera_movement_description": (
+                "The camera is static at eye level, medium shot, with the "
+                "robot arm centered and in sharp focus."
+            ),
+        },
+        "camera_info": {
+            "color": "Neutral",
+            "frame_size": "Medium",
+            "shot_type_angle": "Eye level",
+            "lens_size": "Medium",
+            "composition": "Center",
+            "lighting": "Soft light",
+            "lighting_type": "Artificial light",
+        },
+        "world_knowledge": [],
+        "prominent_elements": [
+            {
+                "name": "robot arm",
+                "description": "A small silver robot arm with a two-finger gripper.",
+                "actions": [
+                    {
+                        "timestamp": "[0.0s - 1.0s]",
+                        "action": "reaches toward the red cube",
+                    }
+                ],
+                "location": "center of the frame",
+                "relative_size": "dominant",
+                "shape_and_color": "articulated silver metal arm",
+                "texture": "brushed metal",
+                "appearance_details": "two-finger gripper, visible joints",
+                "relationship": "reaching toward the red cube on the table",
+                "orientation": "upright, base on the table",
+                "pose": "reaching",
+                "expression": "",
+                "clothing": "",
+                "gender": "",
+                "skin_tone_and_texture": "",
+            }
+        ],
+    },
+    separators=(",", ":"),
 )
 
 # ---------------------------------------------------------------------------
@@ -100,8 +168,7 @@ MODELS = {
             "--height=1024",
             "--num-gpus=2",
             "--tp-size=2",
-            "--dit-layerwise-offload",
-            "false",
+            "--component-residency=dit=resident",
         ],
     },
     # 2. Nightly: flux2_dev_t2i_1024
@@ -114,8 +181,7 @@ MODELS = {
             "--height=1024",
             "--num-gpus=2",
             "--tp-size=2",
-            "--dit-layerwise-offload",
-            "false",
+            "--component-residency=dit=resident",
         ],
     },
     # 3. Nightly: qwen_image_2512_t2i_1024
@@ -248,11 +314,12 @@ MODELS = {
             "--pin-cpu-memory",
         ],
     },
-    # Source-tracked extras from current registry / GPU test coverage.
+    # 12. Nightly: minimax_h3_t2va_5s
     # MiniMax-H3 owns its temporal canvas through target.duration_seconds, so
     # the model-specific sampling fields are passed through --config instead
     # of generic --width/--height/--num-frames flags.
     "minimax-h3-t2va": {
+        "nightly_case_id": "minimax_h3_t2va_5s",
         "path": "MiniMaxAI/MiniMax-H3",
         "prompt": "At night, while their owner sleeps in a bedroom, three cats march in loudly playing tiny brass instruments, then abruptly file out.",
         "seed": 1101,
@@ -280,6 +347,115 @@ MODELS = {
         # torch.compile changes numerical output, so never add the global
         # helper default --enable-torch-compile flag for this preset.
         "force_eager": True,
+        "nightly_cli_ignored": {
+            "width",
+            "height",
+            "num-frames",
+            "fps",
+            "num-inference-steps",
+        },
+    },
+    # Source-tracked extras from current registry / GPU test coverage.
+    "longcat-image": {
+        "path": "meituan-longcat/LongCat-Image",
+        "prompt": "A red panda reading a book beside a sunlit window.",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+            "--num-inference-steps=50",
+            "--guidance-scale=4.5",
+            "--enable-prompt-rewrite=false",
+            "--performance-mode=manual",
+        ],
+    },
+    "sana-video": {
+        "path": "Efficient-Large-Model/SANA-Video_2B_480p_diffusers",
+        "prompt": "A curious raccoon walks through a sunlit forest. motion score: 30.",
+        "extra_args": [
+            "--width=832",
+            "--height=480",
+            "--num-frames=17",
+            "--fps=16",
+            "--num-inference-steps=8",
+            "--guidance-scale=6.0",
+            "--performance-mode=manual",
+        ],
+    },
+    "lingbot-video-moe": {
+        "path": "robbyant/lingbot-video-moe-30b-a3b",
+        "prompt": LINGBOT_VIDEO_PROMPT,
+        "seed": 0,
+        "extra_args": [
+            "--width=384",
+            "--height=640",
+            "--num-frames=17",
+            "--fps=16",
+            "--num-inference-steps=12",
+            "--text-encoder-cpu-offload",
+            "--performance-mode=manual",
+        ],
+    },
+    "cosmos3-edge-t2i": {
+        "path": "nvidia/Cosmos3-Edge",
+        "prompt": "A warehouse robot folds a blue cloth on a clean workbench.",
+        "seed": 0,
+        "env": {
+            "SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1",
+        },
+        "extra_args": [
+            "--width=640",
+            "--height=640",
+            "--num-frames=1",
+            "--num-inference-steps=35",
+            "--guidance-scale=7.0",
+            "--performance-mode=manual",
+        ],
+    },
+    "cosmos3-super-t2i-distilled": {
+        "path": "nvidia/Cosmos3-Super-Text2Image-4Step",
+        "prompt": "A warehouse robot folds a blue cloth on a clean workbench.",
+        "seed": 0,
+        "env": {
+            "SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1",
+        },
+        "extra_args": [
+            "--width=640",
+            "--height=640",
+            "--num-frames=1",
+            "--guidance-scale=1.0",
+            "--num-gpus=4",
+            "--tp-size=4",
+            "--performance-mode=manual",
+        ],
+    },
+    "ltx25": {
+        "path": "Lightricks/LTX-2.5-Diffusers",
+        "prompt": "A cat and a dog baking a cake together in a kitchen.",
+        "extra_args": [
+            "--pipeline-class-name=LTX2Pipeline",
+            "--width=960",
+            "--height=544",
+            "--num-frames=121",
+            "--fps=24",
+            "--num-inference-steps=8",
+            "--guidance-scale=1.0",
+            "--performance-mode=manual",
+        ],
+    },
+    "ltx25-diffusion-decoder": {
+        "path": "Lightricks/LTX-2.5-Diffusers",
+        "prompt": "A cat and a dog baking a cake together in a kitchen.",
+        "extra_args": [
+            "--pipeline-class-name=LTX2Pipeline",
+            "--width=960",
+            "--height=544",
+            "--num-frames=121",
+            "--fps=24",
+            "--num-inference-steps=8",
+            "--guidance-scale=1.0",
+            "--use-diffusion-decoder",
+            "--performance-mode=manual",
+        ],
     },
     "ltx2": {
         "path": "Lightricks/LTX-2",
@@ -618,6 +794,123 @@ def model_nightly_case_id(model_key: str) -> str:
     return MODELS[model_key].get("nightly_case_id", "-")
 
 
+def _safe_cache_component(value: str) -> str:
+    component = "".join(
+        character if character.isalnum() or character in "-_." else "_"
+        for character in value
+    ).strip(".")
+    if not component:
+        raise ValueError(f"Cannot derive a cache directory name from {value!r}")
+    return component
+
+
+def _prepare_model_cache(cache_root: Path, model_key: str, label: str) -> Path:
+    cache_root = cache_root.expanduser().resolve()
+    unsafe_roots = {Path("/"), Path.home().resolve(), REPO_ROOT.resolve()}
+    if cache_root in unsafe_roots:
+        raise ValueError(
+            "Refusing to use a broad or shared directory as the isolated model "
+            f"cache root: {cache_root}"
+        )
+
+    cache_root.mkdir(parents=True, exist_ok=True)
+    marker = cache_root / MODEL_CACHE_MARKER
+    if not marker.exists():
+        marker.write_text(
+            "Owned by bench_diffusion_denoise.py. Only generated child caches "
+            "may be removed.\n",
+            encoding="utf-8",
+        )
+
+    cache_dir = cache_root / (
+        f"{_safe_cache_component(model_key)}-{_safe_cache_component(label)}"
+    )
+    if cache_dir.exists():
+        raise FileExistsError(
+            "The isolated model cache already exists. Refusing to reuse or "
+            f"delete it without inspection: {cache_dir}"
+        )
+    cache_dir.mkdir()
+    return cache_dir
+
+
+def _model_cache_env(cache_dir: Path) -> dict[str, str]:
+    huggingface_root = cache_dir / "huggingface"
+    huggingface_hub = huggingface_root / "hub"
+    return {
+        "HF_HOME": str(huggingface_root),
+        "HF_ASSETS_CACHE": str(huggingface_root / "assets"),
+        "HF_HUB_CACHE": str(huggingface_hub),
+        "HF_MODULES_CACHE": str(huggingface_root / "modules"),
+        "HF_XET_CACHE": str(huggingface_root / "xet"),
+        "HUGGINGFACE_HUB_CACHE": str(huggingface_hub),
+        "DIFFUSERS_CACHE": str(huggingface_hub),
+        "TRANSFORMERS_CACHE": str(huggingface_hub),
+        "MODELSCOPE_CACHE": str(cache_dir / "modelscope"),
+        "MODELSCOPE_MODULES_CACHE": str(cache_dir / "modelscope" / "modules"),
+    }
+
+
+def _cache_stats(cache_dir: Path) -> dict[str, int]:
+    file_count = 0
+    weight_file_count = 0
+    total_bytes = 0
+    if not cache_dir.exists():
+        return {
+            "file_count": 0,
+            "weight_file_count": 0,
+            "total_bytes": 0,
+        }
+
+    for entry in cache_dir.rglob("*"):
+        if not (entry.is_file() or entry.is_symlink()):
+            continue
+        file_count += 1
+        total_bytes += entry.lstat().st_size
+        if entry.suffix.lower() in MODEL_WEIGHT_SUFFIXES:
+            weight_file_count += 1
+    return {
+        "file_count": file_count,
+        "weight_file_count": weight_file_count,
+        "total_bytes": total_bytes,
+    }
+
+
+def _cleanup_model_cache(
+    cache_root: Path,
+    cache_dir: Path,
+    ledger_path: Path,
+    model_key: str,
+    label: str,
+    exit_reason: str,
+) -> dict[str, object]:
+    cache_root = cache_root.expanduser().resolve()
+    cache_dir = cache_dir.resolve()
+    if not (cache_root / MODEL_CACHE_MARKER).is_file():
+        raise RuntimeError(f"Missing isolated-cache ownership marker: {cache_root}")
+    if cache_dir.parent != cache_root:
+        raise RuntimeError(
+            f"Refusing to remove cache outside the isolated root: {cache_dir}"
+        )
+
+    before = _cache_stats(cache_dir)
+    shutil.rmtree(cache_dir)
+    after = _cache_stats(cache_dir)
+    record: dict[str, object] = {
+        "model": model_key,
+        "label": label,
+        "exit_reason": exit_reason,
+        "cache_dir": str(cache_dir),
+        "cleaned_at_unix_s": time.time(),
+        "before": before,
+        "after": after,
+    }
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    with ledger_path.open("a", encoding="utf-8") as ledger:
+        ledger.write(json.dumps(record, sort_keys=True) + "\n")
+    return record
+
+
 def _parse_cli_args(args: list[str]) -> dict[str, object]:
     parsed: dict[str, object] = {}
     i = 0
@@ -669,7 +962,7 @@ def _expected_nightly_cli_args(case: dict) -> dict[str, str]:
         # switch.  It is not a valid ``sglang generate`` flag after the
         # warmup-mode migration, so exclude both spellings from preset drift
         # validation.
-        if flag in {"enable-torch-compile", "warmup", "warmup-mode"}:
+        if flag in {"warmup", "warmup-mode"}:
             continue
         expected[flag] = _normalize_cli_value(value)
 
@@ -716,11 +1009,32 @@ def validate_nightly_alignment() -> int:
         if preset.get("env", {}) != case["frameworks"]["sglang"].get("extra_env", {}):
             errors.append(f"{model_key}: environment differs")
 
+        if "config_overrides" in preset:
+            expected_config = {
+                key: value
+                for key, value in case.get("sglang_request_extra", {}).items()
+                if value is not None
+            }
+            if "num_inference_steps" in case:
+                expected_config["num_inference_steps"] = case["num_inference_steps"]
+            if preset["config_overrides"] != expected_config:
+                errors.append(
+                    f"{model_key}: generated request config differs\n"
+                    f"  skill={preset['config_overrides']}\n"
+                    f"  ci={expected_config}"
+                )
+
+        ignored_args = set(preset.get("nightly_cli_ignored", set()))
         actual_args = {
             key: _normalize_cli_value(value)
             for key, value in _parse_cli_args(preset["extra_args"]).items()
+            if key not in ignored_args
         }
-        expected_args = _expected_nightly_cli_args(case)
+        expected_args = {
+            key: value
+            for key, value in _expected_nightly_cli_args(case).items()
+            if key not in ignored_args
+        }
         if actual_args != expected_args:
             errors.append(
                 f"{model_key}: CLI args differ\n"
@@ -761,12 +1075,12 @@ def print_model_catalog():
 
 def build_sglang_cmd(
     model_key: str,
-    perf_dump_path: Optional[str] = None,
+    perf_dump_path: str | None = None,
     warmup: bool = True,
-    torch_compile: bool = True,
+    torch_compile: bool = False,
     seed: int = 42,
     save_output: bool = True,
-    artifact_dir: Optional[Path] = None,
+    artifact_dir: Path | None = None,
 ) -> list[str]:
     """
     Build the `sglang generate` command for the given model.
@@ -818,12 +1132,13 @@ def build_sglang_cmd(
     return cmd
 
 
-def run_benchmark_once(
+def _run_benchmark_once_impl(
     model_key: str,
     label: str,
     output_dir: Path,
     warmup: bool = True,
-    torch_compile: bool = True,
+    torch_compile: bool = False,
+    model_cache_dir: Path | None = None,
 ) -> dict:
     """Run a single benchmark pass and return results dict."""
     perf_path = output_dir / f"{model_key}_{label}.json"
@@ -846,6 +1161,8 @@ def run_benchmark_once(
     cfg = MODELS[model_key]
     for key, value in cfg.get("env", {}).items():
         env.setdefault(key, str(value))
+    if model_cache_dir is not None:
+        env.update(_model_cache_env(model_cache_dir))
     if env.get("HF_TOKEN") and not env.get("HUGGINGFACE_HUB_TOKEN"):
         env["HUGGINGFACE_HUB_TOKEN"] = env["HF_TOKEN"]
 
@@ -883,10 +1200,20 @@ def run_benchmark_once(
     )
     fallback_detected = False
     assert process.stdout is not None
-    for line in process.stdout:
-        print(line, end="")
-        if any(signal in line.lower() for signal in DIFFUSERS_FALLBACK_SIGNALS):
-            fallback_detected = True
+    try:
+        for line in process.stdout:
+            print(line, end="")
+            if any(signal in line.lower() for signal in DIFFUSERS_FALLBACK_SIGNALS):
+                fallback_detected = True
+    except BaseException:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        raise
     returncode = process.wait()
     elapsed = time.time() - t0
 
@@ -925,10 +1252,7 @@ def run_benchmark_once(
                 if (
                     isinstance(step_name, str)
                     and step.get("duration_ms") is not None
-                    and (
-                        step_name.endswith("DenoisingStage")
-                        or step_name.endswith("RefinementStage")
-                    )
+                    and step_name.endswith(("DenoisingStage", "RefinementStage"))
                     and "BeforeDenoisingStage" not in step_name
                 ):
                     denoise_stage_total_ms += float(step["duration_ms"])
@@ -957,10 +1281,61 @@ def run_benchmark_once(
                         peak_memory_gb = candidate
             metrics["peak_memory_gb"] = peak_memory_gb
 
-        except Exception as e:
+        except (AttributeError, OSError, TypeError, ValueError) as e:
             print(f"  Warning: could not parse perf dump: {e}")
 
     return metrics
+
+
+def run_benchmark_once(
+    model_key: str,
+    label: str,
+    output_dir: Path,
+    warmup: bool = True,
+    torch_compile: bool = False,
+    model_cache_root: Path | None = None,
+    cleanup_model_cache: bool = False,
+    cleanup_ledger_path: Path | None = None,
+) -> dict:
+    """Run one preset and optionally clean its task-owned model cache."""
+    cache_dir = None
+    exit_reason = "error"
+    if model_cache_root is not None:
+        cache_dir = _prepare_model_cache(model_cache_root, model_key, label)
+
+    try:
+        result = _run_benchmark_once_impl(
+            model_key,
+            label,
+            output_dir,
+            warmup=warmup,
+            torch_compile=torch_compile,
+            model_cache_dir=cache_dir,
+        )
+        exit_reason = "error" if result.get("error") else "success"
+        return result
+    except KeyboardInterrupt:
+        exit_reason = "interrupted"
+        raise
+    finally:
+        if cleanup_model_cache and cache_dir is not None:
+            assert model_cache_root is not None
+            ledger_path = cleanup_ledger_path or output_dir / "cleanup.jsonl"
+            record = _cleanup_model_cache(
+                model_cache_root,
+                cache_dir,
+                ledger_path,
+                model_key,
+                label,
+                exit_reason,
+            )
+            before = record["before"]
+            assert isinstance(before, dict)
+            print(
+                "  Cleaned isolated model cache: "
+                f"{before['total_bytes']} bytes, "
+                f"{before['weight_file_count']} weight files; ledger={ledger_path}"
+            )
 
 
 def print_results_table(results: list[dict]):
@@ -1032,10 +1407,37 @@ def main():
         help="Directory for perf dump JSON files",
     )
     parser.add_argument("--no-warmup", action="store_true", help="Skip warmup")
-    parser.add_argument(
+    compile_group = parser.add_mutually_exclusive_group()
+    compile_group.add_argument(
+        "--torch-compile",
+        action="store_true",
+        help="Opt in to a torch.compile comparison. Presets run eager by default.",
+    )
+    compile_group.add_argument(
         "--no-torch-compile",
         action="store_true",
-        help="Keep torch.compile disabled for eager-mode comparisons.",
+        help="Deprecated compatibility flag; eager is already the default.",
+    )
+    parser.add_argument(
+        "--model-cache-root",
+        type=str,
+        help=(
+            "Create a new isolated Hugging Face/ModelScope cache below this "
+            "directory for each model run."
+        ),
+    )
+    parser.add_argument(
+        "--cleanup-model-cache",
+        action="store_true",
+        help=(
+            "Remove the task-owned model cache in a finally block and append "
+            "a cleanup ledger record. Requires --model-cache-root."
+        ),
+    )
+    parser.add_argument(
+        "--cleanup-ledger",
+        type=str,
+        help="JSONL cleanup ledger path (default: <output-dir>/cleanup.jsonl).",
     )
 
     args = parser.parse_args()
@@ -1050,7 +1452,15 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     warmup = not args.no_warmup
-    torch_compile = not args.no_torch_compile
+    torch_compile = args.torch_compile and not args.no_torch_compile
+    if args.cleanup_model_cache and not args.model_cache_root:
+        parser.error("--cleanup-model-cache requires --model-cache-root")
+    model_cache_root = (
+        Path(args.model_cache_root) if args.model_cache_root is not None else None
+    )
+    cleanup_ledger_path = (
+        Path(args.cleanup_ledger) if args.cleanup_ledger is not None else None
+    )
 
     models_to_run = list(MODELS.keys()) if args.all else [args.model or "flux"]
     results = []
@@ -1063,6 +1473,9 @@ def main():
                 output_dir,
                 warmup=warmup,
                 torch_compile=torch_compile,
+                model_cache_root=model_cache_root,
+                cleanup_model_cache=args.cleanup_model_cache,
+                cleanup_ledger_path=cleanup_ledger_path,
             )
         )
 

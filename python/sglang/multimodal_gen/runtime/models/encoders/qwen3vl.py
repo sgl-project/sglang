@@ -481,6 +481,8 @@ class Qwen3VLTextDecoderLayer(nn.Module):
 
 
 class Qwen3VLTextModel(nn.Module):
+    # used only as `self.embed_tokens(input_ids)`; no tied output head here
+    host_resident_table_names = ["embed_tokens"]
     config: Qwen3VLTextConfig
     _no_split_modules = ["Qwen3VLTextDecoderLayer"]
 

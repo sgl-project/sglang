@@ -19,7 +19,7 @@ For all methods and hardware platforms, see the [official SGLang installation gu
 ```bash Command
 pip install --upgrade pip
 pip install uv
-uv pip install sglang
+uv pip install --prerelease=allow sglang
 ```
 
 Then run the **Python** output of the command panel below in that environment.
@@ -332,14 +332,13 @@ HiCache and MegaMoE are **not** supported on RTX PRO 6000.
 MegaMoE fuses expert dispatch + GEMM into a single kernel for higher throughput
 on MoE layers. To enable it, use the **MegaMoE** chip in the Playground
 below — the playground will swap `--moe-a2a-backend deepep` for
-`--moe-a2a-backend megamoe` and add the relevant env vars automatically.
+`--moe-a2a-backend megamoe` and add the relevant launch settings automatically.
 
 Two variants are exposed:
 - **W4A8** — default MegaMoE kernel (FP4 weights, FP8 activations).
-- **W4A4** — adds `SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1` and
-  `SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1` to run the custom W4A4
-  kernel (FP4 activations). Higher throughput with negligible accuracy drop
-  (~89.5 GPQA on Pro).
+- **W4A4** — adds `--enable-w4a4-mxfp4-megamoe` to run the custom W4A4 kernel
+  (FP4 activations). The flag configures the required DeepGEMM settings.
+  Higher throughput with negligible accuracy drop (~89.5 GPQA on Pro).
 
 Notes:
 - The W4A8 / W4A4 variants above are **Blackwell-only** (B200 / B300 / GB200 / GB300). On **Hopper (SM90, H100 / H200)** use the all-FP8 MegaMoE path described below instead.

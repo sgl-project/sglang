@@ -1,3 +1,4 @@
+import pathlib
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -14,6 +15,9 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
     component_residency_strategies as component_residency_strategies_mod,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers import (
+    host_memory_budget,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
     layerwise_offload as layerwise_offload_mod,
@@ -190,6 +194,8 @@ class _TestServerArgs(SimpleNamespace):
     record_component_layerwise_capability = (
         ServerArgs.record_component_layerwise_capability
     )
+    _parse_component_value_map = staticmethod(ServerArgs._parse_component_value_map)
+    layerwise_tuning_for = ServerArgs.layerwise_tuning_for
 
 
 def _server_args(**kwargs):
@@ -210,7 +216,13 @@ def _server_args(**kwargs):
         dit_offload_prefetch_size=1,
         dit_layerwise_resident_layers=0.0,
         dit_layerwise_residency_policy=RESIDENCY_POLICY_LEADING,
+        layerwise_prefetch_size={},
+        layerwise_resident_layers={},
+        layerwise_residency_policy={},
         pin_cpu_memory=False,
+        # the pin budget ranks candidates by bytes x steps, and reads the step
+        # count off the pipeline's sampling defaults
+        pipeline_class_name=None,
     )
     defaults.update(kwargs)
     return _TestServerArgs(**defaults)
@@ -415,6 +427,43 @@ def test_layerwise_pipeline_selection_uses_dit_group(monkeypatch):
     assert selected == ["text_encoder", "text_encoder_alias"]
     assert configured == ["text_encoder"]
     assert is_layerwise_offloaded_module(layerwise_module)
+
+
+def test_pin_budget_ranks_by_steps_resolved_from_model_index(monkeypatch):
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+
+    import sglang.multimodal_gen.registry as registry_mod
+
+    class _Sampling:
+        num_inference_steps = 50
+
+    monkeypatch.setattr(
+        registry_mod,
+        "get_model_info",
+        lambda *args, **kwargs: SimpleNamespace(sampling_param_cls=_Sampling),
+    )
+
+    # Same byte size on purpose: with the steps resolved, the stepped DiT
+    # outranks the encoder; with the silent steps=1 fallback the ranking
+    # ties and stable sort keeps the encoder first.
+    text_encoder = _NestedEncoderDummyModel()
+    transformer = _NestedDummyModel()
+    modules = {"text_encoder": text_encoder, "transformer": transformer}
+
+    configured = configure_layerwise_offload_modules(
+        modules,
+        _server_args(model_path="/models/minimax-h3"),
+        component_names=["text_encoder", "transformer"],
+    )
+
+    assert configured == ["transformer", "text_encoder"], (
+        "the pipeline is resolved from model_index when no override is set, "
+        "so the stepped DiT must claim the pin budget before the "
+        "once-per-request encoder"
+    )
 
 
 def test_layerwise_configuration_filters_by_component_name(monkeypatch):
@@ -1218,3 +1267,339 @@ def test_strided_forward_leaves_exactly_the_resident_set(monkeypatch):
     resident = set(range(8)) - set(manager._streamed_order)
     assert resident <= manager._gpu_layers
     assert len(manager._gpu_layers) <= len(resident) + manager.prefetch_size
+
+
+class _FileBackedBlock(torch.nn.Module):
+    """A block whose weight is a view into a file, as a loaded checkpoint is."""
+
+    def __init__(self, path: pathlib.Path) -> None:
+        super().__init__()
+        path.write_bytes(b"\x00" * (64 * 4))
+        mapped = torch.from_file(str(path), shared=True, size=64, dtype=torch.float32)
+        self.weight = torch.nn.Parameter(mapped.reshape(8, 8), requires_grad=False)
+
+
+class _FileBackedModel(torch.nn.Module):
+    def __init__(self, path: pathlib.Path, num_blocks: int = 1) -> None:
+        super().__init__()
+        self.blocks = torch.nn.ModuleList(
+            [
+                _FileBackedBlock(path.with_name(f"{path.name}.{i}"))
+                for i in range(num_blocks)
+            ]
+        )
+
+
+# one _FileBackedBlock weight: 64 float32
+_BLOCK_BYTES = 64 * 4
+
+
+class _MixedBlock(torch.nn.Module):
+    """A block that is half checkpoint view, half anonymous memory -- the shape
+    of a layer whose qkv was fused at load while the rest stayed mapped."""
+
+    def __init__(self, path: pathlib.Path) -> None:
+        super().__init__()
+        path.write_bytes(b"\x00" * (64 * 4))
+        mapped = torch.from_file(str(path), shared=True, size=64, dtype=torch.float32)
+        self.weight = torch.nn.Parameter(mapped.reshape(8, 8), requires_grad=False)
+        self.fused = torch.nn.Parameter(
+            torch.zeros(8, 8, dtype=torch.float32), requires_grad=False
+        )
+
+
+class _MixedModel(torch.nn.Module):
+    def __init__(self, path: pathlib.Path, num_blocks: int) -> None:
+        super().__init__()
+        self.blocks = torch.nn.ModuleList(
+            [_MixedBlock(path.with_name(f"{path.name}.{i}")) for i in range(num_blocks)]
+        )
+
+
+# one _MixedBlock: 64 float32 mapped + 64 float32 anonymous
+_MIXED_BLOCK_BYTES = 2 * 64 * 4
+
+
+def _mapped_manager(
+    tmp_path,
+    monkeypatch,
+    *,
+    available_gib=None,
+    available_bytes=None,
+    num_blocks=1,
+    pin_budget_bytes=None,
+):
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+    if available_bytes is None:
+        available_bytes = int(available_gib * 1024**3)
+    monkeypatch.setattr(
+        host_memory_budget, "host_memory_available_bytes", lambda: available_bytes
+    )
+    model = _FileBackedModel(tmp_path / "weights.bin", num_blocks=num_blocks)
+    return LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=num_blocks,
+        enabled=True,
+        pin_cpu_memory=True,
+        pin_budget=(
+            host_memory_budget.HostPinBudget(available_bytes=pin_budget_bytes)
+            if pin_budget_bytes is not None
+            else None
+        ),
+        prefetch_size=1,
+    )
+
+
+def test_weights_stay_on_the_mapping_when_copies_do_not_fit(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    # the reserve alone exceeds this, so no copy can be afforded
+    manager = _mapped_manager(
+        tmp_path, monkeypatch, available_gib=0.001, pin_budget_bytes=0
+    )
+    assert manager._mapped_cpu_weights[0], "expected the weight to stay mapped"
+    assert manager._weight_metadata[0]["blocks.0.weight"]["mapped"] is True
+    assert not manager._consolidated_cpu_weights.get(0)
+
+
+def test_weights_are_copied_when_they_fit(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=64)
+    assert not manager._mapped_cpu_weights[0], "a copy was affordable"
+    assert manager._consolidated_cpu_weights[0]
+
+
+def test_a_mapped_weight_is_not_written_back(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    manager = _mapped_manager(
+        tmp_path, monkeypatch, available_gib=0.001, pin_budget_bytes=0
+    )
+    before = manager._mapped_cpu_weights[0]["blocks.0.weight"].clone()
+    manager._gpu_layers.add(0)
+    manager.sync_layer_to_cpu(0)
+    after = manager._mapped_cpu_weights[0]["blocks.0.weight"]
+    assert torch.equal(before, after), "writeback must not touch the checkpoint"
+
+
+def test_the_mapped_store_survives_the_placeholder(tmp_path, monkeypatch):
+    """The store must not hold the parameter it is about to have overwritten.
+
+    `_to_local_tensor` returns the parameter itself for anything that is not a
+    DTensor, so storing it directly stores the parameter. `Tensor.data = ...`
+    then swaps that object's storage in place rather than rebinding a name, so
+    the store is left holding the `(1,)` placeholder. Nothing raises: the reload
+    does `gpu_tensor.copy_(cpu_tensor)`, and a one-element source broadcasts
+    into the full shape, so the layer is silently reconstructed from one value.
+    """
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    stored = manager._mapped_cpu_weights[0]
+    assert stored, "expected the weight to stay mapped"
+
+    parameters = dict(manager.model.named_parameters())
+    for name, tensor in stored.items():
+        assert tensor.numel() > 1, (
+            f"{name} holds {tensor.numel()} element(s): the store is holding the "
+            "placeholder that was assigned to the parameter, not the weight"
+        )
+        assert tensor is not parameters[name], (
+            f"{name} in the store is the parameter object itself, so assigning "
+            "to the parameter's .data will overwrite the store"
+        )
+    assert manager._mapped_bytes == sum(
+        t.numel() * t.element_size() for t in stored.values()
+    ), "the byte counter and the store must describe the same weights"
+
+
+def test_only_the_layers_the_budget_covers_are_pinned(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    # The pin budget covers two of the four layers. Available host memory sits
+    # above the copy reserve by less than all four layers but more than the
+    # two pins, so the rest is demoted to the mapping and the pins stand.
+    budget = 2 * 1024**3 + 2 * _BLOCK_BYTES
+    manager = _mapped_manager(
+        tmp_path,
+        monkeypatch,
+        available_bytes=4 * 1024**3 + 3 * _BLOCK_BYTES,
+        pin_budget_bytes=budget,
+        num_blocks=4,
+    )
+    pinned = {i for i in range(4) if manager._consolidated_cpu_weights.get(i)}
+    mapped = {i for i in range(4) if manager._mapped_cpu_weights.get(i)}
+    assert pinned == {0, 1}, "the layers the budget covers, taken in index order"
+    assert mapped == {2, 3}
+    assert not (pinned & mapped), "a layer is in one store or the other"
+
+
+def test_pins_are_given_back_when_they_do_not_fit_the_host(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    # Four fully mapped layers. The budget covers two pins, but each pin copies
+    # its whole layer off the mapping and the host only has room for one plus
+    # the reserve: the plan must give the second pin back rather than allocate
+    # more than the machine has.
+    available = 4 * 1024**3 + int(1.5 * _BLOCK_BYTES)
+    manager = _mapped_manager(
+        tmp_path,
+        monkeypatch,
+        available_bytes=available,
+        pin_budget_bytes=2 * 1024**3 + 2 * _BLOCK_BYTES,
+        num_blocks=4,
+    )
+    on_mapping = {i for i in range(4) if manager._mapped_cpu_weights.get(i)}
+    assert on_mapping == {1, 2, 3}, (
+        "two pins add two layers of anonymous memory against room for 1.5, so "
+        "the least valuable pin (layer 1) is given back"
+    )
+    pinned = {i for i in range(4) if manager._consolidated_cpu_weights.get(i)}
+    assert pinned == {0}
+
+
+def test_replacing_an_anonymous_original_is_not_charged_as_new(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    # Half of each layer is a fused anonymous tensor whose store buffer
+    # replaces it -- a wash. Only the mapped half is a net addition, so a
+    # host with room for the mapped halves alone must still pin every layer.
+    block = _MIXED_BLOCK_BYTES
+    available = 4 * 1024**3 + int(2.5 * block)
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+    monkeypatch.setattr(
+        host_memory_budget, "host_memory_available_bytes", lambda: available
+    )
+    model = _MixedModel(tmp_path / "weights.bin", num_blocks=4)
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=4,
+        enabled=True,
+        pin_cpu_memory=True,
+        pin_budget=host_memory_budget.HostPinBudget(
+            available_bytes=2 * 1024**3 + 3 * block
+        ),
+        prefetch_size=1,
+    )
+    pinned = {i for i in range(4) if 0 in manager._consolidated_cpu_weights}
+    on_mapping = {i for i in range(4) if manager._mapped_cpu_weights.get(i)}
+    assert not on_mapping, (
+        "the net addition is three pinned mapped-halves plus one pageable "
+        "mapped-half (2 blocks) against room for 2.5 -- charging the replaced "
+        "anonymous originals as new would demote, then strip every pin"
+    )
+    assert all(manager._consolidated_cpu_weights.get(i) for i in range(4))
+
+
+def test_every_layer_is_pinned_when_the_budget_covers_them(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    manager = _mapped_manager(
+        tmp_path,
+        monkeypatch,
+        available_gib=64,
+        pin_budget_bytes=64 * 1024**3,
+        num_blocks=4,
+    )
+    assert not any(manager._mapped_cpu_weights.get(i) for i in range(4))
+    assert all(manager._consolidated_cpu_weights.get(i) for i in range(4))
+
+
+def test_no_layer_is_pinned_when_the_budget_is_spent(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    manager = _mapped_manager(
+        tmp_path, monkeypatch, available_bytes=0, pin_budget_bytes=0, num_blocks=4
+    )
+    assert all(manager._mapped_cpu_weights.get(i) for i in range(4))
+
+
+def test_an_unpinnable_layer_is_still_copied_when_the_copies_fit(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    # no pinned budget at all, but plenty of host memory: a pageable copy is
+    # guaranteed resident where a mapping can be dropped and re-read
+    manager = _mapped_manager(
+        tmp_path,
+        monkeypatch,
+        available_gib=64,
+        pin_budget_bytes=0,
+        num_blocks=4,
+    )
+    assert not any(manager._mapped_cpu_weights.get(i) for i in range(4))
+    assert all(manager._consolidated_cpu_weights.get(i) for i in range(4))
+
+
+def test_mapped_weights_are_visible_to_checksums(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    manager = _mapped_manager(
+        tmp_path, monkeypatch, available_gib=0.001, pin_budget_bytes=0
+    )
+    names = {name for name, _ in manager.iter_cpu_weights()}
+    assert "blocks.0.weight" in names
+
+
+def test_layerwise_tuning_defaults_match_the_group():
+    """No per-component entry: the DiT group keeps its knobs, auxiliaries do not."""
+    args = _server_args(
+        dit_offload_prefetch_size=3,
+        dit_layerwise_resident_layers=20,
+        dit_layerwise_residency_policy=RESIDENCY_POLICY_STRIDED,
+    )
+    assert args.layerwise_tuning_for("transformer", dit_group=True) == (
+        3.0,
+        20.0,
+        RESIDENCY_POLICY_STRIDED,
+    )
+    assert args.layerwise_tuning_for("text_encoder", dit_group=False) == (
+        0.0,
+        0.0,
+        RESIDENCY_POLICY_LEADING,
+    )
+
+
+def test_layerwise_tuning_per_component_entry_wins():
+    """An auxiliary component can be tuned; its layers cost the same per pass."""
+    args = _server_args(
+        dit_offload_prefetch_size=3,
+        dit_layerwise_resident_layers=20,
+        layerwise_prefetch_size="text_encoder=2",
+        layerwise_resident_layers="text_encoder=4",
+        layerwise_residency_policy={"text_encoder": RESIDENCY_POLICY_STRIDED},
+    )
+    assert args.layerwise_tuning_for("text_encoder", dit_group=False) == (
+        2.0,
+        4.0,
+        RESIDENCY_POLICY_STRIDED,
+    )
+    # an entry for one component leaves every other component alone
+    assert args.layerwise_tuning_for("vae", dit_group=False) == (
+        0.0,
+        0.0,
+        RESIDENCY_POLICY_LEADING,
+    )
+    assert args.layerwise_tuning_for("transformer", dit_group=True)[:2] == (3.0, 20.0)
+
+
+def test_layerwise_tuning_rejects_unknown_policy():
+    args = _server_args(layerwise_residency_policy="vae=sideways")
+    with pytest.raises(ValueError, match="unknown residency policy"):
+        args.layerwise_tuning_for("vae", dit_group=False)
+
+
+def test_layerwise_tuning_accepts_json_and_pair_forms():
+    pair = _server_args(layerwise_resident_layers="vae=6,text_encoder=2")
+    assert pair.layerwise_tuning_for("vae", dit_group=False)[1] == 6.0
+    assert pair.layerwise_tuning_for("text_encoder", dit_group=False)[1] == 2.0
+    as_json = _server_args(layerwise_resident_layers='{"vae": 6}')
+    assert as_json.layerwise_tuning_for("vae", dit_group=False)[1] == 6.0

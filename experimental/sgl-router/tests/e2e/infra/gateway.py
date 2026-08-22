@@ -172,6 +172,7 @@ class Gateway:
         tokenizer_path: str,
         worker_urls: list[str],
         policy: str = "round_robin",
+        kv_indexer_endpoint: str | None = None,
         timeout: float = 60.0,
     ) -> None:
         """Start the router in regular (non-PD) mode.
@@ -186,6 +187,7 @@ class Gateway:
                          metadata are learned from ``/server_info``.
             policy: Policy kind — ``round_robin``, ``random``, ``power_of_two``,
                     or ``cache_aware_zmq``.
+            kv_indexer_endpoint: Optional external KV Indexer gRPC endpoint.
             timeout: How long to wait for ``/readyz`` before giving up.
         """
         self._launch(
@@ -194,6 +196,7 @@ class Gateway:
                 tokenizer_path=tokenizer_path,
                 urls=list(worker_urls),
                 policy=policy,
+                kv_indexer_endpoint=kv_indexer_endpoint,
             ),
             timeout=timeout,
         )
@@ -293,6 +296,7 @@ class Gateway:
         tokenizer_path: str,
         urls: list[str],
         policy: str,
+        kv_indexer_endpoint: str | None = None,
     ) -> list[str]:
         resolved_tokenizer = _resolve_tokenizer_path(tokenizer_path)
 
@@ -317,6 +321,8 @@ class Gateway:
                 "--stale-request-timeout-secs",
                 str(self.stale_request_timeout_secs),
             ]
+        if kv_indexer_endpoint is not None:
+            args += ["--kv-indexer-endpoint", kv_indexer_endpoint]
         # `--worker-urls` is multi-valued; keep it last so clap doesn't
         # absorb a following flag as a URL.
         args += ["--worker-urls", *urls]
