@@ -29,6 +29,8 @@ from sglang.srt.disaggregation.common.staging_handler import (
     PrefillStagingContext,
     StagingManagerMixin,
     StagingTransferInfo,
+    handle_staging_rsp,
+    handle_watermark_msg,
 )
 from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
@@ -1944,18 +1946,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
-                    from sglang.srt.disaggregation.common.staging_handler import (
-                        handle_watermark_msg,
-                    )
-
                     handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
                     continue
                 # Staging: decode replies with allocated staging offset
                 if room == "STAGING_RSP":
-                    from sglang.srt.disaggregation.common.staging_handler import (
-                        handle_staging_rsp,
-                    )
-
                     handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
                     continue
                 # Decode-side abort notification: mark room as failed and ACK
