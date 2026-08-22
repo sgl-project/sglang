@@ -90,7 +90,7 @@ def extend_attention_fwd_torch(
             start = (t - (sliding_window_size)).clamp_min(0)  # [extend_len]
         else:
             start = torch.zeros_like(t)
-        window_mask = pos_keys.unsqueeze(0) >= start.unsqueeze(1)
+        window_mask = pos_keys.unsqueeze(0) > start.unsqueeze(1)
 
         final_mask = causal_mask & window_mask
 
