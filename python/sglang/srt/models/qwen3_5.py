@@ -835,7 +835,9 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         )
 
-        if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
+        # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
+        hs = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+        if not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
             hidden_states = self.linear_attn(
                 hidden_states,
                 forward_batch,
@@ -1239,7 +1241,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         )
 
-        if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
+        # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
+        hs = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+        if not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
             hidden_states = self.self_attention(
                 positions=positions,
                 hidden_states=hidden_states,
