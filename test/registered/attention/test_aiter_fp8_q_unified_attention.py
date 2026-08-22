@@ -23,6 +23,7 @@ if _RUNNABLE:
         scaled_fp8_quant,
     )
     from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 
 class _FakeKVPool:
@@ -125,6 +126,63 @@ class TestAiterFP8QUnifiedAttention(CustomTestCase):
             device=device,
         )
         return backend, layer, forward_batch, q
+
+    def test_cuda_graph_page_table_is_refreshed_for_all_page_sizes(self):
+        req_to_token = torch.tensor(
+            [
+                [0, 1, 4, 5, 8, 9, 12, 13],
+                [20, 21, 24, 25, 28, 29, 32, 33],
+            ],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        req_pool_indices = torch.tensor([1, 0], dtype=torch.int32, device="cuda")
+        seq_lens = torch.tensor([4, 3], dtype=torch.int32, device="cuda")
+        max_kv_len = int(seq_lens.max().item())
+
+        for page_size in (1, 2):
+            with self.subTest(page_size=page_size):
+                backend = object.__new__(AiterAttnBackend)
+                backend.use_mla = False
+                backend.use_triton_unified_attention = True
+                backend.use_sliding_window_kv_pool = False
+                backend.max_context_len = req_to_token.shape[1]
+                backend.page_size = page_size
+                backend.req_to_token = req_to_token
+                backend.cuda_graph_page_table = torch.full(
+                    (
+                        len(req_pool_indices),
+                        req_to_token.shape[1] // page_size,
+                    ),
+                    -1,
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+                backend.qo_indptr_unified_decode = torch.arange(
+                    len(req_pool_indices) + 1,
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+
+                backend._apply_cuda_graph_metadata(
+                    bs=len(req_pool_indices),
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    seq_lens_sum=int(seq_lens.sum().item()),
+                    encoder_lens=None,
+                    forward_mode=ForwardMode.DECODE,
+                    spec_info=None,
+                    seq_lens_cpu=seq_lens.cpu(),
+                    verify_tokens_per_req=None,
+                )
+
+                expected = req_to_token[req_pool_indices, :max_kv_len]
+                if page_size > 1:
+                    expected = expected[:, ::page_size] // page_size
+                actual = backend.forward_metadata.kv_indices[
+                    : len(req_pool_indices), : expected.shape[1]
+                ]
+                torch.testing.assert_close(actual, expected)
 
     def test_q_quantization_is_isolated_to_unified_attention(self):
         for branch in ("mla", "vectorized", "unified", "legacy"):

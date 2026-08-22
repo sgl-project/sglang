@@ -1601,8 +1601,15 @@ class AiterAttnBackend(AttentionBackend):
                             kv_indices[:new_rows, :new_cols].copy_(page_indices)
                             swa_page_table = self.cuda_graph_swa_page_table
                             swa_page_table[:new_rows, :new_cols].copy_(swa_page_indices)
-                        elif self.page_size > 1:
-                            page_indices = self._transform_table_1_to_real(page_indices)
+                        else:
+                            # Unified attention always consumes a page table.
+                            # At page_size == 1, req_to_token is already in the
+                            # required format and still needs to be copied into
+                            # the graph-stable destination buffer.
+                            if self.page_size > 1:
+                                page_indices = self._transform_table_1_to_real(
+                                    page_indices
+                                )
                             new_rows = page_indices.shape[0]
                             new_cols = page_indices.shape[1]
                             kv_indices[:new_rows, :new_cols].copy_(page_indices)
