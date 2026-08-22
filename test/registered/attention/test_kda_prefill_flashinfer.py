@@ -123,7 +123,7 @@ def _extend(kernel, data, state, seq_lens, **kwargs):
 
 @pytest.mark.parametrize(
     "num_heads,seq_lens",
-    [(6, [128]), (12, [96]), (12, [64, 160])],
+    [(6, [128]), (12, [96]), (12, [64, 160]), (12, [2048]), (12, [8192])],
 )
 def test_kda_prefill_cake_matches_triton(num_heads, seq_lens):
     torch.manual_seed(num_heads + sum(seq_lens))
