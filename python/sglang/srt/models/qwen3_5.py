@@ -190,7 +190,14 @@ if _is_cuda:
     )
 
 if _is_cpu:
-    fused_sigmoid_mul = torch.ops.sgl_kernel.fused_sigmoid_mul_cpu
+    _fused_sigmoid_mul_cpu = torch.ops.sgl_kernel.fused_sigmoid_mul_cpu
+
+    def fused_sigmoid_mul(x, gate, inplace=True):
+        if not inplace:
+            x = x.clone()
+        _fused_sigmoid_mul_cpu(x, gate)
+        return x
+
     fused_qk_gemma_rmsnorm = torch.ops.sgl_kernel.fused_qk_gemma_rmsnorm_cpu
     fused_qk_gemma_rmsnorm_with_gate = (
         torch.ops.sgl_kernel.fused_qk_gemma_rmsnorm_with_gate_cpu
