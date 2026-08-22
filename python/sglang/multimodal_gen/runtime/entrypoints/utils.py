@@ -44,6 +44,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
+from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.srt.observability.trace import TraceReqContext
 
 logger = init_logger(__name__)
@@ -610,21 +611,29 @@ def _try_save_cuda_video_direct(
                     assert buffer.tensor is not None
                     for start in range(0, num_frames, chunk_frames):
                         end = min(start + chunk_frames, num_frames)
-                        frames = (
-                            (video[:, start:end] * 255).clamp_(0, 255).to(torch.uint8)
-                        )
-                        frames = frames.permute(1, 2, 3, 0).contiguous()
-                        buffer.tensor[: end - start].copy_(frames, non_blocking=True)
-                        torch.cuda.current_stream(video.device).synchronize()
-                        del frames
-                        _sendfile_all(
-                            process.stdin.fileno(),
-                            buffer.fd,
-                            (end - start) * height * width * 3,
-                        )
-                process.stdin.close()
-                process.stdin = None
-                returncode = process.wait()
+                        with maybe_record_function(
+                            f"VIDEO_CHUNK frames {start}-{end} convert+pipe_to_x264"
+                        ):
+                            frames = (
+                                (video[:, start:end] * 255)
+                                .clamp_(0, 255)
+                                .to(torch.uint8)
+                            )
+                            frames = frames.permute(1, 2, 3, 0).contiguous()
+                            buffer.tensor[: end - start].copy_(
+                                frames, non_blocking=True
+                            )
+                            torch.cuda.current_stream(video.device).synchronize()
+                            del frames
+                            _sendfile_all(
+                                process.stdin.fileno(),
+                                buffer.fd,
+                                (end - start) * height * width * 3,
+                            )
+                with maybe_record_function("FFMPEG_FLUSH stdin_close+wait"):
+                    process.stdin.close()
+                    process.stdin = None
+                    returncode = process.wait()
             finally:
                 if process.stdin is not None:
                     process.stdin.close()

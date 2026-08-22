@@ -1,5 +1,7 @@
+import contextlib
 import gzip
 import os
+from collections.abc import Iterator
 
 import torch
 
@@ -17,6 +19,21 @@ if current_platform.is_npu():
     apply_torch_npu_patches(torch_npu, patches)
 
 logger = init_logger(__name__)
+
+
+@contextlib.contextmanager
+def maybe_record_function(name: str, enabled: bool = True) -> Iterator[None]:
+    """Named ``torch.profiler`` span, near-free when no profiler is active.
+    ``enabled`` mirrors :func:`maybe_nvtx_range` for per-request gates such
+    as warmup exclusion.
+    """
+    # Gate on the process-wide module flag; the thread-local _profiler_enabled()
+    # is False under profile_all_threads=True and on non-initiating threads.
+    if not enabled or not torch.autograd.profiler._is_profiler_enabled:
+        yield
+        return
+    with torch.profiler.record_function(name):
+        yield
 
 
 def _resolve_profiler_log_dir(log_dir: str | None) -> str:
