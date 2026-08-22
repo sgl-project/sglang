@@ -15,6 +15,9 @@ from sglang.srt.layers.attention.linear.utils import (
     build_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.speculative.ragged_verify import (
+    ragged_verify_dense_scatter_indices,
+)
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
 
@@ -327,29 +330,6 @@ class KDAKernelDispatcher:
             query_start_loc=query_start_loc,
             **kwargs,
         )
-
-
-def ragged_verify_dense_scatter_indices(
-    *,
-    query_start_loc: torch.Tensor,
-    seq_len: int,
-    draft_token_num: int,
-) -> torch.Tensor:
-    """Dense [bs, draft_token_num] slot index per packed ragged-verify token.
-
-    Rows never exceed draft_token_num under either layout variant (cap for
-    graph replay, planner construction for eager -- see
-    RaggedVerifyLayout.padded_to_bucket), so in-row offsets stay in-row;
-    tokens past the layout's coverage collapse into one ghost row at index
-    bs * draft_token_num.
-    """
-    batch_size = query_start_loc.shape[0] - 1
-    token_pos = torch.arange(seq_len, device=query_start_loc.device, dtype=torch.int32)
-    token_slots = torch.searchsorted(query_start_loc[1:], token_pos, right=True)
-    return (
-        token_slots * draft_token_num
-        + (token_pos - query_start_loc[token_slots]).to(torch.int64)
-    ).clamp_(max=batch_size * draft_token_num)
 
 
 class KDAAttnBackend(MambaAttnBackendBase):

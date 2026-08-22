@@ -17,7 +17,17 @@ from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
 from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
     commit_gdn_replayssm_fold_all_layers,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import (
+    GDN_ATOL,
+    GDN_RTOL,
+    GDNAttentionCase,
+    build_gdn_attention_fixture,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
@@ -240,6 +250,140 @@ class TestGdnReplayssmSpecFold(CustomTestCase):
                     atol=FP32_ATOL,
                     msg=f"{dtype=} {it=}",
                 )
+
+    def test_compact_backend_matches_dense_verify_and_commit(self):
+        draft_token_num = 4
+        case = GDNAttentionCase(
+            name="gdn_replayssm_compact_ragged",
+            backend="triton",
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            num_k_heads=2,
+            num_v_heads=2,
+            page_size=16,
+            prefix_lens=(4, 7, 5),
+            extend_lens=(draft_token_num,) * 3,
+        )
+        fixture = build_gdn_attention_fixture(
+            self, case, enable_linear_replayssm_spec=True
+        )
+        linear_backend = fixture.backend.linear_attn_backend
+        spec_state = fixture.runner.req_to_token_pool.mamba_pool.mamba_cache
+        layer_cache = fixture.runner.req_to_token_pool.mamba2_layer_cache(0)
+        cache_indices = fixture.runner.req_to_token_pool.get_mamba_indices(
+            fixture.forward_batch.req_pool_indices
+        )
+
+        # Exercise history-dependent conv values; the standard tiny fixture
+        # uses an identity conv, which would not catch cross-request packing.
+        with torch.no_grad():
+            fixture.actual_module.attn.conv_weights[:, 0] = 0.25
+            conv = layer_cache.conv[0]
+            gen = torch.Generator(device=DEVICE).manual_seed(2025)
+            conv_values = torch.randn(
+                (cache_indices.shape[0], *conv.shape[1:]),
+                dtype=conv.dtype,
+                device=DEVICE,
+                generator=gen,
+            )
+            conv[cache_indices] = conv_values * 0.1
+
+        initial_conv = spec_state.conv[0].clone()
+        initial_temporal = spec_state.temporal.clone()
+        base_input_ids = fixture.forward_batch.input_ids.clone()
+        base_positions = fixture.forward_batch.positions.clone()
+        base_out_cache_loc = fixture.forward_batch.out_cache_loc.clone()
+
+        def reset_cache():
+            spec_state.conv[0].copy_(initial_conv)
+            spec_state.temporal.copy_(initial_temporal)
+            for tensor in spec_state.intermediate_conv_window:
+                tensor.zero_()
+            for name in (
+                "replayssm_rawv",
+                "replayssm_rawk",
+                "replayssm_g",
+                "replayssm_beta",
+            ):
+                getattr(spec_state, name).zero_()
+
+        def run_verify(token_indices, layout):
+            batch = fixture.forward_batch
+            batch.input_ids = base_input_ids[token_indices]
+            batch.positions = base_positions[token_indices]
+            batch.out_cache_loc = base_out_cache_loc[token_indices]
+            batch.seq_lens = torch.tensor(
+                case.prefix_lens, dtype=torch.int32, device=DEVICE
+            )
+            batch.seq_lens_cpu = torch.tensor(
+                case.prefix_lens, dtype=torch.int32, device="cpu"
+            )
+            batch.seq_lens_sum = sum(case.prefix_lens)
+            batch.spec_info = DFlashVerifyInput(
+                draft_token=batch.input_ids,
+                positions=batch.positions,
+                draft_token_num=draft_token_num,
+                ragged_verify_layout=layout,
+            )
+            with torch.no_grad(), forward_context(
+                ForwardContext(attn_backend=fixture.backend)
+            ):
+                linear_backend.init_forward_metadata(batch)
+                return fixture.actual_module(
+                    batch,
+                    fixture.mixed_qkv[token_indices],
+                    fixture.a[token_indices],
+                    fixture.b[token_indices],
+                )
+
+        dense_indices = torch.arange(case.num_input_tokens, device=DEVICE)
+        dense_out = run_verify(dense_indices, layout=None)
+        accept_lens = torch.tensor([3, 2, 1], dtype=torch.int64, device=DEVICE)
+        fixture.backend.update_mamba_state_after_mtp_verify(
+            last_correct_step_indices=accept_lens - 1,
+            mamba_track_indices=None,
+            mamba_steps_to_track=None,
+            model=None,
+        )
+        dense_conv = spec_state.conv[0].clone()
+        dense_temporal = spec_state.temporal.clone()
+
+        reset_cache()
+        verify_lens = (4, 2, 1)
+        live_indices = torch.tensor(
+            [0, 1, 2, 3, 4, 5, 8], dtype=torch.int64, device=DEVICE
+        )
+        layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=verify_lens,
+            device=torch.device(DEVICE),
+            grid=(8,),
+        )
+        # One graph-tier tail token sits outside qsl[-1] and must use the
+        # ghost row without affecting the seven live packed tokens.
+        graph_indices = torch.cat((live_indices, torch.tensor([6], device=DEVICE)))
+        compact_out = run_verify(graph_indices, layout=layout)
+        fixture.backend.update_mamba_state_after_mtp_verify(
+            last_correct_step_indices=accept_lens - 1,
+            mamba_track_indices=None,
+            mamba_steps_to_track=None,
+            model=None,
+        )
+
+        torch.testing.assert_close(
+            compact_out[:, : live_indices.shape[0]],
+            dense_out[:, live_indices],
+            atol=GDN_ATOL,
+            rtol=GDN_RTOL,
+        )
+        self.assertTrue(
+            torch.equal(compact_out[:, -1], torch.zeros_like(compact_out[:, -1]))
+        )
+        torch.testing.assert_close(spec_state.conv[0], dense_conv, rtol=0, atol=0)
+        torch.testing.assert_close(
+            spec_state.temporal,
+            dense_temporal,
+            rtol=0,
+            atol=FP32_ATOL,
+        )
 
 
 if __name__ == "__main__":
