@@ -295,6 +295,12 @@ class DiffusionTestCase:
     server_args: DiffusionServerArgs
     sampling_params: DiffusionSamplingParams | None = None
     run_perf_check: bool = True
+    # Send the request this many times in one server session; performance and
+    # consistency are validated on the last one. >1 asserts a warm second
+    # request meets the same baselines -- a leak in residency arming, courier
+    # in-flight tracking, or host copies shows up as the second request
+    # degrading or dying.
+    perf_repeat_requests: int = 1
     run_consistency_check: bool = True
     run_component_accuracy_check: bool = True
     run_models_api_check: bool = True
