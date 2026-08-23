@@ -108,6 +108,7 @@ test = [
   "matplotlib",
   "pandas",
   "peft>=0.18.0",
+  "polars",
   "sentence_transformers",
 ]
 all = []
