@@ -110,7 +110,7 @@ class TestContextOverride(CustomTestCase):
         # server_args is read-only after resolution: resolved config changes go
         # to the bags, a per-runner config to a derived variant.
         sa = ServerArgs(model_path="dummy")
-        object.__setattr__(sa, "_declarations_materialized", True)
+        object.__setattr__(sa, "_resolution_finished", True)
         with self.assertRaises(AttributeError):
             sa.page_size = 999
 

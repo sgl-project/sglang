@@ -87,22 +87,25 @@ def launch_server_process(
     server_args: ServerArgs, worker_port: int, dp_id: int
 ) -> mp.Process:
     """Launch a single server process with the given args and port."""
-    # This binding is installed against a released sglang, so it cannot call
-    # into helpers newer than that wheel. Copy first, then write through the
-    # sanctioned channel if the record is resolved (a resolved record refuses
-    # plain assignment), else assign.
-    worker_args = copy.deepcopy(server_args)
     changes = {
         "port": worker_port,
         "base_gpu_id": dp_id * server_args.tp_size,
         "dp_size": 1,
     }
-    late = getattr(worker_args, "_late_resolution", None)
-    if late is not None and getattr(worker_args, "_declarations_materialized", False):
-        late("sglang_router.launch_server_process", **changes)
+    # Three channels, newest first. A wheel that has the read-only record but not
+    # `replace_resolved` still has `_late_resolution`, and plain assignment there
+    # raises; only a wheel with neither accepts `setattr`.
+    replace_resolved = getattr(server_args, "replace_resolved", None)
+    if replace_resolved is not None:
+        worker_args = replace_resolved("sglang_router.launch_server_process", **changes)
     else:
-        for field, value in changes.items():
-            setattr(worker_args, field, value)
+        worker_args = copy.deepcopy(server_args)
+        late = getattr(worker_args, "_late_resolution", None)
+        if late is not None:
+            late("sglang_router.launch_server_process", **changes)
+        else:
+            for field, value in changes.items():
+                setattr(worker_args, field, value)
     server_args = worker_args
 
     proc = mp.Process(target=run_server, args=(server_args, dp_id))

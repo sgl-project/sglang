@@ -247,11 +247,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             Phase,
             check_cuda_graph_backend,
         )
+        from sglang.srt.runtime_context import get_spec
 
-        _sa = getattr(runner, "server_args", None)
-        self.speculative_num_draft_tokens = getattr(
-            _sa, "speculative_num_draft_tokens", None
-        )
+        spec = get_spec()
+        self.speculative_num_draft_tokens = spec.speculative_num_draft_tokens
         _decode_cuda_graph = not check_cuda_graph_backend(
             Phase.DECODE, Backend.DISABLED
         )
@@ -264,7 +263,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         if (
             self.use_msa
             and _decode_cuda_graph
-            and getattr(_sa, "speculative_algorithm", None) is not None
+            and spec.speculative_algorithm is not None
         ):
             raise NotImplementedError(
                 "MiniMax-M3 MSA attention does not support speculative decoding under "

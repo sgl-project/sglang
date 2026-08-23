@@ -233,6 +233,11 @@ def _bare_assignments():
     return sorted(found)
 
 
+def shape_key(shape):
+    """A shape rendered short enough for a failure message."""
+    return ",".join(f"{k}={v}" for k, v in sorted(shape.items())) or "defaults"
+
+
 def _stash_overlay(server_args):
     """What the declarations say, last writer wins -- the projection's input."""
     overlay = {}
@@ -345,35 +350,43 @@ class TestResolutionDeclarations(CustomTestCase):
             + "\n  ".join(unexplained),
         )
 
-    def test_the_projection_input_is_the_resolved_configuration(self):
-        """What the bags are built from equals what the record ends up holding.
+    def test_a_declaration_only_resolver_leaves_the_field_alone(self):
+        """The direction of travel: resolution decides, the record does not move.
 
-        The projection reads `raw input + declarations` rather than the
-        fields, so that it keeps working when the declarations stop
-        materializing. While they still do, the two have to agree leaf for
-        leaf -- a difference means the projection would publish something the
-        record does not say, which is the failure this whole transition is
-        meant to avoid.
+        A resolver that only declares -- a model-specific override, a registry
+        entry -- writes nothing onto the record. The projection carries its
+        answer and the field still holds what the caller passed.
         """
         from sglang.srt.arg_groups.arg_utils import namespace_of
         from sglang.srt.arg_groups.overrides import resolution_result
 
-        differences = []
+        found = []
         for shape in _SHAPES:
             server_args = self._resolve(shape)
+            raw = getattr(server_args, "_raw_input", None) or {}
             for field in namespace_of(type(server_args)):
-                projected = resolution_result(server_args, field)
+                if field not in raw:
+                    continue
+                decided = resolution_result(server_args, field)
                 on_record = getattr(server_args, field)
-                if projected != on_record:
-                    differences.append(
-                        f"{shape} -> {field}: projection={projected!r} "
-                        f"record={on_record!r}"
-                    )
-        self.assertEqual(
-            differences,
+                if decided == on_record:
+                    continue
+                # It moved away from the record's value, so the record must
+                # still hold exactly what the caller passed.
+                self.assertEqual(
+                    on_record,
+                    raw[field],
+                    f"{shape} -> {field}: the record holds {on_record!r}, which "
+                    f"is neither the raw input {raw[field]!r} nor what "
+                    f"resolution decided ({decided!r})",
+                )
+                found.append((shape_key(shape), field))
+        self.assertNotEqual(
+            found,
             [],
-            "the projection and the record disagree about a config leaf:\n  "
-            + "\n  ".join(differences),
+            "no field is resolved by declaration alone any more, so this check "
+            "no longer covers anything -- either the shapes stopped reaching "
+            "one or the declarations are writing the fields again",
         )
 
     def test_the_whole_object_readback_carries_only_fields(self):
@@ -661,7 +674,13 @@ class TestResolutionDeclarations(CustomTestCase):
             f"written:\n  " + "\n  ".join(too_late),
         )
 
-    def test_the_stash_agrees_with_the_fields_it_declared(self):
+    def test_the_stash_is_what_the_projection_answers(self):
+        """The last declaration for a field is what `resolution_result` returns.
+
+        The stash is the resolution result, and every bag is projected from
+        it, so a disagreement here means the projection is reading something
+        other than the declarations.
+        """
         mismatches = []
         for shape in _SHAPES:
             server_args = self._resolve(shape)
@@ -669,16 +688,18 @@ class TestResolutionDeclarations(CustomTestCase):
             for field, declared in overlay.items():
                 if field not in _RESOLVED_FIELDS:
                     continue
-                actual = getattr(server_args, field)
-                if actual != declared:
+                answered = resolution_result(server_args, field)
+                if answered != declared:
                     mismatches.append(
-                        f"{shape} -> {field}: field={actual!r} stash={declared!r}"
+                        f"{shape} -> {field}: projection={answered!r} "
+                        f"stash={declared!r}"
                     )
         self.assertEqual(
             mismatches,
             [],
-            "a declared field and its stash entry disagree, so something "
-            "assigned the field behind the declaration:\n  " + "\n  ".join(mismatches),
+            "the projection disagrees with the last declaration for a field, so "
+            "the bags would publish something no resolver decided:\n  "
+            + "\n  ".join(mismatches),
         )
 
     def test_no_immediate_writer_overrides_a_deferred_one(self):
