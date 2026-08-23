@@ -262,12 +262,14 @@ checkpoint's calibration scales automatically.
   the only cell on this page needing a smaller prefill chunk, because at 0.91
   the pools fit but a 2048-token chunk's activations do not — DSpark at 0.88,
   EAGLE at 0.93 (bfloat16) and 0.94 (float32), and no-speculation at 0.90.
-  float32 is greyed out for both draft-model picks on that card: an fp32 state
-  slot costs 154 MB against bfloat16's 78 MB, so below ~0.92 the state pool
-  never reaches the tier's slot count, while at or above it prefill graph
-  capture or the first request runs out of memory. That was verified across
-  0.86–0.96 at both chunk sizes and with balanced-ratio overrides up to 20.
-  bfloat16 is also the faster choice: DFlash2 posts 4.92 ms median TPOT at an
+  Whether float32 is available with a draft model depends on the `lm_head`: on
+  the BF16-head export it is greyed out for both DSpark and DFlash2, since the
+  dense head's ~3.2 GB leave no fp32 state pool that also clears prefill graph
+  capture. The FP4-head export frees that headroom back — DSpark serves at 0.89
+  and DFlash2 High-Throughput at 0.895 with `--mamba-full-memory-ratio 10`
+  overriding the balanced value — and only DFlash2 Low-Latency stays out of
+  reach, where five fp32 slots and a full request's KV never coexist. bfloat16
+  remains the faster choice regardless: DFlash2 posts 4.92 ms median TPOT at an
   accept length of 4.29, the best result on this card.
 - **Hardware fit**: FP8 weights ~28.5GB (not serviceable beyond bs≤2 on
   32GB cards); NVFP4 weights ~16.5GB (recommended for RTX 5090-class GPUs).

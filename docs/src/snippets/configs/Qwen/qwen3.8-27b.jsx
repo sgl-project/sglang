@@ -121,7 +121,16 @@ export const config = {
             // CUDA-graph capture no longer fit there. fp32 is greyed out by the
             // SSM dtype row. EAGLE and no-speculation are unaffected: replayssm
             // keeps EAGLE's state pool tiny and no-spec loads no draft weights.
-            ...(sel.hw === "rtx5090" ? ["--mem-fraction-static 0.88"] : []),
+            // Measured on the 5090 at the commit the Install accordion pins:
+            // bf16 serves at 0.88, and on the FP4-head export fp32 serves at
+            // 0.89 on the balanced ratio (pool 25,911 / K=6 low-latency,
+            // 29,490 / K=5 high-throughput). fp32 on the BF16-head export is
+            // greyed out by the SSM dtype row.
+            ...(sel.hw === "rtx5090"
+              ? [sel.ssmDtype === "float32"
+                  ? "--mem-fraction-static 0.89"
+                  : "--mem-fraction-static 0.88"]
+              : []),
           ],
         },
         {
@@ -136,8 +145,14 @@ export const config = {
           disabled: (sel) => sel.hw === "rtx5090" && !String(sel.quant).startsWith("nvfp4"),
           disableReason:
             "On the 32GB RTX 5090 the DFlash2 draft model only fits on top of the NVFP4 weights",
+          // fp32 needs the balanced ratio overridden, so that family is
+          // stripped as well and re-emitted below.
           stripPrefixes: (sel) =>
-            sel.hw === "rtx5090" ? ["--mem-fraction-static"] : [],
+            sel.hw === "rtx5090"
+              ? sel.ssmDtype === "float32"
+                ? ["--mem-fraction-static", "--mamba-full-memory-ratio"]
+                : ["--mem-fraction-static"]
+              : [],
           flags: (sel) => [
             "--speculative-algorithm DFLASH",
             "--speculative-draft-model-path incoai/Qwen3.8-27B-DFlash2",
@@ -149,8 +164,16 @@ export const config = {
             // is the fastest recipe on this card (4.92ms median TPOT, 4.29
             // accept length). fp32 is greyed out by the SSM dtype row.
             ...(sel.hw === "rtx5090"
-              ? ["--mem-fraction-static 0.91",
-                 "--chunked-prefill-size 1024"]
+              ? sel.ssmDtype === "float32"
+                // FP4-head export, High-Throughput only (the SSM dtype row
+                // greys out the Low-Latency tier). The balanced ratio is
+                // overridden because these cells pin --max-running-requests 1,
+                // so it provisions KV for concurrency the recipe never uses and
+                // starves the state pool of the slots fp32 needs.
+                ? ["--mem-fraction-static 0.895",
+                   "--mamba-full-memory-ratio 10"]
+                : ["--mem-fraction-static 0.91",
+                   "--chunked-prefill-size 1024"]
               : []),
           ],
         },
@@ -206,12 +229,27 @@ export const config = {
           // against bfloat16's 78MB, which is why only fp32 is caught. EAGLE and
           // no-speculation are unaffected -- replayssm keeps EAGLE's pool tiny
           // and no-spec loads no draft weights at all.
+          // The 32GB RTX 5090 is the only card where an fp32 state pool and a
+          // draft model compete, and how badly depends on the lm_head:
+          //   BF16 head — the dense head's ~3.2GB leave no fp32 pool that also
+          //     clears prefill CUDA-graph capture, for either draft model.
+          //     Measured across 0.86-0.96 at both chunk sizes, plus balanced-
+          //     ratio overrides to 20.
+          //   FP4 head  — the packed head frees that headroom back: DSpark
+          //     serves at 0.89 on the balanced ratio and DFlash2 High-Throughput
+          //     at 0.895 with the ratio overridden to 10. Only DFlash2
+          //     Low-Latency stays out of reach: S=5 fp32 slots plus a full
+          //     request's KV never coexist -- buying the fifth slot cuts KV to
+          //     7,752 tokens against the 9,216 one 8192/1024 request needs, and
+          //     generation stops after a single token.
           disabled: (sel) =>
             sel.hw === "rtx5090" &&
-            (sel.spec === "dflash" || sel.spec === "dspark"),
+            (sel.quant === "nvfp4-bf16-head"
+              ? sel.spec === "dflash" || sel.spec === "dspark"
+              : sel.spec === "dflash" && sel.tier === "low-latency"),
           disableReason:
-            "On the 32GB RTX 5090 an fp32 GDN state pool and a speculative draft model " +
-            "do not fit together — use bfloat16",
+            "On the 32GB RTX 5090 this combination has no fp32 GDN state pool that " +
+            "also leaves room for prefill graph capture — use bfloat16",
           flags: ["--mamba-ssm-dtype float32"],
         },
         {
