@@ -139,13 +139,13 @@ def _get_encoder_quant_config(
                 mapping_fn = get_param_names_mapping(mapping)
 
                 def name_mapper(name: str) -> str:
-                    mapped_name, merge_index, _ = mapping_fn(name)
+                    mapped_name, merge_index, _ = mapping_fn(f"{name}.weight")
                     if merge_index is not None:
                         raise ValueError(
                             "Comfy quantized component weights cannot use a "
                             "stacked parameter-name mapping"
                         )
-                    return mapped_name
+                    return mapped_name.removesuffix(".weight")
 
         markers = inspect_comfy_quant_markers(
             [component_weights_path],
