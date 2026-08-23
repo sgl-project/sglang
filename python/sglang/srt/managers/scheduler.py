@@ -3326,7 +3326,10 @@ class Scheduler(
         """Whether pre-update decode metadata is guaranteed to stay unchanged."""
         if batch.is_empty() or batch.is_prefill_only:
             return True
-        if not batch.forward_mode.is_decode():
+        if not (
+            batch.forward_mode.is_decode()
+            or batch.forward_mode.is_target_verify()
+        ):
             return False
         if any(req.finished() for req in batch.reqs):
             return False

@@ -499,27 +499,43 @@ class SchedulerDPAttnAdapter:
         """Select prefill over a stable decode probe with one MLP-sync gather."""
         local_prefill_priority = prefill_batch is not None
         local_batch = prefill_batch if local_prefill_priority else decode_probe_batch
-        batch, sync_info = _prepare_mlp_sync_batch_raw(
-            local_batch,
-            model_runner=self.model_runner,
-            dp_size=get_parallel().dp_size,
-            attn_tp_size=self.ps.attn_tp_size,
-            attn_cp_size=self.ps.attn_cp_size,
-            tp_group=self.tp_group,
-            get_idle_batch=self.get_idle_batch,
-            disable_cuda_graph=cuda_graph_fully_disabled(),
-            require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
-            disable_overlap_schedule=get_schedule().disable_overlap_schedule,
-            offload_tags=self.offload_tags,
-            dwdp=get_parallel().dwdp_size > 1,
-            local_prefill_priority=local_prefill_priority,
-            # A local prefill makes the decode probe irrelevant. Mark it valid
-            # so it cannot force the no-prefill fallback on other ranks.
-            local_decode_probe_valid=(
-                True if local_prefill_priority else decode_probe_valid
-            ),
-            prefer_prefill=True,
-        )
+        # DSpark's verify preparation leaves the running ScheduleBatch in
+        # TARGET_VERIFY mode.  For scheduler synchronization it is the next
+        # decode candidate; temporarily expose that mode while deriving the
+        # token count/graph metadata, then restore the actual batch state.
+        restore_forward_mode = None
+        if (
+            not local_prefill_priority
+            and local_batch is not None
+            and local_batch.forward_mode.is_target_verify()
+        ):
+            restore_forward_mode = local_batch.forward_mode
+            local_batch.forward_mode = ForwardMode.DECODE
+        try:
+            batch, sync_info = _prepare_mlp_sync_batch_raw(
+                local_batch,
+                model_runner=self.model_runner,
+                dp_size=get_parallel().dp_size,
+                attn_tp_size=self.ps.attn_tp_size,
+                attn_cp_size=self.ps.attn_cp_size,
+                tp_group=self.tp_group,
+                get_idle_batch=self.get_idle_batch,
+                disable_cuda_graph=cuda_graph_fully_disabled(),
+                require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
+                disable_overlap_schedule=get_schedule().disable_overlap_schedule,
+                offload_tags=self.offload_tags,
+                dwdp=get_parallel().dwdp_size > 1,
+                local_prefill_priority=local_prefill_priority,
+                # A local prefill makes the decode probe irrelevant. Mark it
+                # valid so it cannot force the no-prefill fallback elsewhere.
+                local_decode_probe_valid=(
+                    True if local_prefill_priority else decode_probe_valid
+                ),
+                prefer_prefill=True,
+            )
+        finally:
+            if restore_forward_mode is not None:
+                local_batch.forward_mode = restore_forward_mode
         return (
             batch,
             sync_info.global_prefill_priority,
