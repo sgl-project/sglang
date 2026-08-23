@@ -606,6 +606,7 @@ class KimiK3MoE(nn.Module):
             if (
                 _is_npu
                 and self._shared_experts_attn_tp_comm
+                and envs.SGLANG_NPU_FUSED_COLLECTIVE_MATMUL.get()
             )
             else get_parallel().attn_tp_group
         )
