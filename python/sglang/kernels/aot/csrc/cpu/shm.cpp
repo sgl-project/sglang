@@ -541,7 +541,7 @@ void reduce_scatter_outer_loop(torch::Tensor& output, torch::Tensor& data, size_
 }
 
 #define GROUP_ALLGATHER_MAX_BUF_SIZE MAX_BUF_SIZE
-#define GROUP_ALLTOALL_MAX_BUF_SIZE (64 * 1024 * 1024)
+#define GROUP_ALLTOALL_MAX_BUF_SIZE MAX_BUF_SIZE
 #define GROUP_SYMMETRIC_ALLREDUCE_MAX_BUF_SIZE MAX_BUF_SIZE
 #define GROUP_DISTRIBUTED_ALLREDUCE_MAX_BUF_SIZE MAX_BUF_SIZE
 #define GROUP_STATE_ALL_GATHER 0
@@ -714,7 +714,8 @@ int64_t shm_group_initialize(const std::string& group_name, int64_t group_size, 
 }
 void group_all_gather(int64_t handle, char* output_ptr, char* input_ptr, size_t data_size) {
   auto* ctx = get_group_shm_context(handle);
-  TORCH_CHECK(data_size <= GROUP_ALLGATHER_MAX_BUF_SIZE, "group SHM all-gather input size exceeds maximum buffer size.");
+  TORCH_CHECK(
+      data_size <= GROUP_ALLGATHER_MAX_BUF_SIZE, "group SHM all-gather input size exceeds maximum buffer size.");
   enum coll_state copy_current = coll_allgather_naive__copy_in_done;
 
   enum coll_state copy_next = coll_alt1_allgather_naive__copy_in_done;
@@ -796,6 +797,9 @@ void group_all_to_all(int64_t handle, char* output_ptr, char* input_ptr, size_t 
 
 void group_symmetric_all_reduce(
     struct group_shm_context* ctx, char* data_ptr, c10::ScalarType scalar_type, size_t chunk_size, size_t chunk_el) {
+  TORCH_CHECK(
+      chunk_size <= GROUP_SYMMETRIC_ALLREDUCE_MAX_BUF_SIZE,
+      "group SHM symmetric all-reduce chunk exceeds buffer size.");
   enum coll_state copy_current = coll_allreduce_naive__copy_in_done;
   enum coll_state copy_next = coll_alt1_allreduce_naive__copy_in_done;
 
@@ -840,6 +844,9 @@ void group_symmetric_all_reduce(
 
 void group_distributed_reduce(
     struct group_shm_context* ctx, char* data_ptr, c10::ScalarType scalar_type, size_t chunk_size, size_t chunk_el) {
+  TORCH_CHECK(
+      chunk_size <= GROUP_DISTRIBUTED_ALLREDUCE_MAX_BUF_SIZE,
+      "group SHM distributed all-reduce chunk exceeds buffer size.");
   const int state_group = GROUP_STATE_DISTRIBUTED_ALL_REDUCE;
 
   const int current_buffer = ctx->distributed_allreduce_current_buffer;
@@ -930,7 +937,9 @@ void group_distributed_reduce(
 
 void group_all_reduce(int64_t handle, char* data_ptr, c10::ScalarType scalar_type, size_t data_size, size_t numel) {
   auto* ctx = get_group_shm_context(handle);
-  TORCH_CHECK(data_size <= MAX_BUF_SIZE, "group SHM all-reduce input size exceeds maximum buffer size.");
+  if (numel == 0) {
+    return;
+  }
   const size_t element_size = data_size / numel;
 
   for (size_t offset = 0; offset < data_size; offset += MAX_BUF_SIZE) {
