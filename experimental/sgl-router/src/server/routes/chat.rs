@@ -109,9 +109,11 @@ pub async fn chat_completions(
     // still leaves a trace; the completion line below is only reached on exit,
     // so an arrival with no matching completion IS the signal for a stuck
     // request. `model` is absent here because it comes from the body probe.
-    let request_id = headers
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
+    // First hit wins; `-` when the client sent neither, which makes those
+    // arrivals unpairable with their completion line.
+    let request_id = ["venus-request-id", "x-request-id"]
+        .iter()
+        .find_map(|h| headers.get(*h).and_then(|v| v.to_str().ok()))
         .unwrap_or("-")
         .to_string();
     tracing::info!(
