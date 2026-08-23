@@ -21,6 +21,9 @@ from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
     KitchenInt8Config,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_config import (
+    KitchenW4A8Config,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
     _patch_nunchaku_scales,
@@ -175,8 +178,16 @@ class TransformerQuantLoadSpec:
         )
 
     @property
+    def is_serialized_kitchen_w4a8(self) -> bool:
+        return isinstance(self.quant_config, KitchenW4A8Config)
+
+    @property
     def uses_comfy_layer_markers(self) -> bool:
-        return self.is_comfy_fp8 or self.is_serialized_kitchen_int8
+        return (
+            self.is_comfy_fp8
+            or self.is_serialized_kitchen_int8
+            or self.is_serialized_kitchen_w4a8
+        )
 
 
 class _TransformerQuantAdapter:

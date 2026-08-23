@@ -175,6 +175,14 @@ backend.
       <td>CUDA; auto-detected; uses the fused Kitchen INT8 kernel and validates weight/scale layout before model construction. TP requires every row-parallel input shard to preserve the checkpoint's ConvRot group boundary. The H3 256-group DiT supports TP1/2/4, not TP8; its Qwen3-VL encoder keeps TP8 by replicating only incompatible row projections. Offload is supported; FSDP is not.</td>
     </tr>
     <tr>
+      <td><code>comfy-w4a8-convrot</code></td>
+      <td>Safetensors with serialized <code>asym_w4a8_int8</code> layer metadata and packed weights</td>
+      <td><code>--transformer-weights-path</code></td>
+      <td>MiniMax-H3 FL2VA / Ref2VA DiTs</td>
+      <td><code>comfy-kitchen&gt;=0.2.27</code></td>
+      <td>Auto-detected; omit <code>--quantization</code>. Requires SM80+ and validates packed weights, group/channel scales, and optional codebooks before model construction. TP must preserve ConvRot group boundaries; offload is supported and FSDP is not.</td>
+    </tr>
+    <tr>
       <td><code>qvg-kv</code></td>
       <td>Unquantized model with runtime causal KV-cache compression</td>
       <td><code>--kv-cache-quant &#123;int4,int2&#125;</code></td>
