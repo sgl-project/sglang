@@ -48,8 +48,8 @@ def _apply_ref_cpu(logits, vocab_mask):
     word_idx = token_ids // 32
     bit_idx = (token_ids % 32).to(torch.int32)
     words = vocab_mask.cpu()[:, word_idx].to(torch.int32)
-    allowed = ((words >> bit_idx) & 1).bool().to(logits.device)
-    out = logits.clone()
+    allowed = ((words >> bit_idx) & 1).bool()
+    out = logits.detach().clone().cpu()
     out.masked_fill_(~allowed, float("-inf"))
     return out
 
