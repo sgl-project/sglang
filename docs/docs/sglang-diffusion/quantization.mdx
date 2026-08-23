@@ -144,11 +144,11 @@ backend.
     </tr>
     <tr>
       <td><code>modelopt-nvfp4</code></td>
-      <td>Mixed transformer directory/repo with <code>config.json</code>, raw NVFP4 safetensors export/repo, or full ModelOpt Diffusers repo</td>
+      <td>Mixed transformer directory/repo with <code>config.json</code>, raw or Comfy layer-marked NVFP4 safetensors, or full ModelOpt Diffusers repo</td>
       <td><code>--transformer-path</code> for mixed overrides; <code>--transformer-weights-path</code> for raw exports; <code>--model-path</code> for full repos</td>
-      <td>FLUX.1, FLUX.2, Wan2.2, Qwen Image, Qwen Image 2512, Qwen Image Edit, Qwen Image Edit 2511</td>
+      <td>FLUX.1, FLUX.2, Wan2.2, Qwen Image, Qwen Image 2512, Qwen Image Edit, Qwen Image Edit 2511, MiniMax-H3</td>
       <td>None</td>
-      <td>Mixed override repos keep the base model separate; full Qwen Image exports can be loaded directly as <code>--model-path</code>; raw exports such as <code>black-forest-labs/FLUX.2-dev-NVFP4</code> still use the weights-path flow</td>
+      <td>Mixed override repos keep the base model separate; full Qwen Image exports can be loaded directly as <code>--model-path</code>; raw exports such as <code>black-forest-labs/FLUX.2-dev-NVFP4</code> use the weights-path flow. Comfy markers select their checkpoint layout automatically; omit <code>--quantization</code>.</td>
     </tr>
     <tr>
       <td><code>gguf</code></td>

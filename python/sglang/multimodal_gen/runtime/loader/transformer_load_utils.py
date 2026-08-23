@@ -142,6 +142,14 @@ def _merge_modelopt_fp4_configs(
     )
     if getattr(inferred_config, "group_size", None) is None:
         inferred_config.group_size = getattr(existing_config, "group_size", None)
+    inferred_config.checkpoint_uses_comfy_quantization = (
+        inferred_config.checkpoint_uses_comfy_quantization
+        or existing_config.checkpoint_uses_comfy_quantization
+    )
+    inferred_config.checkpoint_uses_native_qkv_layout = (
+        inferred_config.checkpoint_uses_native_qkv_layout
+        or existing_config.checkpoint_uses_native_qkv_layout
+    )
 
     return inferred_config
 
@@ -195,6 +203,10 @@ class TransformerQuantLoadSpec:
             or self.is_serialized_kitchen_int8
             or self.is_serialized_kitchen_w4a4
             or self.is_serialized_kitchen_w4a8
+            or (
+                self.quant_config is not None
+                and self.quant_config.checkpoint_uses_comfy_quantization
+            )
         )
 
 

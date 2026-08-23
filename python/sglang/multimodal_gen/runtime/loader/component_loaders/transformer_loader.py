@@ -233,7 +233,10 @@ class TransformerLoader(ComponentLoader):
                     safetensors_list
                 )
                 checkpoint_quant_config = resolve_minimax_h3_checkpoint_quantization(
-                    layer_markers
+                    layer_markers,
+                    safetensors_list,
+                    dit_config.arch_config.param_names_mapping,
+                    dit_config.arch_config.reverse_param_names_mapping,
                 )
                 if adaln_curve_shape is not None:
                     (

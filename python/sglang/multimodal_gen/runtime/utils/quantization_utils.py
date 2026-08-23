@@ -647,10 +647,14 @@ def _build_nvfp4_config_from_safetensors_files(
             and "layers" in quant_config_dict
         ):
             layers = quant_config_dict.get("layers", {})
-            file_quantized_modules.update(
+            metadata_nvfp4_modules = {
                 layer_name
                 for layer_name, layer_cfg in layers.items()
                 if isinstance(layer_cfg, dict) and layer_cfg.get("format") == "nvfp4"
+            }
+            file_quantized_modules.update(metadata_nvfp4_modules)
+            checkpoint_uses_comfy_quant = checkpoint_uses_comfy_quant or bool(
+                metadata_nvfp4_modules
             )
 
         tensor_metadata = _read_safetensors_tensor_metadata(file_path)
@@ -788,6 +792,7 @@ def _build_nvfp4_config_from_safetensors_files(
                     "swizzled" if checkpoint_uses_swizzled_scales else "linear"
                 ),
                 "swap_weight_nibbles": checkpoint_uses_swizzled_scales,
+                "checkpoint_uses_comfy_quantization": checkpoint_uses_comfy_quant,
             }
         )
         logger.info(
