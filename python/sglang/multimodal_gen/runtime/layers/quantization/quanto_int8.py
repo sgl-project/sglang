@@ -24,6 +24,8 @@ class QuantoInt8LinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         input_size_per_partition: int,
         output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
         params_dtype: torch.dtype,
         **extra_weight_attrs: Any,
     ) -> None:
