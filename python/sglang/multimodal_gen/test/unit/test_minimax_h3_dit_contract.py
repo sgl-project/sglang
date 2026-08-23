@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MiniMaxH3DiTBlock,
     MiniMaxH3DiTModel,
     _copy_grouped_qkv_tp_shard,
+    _diffusers_h3_checkpoint,
     _modulate_gate,
     _reorder_grouped_qkv_to_qkv,
 )
@@ -82,6 +83,31 @@ def test_native_weight_names_and_grouped_qkv_reorder():
         "transformer.blocks.0.attn.qkv_proj.weight",
         None,
         None,
+    )
+
+    assert mapping("transformer_blocks.7.attn.to_k.qweight") == (
+        "blocks.7.attn.qkv_proj.qweight",
+        1,
+        3,
+    )
+
+    diffusers_weights = [
+        ("transformer_blocks.0.attn.to_q.qweight", torch.full((2, 3), 1)),
+        ("transformer_blocks.0.attn.to_k.qweight", torch.full((2, 3), 2)),
+        ("transformer_blocks.0.attn.to_v.qweight", torch.full((2, 3), 3)),
+        (
+            "transformer_blocks.0.ff.net.0.proj.weight",
+            torch.arange(8).reshape(4, 2),
+        ),
+    ]
+    converted = dict(_diffusers_h3_checkpoint(diffusers_weights))
+    assert torch.equal(
+        converted["blocks.0.attn.qkv_proj.qweight"],
+        torch.cat([tensor for _, tensor in diffusers_weights[:3]], dim=1),
+    )
+    assert torch.equal(
+        converted["blocks.0.mlp.fc1.weight"],
+        torch.tensor([[4, 5], [6, 7], [0, 1], [2, 3]]),
     )
 
     weight = torch.arange(12, dtype=torch.float32).reshape(12, 1)

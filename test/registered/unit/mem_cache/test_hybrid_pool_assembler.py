@@ -64,7 +64,13 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
                 page_size=512,
             )
         )
-        server_args = SimpleNamespace(hicache_mem_layout="page_first")
+        # The layout comes from the published configuration.
+        from sglang.srt.runtime_context import publish, reset_context
+        from sglang.srt.server_args import ServerArgs
+
+        server_args = ServerArgs(model_path="dummy", hicache_mem_layout="page_first")
+        publish(server_args, role="scheduler")
+        self.addCleanup(reset_context)
 
         with (
             patch(
