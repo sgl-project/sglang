@@ -1,14 +1,19 @@
 """Manual tests for elastic EP scale-up.
 
 Test classes:
+  TestElasticScaleUp4To5CudaGraph       single-rank decode graph recapture
+  TestElasticScaleUpDP2TP4ToDP4TP8     two attention-TP2 scale-ups (8 GPUs)
   TestElasticScaleUp4To6                primary + joiner scale-up (6 GPUs)
   TestElasticScaleUp4To5To6             two consecutive single-rank scale-ups
   TestElasticScaleUp4To8                full primary + joiner scale-up (8 GPUs)
+  TestElasticScaleUp4To6CudaGraph       mixed-TP decode graph recapture
+  TestElasticScaleUp4To5To6CudaGraph    repeated decode graph recapture
+  TestElasticScaleUp4To8CudaGraph       scale-up with decode graph recapture
 
-Run (8-GPU full scale-up):
+Run (8-GPU CUDA graph scale-up):
 
     CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m pytest \\
-        test/manual/ep/test_elastic_scale.py::TestElasticScaleUp4To8 \\
+        test/manual/ep/test_elastic_scale.py::TestElasticScaleUp4To8CudaGraph \\
         -v -s
 """
 
@@ -51,6 +56,18 @@ DISABLED_CUDA_GRAPH_ARGS = [
     "disabled",
     "--cuda-graph-backend-prefill",
     "disabled",
+]
+ELASTIC_CUDA_GRAPH_ARGS = [
+    "--cuda-graph-backend-decode",
+    "full",
+    "--cuda-graph-backend-prefill",
+    "disabled",
+    "--cuda-graph-bs-decode",
+    "1",
+    "2",
+    "4",
+    "8",
+    "16",
 ]
 
 
@@ -107,10 +124,12 @@ PRE_SCALE_JOINER_DELAY_SEC = float(
 def _scale_up_common_args(
     dist_init_addr: str,
     tp_size: int,
+    dp_size: int,
     nnodes: int,
     node_rank: int,
     cuda_graph_args: list[str],
     moe_dense_tp_size: int | None,
+    dcp_size: int,
 ) -> list[str]:
     args = [
         "--trust-remote-code",
@@ -121,7 +140,9 @@ def _scale_up_common_args(
         "--tp",
         str(tp_size),
         "--dp",
-        str(tp_size),
+        str(dp_size),
+        "--dcp-size",
+        str(dcp_size),
         "--enable-dp-attention",
         "--enable-dp-lm-head",
         "--elastic-ep-backend",
@@ -152,14 +173,20 @@ def _scale_up_common_args(
 
 
 class _ElasticScaleUpEndToEndBase(CustomTestCase):
-    """Shared scale-up E2E plumbing. Subclasses set JOIN_TP/JOIN_NNODES/JOIN_NODE_RANK."""
+    """Shared scale-up E2E plumbing for physical EP and logical DP growth."""
 
+    PRIMARY_TP: int = LAUNCH_EP_SIZE
+    PRIMARY_DP: int = LAUNCH_EP_SIZE
     JOIN_TP: int
+    JOIN_DP: int
     JOIN_NNODES: int
     JOIN_NODE_RANK: int
     TARGET_EP_SIZE: int
+    TARGET_DP_SIZE: int
     CUDA_GRAPH_ARGS: list[str]
     MOE_DENSE_TP_SIZE: int | None = 1
+    DCP_SIZE: int = 1
+    ATTENTION_BACKEND_ARGS: list[str] = []
 
     def setUp(self):
         if (
@@ -179,20 +206,25 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
 
         primary_args = _scale_up_common_args(
             DIST_INIT_ADDR,
-            tp_size=LAUNCH_EP_SIZE,
+            tp_size=cls.PRIMARY_TP,
+            dp_size=cls.PRIMARY_DP,
             nnodes=1,
             node_rank=0,
             cuda_graph_args=cls.CUDA_GRAPH_ARGS,
             moe_dense_tp_size=cls.MOE_DENSE_TP_SIZE,
+            dcp_size=cls.DCP_SIZE,
         )
+        primary_args.extend(cls.ATTENTION_BACKEND_ARGS)
         primary_env = os.environ.copy()
         visible_devices = _visible_device_ids()
-        if len(visible_devices) < LAUNCH_EP_SIZE:
+        if len(visible_devices) < cls.PRIMARY_TP:
             raise RuntimeError(
-                f"Scale-up requires {LAUNCH_EP_SIZE} visible GPUs, got "
+                f"Scale-up requires {cls.PRIMARY_TP} visible GPUs, got "
                 f"{len(visible_devices)}"
             )
-        primary_env["CUDA_VISIBLE_DEVICES"] = ",".join(visible_devices[:LAUNCH_EP_SIZE])
+        primary_env["CUDA_VISIBLE_DEVICES"] = ",".join(
+            visible_devices[: cls.PRIMARY_TP]
+        )
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -207,6 +239,7 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         *,
         rank_offset: int,
         join_tp: int,
+        join_dp: int,
         port: int,
     ) -> subprocess.Popen:
         cmd = [
@@ -217,11 +250,14 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
             *_scale_up_common_args(
                 DIST_INIT_ADDR,
                 tp_size=join_tp,
+                dp_size=join_dp,
                 nnodes=cls.JOIN_NNODES,
                 node_rank=cls.JOIN_NODE_RANK,
                 cuda_graph_args=cls.CUDA_GRAPH_ARGS,
                 moe_dense_tp_size=cls.MOE_DENSE_TP_SIZE,
+                dcp_size=cls.DCP_SIZE,
             ),
+            *cls.ATTENTION_BACKEND_ARGS,
             "--elastic-ep-join-mode",
             "scale",
             "--elastic-ep-join-rank-offset",
@@ -322,12 +358,15 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         *,
         old_ep_size: int,
         target_ep_size: int,
+        target_dp_size: int,
         join_tp: int,
+        join_dp: int,
         port: int,
     ) -> None:
         joining_proc = self._launch_joining_group(
             rank_offset=old_ep_size,
             join_tp=join_tp,
+            join_dp=join_dp,
             port=port,
         )
         self.assertIsNone(
@@ -357,7 +396,7 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
                 self.assertIsNone(state.get("last_error"))
                 self._generate_ok(
                     "on newest joiner",
-                    routed_dp_rank=target_ep_size - 1,
+                    routed_dp_rank=target_dp_size - 1,
                 )
                 return
             try:
@@ -399,7 +438,9 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         self._scale_once(
             old_ep_size=LAUNCH_EP_SIZE,
             target_ep_size=self.TARGET_EP_SIZE,
+            target_dp_size=self.TARGET_DP_SIZE,
             join_tp=self.JOIN_TP,
+            join_dp=self.JOIN_DP,
             port=PORT_B,
         )
 
@@ -411,6 +452,47 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
 
 
 @unittest.skipUnless(
+    _count_visible_gpus() >= MAX_EP_SIZE,
+    f"Repeated attention-TP2 scale-up E2E needs {MAX_EP_SIZE} GPUs.",
+)
+class TestElasticScaleUpDP2TP4ToDP4TP8(_ElasticScaleUpEndToEndBase):
+    """Admit two complete attention-TP2/DCP2 replicas."""
+
+    PRIMARY_DP = 2
+    JOIN_TP = 2
+    JOIN_DP = 1
+    JOIN_NNODES = 2
+    JOIN_NODE_RANK = 1
+    TARGET_EP_SIZE = 8
+    TARGET_DP_SIZE = 4
+    CUDA_GRAPH_ARGS = DISABLED_CUDA_GRAPH_ARGS
+    DCP_SIZE = 2
+    ATTENTION_BACKEND_ARGS = [
+        "--attention-backend=flashinfer",
+        "--flashinfer-mla-disable-ragged",
+    ]
+
+    def test_scale_up_on_demand(self):
+        self._generate_ok("pre-scale")
+
+        for old_ep, new_ep, new_dp, port in (
+            (4, 6, 3, PORT_B),
+            (6, 8, 4, PORT_C),
+        ):
+            self._scale_once(
+                old_ep_size=old_ep,
+                target_ep_size=new_ep,
+                target_dp_size=new_dp,
+                join_tp=2,
+                join_dp=1,
+                port=port,
+            )
+            self._generate_logprob_ok(f"after scale to EP{new_ep}")
+
+        self._run_post_scale_gsm8k()
+
+
+@unittest.skipUnless(
     _count_visible_gpus() >= 6,
     "4-to-6 scale-up E2E needs 6 GPUs.",
 )
@@ -418,9 +500,11 @@ class TestElasticScaleUp4To6(_ElasticScaleUpEndToEndBase):
     """Scale from four to six ranks."""
 
     JOIN_TP = 2
+    JOIN_DP = 2
     JOIN_NNODES = 2
     JOIN_NODE_RANK = 1
     TARGET_EP_SIZE = 6
+    TARGET_DP_SIZE = 6
     CUDA_GRAPH_ARGS = DISABLED_CUDA_GRAPH_ARGS
     MOE_DENSE_TP_SIZE = None
 
@@ -433,9 +517,11 @@ class TestElasticScaleUp4To5To6(_ElasticScaleUpEndToEndBase):
     """Scale from four to five and then from five to six ranks."""
 
     JOIN_TP = 1
+    JOIN_DP = 1
     JOIN_NNODES = 2
     JOIN_NODE_RANK = 1
     TARGET_EP_SIZE = 6
+    TARGET_DP_SIZE = 6
     CUDA_GRAPH_ARGS = DISABLED_CUDA_GRAPH_ARGS
 
     def test_scale_up_on_demand(self):
@@ -444,7 +530,9 @@ class TestElasticScaleUp4To5To6(_ElasticScaleUpEndToEndBase):
         self._scale_once(
             old_ep_size=4,
             target_ep_size=5,
+            target_dp_size=5,
             join_tp=1,
+            join_dp=1,
             port=PORT_B,
         )
         self._generate_ok("after first scale")
@@ -453,7 +541,9 @@ class TestElasticScaleUp4To5To6(_ElasticScaleUpEndToEndBase):
         self._scale_once(
             old_ep_size=5,
             target_ep_size=6,
+            target_dp_size=6,
             join_tp=1,
+            join_dp=1,
             port=PORT_C,
         )
         self._generate_ok("after second scale")
@@ -470,11 +560,65 @@ class TestElasticScaleUp4To8(_ElasticScaleUpEndToEndBase):
     """Scale from four to eight ranks."""
 
     JOIN_TP = LAUNCH_EP_SIZE
+    JOIN_DP = LAUNCH_EP_SIZE
     JOIN_NNODES = 2
     JOIN_NODE_RANK = 1
     TARGET_EP_SIZE = MAX_EP_SIZE
+    TARGET_DP_SIZE = MAX_EP_SIZE
     CUDA_GRAPH_ARGS = DISABLED_CUDA_GRAPH_ARGS
     MOE_DENSE_TP_SIZE = None
+
+
+@unittest.skipUnless(
+    _count_visible_gpus() >= 5,
+    "4-to-5 CUDA graph scale-up E2E needs 5 GPUs.",
+)
+class TestElasticScaleUp4To5CudaGraph(_ElasticScaleUpEndToEndBase):
+    """Scale from four to five ranks and recapture decode CUDA graphs."""
+
+    JOIN_TP = 1
+    JOIN_DP = 1
+    JOIN_NNODES = 2
+    JOIN_NODE_RANK = 1
+    TARGET_EP_SIZE = 5
+    TARGET_DP_SIZE = 5
+    CUDA_GRAPH_ARGS = ELASTIC_CUDA_GRAPH_ARGS
+
+
+@unittest.skipUnless(
+    _count_visible_gpus() >= MAX_EP_SIZE,
+    f"Full scale-up E2E needs {MAX_EP_SIZE} GPUs.",
+)
+class TestElasticScaleUp4To8CudaGraph(_ElasticScaleUpEndToEndBase):
+    """Scale from four to eight ranks and recapture decode CUDA graphs."""
+
+    JOIN_TP = LAUNCH_EP_SIZE
+    JOIN_DP = LAUNCH_EP_SIZE
+    JOIN_NNODES = 2
+    JOIN_NODE_RANK = 1
+    TARGET_EP_SIZE = MAX_EP_SIZE
+    TARGET_DP_SIZE = MAX_EP_SIZE
+    CUDA_GRAPH_ARGS = ELASTIC_CUDA_GRAPH_ARGS
+
+
+@unittest.skipUnless(
+    _count_visible_gpus() >= 6,
+    "4-to-6 CUDA graph scale-up E2E needs 6 GPUs.",
+)
+class TestElasticScaleUp4To6CudaGraph(TestElasticScaleUp4To6):
+    """Recapture decode CUDA graphs across different local TP sizes."""
+
+    CUDA_GRAPH_ARGS = ELASTIC_CUDA_GRAPH_ARGS
+
+
+@unittest.skipUnless(
+    _count_visible_gpus() >= 6,
+    "4-to-5-to-6 CUDA graph scale-up E2E needs 6 GPUs.",
+)
+class TestElasticScaleUp4To5To6CudaGraph(TestElasticScaleUp4To5To6):
+    """Recapture decode CUDA graphs across two scale operations."""
+
+    CUDA_GRAPH_ARGS = ELASTIC_CUDA_GRAPH_ARGS
 
 
 if __name__ == "__main__":

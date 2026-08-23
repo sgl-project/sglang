@@ -261,9 +261,20 @@ def _init_parallel_groups(
             and get_parallel().enable_dsa_prefill_context_parallel
         ),
         enable_symm_mem=server_args.enable_symm_mem,
-        recovered_rank=is_ep_joiner,
+        # Mooncake owns the dynamically expandable WORLD group. Model-parallel
+        # groups remain fixed within each launch cohort, so use the platform
+        # backend for both the primary and joining cohorts.
+        backend=(
+            get_default_distributed_backend(server_args.device)
+            if server_args.elastic_ep_backend == "mooncake"
+            else None
+        ),
+        # A recovery joiner re-enters launch-time model-parallel groups. A
+        # scale joiner instead creates new cohort-local groups; those groups
+        # must be static even though WORLD itself is an extension group.
+        recovered_rank=is_ep_joiner and not is_scale_joiner,
         rank_offset=rank_offset,
-        max_world_size=server_args.max_ep_size,
+        max_world_size=None if is_scale_joiner else server_args.max_ep_size,
     )
     _tag_groups_for_flashinfer_allreduce_only()
     initialize_dp_attention(
