@@ -36,9 +36,8 @@ from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope import (
     apply_qwen_vl_text_rope,
     build_qwen_vl_text_rope,
 )
-from sglang.multimodal_gen.runtime.platforms import (
-    AttentionBackendEnum,
-)
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.common import add_prefix
 from sglang.srt.layers.layernorm import RMSNorm
 
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
@@ -167,6 +166,10 @@ def _make_text_row_linear(
     use_row_parallel = (
         use_tensor_parallel and tp_size > 1 and in_features % tp_size == 0
     )
+    if use_row_parallel and quant_config is not None:
+        use_row_parallel = quant_config.supports_input_partition(
+            prefix, in_features // tp_size
+        )
     if use_weight_only_fp8:
         if use_row_parallel:
             return WeightOnlyFP8RowParallelLinear(
@@ -494,6 +497,7 @@ class Qwen3VLTextModel(nn.Module):
         quant_config: QuantizationConfig | None = None,
         use_weight_only_fp8: bool = False,
         use_tensor_parallel: bool = False,
+        prefix: str = "",
     ):
         super().__init__()
         self.config = config
@@ -511,7 +515,7 @@ class Qwen3VLTextModel(nn.Module):
                     quant_config=quant_config,
                     use_weight_only_fp8=use_weight_only_fp8,
                     use_tensor_parallel=use_tensor_parallel,
-                    prefix=f"layers.{layer_idx}",
+                    prefix=add_prefix(f"layers.{layer_idx}", prefix),
                 )
                 for layer_idx in range(config.num_hidden_layers)
             ]
@@ -672,6 +676,7 @@ class Qwen3VLModel(nn.Module):
         *,
         quant_config: QuantizationConfig | None = None,
         use_tensor_parallel: bool = False,
+        prefix: str = "",
     ):
         super().__init__()
         self.visual = Qwen3VLVisionTransformer(config.vision_config)
@@ -679,6 +684,7 @@ class Qwen3VLModel(nn.Module):
             config.text_config,
             quant_config=quant_config,
             use_tensor_parallel=use_tensor_parallel,
+            prefix=add_prefix("language_model", prefix),
         )
         self.rope_deltas = None  # cache rope_deltas here
         self.config = config
