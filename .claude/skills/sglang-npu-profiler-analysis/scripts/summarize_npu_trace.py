@@ -10,7 +10,12 @@ def _read_csv(path: Path) -> list[dict[str, str]]:
     if not path.is_file():
         return []
     with path.open(newline="", encoding="utf-8", errors="replace") as f:
-        return list(csv.DictReader(f))
+        sample = f.read(4096)
+    if not sample.strip():
+        return []
+    delimiter = "\t" if sample.count("\t") > sample.count(",") else ","
+    with path.open(newline="", encoding="utf-8", errors="replace") as f:
+        return list(csv.DictReader(f, delimiter=delimiter))
 
 
 def _pick_name(row: dict[str, str]) -> str:
@@ -22,18 +27,29 @@ def _pick_name(row: dict[str, str]) -> str:
 
 def _pick_time(row: dict[str, str]) -> float:
     for key in (
+        "Device Total Duration(us)",
+        "Device Self Duration(us)",
+        "Host Total Duration(us)",
+        "Host Self Duration(us)",
+        "Device Total Duration With AICore(us)",
+        "Device Self Duration With AICore(us)",
         "Total Time (us)",
         "Total Time (ms)",
         "Duration (us)",
         "Duration (ms)",
+        "Duration(us)",
         "Device Duration (us)",
         "Device Duration (ms)",
+        "aicore_time(us)",
     ):
         if key in row and row[key]:
-            val = float(str(row[key]).replace(",", ""))
+            val = float(str(row[key]).replace(",", "").strip())
             if "ms" in key.lower():
                 return val
             return val / 1000.0
+    for key, raw in row.items():
+        if "duration" in key.lower() and "(us)" in key.lower() and raw:
+            return float(str(raw).replace(",", "").strip()) / 1000.0
     return 0.0
 
 
