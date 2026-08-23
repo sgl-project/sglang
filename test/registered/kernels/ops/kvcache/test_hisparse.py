@@ -21,7 +21,7 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-l
 register_xpu_ci(est_time=60, suite="stage-b-test-1-gpu-xpu")
 
 if is_xpu():
-    from sgl_kernel.jit.kvcache.hisparse import (
+    from sgl_kernel import (
         load_cache_to_device_buffer_dsv4_mla,
         load_cache_to_device_buffer_mla,
         transfer_cache_dsv4_mla,
@@ -36,7 +36,7 @@ else:
 
 pytestmark = pytest.mark.skipif(
     not (is_cuda() or is_hip() or is_xpu()),
-    reason="HiSparse JIT tests require CUDA/ROCm/XPU.",
+    reason="HiSparse kernel tests require CUDA/ROCm/XPU.",
 )
 
 DEVICE = get_device()

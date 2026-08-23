@@ -8,7 +8,7 @@ import torch
 from sglang.srt.utils import get_device_module, is_hip, is_xpu
 
 if is_xpu():
-    from sgl_kernel.jit.kvcache.hisparse import (
+    from sgl_kernel import (
         load_cache_to_device_buffer_dsv4_mla,
         load_cache_to_device_buffer_mla,
     )
