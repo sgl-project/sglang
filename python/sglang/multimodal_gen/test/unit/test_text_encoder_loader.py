@@ -365,6 +365,7 @@ class TestTextEncoderQuantization(unittest.TestCase):
         )
 
     def test_mixed_w4a8_weight_file_maps_embedding_and_linear_markers(self):
+        self.get_quant_config.return_value = None
         layers = {
             "model.embed_tokens": {"format": "int8_tensorwise"},
             "model.layers.0.mlp.down_proj": {
