@@ -134,9 +134,18 @@ _ENV_MATRIX = (({}, {"SGLANG_IS_IN_CI": "true"}),)
 # are step-12 exposure like any other pair.
 _PASSED = frozenset({"model_path", "device", "random_seed"})
 
-# The reads that still take a value off the supplied instance. `initialize_moe_config`
-# is handed the record until the replay goes away; the rest are pre-publish launcher
-# reads.
+# What is left reads the record because the record is the only thing that exists
+# at that point in the process. Everything else moved to the bags or to
+# `resolving_view`; a new entry here needs the same kind of reason.
+#
+#   engine.py / enable_symm_mem
+#       `_set_envs_and_config` sets NCCL environment variables before anything
+#       publishes -- there is no bag to read yet.
+#   engine.py / reasoning_parser, tool_call_parser
+#   template_detection.py / model_path
+#       the auto-parser detection is late resolution: it runs in the launcher's
+#       validation stage, decides these fields and writes them *in place*,
+#       before the publish that would give it a bag.
 _EXPOSED = {
     ("disaggregation/encoder/server.py", "model_loader_extra_config"),
     ("layers/moe/utils.py", "deepep_mode"),
