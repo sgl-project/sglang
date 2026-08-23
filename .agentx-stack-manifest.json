@@ -77,17 +77,20 @@
   },
   "profiling_overlay": {
     "parent_local_commit": "85c23c62fdc58a5a0c3b7c6d61a7bba720a6cbbf",
-    "local_commit": "668cbe00a9c4e828d9669b9badbfab846fa97197",
+    "local_commit": "8e750fbcbed6b88e91e285cae3ea6e5852350d0a",
     "file": "python/sglang/srt/managers/scheduler_components/profiler_manager.py",
-    "candidate_sha256": "02e19720a334a1184c5bf3ce9ec32ca097e8cac865d89225a056a51f69761d4e",
+    "candidate_sha256": "8e596723f13023f5d550d57db2194977ebb35433a1c3760faac21b27753207e6",
+    "symm_mem_gather_file": "python/sglang/srt/distributed/device_communicators/symm_mem_gather.py",
+    "symm_mem_gather_sha256": "8a1f8e9a1f13c26b89691eb0dc7bec07595b107778f180d1afa0a93d5e8af9c4",
     "scheduler_nvtx_fallback_commit": "81e31117d5f321de2102bbe2ad888d581ae45031",
     "scheduler_nvtx_file": "python/sglang/srt/utils/nvtx_utils.py",
     "scheduler_nvtx_sha256": "56610ee61c53c39e40fdd6b44c7443140eeb6e25bc499889e70f93a33bf3fcdd",
-    "change": "Allow CUDA_PROFILER requests to drive an opt-in Nsight Systems NVTX capture range instead of cudaProfilerStart/Stop, and emit scheduler ranges through torch.cuda.nvtx when the optional nvtx package is absent; model execution is unchanged.",
+    "change": "Allow CUDA_PROFILER requests to drive an opt-in Nsight Systems NVTX capture range instead of cudaProfilerStart/Stop, defer the capture until an explicitly requested rank-local running batch is observed, and make the symmetric-memory gather timeout configurable for profiler report finalization; model execution is unchanged unless the profiling-only environment variables are set.",
     "targeted_validation": {
       "cpu_unit_test": "pass: NVTX range push/pop selected on the base GPU rank and cudaProfilerStart/Stop omitted",
+      "exact_batch_gate": "py_compile pass; targeted unit coverage added for deferred exact-running-batch start plus capture-window rebasing; full local pytest import unavailable on the host Python runtime",
       "scheduler_fallback": "pass: py_compile; missing optional nvtx package no longer disables scheduler markers",
-      "default_behavior": "unchanged when SGLANG_NSYS_NVTX_CAPTURE_RANGE and SGLANG_ENABLE_NVTX_* are unset"
+      "default_behavior": "unchanged when SGLANG_NSYS_NVTX_CAPTURE_RANGE, SGLANG_NSYS_EXACT_RUNNING_BATCH, SGLANG_SYMM_MEM_GATHER_TIMEOUT_MS, and SGLANG_ENABLE_NVTX_* are unset"
     }
   },
   "srt_slurm": {
