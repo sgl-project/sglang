@@ -206,6 +206,8 @@ class GenerateReqInput:
     ] = None
     # Whether to extract and process audio from video inputs.
     use_audio_in_video: bool = False
+    # Optional request-scoped video processor configuration.
+    video_config: Optional[Dict[str, Any]] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
     # Whether to return logprobs.

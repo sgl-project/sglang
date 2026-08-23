@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, 
 from sglang.srt.runtime_context import (
     attention_backends,
     configured_attn_cp_size,
+    configured_dcp_size,
     configured_moe_dp_size,
     configured_pp_size,
     configured_tp_size,
@@ -103,6 +104,7 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -326,7 +328,6 @@ from sglang.srt.utils.hf_transformers_utils import (
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
-from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -417,71 +418,75 @@ class Scheduler(
         # Parse args
         self.server_args = server_args
         self.nccl_port = port_args.nccl_port
-        self.schedule_policy = server_args.schedule_policy
-        self.enable_priority_scheduling = server_args.enable_priority_scheduling
+        self.schedule_policy = get_schedule().schedule_policy
+        self.enable_priority_scheduling = get_schedule().enable_priority_scheduling
         self.abort_on_priority_when_disabled = (
-            server_args.abort_on_priority_when_disabled
+            get_schedule().abort_on_priority_when_disabled
         )
         self.schedule_low_priority_values_first = (
-            server_args.schedule_low_priority_values_first
+            get_schedule().schedule_low_priority_values_first
         )
         self.priority_scheduling_preemption_threshold = (
-            server_args.priority_scheduling_preemption_threshold
+            get_schedule().priority_scheduling_preemption_threshold
         )
-        self.enable_lora = server_args.enable_lora
-        self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
-        self.max_loras_per_batch = server_args.max_loras_per_batch
-        self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
-        self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
-        self.enable_pdmux = server_args.enable_pdmux
+        self.enable_lora = get_lora().enable_lora
+        self.enable_lora_overlap_loading = get_lora().enable_lora_overlap_loading
+        self.max_loras_per_batch = get_lora().max_loras_per_batch
+        self.enable_overlap = (
+            not get_schedule().disable_overlap_schedule and not use_mlx()
+        )
+        self.enable_overlap_mlx = (
+            not get_schedule().disable_overlap_schedule and use_mlx()
+        )
+        self.enable_pdmux = get_disagg().enable_pdmux
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
-        self.stream_interval = server_args.stream_interval
+        self.stream_interval = get_serving().stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
+            get_spec().speculative_algorithm
         )
         self.page_size = get_schedule().page_size
-        self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
-        self.enable_session_radix_cache = server_args.enable_session_radix_cache
-        self.enable_hicache_storage = server_args.hicache_storage_backend is not None
+        self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
+        self.enable_session_radix_cache = get_memory().enable_session_radix_cache
+        self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
         self.enable_decode_hicache = (
-            server_args.disaggregation_decode_enable_radix_cache
+            get_disagg().disaggregation_decode_enable_radix_cache
             and self.enable_hierarchical_cache
         )
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
-        self.enable_hisparse = server_args.enable_hisparse
+        self.enable_hisparse = get_memory().enable_hisparse
         self.enable_dp_attention = get_parallel().enable_dp_attention
-        self.enable_unified_memory = server_args.enable_unified_memory
+        self.enable_unified_memory = get_memory().enable_unified_memory
 
         # Distributed rank info
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
             compute_dp_attention_world_info(
                 get_parallel().enable_dp_attention,
                 tp_rank,
-                server_args.tp_size,
+                configured_tp_size(),
                 get_parallel().dp_size,
-                server_args.attn_cp_size,
+                configured_attn_cp_size(),
             )
         )
         self.ps = ParallelState(
             tp_rank=tp_rank,
-            tp_size=server_args.tp_size,
+            tp_size=configured_tp_size(),
             pp_rank=pp_rank,
-            pp_size=server_args.pp_size,
+            pp_size=configured_pp_size(),
             dp_rank=dp_rank,
             dp_size=get_parallel().dp_size,
             attn_tp_rank=attn_tp_rank,
             attn_tp_size=attn_tp_size,
             attn_cp_rank=attn_cp_rank,
-            attn_cp_size=server_args.attn_cp_size,
-            attn_dcp_rank=tp_rank % server_args.dcp_size,
-            attn_dcp_size=server_args.dcp_size,
+            attn_cp_size=configured_attn_cp_size(),
+            attn_dcp_rank=tp_rank % configured_dcp_size(),
+            attn_dcp_size=configured_dcp_size(),
             attn_dp_rank=attn_dp_rank,
             attn_dp_size=attn_dp_size,
             moe_ep_rank=moe_ep_rank,
             moe_ep_size=get_parallel().ep_size,
             moe_dp_rank=moe_dp_rank,
-            moe_dp_size=server_args.moe_dp_size,
+            moe_dp_size=configured_moe_dp_size(),
             gpu_id=gpu_id,
         )
 
@@ -839,7 +844,7 @@ class Scheduler(
         if (
             self.model_config.is_multimodal
             and self.processor is not None
-            and not server_args.language_model_only
+            and not get_disagg().language_model_only
         ):
             try:
                 import_processors("sglang.srt.multimodal.processors")
@@ -1282,7 +1287,7 @@ class Scheduler(
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
 
     def init_soft_watchdog(self, server_args: ServerArgs):
-        if (x := server_args.soft_watchdog_timeout) is not None:
+        if (x := get_device().soft_watchdog_timeout) is not None:
             self.soft_watchdog = create_scheduler_watchdog(
                 self, watchdog_timeout=x, soft=True
             )
@@ -2180,7 +2185,7 @@ class Scheduler(
         )
 
     def init_output_streamer(self) -> None:
-        self.output_streamer = SchedulerOutputStreamer(
+        self.output_streamer = self.get_output_streamer_class()(
             send_to_detokenizer=self.ipc_channels.send_to_detokenizer,
             tree_cache=self.tree_cache,
             ps=self.ps,
@@ -2191,6 +2196,9 @@ class Scheduler(
             enable_hicache_storage=lambda: self.enable_hicache_storage,
             rust_server=self.rust_server,
         )
+
+    def get_output_streamer_class(self) -> type[SchedulerOutputStreamer]:
+        return SchedulerOutputStreamer
 
     def init_batch_result_processor(self) -> None:
         self.batch_result_processor = SchedulerBatchResultProcessor(
@@ -3837,6 +3845,7 @@ class Scheduler(
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 self._relay_forward_payload(batch.req_pool_indices, batch_result)
                 batch.input_ids = None
+                self._copy_auxiliary_output_to_cpu(batch, batch_result)
             elif not batch.spec_algorithm.is_none():
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).
@@ -3874,6 +3883,7 @@ class Scheduler(
                     self._relay_forward_payload(batch.req_pool_indices, batch_result)
                     batch.input_ids = None
                 self.update_cache_from_scheduler(batch, batch_result)
+                self._copy_auxiliary_output_to_cpu(batch, batch_result)
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
@@ -3964,6 +3974,32 @@ class Scheduler(
         else:
             return
         self.future_map.stash(future_indices, payload)
+
+    def _copy_auxiliary_output_to_cpu(
+        self,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> None:
+        logits_output = result.logits_output
+        if (
+            logits_output is None
+            or logits_output.auxiliary_device_output is None
+            or result.auxiliary_host_output is not None
+        ):
+            return
+        # PP transports the device output to the first rank before copying it.
+        if self.ps.pp_size > 1:
+            return
+        if result.copy_done is not None:
+            raise RuntimeError(
+                "generation result has an uncopied auxiliary output after its "
+                "device-to-host copy was scheduled"
+            )
+        result.copy_done = self.device_module.Event()
+        result.copy_to_cpu(
+            return_logprob=batch.return_logprob,
+            return_hidden_states=batch.return_hidden_states,
+        )
 
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult, cur_batch: ScheduleBatch
@@ -5141,16 +5177,16 @@ def run_scheduler_process(
     parent_process = psutil.Process().parent()
 
     # Set up tracing
-    if server_args.enable_trace:
+    if get_observability().enable_trace:
         process_tracing_init(
-            server_args.otlp_traces_endpoint,
+            get_observability().otlp_traces_endpoint,
             "sglang",
-            trace_modules=server_args.trace_modules,
+            trace_modules=get_observability().trace_modules,
         )
         thread_label = "Scheduler"
-        if server_args.disaggregation_mode == "prefill":
+        if get_disagg().disaggregation_mode == "prefill":
             thread_label = "Prefill Scheduler"
-        elif server_args.disaggregation_mode == "decode":
+        elif get_disagg().disaggregation_mode == "decode":
             thread_label = "Decode Scheduler"
         trace_set_thread_info(thread_label, tp_rank, dp_rank, pp_rank)
 
