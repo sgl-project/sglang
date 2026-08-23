@@ -3,12 +3,6 @@
 import platform as _platform
 import sys as _sys
 
-from sglang._dependency_warnings import (
-    suppress_known_dependency_warnings as _suppress_known_dependency_warnings,
-)
-
-_suppress_known_dependency_warnings()
-
 # sglang.srt.environ must run before the rest of this file's imports
 # (hf_transformers_patches, lang.api, ...), which pull in torch and
 # FlashInfer: those claim these cache dirs early, and the first value set is
