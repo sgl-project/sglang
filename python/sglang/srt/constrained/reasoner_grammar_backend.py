@@ -40,6 +40,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
         grammar: Optional[BaseGrammarObject],
         think_end_ids: List[int],
         think_excluded_token_ids: Optional[List[int]] = None,
+        model_eos_token_ids: Optional[List[int]] = None,
         max_think_tokens: int = -1,
         enable_token_filter: bool = False,
         token_filter_fn=None,
@@ -52,6 +53,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self.think_end_ids = tuple(think_end_ids)
         self._think_end_matcher = TokenSequenceMatcher(self.think_end_ids)
         self.think_excluded_token_ids = think_excluded_token_ids
+        self.model_eos_token_ids = model_eos_token_ids
         self.max_think_tokens = max_think_tokens
         self.enable_token_filter = enable_token_filter
         self.token_filter_fn = token_filter_fn
@@ -143,9 +145,18 @@ class ReasonerGrammarObject(BaseGrammarObject):
             < self.max_think_tokens
         )
 
-    def _do_token_filter(self, vocab_mask, token_ids, idx, is_allowed=True):
+    def _do_token_filter(
+        self,
+        vocab_mask,
+        token_ids,
+        idx,
+        is_allowed=True,
+        reset_vocab_mask=True,
+    ):
         if self.token_filter_fn is not None:
-            self.token_filter_fn(vocab_mask, token_ids, idx, is_allowed)
+            self.token_filter_fn(
+                vocab_mask, token_ids, idx, is_allowed, reset_vocab_mask
+            )
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         if self._is_thinking():
@@ -167,8 +178,22 @@ class ReasonerGrammarObject(BaseGrammarObject):
                     is_allowed=True,
                 )
             return
-        if self._is_generation() and self.grammar is not None:
-            self.grammar.fill_vocab_mask(vocab_mask, idx)
+        if self._is_generation():
+            if self.grammar is not None:
+                self.grammar.fill_vocab_mask(vocab_mask, idx)
+            # Prevent a successful response with reasoning but no answer/tool call.
+            if (
+                self.enable_token_filter
+                and self.tokens_after_end == 0
+                and self.model_eos_token_ids
+            ):
+                self._do_token_filter(
+                    vocab_mask,
+                    self.model_eos_token_ids,
+                    idx,
+                    is_allowed=False,
+                    reset_vocab_mask=self.grammar is None,
+                )
 
     def allocate_vocab_mask(self, vocab_size, batch_size, device):
         if self.grammar is not None:
@@ -195,6 +220,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
             grammar=self.grammar.copy() if self.grammar is not None else None,
             think_end_ids=self.think_end_ids,
             think_excluded_token_ids=self.think_excluded_token_ids,
+            model_eos_token_ids=self.model_eos_token_ids,
             max_think_tokens=self.max_think_tokens,
             enable_token_filter=self.enable_token_filter,
             token_filter_fn=self.token_filter_fn,
@@ -247,6 +273,7 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         reasoning_parser: ReasoningParser,
         tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
         enable_strict_thinking: bool = False,
+        model_eos_token_ids: Optional[List[int]] = None,
     ):
         super().__init__()
         self.grammar_backend = grammar_backend
@@ -260,12 +287,15 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             )
         self.think_end_ids = think_end_ids
         self._enable_strict_thinking = enable_strict_thinking
+        self.model_eos_token_ids = model_eos_token_ids
         self.think_excluded_token_ids = self._get_think_excluded_token_ids(
             reasoning_parser, tokenizer
         )
         self.max_think_tokens = envs.SGLANG_MAX_THINK_TOKENS.get()
         self.enable_token_filter = self.enable_strict_thinking and (
-            self.think_excluded_token_ids is not None or self.max_think_tokens >= 0
+            self.think_excluded_token_ids is not None
+            or self.model_eos_token_ids is not None
+            or self.max_think_tokens >= 0
         )
         if (
             self.enable_token_filter
@@ -308,6 +338,7 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             grammar=grammar,
             think_end_ids=self.think_end_ids,
             think_excluded_token_ids=self.think_excluded_token_ids,
+            model_eos_token_ids=self.model_eos_token_ids,
             max_think_tokens=self.max_think_tokens,
             enable_token_filter=self.enable_token_filter,
             token_filter_fn=self._token_filter_fn,
