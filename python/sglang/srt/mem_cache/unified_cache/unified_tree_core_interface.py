@@ -243,6 +243,17 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def evict_component_device_node(
+        self,
+        node_id: NodeId,
+        component_type: ComponentType,
+        require_host_backup: bool,
+    ) -> EvictDeviceLeafResult:
+        """Evict one auxiliary component's device value without evicting Full.
+        The result carries a BackupKV when the component first needs D->H backup."""
+        ...
+
+    @abstractmethod
     def drop_subtree_no_host(self, node_id: NodeId) -> DropSubtreeNoHostResult:
         """Drop an unbacked D-leaf's subtree when its write-back backup failed
         under host pressure; declines (is_dropped=False) if any node is locked."""

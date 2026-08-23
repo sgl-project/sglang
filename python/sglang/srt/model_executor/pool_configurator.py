@@ -32,6 +32,9 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
+from sglang.srt.mem_cache.deepseek_v4_continuation import (
+    dsv4_continuation_payload_bytes,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_ring_size,
     get_compress_state_write_pad,
@@ -66,6 +69,8 @@ class MemoryPoolConfig:
     c128_max_total_num_tokens: int = 0
     c4_state_pool_size: int = 0
     c128_state_pool_size: int = 0
+    dsv4_continuation_num_slots: int = 0
+    dsv4_continuation_payload_bytes: int = 0
 
     mem_fraction_static: Optional[float] = None
 
@@ -110,6 +115,13 @@ def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
         "Unsupported SGLANG_DSV4_COMPRESS_STATE_DTYPE="
         f"{dtype_name!r}. Expected one of: float32, fp32, bfloat16, bf16."
     )
+
+
+def _dsv4_packed_draft_layer_num(kvc: KVCacheConfigurator) -> int:
+    if not kvc.spec_algorithm.is_dspark():
+        return 1 if kvc.server_args.speculative_algorithm is not None else 0
+    target_layer_ids = getattr(kvc.spec_aux_config, "dflash_target_layer_ids", None)
+    return len(target_layer_ids or ())
 
 
 class MemoryPoolConfigurator:
@@ -770,6 +782,40 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_total = len(self.compression_ratios)
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
+        self.enable_continuation = (
+            get_memory().enable_hierarchical_cache
+            and kvc.spec_algorithm.is_dspark()
+            and get_parallel().attn_dcp_size > 1
+        )
+        if self.enable_continuation:
+            from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+                is_unified_kv_triton,
+            )
+
+            if not is_unified_kv_triton():
+                raise NotImplementedError(
+                    "DeepSeek V4 DCP + HiCache + DSpark continuation requires "
+                    "the unified_kv_triton backend."
+                )
+        self.draft_layer_num = _dsv4_packed_draft_layer_num(kvc)
+        if self.enable_continuation and self.draft_layer_num <= 0:
+            raise RuntimeError(
+                "DeepSeek V4 continuation requires a resolved positive DSpark "
+                "draft layer count."
+            )
+        c4_state_dtype_size, _ = _get_dsv4_compress_state_dtype_sizes()
+        self.continuation_payload_bytes = (
+            dsv4_continuation_payload_bytes(
+                target_layer_num=self.num_layers_total,
+                draft_layer_num=self.draft_layer_num,
+                c4_layer_num=self.num_layers_ca4,
+                attention_head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
+                indexer_head_dim=self.indexer_head_dim,
+                c4_state_element_size=c4_state_dtype_size,
+            )
+            if self.enable_continuation
+            else 0
+        )
 
         if self.is_speculative:
             # Ring is sized once here, so it must serve the largest adaptive tier.
@@ -783,6 +829,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             # per-token bytes by (target+draft)/target. Equivalent to dflash's
             # scale_kv_cell_size_per_token_for_dflash but applied to
             # bytes_per_full_token: tokens = avail / (bpft * (T+D)/T).
+            # The target budget models one packed draft pool here. Its fixed
+            # per-stage continuation rings are accounted separately above.
             draft_layers = 1
             target_layers = self.num_layers_total
             self.bytes_per_full_token *= (target_layers + draft_layers) / target_layers
@@ -931,6 +979,27 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         max_running_requests = min(estimated, token_capacity // 2)
         return self._get_c128_state_fixed_bytes(max_running_requests)
 
+    def _get_continuation_num_slots(self, max_running_requests: int) -> int:
+        if not self.enable_continuation:
+            return 0
+        usable_req_slots = self._get_num_req_slots(max_running_requests) - 1
+        return 2 * usable_req_slots
+
+    def _get_continuation_fixed_bytes(self, max_running_requests: int) -> int:
+        num_slots = self._get_continuation_num_slots(max_running_requests)
+        return (num_slots + 1) * self.continuation_payload_bytes if num_slots else 0
+
+    def _get_continuation_fixed_bytes_for_token_capacity(
+        self, token_capacity: int
+    ) -> int:
+        if self.requested_max_running_requests_per_worker is not None:
+            max_running_requests = self.requested_max_running_requests_per_worker
+        else:
+            estimated = int(token_capacity / self.context_len * 512)
+            estimated = max(min(estimated, 4096), 2048)
+            max_running_requests = min(estimated, token_capacity // 2)
+        return self._get_continuation_fixed_bytes(max_running_requests)
+
     def _to_config(self, sizes: _DSV4PoolSizes) -> MemoryPoolConfig:
         full = sizes.full_max_total_num_tokens
         swa = sizes.swa_max_total_num_tokens
@@ -960,6 +1029,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             config.c128_state_pool_size = num_req_slots
         else:
             config.c128_state_pool_size = num_req_slots * self.c128_ring_size
+        config.dsv4_continuation_num_slots = self._get_continuation_num_slots(
+            config.max_running_requests
+        )
+        config.dsv4_continuation_payload_bytes = self.continuation_payload_bytes
         return config
 
     def calculate_pool_sizes(
@@ -979,7 +1052,16 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 self._get_c128_state_fixed_bytes_for_token_capacity(full_token)
             )
 
-        available_bytes_for_tokens = max(available_bytes - c128_state_fixed_bytes, 0)
+        continuation_fixed_bytes = (
+            self._get_continuation_fixed_bytes_for_token_capacity(
+                int(available_bytes / self.bytes_per_full_token)
+            )
+        )
+
+        available_bytes_for_tokens = max(
+            available_bytes - c128_state_fixed_bytes - continuation_fixed_bytes,
+            0,
+        )
         full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
 
         sizes = self._compute_dsv4_sizes(full_token, page_size)
@@ -988,6 +1070,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             f"bytes_per_full_token={self.bytes_per_full_token:.2f}, "
             f"available_bytes={available_bytes / (1 << 30):.2f} GB, "
             f"c128_state_fixed={c128_state_fixed_bytes / (1 << 30):.2f} GB, "
+            f"continuation_fixed={continuation_fixed_bytes / (1 << 30):.2f} GB, "
             f"full_token={sizes.full_max_total_num_tokens}"
         )
         return self._to_config(sizes)

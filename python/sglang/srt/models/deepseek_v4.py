@@ -1753,6 +1753,39 @@ class DeepseekV4DecoderLayer(nn.Module):
             alt_streams=alt_streams,
             compress_ratio_override=compress_ratio_override,
         )
+        if _use_aiter and not is_nextn and isinstance(self.self_attn, MQALayer):
+            if self.self_attn.compress_ratio == 4:
+                weights_proj = self.self_attn.indexer.weights_proj
+                if (
+                    tuple(weights_proj.weight.shape) == (64, 7168)
+                    and weights_proj.bias is None
+                ):
+                    weights_proj._use_deterministic_small_m_linear = True
+
+            if self.self_attn.compressor is not None:
+                compressors = [self.self_attn.compressor]
+                if self.self_attn.indexer is not None:
+                    compressors.append(self.self_attn.indexer.compressor)
+                for compressor in compressors:
+                    expected_output_size = 2 * compressor.coff * compressor.head_dim
+                    contract = (
+                        compressor.ratio,
+                        compressor.coff,
+                        compressor.head_dim,
+                        expected_output_size,
+                    )
+                    if (
+                        contract
+                        in (
+                            (4, 2, 128, 512),
+                            (4, 2, 512, 2048),
+                            (128, 1, 512, 1024),
+                        )
+                        and tuple(compressor.wkv_gate.weight.shape)
+                        == (expected_output_size, 7168)
+                        and compressor.wkv_gate.bias is None
+                    ):
+                        compressor._use_deterministic_small_m_projection = True
         moe_alt_stream = (
             alt_streams[0]
             if (

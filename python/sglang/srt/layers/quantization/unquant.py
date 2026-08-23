@@ -260,6 +260,26 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
 
+        elif (
+            _use_aiter
+            and getattr(layer, "_use_deterministic_small_m_linear", False)
+            and x.numel() // x.shape[-1] <= 32
+        ):
+            if not (
+                tuple(layer.weight.shape) == (64, 7168)
+                and x.shape[-1] == 7168
+                and x.dtype == torch.bfloat16
+                and layer.weight.dtype == torch.bfloat16
+                and bias is None
+            ):
+                raise RuntimeError(
+                    "Deterministic small-M linear received an unexpected contract: "
+                    f"input={tuple(x.shape)}/{x.dtype}, "
+                    f"weight={tuple(layer.weight.shape)}/{layer.weight.dtype}, "
+                    f"bias={bias is not None}"
+                )
+            return F.linear(x, layer.weight, None)
+
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 

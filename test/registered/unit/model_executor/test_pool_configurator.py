@@ -867,6 +867,24 @@ class TestDflashDraftKvBudget(CustomTestCase):
 
         self.assertLess(_tokens(10240), _tokens(None))
 
+    def test_dsv4_continuation_uses_all_packed_dspark_layers(self):
+        from sglang.srt.mem_cache.deepseek_v4_continuation import (
+            dsv4_continuation_payload_bytes,
+        )
+
+        target_layers = 61
+        draft_layers = 3
+        payload = dsv4_continuation_payload_bytes(
+            target_layer_num=target_layers,
+            draft_layer_num=draft_layers,
+            c4_layer_num=30,
+            attention_head_dim=512,
+            indexer_head_dim=128,
+            c4_state_element_size=4,
+        )
+
+        self.assertEqual(payload, 9_617_408)
+
 
 if __name__ == "__main__":
     unittest.main()

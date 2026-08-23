@@ -411,6 +411,40 @@ class Compressor(BaseFusedOp):
     def _pending_key(self):
         return ("kv_score", self.layer_id, self.is_in_indexer)
 
+    def _compute_kv_score_projection(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            _is_hip
+            and getattr(self, "_use_deterministic_small_m_projection", False)
+            and x.numel() // x.shape[-1] <= 32
+        ):
+            expected_output_size = 2 * self.coff * self.head_dim
+            contract = (
+                self.ratio,
+                self.coff,
+                self.head_dim,
+                expected_output_size,
+            )
+            if not (
+                contract
+                in (
+                    (4, 2, 128, 512),
+                    (4, 2, 512, 2048),
+                    (128, 1, 512, 1024),
+                )
+                and x.shape[-1] == 7168
+                and x.dtype == torch.bfloat16
+                and tuple(self.wkv_gate.weight.shape) == (expected_output_size, 7168)
+                and self.wkv_gate.weight.dtype == torch.bfloat16
+            ):
+                raise RuntimeError(
+                    "Deterministic compressor projection received an unexpected "
+                    f"contract: ratio={self.ratio}, input={tuple(x.shape)}/"
+                    f"{x.dtype}, weight={tuple(self.wkv_gate.weight.shape)}/"
+                    f"{self.wkv_gate.weight.dtype}"
+                )
+            return torch.mm(x, self.wkv_gate.weight.t(), out_dtype=torch.float32)
+        return linear_bf16_fp32(x, self.wkv_gate.weight)
+
     def prelaunch_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
         """Compute kv_score and start its CP all-gather, without waiting.
 
@@ -425,7 +459,7 @@ class Compressor(BaseFusedOp):
         comm_stream = getattr(forward_batch, "_cp_prefetch_comm_stream", None)
         if comm_stream is None or not dsa_use_prefill_cp(forward_batch):
             return
-        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
+        kv_score = self._compute_kv_score_projection(x)
         # Keyed by forward_batch: each TBO ubatch carries its own, so the two
         # ubatches cannot collect each other's gather.
         pending = forward_batch.__dict__.setdefault("_cp_pending_gathers", {})
@@ -440,7 +474,7 @@ class Compressor(BaseFusedOp):
             if handle is not None:
                 return cp_all_gather_rerange_finish(handle)
 
-        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
+        kv_score = self._compute_kv_score_projection(x)
 
         # CUDA path: delegate to backend
         if dsa_use_prefill_cp(forward_batch):

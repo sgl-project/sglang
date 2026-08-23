@@ -1273,6 +1273,37 @@ class TestHiCacheArgs(unittest.TestCase):
             setattr(args, key, value)
         return args
 
+    def test_dsv4_dcp_dspark_l2_is_allowed(self):
+        from sglang.srt.configs.model_config import AttentionArch
+
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            dcp_size=8,
+            speculative_algorithm="DSPARK",
+        )
+        args.model_config = SimpleNamespace(
+            is_deepseek_v4_arch=True,
+            attention_arch=AttentionArch.MHA,
+        )
+
+        args._resolve_hicache_dcp_compatibility()
+
+    def test_generic_mha_dcp_hicache_remains_rejected(self):
+        from sglang.srt.configs.model_config import AttentionArch
+
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            dcp_size=8,
+            speculative_algorithm="DSPARK",
+        )
+        args.model_config = SimpleNamespace(
+            is_deepseek_v4_arch=False,
+            attention_arch=AttentionArch.MHA,
+        )
+
+        with self.assertRaisesRegex(NotImplementedError, "only supported for MLA"):
+            args._resolve_hicache_dcp_compatibility()
+
     def _assert_hicache_fields(
         self,
         args: ServerArgs,

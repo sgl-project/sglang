@@ -43,6 +43,8 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
+    record_stream_each,
+    record_stream_for_v2_verify,
     sample_simulated_acc_len,
 )
 from sglang.srt.utils import is_npu
@@ -75,6 +77,7 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
+    verify_forward_batch: object
 
 
 class TargetVerifyExecutor:
@@ -203,6 +206,8 @@ class TargetVerifyExecutor:
             capture_hidden_mode=CaptureHiddenMode.FULL,
             ragged_verify_layout=idle_layout,
         )
+        forward_stream = torch.get_device_module(device).current_stream()
+        record_stream_for_v2_verify(batch, verify_input, forward_stream)
         batch.out_cache_loc = torch.zeros(
             (num_dummy_tokens,), dtype=torch.int64, device=device
         )
@@ -221,6 +226,7 @@ class TargetVerifyExecutor:
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
+        record_stream_each((batch.input_ids, batch.out_cache_loc), forward_stream)
         self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -249,6 +255,10 @@ class TargetVerifyExecutor:
             capture_hidden_mode=CaptureHiddenMode.FULL,
             live_seq_lens_cpu=batch.seq_lens_cpu,
         )
+        forward_stream = torch.get_device_module(
+            self.model_runner.device
+        ).current_stream()
+        record_stream_for_v2_verify(batch, verify_input, forward_stream)
         batch.out_cache_loc = verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
@@ -284,9 +294,13 @@ class TargetVerifyExecutor:
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
     ) -> TargetVerifyResult:
+        forward_stream = torch.get_device_module(
+            self.model_runner.device
+        ).current_stream()
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
+        record_stream_each((batch.input_ids, batch.out_cache_loc), forward_stream)
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
@@ -299,6 +313,7 @@ class TargetVerifyExecutor:
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
             can_run_cuda_graph=target_out.can_run_cuda_graph,
+            verify_forward_batch=verify_forward_batch,
         )
 
     def commit_hidden(
@@ -362,6 +377,10 @@ class TargetVerifyExecutor:
             ragged_verify_layout=layout,
             live_seq_lens_cpu=batch.seq_lens_cpu,
         )
+        forward_stream = torch.get_device_module(
+            self.model_runner.device
+        ).current_stream()
+        record_stream_for_v2_verify(batch, verify_input, forward_stream)
         batch.out_cache_loc = ragged_window.verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum

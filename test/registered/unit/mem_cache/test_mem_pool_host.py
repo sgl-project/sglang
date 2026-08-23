@@ -127,6 +127,7 @@ class TestLazyHostPoolRelease(CustomTestCase):
         pool = DeepSeekV4PagedHostPool.__new__(DeepSeekV4PagedHostPool)
         pool.size = 8
         pool.slot_page_size = 2
+        pool.require_full_page_transfers = False
         pool.lock = threading.RLock()
         pool.clear()
         return pool
@@ -199,6 +200,79 @@ class TestLazyHostPoolRelease(CustomTestCase):
             pool.alloc(1)
         with self.assertRaises(ValueError):
             pool.free(torch.tensor([0]))
+
+
+class TestDeepSeekV4DCPHostTransferGeometry(CustomTestCase):
+    @staticmethod
+    def _make_pool():
+        pool = DeepSeekV4PagedHostPool.__new__(DeepSeekV4PagedHostPool)
+        pool.pool_name = "dsv4-c4"
+        pool.slot_page_size = 2048
+        pool.require_full_page_transfers = True
+        return pool
+
+    def test_accepts_complete_widened_pages(self):
+        pool = self._make_pool()
+        indices = torch.arange(4096, dtype=torch.int64)
+
+        self.assertTrue(pool._has_transfer_indices(indices, indices.clone()))
+        torch.testing.assert_close(pool._to_page_indices(indices), torch.tensor([0, 1]))
+
+    def test_rejects_token_granular_widened_transfer(self):
+        pool = self._make_pool()
+        indices = torch.arange(2049, dtype=torch.int64)
+
+        with self.assertRaisesRegex(ValueError, "complete widened pages"):
+            pool._has_transfer_indices(indices, indices.clone())
+
+    def test_rejects_misaligned_or_noncontiguous_pages(self):
+        pool = self._make_pool()
+
+        with self.assertRaisesRegex(ValueError, "aligned, contiguous"):
+            pool._has_transfer_indices(
+                torch.arange(1, 2049, dtype=torch.int64),
+                torch.arange(2048, dtype=torch.int64),
+            )
+
+        noncontiguous = torch.arange(2048, dtype=torch.int64)
+        noncontiguous[-1] = 4096
+        with self.assertRaisesRegex(ValueError, "aligned, contiguous"):
+            pool._has_transfer_indices(noncontiguous, torch.arange(2048))
+
+    def test_backup_rejects_partial_page_before_transfer(self):
+        pool = self._make_pool()
+        indices = torch.arange(2049, dtype=torch.int64)
+
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.memory_pool_host.transfer_cache_dsv4_mla"
+        ) as transfer:
+            with self.assertRaisesRegex(ValueError, "complete widened pages"):
+                pool.backup_from_device_all_layer(
+                    device_pool=None,
+                    host_indices=indices,
+                    device_indices=indices.clone(),
+                    io_backend="kernel",
+                )
+
+        transfer.assert_not_called()
+
+    def test_load_rejects_partial_page_before_transfer(self):
+        pool = self._make_pool()
+        indices = torch.arange(2049, dtype=torch.int64)
+
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.memory_pool_host.transfer_cache_dsv4_mla"
+        ) as transfer:
+            with self.assertRaisesRegex(ValueError, "complete widened pages"):
+                pool.load_to_device_per_layer(
+                    device_pool=None,
+                    host_indices=indices,
+                    device_indices=indices.clone(),
+                    layer_id=0,
+                    io_backend="kernel",
+                )
+
+        transfer.assert_not_called()
 
 
 class TestHostMemoryBudget(CustomTestCase):

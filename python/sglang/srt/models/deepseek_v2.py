@@ -543,6 +543,15 @@ class MoEGate(nn.Module):
                     hidden_states, self.weight, out_dtype=torch.float32
                 )
 
+            elif (
+                _use_aiter
+                and self.is_deepseek_v4
+                and not self.is_nextn
+                and hidden_states.shape[0] <= 32
+                and hidden_states.shape[1] == 7168
+                and self.weight.shape[0] == 384
+            ):
+                logits = F.linear(hidden_states, self.weight, None)
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
             elif not _is_cuda:
@@ -752,6 +761,25 @@ class DeepseekV2MoE(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 **(dict(tp_rank=0, tp_size=1) if _shared_expert_use_tp1 else {}),
             )
+            if _use_aiter_bpreshuffle_gfx95 and is_deepseek_v4 and not is_nextn:
+                from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    aiter_w8a8_block_fp8_linear,
+                )
+
+                gate_up = self.shared_experts.gate_up_proj
+                gate_up_method = gate_up.quant_method
+                if (
+                    self.tp_size == 8
+                    and not _shared_expert_use_tp1
+                    and isinstance(gate_up_method, Fp8LinearMethod)
+                    and gate_up_method.block_quant
+                    and gate_up_method.weight_block_size == [128, 128]
+                    and gate_up_method.w8a8_block_fp8_linear
+                    is aiter_w8a8_block_fp8_linear
+                    and tuple(gate_up.weight.shape) == (768, 7168)
+                ):
+                    gate_up._force_deterministic_small_m_bpreshuffle_ck = True
             # Flags must be set before weight load so
             # process_weights_after_loading sees them and builds the
             # [Up, Gate]-interleaved weight + scale.

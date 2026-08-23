@@ -189,12 +189,21 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         device: str = "cpu",
         pin_memory: bool = True,
         allocator_type: str = "default",
+        require_full_page_transfers: bool = False,
+        write_back_staging_page_chunk: int = _WRITE_BACK_STAGING_PAGE_CHUNK,
     ):
+        if write_back_staging_page_chunk <= 0:
+            raise ValueError(
+                "write-back staging page chunk must be positive, got "
+                f"{write_back_staging_page_chunk}"
+            )
         self.pool_name = pool_name
         self.layer_num = len(device_buffers)
         self.item_bytes = item_bytes
         self.num_host_pages = num_host_pages
         self.slot_page_size = slot_page_size
+        self.require_full_page_transfers = require_full_page_transfers
+        self.write_back_staging_page_chunk = write_back_staging_page_chunk
         self.dtype = torch.uint8
         self.device = device
         self.pin_memory = pin_memory
@@ -290,7 +299,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
             element_size=self.item_bytes * self.dtype.itemsize,
         )
-        staging_page_capacity = min(self.num_host_pages, _WRITE_BACK_STAGING_PAGE_CHUNK)
+        staging_page_capacity = min(
+            self.num_host_pages, self.write_back_staging_page_chunk
+        )
         self.staging_buffer = torch.empty(
             (staging_page_capacity, self.layer_num, self.item_bytes),
             dtype=self.dtype,
@@ -317,6 +328,31 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 f"{self.pool_name} transfer index size mismatch: "
                 f"host={host_indices.numel()}, device={device_indices.numel()}"
             )
+        if getattr(self, "require_full_page_transfers", False):
+            page_offsets = torch.arange(
+                self.slot_page_size,
+                dtype=host_indices.dtype,
+                device=host_indices.device,
+            )
+            for name, indices in (
+                ("host", host_indices),
+                ("device", device_indices),
+            ):
+                if indices.numel() % self.slot_page_size != 0:
+                    raise ValueError(
+                        f"{self.pool_name} DCP transfers require complete widened "
+                        f"pages of {self.slot_page_size} slots; got {name}="
+                        f"{indices.numel()}."
+                    )
+                pages = indices.reshape(-1, self.slot_page_size)
+                starts = pages[:, :1]
+                if torch.any(starts % self.slot_page_size != 0) or not torch.equal(
+                    pages, starts + page_offsets.to(indices.device)
+                ):
+                    raise ValueError(
+                        f"{self.pool_name} DCP {name} indices must contain aligned, "
+                        "contiguous widened pages."
+                    )
         return host_indices.numel() > 0
 
     def get_size_per_token(self):
@@ -369,6 +405,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
     ):
         if not self._has_transfer_indices(host_indices, device_indices):
             return
+        wait_ready = getattr(device_pool, "wait_ready_indices", None)
+        if wait_ready is not None:
+            wait_ready(device_indices)
         if (
             host_indices.numel() % self.slot_page_size != 0
             or device_indices.numel() % self.slot_page_size != 0
@@ -383,6 +422,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 src_indices=device_indices.to(dtype=torch.int64),
                 dst_indices=host_indices.to(dtype=torch.int64),
             )
+            record_ready = getattr(device_pool, "record_ready_indices", None)
+            if record_ready is not None:
+                record_ready(device_indices)
             return
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
@@ -436,6 +478,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             raise ValueError(
                 f"Unsupported V4 paged host layout/backend: {self.layout}/{io_backend}"
             )
+        record_ready = getattr(device_pool, "record_ready_indices", None)
+        if record_ready is not None:
+            record_ready(device_indices)
 
     def load_to_device_per_layer(
         self,
@@ -449,6 +494,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
     ):
         if not self._has_transfer_indices(host_indices, device_indices):
             return
+        wait_ready = getattr(device_pool, "wait_ready_indices", None)
+        if wait_ready is not None:
+            wait_ready(device_indices)
         if (
             host_indices.numel() % self.slot_page_size != 0
             or device_indices.numel() % self.slot_page_size != 0
@@ -461,6 +509,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 src_indices=host_indices.to(dtype=torch.int64),
                 dst_indices=device_indices.to(dtype=torch.int64),
             )
+            record_ready = getattr(device_pool, "record_ready_indices", None)
+            if record_ready is not None:
+                record_ready(device_indices)
             return
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
@@ -504,6 +555,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             raise ValueError(
                 f"Unsupported V4 paged host layout/backend: {self.layout}/{io_backend}"
             )
+        record_ready = getattr(device_pool, "record_ready_indices", None)
+        if record_ready is not None:
+            record_ready(device_indices)
 
     def get_data_page(self, index, flat=True):
         index = int(index) // self.slot_page_size

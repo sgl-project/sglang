@@ -11,7 +11,13 @@ from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
     merge_graph_time_usage,
 )
-from sglang.srt.runtime_context import get_disagg, get_exec, get_memory, get_schedule
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_memory,
+    get_parallel,
+    get_schedule,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import (
@@ -258,6 +264,16 @@ class BaseSpecWorker(ABC):
             return HiCacheDraftPlan(
                 mode=HiCacheDraftMode.PACKED,
                 device_pools=draft_pools,
+            )
+
+        if (
+            get_parallel().dcp_enabled
+            and spec_algorithm.is_dspark()
+            and getattr(target_model_runner.model_config, "is_deepseek_v4_arch", False)
+        ):
+            raise NotImplementedError(
+                "DeepSeek V4 DCP HiCache requires the packed DSpark draft model; "
+                "draft sidecar pools do not support DCP index translation."
             )
 
         return HiCacheDraftPlan(

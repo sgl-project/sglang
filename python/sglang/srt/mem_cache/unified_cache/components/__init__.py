@@ -1,3 +1,6 @@
+from sglang.srt.mem_cache.unified_cache.components.dsv4_continuation_component import (
+    DSV4ContinuationComponent,
+)
 from sglang.srt.mem_cache.unified_cache.components.full_component import FullComponent
 from sglang.srt.mem_cache.unified_cache.components.mamba_component import MambaComponent
 from sglang.srt.mem_cache.unified_cache.components.swa_component import SWAComponent
@@ -20,6 +23,7 @@ __all__ = [
     "BASE_COMPONENT_TYPE",
     "ComponentData",
     "ComponentType",
+    "DSV4ContinuationComponent",
     "EvictLayer",
     "FullComponent",
     "CacheTransferPhase",

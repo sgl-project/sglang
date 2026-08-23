@@ -720,7 +720,12 @@ class Fp8LinearMethod(LinearMethodBase):
             and self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
         ):
             n, k = layer.weight.shape
-            if not use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k):
+            force_bpreshuffle_ck = getattr(
+                layer, "_force_deterministic_small_m_bpreshuffle_ck", False
+            )
+            if force_bpreshuffle_ck or not use_aiter_triton_gemm_w8a8_tuned_gfx950(
+                n, k
+            ):
                 # TODO(1am9trash), to deal with case that this branch chance
                 # drops as use_aiter_triton_gemm_w8a8_tuned_gfx950() expands
                 t = shuffle_weight(layer.weight, (16, 16))
@@ -1013,6 +1018,11 @@ class Fp8LinearMethod(LinearMethodBase):
                     True,  # is_vnni
                 )
 
+            input_tensor = x[0] if isinstance(x, tuple) else x
+            force_bpreshuffle_ck = (
+                getattr(layer, "_force_deterministic_small_m_bpreshuffle_ck", False)
+                and input_tensor.numel() // input_tensor.shape[-1] <= 32
+            )
             if isinstance(x, tuple):
                 return self.w8a8_block_fp8_linear(
                     input=x[0],
@@ -1021,6 +1031,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale=layer.weight_scale_inv,
                     input_scale=x[1],
                     bias=bias,
+                    **({"force_bpreshuffle_ck": True} if force_bpreshuffle_ck else {}),
                 )
 
             return self.w8a8_block_fp8_linear(
@@ -1030,6 +1041,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_scale=layer.weight_scale_inv,
                 input_scale=None,
                 bias=bias,
+                **({"force_bpreshuffle_ck": True} if force_bpreshuffle_ck else {}),
             )
 
         if isinstance(x, tuple):

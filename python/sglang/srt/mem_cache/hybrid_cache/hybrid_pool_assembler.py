@@ -410,6 +410,58 @@ def _deepseek_v4_num_host_pages(
     return full_host_pages, swa_host_pages
 
 
+def _deepseek_v4_continuation_num_host_slots(
+    *, num_host_pages: int, continuation_num_slots: int, hicache_ratio: float
+) -> int:
+    return max(num_host_pages, int(continuation_num_slots * hicache_ratio), 1)
+
+
+def _validate_deepseek_v4_dcp_hicache_geometry(
+    *, params: CacheInitParams, kvcache: Any, requested_dcp_size: int
+) -> bool:
+    allocator = params.token_to_kv_pool_allocator
+    if requested_dcp_size <= 1:
+        return False
+    if not getattr(allocator, "supports_dsv4_dcp", False):
+        raise NotImplementedError(
+            "DeepSeek V4 DCP HiCache requires the widened DSV4 DCP allocator."
+        )
+
+    dcp_size = getattr(allocator, "dcp_size", 1)
+    if dcp_size != requested_dcp_size:
+        raise ValueError(
+            "DeepSeek V4 DCP HiCache allocator size does not match the requested "
+            f"DCP size: requested {requested_dcp_size}, allocator {dcp_size}."
+        )
+    expected_page_size = getattr(allocator, "physical_page_size", 0) * dcp_size
+    if dcp_size <= 1 or expected_page_size <= 0:
+        raise ValueError("DeepSeek V4 DCP HiCache received invalid allocator geometry.")
+    if not getattr(kvcache, "supports_dsv4_dcp", False) or not getattr(
+        kvcache, "_unified_kv", False
+    ):
+        raise NotImplementedError(
+            "DeepSeek V4 DCP HiCache requires the ROCm unified-KV pool."
+        )
+    if (
+        params.page_size != expected_page_size
+        or getattr(allocator, "page_size", None) != expected_page_size
+    ):
+        raise ValueError(
+            "DeepSeek V4 DCP HiCache requires the widened allocator page size: "
+            f"expected {expected_page_size}, got params={params.page_size}, "
+            f"allocator={getattr(allocator, 'page_size', None)}."
+        )
+    if (
+        getattr(kvcache, "dcp_size", None) != dcp_size
+        or getattr(kvcache, "dcp_rank", None) != getattr(allocator, "dcp_rank", None)
+        or getattr(kvcache, "logical_page_size", None) != expected_page_size
+    ):
+        raise ValueError(
+            "DeepSeek V4 DCP HiCache KV-pool geometry does not match its allocator."
+        )
+    return True
+
+
 def _dsv4_compressed_region_buffers(kvcache: Any, ratio: int) -> tuple[list, int]:
     """
     Resolve ``(device_buffers, item_bytes)`` for a DeepSeek V4 C4/C128 main-KV
@@ -430,12 +482,19 @@ def build_deepseek_v4_hicache_stack(
     storage_backend: Optional[str],
     host_swa_evict_fn: Optional[Callable[[int], Any]] = None,
     device_swa_evict_fn: Optional[Callable[[int], Any]] = None,
+    host_continuation_evict_fn: Optional[Callable[[int], Any]] = None,
+    device_continuation_evict_fn: Optional[Callable[[int], Any]] = None,
     prefetch_threshold: int = 256,
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     page_size = params.page_size
+    dcp_enabled = _validate_deepseek_v4_dcp_hicache_geometry(
+        params=params,
+        kvcache=kvcache,
+        requested_dcp_size=server_args.dcp_size,
+    )
     transfer_layer_num = kvcache.end_layer - kvcache.start_layer
     full_layer_mapping = {layer_id: layer_id for layer_id in range(transfer_layer_num)}
 
@@ -509,6 +568,36 @@ def build_deepseek_v4_hicache_stack(
         ),
     ]
 
+    continuation_pool = getattr(params, "dsv4_continuation_pool", None)
+    if continuation_pool is not None:
+        continuation_host_pool = DeepSeekV4PagedHostPool(
+            pool_name=str(PoolName.DSV4_CONTINUATION),
+            device_buffers=[continuation_pool.buffer],
+            item_bytes=continuation_pool.payload_bytes,
+            num_host_pages=_deepseek_v4_continuation_num_host_slots(
+                num_host_pages=num_host_pages,
+                continuation_num_slots=continuation_pool.num_slots,
+                hicache_ratio=get_memory().hicache_ratio,
+            ),
+            slot_page_size=1,
+            layout=server_args.hicache_mem_layout,
+            allocator_type=_get_allocator_type(server_args),
+            write_back_staging_page_chunk=1,
+        )
+        entries.append(
+            build_pool_entry(
+                name=PoolName.DSV4_CONTINUATION,
+                host_pool=continuation_host_pool,
+                device_pool=continuation_pool,
+                layer_mapping={0: 0},
+                transfer_layer_num=transfer_layer_num,
+                host_evict_fn=host_continuation_evict_fn,
+                device_evict_fn=device_continuation_evict_fn,
+                device_alloc_fn=continuation_pool.alloc,
+                device_free_fn=continuation_pool.free,
+            )
+        )
+
     if not is_unified_kv:
         swa_host_pool = DeepSeekV4PagedHostPool(
             pool_name=str(PoolName.SWA),
@@ -547,6 +636,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=_get_allocator_type(server_args),
+            require_full_page_transfers=dcp_enabled,
         )
         c4_indexer_host_pool = DeepSeekV4PagedHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER),
@@ -559,6 +649,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=_get_allocator_type(server_args),
+            require_full_page_transfers=dcp_enabled,
         )
         entries.extend(
             [
@@ -633,6 +724,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=_get_allocator_type(server_args),
+            require_full_page_transfers=dcp_enabled,
         )
         # C128 state pool is intentionally not registered with hicache.
         # page_size=256 % 128 == 0, so state pool is not consumed on load.
@@ -1148,6 +1240,10 @@ _COMPONENT_HOST_ATTR: dict[ComponentType, tuple[str, str]] = {
     ComponentType.FULL: ("full_kv_pool_host", "_full_kv_pool_host"),
     ComponentType.SWA: ("swa_kv_pool_host", "_swa_kv_pool_host"),
     ComponentType.MAMBA: ("mamba_pool_host", "_mamba_pool_host"),
+    ComponentType.DSV4_CONTINUATION: (
+        "dsv4_continuation_pool_host",
+        "_host_pool",
+    ),
 }
 
 
@@ -1191,10 +1287,14 @@ class _DeepSeekV4Strategy(StackStrategy):
             DeepSeekV4TokenToKVPool,
         )
 
-        return isinstance(kvcache, DeepSeekV4TokenToKVPool) and components == {
-            ComponentType.FULL,
-            ComponentType.SWA,
-        }
+        return isinstance(kvcache, DeepSeekV4TokenToKVPool) and components in (
+            {ComponentType.FULL, ComponentType.SWA},
+            {
+                ComponentType.FULL,
+                ComponentType.SWA,
+                ComponentType.DSV4_CONTINUATION,
+            },
+        )
 
     def build(
         self,
@@ -1220,6 +1320,12 @@ class _DeepSeekV4Strategy(StackStrategy):
             storage_backend=storage_backend,
             host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
             device_swa_evict_fn=lambda n: cache.evict(EvictParams(swa_num_tokens=n)),
+            host_continuation_evict_fn=lambda n: cache.evict_host(
+                n, ComponentType.DSV4_CONTINUATION
+            ),
+            device_continuation_evict_fn=lambda n: cache.evict(
+                EvictParams(dsv4_continuation_num=n)
+            ),
             prefetch_threshold=prefetch_threshold,
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
@@ -1252,6 +1358,10 @@ class _DeepSeekV4Strategy(StackStrategy):
             component_host_pools[ComponentType.SWA] = host_pool_group.get_pool(
                 PoolName.SWA
             )
+        if PoolName.DSV4_CONTINUATION in host_pool_group.entry_map:
+            component_host_pools[ComponentType.DSV4_CONTINUATION] = (
+                host_pool_group.get_pool(PoolName.DSV4_CONTINUATION)
+            )
 
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -1259,7 +1369,7 @@ class _DeepSeekV4Strategy(StackStrategy):
             component_host_pools=component_host_pools,
             sidecars=sidecars,
             transfer_layer_num=kvcache.end_layer - kvcache.start_layer,
-            pools_desc="KV + SWA + DeepSeekV4 sidecars",
+            pools_desc="KV + SWA + DeepSeekV4 sidecars + continuation",
         )
 
 

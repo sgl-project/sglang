@@ -55,3 +55,4 @@ class CacheInitParams:
     )
 
     mtp_draft_device_pools: tuple[object, ...] = ()
+    dsv4_continuation_pool: Optional[object] = None

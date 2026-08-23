@@ -269,6 +269,7 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
@@ -980,6 +981,30 @@ class Scheduler(
                 token_to_kv_pool_allocator=allocator,
             )
             self.draft_worker.init_hicache_draft_plan()
+
+        model_runner = self.tp_worker.model_runner
+        config = model_runner.memory_pool_config
+        if config.dsv4_continuation_num_slots:
+            from sglang.srt.mem_cache.deepseek_v4_continuation import (
+                DeepSeekV4ContinuationPool,
+            )
+
+            continuation_pool = DeepSeekV4ContinuationPool(
+                target_pool=model_runner.token_to_kv_pool,
+                draft_pools=model_runner.mtp_draft_device_pools,
+                req_to_token_pool=model_runner.req_to_token_pool,
+                num_slots=config.dsv4_continuation_num_slots,
+            )
+            if (
+                continuation_pool.payload_bytes
+                != config.dsv4_continuation_payload_bytes
+            ):
+                raise RuntimeError(
+                    "DSV4 continuation payload sizing mismatch: "
+                    f"configured={config.dsv4_continuation_payload_bytes}, "
+                    f"allocated={continuation_pool.payload_bytes}"
+                )
+            model_runner.dsv4_continuation_pool = continuation_pool
 
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""
@@ -3724,6 +3749,165 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
+    def _prepare_dsv4_continuation_capture(self, batch: ScheduleBatch) -> None:
+        batch.dsv4_continuation_capture_slots = None
+        batch.dsv4_continuation_capture_batch_indices = None
+        batch.dsv4_continuation_capture_endpoints = None
+
+        pool = self.tp_worker.model_runner.dsv4_continuation_pool
+        if (
+            pool is None
+            or self.tree_cache.is_chunk_cache()
+            or not batch.forward_mode.is_context_parallel_extend()
+        ):
+            return
+        if batch.seq_lens_cpu is None:
+            raise RuntimeError(
+                "DSV4 continuation capture requires CPU sequence lengths"
+            )
+
+        decoding_req_ids = {id(req) for req in batch.decoding_reqs or ()}
+        candidates = []
+        for batch_index, (req, endpoint_tensor) in enumerate(
+            zip(batch.reqs, batch.seq_lens_cpu, strict=True)
+        ):
+            endpoint = int(endpoint_tensor)
+            if (
+                id(req) in decoding_req_ids
+                or req.req_pool_idx is None
+                or req.is_retracted
+                or req.skip_radix_cache_insert
+                or (req.session is not None and req.session.streaming)
+                or req.dsv4_continuation_value is not None
+                or endpoint < pool.target_pool.unified_swa_window
+                or endpoint % pool.logical_page_size != 0
+            ):
+                continue
+            candidates.append((batch_index, endpoint))
+
+        if not candidates:
+            return
+
+        needed = len(candidates)
+        if pool.available_size() < needed:
+            self.tree_cache.evict(
+                EvictParams(dsv4_continuation_num=needed - pool.available_size())
+            )
+        capture_count = min(needed, pool.available_size())
+        if capture_count == 0:
+            return
+        slots = pool.alloc(capture_count)
+        if slots is None:
+            return
+
+        selected = candidates[:capture_count]
+        batch.dsv4_continuation_capture_slots = slots
+        batch.dsv4_continuation_capture_batch_indices = [
+            batch_index for batch_index, _ in selected
+        ]
+        batch.dsv4_continuation_capture_endpoints = [
+            endpoint for _, endpoint in selected
+        ]
+
+    def _prepare_dsv4_continuation_restore(self, batch: ScheduleBatch) -> None:
+        batch.dsv4_continuation_restore_slots = None
+        batch.dsv4_continuation_restore_batch_indices = None
+        batch.dsv4_continuation_restore_endpoints = None
+
+        pool = self.tp_worker.model_runner.dsv4_continuation_pool
+        if (
+            pool is None
+            or self.tree_cache.is_chunk_cache()
+            or not batch.forward_mode.is_context_parallel_extend()
+        ):
+            return
+
+        decoding_req_ids = {id(req) for req in batch.decoding_reqs or ()}
+        slots = []
+        batch_indices = []
+        endpoints = []
+        for batch_index, req in enumerate(batch.reqs):
+            if id(req) in decoding_req_ids or req.dsv4_continuation_node is None:
+                continue
+            value = self.tree_cache.get_dsv4_continuation_value(
+                req.dsv4_continuation_node
+            )
+            if value is None:
+                raise RuntimeError(
+                    f"matched DSV4 continuation is not device-resident for {req.rid}"
+                )
+            endpoint = len(req.prefix_indices)
+            if endpoint <= 0 or endpoint % pool.logical_page_size != 0:
+                raise RuntimeError(
+                    "matched DSV4 continuation endpoint is not logical-page aligned: "
+                    f"rid={req.rid}, endpoint={endpoint}"
+                )
+            slots.append(value)
+            batch_indices.append(batch_index)
+            endpoints.append(endpoint)
+            req.dsv4_continuation_node = None
+            req.dsv4_continuation_host_hit = False
+
+        if slots:
+            batch.dsv4_continuation_restore_slots = torch.cat(slots)
+            batch.dsv4_continuation_restore_batch_indices = batch_indices
+            batch.dsv4_continuation_restore_endpoints = endpoints
+
+    def _handoff_dsv4_continuation_capture(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        slots = result.dsv4_continuation_slots
+        batch_indices = result.dsv4_continuation_batch_indices
+        endpoints = result.dsv4_continuation_endpoints
+        if slots is None:
+            if batch.dsv4_continuation_capture_slots is not None:
+                self.tp_worker.model_runner.dsv4_continuation_pool.free(
+                    batch.dsv4_continuation_capture_slots
+                )
+                raise RuntimeError("DSV4 continuation capture result is missing")
+            return
+        if (
+            batch_indices is None
+            or endpoints is None
+            or slots.numel() != len(batch_indices)
+            or slots.numel() != len(endpoints)
+        ):
+            self.tp_worker.model_runner.dsv4_continuation_pool.free(slots)
+            raise RuntimeError("invalid DSV4 continuation capture result")
+
+        requests = []
+        for batch_index in batch_indices:
+            if not 0 <= batch_index < len(batch.reqs):
+                self.tp_worker.model_runner.dsv4_continuation_pool.free(slots)
+                raise RuntimeError("DSV4 continuation result batch index is invalid")
+            requests.append(batch.reqs[batch_index])
+        duplicate = next(
+            (req for req in requests if req.dsv4_continuation_value is not None),
+            None,
+        )
+        if duplicate is not None:
+            self.tp_worker.model_runner.dsv4_continuation_pool.free(slots)
+            raise RuntimeError(
+                f"request {duplicate.rid} already owns DSV4 continuation state"
+            )
+
+        discarded = []
+        for offset, (req, endpoint) in enumerate(zip(requests, endpoints, strict=True)):
+            slot = slots[offset : offset + 1]
+            if req.is_retracted or req.finished() or req.skip_radix_cache_insert:
+                discarded.append(slot)
+                continue
+            req.dsv4_continuation_value = slot
+            req.dsv4_continuation_endpoint = endpoint
+        if discarded:
+            self.tp_worker.model_runner.dsv4_continuation_pool.free(
+                torch.cat(discarded)
+            )
+
+        batch.dsv4_continuation_capture_slots = None
+        batch.dsv4_continuation_capture_batch_indices = None
+        batch.dsv4_continuation_capture_endpoints = None
+
     @scheduler_nvtx_method("scheduler.run_batch")
     def run_batch(
         self,
@@ -3749,6 +3933,9 @@ class Scheduler(
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
+
+        self._prepare_dsv4_continuation_restore(batch)
+        self._prepare_dsv4_continuation_capture(batch)
 
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -3894,6 +4081,8 @@ class Scheduler(
                     self._relay_forward_payload(batch.req_pool_indices, batch_result)
                     batch.input_ids = None
                 self.update_cache_from_scheduler(batch, batch_result)
+
+            self._handoff_dsv4_continuation_capture(batch, batch_result)
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that

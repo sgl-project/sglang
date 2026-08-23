@@ -1251,6 +1251,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result = EvictDeviceLeafResult()
         node = self.node_by_id(node_id)
         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
+        if is_write_back and self._needs_incremental_component_backup(node):
+            result.backup_kv = self._build_backup_kv_action(node, write_back=True)
+            return result
         if not node.backuped:
             if is_write_back:
                 result.backup_kv = self._build_backup_kv_action(node, write_back=True)
@@ -1271,17 +1274,39 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         return result
 
+    def evict_component_device_node(
+        self,
+        node_id: NodeId,
+        component_type: ComponentType,
+        require_host_backup: bool,
+    ) -> EvictDeviceLeafResult:
+        result = EvictDeviceLeafResult()
+        node = self.node_by_id(node_id)
+        component = self.components_by_type[component_type]
+        cd = node.component_data[component_type]
+        assert component_type != BASE_COMPONENT_TYPE
+        assert cd.value is not None and cd.lock_ref == 0
+        if require_host_backup and component.needs_incremental_backup(node):
+            result.backup_kv = self._build_backup_kv_action(node, write_back=True)
+            return result
+        self._evict_component_and_detach_lru(
+            node,
+            component,
+            target=EvictLayer.DEVICE,
+            tracker=result.tracker,
+            device_frees=result.device_frees,
+            host_frees=result.host_frees,
+        )
+        self._update_evictable_leaf_sets(node)
+        return result
+
     def drop_subtree_no_host(self, node_id: NodeId) -> DropSubtreeNoHostResult:
-        """Write-back fallback when a D-leaf's D->H backup fails under host
-        memory pressure: drop the subtree rooted at the unbacked leaf so
-        device eviction keeps making progress instead of leaving its KV
-        unevictable until host space frees up."""
+        """Drop an unbacked D-leaf after its D->H backup fails."""
         result = DropSubtreeNoHostResult(is_dropped=False)
         node = self.node_by_id(node_id)
         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
-        # A failed backup never issues the D->H copy, so the subtree root has
-        # no host state and no in-flight DMA reading its device slots.
-        assert not node.backuped and node.write_through_pending_id is None
+        if node.backuped or node.write_through_pending_id is not None:
+            return result
         if any(cd.host_lock_ref > 0 for cd in node.component_data):
             return result
         descendants: list[UnifiedTreeNode] = []
@@ -1549,6 +1574,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if comp.eviction_priority(is_leaf) <= trigger_priority:
                 if comp is not trigger and comp.node_has_component_data(node, target):
                     cd = node.component_data[comp.component_type]
+                    if (
+                        EvictLayer.DEVICE in target
+                        and self.is_write_back
+                        and comp.needs_incremental_backup(node)
+                    ):
+                        continue
                     # A comp whose TRUE internal priority outranks the trigger
                     # is only in this loop because leaf-collapse flattened
                     # priorities; a lock on it is a legit pin and must be

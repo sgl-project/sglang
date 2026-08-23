@@ -599,6 +599,27 @@ class TpModelWorker(BaseTpWorker):
                 capture_hidden_mode is None
             ), "capture_hidden_mode override requires a ScheduleBatch input"
 
+        if batch is not None and batch.dsv4_continuation_restore_slots is not None:
+            continuation_pool = self.model_runner.dsv4_continuation_pool
+            if continuation_pool is None:
+                raise RuntimeError("DSV4 continuation restore pool is unavailable")
+            if self.hicache_layer_transfer_counter is not None:
+                self.hicache_layer_transfer_counter.wait_until(
+                    self.hicache_layer_transfer_counter.num_layers - 1
+                )
+            batch_indices = batch.dsv4_continuation_restore_batch_indices
+            endpoints = batch.dsv4_continuation_restore_endpoints
+            if batch_indices is None or endpoints is None:
+                raise RuntimeError("incomplete DSV4 continuation restore plan")
+            continuation_pool.restore_batch(
+                slots=batch.dsv4_continuation_restore_slots,
+                req_pool_indices=forward_batch.req_pool_indices[batch_indices],
+                req_pool_indices_cpu=[
+                    int(batch.req_pool_indices_cpu[index]) for index in batch_indices
+                ],
+                endpoints=endpoints,
+            )
+
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 

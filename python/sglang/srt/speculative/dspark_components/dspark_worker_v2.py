@@ -436,9 +436,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
-            return self._forward_prefill(batch, on_publish)
+            result = self._forward_prefill(batch, on_publish)
+        else:
+            result = self._forward_decode(batch, on_publish, grammar_barrier)
 
-        return self._forward_decode(batch, on_publish, grammar_barrier)
+        read_done = torch.get_device_module(self.device).Event()
+        read_done.record()
+        self.model_runner.shared_read_done_event = read_done
+        return result
 
     def _forward_prefill(
         self, batch: ScheduleBatch, on_publish
@@ -456,8 +461,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
         batch_output.new_seq_lens = batch.seq_lens
-        if on_publish is not None:
-            on_publish(batch_output.new_seq_lens)
 
         if logits_output.hidden_states is None:
             raise RuntimeError(
@@ -504,8 +507,30 @@ class DSparkWorkerV2(BaseSpecWorker):
             state_slot=state_slot,
             final_pos=final_pos,
         )
+
+        capture_slots = batch.dsv4_continuation_capture_slots
+        capture_indices = batch.dsv4_continuation_capture_batch_indices
+        capture_endpoints = batch.dsv4_continuation_capture_endpoints
+        if capture_slots is not None:
+            if not capture_indices or not capture_endpoints:
+                raise RuntimeError("incomplete DSV4 continuation capture plan")
+            continuation_pool = self.model_runner.dsv4_continuation_pool
+            if continuation_pool is None:
+                raise RuntimeError("DSV4 continuation capture pool is unavailable")
+            continuation_pool.capture_batch(
+                slots=capture_slots,
+                req_pool_indices=batch.req_pool_indices[capture_indices],
+                endpoints=capture_endpoints,
+            )
+            batch_output.dsv4_continuation_slots = capture_slots
+            batch_output.dsv4_continuation_batch_indices = capture_indices
+            batch_output.dsv4_continuation_endpoints = capture_endpoints
+
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
+
+        if on_publish is not None:
+            on_publish(batch_output.new_seq_lens)
 
         batch_output.next_draft_input = make_next_draft_input(
             bonus_tokens=next_token_ids,
@@ -723,6 +748,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
         )
+        self._clear_unaccepted_target_c128_states(
+            batch=batch,
+            seq_lens_pre_verify=prefix_lens,
+            commit_lens=accept.commit_lens,
+        )
         if batch.return_logprob:
             compute_spec_logprobs(
                 batch,
@@ -797,6 +827,28 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
+            extra_keep_alive_refs=[target_verify.verify_forward_batch],
+        )
+
+    def _clear_unaccepted_target_c128_states(
+        self,
+        *,
+        batch: ScheduleBatch,
+        seq_lens_pre_verify: torch.Tensor,
+        commit_lens: torch.Tensor,
+    ) -> None:
+        clear_unaccepted = getattr(
+            self.model_runner.token_to_kv_pool,
+            "clear_unaccepted_c128_draft_states",
+            None,
+        )
+        if clear_unaccepted is None or batch.forward_mode.is_idle():
+            return
+        clear_unaccepted(
+            batch.req_pool_indices,
+            seq_lens_pre_verify,
+            commit_lens,
+            self.verify_num_draft_tokens,
         )
 
     def _commit_target_mamba_states_after_verify(

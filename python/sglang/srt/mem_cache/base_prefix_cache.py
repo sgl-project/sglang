@@ -70,6 +70,7 @@ class InsertParams:
 
     # DSV4 NPU C128 sidecar pages, one page id per physical C128 page group.
     c128_value: Optional[torch.Tensor] = None
+    dsv4_continuation_value: Optional[torch.Tensor] = None
 
     # SWA specific
     prev_prefix_len: int = 0
@@ -88,6 +89,7 @@ class InsertResult:
     total_len: int = 0
     last_device_node: Any = None
     mamba_exist: bool = False
+    dsv4_continuation_exist: bool = False
     inserted_host_node: Any = None
     host_insert_dropped: bool = False
     # Controller-applied actions from the non-stepped channels (e.g. insert_host); the stepped insert emits via InsertStepResult.actions.
@@ -103,6 +105,7 @@ class EvictParams:
     num_tokens: int = 0
     swa_num_tokens: int = 0
     mamba_num: int = 0
+    dsv4_continuation_num: int = 0
 
 
 @dataclasses.dataclass
@@ -190,6 +193,8 @@ class MatchResult(NamedTuple):
                             window) and will be load-back into the SWA device pool.
         mamba_host_hit_length:   Number of Mamba slots that hit on host and will be load-back
                             into the Mamba device pool. Typically 0 or 1.
+        dsv4_continuation_host_hit: Whether the matched DSV4 continuation state exists
+                        only on host and needs load-back.
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
                                 page-aligned position that could've been cache hit if there
                                 exists a mamba state.
@@ -209,6 +214,7 @@ class MatchResult(NamedTuple):
     full_kv_hit_length: int = 0
     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
+    dsv4_continuation_host_hit: bool = False
 
 
 def zero_match_result(
@@ -228,6 +234,7 @@ def zero_match_result(
         host_hit_length=0,
         swa_host_hit_length=0,
         mamba_host_hit_length=0,
+        dsv4_continuation_host_hit=False,
         full_kv_hit_length=0,
     )
 
@@ -397,6 +404,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         # trailing sliding window for re-prefill; every other cache keeps SWA
         # content-stable and overrides this where relevant.
         return 0
+
+    def get_dsv4_continuation_value(self, node_id) -> Optional[torch.Tensor]:
+        """Return a tree-owned continuation slot for a matched endpoint."""
+        return None
 
     def supports_mamba(self) -> bool:
         return False

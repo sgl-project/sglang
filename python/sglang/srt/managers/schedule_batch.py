@@ -962,6 +962,9 @@ class Req(ReqDllmMixin):
         # Lazy extra buffer: skip radix cache insert when prealloc failed at
         # boundary — the forward overwrites the only slot, corrupting the state.
         self.mamba_lazy_is_insert: bool = True
+        self.dsv4_continuation_value: Optional[torch.Tensor] = None
+        self.dsv4_continuation_endpoint: Optional[int] = None
+        self.dsv4_continuation_node: Any = None
 
         # Check finish
         self.tokenizer = None
@@ -1011,6 +1014,7 @@ class Req(ReqDllmMixin):
         self.host_hit_length = 0
         self.swa_host_hit_length = 0
         self.mamba_host_hit_length = 0
+        self.dsv4_continuation_host_hit = False
         # Total cached prefix length (on-device prefix_indices + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
         # time and used to estimate uncached tokens / sort by longest prefix for
@@ -1236,6 +1240,7 @@ class Req(ReqDllmMixin):
             self.host_hit_length > 0
             or self.swa_host_hit_length > 0
             or self.mamba_host_hit_length > 0
+            or self.dsv4_continuation_host_hit
         )
 
     def effective_kv_committed_len(self) -> int:
@@ -1375,6 +1380,7 @@ class Req(ReqDllmMixin):
                 match_result = zero_match_result(
                     tree_cache, match_result, extra_key=self.extra_key
                 )
+                self.dsv4_continuation_node = None
             (
                 self.prefix_indices,
                 self.last_node,
@@ -1383,6 +1389,7 @@ class Req(ReqDllmMixin):
                 self.host_hit_length,
                 self.swa_host_hit_length,
                 self.mamba_host_hit_length,
+                self.dsv4_continuation_host_hit,
                 self.mamba_branching_seqlen,
             ) = (
                 match_result.device_indices,
@@ -1392,6 +1399,7 @@ class Req(ReqDllmMixin):
                 match_result.host_hit_length,
                 match_result.swa_host_hit_length,
                 match_result.mamba_host_hit_length,
+                match_result.dsv4_continuation_host_hit,
                 match_result.mamba_branching_seqlen,
             )
             if match_result.cache_protected_len is not None:
@@ -1703,6 +1711,10 @@ class Req(ReqDllmMixin):
         self.mamba_branching_seqlen = None
         self.mamba_cow_src_index = None
         self.mamba_needs_clear = False
+        self.dsv4_continuation_value = None
+        self.dsv4_continuation_endpoint = None
+        self.dsv4_continuation_node = None
+        self.dsv4_continuation_host_hit = False
         self.already_computed = 0
         assert self.kv is None, "expect it is already released"
         self.kv_committed_len = 0
@@ -2095,6 +2107,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
+    # Scheduler-owned capture plan consumed by DSpark prefill. The slots are
+    # compact; batch_indices/endpoints preserve the original request order.
+    dsv4_continuation_capture_slots: Optional[torch.Tensor] = None
+    dsv4_continuation_capture_batch_indices: Optional[List[int]] = None
+    dsv4_continuation_capture_endpoints: Optional[List[int]] = None
+    dsv4_continuation_restore_slots: Optional[torch.Tensor] = None
+    dsv4_continuation_restore_batch_indices: Optional[List[int]] = None
+    dsv4_continuation_restore_endpoints: Optional[List[int]] = None
     # DSV4-NPU: KV-only per-pool slot bundle from
     # DSV4NPUTokenToKVPoolAllocator (None elsewhere).
     out_cache_loc_dsv4: Optional[Any] = None

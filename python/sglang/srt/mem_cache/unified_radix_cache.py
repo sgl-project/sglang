@@ -61,6 +61,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
     ComponentType,
+    DSV4ContinuationComponent,
     FullComponent,
     MambaComponent,
     PrepareLoadBackResult,
@@ -105,6 +106,7 @@ _COMPONENT_POOL_LABEL = {
     ComponentType.FULL: PoolName.KV.value,
     ComponentType.SWA: PoolName.SWA.value,
     ComponentType.MAMBA: PoolName.MAMBA.value,
+    ComponentType.DSV4_CONTINUATION: "dsv4_continuation",
 }
 
 
@@ -112,6 +114,7 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
     ComponentType.FULL: FullComponent,
     ComponentType.MAMBA: MambaComponent,
     ComponentType.SWA: SWAComponent,
+    ComponentType.DSV4_CONTINUATION: DSV4ContinuationComponent,
 }
 
 
@@ -494,7 +497,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(
         same_params=["params"],
-        same_results=["result.full_kv_hit_length", "result.swa_host_hit_length"],
+        same_results=[
+            "result.full_kv_hit_length",
+            "result.swa_host_hit_length",
+            "result.dsv4_continuation_host_hit",
+        ],
     )
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)
@@ -545,6 +552,7 @@ class UnifiedRadixCache(BasePrefixCache):
             ComponentType.SWA: params.swa_num_tokens,
             ComponentType.MAMBA: params.mamba_num,
             ComponentType.C128: 0,
+            ComponentType.DSV4_CONTINUATION: params.dsv4_continuation_num,
         }
         self._evict_components(request_by_type, tracker)
 
@@ -602,6 +610,21 @@ class UnifiedRadixCache(BasePrefixCache):
         self._accumulate_tracker(tracker, result.tracker)
         return result.backup_kv
 
+    def _evict_component_device_node(
+        self,
+        node_id: NodeId,
+        component_type: ComponentType,
+        tracker: dict[ComponentType, int],
+    ) -> Optional[BackupKV]:
+        result = self.tree_core.evict_component_device_node(
+            node_id,
+            component_type,
+            require_host_backup=self.is_write_back,
+        )
+        self._free_values(result.device_frees, result.host_frees)
+        self._accumulate_tracker(tracker, result.tracker)
+        return result.backup_kv
+
     def _demote(self, node_id: NodeId, tracker: dict[ComponentType, int]) -> None:
         """Demote a backed-up node, consuming its step result."""
         result = self.tree_core.demote(node_id)
@@ -635,6 +658,27 @@ class UnifiedRadixCache(BasePrefixCache):
                 while (
                     node_id := self._evict_device_next_node(ct, tracker)
                 ) is not None:
+                    if ct == ComponentType.DSV4_CONTINUATION:
+                        backup_kv = self._evict_component_device_node(
+                            node_id, ct, tracker
+                        )
+                        if backup_kv is not None:
+                            written = self._execute_and_commit_kv_backup(
+                                backup_kv, write_back=True
+                            )
+                            if written > 0:
+                                self.writing_check(write_back=True)
+                                followup = self._evict_component_device_node(
+                                    node_id, ct, tracker
+                                )
+                                assert followup is None
+                            else:
+                                logger.warning(
+                                    "write_back: continuation backup failed; "
+                                    "node %d stays device-resident",
+                                    node_id,
+                                )
+                        continue
                     backup_kv = self._evict_device_leaf(node_id, tracker)
                     if backup_kv is not None:
                         # Deferred demote: run the D->H backup, demote only on success.
@@ -1263,7 +1307,10 @@ class UnifiedRadixCache(BasePrefixCache):
             if not write_back:
                 lock_params = self.inc_lock_ref(node_id).to_dec_params()
             self._track_write_through_node(node_id, lock_params)
-            written = len(host_indices)
+            # Auxiliary-only backups intentionally carry an empty Full-KV
+            # anchor. Count a completed component transfer as success so the
+            # write-back eviction driver can wait for its ack before demoting.
+            written = max(written, len(host_indices), int(bool(comp_xfers)))
         return written
 
     def _build_backup_sidecar(self, device_value, comp_xfers):
@@ -2549,10 +2596,15 @@ class UnifiedRadixCache(BasePrefixCache):
             or params.host_hit_length > 0
             or (
                 req is not None
-                and (req.swa_host_hit_length > 0 or req.mamba_host_hit_length > 0)
+                and (
+                    req.swa_host_hit_length > 0
+                    or req.mamba_host_hit_length > 0
+                    or req.dsv4_continuation_host_hit
+                )
             )
         ):
             if self.load_back(best_match_node_id, mem_quota, req=req):
+                req.dsv4_continuation_host_hit = False
                 new_indices = self.tree_core.collect_full_device_indices(
                     best_match_node_id, last_best_match_device_node_id
                 )
@@ -2676,12 +2728,21 @@ class UnifiedRadixCache(BasePrefixCache):
         layout.
         """
         swa = self.components.get(ComponentType.SWA)
+        if ComponentType.DSV4_CONTINUATION in self.components:
+            return 0
         unified_compress_only_hicache = (
             self.cache_controller is not None
             and swa is not None
             and not self.tree_core.has_swa_host_pool
         )
         return swa.sliding_window_size if unified_compress_only_hicache else 0
+
+    def get_dsv4_continuation_value(self, node_id) -> Optional[torch.Tensor]:
+        if node_id is None or ComponentType.DSV4_CONTINUATION not in self.components:
+            return None
+        return self.tree_core.get_component_device_value(
+            node_id, ComponentType.DSV4_CONTINUATION
+        )
 
     def swa_retain_floor(self, req) -> int | None:
         if not self.is_mamba_enabled or self._sliding_window_size is None:

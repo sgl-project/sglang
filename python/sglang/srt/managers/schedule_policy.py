@@ -169,6 +169,7 @@ def match_prefix_for_req(
         match_result = zero_match_result(
             tree_cache, match_result, extra_key=req.extra_key
         )
+        req.dsv4_continuation_node = None
     (
         req.prefix_indices,
         req.last_node,
@@ -177,6 +178,7 @@ def match_prefix_for_req(
         req.host_hit_length,
         req.swa_host_hit_length,
         req.mamba_host_hit_length,
+        req.dsv4_continuation_host_hit,
     ) = (
         match_result.device_indices,
         match_result.last_device_node,
@@ -185,6 +187,7 @@ def match_prefix_for_req(
         match_result.host_hit_length,
         match_result.swa_host_hit_length,
         match_result.mamba_host_hit_length,
+        match_result.dsv4_continuation_host_hit,
     )
     max_len = req._compute_max_prefix_len(len(token_ids))
     req.num_matched_prefix_tokens = min(
@@ -1334,6 +1337,8 @@ class PrefillAdder:
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
+                if req.dsv4_continuation_host_hit:
+                    return AddReqResult.NO_TOKEN
 
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)

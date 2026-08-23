@@ -1167,6 +1167,7 @@ def aiter_w8a8_block_fp8_linear(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
+    force_bpreshuffle_ck: bool = False,
 ) -> torch.Tensor:
     # assert input_scale is None
     input_2d = input.view(-1, input.shape[-1])
@@ -1186,6 +1187,22 @@ def aiter_w8a8_block_fp8_linear(
         )
     else:
         use_triton = True
+
+    if force_bpreshuffle_ck:
+        if not (
+            _use_aiter_bpreshuffle_gfx95
+            and input_2d.shape[0] <= 32
+            and (n, k) == (768, 7168)
+            and block_size == [128, 128]
+            and weight_scale.dtype == torch.float32
+        ):
+            raise RuntimeError(
+                "Forced deterministic CK path received an unexpected contract: "
+                f"M={input_2d.shape[0]}, N={n}, K={k}, "
+                f"block_size={block_size}, weight_scale={weight_scale.dtype}, "
+                f"bpreshuffle_gfx95={_use_aiter_bpreshuffle_gfx95}"
+            )
+        use_triton = False
 
     # if input_scale not None, input is quanted
     if input_scale is not None:
@@ -1216,20 +1233,36 @@ def aiter_w8a8_block_fp8_linear(
         elif materialize_bpreshuffle_scale:
             x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
 
-    if use_triton:
+    if force_bpreshuffle_ck:
+        from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_bpreshuffle_ck
+
+        output = torch.empty(
+            (input_2d.shape[0], n),
+            dtype=torch.bfloat16 if input_scale is not None else input_2d.dtype,
+            device=input_2d.device,
+        )
+        output = gemm_a8w8_blockscale_bpreshuffle_ck(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            output,
+        )
+    elif use_triton:
         gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale
     elif _use_aiter_bpreshuffle_gfx95:
         gemm_a8w8_blockscale_op = gemm_a8w8_blockscale_bpreshuffle
     else:
         gemm_a8w8_blockscale_op = ck_gemm_a8w8_blockscale
 
-    output = gemm_a8w8_blockscale_op(
-        q_input,
-        weight,
-        x_scale,
-        weight_scale,
-        dtype=torch.bfloat16 if input_scale is not None else input.dtype,
-    )
+    if not force_bpreshuffle_ck:
+        output = gemm_a8w8_blockscale_op(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            dtype=torch.bfloat16 if input_scale is not None else input.dtype,
+        )
 
     if bias is not None:
         output += bias

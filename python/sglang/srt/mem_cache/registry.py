@@ -163,6 +163,8 @@ def _create_unified_radix_cache(
         tree_components.append(ComponentType.SWA)
     if ctx.is_hybrid_ssm:
         tree_components.append(ComponentType.MAMBA)
+    if params.dsv4_continuation_pool is not None:
+        tree_components.append(ComponentType.DSV4_CONTINUATION)
 
     if hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
         from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (

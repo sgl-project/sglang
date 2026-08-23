@@ -332,6 +332,7 @@ def build_kv_cache(
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
+        dsv4_continuation_pool=tp_worker.model_runner.dsv4_continuation_pool,
     )
 
     tree_cache = create_tree_cache(

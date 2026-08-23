@@ -7536,11 +7536,13 @@ class ServerArgs:
                 "--enable-hisparse with --dcp-size > 1 is not supported: the "
                 "HiSparse host pool is constructed without DCP translation."
             )
-        if not self.use_mla_backend():
+        if not self.use_mla_backend() and not getattr(
+            self.get_model_config(), "is_deepseek_v4_arch", False
+        ):
             raise NotImplementedError(
-                "HiCache with --dcp-size > 1 is only supported for MLA models: "
-                "the index translation lives in MLATokenToKVPoolHost, and the "
-                "MHA host pool has none."
+                "HiCache with --dcp-size > 1 is only supported for MLA or "
+                "DeepSeek V4 models: other MHA host pools have no DCP index "
+                "translation."
             )
         logger.info(
             "HiCache + DCP enabled (L1/L2 only): host pool uses widened "
