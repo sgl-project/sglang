@@ -1178,13 +1178,17 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                 ),
                 ModelOptFp4LinearMethod,
             )
-        self.assertIsInstance(
-            config.get_quant_method(
-                LinearBase(input_size=256, output_size=32),
-                "blocks.0.attn.out_proj",
-            ),
-            KitchenInt8LinearMethod,
-        )
+        with patch(
+            "sglang.multimodal_gen.runtime.layers.quantization."
+            "kitchen_int8._load_comfy_kitchen"
+        ):
+            self.assertIsInstance(
+                config.get_quant_method(
+                    LinearBase(input_size=256, output_size=32),
+                    "blocks.0.attn.out_proj",
+                ),
+                KitchenInt8LinearMethod,
+            )
 
     def test_builder_adds_diffusers_quant_type_for_nvfp4(self):
         updated = _updated_quant_config(
