@@ -1110,6 +1110,12 @@ def calculate_metrics(
     itls: List[float] = []
     tpots: List[float] = []
     ttfts: List[float] = []
+    # A streamed request whose chunks never carried a token leaves `ttft` at its
+    # 0.0 default, which is indistinguishable from a real measurement. Since TPOT
+    # subtracts TTFT, folding those in silently corrupts both statistics: the
+    # request's whole queueing and prefill time lands in TPOT instead. Count them
+    # and keep them out of the latency statistics.
+    unmeasured_ttft = 0
     e2e_latencies: List[float] = []
     retokenized_itls: List[float] = []
 
@@ -1131,7 +1137,10 @@ def calculate_metrics(
                 total_input += input_requests[i].prompt_len
                 total_input_text += input_requests[i].text_prompt_len
                 total_input_vision += input_requests[i].vision_prompt_len
-            if output_len > 1:
+            has_measured_ttft = outputs[i].ttft > 0
+            if not has_measured_ttft:
+                unmeasured_ttft += 1
+            elif output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             if use_retokenized_itl:
                 for k, itl in enumerate(outputs[i].itl):
@@ -1144,7 +1153,8 @@ def calculate_metrics(
                     retokenized_itls.extend([adjusted_itl] * num_tokens)
             else:
                 itls += outputs[i].itl
-            ttfts.append(outputs[i].ttft)
+            if has_measured_ttft:
+                ttfts.append(outputs[i].ttft)
 
             e2e_latencies.append(outputs[i].latency)
 
@@ -1152,6 +1162,15 @@ def calculate_metrics(
         else:
             output_lens.append(0)
             retokenized_output_lens.append(0)
+
+    if unmeasured_ttft:
+        warnings.warn(
+            f"{unmeasured_ttft} of {completed} successful requests never reported "
+            "a first token, so their TTFT could not be measured. They are excluded "
+            f"from the TTFT and TPOT statistics, which now cover {len(ttfts)} "
+            "requests. Treat throughput numbers for this run with care.",
+            stacklevel=2,
+        )
 
     if completed == 0:
         warnings.warn(
