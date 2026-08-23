@@ -1,0 +1,45 @@
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+from sglang.srt.managers.scheduler_components.profiler_manager import (
+    SchedulerProfilerManager,
+)
+
+
+def test_cuda_profiler_activity_can_use_nsys_nvtx_capture_range(tmp_path):
+    ps = SimpleNamespace(gpu_id=0)
+    manager = SchedulerProfilerManager(
+        ps=ps,
+        dp_tp_cpu_group=MagicMock(),
+        get_forward_ct=lambda: 0,
+    )
+    manager.torch_profiler_output_dir = tmp_path
+    manager.torch_profiler_with_stack = None
+    manager.torch_profiler_record_shapes = None
+    manager.profiler_activities = ["CUDA_PROFILER"]
+    manager.profile_id = "nsys-nvtx-test"
+    manager.profile_prefix = ""
+
+    device = SimpleNamespace(base_gpu_id=0)
+    with (
+        patch.dict(
+            "os.environ",
+            {"SGLANG_NSYS_NVTX_CAPTURE_RANGE": "agentx_decode_capture"},
+        ),
+        patch(
+            "sglang.srt.managers.scheduler_components.profiler_manager.get_device",
+            return_value=device,
+        ),
+        patch("torch.cuda.nvtx.range_push") as range_push,
+        patch("torch.cuda.nvtx.range_pop") as range_pop,
+        patch("torch.cuda.cudart") as cudart,
+    ):
+        start_result = manager._start_profile()
+        stop_result = manager._stop_profile()
+
+    assert start_result.success
+    assert stop_result.success
+    range_push.assert_called_once_with("agentx_decode_capture")
+    range_pop.assert_called_once_with()
+    cudart.assert_not_called()
+    assert not manager.nsys_nvtx_capture_active

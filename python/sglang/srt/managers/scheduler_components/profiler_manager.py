@@ -77,6 +77,7 @@ class SchedulerProfilerManager:
         self.profile_by_stage: bool = False
         self.profile_in_progress: bool = False
         self.merge_profiles = False
+        self.nsys_nvtx_capture_active = False
 
         # For ROCM
         self.rpd_profiler = None
@@ -258,7 +259,16 @@ class SchedulerProfilerManager:
 
         if "CUDA_PROFILER" in activities:
             if self.ps.gpu_id == get_device().base_gpu_id:
-                torch.cuda.cudart().cudaProfilerStart()
+                capture_range = os.getenv("SGLANG_NSYS_NVTX_CAPTURE_RANGE", "").strip()
+                if capture_range:
+                    torch.cuda.nvtx.range_push(capture_range)
+                    self.nsys_nvtx_capture_active = True
+                    logger.info(
+                        "Started Nsight Systems NVTX capture range: %s",
+                        capture_range,
+                    )
+                else:
+                    torch.cuda.cudart().cudaProfilerStart()
             self.profile_in_progress = True
 
         return ProfileReqOutput(success=True, message="Succeeded")
@@ -369,7 +379,11 @@ class SchedulerProfilerManager:
 
         if "CUDA_PROFILER" in self.profiler_activities:
             if self.ps.gpu_id == get_device().base_gpu_id:
-                torch.cuda.cudart().cudaProfilerStop()
+                if self.nsys_nvtx_capture_active:
+                    torch.cuda.nvtx.range_pop()
+                    self.nsys_nvtx_capture_active = False
+                else:
+                    torch.cuda.cudart().cudaProfilerStop()
 
         merge_message = self._merge_profile_traces()
 
