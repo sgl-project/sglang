@@ -51,7 +51,9 @@ repo contains multiple candidate checkpoints, pass
 `--transformer-weights-path` explicitly.
 
 MiniMax-H3 is a verified example for Comfy safetensors with per-layer metadata,
-including `pruned_fp8_scaled` and serialized ConvRot INT8. Pass one selected
+including `pruned_fp8_scaled` and serialized ConvRot INT8. Other Comfy FP8
+exports are also auto-detected: the presence of an input scale selects static
+activation scaling, while its absence selects dynamic scaling. Pass one selected
 FL2VA or Ref2VA DiT file by local path, `owner/repo/path/file.safetensors`, or
 direct Hugging Face file URL; do not combine it with `--quantization`. Its GGUF
 usage is documented in
