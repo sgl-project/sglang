@@ -888,6 +888,12 @@ class Envs:
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
+    # Experimental M<=16 Qwen3.8 dense NVFP4 GEMM for SM120 GPUs.
+    SGLANG_ENABLE_QWEN38_FP4_SKINNY_GEMM = EnvBool(False)
+    # Comma-separated shape roles used by the experimental kernel. The safe
+    # default keeps the numerically sensitive down projection on FlashInfer
+    # for M>1; "all" is an explicit benchmark/debug override.
+    SGLANG_QWEN38_FP4_SKINNY_GEMM_ROLES = EnvStr("gate_up,down_m1,lm_head")
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")

@@ -139,6 +139,31 @@ def fp4_gemm(
     out_dtype: torch.dtype,
     out_features: int,
 ) -> torch.Tensor:
+    if envs.SGLANG_ENABLE_QWEN38_FP4_SKINNY_GEMM.get():
+        from sglang.kernels.ops.gemm.nvfp4_skinny_sm120 import (
+            nvfp4_skinny_sm120,
+            use_nvfp4_skinny_sm120,
+        )
+
+        if use_nvfp4_skinny_sm120(
+            input,
+            weight,
+            input_sf,
+            weight_sf,
+            alpha,
+            out_dtype,
+            out_features,
+        ):
+            return nvfp4_skinny_sm120(
+                input,
+                weight,
+                input_sf,
+                weight_sf,
+                alpha,
+                out_dtype,
+                out_features,
+            )
+
     if not enable_flashinfer_fp4_gemm:
         raise RuntimeError(
             "NVFP4 GEMM requires flashinfer's mm_fp4; please install flashinfer."
