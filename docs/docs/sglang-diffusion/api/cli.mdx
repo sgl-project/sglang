@@ -150,6 +150,9 @@ for the current component matrix.
 
 Component overrides accept a local component directory, a standalone Hub
 repository, or a Hub component subfolder written as `owner/repo/subfolder`.
+For transformer and native encoder loaders, an explicit weight filename keeps
+the base component configuration and replaces only its weights; the selected
+file format must still be supported by that loader.
 
 For supported realtime causal video models, `--kv-cache-quant {off|int4|int2}`
 compresses completed KV-cache chunks independently of transformer weight
