@@ -433,6 +433,13 @@ class Req:
                  save_output: {self.save_output}
             output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]
+        # Add model-specific fields if present
+        bot_task = getattr(self, "bot_task", None)
+        sys_type = getattr(self, "sys_type", None)
+        if bot_task is not None:
+            debug_str += f"                  bot_task: {bot_task}\n"
+        if sys_type is not None:
+            debug_str += f"                  sys_type: {sys_type}\n"
         logger.info(debug_str)
 
 

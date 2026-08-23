@@ -200,7 +200,8 @@ class RMSNorm(CustomOp):
                 residual, x, self.weight.data, self.variance_epsilon
             )
             return out, residual_out
-        return torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
+        # print(f"RMS insde {x.std()} {self.weight.data.float().detach().std()} {self.variance_epsilon}")
+        return torch_npu.npu_rms_norm(x, self.weight, self.variance_epsilon)[0]
 
     def forward_hip(
         self,

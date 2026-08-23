@@ -360,7 +360,10 @@ class SamplingParams:
 
         self._validate()
 
-        # Allow env var to override num_inference_steps (for faster CI testing on AMD)
+        # Allow env var to override num_inference_steps (for faster CI testing).
+        # Only applies to the base SamplingParams class — model-specific subclasses
+        # (e.g. HunyuanImage3SamplingParams with num_inference_steps=50) define their
+        # own defaults that should not be silently overridden by a global env var.
         env_steps = os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS")
         if env_steps is not None and self.num_inference_steps is not None:
             self.num_inference_steps = int(env_steps)
@@ -1421,6 +1424,27 @@ class SamplingParams:
             "--upscaling-scale",
             type=int,
             help="Upscaling factor (default: 4).",
+        )
+        # HunyuanImage-3 and similar model-specific tokenizer/prompt arguments
+        add_argument(
+            "--bot-task",
+            dest="bot_task",
+            type=str,
+            help=(
+                "Tokenizer bot task (model-specific). For HunyuanImage-3: "
+                "auto, image, think, recaption, img_ratio, none. "
+                "Controls the bot response prefix in the tokenizer."
+            ),
+        )
+        add_argument(
+            "--sys-type",
+            dest="sys_type",
+            type=str,
+            help=(
+                "System prompt type (model-specific). For HunyuanImage-3: "
+                "none, en_unified, en_vanilla, en_recaption, en_think_recaption, auto. "
+                "Controls which system prompt to use."
+            ),
         )
         return parser
 
