@@ -3339,9 +3339,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 for backend, indices in deferred_by_backend.items():
                     group_items = [selected_items[index] for index in indices]
                     group_configs = [deferred[index] for index in indices]
-                    # `indices` are positions within selected_items (this
-                    # vision-DP rank's shard), while grid_thws_host is indexed
-                    # by global image position; map back before reading it.
+                    # Map backend-group positions through the rank-local shard to global grid rows.
                     global_indices = [image_indices[index] for index in indices]
                     first_config = group_configs[0]
                     if backend == "gpu":
