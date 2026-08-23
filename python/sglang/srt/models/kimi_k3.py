@@ -1839,8 +1839,7 @@ class KimiK3DeltaAttention(nn.Module):
             forget_gate = forget_gate.unflatten(-1, (-1, self.head_dim))
             if (
                 not forward_batch.forward_mode.is_target_verify()
-                and not get_attn_backend()
-                .linear_attn_backend.kernel_dispatcher.extend_uses_cake_prefill
+                and not get_attn_backend().linear_attn_backend.kernel_dispatcher.extend_uses_cake_prefill
             ):
                 # Triton and the other chunk backends take probabilities. Cake
                 # fuses sigmoid and consumes the original (possibly strided)

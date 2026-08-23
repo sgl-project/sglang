@@ -411,8 +411,7 @@ class KimiDeltaAttention(nn.Module):
             )  # [T, H*K] -> [T, H, K]
             if (
                 not forward_batch.forward_mode.is_target_verify()
-                and not get_attn_backend()
-                .linear_attn_backend.kernel_dispatcher.extend_uses_cake_prefill
+                and not get_attn_backend().linear_attn_backend.kernel_dispatcher.extend_uses_cake_prefill
             ):
                 # Triton and the other chunk backends take probabilities. Cake
                 # fuses sigmoid and consumes the original (possibly strided)

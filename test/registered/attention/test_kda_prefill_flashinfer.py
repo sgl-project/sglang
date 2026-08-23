@@ -153,9 +153,7 @@ def test_kda_prefill_cake_matches_triton_across_2k_continuations():
     chunk_size = 2048
     num_chunks = 8
     data = _make_inputs([chunk_size * num_chunks], 12)
-    chunk_cu_seqlens = torch.tensor(
-        [0, chunk_size], device="cuda", dtype=torch.int32
-    )
+    chunk_cu_seqlens = torch.tensor([0, chunk_size], device="cuda", dtype=torch.int32)
 
     def run_continuations(kernel, state):
         outputs = []
