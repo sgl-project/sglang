@@ -451,7 +451,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             self._swa_layers_num > 0
         ), "Hybrid SWA model must have at least one SWA layer"
 
-        self._swa_full_tokens_ratio = kvc.server_args.swa_full_tokens_ratio
+        self._swa_full_tokens_ratio = get_schedule().swa_full_tokens_ratio
         self._sliding_window_size = kvc.sliding_window_size
         self._page_size = kvc.page_size
 
@@ -779,19 +779,19 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"local={len(self.compression_ratios)}/{len(cfg.compress_ratios)}"
             )
         self.swa_page_size = cfg.window_size
-        self.swa_ratio = kvc.server_args.swa_full_tokens_ratio
-        self.is_speculative = kvc.server_args.speculative_algorithm is not None
+        self.swa_ratio = get_schedule().swa_full_tokens_ratio
+        self.is_speculative = get_spec().speculative_algorithm is not None
         self.online_c128_mtp_max_draft_tokens = (
             kvc.server_args.max_speculative_num_draft_tokens or 0
         )
         self.requested_max_running_requests_per_worker = (
-            kvc.server_args.max_running_requests // kvc.ps.attn_dp_size
-            if kvc.server_args.max_running_requests is not None
+            get_schedule().max_running_requests // kvc.ps.attn_dp_size
+            if get_schedule().max_running_requests is not None
             else None
         )
-        self.disaggregation_mode = kvc.server_args.disaggregation_mode
+        self.disaggregation_mode = get_disagg().disaggregation_mode
         self.disaggregation_decode_extra_slots = (
-            kvc.server_args.disaggregation_decode_extra_slots or 0
+            get_disagg().disaggregation_decode_extra_slots or 0
         )
         if kvc.server_args.enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config

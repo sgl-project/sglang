@@ -275,7 +275,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertEqual(curve_shape, (1025, 8))
         self.assertEqual(comfy_quant["blocks.0.mlp.fc1"]["format"], "int8_tensorwise")
 
-    def test_inspect_minimax_h3_fp8_validates_required_scales(self):
+    def test_inspect_minimax_h3_fp8_detects_static_activation_scale(self):
         marker = torch.tensor(list(b'{"format":"float8_e4m3fn"}'), dtype=torch.uint8)
         with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
             save_file(
@@ -292,7 +292,31 @@ class TestTransformerQuantHelpers(unittest.TestCase):
 
             _, layer_markers = inspect_minimax_h3_safetensors([f.name])
 
-        self.assertEqual(layer_markers["blocks.0.mlp.fc1"], {"format": "float8_e4m3fn"})
+        self.assertEqual(
+            layer_markers["blocks.0.mlp.fc1"],
+            {"format": "float8_e4m3fn", "_activation_scheme": "static"},
+        )
+
+    def test_inspect_minimax_h3_fp8_without_input_scale_uses_dynamic_activation(self):
+        marker = torch.tensor(list(b'{"format":"float8_e4m3fn"}'), dtype=torch.uint8)
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
+            save_file(
+                {
+                    "blocks.0.mlp.fc1.weight": torch.ones(
+                        (2, 2), dtype=torch.float8_e4m3fn
+                    ),
+                    "blocks.0.mlp.fc1.weight_scale": torch.tensor(0.5),
+                    "blocks.0.mlp.fc1.comfy_quant": marker,
+                },
+                f.name,
+            )
+
+            _, layer_markers = inspect_minimax_h3_safetensors([f.name])
+
+        self.assertEqual(
+            layer_markers["blocks.0.mlp.fc1"],
+            {"format": "float8_e4m3fn", "_activation_scheme": "dynamic"},
+        )
 
     def test_minimax_h3_comfy_int8_resolves_serialized_kitchen(self):
         config = resolve_minimax_h3_checkpoint_quantization(
@@ -310,6 +334,8 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertTrue(config.checkpoint_uses_native_qkv_layout)
         self.assertFalse(KitchenInt8Config().checkpoint_uses_native_qkv_layout)
         self.assertFalse(_needs_device_weight_postprocess(config))
+        self.assertTrue(config.supports_input_partition("blocks.0.mlp.fc1", 6400))
+        self.assertFalse(config.supports_input_partition("blocks.0.mlp.fc1", 3200))
 
     @patch(
         "sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8."
@@ -355,7 +381,10 @@ class TestTransformerQuantHelpers(unittest.TestCase):
     def test_minimax_h3_comfy_fp8_resolves_per_layer_dispatch(self):
         config = resolve_minimax_h3_checkpoint_quantization(
             {
-                "blocks.0.attn.qkv_proj": {"format": "float8_e4m3fn"},
+                "blocks.0.attn.qkv_proj": {
+                    "format": "float8_e4m3fn",
+                    "_activation_scheme": "dynamic",
+                },
                 "blocks.0.mlp.fc2": {
                     "format": "float8_e4m3fn",
                     "full_precision_matrix_mult": True,
@@ -370,10 +399,9 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             config.get_quant_method(layer, "blocks.0.mlp.fc2"),
             ComfyFullPrecisionFp8LinearMethod,
         )
-        self.assertIsInstance(
-            config.get_quant_method(layer, "blocks.0.attn.qkv_proj"),
-            Fp8LinearMethod,
-        )
+        fp8_method = config.get_quant_method(layer, "blocks.0.attn.qkv_proj")
+        self.assertIsInstance(fp8_method, Fp8LinearMethod)
+        self.assertEqual(fp8_method.quant_config.activation_scheme, "dynamic")
         self.assertIsInstance(
             config.get_quant_method(layer, "unmarked"),
             UnquantizedLinearMethod,
