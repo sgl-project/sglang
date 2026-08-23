@@ -46,6 +46,10 @@ if [[ "${ENABLE_NPU_GRAPH:-1}" == "1" ]]; then
 else
     GRAPH_ARGS=(--disable-cuda-graph)
 fi
+K3_RANDOM_SEED_ARGS=()
+if [[ -n "${K3_SERVER_RANDOM_SEED:-}" ]]; then
+    K3_RANDOM_SEED_ARGS=(--random-seed "${K3_SERVER_RANDOM_SEED}")
+fi
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
 echo "${LOCAL_HOST1}"
@@ -123,6 +127,7 @@ do
             --dist-init-addr 192.168.25.209:5000 --nnodes 4 --node-rank $i \
             --model-path $MODEL_PATH \
             --tokenizer-path $MODEL_PATH \
+            "${K3_RANDOM_SEED_ARGS[@]}" \
             --trust-remote-code \
             --attention-backend ascend \
             --device npu \
