@@ -99,8 +99,8 @@ resolved configuration lives in the namespace bags.**
 
 **Why a bag override cannot stand in for late resolution or per-runner
 construction.** The bags are projected at
-publish *from the instance's fields*, so anything the runtime must read has to be on
-the instance before publish — an override afterwards puts instance and bags back out
+publish *from the declarations over the instance's raw fields*, so anything the
+runtime must read has to be declared before publish — an override afterwards puts instance and bags back out
 of agreement, and whole-object readers (`ModelConfig.from_server_args`,
 `build_load_config`, `MMEncoder`'s own `self.server_args.X`) never see it. And bags do
 not cross a process boundary: a child publishes from the object it receives and
@@ -114,7 +114,8 @@ bag to override at all.
 - **Per-runner values** — there is no per-runner `ServerArgs` any more. The
   draft-worker config copy is gone: every worker (`TpModelWorker`, the draft
   workers in `speculative/`) is handed the *same* instance the process published,
-  so `self.server_args.X` and the bag leaf agree **at publish** — a
+  so a bag leaf is the decision and `self.server_args.X` is the operator's
+  input — a
   post-publish `override` moves only the bag, which is exactly why a field that
   is process-wide config (`attention_backend`, `skip_tokenizer_init`,
   `kv_cache_dtype`) reads from the bags like any other, and why a residual

@@ -315,8 +315,8 @@ def initialize_moe_config():
     """Seed the MoE runtime flags from the published configuration.
 
     Reads the bags: `moe_a2a_backend` and its siblings are resolution's
-    answers, and the record carries them only while declarations materialize
-    onto it. Called once per process after publish
+    answers, and the record carries the operator's input. Called once per
+    process after publish
     (scheduler init, the benchmark work functions).
     """
     exec_moe = get_exec().moe

@@ -196,7 +196,11 @@ def main():
         server_args.resolve_once()
     router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
 
-    # Find available ports for workers
+    # Find available ports for workers. The count is the operator's requested
+    # replica count, which is the raw field on purpose: `--dwdp-size` makes
+    # resolution declare a `dp_size` that describes one multi-rank server's
+    # internal topology, and spawning that many single-rank children would ask
+    # for dp_size^2 GPUs.
     worker_ports = find_available_ports(
         args.router_dp_worker_base_port, server_args.dp_size
     )

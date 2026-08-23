@@ -251,7 +251,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 kwargs["log_level"] = "error"
             server_args = self.server_args_class(**kwargs)
         self.server_args = server_args
-        logger.info(f"{server_args=}")
+        logger.info(f"server_args={server_args.resolved_dict()}")
 
         # Rust Server is not supported with the offline Engine API
         if envs.SGLANG_RUST_SERVER.get():
@@ -1076,7 +1076,7 @@ class Engine(EngineScoreMixin, EngineBase):
             # Allocate ports for inter-process communications
             if port_args is None:
                 port_args = PortArgs.init_new(server_args)
-            logger.info(f"{server_args=}")
+            logger.info(f"server_args={server_args.resolved_dict()}")
 
             # Start the engine info bootstrap server if per-rank info is needed.
             engine_info_bootstrap_server = None
