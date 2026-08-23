@@ -168,7 +168,7 @@ from sglang.srt.model_executor.runner import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
-    ensure_published,
+    assert_published,
     get_context,
     get_device,
     get_exec,
@@ -332,13 +332,10 @@ class ModelRunner:
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
-        # Set the global server_args in the scheduler process (target worker
-        # only, so a draft init cannot clobber target-derived global state).
-        # Before the constructor's bag reads (page_size below): a standalone
-        # construction (benchmark/one_batch, the manual runner tests) has no
-        # earlier publish.
+        # The process entry published; a draft runner is not one (it must not
+        # clobber the target's config), so only the target checks.
         if not is_draft_worker:
-            ensure_published(server_args, role="scheduler")
+            assert_published(server_args, role="scheduler")
         # Set by maybe_init_lora_manager; stays None when LoRA is off and on
         # draft runners, which serve adapters' target model unadapted.
         self.lora_manager: Optional[LoRAManager] = None
