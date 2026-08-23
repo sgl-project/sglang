@@ -364,15 +364,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
         self.kv_buffer_tensors = None
 
-    def _is_watermark_ready(
-        self, session_id: str, alloc_round: int, alloc_end: int
-    ) -> bool:
-        from sglang.srt.disaggregation.common.staging_handler import (
-            is_watermark_ready,
-        )
-
-        return is_watermark_ready(self._staging_ctx, session_id, alloc_round, alloc_end)
-
     def _try_create_staging_strategy(self, staging_buffer):
         if not self.enable_staging or self.kv_buffer_tensors is None:
             return None
