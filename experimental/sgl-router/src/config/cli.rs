@@ -10,11 +10,11 @@ use clap::Parser;
 use std::num::NonZeroU32;
 
 use crate::config::{
-    default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
-    resolve_mode, ActiveLoadConfig, CacheAwareConfig, CircuitBreakerConfig, Config,
-    DiscoveryBackend, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
-    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
-    StickyConfig,
+    default_cb_cool_down, default_max_chat_body_bytes, default_proxy_request_timeout_secs,
+    default_stale_request_timeout_secs, resolve_mode, ActiveLoadConfig, CacheAwareConfig,
+    CircuitBreakerConfig, Config, DiscoveryBackend, K8sDiscoveryConfig, KvIndexerEndpointConfig,
+    LogFormat, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig,
+    StaticUrlsDiscoveryConfig, StickyConfig,
 };
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
@@ -145,6 +145,12 @@ pub struct Cli {
     /// Per-request upstream timeout in seconds.
     #[arg(long, default_value_t = default_proxy_request_timeout_secs())]
     pub request_timeout_secs: u64,
+    /// Max accepted `/v1/chat/completions` body size in bytes. Larger
+    /// bodies are rejected with 413 before routing. Raising this raises
+    /// the worst-case heap one request can pin, so size it against
+    /// concurrency, not just the biggest prompt.
+    #[arg(long, default_value_t = default_max_chat_body_bytes())]
+    pub max_chat_body_bytes: usize,
     /// Max lifetime of an in-flight request entry before the janitor
     /// reaps it (returns 504 `stale_request_expired`).
     #[arg(long, default_value_t = default_stale_request_timeout_secs())]
@@ -351,6 +357,7 @@ impl Cli {
             discovery,
             proxy: ProxyConfig {
                 request_timeout_secs: self.request_timeout_secs,
+                max_chat_body_bytes: self.max_chat_body_bytes,
             },
             active_load: ActiveLoadConfig {
                 stale_request_timeout_secs: self.stale_request_timeout_secs,
@@ -1041,6 +1048,28 @@ mod tests {
         .unwrap();
         assert_eq!(c.proxy.request_timeout_secs, 120);
         assert_eq!(c.active_load.stale_request_timeout_secs, 240);
+    }
+
+    /// Pins the body cap to the flag, and pins the unflagged default to the
+    /// same constant the 413 test builds its oversized body from — a drift
+    /// between the two would make that test assert against the wrong size.
+    #[test]
+    fn max_chat_body_bytes_defaults_and_overrides() {
+        let c = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        assert_eq!(c.proxy.max_chat_body_bytes, 5 << 20);
+        assert_eq!(
+            c.proxy.max_chat_body_bytes,
+            crate::server::routes::chat::MAX_CHAT_BODY_BYTES,
+        );
+
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--max-chat-body-bytes",
+            "536870912",
+        ]))
+        .unwrap();
+        assert_eq!(c.proxy.max_chat_body_bytes, 512 << 20);
     }
 
     #[test]
