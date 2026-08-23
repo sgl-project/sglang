@@ -22,7 +22,6 @@ from sglang.srt.configs.interns2_mobius import (
     InternS2MobiusVisionConfig,
 )
 from sglang.srt.configs.interns2preview import InternS2PreviewConfig
-from sglang.srt.configs.spark3 import Spark3Config
 from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.jet_nemotron import JetNemotronConfig
 from sglang.srt.configs.jet_vlm import JetVLMConfig
@@ -57,6 +56,7 @@ from sglang.srt.configs.qwen3_5 import (
 )
 from sglang.srt.configs.qwen3_asr import Qwen3ASRConfig
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
+from sglang.srt.configs.spark3 import Spark3Config
 from sglang.srt.configs.step3_vl import (
     Step3TextConfig,
     Step3VisionEncoderConfig,

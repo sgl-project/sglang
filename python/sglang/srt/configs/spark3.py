@@ -2,6 +2,7 @@ from typing import Any, Optional
 
 from transformers.configuration_utils import PretrainedConfig
 
+
 class Spark3Config(PretrainedConfig):
     model_type = "spark3"
     architectures = ["Spark3ForCausalLM"]

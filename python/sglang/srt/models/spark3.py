@@ -102,7 +102,7 @@ class Spark3Attention(nn.Module):
         self.total_num_heads = num_heads
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
-        
+
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
         self.total_num_kv_heads = num_kv_heads
@@ -148,7 +148,7 @@ class Spark3Attention(nn.Module):
                 tp_size=attn_tp_size,
                 prefix=add_prefix("g_proj", prefix),
             )
-        
+
         self.out_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -198,14 +198,11 @@ class Spark3Attention(nn.Module):
         if self.headwise_attn_output_gate:
             g, _ = self.g_proj(hidden_states)
             g = torch.sigmoid(g.float()).to(attn_output.dtype)
-            gate_output = (
-                attn_output.view(
-                    attn_output.shape[0],
-                    self.num_heads,
-                    self.head_dim,
-                )
-                * g.unsqueeze(-1)
-            )
+            gate_output = attn_output.view(
+                attn_output.shape[0],
+                self.num_heads,
+                self.head_dim,
+            ) * g.unsqueeze(-1)
             attn_output = gate_output.view(*attn_output.shape)
 
         output, _ = self.out_proj(attn_output)
@@ -249,7 +246,9 @@ class Spark3DecoderLayer(nn.Module):
             quant_config=quant_config,
             sliding_window=_get_attention_sliding_window_size(config),
             layer_type=layer_type,
-            headwise_attn_output_gate=getattr(config, "headwise_attn_output_gate", True),
+            headwise_attn_output_gate=getattr(
+                config, "headwise_attn_output_gate", True
+            ),
             prefix=add_prefix("self_attn", prefix),
         )
 
@@ -261,9 +260,7 @@ class Spark3DecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
-        self.input_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -329,9 +326,7 @@ class Spark3Model(nn.Module):
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
-            self.norm = RMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
-            )
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
@@ -515,9 +510,7 @@ class Spark3ForCausalLM(nn.Module):
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
 
-            if name in (
-                    "model.embedding.weight",
-                ):
+            if name in ("model.embedding.weight",):
                 name = "model.embed_tokens.weight"
             if (
                 name == "model.embed_tokens.weight"
@@ -548,9 +541,7 @@ class Spark3ForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-            elif original_name in (
-                "model.embedding.weight",
-            ):
+            elif original_name in ("model.embedding.weight",):
                 continue
             else:
                 logger.warning(f"Parameter {name} not found in params_dict")
