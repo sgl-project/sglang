@@ -13,6 +13,10 @@ from sglang.kernels.ops.attention.metadata import (
 )
 from sglang.kernels.ops.attention.pa_page_table import _build_pa_page_table
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    FA3MLAFP8KVShadow,
+    is_fa3_mla_fp8_shadow_enabled,
+)
 from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
@@ -352,6 +356,26 @@ class FlashAttentionBackend(AttentionBackend):
             and not self.use_mla
         )
 
+        self._fa3_mla_fp8_shadow = None
+        can_allocate_mla_fp8_shadow = is_fa3_mla_fp8_shadow_enabled(
+            fa_impl_ver=self.fa_impl_ver,
+            use_mla=self.use_mla,
+            page_size=self.page_size,
+            unified_dense=self._unified_dense,
+            attn_cp_size=self.attn_cp_size,
+            is_draft_runner=self.is_draft_runner,
+            dcp_enabled=get_parallel().dcp_enabled,
+            dsa_kv_cache_store_fp8=getattr(
+                self.token_to_kv_pool, "dsa_kv_cache_store_fp8", False
+            ),
+        )
+        if can_allocate_mla_fp8_shadow:
+            first_layer = getattr(self.token_to_kv_pool, "start_layer", 0)
+            source = self.token_to_kv_pool.get_key_buffer(first_layer)
+            self._fa3_mla_fp8_shadow = FA3MLAFP8KVShadow.maybe_create(
+                source, model_runner.dtype
+            )
+
         # Skip the FA3 scheduler_metadata precompute (PR #21104) when distributed
         # attention modes can change live cache_seqlens/num_splits across ranks.
         # A stale precomputed buffer can lead to an OOB read in the split-KV
@@ -389,6 +413,27 @@ class FlashAttentionBackend(AttentionBackend):
             has_softcap=self.has_softcap,
             num_splits=self.num_splits,
         )
+
+    def _get_mla_kv_cache_for_fa3(
+        self,
+        layer_id: int,
+        output_dtype: torch.dtype,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        use_fp8_shadow: bool,
+    ) -> torch.Tensor:
+        source = self.token_to_kv_pool.get_key_buffer(layer_id)
+        shadow = self._fa3_mla_fp8_shadow
+
+        if (
+            use_fp8_shadow
+            and shadow is not None
+            and shadow.can_materialize(source, output_dtype)
+        ):
+            return shadow.materialize(source, page_table, cache_seqlens)
+
+        # Preserve the existing path for every unsupported configuration.
+        return source.to(output_dtype)
 
     def _mxfp8_sf_kwargs(self, layer, forward_batch, q_descale=None):
         """Block-scaled UE8M0 scale factors for the FA4 MXFP8 attention path.
@@ -1617,8 +1662,25 @@ class FlashAttentionBackend(AttentionBackend):
                 # call takes the same qv/ver arguments as this extend path.
                 assert self.fa_impl_ver in (3, 4), "Only FA3/FA4 support here"
                 # Do absorbed multi-latent attention
-                kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
-                    q.dtype
+                use_fp8_shadow = (
+                    forward_batch.forward_mode
+                    in (
+                        ForwardMode.EXTEND,
+                        ForwardMode.MIXED,
+                        ForwardMode.SPLIT_PREFILL,
+                    )
+                    and not is_cp_mode
+                    and not use_cascade_attn
+                    and not use_local_attn
+                    and not is_swa_layer
+                    and not layer.is_cross_attention
+                )
+                kv_cache = self._get_mla_kv_cache_for_fa3(
+                    layer_id=layer.layer_id,
+                    output_dtype=q.dtype,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    use_fp8_shadow=use_fp8_shadow,
                 )
                 k_rope = kv_cache[:, :, layer.v_head_dim :]
                 c_kv = kv_cache[:, :, : layer.v_head_dim]
@@ -2031,8 +2093,22 @@ class FlashAttentionBackend(AttentionBackend):
                 else:
                     o = result
         else:
+            use_fp8_shadow = (
+                forward_batch.forward_mode.is_decode_or_idle()
+                and forward_batch.spec_info is None
+                and not use_cascade_attn
+                and not use_local_attn
+                and not is_swa_layer
+                and not layer.is_cross_attention
+            )
             # Do absorbed multi-latent attention
-            kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
+            kv_cache = self._get_mla_kv_cache_for_fa3(
+                layer_id=layer.layer_id,
+                output_dtype=q.dtype,
+                page_table=metadata.page_table,
+                cache_seqlens=metadata.cache_seqlens_int32,
+                use_fp8_shadow=use_fp8_shadow,
+            )
             k_rope = kv_cache[:, :, layer.v_head_dim :]
             c_kv = kv_cache[:, :, : layer.v_head_dim]
             k_rope_cache = k_rope.view(
