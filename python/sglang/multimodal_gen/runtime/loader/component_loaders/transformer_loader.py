@@ -222,7 +222,7 @@ class TransformerLoader(ComponentLoader):
         is_minimax_h3 = model_cls.__name__ == "MiniMaxH3DiTModel"
         if is_minimax_h3:
             dit_config.arch_config.checkpoint_uses_diffusers_layout = (
-                cls_name == "MiniMaxH3Transformer3DModel"
+                cls_name != model_cls.__name__
             )
 
         checkpoint_quant_config = None

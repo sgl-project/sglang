@@ -90,6 +90,12 @@ def test_native_weight_names_and_grouped_qkv_reorder():
         1,
         3,
     )
+    assert mapping("time_embedder.table") == ("adaln_t_table", None, None)
+    assert mapping("transformer_blocks.7.adaln_proj.folded_bias") == (
+        "blocks.7.adaln_proj.linear.bias",
+        None,
+        None,
+    )
 
     diffusers_weights = [
         ("transformer_blocks.0.attn.to_q.qweight", torch.full((2, 3), 1)),
@@ -109,6 +115,19 @@ def test_native_weight_names_and_grouped_qkv_reorder():
         converted["blocks.0.mlp.fc1.weight"],
         torch.tensor([[4, 5], [6, 7], [0, 1], [2, 3]]),
     )
+
+    pruned_config = MiniMaxH3DiTConfig()
+    pruned_config.update_model_arch(
+        {
+            "_class_name": "MiniMaxH3PrunedTransformer3DModel",
+            "adaln_rank": 8,
+            "time_embed_dim": 2688,
+            "time_table_size": 1025,
+        }
+    )
+    assert pruned_config.arch_config.time_embed_dim == 8
+    assert pruned_config.arch_config.adaln_curve_grid == 1025
+    assert pruned_config.arch_config.adaln_affine_input_dim == 2688
 
     weight = torch.arange(12, dtype=torch.float32).reshape(12, 1)
     actual = _reorder_grouped_qkv_to_qkv(

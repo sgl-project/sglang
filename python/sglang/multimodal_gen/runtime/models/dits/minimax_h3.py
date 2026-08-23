@@ -1653,7 +1653,10 @@ class MiniMaxH3FinalLayer(nn.Module):
 
 
 class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
-    _aliases = ["MiniMaxH3Transformer3DModel"]
+    _aliases = [
+        "MiniMaxH3Transformer3DModel",
+        "MiniMaxH3PrunedTransformer3DModel",
+    ]
     _fsdp_shard_conditions = [is_block]
     # refine_prompt_embeds drives a forward pass outside __call__.
     _fsdp_forward_methods = ("refine_prompt_embeds",)
@@ -1845,6 +1848,28 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 ),
                 requires_grad=False,
             )
+        if arch.adaln_affine_input_dim is None:
+            self.register_parameter("adaln_basis", None)
+            self.register_parameter("adaln_mean", None)
+        else:
+            self.register_parameter(
+                "adaln_basis",
+                nn.Parameter(
+                    torch.empty(
+                        arch.time_embed_dim,
+                        arch.adaln_affine_input_dim,
+                        dtype=_FP32_DTYPE,
+                    ),
+                    requires_grad=False,
+                ),
+            )
+            self.register_parameter(
+                "adaln_mean",
+                nn.Parameter(
+                    torch.empty(arch.adaln_affine_input_dim, dtype=_FP32_DTYPE),
+                    requires_grad=False,
+                ),
+            )
         self.rope = MiniMaxH3Rope(arch.rope_inv_freq_len)
         self.token_refiner = MiniMaxH3TokenRefiner(
             arch,
@@ -1929,6 +1954,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 if not name.startswith("time_embedder.")
             ]
             fp32_param_names.append("adaln_t_table")
+            if self.adaln_basis is not None:
+                fp32_param_names.extend(("adaln_basis", "adaln_mean"))
         for name in fp32_param_names:
             param = self.get_parameter(name)
             if param.dtype != _FP32_DTYPE:
