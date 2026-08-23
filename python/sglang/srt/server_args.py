@@ -3832,6 +3832,10 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
+        # Read through the declarations from here on: the handlers below declare
+        # rather than assign, so a field read would answer with the raw input.
+        cfg = resolving_view(self)
+
         from sglang.srt.arg_groups.mega_moe_hook import handle_mega_moe
 
         handle_mega_moe(self)
@@ -3843,7 +3847,7 @@ class ServerArgs:
         # Reject an explicitly enabled but incompatible hardware runtime before
         # model path resolution, downloads, or the dummy-model short circuit.
         self._handle_hardware_runtime_validation()
-        if self.model_path.lower() in ["none", "dummy"]:
+        if cfg.model_path.lower() in ["none", "dummy"]:
             return
 
         self._handle_model_source_paths()
@@ -3904,8 +3908,10 @@ class ServerArgs:
             current_platform.apply_server_args_defaults,
         )
 
-        # Get GPU memory capacity, which is a common dependency for several configuration steps.
-        gpu_mem = get_device_memory_capacity(self.device)
+        # Get GPU memory capacity, which is a common dependency for several
+        # configuration steps. Through the view: the platform defaults just
+        # above declare `device`, and a field read would answer "auto".
+        gpu_mem = get_device_memory_capacity(cfg.device)
 
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
