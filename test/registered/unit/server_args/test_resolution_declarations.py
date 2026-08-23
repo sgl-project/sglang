@@ -376,6 +376,32 @@ class TestResolutionDeclarations(CustomTestCase):
             + "\n  ".join(differences),
         )
 
+    def test_the_whole_object_readback_carries_only_fields(self):
+        """`/server_info` and its gRPC and in-process twins report
+        `ServerArgs.resolved_dict()`.
+
+        The dump is exactly the field names, carrying the resolution result
+        for each. It holds none of the resolution bookkeeping (`_raw_input`, the
+        declaration stash, the finished flag) and no `ModelConfig` memo: none of
+        that is configuration, and all of it would cross IPC with the
+        readback.
+        """
+        server_args = self._resolve({"tp_size": 2})
+        dump = server_args.resolved_dict()
+        self.assertEqual(
+            sorted(dump),
+            sorted(field.name for field in dataclasses.fields(server_args)),
+            "the readback dump is no longer exactly the fields",
+        )
+        leaked = sorted(
+            name
+            for name in vars(server_args)
+            if name not in dump and not name.startswith("__")
+        )
+        self.assertNotEqual(
+            leaked, [], "nothing to leak any more -- this check is now vacuous"
+        )
+
     def test_every_published_leaf_is_what_resolution_decided(self):
         """One hop further than the check above: the leaf a reader reads.
 
