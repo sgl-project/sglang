@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import torch
@@ -359,19 +360,23 @@ async def rollout_generate(request: RolloutRequest):
         ) from exc
     if output_batch.error:
         raise HTTPException(status_code=500, detail=output_batch.error)
-    with stamps.span("build"):
-        rollout_responses = _build_response(
-            request_id,
-            request.prompt,
-            request.seed,
-            request.rollout,
-            output_batch,
-            video_dtype=request.rollout_video_dtype,
-        )
-    with stamps.span("dump"):
-        payload = [r.model_dump() for r in rollout_responses]
-    with stamps.span("msgpack"):
-        parts = msgpack_encode_spliced(payload)
+    def _serialize_response() -> list[bytes]:
+        with stamps.span("build"):
+            rollout_responses = _build_response(
+                request_id,
+                request.prompt,
+                request.seed,
+                request.rollout,
+                output_batch,
+                video_dtype=request.rollout_video_dtype,
+            )
+        with stamps.span("dump"):
+            payload = [r.model_dump() for r in rollout_responses]
+        with stamps.span("msgpack"):
+            return msgpack_encode_spliced(payload)
+
+    # Off the event loop: building the response copies hundreds of MB
+    parts = await asyncio.to_thread(_serialize_response)
 
     # Timing rides a header: the last marks postdate the encoded body. The
     # explicit content-length keeps uvicorn on identity framing, not chunked.
