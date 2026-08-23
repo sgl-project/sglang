@@ -81,6 +81,7 @@ class SchedulerProfilerManager:
         self.nsys_exact_batch = int(
             os.getenv("SGLANG_NSYS_EXACT_RUNNING_BATCH", "0") or "0"
         )
+        self.nsys_exact_decode_batches_seen = 0
 
         # For ROCM
         self.rpd_profiler = None
@@ -122,6 +123,7 @@ class SchedulerProfilerManager:
 
         self.profile_by_stage = profile_by_stage
         self.merge_profiles = merge_profiles
+        self.nsys_exact_decode_batches_seen = 0
 
         if output_dir is None:
             output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
@@ -430,10 +432,15 @@ class SchedulerProfilerManager:
                 raise RuntimeError(f"unsupported profile stage: {batch.forward_mode}")
         else:
             # Check profiler
+            exact_decode_boundary_ready = (
+                not self.nsys_exact_batch
+                or self.nsys_exact_decode_batches_seen >= 2
+            )
             if (
                 self.profiler_target_forward_ct
                 and self.profiler_target_forward_ct <= self.get_forward_ct()
                 and self.profile_in_progress
+                and exact_decode_boundary_ready
             ):
                 self._stop_profile()
             if self.profiler_start_forward_ct and not self.profile_in_progress:
@@ -461,6 +468,12 @@ class SchedulerProfilerManager:
                             forward_ct,
                         )
                     self._start_profile()
+            if (
+                self.nsys_exact_batch
+                and self.profile_in_progress
+                and batch.forward_mode.is_decode()
+            ):
+                self.nsys_exact_decode_batches_seen += 1
 
     def _profile(self, recv_req: ProfileReq):
         if recv_req.req_type == ProfileReqType.START_PROFILE:

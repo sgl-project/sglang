@@ -72,3 +72,56 @@ def test_nsys_exact_running_batch_defers_and_rebases_capture_window(tmp_path):
 
     start_profile.assert_called_once_with()
     assert manager.profiler_target_forward_ct == 207
+
+
+def test_nsys_exact_capture_waits_for_two_real_decode_batches_after_idle_steps():
+    forward_ct = 100
+    ps = SimpleNamespace(gpu_id=0)
+    with patch.dict(
+        "os.environ", {"SGLANG_NSYS_EXACT_RUNNING_BATCH": "32"}
+    ):
+        manager = SchedulerProfilerManager(
+            ps=ps,
+            dp_tp_cpu_group=MagicMock(),
+            get_forward_ct=lambda: forward_ct,
+        )
+    manager.profiler_start_forward_ct = 100
+    manager.profiler_target_forward_ct = 101
+
+    decode_mode = SimpleNamespace(is_decode=lambda: True)
+    idle_mode = SimpleNamespace(is_decode=lambda: False)
+    with (
+        patch.object(manager, "_start_profile") as start_profile,
+        patch.object(manager, "_stop_profile") as stop_profile,
+    ):
+        start_profile.side_effect = lambda: setattr(
+            manager, "profile_in_progress", True
+        )
+        stop_profile.side_effect = lambda: setattr(
+            manager, "profile_in_progress", False
+        )
+
+        manager._profile_batch_predicate(
+            SimpleNamespace(reqs=[object()] * 32, forward_mode=decode_mode)
+        )
+        assert manager.nsys_exact_decode_batches_seen == 1
+
+        forward_ct = 1000
+        for _ in range(5):
+            manager._profile_batch_predicate(
+                SimpleNamespace(reqs=[], forward_mode=idle_mode)
+            )
+        stop_profile.assert_not_called()
+
+        manager._profile_batch_predicate(
+            SimpleNamespace(reqs=[object()] * 31, forward_mode=decode_mode)
+        )
+        assert manager.nsys_exact_decode_batches_seen == 2
+        stop_profile.assert_not_called()
+
+        manager._profile_batch_predicate(
+            SimpleNamespace(reqs=[], forward_mode=idle_mode)
+        )
+
+    start_profile.assert_called_once_with()
+    stop_profile.assert_called_once_with()
