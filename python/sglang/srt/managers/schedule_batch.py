@@ -1287,6 +1287,7 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+        self.hisparse_spec_info = None
 
     @property
     def seqlen(self) -> int:
@@ -1783,6 +1784,7 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_val = None
         self.temp_input_token_ids_logprobs_idx = None
         self.inflight_middle_chunks = 0
+        self.hisparse_spec_info = None
         self.kv.mamba_pool_idx = None
         self.kv.mamba_ping_pong_track_buffer = None
         self.kv.mamba_next_track_idx = None

@@ -167,6 +167,37 @@ def load_cache_to_device_buffer_spec_mla(
 
 
 @functools.cache
+def _jit_native_mtp_sparse_module(
+    item_size_bytes: int,
+    block_size: int,
+    num_top_k: int,
+    hot_buffer_size: int,
+) -> Module:
+    """Build the correctness-first MTP materialization kernel."""
+    template_args = make_cpp_args(
+        block_size,
+        num_top_k,
+        hot_buffer_size,
+        True,
+        False,
+    )
+    return load_jit(
+        "native_mtp_sparse_cache",
+        item_size_bytes,
+        block_size,
+        num_top_k,
+        hot_buffer_size,
+        cuda_files=["hisparse_mtp_native.cuh"],
+        cuda_wrappers=[
+            (
+                "load_cache_to_device_buffer",
+                f"load_cache_to_device_buffer<{template_args}>",
+            )
+        ],
+    )
+
+
+@functools.cache
 def _jit_sparse_module(
     item_size_bytes: int,
     block_size: int,
@@ -396,6 +427,67 @@ def load_cache_to_device_buffer_mla(
         miss_dst=miss_dst,
         miss_count=miss_count,
         skip_io=skip_io,
+    )
+
+
+def load_cache_to_device_buffer_mtp_mla(
+    *,
+    top_k_tokens: torch.Tensor,
+    device_buffer_tokens: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    device_buffer_locs: torch.Tensor,
+    host_cache: torch.Tensor,
+    device_buffer: torch.Tensor,
+    top_k_device_locs: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    mtp_staging_locs: torch.Tensor,
+    item_size_bytes: int,
+    num_top_k: int,
+    hot_buffer_size: int,
+    page_size: int,
+    block_size: int,
+    num_real_reqs: torch.Tensor,
+    num_steps: int,
+) -> None:
+    """Materialize each historical MTP occurrence into stable device rows."""
+    if top_k_tokens.dim() != 3:
+        raise ValueError("native MTP TopK must have shape [request, step, topk]")
+    num_reqs, actual_steps, actual_top_k = top_k_tokens.shape
+    if actual_steps != num_steps or actual_top_k != num_top_k:
+        raise ValueError("native MTP TopK shape does not match num_steps/num_top_k")
+    if top_k_device_locs.shape != top_k_tokens.shape:
+        raise ValueError("native MTP output must match the TopK shape")
+    if seq_lens.numel() != num_reqs * num_steps:
+        raise ValueError("native MTP sequence lengths must be request-major")
+    if mtp_staging_locs.ndim != 2 or mtp_staging_locs.shape[1] < (
+        num_steps * num_top_k
+    ):
+        raise ValueError("native MTP staging capacity is smaller than steps * topk")
+
+    empty = torch.empty(0)
+    _jit_native_mtp_sparse_module(
+        item_size_bytes,
+        block_size,
+        num_top_k,
+        hot_buffer_size,
+    ).load_cache_to_device_buffer(
+        top_k_tokens,
+        device_buffer_tokens,
+        host_cache_locs,
+        device_buffer_locs,
+        host_cache,
+        empty,
+        device_buffer,
+        empty,
+        top_k_device_locs,
+        req_pool_indices,
+        seq_lens,
+        mtp_staging_locs,
+        num_real_reqs,
+        page_size,
+        item_size_bytes,
+        num_steps,
     )
 
 

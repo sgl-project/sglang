@@ -11,6 +11,7 @@ import os
 import unittest
 from array import array
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import torch
 
@@ -25,7 +26,7 @@ register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 # ---------------------------------------------------------------------------
 # Test configuration (small-scale for fast CI runs)
 # ---------------------------------------------------------------------------
-SIZE = 2048  # device buffer pool size (tokens)
+SIZE = 8192  # includes native MTP staging for multi-request coverage
 PAGE_SIZE = 64  # page size (must be 64 for CUDA, 1 for ROCm)
 TOP_K = 256  # top-k selection count
 DEVICE_BUFFER_SIZE = 512  # device buffer per request
@@ -61,6 +62,150 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         req, "extend_range", Range(start, end)
     )
     return req
+
+
+class TestHiSparseMTPNative(unittest.TestCase):
+    def test_native_target_verify_keeps_request_relative_topk(self):
+        from sglang.srt.layers.attention import dsa_backend
+        from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+            DSATopKBackend,
+            TopkTransformMethod,
+        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        backend = object.__new__(dsa_backend.DeepseekSparseAttnBackend)
+        backend.use_fused_topk = True
+        backend.hisparse_coordinator = SimpleNamespace(mtp_demand_buffer_enabled=False)
+        backend.forward_metadata = SimpleNamespace(
+            paged_mqa_schedule_metadata=None,
+            paged_mqa_ctx_lens_2d=None,
+        )
+        backend.dsa_topk_backend = DSATopKBackend.SGL_KERNEL
+        backend.get_topk_transform_method = MagicMock(
+            return_value=TopkTransformMethod.PAGED
+        )
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+
+        metadata = backend.get_indexer_metadata(layer_id=0, forward_batch=forward_batch)
+
+        self.assertTrue(metadata.force_unfused_topk)
+
+    def test_mtp_keeps_draft_kv_device_resident(self):
+        from sglang.srt.model_executor import model_runner
+
+        server_args = SimpleNamespace(
+            enable_hisparse=True,
+            device="cuda",
+            kv_cache_dtype="fp8_e4m3",
+            dsa_decode_backend="flashmla_kv",
+            speculative_algorithm="EAGLE",
+            speculative_num_steps=3,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=4,
+            speculative_attention_mode="prefill",
+            pp_size=1,
+            attn_cp_size=1,
+            enable_pdmux=False,
+            disaggregation_mode="null",
+        )
+
+        self.assertTrue(
+            model_runner.resolve_hisparse_for_runner(server_args, is_draft_worker=False)
+        )
+        self.assertFalse(
+            model_runner.resolve_hisparse_for_runner(server_args, is_draft_worker=True)
+        )
+
+    def test_target_verify_runs_native_multistep_swap(self):
+        from sglang.srt.layers.attention import dsa_backend
+
+        logical_topk = torch.arange(8 * 16, dtype=torch.int32).view(8, 16)
+        physical_storage = torch.arange(2 * 4 * 32, dtype=torch.int32).view(2, 4, 32)
+        physical_topk_3d = physical_storage[..., ::2]
+        swap = MagicMock(return_value=physical_topk_3d)
+        coordinator = SimpleNamespace(swap_in_selected_pages_mtp=swap)
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([3, 7], dtype=torch.int64)
+        )
+        metadata = SimpleNamespace(
+            dsa_seqlens_expanded=torch.tensor(
+                [129, 130, 131, 132, 257, 258, 259, 260], dtype=torch.int32
+            )
+        )
+
+        actual = dsa_backend._prepare_hisparse_mtp_native(
+            coordinator=coordinator,
+            forward_batch=forward_batch,
+            metadata=metadata,
+            relative_topk=logical_topk,
+            layer_id=12,
+            num_steps=4,
+        )
+
+        self.assertTrue(torch.equal(actual, physical_topk_3d.reshape(8, 16)))
+        call = swap.call_args.kwargs
+        self.assertEqual(call["top_k_result"].shape, (2, 4, 16))
+        self.assertEqual(call["layer_id"], 12)
+
+    def test_verify_preparation_delegates_four_rows(self):
+        from sglang.srt.speculative import eagle_utils
+
+        calls = []
+        seq_lens = torch.tensor([128, 4094], dtype=torch.int64)
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+            hisparse_coordinator=SimpleNamespace(
+                prepare_verify_slots_spec_v2=lambda **kwargs: calls.append(kwargs)
+            ),
+            req_pool_indices=torch.tensor([3, 7], dtype=torch.int64),
+            req_pool_indices_cpu=torch.tensor([3, 7], dtype=torch.int64),
+            out_cache_loc=torch.tensor(
+                [101, 102, 103, 104, 201, 202, 203, 204], dtype=torch.int64
+            ),
+            seq_lens=seq_lens,
+            reqs=[
+                SimpleNamespace(kv_committed_len=128),
+                SimpleNamespace(kv_committed_len=4094),
+            ],
+        )
+
+        eagle_utils._prepare_hisparse_mtp_verify_slots(batch, draft_token_num=4)
+
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertIs(call["verify_cache_locs"], batch.out_cache_loc)
+        self.assertEqual(call["num_tokens_per_req"], 4)
+        self.assertIs(call["start_positions"], seq_lens)
+
+    def test_native_finalize_commits_accepted_rows(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        calls = []
+        coordinator.finalize_accepted_tokens = lambda **kwargs: calls.append(kwargs)
+        verify_cache_locs = torch.tensor(
+            [10, 11, 12, 13, 20, 21, 22, 23], dtype=torch.int64
+        )
+
+        coordinator.finalize_accepted_tokens_spec_v2(
+            req_pool_indices=torch.tensor([2, 5], dtype=torch.int64),
+            seq_lens=torch.tensor([5000, 7000], dtype=torch.int64),
+            verify_cache_locs=verify_cache_locs,
+            accept_index=torch.tensor(
+                [[0, 1, -1, -1], [4, -1, -1, -1]], dtype=torch.int32
+            ),
+        )
+
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertTrue(
+            torch.equal(call["accepted_cache_locs"], torch.tensor([10, 11, 20]))
+        )
+        self.assertTrue(
+            torch.equal(
+                call["accepted_token_positions"], torch.tensor([5000, 5001, 7000])
+            )
+        )
 
 
 class TestHiSparseUnit(unittest.TestCase):
@@ -150,6 +295,7 @@ class TestHiSparseUnit(unittest.TestCase):
             device="cuda",
             tp_group=cls.tp_group,
             host_to_device_ratio=HOST_TO_DEVICE_RATIO,
+            mtp_num_rows=4,
         )
 
     @classmethod
@@ -171,6 +317,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator.mem_pool_host.clear()
         # Reset per-request coordinator bookkeeping
         self.coordinator.req_to_device_buffer.zero_()
+        self.coordinator.req_to_mtp_staging.zero_()
         self.coordinator.req_device_buffer_size.zero_()
         self.coordinator.req_to_host_pool.fill_(-1)
         self.coordinator.req_to_host_pool_allocated_len.zero_()
@@ -497,6 +644,66 @@ class TestHiSparseUnit(unittest.TestCase):
         self._cleanup_req(req, kv_loc, logical_only=True)
         self._assert_sizes_restored(initial, "lru_replacement")
 
+    def test_native_mtp_multistep_swap_preserves_cross_step_rows(self):
+        """Later MTP rows must not overwrite earlier returned page tables."""
+        initial = self._get_initial_sizes()
+        fill_len = DEVICE_BUFFER_SIZE + self.page_size * 8
+        req = _make_req("native-mtp-swap", list(range(fill_len)))
+        self._alloc_req_slot(req)
+
+        kv_loc = self._alloc_kv(req, fill_len, logical_only=True)
+        self._populate_host_pool(req, fill_len)
+        self.coordinator.admit_request_direct(req)
+
+        # Four rows share 128 tokens and contribute 128 unique tokens each:
+        # 640 distinct rows in total, which exceeds the 512-row native hot
+        # slice. Returning four physical page tables is only correct if later
+        # steps cannot overwrite rows still referenced by earlier steps.
+        common = torch.arange(128, dtype=torch.int32, device="cuda")
+        rows = []
+        for step in range(4):
+            unique_start = 128 + step * 128
+            rows.append(
+                torch.cat(
+                    (
+                        common,
+                        torch.arange(
+                            unique_start,
+                            unique_start + 128,
+                            dtype=torch.int32,
+                            device="cuda",
+                        ),
+                    )
+                )
+            )
+        topk = torch.stack(rows).unsqueeze(0)
+        req_pool_indices = torch.tensor(
+            [req.req_pool_idx], dtype=torch.int64, device="cuda"
+        )
+        seq_lens = torch.full((4,), fill_len, dtype=torch.int32, device="cuda")
+        self.coordinator.num_real_reqs.fill_(1)
+
+        locs = self.coordinator.swap_in_selected_pages_mtp(
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            top_k_result=topk,
+            layer_id=0,
+        )
+
+        self.assertEqual(locs.shape, topk.shape)
+        self.assertTrue(torch.all(locs >= 0))
+        for step in range(4):
+            self._assert_kv_correct(
+                locs[0, step],
+                topk[0, step],
+                layer_id=0,
+                count=TOP_K,
+                msg=f"native MTP step {step}: ",
+            )
+
+        self._cleanup_req(req, kv_loc, logical_only=True)
+        self._assert_sizes_restored(initial, "native_mtp_multistep")
+
     # ==================================================================
     # Test: Allocator alloc/free lifecycle
     # ==================================================================
@@ -533,6 +740,57 @@ class TestHiSparseUnit(unittest.TestCase):
         self.allocator.free_hisparse_indices(buf_idx)
         self.allocator.logical_attn_allocator.free(kv_loc)
         self._assert_sizes_restored(initial, "alloc_free_cycle")
+
+    def test_allocator_reserve_failure_is_transactional(self):
+        """A failed side-reserve claim must not publish a partial transition."""
+        initial = self._get_initial_sizes()
+        device = self.allocator.device
+        fill_len = self.page_size * 2
+        kv_loc = self.allocator.alloc_extend(
+            prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+            prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+            seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+            seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+            last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+            extend_num_tokens=fill_len,
+        )
+        self.assertIsNotNone(kv_loc)
+
+        mapping_before = self.allocator.full_to_hisparse_device_index_mapping[
+            kv_loc
+        ].clone()
+        available_before = self.allocator.hisparse_attn_allocator.available_size()
+        claimed = self.allocator.alloc_device_buffer_with_reserve(
+            kv_loc,
+            need_size=self.page_size,
+            reserve_size=available_before + 2 * self.page_size,
+        )
+
+        self.assertIsNone(claimed)
+        self.assertTrue(
+            torch.equal(
+                mapping_before,
+                self.allocator.full_to_hisparse_device_index_mapping[kv_loc],
+            )
+        )
+        self.assertEqual(
+            self.allocator.hisparse_attn_allocator.available_size(), available_before
+        )
+
+        claimed = self.allocator.alloc_device_buffer_with_reserve(
+            kv_loc,
+            need_size=self.page_size,
+            reserve_size=self.page_size,
+        )
+        self.assertIsNotNone(claimed)
+        hot, reserve = claimed
+        self.assertTrue(
+            torch.all(self.allocator.full_to_hisparse_device_index_mapping[kv_loc] == 0)
+        )
+
+        self.allocator.free_hisparse_indices(torch.cat([hot, reserve]))
+        self.allocator.logical_attn_allocator.free(kv_loc)
+        self._assert_sizes_restored(initial, "transactional_reserve")
 
     def test_allocator_page_size_one_alloc_free_cycle(self):
         """alloc() maps logical to hisparse indices for ROCm page_size=1."""

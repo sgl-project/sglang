@@ -3351,9 +3351,6 @@ class Scheduler(
         last_tokens = torch.tensor(
             [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
         )
-        self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
-        )
         batch.input_ids = None
 
         if batch.return_logprob:
@@ -3363,7 +3360,32 @@ class Scheduler(
         batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
             batch, self.model_config.vocab_size
         )
-        # todo hisparse, maybe other info to contain for the new batch
+
+        if batch.spec_algorithm.is_none():
+            self.future_map.stash(
+                batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
+            )
+        else:
+            missing = [
+                req.rid
+                for req in reqs
+                if getattr(req, "hisparse_spec_info", None) is None
+            ]
+            if missing:
+                raise RuntimeError(
+                    "HiSparse decode batch is missing staged speculative state for: "
+                    + ", ".join(missing)
+                )
+            batch.spec_info = reqs[0].hisparse_spec_info
+            reqs[0].hisparse_spec_info = None
+            for req in reqs[1:]:
+                batch.spec_info.merge_batch(req.hisparse_spec_info)
+                req.hisparse_spec_info = None
+            # Prefill already published the complete draft payload under these
+            # request-pool keys.  Keep that relay intact; the next forward
+            # gathers topk/hidden/bonus values from it after staging completes.
+            batch.spec_info.future_indices = batch.req_pool_indices
+
         return batch
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")

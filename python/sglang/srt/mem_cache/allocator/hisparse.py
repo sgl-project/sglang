@@ -127,42 +127,64 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def alloc_device_buffer(self, allocated_indices, need_size: int):
+        claimed = self.alloc_device_buffer_with_reserve(
+            allocated_indices, need_size, reserve_size=0
+        )
+        if claimed is None:
+            return None
+        return claimed[0]
+
+    def alloc_device_buffer_with_reserve(
+        self, allocated_indices, need_size: int, reserve_size: int
+    ):
+        """Atomically replace logical rows with a hot buffer and side reserve."""
         assert need_size % self.page_size == 0
-        # clear original reference and isolate the buffer from outside addressing, allocate new buffer if needed
-        hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
-        self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
+        assert reserve_size % self.page_size == 0
+        total_size = need_size + reserve_size
+        original_mapping = self.full_to_hisparse_device_index_mapping[allocated_indices]
         # Filter valid (non-zero) hisparse indices.
         # In the direct-to-host path, mapping is all zeros since no hisparse
         # device indices were pre-allocated.
-        hisparse_indices = hisparse_indices[hisparse_indices > 0]
-        if len(hisparse_indices) >= need_size:
-            buffer_indices = hisparse_indices[:need_size]
-            self.free_hisparse_indices(hisparse_indices[need_size:])
-        else:
-            # page alignment, claiming the residual space for an incomplete page
-            page_residual_length = len(hisparse_indices) % self.page_size
-            if page_residual_length != 0:
-                hisparse_indices = torch.cat(
-                    [
-                        hisparse_indices,
-                        torch.arange(
-                            hisparse_indices[-1] + 1,
-                            hisparse_indices[-1]
-                            + self.page_size
-                            - page_residual_length
-                            + 1,
-                            device=self.device,
-                        ),
-                    ]
-                )
-            extra_indices = self.hisparse_attn_allocator.alloc(
-                need_size - len(hisparse_indices)
+        hisparse_indices = original_mapping[original_mapping > 0]
+
+        # Claim the residual rows of an already allocated page before checking
+        # capacity. They are owned by this request even though no logical token
+        # points at them yet.
+        page_residual_length = len(hisparse_indices) % self.page_size
+        if page_residual_length != 0:
+            hisparse_indices = torch.cat(
+                [
+                    hisparse_indices,
+                    torch.arange(
+                        hisparse_indices[-1] + 1,
+                        hisparse_indices[-1]
+                        + self.page_size
+                        - page_residual_length
+                        + 1,
+                        device=self.device,
+                    ),
+                ]
             )
-            assert extra_indices is not None, (
-                "Hisparse allocation failed in alloc_device_buffer"
-            )
-            buffer_indices = torch.cat([hisparse_indices, extra_indices])
-        return buffer_indices
+        extra_size = max(0, total_size - len(hisparse_indices))
+        if extra_size > self.hisparse_attn_allocator.available_size():
+            return None
+
+        extra_indices = None
+        if extra_size > 0:
+            extra_indices = self.hisparse_attn_allocator.alloc(extra_size)
+            if extra_indices is None:
+                return None
+
+        # No operation below can fail: publish the ownership transition only
+        # after every required row has been reserved.
+        self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
+        if extra_indices is not None:
+            hisparse_indices = torch.cat([hisparse_indices, extra_indices])
+        claimed = hisparse_indices[:total_size]
+        unused = hisparse_indices[total_size:]
+        if unused.numel() > 0:
+            self.free_hisparse_indices(unused)
+        return claimed[:need_size], claimed[need_size:]
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
         self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])

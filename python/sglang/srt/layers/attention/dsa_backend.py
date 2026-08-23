@@ -99,6 +99,30 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 
+def _prepare_hisparse_mtp_native(
+    coordinator,
+    forward_batch: ForwardBatch,
+    metadata,
+    relative_topk: torch.Tensor,
+    layer_id: int,
+    num_steps: int,
+) -> torch.Tensor:
+    """Materialize request-relative TopK rows before target attention."""
+    num_reqs = forward_batch.req_pool_indices.numel()
+    expected_rows = num_reqs * num_steps
+    if relative_topk.shape[0] != expected_rows:
+        raise ValueError(
+            "native MTP HiSparse TopK row mismatch: "
+            f"got {relative_topk.shape[0]}, expected {expected_rows}"
+        )
+    return coordinator.swap_in_selected_pages_mtp(
+        req_pool_indices=forward_batch.req_pool_indices,
+        seq_lens=metadata.dsa_seqlens_expanded,
+        top_k_result=relative_topk.reshape(num_reqs, num_steps, -1),
+        layer_id=layer_id,
+    ).reshape(expected_rows, -1)
+
+
 def _all_gather_dsa_trtllm_fp8_kv(
     forward_batch: ForwardBatch,
     k: torch.Tensor,
@@ -1967,7 +1991,6 @@ class DeepseekSparseAttnBackend(
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
-
         if self.use_fused_topk:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
@@ -2005,10 +2028,20 @@ class DeepseekSparseAttnBackend(
 
         # todo hisparse: to cover more backends
         if self.hisparse_coordinator is not None:
-            # flash_mla_sparse_fwd / tilelang require int32 page indices.
-            page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
-                page_table_1
-            ).to(torch.int32)
+            if forward_batch.forward_mode.is_target_verify():
+                page_table_1 = _prepare_hisparse_mtp_native(
+                    coordinator=self.hisparse_coordinator,
+                    forward_batch=forward_batch,
+                    metadata=metadata,
+                    relative_topk=page_table_1,
+                    layer_id=layer.layer_id,
+                    num_steps=self.speculative_num_draft_tokens,
+                )
+            else:
+                # flash_mla_sparse_fwd / tilelang require int32 page indices.
+                page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
+                    page_table_1
+                ).to(torch.int32)
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
@@ -3386,9 +3419,14 @@ class DeepseekSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> DSAIndexerMetadata:
+        # Native HiSparse materialization indexes request-local Host rows by
+        # token position. A fused PAGED transform would return KV-pool IDs.
         force_unfused = not self.use_fused_topk or (
             self.hisparse_coordinator is not None
-            and forward_batch.forward_mode.is_decode_or_idle()
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            )
         )
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,

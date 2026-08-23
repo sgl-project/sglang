@@ -458,6 +458,25 @@ def _compact_accept_to_front(
     return out
 
 
+def _finalize_hisparse_mtp_verify(
+    batch: ScheduleBatch, accept_index: torch.Tensor
+) -> None:
+    """Commit accepted target-verify rows through the HiSparse lifecycle."""
+    coordinator = batch.hisparse_coordinator
+    if (
+        coordinator is None
+        or not coordinator.supports_hisparse_draft_slots()
+        or batch.forward_mode.is_idle()
+    ):
+        return
+    coordinator.finalize_accepted_tokens_spec_v2(
+        req_pool_indices=batch.req_pool_indices,
+        seq_lens=batch.seq_lens,
+        verify_cache_locs=batch.out_cache_loc,
+        accept_index=accept_index,
+    )
+
+
 def run_eagle_verify(
     batch: ScheduleBatch,
     *,
@@ -586,6 +605,7 @@ def run_eagle_verify(
         accept_index,
     ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
     new_seq_lens = batch.seq_lens + accept_lens
+    _finalize_hisparse_mtp_verify(batch, accept_index)
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
         "clear_unaccepted_c128_draft_states",
