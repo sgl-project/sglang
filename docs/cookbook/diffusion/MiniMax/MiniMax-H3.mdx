@@ -273,19 +273,23 @@ sglang serve \
   --port 30010
 ```
 
-SGLang uses its native static-activation FP8 linear path for attention and
-`fc1`. The checkpoint marks `fc2` for full-precision matrix multiplication, so
+SGLang uses its native static-activation FP8 linear path when the checkpoint
+stores input scales, and automatically uses dynamic activation scaling for
+Comfy FP8 exports that omit them. The checkpoint above marks `fc2` for
+full-precision matrix multiplication, so
 SGLang retains its FP8 storage but materializes and scales one compute-dtype
 `fc2` matrix for each call. This preserves the checkpoint's mixed execution
 contract and low resident weight memory, but that part is slower than a fully
 quantized FP8 GEMM. TP, Ulysses/Ring sequence parallelism, and
 component/layerwise offload are supported; FSDP inference is rejected.
 
-The `pruned_int8_convrot` files are detected but remain unsupported. They
-require online regular-Hadamard ConvRot, dynamic INT8 activation quantization,
-and a matching W8A8 GEMM. SGLang fails before loading them instead of silently
-treating their stored INT8 values as ordinary weights. A native ConvRot kernel
-path should be added and benchmarked separately before these files are accepted.
+The `pruned_int8_convrot` files use the same override path and are detected
+automatically. Install `comfy-kitchen`, replace the FP8 filename above with
+`minimax_h3_fl2va_pruned_int8_convrot.safetensors`, and still omit
+`--quantization`. SGLang loads their serialized INT8 weights and row scales into
+the fused ConvRot kernel without requantizing them. TP1/2/4 and sequence or
+layerwise offload are supported; TP8 violates the checkpoint's 256-element
+ConvRot group boundary, and FSDP is rejected.
 
 ### Advanced: precomputed AdaLN cache
 
@@ -907,7 +911,7 @@ sglang generate \
 `--attention-backend sol_attn` with
 `--attention-backend-config dense_backend=sage_attn,dense_steps=10` and
 `--component-attention-backends text_encoder=torch_sdpa,transformer=sol_attn`.
-See [Quantization](/docs/sglang-diffusion/quantization#kitchen-int8-online-quantization)
+See [Quantization](/docs/sglang-diffusion/quantization#kitchen-int8)
 and [Attention Backends](/docs/sglang-diffusion/attention_backends#sage-then-sol-hybrid).
 
 <Warning>
