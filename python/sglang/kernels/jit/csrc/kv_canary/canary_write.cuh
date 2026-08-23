@@ -11,9 +11,9 @@
 #include "canary_common.cuh"
 #include <cstdint>
 
-namespace canary {
+namespace sglang {
 
-namespace {
+namespace canary {
 
 // Single thread per block — chain advance is inherently serial.
 constexpr uint32_t kWriteBlockSize = 1;
@@ -163,8 +163,6 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
   atomicAdd(
       reinterpret_cast<unsigned long long*>(p.slot_run_counter), static_cast<unsigned long long>(entries_written));
 }
-
-}  // namespace
 
 // API source of truth: docstring of canary_write_step in python/sglang/kernels/ops/kv_canary/write.py.
 //
@@ -347,3 +345,5 @@ inline void canary_write_step_cuda(
 }
 
 }  // namespace canary
+
+}  // namespace sglang

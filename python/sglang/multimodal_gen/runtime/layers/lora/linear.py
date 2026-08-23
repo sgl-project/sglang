@@ -47,6 +47,27 @@ LoRAWeightEntry = tuple[
 ]
 
 
+def _compute_lora_delta(
+    x: torch.Tensor, lora_A: torch.Tensor, lora_B: torch.Tensor
+) -> torch.Tensor:
+    """Apply a regular or stacked LoRA projection to the last dimension."""
+    if lora_A.dim() == 2 and lora_B.dim() == 2:
+        return x @ lora_A.T @ lora_B.T
+    if lora_A.dim() == 3 and lora_B.dim() == 3:
+        if lora_A.shape[0] != lora_B.shape[0]:
+            raise ValueError(
+                "Stacked LoRA A/B projections must have the same group count, got "
+                f"{lora_A.shape[0]} and {lora_B.shape[0]}"
+            )
+        hidden = torch.einsum("...i,nri->...nr", x, lora_A)
+        delta = torch.einsum("...nr,nor->...no", hidden, lora_B)
+        return delta.flatten(start_dim=-2)
+    raise ValueError(
+        "LoRA A/B projections must both be 2D or both be 3D, got "
+        f"{tuple(lora_A.shape)} and {tuple(lora_B.shape)}"
+    )
+
+
 class BaseLayerWithLoRA(nn.Module):
     def __init__(
         self,
@@ -100,7 +121,7 @@ class BaseLayerWithLoRA(nn.Module):
             lora_B_sliced = self.slice_lora_b_weights(
                 lora_B.to(device=x.device, non_blocking=True)
             )
-            delta = x_lora @ lora_A_sliced.T @ lora_B_sliced.T
+            delta = _compute_lora_delta(x_lora, lora_A_sliced, lora_B_sliced)
             if self.lora_alpha != self.lora_rank:
                 delta = delta * (
                     self.lora_alpha / self.lora_rank  # type: ignore
@@ -481,7 +502,9 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
             lora_B_sliced = self.slice_lora_b_weights(
                 lora_B.to(device=input_.device, non_blocking=True)
             )
-            delta_parallel = input_lora @ lora_A_sliced.T @ lora_B_sliced.T
+            delta_parallel = _compute_lora_delta(
+                input_lora, lora_A_sliced, lora_B_sliced
+            )
             if self.lora_alpha != self.lora_rank:
                 delta_parallel = delta_parallel * (
                     self.lora_alpha / self.lora_rank  # type: ignore
@@ -523,11 +546,26 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
     def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
         tp_rank = get_tp_rank()
-        # Since the outputs for both gate and up are identical, we use a random one.
-        shard_size = self.base_layer.output_partition_sizes[0]
-        start_idx = tp_rank * shard_size
-        end_idx = (tp_rank + 1) * shard_size
-        return B[:, start_idx:end_idx, :]
+        if B.dim() == 3:
+            # Stacked Q/K/V (or gate/up) LoRA weights from diffusers-style adapters.
+            shard_size = self.base_layer.output_partition_sizes[0]
+            start_idx = tp_rank * shard_size
+            end_idx = (tp_rank + 1) * shard_size
+            return B[:, start_idx:end_idx, :]
+
+        # Native fused checkpoints (MiniMax H3, etc.) store one concatenated 2D
+        # lora_B matrix per logical layer; shard each section independently.
+        shards: list[torch.Tensor] = []
+        row_offset = 0
+        for full_size, part_size in zip(
+            self.base_layer.output_sizes,
+            self.base_layer.output_partition_sizes,
+        ):
+            local_start = tp_rank * part_size
+            local_end = (tp_rank + 1) * part_size
+            shards.append(B[row_offset + local_start : row_offset + local_end, :])
+            row_offset += full_size
+        return torch.cat(shards, dim=0)
 
 
 class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
@@ -601,7 +639,9 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             lora_B_sliced = self.slice_lora_b_weights(
                 lora_B.to(device=input_parallel.device, non_blocking=True)
             )
-            delta_parallel = input_parallel_lora @ lora_A_sliced.T @ lora_B_sliced.T
+            delta_parallel = _compute_lora_delta(
+                input_parallel_lora, lora_A_sliced, lora_B_sliced
+            )
             if self.lora_alpha != self.lora_rank:
                 delta_parallel = delta_parallel * (
                     self.lora_alpha / self.lora_rank  # type: ignore
@@ -673,7 +713,7 @@ class LinearWithLoRA(BaseLayerWithLoRA):
             lora_B_sliced = self.slice_lora_b_weights(
                 lora_B.to(device=x.device, non_blocking=True)
             )
-            delta = x_lora @ lora_A_sliced.T @ lora_B_sliced.T
+            delta = _compute_lora_delta(x_lora, lora_A_sliced, lora_B_sliced)
             if self.lora_alpha != self.lora_rank:
                 delta = delta * (
                     self.lora_alpha / self.lora_rank  # type: ignore

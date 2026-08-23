@@ -28,7 +28,11 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_flags, get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
-from sglang.srt.utils import get_bool_env_var, get_current_device_stream_fast
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_current_device_stream_fast,
+    next_power_of_2,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -337,6 +341,15 @@ class AscendAttnBackend(AttentionBackend):
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
+        if (
+            self.speculative_num_draft_tokens is not None
+            and model_runner.is_draft_worker
+        ):
+            self.speculative_num_draft_tokens = (
+                model_runner.spec_algorithm.get_num_tokens_per_req_for_target_verify(
+                    int(self.speculative_num_draft_tokens), is_draft_worker=True
+                )
+            )
         self.ascend_attn_mask_builder = AscendAttnMaskBuilder(
             model_runner, self.device, self.use_fia, self.use_mla
         )
@@ -432,12 +445,20 @@ class AscendAttnBackend(AttentionBackend):
         self.forward_metadata = ForwardMetadata()
         seq_lens_max = forward_batch.seq_lens.max()
         if forward_batch.forward_mode.is_target_verify():
-            seq_lens_max += self.speculative_num_draft_tokens
+            spec_tokens_per_req = int(forward_batch.spec_info.draft_token_num)
+            # Overlap scheduling can publish the CPU sequence length one step
+            # ahead of the device tensor. FIA consumes seq_lens_cpu below, so
+            # derive the block-table width from the same source. Otherwise a
+            # page-aligned request can expose KV_S=N while asking FIA for N+1.
+            seq_lens_max = forward_batch.seq_lens_cpu.max().item() + spec_tokens_per_req
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
         ):
+            seq_lens_max = forward_batch.seq_lens.max()
             seq_lens_max += self.speculative_step_id + 1
+        else:
+            seq_lens_max = forward_batch.seq_lens.max()
         self.forward_metadata.block_tables = (
             self.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, :seq_lens_max
@@ -477,10 +498,10 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
             self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
 
-        if forward_batch.forward_mode.is_target_verify() and not _is_dflash_verify(
-            forward_batch.spec_info
-        ):
-            self.forward_metadata.seq_lens_cpu_int += self.speculative_num_draft_tokens
+        if forward_batch.forward_mode.is_target_verify():
+            spec_algorithm = forward_batch.spec_algorithm
+            if spec_algorithm is None or not spec_algorithm.is_dspark():
+                self.forward_metadata.seq_lens_cpu_int += spec_tokens_per_req
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
@@ -497,11 +518,16 @@ class AscendAttnBackend(AttentionBackend):
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
+            spec_tokens_per_req = (
+                int(forward_batch.spec_info.draft_token_num)
+                if forward_batch.forward_mode.is_target_verify()
+                else self.speculative_num_draft_tokens
+            )
             self.forward_metadata.actual_seq_lengths_q = torch.arange(
-                self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens
-                + forward_batch.seq_lens.shape[0] * self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens,
+                spec_tokens_per_req,
+                spec_tokens_per_req
+                + forward_batch.seq_lens.shape[0] * spec_tokens_per_req,
+                spec_tokens_per_req,
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -581,7 +607,7 @@ class AscendAttnBackend(AttentionBackend):
             )
         if self.use_sliding_window_kv_pool:
             # refilled in place at replay; the captured graph reads this storage
-            self.swa_out_cache_loc_buf = torch.zeros(
+            self.cuda_graph_swa_out_cache_loc = torch.zeros(
                 max_num_tokens,
                 dtype=torch.int64,
                 device=self.device,
@@ -612,7 +638,7 @@ class AscendAttnBackend(AttentionBackend):
             metadata.swa_mask = self.graph_metadata["swa_mask"][:bs, :, :]
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             num_tokens = out_cache_loc.shape[0]
-            metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
+            metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
@@ -686,8 +712,8 @@ class AscendAttnBackend(AttentionBackend):
         # refill the captured SWA write-target buffer in place from the live loc
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             n = out_cache_loc.shape[0]
-            self.swa_out_cache_loc_buf[n:].zero_()
-            self.swa_out_cache_loc_buf[:n].copy_(
+            self.cuda_graph_swa_out_cache_loc[n:].zero_()
+            self.cuda_graph_swa_out_cache_loc[:n].copy_(
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
             )
         max_len = seq_lens_cpu[:bs].max().item()
@@ -698,12 +724,15 @@ class AscendAttnBackend(AttentionBackend):
         max_seq_pages = (max_len + self.page_size - 1) // self.page_size
 
         if self.is_hybrid_swa:
-            metadata.block_tables_swa[:bs, :max_seq_pages].copy_(
-                self.full_to_swa_index_mapping[
-                    self.req_to_token[req_pool_indices[:bs], :max_len]
-                ][:, :: self.page_size]
-                // self.page_size
+            full_page_locs = self.req_to_token[
+                req_pool_indices[:bs],
+                0 : max_len : self.page_size,
+            ]
+            swa_page_table = (
+                self.full_to_swa_index_mapping[full_page_locs] // self.page_size
             )
+
+            metadata.block_tables_swa[:bs, :max_seq_pages].copy_(swa_page_table)
             metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
             metadata.block_tables_swa[bs:, :].fill_(0)
 
@@ -1558,7 +1587,9 @@ class AscendAttnBackend(AttentionBackend):
                             (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
                         )
                     else:
-                        attn_output = torch.empty_like(q)
+                        attn_output = torch.empty_like(
+                            q, memory_format=torch.contiguous_format
+                        )
 
                     use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
@@ -1840,10 +1871,10 @@ class AscendAttnBackend(AttentionBackend):
 
                 attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
                     q_nope,
-                    k_nope,
-                    v,
+                    k_nope.contiguous(),
+                    v.contiguous(),
                     query_rope=q_rope,
-                    key_rope=k_rope,
+                    key_rope=k_rope.contiguous(),
                     num_heads=layer.tp_q_head_num,
                     input_layout="TND",
                     atten_mask=self.fia_mask,
@@ -2717,7 +2748,9 @@ class AscendAttnBackend(AttentionBackend):
                         (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
                     )
                 else:
-                    attn_output = torch.empty_like(q)
+                    attn_output = torch.empty_like(
+                        q, memory_format=torch.contiguous_format
+                    )
 
                 use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
@@ -2781,13 +2814,32 @@ class AscendAttnBackend(AttentionBackend):
                     layer.tp_q_head_num,
                     self.qk_rope_head_dim,
                 )
+                if (layer.tp_q_head_num & (layer.tp_q_head_num - 1)) != 0:
+                    power_of_2_head = next_power_of_2(layer.tp_q_head_num)
+                    padding_head = power_of_2_head - layer.tp_q_head_num
+                    q_padding_tensor = torch.zeros(
+                        [num_tokens, q.shape[1], padding_head, q.shape[-1]],
+                        dtype=q.dtype,
+                        device=q.device,
+                    )
+                    q = torch.cat((q, q_padding_tensor), dim=-2)
+                    q_rope_padding_tensor = torch.zeros(
+                        [num_tokens, q_rope.shape[1], padding_head, q_rope.shape[-1]],
+                        dtype=q_rope.dtype,
+                        device=q_rope.device,
+                    )
+                    q_rope = torch.cat((q_rope, q_rope_padding_tensor), dim=-2)
+                    tp_q_head_num = power_of_2_head
+                else:
+                    tp_q_head_num = layer.tp_q_head_num
+
                 attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
                     q,
                     kv_c,
                     kv_c,
                     query_rope=q_rope,
                     key_rope=k_pe,
-                    num_heads=layer.tp_q_head_num,
+                    num_heads=tp_q_head_num,
                     num_key_value_heads=layer.tp_k_head_num,
                     input_layout="BSND",
                     atten_mask=None,
@@ -2799,6 +2851,7 @@ class AscendAttnBackend(AttentionBackend):
                     block_size=self.page_size,
                     actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
                 )
+                attn_output = attn_output[:, :, : layer.tp_q_head_num, :]
             else:
                 assert (
                     self.graph_mode == False

@@ -10,11 +10,16 @@ from abc import ABC
 from typing import Any, Type
 
 import torch
+import transformers
 from diffusers import AutoModel
 from torch import nn
-from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
+from transformers import (
+    AutoImageProcessor,
+    AutoProcessor,
+    AutoTokenizer,
+    PretrainedConfig,
+)
 
-from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     component_attn_backend_context_manager,
@@ -23,28 +28,68 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
 from sglang.multimodal_gen.runtime.loader.utils import (
     _normalize_component_type,
     component_name_to_loader_cls,
+    format_component_residency,
     get_memory_usage_of_component,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
-    configure_layerwise_offload_modules,
-    is_layerwise_offloaded_module,
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    ComponentResidencyError,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
-    LAYERWISE_OFFLOAD_ALL_COMPONENTS,
-    LAYERWISE_OFFLOAD_DIT_GROUP,
-    layerwise_component_matches_any_selection,
-    normalize_layerwise_offload_components,
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+    is_fsdp_managed_module,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    get_diffusers_component_config,
     get_hf_config,
     prepare_diffusers_component_path_for_loading,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
+from sglang.srt.model_loader.checkpoint_quantization import (
+    resolve_checkpoint_quant_spec,
+)
 
 logger = init_logger(__name__)
+
+
+class ComponentCheckpointUnsupportedError(ValueError):
+    """A component checkpoint is unsupported and must not use native fallback."""
+
+
+class NativeComponentLoaderRequired(RuntimeError):
+    """The customized loader must defer to the native library loader."""
+
+
+def uses_native_transformers_bnb4(config: object, component_name: str) -> bool:
+    """Validate a serialized BnB4 checkpoint owned by Transformers."""
+    try:
+        quant_spec = resolve_checkpoint_quant_spec(config)
+    except (TypeError, ValueError) as error:
+        raise ComponentCheckpointUnsupportedError(
+            f"Cannot parse checkpoint quantization for {component_name!r}: {error}"
+        ) from error
+    if quant_spec is None or quant_spec.declared_method != "bitsandbytes":
+        return False
+    if quant_spec.source != "quantization_config":
+        raise ComponentCheckpointUnsupportedError(
+            f"Transformers-managed {component_name!r} quantization requires "
+            "a top-level quantization_config; "
+            f"got metadata from {quant_spec.source!r}"
+        )
+
+    load_in_4bit = quant_spec.config.get(
+        "load_in_4bit", quant_spec.config.get("_load_in_4bit")
+    )
+    load_in_8bit = quant_spec.config.get(
+        "load_in_8bit", quant_spec.config.get("_load_in_8bit", False)
+    )
+    if load_in_4bit is not True or load_in_8bit is True:
+        raise ComponentCheckpointUnsupportedError(
+            f"Transformers-managed {component_name!r} quantization supports only "
+            "serialized BitsAndBytes 4-bit checkpoints"
+        )
+    return True
 
 
 def _load_auto_tokenizer_with_roberta_processing_compat(*args, **kwargs):
@@ -77,6 +122,11 @@ class ComponentLoader(ABC):
     # diffusers or transformers
     expected_library: str = ""
 
+    # --attention-backend primarily selects the DiT backend. Auxiliary
+    # components may fall back when that global choice is incompatible; an
+    # explicit --component-attention-backends entry remains strict.
+    allow_global_attention_backend_fallback = True
+
     _loaders_registered = False
 
     def __init_subclass__(cls, **kwargs):
@@ -91,21 +141,15 @@ class ComponentLoader(ABC):
         self.device = device
         self.component_architecture: str | None = None
 
-    def should_offload(
-        self, server_args: ServerArgs, model_config: ModelConfig | None = None
-    ):
-        # not offload by default
-        return False
-
-    def target_device(self, should_offload):
-        if should_offload:
+    @staticmethod
+    def target_device(component_starts_on_cpu: bool) -> torch.device:
+        if component_starts_on_cpu:
             return (
                 torch.device("mps")
                 if current_platform.is_mps()
                 else torch.device("cpu")
             )
-        else:
-            return get_local_torch_device()
+        return get_local_torch_device()
 
     def customized_load_kwargs_for_component(
         self, _server_args: ServerArgs, _component_name: str
@@ -120,62 +164,6 @@ class ComponentLoader(ABC):
         )
         return component_name in native_only_components
 
-    @staticmethod
-    def _is_component_set_as_layerwise_load(
-        server_args: ServerArgs, component_name: str
-    ) -> bool:
-        """if a component should be loaded in a layerwise-fashion"""
-        selected_component_names = normalize_layerwise_offload_components(
-            server_args.layerwise_offload_components
-        )
-        if selected_component_names is None:
-            return False
-        selected_component_names = set(selected_component_names)
-        if LAYERWISE_OFFLOAD_ALL_COMPONENTS in selected_component_names:
-            return True
-        explicit_component_names = selected_component_names - {
-            LAYERWISE_OFFLOAD_DIT_GROUP
-        }
-        return layerwise_component_matches_any_selection(
-            component_name, explicit_component_names
-        )
-
-    def _maybe_configure_layerwise_after_startup_cpu_staging(
-        self,
-        component: AutoModel,
-        server_args: ServerArgs,
-        component_name: str,
-        load_kwargs: dict[str, Any],
-    ) -> AutoModel:
-        if not load_kwargs.get("cpu_offload_flag"):
-            return component
-        if not isinstance(component, nn.Module):
-            return component
-
-        # try to configure layerwise-offload with the component
-        configured_components = configure_layerwise_offload_modules(
-            {component_name: component},
-            server_args,
-            component_names=server_args.layerwise_offload_components,
-            warn_missing=False,
-        )
-        if is_layerwise_offloaded_module(component):
-            logger.info(
-                "Configured layerwise offload for %s immediately after startup CPU staging",
-                component_name,
-            )
-            return component
-
-        logger.warning(
-            "Layerwise startup CPU staging was requested for %s, but the loaded "
-            "module did not enable layerwise offload. Moving it to GPU.",
-            component_name,
-        )
-        # ensures the module is on GPU
-        if component_name in configured_components:
-            return component
-        return component.to(get_local_torch_device())
-
     def _load_customized_with_context(
         self,
         component_model_path: str,
@@ -183,18 +171,18 @@ class ComponentLoader(ABC):
         component_name: str,
         attn_backend: Any,
         component_attn_name: str | None,
+        allow_global_backend_fallback: bool,
     ) -> AutoModel:
         with component_attn_backend_context_manager(
-            attn_backend, component_name=component_attn_name
+            attn_backend,
+            component_name=component_attn_name,
+            allow_global_backend_fallback=allow_global_backend_fallback,
         ):
             load_kwargs = self.customized_load_kwargs_for_component(
                 server_args, component_name
             )
-            component = self.load_customized(
+            return self.load_customized(
                 component_model_path, server_args, component_name, **load_kwargs
-            )
-            return self._maybe_configure_layerwise_after_startup_cpu_staging(
-                component, server_args, component_name, load_kwargs
             )
 
     def _load_native_with_context(
@@ -205,9 +193,12 @@ class ComponentLoader(ABC):
         transformers_or_diffusers: str,
         attn_backend: Any,
         component_attn_name: str | None,
+        allow_global_backend_fallback: bool,
     ) -> AutoModel:
         with component_attn_backend_context_manager(
-            attn_backend, component_name=component_attn_name
+            attn_backend,
+            component_name=component_attn_name,
+            allow_global_backend_fallback=allow_global_backend_fallback,
         ):
             component = self.load_native(
                 component_model_path,
@@ -215,9 +206,7 @@ class ComponentLoader(ABC):
                 transformers_or_diffusers,
                 component_name,
             )
-        should_offload = self.should_offload(server_args)
-        target_device = self.target_device(should_offload)
-        return component.to(device=target_device)
+        return component
 
     def load(
         self,
@@ -261,16 +250,24 @@ class ComponentLoader(ABC):
                 component_name,
                 attn_backend,
                 component_attn_name,
+                self.allow_global_attention_backend_fallback,
             )
             source = "sgl-diffusion"
+        except (ComponentCheckpointUnsupportedError, ComponentResidencyError):
+            raise
         except Exception as e:
+            native_loader_required = isinstance(e, NativeComponentLoaderRequired)
             if self.should_raise_customized_load_error(server_args, component_name):
+                if native_loader_required:
+                    raise
                 traceback.print_exc()
                 raise RuntimeError(
                     f"Failed to load customized {component_name}; native fallback "
                     "is disabled for this component configuration."
                 ) from e
-            if "Unsupported model architecture" in str(e):
+            if native_loader_required:
+                logger.info("%s", e)
+            elif "Unsupported model architecture" in str(e):
                 logger.info(
                     f"Component: {component_name} doesn't have a customized version yet, using native version"
                 )
@@ -287,6 +284,7 @@ class ComponentLoader(ABC):
                 transformers_or_diffusers,
                 attn_backend,
                 component_attn_name,
+                self.allow_global_attention_backend_fallback,
             )
             source = "native"
             logger.warning(
@@ -301,15 +299,21 @@ class ComponentLoader(ABC):
         else:
             if isinstance(component, nn.Module):
                 component = component.eval()
+                if not is_fsdp_managed_module(component):
+                    component = component.to(
+                        self.target_device(
+                            server_args.should_start_component_on_cpu(component_name)
+                        )
+                    )
             current_gpu_mem = current_platform.get_available_gpu_memory()
             model_size = get_memory_usage_of_component(component) or "NA"
             consumed = gpu_mem_before_loading - current_gpu_mem
             logger.info(
-                f"Loaded %s: %s ({source} version). model size: %s GB, consumed GPU mem: %.2f GB, avail GPU mem: %.2f GB",
+                f"Loaded %s: %s ({source} version). model size: %s GB, %s. avail GPU mem: %.2f GB",
                 component_name,
                 component.__class__.__name__,
                 model_size,
-                consumed,
+                format_component_residency(component),
                 current_gpu_mem,
             )
         return component, consumed
@@ -334,14 +338,18 @@ class ComponentLoader(ABC):
             load_kwargs["torch_dtype"] = precision
 
         if transformers_or_diffusers == "transformers":
-            from transformers import AutoModel
-
             config = get_hf_config(
                 component_model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
             )
-            return AutoModel.from_pretrained(
+            if uses_native_transformers_bnb4(config, component_name or "component"):
+                server_args.require_component_resident(
+                    component_name or "component",
+                    feature_name="Transformers bitsandbytes component",
+                )
+            model_class = self.resolve_native_transformers_model_class(config)
+            return model_class.from_pretrained(
                 component_model_path,
                 config=config,
                 trust_remote_code=server_args.trust_remote_code,
@@ -362,6 +370,9 @@ class ComponentLoader(ABC):
             )
         else:
             raise ValueError(f"Unsupported library: {transformers_or_diffusers}")
+
+    def resolve_native_transformers_model_class(self, config: PretrainedConfig) -> type:
+        return transformers.AutoModel
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
@@ -403,7 +414,14 @@ class ComponentLoader(ABC):
         self, transformers_or_diffusers: str, component_name: str
     ) -> str:
         # NOTE(FlamingoPg): special for LTX-2 models
-        if component_name == "vocoder" or component_name == "connectors":
+        # `model_index.json` records these under an `ltx2` library that is not a
+        # real importable package; SGLang implements them natively.
+        if component_name in (
+            "vocoder",
+            "connectors",
+            "duration_head",
+            "diffusion_decoder",
+        ):
             transformers_or_diffusers = "diffusers"
 
         # NOTE(CloudRipple): special for MOVA models
@@ -420,6 +438,9 @@ class ComponentLoader(ABC):
             component_name == "scheduler"
             and transformers_or_diffusers == "mova.diffusion.schedulers.flow_match_pair"
         ):
+            transformers_or_diffusers = "diffusers"
+
+        if transformers_or_diffusers.startswith("lingbot_video"):
             transformers_or_diffusers = "diffusers"
 
         return transformers_or_diffusers
@@ -468,6 +489,36 @@ class ComponentLoader(ABC):
         return GenericComponentLoader(transformers_or_diffusers, component_architecture)
 
 
+class PlainStateDictComponentLoader(ComponentLoader):
+    """Base for native loaders whose current materializer expects plain weights."""
+
+    @staticmethod
+    def ensure_plain_state_dict_checkpoint(config: object, component_name: str) -> None:
+        try:
+            quant_spec = resolve_checkpoint_quant_spec(config)
+        except (TypeError, ValueError) as error:
+            raise ComponentCheckpointUnsupportedError(
+                f"Cannot parse checkpoint quantization metadata for "
+                f"{component_name!r}: {error}"
+            ) from error
+        if quant_spec is None:
+            return
+
+        method = quant_spec.declared_method or "unspecified"
+        raise ComponentCheckpointUnsupportedError(
+            f"{component_name!r} checkpoint declares quantization metadata in "
+            f"{quant_spec.source} (quant_method={method!r}), which its current "
+            "plain state-dict materializer cannot restore."
+        )
+
+    def load_component_config(
+        self, component_model_path: str, component_name: str
+    ) -> dict[str, Any]:
+        config = get_diffusers_component_config(component_path=component_model_path)
+        self.ensure_plain_state_dict_checkpoint(config, component_name)
+        return config
+
+
 class ImageProcessorLoader(ComponentLoader):
     """Loader for image processor."""
 
@@ -477,13 +528,15 @@ class ImageProcessorLoader(ComponentLoader):
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ) -> Any:
-        return AutoImageProcessor.from_pretrained(component_model_path, use_fast=True)
+        return AutoImageProcessor.from_pretrained(
+            component_model_path, backend="torchvision"
+        )
 
 
 class AutoProcessorLoader(ComponentLoader):
     """Loader for auto processor."""
 
-    component_names = ["processor"]
+    component_names = ["processor", "text_processor"]
     expected_library = "transformers"
 
     def load_customized(
@@ -539,6 +592,10 @@ class TokenizerLoader(ComponentLoader):
 class GenericComponentLoader(ComponentLoader):
     """Generic loader for components that don't have a specific loader."""
 
+    # An unknown out-of-tree component may itself be the primary transformer.
+    # Require it to opt into fallback through a registered component loader.
+    allow_global_attention_backend_fallback = False
+
     def __init__(
         self, library="transformers", component_architecture: str | None = None
     ) -> None:
@@ -559,6 +616,8 @@ class PipelineComponentLoader:
         transformers_or_diffusers: str,
         server_args: ServerArgs,
         component_architecture: str | None = None,
+        component_attn_backend: Any = None,
+        component_attn_name: str | None = None,
     ):
         """
         Load a pipeline component.
@@ -576,15 +635,21 @@ class PipelineComponentLoader:
         )
 
         try:
-            # Load the component
-            return loader.load(
-                component_model_path,
-                server_args,
-                component_name,
-                transformers_or_diffusers,
-            )
-        except Exception as e:
+            with component_attn_backend_context_manager(
+                component_attn_backend,
+                component_name=component_attn_name,
+                allow_global_backend_fallback=(
+                    loader.allow_global_attention_backend_fallback
+                ),
+            ):
+                return loader.load(
+                    component_model_path,
+                    server_args,
+                    component_name,
+                    transformers_or_diffusers,
+                )
+        except Exception:
             logger.error(
                 f"Error while loading component: {component_name}, {component_model_path=}"
             )
-            raise e
+            raise

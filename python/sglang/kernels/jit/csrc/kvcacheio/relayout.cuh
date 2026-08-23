@@ -3,7 +3,7 @@
 #include "hicache.cuh"
 #include <limits>
 
-namespace {
+namespace sglang {
 
 struct HicacheRelayoutParams {
   void* __restrict__ k_cache_dst;
@@ -87,4 +87,4 @@ inline void launch_hicache_relayout_kernel(
   LaunchKernel(static_cast<uint32_t>(grid), kRelayoutBlockSize, device)(kernel, params);
 }
 
-}  // namespace
+}  // namespace sglang
