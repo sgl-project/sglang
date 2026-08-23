@@ -63,7 +63,11 @@ from sglang.srt.managers.load_snapshot import (
     zmq_reader_owner,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.runtime_context import get_parallel, publish
+from sglang.srt.runtime_context import (
+    ensure_published,
+    get_disagg,
+    get_parallel,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
@@ -443,7 +447,7 @@ class MultiTokenizerRouter:
         port_args: PortArgs,
     ):
         self.server_args = server_args
-        publish(server_args, role="tokenizer")
+        ensure_published(server_args, role="tokenizer")
         self.startup_time: Optional[Dict[str, Any]] = None
         context = zmq.asyncio.Context(3)
         self.recv_from_detokenizer = get_zmq_socket(
@@ -785,7 +789,7 @@ class TokenizerWorker(TokenizerManager):
 
         # For PD disaggregation
         self.disaggregation_transfer_backend = TransferBackend(
-            self.server_args.disaggregation_transfer_backend
+            get_disagg().disaggregation_transfer_backend
         )
 
         # Register this worker with the router for pause/continue broadcasting

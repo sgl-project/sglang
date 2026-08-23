@@ -178,8 +178,8 @@ class TestLoadReporterPortParsing:
 class TestLoadReporterPortValidation:
     @pytest.mark.parametrize("port", [0, 65536])
     def test_invalid_port_is_rejected(self, port):
-        with pytest.raises((ValueError, SystemExit)):
-            _parse(["--load-reporter-port", str(port)])
+        with pytest.raises(ValueError, match="--load-reporter-port"):
+            _parse(["--load-reporter-port", str(port)]).resolve_once()
 
 
 # ============================================================================
