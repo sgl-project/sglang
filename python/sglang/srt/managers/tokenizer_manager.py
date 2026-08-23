@@ -3412,6 +3412,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         (never arbitrary caller input), and a later output for a discarded rid
         is ignored (the scheduler-response path looks up state with
         ``.get(...)``), so this is safe for partial/failed dispatches.
+
+        A dispatch failure must not abort the cleanup loop: the state is still
+        removed (``finally``) and the remaining rids are processed, so a broken
+        scheduler socket cannot leak entries or mask the original
+        CancelledError/GeneratorExit that triggered the cleanup.
         """
         if not hasattr(obj, "is_single") or obj.is_single:
             rids = [obj.rid]
@@ -3419,8 +3424,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             rids = obj.rid
         for rid in rids:
             if rid in self.rid_to_state:
-                self._dispatch_to_scheduler(AbortReq(rid=rid))
-                self.rid_to_state.pop(rid, None)
+                try:
+                    self._dispatch_to_scheduler(AbortReq(rid=rid))
+                except Exception:
+                    logger.exception(
+                        "Failed to abort request during disconnect cleanup: %s",
+                        rid,
+                    )
+                finally:
+                    self.rid_to_state.pop(rid, None)
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]

@@ -273,37 +273,40 @@ class _DummyAsyncCM:
         return False
 
 
+def _make_generate_tm(case):
+    tm = _make_tm_with_log(case)
+    tm.auto_create_handle_loop = Mock()
+    tm._set_default_priority = Mock()
+    tm.request_logger = Mock()
+    tm.tokenizer = None
+    tm.is_pause = False
+    tm.is_pause_cond = asyncio.Condition()
+    tm.model_update_lock = Mock()
+    tm.model_update_lock.reader_lock = _DummyAsyncCM()
+    tm._validate_and_resolve_lora = AsyncMock(return_value=None)
+    return tm
+
+
+def _make_obj(rid):
+    obj = MagicMock(spec=GenerateReqInput)
+    obj.routed_dp_rank = None
+    obj.is_single = True
+    obj.rid = rid
+    obj.received_time = 0.0
+    obj.external_trace_header = None
+    obj.bootstrap_room = None
+    obj.max_thinking_tokens = None
+    obj.normalize_batch_and_arguments = Mock()
+    return obj
+
+
 class TestDisconnectCleanupOrdering(CustomTestCase):
-    def _make_generate_tm(self):
-        tm = _make_tm_with_log(self)
-        tm.auto_create_handle_loop = Mock()
-        tm._set_default_priority = Mock()
-        tm.request_logger = Mock()
-        tm.tokenizer = None
-        tm.is_pause = False
-        tm.is_pause_cond = asyncio.Condition()
-        tm.model_update_lock = Mock()
-        tm.model_update_lock.reader_lock = _DummyAsyncCM()
-        tm._validate_and_resolve_lora = AsyncMock(return_value=None)
-        return tm
-
-    def _make_obj(self, rid):
-        obj = MagicMock(spec=GenerateReqInput)
-        obj.routed_dp_rank = None
-        obj.is_single = True
-        obj.rid = rid
-        obj.received_time = 0.0
-        obj.external_trace_header = None
-        obj.bootstrap_room = None
-        obj.max_thinking_tokens = None
-        obj.normalize_batch_and_arguments = Mock()
-        return obj
-
     def test_cancelled_error_dispatches_abort_before_pop(self):
         """Client disconnect => CancelledError => AbortReq sent, then state popped."""
-        tm = self._make_generate_tm()
+        tm = _make_generate_tm(self)
         rid = "streaming-rid"
-        obj = self._make_obj(rid)
+        obj = _make_obj(rid)
+
 
         tm._tokenize_one_request = AsyncMock(return_value=Mock(input_ids=[1]))
         tm._send_one_request = Mock()
@@ -345,9 +348,9 @@ class TestDisconnectCleanupOrdering(CustomTestCase):
 
     def test_normal_completion_does_not_dispatch_extra_abort(self):
         """Normal completion removes state via batch-output path, no AbortReq."""
-        tm = self._make_generate_tm()
+        tm = _make_generate_tm(self)
         rid = "normal-rid"
-        obj = self._make_obj(rid)
+        obj = _make_obj(rid)
 
         tm._tokenize_one_request = AsyncMock(return_value=Mock(input_ids=[1]))
         tm._send_one_request = Mock()
@@ -376,9 +379,9 @@ class TestDisconnectCleanupOrdering(CustomTestCase):
         the background task calls abort_request(rid). With the public guard
         intact this is a no-op => exactly one AbortReq in total.
         """
-        tm = self._make_generate_tm()
+        tm = _make_generate_tm(self)
         rid = "delayed-rid"
-        obj = self._make_obj(rid)
+        obj = _make_obj(rid)
 
         tm._tokenize_one_request = AsyncMock(return_value=Mock(input_ids=[1]))
         tm._send_one_request = Mock()
@@ -436,6 +439,88 @@ class TestBatchDisconnectOrdering(CustomTestCase):
                 f"AbortReq for {r} must precede its pop; log={log.events}",
             )
             self.assertNotIn(r, tm.rid_to_state)
+
+
+class TestCleanupDispatchFailure(CustomTestCase):
+    """A dispatch failure during cleanup must not leak state or mask the
+    original cancellation exception."""
+
+    def test_dispatch_failure_still_cleans_all_batch_rids(self):
+        """Middle dispatch raises => loop continues, every state still popped."""
+        log = _EventLog()
+        tm = _make_tm(self)
+        tm.rid_to_state = _TracingDict(log)
+        tm.log = log
+
+        rids = ["f_0", "f_1", "f_2"]
+        for r in rids:
+            tm.rid_to_state[r] = _make_state(r)
+
+        class FailingSock:
+            def send_pyobj(self, obj, *a, **kw):
+                rid = getattr(obj, "rid", None)
+                if rid == "f_1":
+                    raise RuntimeError("scheduler socket broken")
+                log.record("sent", ("AbortReq", rid))
+
+        tm.send_to_scheduler = FailingSock()
+
+        obj = Mock(spec=GenerateReqInput)
+        obj.is_single = False
+        obj.rid = list(rids)
+
+        tm._abort_and_discard_pending_req_states(obj)  # must not raise
+
+        # Loop continued past the failing rid: f_0 and f_2 were still aborted.
+        self.assertEqual(
+            [e for e in log.kinds("sent")],
+            [("sent", ("AbortReq", "f_0")), ("sent", ("AbortReq", "f_2"))],
+            f"log={log.events}",
+        )
+        # No state leaked, including the rid whose dispatch failed.
+        for r in rids:
+            self.assertNotIn(r, tm.rid_to_state)
+            self.assertIn(("pop", r), log.events)
+
+    def test_dispatch_failure_does_not_mask_cancelled_error(self):
+        """generate_request must re-raise CancelledError, not the dispatch error."""
+        tm = _make_generate_tm(self)
+        rid = "broken-dispatch-rid"
+        obj = _make_obj(rid)
+
+        class BrokenSock:
+            def send_pyobj(self, o, *a, **k):
+                raise RuntimeError("scheduler socket broken")
+
+        tm.send_to_scheduler = BrokenSock()
+        tm._tokenize_one_request = AsyncMock(return_value=Mock(input_ids=[1]))
+        tm._send_one_request = Mock()
+
+        async def wait_then_cancel(*args, **kwargs):
+            yield {"chunk": 1}
+            raise asyncio.CancelledError()
+
+        tm._wait_one_response = wait_then_cancel
+
+        raised = None
+
+        async def drive():
+            nonlocal raised
+            try:
+                async for _ in tm.generate_request(obj):
+                    pass
+            except BaseException as e:  # assert exception identity is preserved
+                raised = e
+
+        asyncio.run(drive())
+
+        self.assertIsInstance(
+            raised,
+            asyncio.CancelledError,
+            f"original CancelledError must not be masked by a dispatch "
+            f"failure; got {raised!r}",
+        )
+        self.assertNotIn(rid, tm.rid_to_state)
 
 
 if __name__ == "__main__":
