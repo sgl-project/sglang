@@ -22,6 +22,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
     KVTransferError,
+    SocketCacheError,
 )
 from sglang.srt.disaggregation.common.staging_handler import (
     STAGING_WATERMARK_WAIT_S,
@@ -156,8 +157,8 @@ class KVArgsRegisterInfo:
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
             mooncake_session_id=msg[3].decode("ascii"),
-            dst_kv_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
-            dst_aux_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
+            dst_kv_ptrs=list(struct.unpack(f"{len(msg[4]) // 8}Q", msg[4])),
+            dst_aux_ptrs=list(struct.unpack(f"{len(msg[5]) // 8}Q", msg[5])),
             dst_state_data_ptrs=unpack_int_lists(msg[6], "Q"),
             dst_tp_rank=int(msg[7].decode("ascii")),
             dst_attn_tp_size=int(msg[8].decode("ascii")),
@@ -386,8 +387,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         """Notify decode that a staging chunk RDMA is complete (every chunk;
         scatter is arrival-driven)."""
         na = NetworkAddress(req.endpoint, req.dst_port)
-        self._send_multipart_locked(
+        self._connect(
             na.to_tcp(),
+            is_ipv6=na.is_ipv6,
+        ).send_multipart(
             [
                 b"CHUNK_READY",
                 str(req.room).encode("ascii"),
@@ -396,8 +399,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
                 req.mooncake_session_id.encode("ascii"),
                 str(prefill_unique_rank).encode("ascii"),
-            ],
-            is_ipv6=na.is_ipv6,
+            ]
         )
 
     def _do_staging_transfer(
@@ -1149,8 +1151,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         data: bytes,
     ):
         na = NetworkAddress(remote, dst_port)
-        self._send_multipart_locked(
+        self._connect(
             na.to_tcp(),
+            is_ipv6=na.is_ipv6,
+        ).send_multipart(
             [
                 MooncakeKVManager.AUX_DATA_HEADER,
                 str(room).encode("ascii"),
@@ -1158,8 +1162,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 str(aux_index).encode("ascii"),
                 struct.pack(">I", len(data)),
                 data,
-            ],
-            is_ipv6=na.is_ipv6,
+            ]
         )
 
     def _handle_aux_data(self, msg: List[bytes]):
@@ -1573,14 +1576,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
     ):
         na = NetworkAddress(remote, dst_port)
-        self._send_multipart_locked(
+        self._connect(
             na.to_tcp(),
+            is_ipv6=na.is_ipv6,
+        ).send_multipart(
             [
                 str(room).encode("ascii"),
                 str(status).encode("ascii"),
                 str(prefill_rank).encode("ascii"),
-            ],
-            is_ipv6=na.is_ipv6,
+            ]
         )
 
     def transfer_worker(
@@ -1931,6 +1935,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 self._staging_ctx.prefetch_requested.discard(key)
                         self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
 
+            except SocketCacheError as e:
+                room = kv_chunk.room
+                reason = (
+                    f"Outbound ZMQ socket cache failure while processing room "
+                    f"{room}: {e}"
+                )
+                self.record_failure(room, reason)
+                self.update_status(room, KVPoll.Failed)
+                self.transfer_infos.pop(room, None)
+                self.req_to_decode_prefix_len.pop(room, None)
+                logger.error(reason)
+
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 raise RuntimeError(
@@ -2004,17 +2020,24 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     # Send ACK back to decode endpoint
                     try:
                         na = NetworkAddress(decode_ip, decode_port)
-                        self._send_multipart_locked(
+                        self._connect(
                             na.to_tcp(),
+                            is_ipv6=na.is_ipv6,
+                        ).send_multipart(
                             [
                                 b"ABORT_ACK",
                                 str(room_to_be_aborted).encode("ascii"),
-                            ],
-                            is_ipv6=na.is_ipv6,
+                            ]
                         )
                         logger.debug(
                             f"Sent ABORT_ACK for room {room_to_be_aborted} to "
                             f"{decode_ip}:{decode_port}"
+                        )
+                    except SocketCacheError as e:
+                        logger.warning(
+                            "Failed to send ABORT_ACK for room %s: %s",
+                            room_to_be_aborted,
+                            e,
                         )
                     except Exception as e:
                         logger.debug(
@@ -2245,7 +2268,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
 
 class MooncakeKVSender(CommonKVSender):
-
     def __init__(
         self,
         mgr: MooncakeKVManager,
