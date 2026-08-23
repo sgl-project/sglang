@@ -62,7 +62,9 @@ class _FakeNpuOps:
 
     def apply_token_bitmask(self, logits, vocab_mask):
         self.last_call = (logits, vocab_mask)
-        out = _apply_ref_cpu(logits, vocab_mask)
+        # Logits may report device=npu via a subclass while storage is CPU;
+        # apply the reference mask on CPU tensors to avoid device mismatch.
+        out = _apply_ref_cpu(logits.detach().clone(), vocab_mask)
         logits.copy_(out)
 
 
@@ -94,7 +96,7 @@ if _HAS_TORCH and _HAS_LLGUIDANCE:
         def device(self):
             return torch.device("npu:0")
 
-    class TestGuidanceGrammarApplyVocabMaskNpu(unittest.TestCase):
+    class TestGuidanceGrammarApplyVocabMaskNpu(unittest.TestCase):  # noqa: E501
         """Verify the NPU branch in ``GuidanceGrammar.apply_vocab_mask``."""
 
         def test_npu_branch_dispatches_to_npu_kernel(self):
