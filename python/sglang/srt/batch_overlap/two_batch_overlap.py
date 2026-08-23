@@ -769,7 +769,7 @@ class TboForwardBatchPreparer:
 
         # TODO improve, e.g. unify w/ `init_raw`
         if (
-            get_parallel().moe_dense_tp_size == 1
+            get_parallel().config.moe_dense_tp_size == 1
             and batch.global_dp_buffer_len is not None
         ):
             sum_len = end_token_index - start_token_index
