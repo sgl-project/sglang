@@ -1146,5 +1146,95 @@ class PolicySelectionTest(unittest.TestCase):
             kvcr_store._resolve_policy("collections.OrderedDict")
 
 
+class SourcePumpFaultToleranceTest(unittest.TestCase):
+    """The pump is what makes this worker usable as a P2P source.
+
+    ``_poll_completed`` is what advances a peer's ``start_write`` through pin
+    and transfer, and on an otherwise idle worker the pump is its only caller.
+    A pump that exits on one transient NIXL or ZMQ error therefore retires the
+    worker as a source for the life of the process: nothing restarts the thread
+    (``_start_source_pump`` returns early once ``_pump_thread`` is set), the
+    engine keeps serving inference, and peers see only that this worker never
+    has anything -- indistinguishable from a cold cache.
+    """
+
+    def _run_pump(self, store, poll, *, stop_after: float = 0.5) -> None:
+        """Drive the real loop body until it returns or the guard time elapses."""
+        store._poll_once = poll
+        store._kvcr = SimpleNamespace()
+        stopper = threading.Timer(stop_after, store._pump_stop.set)
+        stopper.start()
+        try:
+            store._source_pump_func()
+        finally:
+            stopper.cancel()
+            store._pump_stop.set()
+
+    def test_a_transient_fault_does_not_end_the_pump(self):
+        calls = []
+
+        def poll(_kvcr):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("transient NIXL error")
+
+        store = _store(0, 1)
+        self._run_pump(store, poll)
+
+        # Polling continued past the raise, which is the whole guard.
+        self.assertGreater(len(calls), 1)
+        self.assertEqual(store.stats().get("source_pump_dead", 0), 0)
+
+    def test_a_persistent_fault_ends_the_pump_and_is_visible(self):
+        """The negative branch: retrying forever on a dead core is not a fix.
+
+        Without this, "survive faults" could degrade into an unconditional spin
+        that never reports. The counter is the only trace an operator gets --
+        past this point the worker is silently source-dead.
+        """
+        calls = []
+
+        def poll(_kvcr):
+            calls.append(1)
+            raise RuntimeError("core is gone")
+
+        store = _store(0, 1)
+        with self.assertLogs(
+            "sglang.srt.mem_cache.storage.kvcr.kvcr_store", "ERROR"
+        ) as logs:
+            self._run_pump(store, poll)
+
+        self.assertEqual(len(calls), kvcr_store._PUMP_MAX_CONSECUTIVE_FAULTS)
+        self.assertEqual(store.stats()["source_pump_dead"], 1)
+        self.assertEqual(
+            store.stats()["source_pump_faults"],
+            kvcr_store._PUMP_MAX_CONSECUTIVE_FAULTS,
+        )
+        self.assertIn("P2P source", "\n".join(logs.output))
+
+    def test_the_fault_streak_resets_on_a_successful_poll(self):
+        """Faults spread over a long run must not accumulate into a shutdown.
+
+        Counting total rather than *consecutive* faults would eventually kill
+        the pump on a healthy worker that saw an occasional blip.
+        """
+        calls = []
+
+        def poll(_kvcr):
+            calls.append(1)
+            # Fail every other poll: never two in a row, but many in total.
+            if len(calls) % 2 == 1:
+                raise RuntimeError("intermittent")
+
+        store = _store(0, 1)
+        self._run_pump(store, poll)
+
+        self.assertGreater(
+            store.stats()["source_pump_faults"],
+            kvcr_store._PUMP_MAX_CONSECUTIVE_FAULTS,
+        )
+        self.assertEqual(store.stats().get("source_pump_dead", 0), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

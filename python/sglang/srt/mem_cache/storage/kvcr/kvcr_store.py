@@ -115,6 +115,11 @@ _DRAIN_POLL_MAX_S = 2e-3
 # complete before the source-side deadline expires.
 _SOURCE_PUMP_INTERVAL_S = 5e-3
 
+# Consecutive pump faults tolerated before giving up. Arbitrary; chosen to ride
+# out a blip without spinning on a core that is genuinely dead. At the interval
+# above this is ~50ms of retrying.
+_PUMP_MAX_CONSECUTIVE_FAULTS = 10
+
 # How long close() waits for the pump to leave its last poll. One pump period is
 # the wait plus one poll_completed(), so this is ample unless the poll itself has
 # stalled -- which is precisely the case close() must not close underneath.
@@ -553,6 +558,20 @@ class KVCRStore(HiCacheStorage):
         self._pump_thread.start()
 
     def _source_pump_func(self) -> None:
+        """Poll until stopped, surviving transient faults.
+
+        Exiting on the first exception would silently retire this worker as a
+        P2P source for the rest of the process: nothing restarts the thread
+        (``_start_source_pump`` returns early once ``_pump_thread`` is set), the
+        engine keeps serving inference, and peers see only that we never have
+        anything -- indistinguishable from a cold cache. A transient NIXL or ZMQ
+        error is not worth that, so keep polling and count the faults.
+
+        Consecutive failures are what distinguish a blip from a dead core. Give
+        up only after ``_PUMP_MAX_CONSECUTIVE_FAULTS`` of them, and log that at
+        error level, since past this point the worker is silently source-dead.
+        """
+        consecutive_faults = 0
         while not self._pump_stop.wait(_SOURCE_PUMP_INTERVAL_S):
             kvcr = self._kvcr
             if kvcr is None:
@@ -560,8 +579,25 @@ class KVCRStore(HiCacheStorage):
             try:
                 self._poll_once(kvcr)
             except Exception:
-                logger.warning("KVCRStore source pump failed", exc_info=True)
-                return
+                consecutive_faults += 1
+                self._note("source_pump_faults")
+                if consecutive_faults >= _PUMP_MAX_CONSECUTIVE_FAULTS:
+                    self._note("source_pump_dead")
+                    logger.error(
+                        "KVCRStore source pump failed %d times in a row; this "
+                        "worker can no longer serve peers as a P2P source",
+                        consecutive_faults,
+                        exc_info=True,
+                    )
+                    return
+                logger.warning(
+                    "KVCRStore source pump failed (%d/%d consecutive)",
+                    consecutive_faults,
+                    _PUMP_MAX_CONSECUTIVE_FAULTS,
+                    exc_info=True,
+                )
+            else:
+                consecutive_faults = 0
 
     def _poll_once(self, kvcr: KVCR) -> None:
         """Drain one round of completions, stashing them for their waiters.
@@ -1248,6 +1284,11 @@ class KVCRStore(HiCacheStorage):
         deadline did. After that the op is on its own: ``kvcr.abort()`` is a
         no-op stub, so we cannot cancel it, only agree to ignore whatever it
         reports -- or never reports.
+
+        Abandoning is safe only because ``get_timeout_s > operation_timeout_ms``
+        (enforced in ``KVCRBackendConfig``): HiCache frees this op's host pages
+        once we return, and nothing here fences a transfer still writing into
+        them. Do not shorten this wait below the core's deadline.
         """
         timeout = self._config.get_timeout_s if timeout_s is None else timeout_s
         deadline = time.monotonic() + timeout

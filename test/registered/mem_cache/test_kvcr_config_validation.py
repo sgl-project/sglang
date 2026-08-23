@@ -1,10 +1,14 @@
-"""The KVCR backend must refuse a remote-hint config no peer can dial.
+"""The KVCR backend must refuse configs whose failure mode is silent.
 
-Both offending values are *defaults*, and neither breaks startup: a worker with
-``control_port = 0`` or a wildcard advertise host comes up, offloads, gets
-indexed by the router and receives hints -- every fetch just fails to reach it.
-That presents as "P2P does not work on this branch", which is expensive to chase
-and has nothing to do with the transfer path. These tests pin the refusal.
+Two independent rules, both about values that do not break startup.
+
+A worker with ``control_port = 0`` or a wildcard advertise host comes up,
+offloads, gets indexed by the router and receives hints -- every fetch just
+fails to reach it. That presents as "P2P does not work on this branch", which is
+expensive to chase and has nothing to do with the transfer path.
+
+``get_timeout_s <= operation_timeout_ms`` is worse: it does not fail, it
+corrupts. See :class:`TimeoutOrderingValidationTest`.
 
 Needs no ``kvcr`` wheel: ``KVCRBackendConfig`` is a plain msgspec struct.
 
@@ -107,6 +111,58 @@ class RemoteHintEndpointValidationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             KVCRBackendConfig.from_extra_config(
                 {**_DIALABLE, "control_port": 0, "unknown_key": "ignored"}
+            )
+
+
+class TimeoutOrderingValidationTest(unittest.TestCase):
+    """``get_timeout_s`` must outlast ``operation_timeout_ms``.
+
+    ``_drain_until`` abandons an op at ``get_timeout_s`` and cannot cancel it:
+    ``kvcr.abort()`` is a no-op stub and NIXL's cancellation releases the
+    transfer handle without fencing an in-flight DMA. HiCache then frees that
+    op's host pages and hands them to the next prefetch. Only the core giving up
+    first -- both ends anchor to ``operation_timeout_ms`` -- keeps that safe.
+
+    Invert the order and an abandoned transfer writes into pages another request
+    owns. Nothing downstream can catch it: KVCR block keys are token hashes with
+    no content check, so it surfaces as wrong generated text, not an error.
+    """
+
+    def test_get_timeout_below_operation_timeout_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            KVCRBackendConfig(operation_timeout_ms=30000, get_timeout_s=10.0)
+        self.assertIn("get_timeout_s", str(caught.exception))
+
+    def test_equal_timeouts_are_refused(self):
+        """A tie is not safe: the core's deadline and ours would race."""
+        with self.assertRaises(ValueError):
+            KVCRBackendConfig(operation_timeout_ms=20000, get_timeout_s=20.0)
+
+    def test_the_rule_applies_to_local_only_configs(self):
+        """The pages are reused the same way whether or not a peer is involved.
+
+        A deposit hands the core host pages as transfer *sources*, so abandoning
+        one early lets the core read out of pages HiCache has already reused.
+        Scoping this check to ``enable_remote_hint`` -- as the endpoint checks
+        above are -- would leave that open.
+        """
+        with self.assertRaises(ValueError):
+            KVCRBackendConfig(
+                enable_remote_hint=False,
+                operation_timeout_ms=30000,
+                get_timeout_s=10.0,
+            )
+
+    def test_the_shipped_defaults_satisfy_the_rule(self):
+        """The negative branch: a stricter rule would fail every launch."""
+        config = KVCRBackendConfig()
+        self.assertGreater(config.get_timeout_s * 1000.0, config.operation_timeout_ms)
+
+    def test_validation_runs_on_the_extra_config_path(self):
+        """``from_extra_config`` is how operators actually set both knobs."""
+        with self.assertRaises(ValueError):
+            KVCRBackendConfig.from_extra_config(
+                {"operation_timeout_ms": 45000, "get_timeout_s": 30.0}
             )
 
 

@@ -79,6 +79,45 @@ class KVCRBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
     get_timeout_s: float = 30.0
 
     def __post_init__(self) -> None:
+        """Refuse a config that cannot be operated safely.
+
+        Two independent checks: the timeout ordering below, then the remote-hint
+        control endpoint.
+        """
+        self._validate_timeout_ordering()
+        self._validate_control_endpoint()
+
+    def _validate_timeout_ordering(self) -> None:
+        """``get_timeout_s`` must outlast the core's own operation deadline.
+
+        ``_drain_until`` stops waiting at ``get_timeout_s`` and returns a miss.
+        It cannot cancel: ``kvcr.abort()`` is a no-op stub, and NIXL's
+        cancellation path releases the transfer handle without fencing an
+        in-flight DMA. HiCache then frees the operation's host pages -- via
+        ``append_host_mem_release`` in ``prefetch_io_aux_func``, or via
+        ``check_prefetch_progress`` on the scheduler thread -- and hands them to
+        the next prefetch.
+
+        What keeps that safe is only that the core gives up first: both ends
+        anchor their deadline to ``operation_timeout_ms``, so once it has
+        elapsed no peer is still writing into those pages. Order the two the
+        other way and an abandoned fetch keeps writing into pages another
+        request now owns, which surfaces as wrong KV rather than as an error --
+        block keys are token hashes with no content check, so nothing downstream
+        can notice. Both knobs are operator-settable, so the ordering is
+        enforced here rather than left as a comment on the defaults.
+        """
+        if self.get_timeout_s * 1000.0 <= self.operation_timeout_ms:
+            raise ValueError(
+                f"KVCR get_timeout_s ({self.get_timeout_s}s) must exceed "
+                f"operation_timeout_ms ({self.operation_timeout_ms}ms): giving "
+                "up before the core does leaves an uncancellable transfer "
+                "writing into host pages HiCache has already reused, which "
+                "corrupts KV silently. Raise get_timeout_s or lower "
+                "operation_timeout_ms in --hicache-storage-backend-extra-config."
+            )
+
+    def _validate_control_endpoint(self) -> None:
         """Refuse a remote-hint config whose control endpoint cannot be dialed.
 
         A hinted fetch reaches the source by dialing the endpoint the source
