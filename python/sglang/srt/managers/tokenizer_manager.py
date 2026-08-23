@@ -3591,7 +3591,7 @@ def get_processor_wrapper(server_args):
         tokenizer_mode=get_serving().tokenizer_mode,
         trust_remote_code=get_model().trust_remote_code,
         revision=get_model().revision,
-        image_processor_backend=resolve_image_processor_backend(server_args),
+        image_processor_backend=resolve_image_processor_backend(get_mm()),
         tokenizer_backend=get_serving().tokenizer_backend,
         model_name=get_model().model_path,
     )
