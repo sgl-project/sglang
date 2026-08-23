@@ -10,7 +10,6 @@ import asyncio
 import concurrent.futures
 import functools
 import logging
-import os
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
 
@@ -149,7 +148,7 @@ class EncoderPreprocessor:
             max_workers=envs.SGLANG_ENCODER_PREPROC_WORKERS.get()
         )
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=int(os.environ.get("SGLANG_ENCODER_MM_LOAD_WORKERS", 4))
+            max_workers=envs.SGLANG_ENCODER_MM_LOAD_WORKERS.get()
         )
 
     # ------------------------------------------------------------------

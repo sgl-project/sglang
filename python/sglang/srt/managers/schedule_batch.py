@@ -1930,7 +1930,7 @@ def release_req(
     # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
     # pass offload_kv=False to skip the wasteful device->host copy.
     backup_saved = True
-    if server_args.disaggregation_mode == "decode" and offload_kv:
+    if get_disagg().disaggregation_mode == "decode" and offload_kv:
         backup_saved = retraction_backup(
             req,
             tree_cache,
@@ -2832,7 +2832,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
-        sorted_indices = self._get_decode_retraction_order(self.reqs, server_args)
+        sorted_indices = self._get_decode_retraction_order(self.reqs)
 
         retracted_reqs = []
         reqs_to_abort: List[Req] = []
@@ -2892,9 +2892,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
     @staticmethod
-    def _get_decode_retraction_order(
-        reqs: List[Req], server_args: ServerArgs
-    ) -> List[int]:
+    def _get_decode_retraction_order(reqs: List[Req]) -> List[int]:
         """Return indices ordered from most-preferred to least-preferred to keep.
 
         The retraction loop pops from the end of this list, so the least-preferred
@@ -2907,15 +2905,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         def length_key(req: Req) -> Tuple[int, int]:
             return (len(req.output_ids), -len(req.origin_input_ids))
 
-        if server_args.retraction_policy == "priority":
-            priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
+        if get_schedule().retraction_policy == "priority":
+            priority_sign = (
+                1 if get_schedule().schedule_low_priority_values_first else -1
+            )
 
             def retraction_key(req: Req) -> Tuple[int, int, int]:
                 priority = req.priority
                 if priority is None:
                     priority = (
                         sys.maxsize
-                        if server_args.schedule_low_priority_values_first
+                        if get_schedule().schedule_low_priority_values_first
                         else -sys.maxsize - 1
                     )
                 return (priority * (-priority_sign), *length_key(req))

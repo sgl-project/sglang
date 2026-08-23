@@ -180,6 +180,22 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             {"text_encoder": "owner/repo/text_encoder/model.safetensors"},
         )
 
+    def test_supplemental_weight_file_remains_a_component_path(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_paths": {
+                    "conditioning_projection": "owner/repo/projection.safetensors"
+                },
+            }
+        )
+
+        self.assertEqual(
+            args.component_paths,
+            {"conditioning_projection": "owner/repo/projection.safetensors"},
+        )
+        self.assertEqual(args.component_weights_paths, {})
+
     def test_component_attention_backends_are_normalized(self):
         args = self._from_dict_without_model_resolution(
             {

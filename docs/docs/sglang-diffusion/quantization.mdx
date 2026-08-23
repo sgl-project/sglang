@@ -50,10 +50,13 @@ directory directly as `--model-path`, but that is a compatibility path. If a
 repo contains multiple candidate checkpoints, pass
 `--transformer-weights-path` explicitly.
 
-MiniMax-H3 auto-detects the per-layer metadata in Comfy's
-`pruned_fp8_scaled` safetensors. Pass one selected FL2VA or Ref2VA file by local
-path, `owner/repo/path/file.safetensors`, or direct Hugging Face file URL; do
-not combine it with `--quantization`. MiniMax-H3 GGUF usage is documented in
+MiniMax-H3 is a verified example for Comfy safetensors with per-layer metadata,
+including `pruned_fp8_scaled` and serialized ConvRot INT8. Other Comfy FP8
+exports are also auto-detected: the presence of an input scale selects static
+activation scaling, while its absence selects dynamic scaling. Pass one selected
+FL2VA or Ref2VA DiT file by local path, `owner/repo/path/file.safetensors`, or
+direct Hugging Face file URL; do not combine it with `--quantization`. Its GGUF
+usage is documented in
 the [MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#pre-quantized-gguf-transformer).
 
 ## Quantized Component Repositories
@@ -164,6 +167,14 @@ backend.
       <td>MiniMax-H3 pruned FL2VA / Ref2VA DiTs</td>
       <td>None</td>
       <td>CUDA; auto-detected; TP, sequence parallelism, and component/layerwise offload are supported, while FSDP is not. Checkpoint-marked <code>fc2</code> layers retain FP8 storage and use compute-dtype matmul.</td>
+    </tr>
+    <tr>
+      <td><code>comfy-int8-convrot</code></td>
+      <td>One selected safetensors file with per-layer <code>int8_tensorwise</code> and ConvRot metadata</td>
+      <td><code>--transformer-weights-path</code>, or an explicit weight file through <code>--component-paths.&lt;component&gt;</code></td>
+      <td>Native DiTs and encoders whose parameter mappings preserve each marked linear; MiniMax-H3 DiT and Qwen3-VL encoder checkpoints have validated tensor contracts</td>
+      <td><code>comfy-kitchen</code></td>
+      <td>CUDA; auto-detected; uses the fused Kitchen INT8 kernel and validates weight/scale layout before model construction. TP requires every row-parallel input shard to preserve the checkpoint's ConvRot group boundary. The H3 256-group DiT supports TP1/2/4, not TP8; its Qwen3-VL encoder keeps TP8 by replicating only incompatible row projections. Offload is supported; FSDP is not.</td>
     </tr>
     <tr>
       <td><code>qvg-kv</code></td>
@@ -334,7 +345,15 @@ sglang generate \
 ```
 **Note:** Requires `aiter` package with MXFP4 kernel support
 
-### Kitchen INT8 Online Quantization
+### Kitchen INT8
+
+Serialized Comfy ConvRot INT8 DiTs use `--transformer-weights-path`; compatible
+native encoders use an explicit file through `--component-paths.<component>` or
+its component alias. Both are auto-detected from per-layer markers and load
+INT8 weights and row scales directly; omit `--quantization`.
+
+For a BF16 checkpoint, `--quantization kitchen_int8` instead performs online
+quantization after loading:
 
 `kitchen_int8` quantizes DiT linear weights online from the stock BF16
 checkpoint. Forward uses the fused `comfy_kitchen.int8_linear` op (rotation,

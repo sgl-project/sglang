@@ -1235,6 +1235,7 @@ class Envs:
     SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU = EnvBool(False)
     SGLANG_ENCODER_MAX_BATCH_SIZE = EnvInt(8)
     SGLANG_ENCODER_PREPROC_WORKERS = EnvInt(8)
+    SGLANG_ENCODER_MM_LOAD_WORKERS = EnvInt(4)
     # EncoderBootstrapServer health-check tuning.  Interval == 0 disables it.
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL = EnvFloat(10.0)
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT = EnvFloat(2.0)
@@ -1485,6 +1486,8 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
+    # Use the ROCm radix-4 router for covered K3 top-k workloads.
+    SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
