@@ -21,6 +21,25 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     minimax_h3_packed_sequence,
     minimax_h3_packed_sequence_ref2va_blocks,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
+    minimax_h3_time_shift_sigmas,
+)
+
+
+def test_sigma_schedule_honors_requested_nfe_count():
+    for num_steps in (1, 4, 50):
+        sigmas = minimax_h3_time_shift_sigmas(num_steps=num_steps, shift_scale=1.0)
+        assert len(sigmas) - 1 == num_steps
+        assert sigmas[0] == 1.0
+        assert sigmas[-1] == 0.0
+
+    assert minimax_h3_time_shift_sigmas(num_steps=4, shift_scale=1.0) == [
+        1.0,
+        0.75,
+        0.5,
+        0.25,
+        0.0,
+    ]
 
 
 def _branch(

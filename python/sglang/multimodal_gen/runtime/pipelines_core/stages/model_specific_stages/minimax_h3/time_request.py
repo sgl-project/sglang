@@ -41,12 +41,8 @@ def minimax_h3_time_shift_sigmas(
 
     import torch
 
-    # The rectified-flow sigma range is fixed at [1.0, 0.0].  The Euler
-    # denoise loop performs ``len(sigmas) - 1`` updates, so the schedule must
-    # hold exactly ``num_steps + 1`` points to honor the requested step count.
-    # torch.linspace already includes both endpoints, and the time-shift
-    # mapping is strictly monotonic, so no post-hoc deduplication is needed
-    # (it could only ever shrink the schedule and break the N+1 contract).
+    # The Euler loop performs one update between each pair of sigma points,
+    # so N requested updates require N + 1 points including both endpoints.
     base = torch.linspace(
         1.0,
         0.0,
