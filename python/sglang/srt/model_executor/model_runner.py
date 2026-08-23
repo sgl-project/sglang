@@ -807,6 +807,15 @@ class ModelRunner:
     ) -> int:
         """Logits rows per decode batch slot."""
         if self.spec_algorithm.is_speculative():
+            if self.spec_algorithm.is_dspark() and self.is_draft_worker:
+                from sglang.srt.speculative.dspark_components.dspark_config import (
+                    get_dspark_sample_from_anchor,
+                )
+
+                if not get_dspark_sample_from_anchor(self.model_config.hf_config):
+                    if num_draft_tokens is None:
+                        num_draft_tokens = get_spec().speculative_num_draft_tokens
+                    return int(num_draft_tokens)
             return resolve_num_tokens_per_req(
                 phase="target_verify",
                 spec_algorithm=self.spec_algorithm,
@@ -1298,9 +1307,12 @@ class ModelRunner:
     def effective_max_total_num_tokens(self):
         """Return the max token pool size considering hybrid swa settings."""
         if self.is_hybrid_swa:
-            return self.full_max_total_num_tokens or self.swa_max_total_num_tokens
+            capacity = self.full_max_total_num_tokens or self.swa_max_total_num_tokens
         else:
-            return self.max_total_num_tokens
+            capacity = self.max_total_num_tokens
+        if (req_to_token_pool := getattr(self, "req_to_token_pool", None)) is not None:
+            return req_to_token_pool.schedulable_token_capacity(capacity)
+        return capacity
 
     @property
     def max_token_pool_size(self):

@@ -22,6 +22,7 @@ from sglang.srt.arg_groups.overrides import (
     register_model_override,
     validate_declarations,
 )
+from sglang.srt.configs.minicpm import MiniCPMHybridConfig
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_context,
@@ -77,6 +78,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "dcp_comm_backend",
                     "dcp_replicate_q_proj",
                     "disable_overlap_schedule",
+                    "disable_radix_cache",
                     "uses_mamba_radix_cache",
                     "mamba_radix_cache_strategy",
                     "mamba_full_memory_ratio",
@@ -95,9 +97,23 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "enable_aiter_allreduce_fusion",
                     "enable_symm_mem",
                     "speculative_attention_mode",
+                    "speculative_draft_attention_backend",
                 }
             ),
         )
+
+
+class TestDSparkCheckpointConfig(CustomTestCase):
+    def test_sample_from_anchor_is_read_from_checkpoint_config(self):
+        from sglang.srt.speculative.dspark_components.dspark_config import (
+            get_dspark_sample_from_anchor,
+        )
+
+        config = SimpleNamespace(
+            architectures=["UnrelatedDSparkModel"], sample_from_anchor=False
+        )
+        self.assertFalse(get_dspark_sample_from_anchor(config))
+        self.assertTrue(get_dspark_sample_from_anchor(SimpleNamespace()))
 
 
 class _IsolatedRegistry(CustomTestCase):
@@ -294,6 +310,235 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         "v_head_dim": 16,
     }
 
+    @staticmethod
+    def _minicpm_overrides(
+        architecture,
+        *,
+        sparse_attention=False,
+        lightning_attention=False,
+        attention_backend=None,
+        prefill_attention_backend=None,
+        decode_attention_backend=None,
+        disaggregation_mode="null",
+        enable_dp_attention=False,
+        enable_hierarchical_cache=False,
+    ):
+        args = SimpleNamespace(
+            attention_backend=attention_backend,
+            prefill_attention_backend=prefill_attention_backend,
+            decode_attention_backend=decode_attention_backend,
+            disaggregation_mode=disaggregation_mode,
+            enable_dp_attention=enable_dp_attention,
+            enable_hierarchical_cache=enable_hierarchical_cache,
+        )
+        args.is_attention_backend_not_set = lambda: all(
+            backend is None
+            for backend in (
+                args.attention_backend,
+                args.prefill_attention_backend,
+                args.decode_attention_backend,
+            )
+        )
+        mixer_types = []
+        if sparse_attention:
+            mixer_types.append("minicpm4")
+        if lightning_attention:
+            mixer_types.append("lightning-attn")
+        if not mixer_types:
+            mixer_types.append("minicpm4")
+        declarations = collect_model_override_declarations(
+            architecture,
+            args,
+            hf_config=MiniCPMHybridConfig(
+                num_hidden_layers=len(mixer_types),
+                num_attention_heads=1,
+                num_key_value_heads=1,
+                mixer_types=mixer_types,
+                sparse_config={} if sparse_attention else None,
+            ),
+        )
+        return {
+            field: value
+            for _, declaration in declarations
+            for field, value in declaration.items()
+        }
+
+    def test_minicpm_disables_radix_cache_only_for_hybrid_layers(self):
+        for architecture in ("MiniCPMForCausalLM", "MiniCPMSALAForCausalLM"):
+            with self.subTest(architecture=architecture):
+                self.assertNotIn(
+                    "disable_radix_cache",
+                    self._minicpm_overrides(architecture),
+                )
+                self.assertTrue(
+                    self._minicpm_overrides(architecture, sparse_attention=True)[
+                        "disable_radix_cache"
+                    ]
+                )
+                self.assertTrue(
+                    self._minicpm_overrides(architecture, lightning_attention=True)[
+                        "disable_radix_cache"
+                    ]
+                )
+
+    def test_minicpm_rejects_dp_attention(self):
+        for architecture in ("MiniCPMForCausalLM", "MiniCPMSALAForCausalLM"):
+            with self.subTest(architecture=architecture):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "MiniCPM does not support DP attention",
+                ):
+                    self._minicpm_overrides(
+                        architecture,
+                        enable_dp_attention=True,
+                    )
+
+    def test_minicpm_rejects_hierarchical_cache_for_hybrid_models(self):
+        for capability in ("sparse_attention", "lightning_attention"):
+            with self.subTest(capability=capability):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "MiniCPM SALA does not support hierarchical cache",
+                ):
+                    self._minicpm_overrides(
+                        "MiniCPMSALAForCausalLM",
+                        enable_hierarchical_cache=True,
+                        **{capability: True},
+                    )
+
+    def test_sparse_minicpm_defaults_to_sparse_attention_backend(self):
+        with patch.object(
+            overrides_module,
+            "is_blackwell_supported",
+            return_value=False,
+        ):
+            for architecture in ("MiniCPMForCausalLM", "MiniCPMSALAForCausalLM"):
+                with self.subTest(architecture=architecture):
+                    self.assertEqual(
+                        self._minicpm_overrides(
+                            architecture,
+                            sparse_attention=True,
+                        )["attention_backend"],
+                        "minicpm_flashattn",
+                    )
+
+    def test_minicpm_overrides_use_config_capabilities(self):
+        args = SimpleNamespace(
+            attention_backend=None,
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+            disaggregation_mode="null",
+            enable_dp_attention=False,
+            enable_hierarchical_cache=False,
+            is_attention_backend_not_set=lambda: True,
+        )
+        config = SimpleNamespace(
+            has_minicpm_sparse_attention=True,
+            has_lightning_layers=False,
+        )
+
+        with patch.object(
+            overrides_module, "is_blackwell_supported", return_value=False
+        ):
+            overrides = overrides_module._minicpm_sala_overrides(args, config)
+
+        self.assertTrue(overrides["disable_radix_cache"])
+        self.assertEqual(overrides["attention_backend"], "minicpm_flashattn")
+
+    def test_sparse_minicpm_defaults_to_flashinfer_on_blackwell(self):
+        with patch.object(
+            overrides_module,
+            "is_blackwell_supported",
+            return_value=True,
+        ):
+            self.assertEqual(
+                self._minicpm_overrides(
+                    "MiniCPMSALAForCausalLM",
+                    sparse_attention=True,
+                )["attention_backend"],
+                "minicpm_flashinfer",
+            )
+
+    def test_minicpm_preserves_explicit_attention_backend(self):
+        overrides = self._minicpm_overrides(
+            "MiniCPMSALAForCausalLM",
+            sparse_attention=True,
+            attention_backend="fa3",
+        )
+        self.assertNotIn("attention_backend", overrides)
+
+    def test_sparse_minicpm_rejects_pd_disaggregation(self):
+        for disaggregation_mode in ("prefill", "decode"):
+            with self.subTest(disaggregation_mode=disaggregation_mode):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "MiniCPM sparse attention does not support PD disaggregation",
+                ):
+                    self._minicpm_overrides(
+                        "MiniCPMSALAForCausalLM",
+                        sparse_attention=True,
+                        disaggregation_mode=disaggregation_mode,
+                    )
+        for backend_field in (
+            "prefill_attention_backend",
+            "decode_attention_backend",
+        ):
+            with self.subTest(backend_field=backend_field):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "MiniCPM sparse attention does not support PD disaggregation",
+                ):
+                    self._minicpm_overrides(
+                        "MiniCPMSALAForCausalLM",
+                        sparse_attention=True,
+                        disaggregation_mode="decode",
+                        **{backend_field: "minicpm_flashattn"},
+                    )
+
+    def test_minicpm_force_dense_uses_stock_attention_backend(self):
+        with envs.SGLANG_MINICPM_FORCE_DENSE.override(True):
+            self.assertNotIn(
+                "attention_backend",
+                self._minicpm_overrides(
+                    "MiniCPMSALAForCausalLM",
+                    sparse_attention=True,
+                ),
+            )
+            self.assertEqual(
+                self._minicpm_overrides(
+                    "MiniCPMSALAForCausalLM",
+                    sparse_attention=True,
+                    attention_backend="minicpm_flashinfer",
+                )["attention_backend"],
+                "flashinfer",
+            )
+            with patch.object(
+                overrides_module,
+                "is_blackwell_supported",
+                return_value=True,
+            ):
+                self.assertEqual(
+                    self._minicpm_overrides(
+                        "MiniCPMSALAForCausalLM",
+                        sparse_attention=True,
+                        attention_backend="minicpm_flashattn",
+                    )["attention_backend"],
+                    "fa4",
+                )
+            with patch.object(
+                overrides_module,
+                "is_blackwell_supported",
+                return_value=False,
+            ):
+                split_overrides = self._minicpm_overrides(
+                    "MiniCPMSALAForCausalLM",
+                    sparse_attention=True,
+                    prefill_attention_backend="minicpm_flashattn",
+                    decode_attention_backend="minicpm_flashattn",
+                )
+                self.assertEqual(split_overrides["prefill_attention_backend"], "fa3")
+                self.assertEqual(split_overrides["decode_attention_backend"], "fa3")
+
     def _construct(self, arch, model_type, config_extra=None, **server_kwargs):
         from sglang.srt.server_args import ServerArgs
 
@@ -478,6 +723,14 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 moe_runner_backend="auto",
                 moe_a2a_backend="none",
                 attention_backend=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                speculative_algorithm=None,
+                speculative_eagle_topk=None,
+                speculative_draft_attention_backend=None,
+                page_size=None,
+                mamba_radix_cache_strategy="auto",
+                is_attention_backend_not_set=lambda: True,
                 get_model_config=lambda: model_config,
             ),
             hf_config,
@@ -500,13 +753,16 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             }
         )
 
-        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+        with (
+            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+            patch.object(overrides_module, "is_blackwell_supported", return_value=True),
+        ):
             self.assertEqual(
                 _nemotron_h_overrides(server_args, hf_config),
                 {
                     "quantization": "modelopt_mixed",
                     "moe_runner_backend": "marlin",
-                    "attention_backend": "flashinfer",
+                    "attention_backend": "trtllm_mha",
                 },
             )
 
@@ -527,15 +783,168 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             }
         )
 
-        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+        with (
+            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+            patch.object(overrides_module, "is_blackwell_supported", return_value=True),
+        ):
             self.assertEqual(
                 _nemotron_h_overrides(server_args, hf_config),
                 {
                     "quantization": "modelopt_mixed",
                     "moe_runner_backend": "flashinfer_trtllm",
-                    "attention_backend": "flashinfer",
+                    "attention_backend": "trtllm_mha",
                 },
             )
+
+    def test_nemotron_h_speculation_uses_arch_specific_attention_on_blackwell(self):
+        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+
+        cases = {
+            True: {
+                "attention_backend": "trtllm_mha",
+                "page_size": 64,
+                "mamba_radix_cache_strategy": "extra_buffer",
+                "speculative_draft_attention_backend": "trtllm_mha",
+            },
+            False: {
+                "attention_backend": "triton",
+                "speculative_draft_attention_backend": "flashinfer",
+            },
+        }
+        for is_sm100, expected in cases.items():
+            with self.subTest(is_sm100=is_sm100):
+                server_args, hf_config = self._nemotron_h_args(quantized_layers={})
+                server_args.speculative_algorithm = "EAGLE"
+
+                with (
+                    patch.object(
+                        overrides_module,
+                        "is_blackwell_supported",
+                        return_value=True,
+                    ),
+                    patch.object(
+                        overrides_module,
+                        "is_sm100_supported",
+                        return_value=is_sm100,
+                    ),
+                ):
+                    overrides = _nemotron_h_overrides(server_args, hf_config)
+                    for key, value in expected.items():
+                        self.assertEqual(overrides[key], value)
+
+    def test_nemotron_h_sm100_speculative_draft_backend_matrix(self):
+        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+
+        for algorithm in ("EAGLE", "NEXTN", "DSPARK"):
+            with self.subTest(algorithm=algorithm):
+                server_args, hf_config = self._nemotron_h_args(quantized_layers={})
+                server_args.speculative_algorithm = algorithm
+                with (
+                    patch.object(
+                        overrides_module, "is_blackwell_supported", return_value=True
+                    ),
+                    patch.object(
+                        overrides_module, "is_sm100_supported", return_value=True
+                    ),
+                ):
+                    overrides = _nemotron_h_overrides(server_args, hf_config)
+                self.assertEqual(overrides["attention_backend"], "trtllm_mha")
+                self.assertEqual(
+                    overrides["speculative_draft_attention_backend"],
+                    "trtllm_mha",
+                )
+
+        server_args, hf_config = self._nemotron_h_args(quantized_layers={})
+        server_args.speculative_algorithm = "DFLASH"
+        with (
+            patch.object(overrides_module, "is_blackwell_supported", return_value=True),
+            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+        ):
+            overrides = _nemotron_h_overrides(server_args, hf_config)
+        self.assertEqual(overrides["attention_backend"], "trtllm_mha")
+        self.assertNotIn("speculative_draft_attention_backend", overrides)
+
+    def test_nemotron_h_sm100_speculation_preserves_explicit_cache_and_draft(self):
+        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+
+        server_args, hf_config = self._nemotron_h_args(quantized_layers={})
+        server_args.speculative_algorithm = "DSPARK"
+        server_args.page_size = 128
+        server_args.mamba_radix_cache_strategy = "extra_buffer_lazy"
+        server_args.speculative_draft_attention_backend = "flashinfer"
+
+        with (
+            patch.object(overrides_module, "is_blackwell_supported", return_value=True),
+            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+        ):
+            overrides = _nemotron_h_overrides(server_args, hf_config)
+
+        self.assertEqual(overrides["attention_backend"], "trtllm_mha")
+        self.assertNotIn("page_size", overrides)
+        self.assertNotIn("mamba_radix_cache_strategy", overrides)
+        self.assertNotIn("speculative_draft_attention_backend", overrides)
+
+    def test_nemotron_h_sm100_topk_tree_falls_back_to_triton(self):
+        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+
+        server_args, hf_config = self._nemotron_h_args(quantized_layers={})
+        server_args.speculative_algorithm = "EAGLE"
+        server_args.speculative_eagle_topk = 4
+
+        with (
+            patch.object(overrides_module, "is_blackwell_supported", return_value=True),
+            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+        ):
+            overrides = _nemotron_h_overrides(server_args, hf_config)
+
+        self.assertEqual(overrides["attention_backend"], "triton")
+        self.assertEqual(overrides["speculative_draft_attention_backend"], "flashinfer")
+        self.assertNotIn("page_size", overrides)
+        self.assertNotIn("mamba_radix_cache_strategy", overrides)
+
+    def test_nemotron_h_target_only_sm120_defers_to_generic_attention_default(self):
+        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+
+        server_args, hf_config = self._nemotron_h_args(quantized_layers={})
+
+        with (
+            patch.object(overrides_module, "is_blackwell_supported", return_value=True),
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+        ):
+            self.assertNotIn(
+                "attention_backend", _nemotron_h_overrides(server_args, hf_config)
+            )
+
+    def test_nemotron_h_target_only_sm100_uses_trtllm_mha(self):
+        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+
+        server_args, hf_config = self._nemotron_h_args(quantized_layers={})
+
+        with (
+            patch.object(overrides_module, "is_blackwell_supported", return_value=True),
+            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+        ):
+            self.assertEqual(
+                _nemotron_h_overrides(server_args, hf_config)["attention_backend"],
+                "trtllm_mha",
+            )
+
+    def test_nemotron_h_explicit_split_attention_backend_wins(self):
+        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+
+        server_args, hf_config = self._nemotron_h_args(quantized_layers={})
+        server_args.speculative_algorithm = "DFLASH"
+        server_args.prefill_attention_backend = "triton"
+        server_args.speculative_draft_attention_backend = "fa3"
+        server_args.is_attention_backend_not_set = lambda: False
+
+        with (
+            patch.object(overrides_module, "is_blackwell_supported", return_value=True),
+            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+        ):
+            overrides = _nemotron_h_overrides(server_args, hf_config)
+        self.assertNotIn("attention_backend", overrides)
+        self.assertNotIn("speculative_draft_attention_backend", overrides)
 
     def test_nemotron_h_w4a16_moe_rejects_a2a_backend(self):
         from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
@@ -1103,20 +1512,36 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 moe_runner_backend="auto",
                 moe_a2a_backend="none",
                 attention_backend=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                speculative_algorithm=None,
+                speculative_eagle_topk=None,
+                speculative_draft_attention_backend=None,
+                page_size=None,
+                mamba_radix_cache_strategy="auto",
                 get_model_config=lambda: mc,
             )
             defaults.update(kw)
-            return SimpleNamespace(**defaults)
+            args = SimpleNamespace(**defaults)
+            args.is_attention_backend_not_set = lambda: (
+                args.attention_backend is None
+                and args.prefill_attention_backend is None
+                and args.decode_attention_backend is None
+            )
+            return args
 
         hf = _hf()
-        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+        with (
+            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+            patch.object(overrides_module, "is_blackwell_supported", return_value=True),
+        ):
             # modelopt checkpoint: quant algo resolution + sm100 defaults
             self.assertEqual(
                 _nemotron_h_overrides(_args("modelopt", hf), hf),
                 {
                     "quantization": "modelopt_fp4",
                     "moe_runner_backend": "flashinfer_trtllm",
-                    "attention_backend": "flashinfer",
+                    "attention_backend": "trtllm_mha",
                 },
             )
             hf_mixed = _hf("MIXED_PRECISION")
@@ -1152,7 +1577,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
         hf_without_quant_cfg = _hf(include_quantization_config=False)
-        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+        with (
+            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+            patch.object(overrides_module, "is_blackwell_supported", return_value=True),
+        ):
             for modelopt_quantization in ("modelopt_fp8", "modelopt_fp4"):
                 with self.subTest(modelopt_quantization=modelopt_quantization):
                     self.assertEqual(
@@ -1163,7 +1591,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                         {
                             "quantization": modelopt_quantization,
                             "moe_runner_backend": "flashinfer_trtllm",
-                            "attention_backend": "flashinfer",
+                            "attention_backend": "trtllm_mha",
                         },
                     )
 

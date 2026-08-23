@@ -612,6 +612,7 @@ class TestNixlReceiverPoll(CustomTestCase):
         receiver.init_time = None
         receiver.conclude_state = None
         receiver.abort_notified = False
+        receiver._connection_pool_entries = {}
         return receiver, mgr
 
     def test_returns_existing_conclude_state_without_polling_manager(self):

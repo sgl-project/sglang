@@ -205,6 +205,18 @@ For the original Flash and Pro checkpoints:
 - `high-throughput`: MTP disabled — at saturation the verify step costs more than it saves.
 - MTP runs on the v2 speculative path.
 
+**Shared experts fusion (Blackwell, flashinfer_mxfp4)**
+
+On the Blackwell fp4 recipes (`--moe-runner-backend flashinfer_mxfp4`), the shared expert runs as a separate FP8 MLP on an alternate stream by default. Adding:
+
+```bash Command
+--enforce-shared-experts-fusion
+```
+
+routes it as one extra MXFP4 expert through the same trtllm-gen MoE kernel, so the whole MoE runs on a single stream (~4 fewer kernel launches and 2 fewer stream syncs per MoE layer). The shared expert is requantized from FP8 to MXFP4 at load time. Measured on GB200 tp4: gsm8k and AIME25 accuracy on par with the unfused baseline; Mean TTFT -13% to -21% and P99 ITL -15% to -53% at QPS 1-8 with neutral throughput.
+
+Only for deployments without expert parallelism (e.g. the single-node low-latency recipes): with `moe_ep_size > 1` the flag is rejected at startup, unless the DeepEP/MegaMOE per-rank shared-slot path is in use.
+
 **Compressed attention state dtype**
 
 DeepSeek-V4 uses hybrid compressed attention for long-context efficiency. `SGLANG_DSV4_COMPRESS_STATE_DTYPE` controls the dtype of the C4 / C128 compressed attention state pools. Supported values are `float32` / `fp32` (default: `float32`) and `bfloat16` / `bf16`. For BF16 on the offline compression path:

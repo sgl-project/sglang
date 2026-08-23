@@ -413,6 +413,8 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     sliding_window = _cfg_get(
         text_config, "sliding_window", _cfg_get(config, "sliding_window")
     )
+    if sliding_window is None and is_nemotron_35_draft_config(config):
+        sliding_window = _get_dflash_config(config).get("swa_window_size")
     if sliding_window is None:
         raise ValueError(
             "DFLASH sliding_attention layers require config.sliding_window."
@@ -461,6 +463,46 @@ def _get_dflash_config(config: Any) -> dict:
         return dict(cfg)
     except Exception:
         return {}
+
+
+def is_nemotron_35_draft_config(config: Any) -> bool:
+    """Identify the published Nemotron 3.5 DFlash/DSpark draft layout.
+
+    Keep the non-anchor query layout and checkpoint-local vocabulary modules
+    scoped to this structurally distinct family instead of changing every
+    DFlash/DSpark checkpoint that happens to expose one of these fields.
+    """
+    architectures = _cfg_get(config, "architectures", None) or []
+    if not {"DFlashDraftModel", "Qwen3DSparkModel"}.intersection(architectures):
+        return False
+    if not bool(_cfg_get(config, "has_embed_tokens", False)):
+        return False
+    if bool(_cfg_get(config, "has_lm_head", False)):
+        return False
+
+    quant_config = _cfg_get(config, "quantization_config", None) or {}
+    if _cfg_get(quant_config, "quant_algo", None) != "W4A16_NVFP4":
+        return False
+
+    dflash_config = _get_dflash_config(config)
+    target_layer_ids = dflash_config.get(
+        "target_layer_ids", _cfg_get(config, "target_layer_ids", None)
+    )
+    aux_layer_ids = _cfg_get(config, "eagle_aux_hidden_state_layer_ids", None)
+    if not target_layer_ids or not aux_layer_ids:
+        return False
+    if len(target_layer_ids) != len(aux_layer_ids):
+        return False
+    if any(
+        int(target) + 1 != int(aux)
+        for target, aux in zip(target_layer_ids, aux_layer_ids)
+    ):
+        return False
+
+    sample_from_anchor = dflash_config.get(
+        "sample_from_anchor", _cfg_get(config, "sample_from_anchor", True)
+    )
+    return sample_from_anchor is False
 
 
 def _parse_optional_int(

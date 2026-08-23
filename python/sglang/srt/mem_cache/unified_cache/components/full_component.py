@@ -428,7 +428,7 @@ class FullComponent(TreeComponent):
         if self._full_kv_pool_host is None:
             return
         for host_value in host_values:
-            self._full_kv_pool_host.free(host_value)
+            self.cache.host_pool_group.free(host_value, pool=PoolName.KV)
 
     def apply_component_action(self, action: ComponentAction) -> None:
         if isinstance(action, FreeComponentDeviceSlot):
