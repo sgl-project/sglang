@@ -7,6 +7,45 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-flashmla)
 
+find_program(FLASHMLA_PATCH_EXECUTABLE NAMES patch REQUIRED)
+set(
+    FLASHMLA_HISPARSE_DEMAND_PATCH
+    "${CMAKE_CURRENT_LIST_DIR}/flashmla_hisparse_demand.patch"
+)
+execute_process(
+    COMMAND
+        "${FLASHMLA_PATCH_EXECUTABLE}" -p1 --forward --dry-run --batch --silent
+        --ignore-whitespace --fuzz=0
+        -i "${FLASHMLA_HISPARSE_DEMAND_PATCH}"
+    WORKING_DIRECTORY "${repo-flashmla_SOURCE_DIR}"
+    RESULT_VARIABLE FLASHMLA_HISPARSE_DEMAND_FORWARD_RESULT
+)
+if(FLASHMLA_HISPARSE_DEMAND_FORWARD_RESULT EQUAL 0)
+    execute_process(
+        COMMAND
+            "${FLASHMLA_PATCH_EXECUTABLE}" -p1 --forward --batch --silent
+            --ignore-whitespace --fuzz=0
+            -i "${FLASHMLA_HISPARSE_DEMAND_PATCH}"
+        WORKING_DIRECTORY "${repo-flashmla_SOURCE_DIR}"
+        RESULT_VARIABLE FLASHMLA_HISPARSE_DEMAND_APPLY_RESULT
+    )
+    if(NOT FLASHMLA_HISPARSE_DEMAND_APPLY_RESULT EQUAL 0)
+        message(FATAL_ERROR "Failed to apply the HiSparse Demand patch")
+    endif()
+else()
+    execute_process(
+        COMMAND
+            "${FLASHMLA_PATCH_EXECUTABLE}" -p1 --reverse --dry-run --batch
+            --silent --ignore-whitespace --fuzz=0
+            -i "${FLASHMLA_HISPARSE_DEMAND_PATCH}"
+        WORKING_DIRECTORY "${repo-flashmla_SOURCE_DIR}"
+        RESULT_VARIABLE FLASHMLA_HISPARSE_DEMAND_REVERSE_RESULT
+    )
+    if(NOT FLASHMLA_HISPARSE_DEMAND_REVERSE_RESULT EQUAL 0)
+        message(FATAL_ERROR "Demand patch does not match pinned FlashMLA")
+    endif()
+endif()
+
 # flashmla submodule pin: NVIDIA/cutlass @ 147f5673d0c1c3dcf66f78d677fd647e4a020219
 FetchContent_Declare(
     repo-flashmla-cutlass

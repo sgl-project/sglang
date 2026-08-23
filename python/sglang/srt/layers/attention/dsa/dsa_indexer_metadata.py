@@ -11,6 +11,7 @@ from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
+    TopKOutputBuffers,
     TopkTransformMethod,
 )
 
@@ -98,6 +99,7 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
     force_unfused_topk: bool = False
+    topk_output_buffers: Optional[TopKOutputBuffers] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.attn_metadata.cache_seqlens_int32
@@ -166,4 +168,5 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
             row_starts=ks,
             batch_idx_list=batch_idx_list,
             force_unfused_topk=self.force_unfused_topk,
+            output_buffers=self.topk_output_buffers,
         )

@@ -63,7 +63,8 @@ def _parse_sparse_config() -> SparseConfig:
     """Parse hierarchical sparse config from JSON string.
 
     Required fields with defaults: top_k (2048), device_buffer_size (2*top_k),
-    host_to_device_ratio (2), swap_in_block_size (960).
+    host_to_device_ratio (2), swap_in_block_size (960),
+    mtp_demand_buffer (False).
     Optional fields (default None): algorithm, backend, min_sparse_prompt_len,
     page_size. All remaining fields go to sparse_extra_config.
     """
@@ -80,6 +81,7 @@ def _parse_sparse_config() -> SparseConfig:
     device_buffer_size = extra_config.pop("device_buffer_size", 2 * top_k)
     host_to_device_ratio = extra_config.pop("host_to_device_ratio", 2)
     swap_in_block_size = extra_config.pop("swap_in_block_size", 960)
+    mtp_demand_buffer = extra_config.pop("mtp_demand_buffer", False)
 
     if device_buffer_size < top_k:
         raise ValueError(
@@ -93,6 +95,10 @@ def _parse_sparse_config() -> SparseConfig:
         raise ValueError(
             f"swap_in_block_size ({swap_in_block_size}) must be in the range [1, 1024]"
         )
+    if not isinstance(mtp_demand_buffer, bool):
+        raise ValueError(
+            f"mtp_demand_buffer must be a boolean, got {mtp_demand_buffer!r}"
+        )
 
     algorithm = extra_config.pop("algorithm", None)
     backend = extra_config.pop("backend", None)
@@ -104,6 +110,7 @@ def _parse_sparse_config() -> SparseConfig:
         device_buffer_size=device_buffer_size,
         host_to_device_ratio=host_to_device_ratio,
         swap_in_block_size=swap_in_block_size,
+        mtp_demand_buffer=mtp_demand_buffer,
         algorithm=algorithm,
         backend=backend,
         page_size=page_size,

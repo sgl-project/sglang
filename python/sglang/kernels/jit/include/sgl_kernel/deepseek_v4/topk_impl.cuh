@@ -190,7 +190,9 @@ SGL_DEVICE int32_t page_to_indices(const int32_t* __restrict__ page_table, uint3
 struct TopKProblem {
   const float* __restrict__ in;
   int32_t* __restrict__ out;  // page_indices [topk]
+  int32_t* __restrict__ raw_out;
   const int32_t* __restrict__ page_table;
+  const int64_t* __restrict__ direct_table;
   uint32_t topk;
   uint32_t seq_len;
   uint32_t page_bits;
@@ -200,7 +202,11 @@ struct TopKProblem {
     out[pos] = static_cast<int32_t>(raw_idx) + bias;
   }
   SGL_DEVICE void transform_output(uint32_t t, int32_t raw) const {
-    out[t] = raw < 0 ? -1 : page_to_indices(page_table, raw, page_bits);
+    if (raw_out != nullptr) raw_out[t] = raw;
+    const int32_t transformed = raw < 0                   ? -1
+                                : direct_table != nullptr ? static_cast<int32_t>(direct_table[raw])
+                                                          : page_to_indices(page_table, raw, page_bits);
+    out[t] = transformed;
   }
 };
 

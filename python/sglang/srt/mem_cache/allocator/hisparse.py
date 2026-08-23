@@ -258,7 +258,12 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         hisparse_indices = self._kvcache._translate_loc_to_hisparse_device(free_indices)
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
         self.free_hisparse_indices(hisparse_indices)
-        self.full_to_hisparse_device_index_mapping[free_indices] = 0
+        # Python-scalar advanced-index assignment copies the scalar to CUDA and
+        # synchronizes the CPU with the current stream.  This path runs once per
+        # speculative verify step, so keep the mapping clear asynchronous.
+        self.full_to_hisparse_device_index_mapping.index_fill_(
+            0, free_indices.to(torch.int64), 0
+        )
 
     def clear(self):
         self.logical_attn_allocator.clear()

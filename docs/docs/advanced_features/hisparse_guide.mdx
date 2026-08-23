@@ -6,7 +6,7 @@ metatags:
 
 HiSparse reduces per-request GPU memory consumption during the decode phase by maintaining only a small "hot" KV buffer on GPU while keeping complete KV data in CPU pinned memory. Combined with PD disaggregation, it enables significantly higher decode concurrency.
 
-> **Prerequisites**: HiSparse works with models that use **DeepSeek Sparse Attention (DSA)** architectures (e.g., DeepSeek-V3.2, GLM-5.1) and **DeepSeek V4**. These models natively select a subset of tokens for attention, making it possible to keep only the top-k KV on GPU while storing the full KV in host memory — without accuracy loss. Additionally, HiSparse currently requires **PD disaggregation mode** and is enabled on the **decode instance** only.
+> **Prerequisites**: HiSparse works with models that use **DeepSeek Sparse Attention (DSA)** architectures (e.g., DeepSeek-V3.2, GLM-5.1) and **DeepSeek V4**. These models natively select a subset of tokens for attention, making it possible to keep only the top-k KV on GPU while storing the full KV in host memory — without accuracy loss. The production deployment described below uses **PD disaggregation mode** and enables HiSparse on the **decode instance** only. The opt-in MTP Demand Buffer also supports the restricted integrated-serving configuration documented in its section.
 
 ## Why HiSparse?
 
@@ -113,6 +113,11 @@ Pass as a JSON string via `--hisparse-config`:
       <td>int / 960</td>
       <td>CUDA thread-block size for the HiSparse swap-in kernel</td>
     </tr>
+    <tr>
+      <td><code>mtp_demand_buffer</code></td>
+      <td>bool / false</td>
+      <td>Use the HiSparse MTP Demand Buffer for supported target-verify attention</td>
+    </tr>
   </tbody>
 </table>
 
@@ -124,9 +129,22 @@ When a model reuses one anchor layer's top-k selection across a run of subsequen
 
 The prefetch is enabled automatically for eligible models (no pipeline parallelism, no speculative decoding) and can be turned off for A/B comparison with `SGLANG_DISABLE_HISPARSE_PREFETCH=1`.
 
+### MTP Demand Buffer (opt-in)
+
+With MTP/speculative decoding, target verification evaluates several query rows at once. The native HiSparse MTP path eagerly materializes each row's selected historical KV into stable request-local staging before attention. On supported configurations, `mtp_demand_buffer` instead lets FlashMLA probe a request-local HBM buffer and read an authoritative pinned-Host row only when it misses. A producer that reads from Host also fills and publishes the row for later consumers. Entries remain reusable across adjacent verify calls and are replaced lazily; there is no planner, prefetch pass, or additional CUDA stream.
+
+Enable it with:
+
+```bash
+--enable-hisparse \
+--hisparse-config='{"top_k": 2048, "device_buffer_size": 4096, "mtp_demand_buffer": true}'
+```
+
+The initial implementation is restricted to GLM-5.2 MLA on CUDA SM90, TP8/DP8 with DP attention, FP8 KV with the `flashmla_kv` decode backend, fused SGLang TopK-v2, page size 64, and EAGLE/MTP `num_steps=3`, `topk=1`, `num_draft_tokens=4`. PD decode additionally requires `index_share_for_mtp_iteration=false`, because Demand consumes the complete per-row TopK output. Unsupported layouts keep the native HiSparse MTP path. The option defaults to `false`.
+
 ## Deployment
 
-HiSparse currently requires **PD disaggregation mode** and is enabled only on the **decode instance**.
+The general production deployment currently uses **PD disaggregation mode** and enables HiSparse only on the **decode instance**. The MTP Demand Buffer's validated integrated TP8/DP8 configuration is the explicit exception described above.
 
 ### Prefill Instance
 

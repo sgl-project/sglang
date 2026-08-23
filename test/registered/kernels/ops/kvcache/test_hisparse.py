@@ -4,8 +4,10 @@ import pytest
 import torch
 
 from sglang.kernels.ops.kvcache.hisparse import (
+    backup_mtp_demand_window_mla,
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
+    load_cache_to_device_buffer_mtp_mla,
     transfer_cache_dsv4_mla,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
@@ -36,6 +38,43 @@ DSV4_SCALE_BYTES = 8
 DSV4_ITEM_BYTES = DSV4_VALUE_BYTES + DSV4_SCALE_BYTES
 DSV4_PAGE_BYTES = ((DSV4_ITEM_BYTES * DSV4_PAGE_SIZE + 575) // 576) * 576
 DSV4_SCALE_OFFSET = DSV4_VALUE_BYTES * DSV4_PAGE_SIZE
+
+
+@pytest.mark.skipif(is_hip(), reason="MTP Demand writeback kernel is CUDA-only.")
+def test_backup_mtp_demand_window_mla_masks_and_parallelizes_layers() -> None:
+    layers, rows, item_size = 3, 8, 32
+    src = torch.arange(
+        layers * rows * item_size, dtype=torch.uint8, device=DEVICE
+    ).reshape(layers, rows, item_size)
+    dst = torch.zeros_like(src)
+    src_ptrs = torch.tensor(
+        [src[layer].data_ptr() for layer in range(layers)],
+        dtype=torch.int64,
+        device=DEVICE,
+    )
+    dst_ptrs = torch.tensor(
+        [dst[layer].data_ptr() for layer in range(layers)],
+        dtype=torch.int64,
+        device=DEVICE,
+    )
+    src_indices = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device=DEVICE)
+    dst_indices = torch.tensor([4, 5, 6, 7], dtype=torch.int64, device=DEVICE)
+    accept_index = torch.tensor([0, 1, -1, -1], dtype=torch.int32, device=DEVICE)
+
+    backup_mtp_demand_window_mla(
+        src_layers=src_ptrs,
+        dst_layers=dst_ptrs,
+        src_indices=src_indices,
+        dst_indices=dst_indices,
+        accept_index=accept_index,
+        item_size=item_size,
+        num_layers=layers,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(dst[:, 4], src[:, 1])
+    assert torch.equal(dst[:, 5], src[:, 2])
+    assert torch.count_nonzero(dst[:, 6:]).item() == 0
 
 
 def _host_cache() -> torch.Tensor:
@@ -181,6 +220,48 @@ def _make_state(
         "lru_slots": lru_slots,
         "host_cache_locs": host_cache_locs,
     }
+
+
+@pytest.mark.skipif(is_hip(), reason="Native HiSparse MTP is CUDA-only.")
+def test_mtp_page_tables_remain_valid_after_later_step_swap() -> None:
+    state = _make_state(
+        [[0, 1, 2, 3, 4]],
+        [[0, 1, 2, 3, -1]],
+        [15],
+    )
+    top_k_tokens = torch.tensor(
+        [[[4, 5, 6, 7], [8, 9, 10, 11]]],
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+    page_tables = torch.full_like(top_k_tokens, -1)
+
+    load_cache_to_device_buffer_mtp_mla(
+        top_k_tokens=top_k_tokens,
+        device_buffer_tokens=state["device_buffer_tokens"],
+        host_cache_locs=state["host_cache_locs"],
+        device_buffer_locs=state["device_buffer_locs"],
+        host_cache=state["host_cache"],
+        device_buffer=state["device_buffer"],
+        top_k_device_locs=page_tables,
+        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([8, 12], dtype=torch.int32, device=DEVICE),
+        mtp_staging_locs=torch.arange(5, 13, dtype=torch.int64, device=DEVICE).view(
+            1, -1
+        ),
+        item_size_bytes=ITEM_SIZE_BYTES,
+        num_top_k=4,
+        hot_buffer_size=HOT_BUFFER_SIZE,
+        page_size=1,
+        block_size=256,
+        num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
+        num_steps=2,
+    )
+    torch.cuda.synchronize()
+
+    materialized = state["device_buffer"][page_tables.to(torch.int64)]
+    expected = state["host_cache"][top_k_tokens.cpu()].to(DEVICE)
+    assert torch.equal(materialized, expected)
 
 
 @pytest.mark.skipif(is_hip(), reason="DSV4 paged-layout HiSparse test is CUDA-only.")

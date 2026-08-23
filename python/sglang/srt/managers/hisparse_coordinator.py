@@ -1,11 +1,12 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
-from typing import Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 
 from sglang.kernels.ops.kvcache.hisparse import (
+    backup_mtp_demand_window_mla,
     copy_cache_planned_mla,
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
@@ -25,6 +26,13 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.utils import get_device_module, is_hip
+
+if TYPE_CHECKING:
+    from sgl_kernel.flashmla_hisparse_demand import HiSparseDemandInputs
+
+    from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+        TopKOutputBuffers,
+    )
 
 device_module = get_device_module()
 
@@ -125,6 +133,7 @@ class HiSparseCoordinator:
         swap_in_block_size: int = 960,
         shared_index_layers: Optional[List[bool]] = None,
         mtp_num_rows: int = 0,
+        enable_mtp_demand_buffer: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -178,7 +187,30 @@ class HiSparseCoordinator:
             self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
         self.mtp_num_rows = mtp_num_rows if not self.is_dsv4_hisparse else 0
-        self.mtp_staging_size = self.mtp_num_rows * self.top_k
+        self.mtp_demand_buffer_enabled = bool(
+            enable_mtp_demand_buffer
+            and not self.is_dsv4_hisparse
+            and self.top_k == 2048
+            and self.device_buffer_size == 4096
+            and self.page_size == 64
+            and self.item_size_bytes == 656
+        )
+        if enable_mtp_demand_buffer and not self.mtp_demand_buffer_enabled:
+            logger.warning(
+                "HiSparse MTP Demand layout is unsupported; falling back to "
+                "the native MTP swap path"
+            )
+        elif self.mtp_demand_buffer_enabled:
+            logger.info("HiSparse MTP Demand buffer enabled")
+        self.mtp_demand_cache_rows = 4096
+        self.mtp_staging_size = (
+            0 if self.mtp_demand_buffer_enabled else self.mtp_num_rows * self.top_k
+        )
+        self.mtp_side_reserve_size = (
+            self.mtp_demand_cache_rows
+            if self.mtp_demand_buffer_enabled
+            else self.mtp_staging_size
+        )
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
         max_compressed_context_len = (
@@ -220,12 +252,58 @@ class HiSparseCoordinator:
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
         self._pending_draft_extend_backup = None
+        self._pending_mtp_demand_commit = None
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
 
         # initialize data structures for swap-in kernel
         layer_num = self.mem_pool_device.layer_num
+        if self.mtp_demand_buffer_enabled:
+            device_dtype = self.mem_pool_device.get_key_buffer(
+                self.mem_pool_device.start_layer
+            ).dtype
+            self.mtp_demand_host_kv = self.mem_pool_host.kv_buffer.view(device_dtype)
+            self.mtp_demand_cache_tags = torch.zeros(
+                (layer_num, max_num_req_slots, self.mtp_demand_cache_rows),
+                dtype=torch.int64,
+                device=device,
+            )
+            self.mtp_demand_decode_calls = torch.zeros(
+                max_num_req_slots, dtype=torch.int32, device=device
+            )
+            self.mtp_demand_num_real_query_rows = torch.zeros(
+                1, dtype=torch.int32, device=device
+            )
+            # CUDA Graph capture runs the fused TopK transform before a live
+            # batch has populated these stable inputs. Slot/length zero keeps
+            # that capture pass inside the allocated request metadata.
+            self.mtp_demand_expanded_req_pool_indices = torch.zeros(
+                max_num_req_slots * 4, dtype=torch.int64, device=device
+            )
+            self.mtp_demand_expanded_committed_lens = torch.zeros(
+                max_num_req_slots * 4, dtype=torch.int32, device=device
+            )
+            self.mtp_demand_device_locs = torch.zeros(
+                (max_num_req_slots, self.mtp_demand_cache_rows + 6),
+                dtype=torch.int64,
+                device=device,
+            )
+            self.top_k_host_locs_buffer = torch.full(
+                (max_num_req_slots * 4, self.top_k),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+        else:
+            self.mtp_demand_host_kv = None
+            self.mtp_demand_cache_tags = None
+            self.mtp_demand_decode_calls = None
+            self.mtp_demand_num_real_query_rows = None
+            self.mtp_demand_expanded_req_pool_indices = None
+            self.mtp_demand_expanded_committed_lens = None
+            self.mtp_demand_device_locs = None
+            self.top_k_host_locs_buffer = None
         self.req_device_buffer_tokens = torch.full(
             (layer_num, max_num_req_slots, self.padded_buffer_size),
             -1,
@@ -261,7 +339,10 @@ class HiSparseCoordinator:
             device=device,
         )
         self.raw_indices_buffer = torch.full(
-            (max_num_req_slots, self.top_k),
+            (
+                max_num_req_slots * (4 if self.mtp_demand_buffer_enabled else 1),
+                self.top_k,
+            ),
             -1,
             dtype=torch.int32,
             device=device,
@@ -335,6 +416,180 @@ class HiSparseCoordinator:
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
+
+    def get_mtp_demand_topk_output_buffers(
+        self, num_query_rows: int
+    ) -> "TopKOutputBuffers":
+        """Expose the fused TopK outputs without leaking Demand state layout."""
+        assert self.mtp_demand_buffer_enabled
+        assert self.raw_indices_buffer is not None
+        assert self.top_k_host_locs_buffer is not None
+        assert self.mtp_demand_expanded_req_pool_indices is not None
+        from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+            TopKOutputBuffers,
+        )
+
+        return TopKOutputBuffers(
+            raw_indices=self.raw_indices_buffer[:num_query_rows],
+            physical_indices=self.top_k_host_locs_buffer[:num_query_rows],
+            direct_transform_table=self.req_to_host_pool,
+            direct_transform_rows=self.mtp_demand_expanded_req_pool_indices[
+                :num_query_rows
+            ],
+        )
+
+    def get_mtp_demand_attention_inputs(
+        self,
+        layer_id: int,
+        seq_lens: torch.Tensor,
+    ) -> "HiSparseDemandInputs":
+        """Build the MTP Demand Buffer adapter without a side-kernel launch."""
+        assert self.mtp_demand_buffer_enabled
+        assert self.mtp_demand_host_kv is not None
+        assert self.mtp_demand_cache_tags is not None
+        assert self.mtp_demand_decode_calls is not None
+        assert self.mtp_demand_num_real_query_rows is not None
+        assert self.mtp_demand_device_locs is not None
+        assert self.top_k_host_locs_buffer is not None
+        assert self.mtp_demand_expanded_req_pool_indices is not None
+        assert self.mtp_demand_expanded_committed_lens is not None
+        from sgl_kernel.flashmla_hisparse_demand import HiSparseDemandInputs
+
+        rows = seq_lens.shape[0]
+        if rows > self.top_k_host_locs_buffer.shape[0]:
+            raise RuntimeError(
+                "HiSparse MTP Demand query rows exceed scratch capacity: "
+                f"rows={rows}, capacity={self.top_k_host_locs_buffer.shape[0]}"
+            )
+        local_layer_id = layer_id - self.mem_pool_device.start_layer
+        assert 0 <= local_layer_id < self.mem_pool_device.layer_num
+        return HiSparseDemandInputs(
+            host_kv=self.mtp_demand_host_kv[local_layer_id],
+            host_locs=self.top_k_host_locs_buffer[:rows],
+            device_locs=self.mtp_demand_device_locs,
+            cache_tags=self.mtp_demand_cache_tags[local_layer_id],
+            decode_calls=self.mtp_demand_decode_calls,
+            num_real_reqs=self.mtp_demand_num_real_query_rows,
+            req_pool_indices=self.mtp_demand_expanded_req_pool_indices[:rows],
+            seq_lens=seq_lens,
+            mtp_committed_lens=self.mtp_demand_expanded_committed_lens[:rows],
+            cache_rows=self.mtp_demand_cache_rows,
+        )
+
+    def prepare_mtp_demand_verify(
+        self,
+        req_pool_indices: torch.Tensor,
+        committed_lens: torch.Tensor,
+        num_query_rows: int,
+    ) -> None:
+        if not self.mtp_demand_buffer_enabled:
+            return
+        self.advance_mtp_demand_epoch(req_pool_indices)
+        self.prepare_mtp_demand_batch(
+            req_pool_indices=req_pool_indices,
+            committed_lens=committed_lens,
+            num_query_rows=num_query_rows,
+        )
+
+    def set_mtp_demand_num_query_rows(self, num_query_rows: int) -> None:
+        if self.mtp_demand_buffer_enabled:
+            assert self.mtp_demand_num_real_query_rows is not None
+            self.mtp_demand_num_real_query_rows.fill_(num_query_rows)
+
+    def _bind_mtp_demand_overlay(
+        self,
+        req_pool_indices: torch.Tensor,
+        device_slots: torch.Tensor,
+    ) -> None:
+        if not self.mtp_demand_buffer_enabled:
+            return
+        assert self.mtp_demand_device_locs is not None
+        overlay_start = self.mtp_demand_cache_rows + 2
+        num_tokens_per_req = device_slots.numel() // req_pool_indices.numel()
+        self.mtp_demand_device_locs[
+            req_pool_indices, overlay_start : overlay_start + num_tokens_per_req
+        ] = device_slots.view(req_pool_indices.numel(), num_tokens_per_req)
+
+    def _bind_mtp_demand_buffer(
+        self, req_pool_idx: int, reserved_rows: torch.Tensor
+    ) -> None:
+        if not self.mtp_demand_buffer_enabled:
+            return
+        assert self.mtp_demand_device_locs is not None
+        current = self.mtp_demand_device_locs[
+            req_pool_idx, : self.mtp_demand_cache_rows
+        ]
+        if reserved_rows.numel() != self.mtp_demand_cache_rows:
+            raise RuntimeError(
+                "HiSparse MTP Demand side-reserve size mismatch: "
+                f"expected={self.mtp_demand_cache_rows}, "
+                f"actual={reserved_rows.numel()}"
+            )
+        current.copy_(reserved_rows)
+
+    def _free_mtp_demand_buffer(self, req_pool_idx: int) -> None:
+        if not self.mtp_demand_buffer_enabled:
+            return
+        assert self.mtp_demand_device_locs is not None
+        row = self.mtp_demand_device_locs[req_pool_idx]
+        cache_rows = row[: self.mtp_demand_cache_rows]
+        allocated = cache_rows[cache_rows > 0]
+        if allocated.numel() > 0:
+            self.token_to_kv_pool_allocator.free_hisparse_indices(allocated)
+        row.zero_()
+
+    def _reset_mtp_demand_request_state(self, req_pool_idx: int) -> None:
+        if not self.mtp_demand_buffer_enabled:
+            return
+        assert self.mtp_demand_cache_tags is not None
+        assert self.mtp_demand_decode_calls is not None
+        self.mtp_demand_cache_tags[:, req_pool_idx].zero_()
+        self.mtp_demand_decode_calls[req_pool_idx].zero_()
+
+    def advance_mtp_demand_epoch(self, req_pool_indices: torch.Tensor) -> None:
+        if not self.mtp_demand_buffer_enabled:
+            return
+        assert self.mtp_demand_decode_calls is not None
+        self.mtp_demand_decode_calls.index_add_(
+            0,
+            req_pool_indices.to(dtype=torch.int64),
+            torch.ones_like(req_pool_indices, dtype=torch.int32),
+        )
+
+    def prepare_mtp_demand_batch(
+        self,
+        req_pool_indices: torch.Tensor,
+        committed_lens: torch.Tensor,
+        num_query_rows: int,
+    ) -> None:
+        """Expand request metadata once per verify step, not once per layer."""
+        if not self.mtp_demand_buffer_enabled:
+            return
+        assert self.mtp_demand_expanded_req_pool_indices is not None
+        assert self.mtp_demand_expanded_committed_lens is not None
+        assert self.mtp_demand_num_real_query_rows is not None
+        num_reqs = req_pool_indices.numel()
+        if num_reqs == 0 or num_query_rows % num_reqs != 0:
+            raise ValueError(
+                "MTP Demand query rows must be a non-zero multiple of requests"
+            )
+        if num_query_rows > self.mtp_demand_expanded_req_pool_indices.numel():
+            raise ValueError("MTP Demand query rows exceed metadata capacity")
+        repeats = num_query_rows // num_reqs
+        self.mtp_demand_expanded_req_pool_indices[:num_query_rows].copy_(
+            torch.repeat_interleave(
+                req_pool_indices, repeats, dim=0, output_size=num_query_rows
+            )
+        )
+        self.mtp_demand_expanded_committed_lens[:num_query_rows].copy_(
+            torch.repeat_interleave(
+                committed_lens.to(torch.int32),
+                repeats,
+                dim=0,
+                output_size=num_query_rows,
+            )
+        )
+        self.mtp_demand_num_real_query_rows.fill_(num_query_rows)
 
     def destroy(self) -> None:
         # Drain in-flight transfers so the buffer is idle, then unregister it.
@@ -479,27 +734,41 @@ class HiSparseCoordinator:
         )
         compressed_len = len(compressed_logical_indices)
 
+        if self.mtp_demand_buffer_enabled:
+            assert self.mtp_demand_device_locs is not None
+            demand_rows = self.mtp_demand_device_locs[
+                req.kv.req_pool_idx, : self.mtp_demand_cache_rows
+            ]
+            if torch.any(demand_rows != 0):
+                raise RuntimeError(
+                    "HiSparse MTP Demand buffer already allocated for request slot "
+                    f"{req.kv.req_pool_idx}"
+                )
+            self._reset_mtp_demand_request_state(req.kv.req_pool_idx)
+
         claimed = self.token_to_kv_pool_allocator.alloc_device_buffer_with_reserve(
             compressed_logical_indices,
             alloc_size,
-            reserve_size=self.mtp_staging_size,
+            reserve_size=self.mtp_side_reserve_size,
         )
         if claimed is None:
             logger.error(
                 "HiSparse: device admission failed for req %s "
-                "(compressed_len=%d, hot=%d, mtp_staging=%d)",
+                "(compressed_len=%d, hot=%d, mtp_side_reserve=%d)",
                 req.rid,
                 compressed_len,
                 alloc_size,
-                self.mtp_staging_size,
+                self.mtp_side_reserve_size,
             )
             raise RuntimeError("HiSparse device admission capacity exhausted")
-        buffer_indices, mtp_staging_indices = claimed
+        buffer_indices, mtp_side_reserve = claimed
 
         buffer_indices = buffer_indices.to(torch.int32)
         self.req_to_device_buffer[req.kv.req_pool_idx, :alloc_size] = buffer_indices
-        if self.mtp_staging_size > 0:
-            self.req_to_mtp_staging[req.kv.req_pool_idx].copy_(mtp_staging_indices)
+        if self.mtp_demand_buffer_enabled:
+            self._bind_mtp_demand_buffer(req.kv.req_pool_idx, mtp_side_reserve)
+        elif self.mtp_staging_size > 0:
+            self.req_to_mtp_staging[req.kv.req_pool_idx].copy_(mtp_side_reserve)
         self.req_device_buffer_size[req.kv.req_pool_idx] = alloc_size
 
         self.req_device_buffer_tokens[
@@ -562,6 +831,7 @@ class HiSparseCoordinator:
         verify_cache_locs: torch.Tensor,
         num_tokens_per_req: int,
         start_positions: torch.Tensor,
+        host_reserve_end_positions_cpu: List[int],
     ) -> None:
         """Bind one fixed-width target-verify window to hot/extra-page slots."""
         assert self.supports_hisparse_draft_slots()
@@ -579,6 +849,22 @@ class HiSparseCoordinator:
                 "HiSparse MTP verify slot mismatch: "
                 f"expected {total_slots}, got {verify_cache_locs.numel()}"
             )
+
+        if len(host_reserve_end_positions_cpu) != req_pool_indices.numel():
+            raise ValueError("MTP Demand host reserve shape mismatch")
+        if self.mtp_demand_buffer_enabled:
+            for req_pool_idx, reserve_end in zip(
+                req_pool_indices_cpu.tolist(), host_reserve_end_positions_cpu
+            ):
+                allocated_len = int(self.req_to_host_pool_allocated_len[req_pool_idx])
+                if reserve_end > allocated_len:
+                    self.mem_pool_host.alloc_paged_token_slots(
+                        self.req_to_host_pool,
+                        self.req_to_host_pool_allocated_len,
+                        req_pool_idx,
+                        allocated_len,
+                        reserve_end - allocated_len,
+                    )
 
         row_indices = torch.repeat_interleave(req_pool_indices, num_tokens_per_req)
         pos_in_segment = (
@@ -607,6 +893,7 @@ class HiSparseCoordinator:
         self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping.index_copy_(
             0, verify_cache_locs.to(torch.int64), device_slots
         )
+        self._bind_mtp_demand_overlay(req_pool_indices, device_slots)
 
     def _backup_native_device_locs_to_host(
         self, host_locs: torch.Tensor, device_locs: torch.Tensor
@@ -663,6 +950,104 @@ class HiSparseCoordinator:
             full_to_device_mapping.index_fill_(
                 0, logical_locs_to_clear.to(torch.int64), 0
             )
+
+    def _finalize_mtp_demand_verify_window(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        verify_cache_locs: torch.Tensor,
+        accept_index: torch.Tensor,
+    ) -> None:
+        if self._pending_mtp_demand_commit is not None:
+            raise RuntimeError("Previous MTP Demand commit was not retired")
+
+        num_reqs, num_tokens_per_req = accept_index.shape
+        if verify_cache_locs.numel() != num_reqs * num_tokens_per_req:
+            raise ValueError("MTP Demand verify window shape mismatch")
+        counts = (accept_index != -1).sum(dim=1).to(torch.int64)
+        last_columns = (counts - 1).unsqueeze(1)
+        last_offsets = accept_index.gather(1, last_columns).squeeze(1).to(torch.int64)
+
+        row_indices = torch.repeat_interleave(req_pool_indices, num_tokens_per_req)
+        token_positions = torch.repeat_interleave(
+            seq_lens.to(torch.int64), num_tokens_per_req
+        ) + torch.arange(
+            num_tokens_per_req,
+            dtype=torch.int64,
+            device=seq_lens.device,
+        ).repeat(
+            num_reqs
+        )
+
+        full_to_device_mapping = (
+            self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+        )
+        device_locs = full_to_device_mapping[verify_cache_locs]
+        host_locs = self.req_to_host_pool[row_indices, token_positions]
+        last_logical = verify_cache_locs[last_offsets]
+        last_slots = device_locs[last_offsets]
+        last_positions = seq_lens.to(torch.int64) + counts - 1
+        reserved_positions = last_positions.clamp(max=self.device_buffer_size)
+        newest_slots = self.req_to_device_buffer[req_pool_indices, reserved_positions]
+
+        # Draft-extend still consumes the verify overlay. Commit only after it
+        # has completed on the same stream.
+        self._pending_mtp_demand_commit = (
+            verify_cache_locs,
+            last_logical,
+            newest_slots,
+            host_locs,
+            device_locs,
+            accept_index.reshape(-1).to(torch.int32),
+            req_pool_indices,
+            reserved_positions,
+            last_positions,
+            last_slots,
+        )
+
+    def finish_pending_mtp_demand_commit(self) -> None:
+        pending = self._pending_mtp_demand_commit
+        if pending is None:
+            return
+        self._pending_mtp_demand_commit = None
+        (
+            verify_cache_locs,
+            last_logical,
+            newest_slots,
+            window_host_locs,
+            window_device_locs,
+            window_accept_index,
+            req_pool_indices,
+            reserved_positions,
+            last_positions,
+            last_slots,
+        ) = pending
+        # The full four-row window is already reserved. Writing it sequentially
+        # avoids a GPU-sized compaction and host synchronization; only the last
+        # accepted row is published in the logical mapping below.
+        self._backup_device_locs_to_host(
+            window_host_locs,
+            window_device_locs,
+            window_accept_index,
+        )
+        self.req_device_buffer_tokens[:, req_pool_indices, reserved_positions] = (
+            last_positions.to(torch.int32).unsqueeze(0)
+        )
+        self.req_device_buffer_token_locs[:, req_pool_indices, reserved_positions] = (
+            newest_slots.to(torch.int32)
+        )
+        self.mem_pool_device.transfer_values_on_device(
+            dst_indices=newest_slots,
+            src_indices=last_slots,
+        )
+        full_to_device_mapping = (
+            self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+        )
+        # Advanced-index assignment with a Python scalar materializes the scalar
+        # on CUDA and synchronizes the CPU with the current stream.  index_fill_
+        # submits the same clear asynchronously and preserves stream ordering.
+        full_to_device_mapping.index_fill_(0, verify_cache_locs, 0)
+        full_to_device_mapping[last_logical] = newest_slots
 
     def finalize_accepted_tokens(
         self,
@@ -801,6 +1186,14 @@ class HiSparseCoordinator:
         accept_index: torch.Tensor,
     ) -> None:
         if verify_cache_locs.numel() == 0:
+            return
+        if self.mtp_demand_buffer_enabled:
+            self._finalize_mtp_demand_verify_window(
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                verify_cache_locs=verify_cache_locs,
+                accept_index=accept_index,
+            )
             return
 
         counts = (accept_index != -1).sum(dim=1).to(torch.int64)
@@ -1104,6 +1497,39 @@ class HiSparseCoordinator:
                 device_locs.record_stream(self.decode_backup_stream)
         self._has_pending_backup = True
 
+    def _backup_device_locs_to_host(
+        self,
+        host_locs: torch.Tensor,
+        device_locs: torch.Tensor,
+        accept_index: torch.Tensor,
+    ) -> None:
+        """Back up accepted MTP rows after draft-extend releases the overlay."""
+        if host_locs.numel() == 0:
+            return
+        self.wait_for_pending_backup()
+        schedule_stream = device_module.current_stream()
+        with device_module.stream(self.decode_backup_stream):
+            self.decode_backup_stream.wait_stream(schedule_stream)
+            if self.decode_producer_stream is not None:
+                self.decode_backup_stream.wait_stream(self.decode_producer_stream)
+            backup_mtp_demand_window_mla(
+                src_layers=self.mem_pool_device.data_ptrs,
+                dst_layers=self.mem_pool_host.data_ptrs,
+                src_indices=device_locs,
+                dst_indices=host_locs,
+                accept_index=accept_index,
+                item_size=self.mem_pool_device.bytes_per_token,
+                num_layers=self.mem_pool_device.layer_num,
+            )
+            self._backup_done_event.record()
+            if host_locs.is_cuda:
+                host_locs.record_stream(self.decode_backup_stream)
+            if device_locs.is_cuda:
+                device_locs.record_stream(self.decode_backup_stream)
+            if accept_index.is_cuda:
+                accept_index.record_stream(self.decode_backup_stream)
+        self._has_pending_backup = True
+
     def wait_for_pending_backup(self) -> None:
         if not self._has_pending_backup:
             return
@@ -1246,6 +1672,10 @@ class HiSparseCoordinator:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
         self.wait_for_pending_backup()
         self.finish_pending_draft_extend_backup()
+        self.finish_pending_mtp_demand_commit()
+
+        self._reset_mtp_demand_request_state(req.req_pool_idx)
+        self._free_mtp_demand_buffer(req.req_pool_idx)
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the
         # allocator can over-allocate beyond the committed seqlen, and those

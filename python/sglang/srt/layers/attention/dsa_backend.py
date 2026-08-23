@@ -94,9 +94,25 @@ if is_cuda():
     import deep_gemm
 
 if TYPE_CHECKING:
+    from sgl_kernel.flashmla_hisparse_demand import HiSparseDemandInputs
+
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+def _prepare_hisparse_mtp_demand(
+    coordinator,
+    metadata,
+    logical_topk: torch.Tensor,
+    layer_id: int,
+) -> tuple[torch.Tensor, HiSparseDemandInputs]:
+    """Build the target-verify Demand bundle without translating logical TopK."""
+    inputs = coordinator.get_mtp_demand_attention_inputs(
+        layer_id=layer_id,
+        seq_lens=metadata.dsa_seqlens_expanded,
+    )
+    return logical_topk, inputs
 
 
 def _prepare_hisparse_mtp_native(
@@ -1991,6 +2007,8 @@ class DeepseekSparseAttnBackend(
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
+        hisparse_demand = None
+
         if self.use_fused_topk:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
@@ -2028,7 +2046,18 @@ class DeepseekSparseAttnBackend(
 
         # todo hisparse: to cover more backends
         if self.hisparse_coordinator is not None:
-            if forward_batch.forward_mode.is_target_verify():
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                and self.hisparse_coordinator.mtp_demand_buffer_enabled
+                and dsa_impl == "flashmla_kv"
+            ):
+                page_table_1, hisparse_demand = _prepare_hisparse_mtp_demand(
+                    coordinator=self.hisparse_coordinator,
+                    metadata=metadata,
+                    logical_topk=page_table_1,
+                    layer_id=layer.layer_id,
+                )
+            elif forward_batch.forward_mode.is_target_verify():
                 page_table_1 = _prepare_hisparse_mtp_native(
                     coordinator=self.hisparse_coordinator,
                     forward_batch=forward_batch,
@@ -2183,6 +2212,7 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                hisparse_demand=hisparse_demand,
             )
         elif dsa_impl == "fa3":
             return self._forward_fa3(
@@ -2833,6 +2863,7 @@ class DeepseekSparseAttnBackend(
         layer,
         metadata: DSAMetadata,
         page_table_1,
+        hisparse_demand: Optional[HiSparseDemandInputs] = None,
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
@@ -2878,6 +2909,7 @@ class DeepseekSparseAttnBackend(
                 (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
             ),
             is_fp8_kvcache=True,
+            hisparse_demand=hisparse_demand,
         )
 
         if target_q_heads != num_q_heads:
@@ -3419,15 +3451,33 @@ class DeepseekSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> DSAIndexerMetadata:
+        use_mtp_demand = bool(
+            self.hisparse_coordinator is not None
+            and self.hisparse_coordinator.mtp_demand_buffer_enabled
+            and forward_batch.forward_mode.is_target_verify()
+            and self.dsa_topk_backend.should_use_topk_v2()
+        )
         # Native HiSparse materialization indexes request-local Host rows by
-        # token position. A fused PAGED transform would return KV-pool IDs.
+        # token position. Demand instead requests raw + physical fused outputs.
         force_unfused = not self.use_fused_topk or (
             self.hisparse_coordinator is not None
             and (
                 forward_batch.forward_mode.is_decode_or_idle()
-                or forward_batch.forward_mode.is_target_verify()
+                or (
+                    forward_batch.forward_mode.is_target_verify() and not use_mtp_demand
+                )
             )
         )
+        topk_output_buffers = None
+        if use_mtp_demand:
+            spec_info = getattr(forward_batch, "spec_info", None)
+            rows_per_req = getattr(spec_info, "num_tokens_per_req", 4)
+            num_topk_rows = forward_batch.batch_size * rows_per_req
+            topk_output_buffers = (
+                self.hisparse_coordinator.get_mtp_demand_topk_output_buffers(
+                    num_topk_rows
+                )
+            )
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
             topk_transform_method=self.get_topk_transform_method(
@@ -3437,6 +3487,7 @@ class DeepseekSparseAttnBackend(
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=self.forward_metadata.paged_mqa_ctx_lens_2d,
             force_unfused_topk=force_unfused,
+            topk_output_buffers=topk_output_buffers,
         )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):

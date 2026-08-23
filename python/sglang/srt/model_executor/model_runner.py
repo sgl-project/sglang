@@ -20,7 +20,7 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -298,6 +298,35 @@ def resolve_hisparse_for_runner(
     return bool(
         server_args.enable_hisparse
         and not (is_draft_worker and _supports_glm52_hisparse_mtp(server_args))
+    )
+
+
+def should_enable_hisparse_mtp_demand_buffer(
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    device_capability: Tuple[int, int],
+    mtp_demand_buffer: bool,
+) -> bool:
+    """Return whether this target worker supports the requested Demand path."""
+    architectures = model_config.hf_config.architectures or []
+    iteration_share = bool(
+        getattr(model_config.hf_config, "index_share_for_mtp_iteration", True)
+    )
+    supports_topk_source = server_args.disaggregation_mode == "null" or (
+        server_args.disaggregation_mode == "decode" and not iteration_share
+    )
+    return bool(
+        mtp_demand_buffer
+        and _supports_glm52_hisparse_mtp(server_args)
+        and server_args.tp_size == 8
+        and server_args.dp_size == 8
+        and server_args.enable_dp_attention
+        and server_args.dsa_topk_backend == "sgl-kernel"
+        and supports_topk_source
+        and envs.SGLANG_DSA_FUSE_TOPK.get()
+        and envs.SGLANG_OPT_USE_TOPK_V2.get()
+        and device_capability == (9, 0)
+        and architectures == ["GlmMoeDsaForCausalLM"]
     )
 
 
@@ -1004,6 +1033,12 @@ class ModelRunner:
                 self.server_args.speculative_num_draft_tokens
                 if self.spec_algorithm.is_speculative()
                 else 0
+            ),
+            enable_mtp_demand_buffer=should_enable_hisparse_mtp_demand_buffer(
+                self.server_args,
+                self.model_config,
+                torch.cuda.get_device_capability(self.device),
+                hisparse_cfg.mtp_demand_buffer,
             ),
         )
 
@@ -1806,6 +1841,15 @@ class ModelRunner:
                 forward_batch.hisparse_coordinator = self.hisparse_coordinator
                 self.hisparse_coordinator.wait_for_pending_backup()
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+                if (
+                    forward_batch.forward_mode.is_target_verify()
+                    and self.hisparse_coordinator.mtp_demand_buffer_enabled
+                ):
+                    self.hisparse_coordinator.prepare_mtp_demand_verify(
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        committed_lens=forward_batch.seq_lens,
+                        num_query_rows=forward_batch.input_ids.numel(),
+                    )
 
             # Replay cuda graph if applicable
             if can_run_graph:

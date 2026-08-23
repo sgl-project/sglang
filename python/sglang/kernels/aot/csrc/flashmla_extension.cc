@@ -49,6 +49,54 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
       static_cast<float>(sm_scale));
 }
 
+static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+sgl_sparse_decode_hisparse_demand_fwd(
+    const at::Tensor& q,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
+    const std::optional<at::Tensor>& topk_length,
+    const std::optional<at::Tensor>& attn_sink,
+    std::optional<at::Tensor> tile_scheduler_metadata,
+    std::optional<at::Tensor> num_splits,
+    int64_t d_v,
+    double sm_scale,
+    const at::Tensor& host_kv,
+    const at::Tensor& host_locs,
+    const at::Tensor& device_locs,
+    const at::Tensor& cache_tags,
+    const at::Tensor& decode_calls,
+    const at::Tensor& num_real_reqs,
+    const at::Tensor& req_pool_indices,
+    const at::Tensor& seq_lens,
+    const std::optional<at::Tensor>& mtp_committed_lens,
+    int64_t cache_rows) {
+  return sparse_attn_decode_interface(
+      q,
+      kv,
+      indices,
+      topk_length,
+      attn_sink,
+      tile_scheduler_metadata,
+      num_splits,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      static_cast<int>(d_v),
+      static_cast<float>(sm_scale),
+      HisparseDemandArgs{
+          host_kv,
+          host_locs,
+          device_locs,
+          cache_tags,
+          decode_calls,
+          num_real_reqs,
+          req_pool_indices,
+          seq_lens,
+          mtp_committed_lens,
+          cache_rows,
+      });
+}
+
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> sgl_dense_decode_fwd(
     at::Tensor q,
     const at::Tensor& kcache,
@@ -104,6 +152,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? tile_scheduler_metadata, Tensor? num_splits, Tensor? extra_kv, Tensor? extra_indices, "
       "Tensor? extra_topk_length, int d_v, float sm_scale) -> (Tensor, Tensor, Tensor?, Tensor?)");
   m.impl("sparse_decode_fwd", torch::kCUDA, &sgl_sparse_decode_fwd);
+
+  m.def(
+      "sparse_decode_hisparse_demand_fwd(Tensor q, Tensor(b!) kv, Tensor indices, Tensor? topk_length, Tensor? "
+      "attn_sink, Tensor? tile_scheduler_metadata, Tensor? num_splits, int d_v, float sm_scale, Tensor host_kv, "
+      "Tensor host_locs, Tensor device_locs, Tensor(d!) cache_tags, Tensor decode_calls, Tensor num_real_reqs, "
+      "Tensor req_pool_indices, Tensor seq_lens, Tensor? mtp_committed_lens, int cache_rows) "
+      "-> (Tensor, Tensor, Tensor?, Tensor?)");
+  m.impl("sparse_decode_hisparse_demand_fwd", torch::kCUDA, &sgl_sparse_decode_hisparse_demand_fwd);
 
   m.def(
       "dense_decode_fwd(Tensor q, Tensor kcache, int head_size_v, Tensor seqlens_k, Tensor block_table, float "

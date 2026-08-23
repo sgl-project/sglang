@@ -282,6 +282,44 @@ def _jit_dsv4_transfer_module(block_size: int) -> Module:
     )
 
 
+@functools.cache
+def _jit_mtp_demand_writeback_module() -> Module:
+    return load_jit(
+        "mtp_demand_writeback",
+        cuda_files=["hisparse.cuh"],
+        cuda_wrappers=[
+            ("backup_mtp_demand_window_mla", "backup_mtp_demand_window_mla"),
+        ],
+    )
+
+
+def backup_mtp_demand_window_mla(
+    *,
+    src_layers: torch.Tensor,
+    dst_layers: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    accept_index: torch.Tensor,
+    item_size: int,
+    num_layers: int,
+) -> None:
+    """Write accepted fixed-width MTP rows with layer-parallel GPU workers."""
+    assert src_layers.dtype == dst_layers.dtype
+    assert src_layers.dtype in (torch.int64, torch.uint64)
+    assert src_indices.dtype == dst_indices.dtype == torch.int64
+    assert accept_index.dtype == torch.int32
+    assert src_indices.numel() == dst_indices.numel() == accept_index.numel()
+    _jit_mtp_demand_writeback_module().backup_mtp_demand_window_mla(
+        src_layers,
+        dst_layers,
+        src_indices,
+        dst_indices,
+        accept_index,
+        item_size,
+        num_layers,
+    )
+
+
 def transfer_cache_dsv4_mla(
     src_ptrs: torch.Tensor,
     dst_ptrs: torch.Tensor,

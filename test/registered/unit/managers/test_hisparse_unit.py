@@ -7,9 +7,11 @@ Tests cover:
 - Batch multi-request correctness
 """
 
+import ast
 import os
 import unittest
 from array import array
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -62,6 +64,1103 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         req, "extend_range", Range(start, end)
     )
     return req
+
+
+class TestHiSparseMTPDemandSelector(unittest.TestCase):
+    def test_hisparse_config_parses_mtp_demand_buffer_as_opt_in(self):
+        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+        disabled = parse_hisparse_config(SimpleNamespace(hisparse_config=None))
+        enabled = parse_hisparse_config(
+            SimpleNamespace(hisparse_config='{"mtp_demand_buffer": true}')
+        )
+
+        self.assertFalse(disabled.mtp_demand_buffer)
+        self.assertTrue(enabled.mtp_demand_buffer)
+
+        with self.assertRaisesRegex(ValueError, "mtp_demand_buffer must be a boolean"):
+            parse_hisparse_config(
+                SimpleNamespace(hisparse_config='{"mtp_demand_buffer": 1}')
+            )
+
+    def test_generic_free_clears_mapping_without_cpu_scalar_copy(self):
+        from sglang.srt.mem_cache.allocator.hisparse import (
+            HiSparseTokenToKVPoolAllocator,
+        )
+
+        class MappingWithAsyncClear:
+            def __init__(self):
+                self.tensor = torch.tensor([0, 11, 12, 13], dtype=torch.int64)
+                self.index_fill_calls = []
+
+            def __getitem__(self, key):
+                return self.tensor[key]
+
+            def __setitem__(self, key, value):
+                if isinstance(value, int) and value == 0:
+                    raise AssertionError("mapping clear must not copy a CPU scalar")
+                self.tensor[key] = value
+
+            def index_fill_(self, dim, index, value):
+                self.index_fill_calls.append((dim, index.clone(), value))
+                return self.tensor.index_fill_(dim, index, value)
+
+        allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
+        allocator._kvcache = SimpleNamespace(
+            _translate_loc_to_hisparse_device=lambda indices: torch.tensor(
+                [21, 22], dtype=torch.int64
+            )
+        )
+        allocator.full_to_hisparse_device_index_mapping = MappingWithAsyncClear()
+        freed = []
+        allocator.free_hisparse_indices = lambda indices: freed.append(indices.clone())
+        free_indices = torch.tensor([1, 3], dtype=torch.int32)
+
+        allocator.free_hisparse(free_indices)
+
+        self.assertEqual(len(freed), 1)
+        self.assertTrue(torch.equal(freed[0], torch.tensor([21, 22])))
+        calls = allocator.full_to_hisparse_device_index_mapping.index_fill_calls
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], 0)
+        self.assertEqual(calls[0][1].dtype, torch.int64)
+        self.assertTrue(torch.equal(calls[0][1], free_indices.to(torch.int64)))
+        self.assertEqual(calls[0][2], 0)
+        self.assertTrue(
+            torch.equal(
+                allocator.full_to_hisparse_device_index_mapping.tensor,
+                torch.tensor([0, 0, 12, 0], dtype=torch.int64),
+            )
+        )
+
+    def test_mtp_demand_indexer_only_publishes_logical_and_host_row_outputs(self):
+        from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+
+        raw_indices = torch.empty(8, 2048, dtype=torch.int32)
+        host_locs = torch.empty_like(raw_indices)
+        req_to_host = torch.empty(4, 4096, dtype=torch.int64)
+        forward_metadata = SimpleNamespace(
+            paged_mqa_schedule_metadata=None,
+            paged_mqa_ctx_lens_2d=None,
+        )
+        backend = SimpleNamespace(
+            use_fused_topk=True,
+            hisparse_coordinator=SimpleNamespace(
+                mtp_demand_buffer_enabled=True,
+                mem_pool_device=SimpleNamespace(start_layer=0),
+                get_mtp_demand_topk_output_buffers=lambda _rows: SimpleNamespace(
+                    raw_indices=raw_indices,
+                    physical_indices=host_locs,
+                    direct_transform_table=req_to_host,
+                    direct_transform_rows=torch.tensor(
+                        [1, 1, 1, 1, 3, 3, 3, 3], dtype=torch.int64
+                    ),
+                ),
+            ),
+            forward_metadata=forward_metadata,
+            dsa_topk_backend=SimpleNamespace(should_use_topk_v2=lambda: True),
+            get_topk_transform_method=lambda _mode: "paged",
+        )
+        target_verify = SimpleNamespace(
+            is_decode_or_idle=lambda: False,
+            is_target_verify=lambda: True,
+        )
+        req_pool_indices = torch.tensor([1, 3], dtype=torch.int64)
+
+        metadata = DeepseekSparseAttnBackend.get_indexer_metadata(
+            backend,
+            layer_id=0,
+            forward_batch=SimpleNamespace(
+                forward_mode=target_verify,
+                batch_size=2,
+                req_pool_indices=req_pool_indices,
+                spec_info=SimpleNamespace(num_tokens_per_req=4),
+            ),
+        )
+
+        self.assertFalse(metadata.force_unfused_topk)
+        self.assertIsNotNone(metadata.topk_output_buffers)
+        outputs = metadata.topk_output_buffers
+        self.assertEqual(outputs.raw_indices.shape, (8, 2048))
+        self.assertEqual(outputs.raw_indices.data_ptr(), raw_indices.data_ptr())
+        self.assertEqual(outputs.physical_indices.shape, (8, 2048))
+        self.assertEqual(outputs.physical_indices.data_ptr(), host_locs.data_ptr())
+        self.assertIs(outputs.direct_transform_table, req_to_host)
+        self.assertTrue(
+            torch.equal(
+                outputs.direct_transform_rows,
+                torch.tensor([1, 1, 1, 1, 3, 3, 3, 3], dtype=torch.int64),
+            )
+        )
+        self.assertFalse(hasattr(metadata, "demand_source_plan"))
+        self.assertFalse(hasattr(metadata, "demand_cache_tags"))
+
+    def test_eagle_draft_input_snapshots_staged_request_state(self):
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+        draft_input = EagleDraftInput(
+            topk_p=torch.tensor([[0.1], [0.2]]),
+            topk_index=torch.tensor([[11], [22]]),
+            hidden_states=torch.tensor([[1.0], [2.0]]),
+            bonus_tokens=torch.tensor([101, 202]),
+            future_indices=torch.tensor([3, 7]),
+            future_dsa_topk_indices_available=True,
+        )
+
+        staged = draft_input.slice_single(1)
+
+        self.assertTrue(torch.equal(staged.future_indices, torch.tensor([7])))
+        self.assertTrue(torch.equal(staged.topk_p, torch.tensor([[0.2]])))
+        self.assertTrue(torch.equal(staged.topk_index, torch.tensor([[22]])))
+        self.assertTrue(torch.equal(staged.bonus_tokens, torch.tensor([202])))
+        self.assertTrue(staged.future_dsa_topk_indices_available)
+
+    def test_prefill_result_processor_stashes_hisparse_spec_state(self):
+        from sglang.srt.managers.scheduler_components.batch_result_processor import (
+            SchedulerBatchResultProcessor,
+        )
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+        processor = SchedulerBatchResultProcessor.__new__(SchedulerBatchResultProcessor)
+        object.__setattr__(
+            processor,
+            "server_args",
+            SimpleNamespace(enable_hisparse=True),
+        )
+        batch = SimpleNamespace(
+            spec_info=EagleDraftInput(
+                topk_p=torch.tensor([[0.25], [0.75]]),
+                topk_index=torch.tensor([[31], [47]]),
+                hidden_states=torch.tensor([[3.0], [4.0]]),
+                bonus_tokens=torch.tensor([301, 401]),
+                future_indices=torch.tensor([5, 9]),
+            )
+        )
+        req = SimpleNamespace(hisparse_spec_info=None)
+
+        processor._stash_hisparse_spec_info(batch, 1, req)
+
+        self.assertTrue(
+            torch.equal(req.hisparse_spec_info.future_indices, torch.tensor([9]))
+        )
+        self.assertTrue(
+            torch.equal(req.hisparse_spec_info.topk_index, torch.tensor([[47]]))
+        )
+
+    def test_flashmla_wrapper_exposes_one_mtp_demand_adapter(self):
+        import sglang
+
+        wrapper = (
+            Path(sglang.__file__).parent / "kernels/aot/python/sgl_kernel/flash_mla.py"
+        )
+        module = ast.parse(wrapper.read_text())
+        function = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "flash_mla_with_kvcache"
+        )
+        parameters = {argument.arg for argument in function.args.args}
+        self.assertIn("hisparse_demand", parameters)
+        for name in (
+            "hisparse_host_kv",
+            "hisparse_host_locs",
+            "hisparse_device_locs",
+            "hisparse_cache_tags",
+            "hisparse_decode_calls",
+            "hisparse_num_real_reqs",
+            "hisparse_req_pool_indices",
+            "hisparse_seq_lens",
+            "hisparse_mtp_committed_lens",
+            "hisparse_cache_rows",
+        ):
+            with self.subTest(name=name):
+                self.assertNotIn(name, parameters)
+        self.assertNotIn("hisparse_source_plan", parameters)
+        self.assertNotIn("hisparse_cache_stats", parameters)
+
+    def test_glm52_w4a_four_token_mtp_route_requires_explicit_opt_in(self):
+        from sglang.srt.model_executor import model_runner
+
+        selector = getattr(
+            model_runner, "should_enable_hisparse_mtp_demand_buffer", None
+        )
+        self.assertIsNotNone(selector, "MTP Demand selector is missing")
+        if selector is None:
+            return
+
+        server_args = SimpleNamespace(
+            enable_hisparse=True,
+            device="cuda",
+            kv_cache_dtype="fp8_e4m3",
+            dsa_decode_backend="flashmla_kv",
+            dsa_topk_backend="sgl-kernel",
+            tp_size=8,
+            dp_size=8,
+            enable_dp_attention=True,
+            speculative_algorithm="EAGLE",
+            speculative_num_steps=3,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=4,
+            speculative_attention_mode="prefill",
+            pp_size=1,
+            attn_cp_size=1,
+            enable_pdmux=False,
+            disaggregation_mode="null",
+        )
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["GlmMoeDsaForCausalLM"],
+                index_share_for_mtp_iteration=True,
+            )
+        )
+
+        self.assertTrue(
+            selector(
+                server_args,
+                model_config,
+                device_capability=(9, 0),
+                mtp_demand_buffer=True,
+            )
+        )
+        self.assertFalse(
+            selector(
+                server_args,
+                model_config,
+                device_capability=(9, 0),
+                mtp_demand_buffer=False,
+            )
+        )
+        for field, value in (
+            ("speculative_num_steps", 1),
+            ("speculative_num_draft_tokens", 2),
+            ("speculative_eagle_topk", 2),
+            ("dsa_decode_backend", "flashmla_sparse"),
+            ("dsa_topk_backend", "torch"),
+            ("tp_size", 4),
+            ("dp_size", 4),
+            ("enable_dp_attention", False),
+            ("enable_pdmux", True),
+            ("disaggregation_mode", "decode"),
+        ):
+            candidate = SimpleNamespace(**vars(server_args))
+            setattr(candidate, field, value)
+            with self.subTest(field=field, value=value):
+                self.assertFalse(
+                    selector(
+                        candidate,
+                        model_config,
+                        device_capability=(9, 0),
+                        mtp_demand_buffer=True,
+                    )
+                )
+
+        from sglang.srt.environ import envs
+
+        for env_var in (envs.SGLANG_DSA_FUSE_TOPK, envs.SGLANG_OPT_USE_TOPK_V2):
+            with self.subTest(env_var=env_var), env_var.override(False):
+                self.assertFalse(
+                    selector(
+                        server_args,
+                        model_config,
+                        device_capability=(9, 0),
+                        mtp_demand_buffer=True,
+                    )
+                )
+
+        pd_decode = SimpleNamespace(**vars(server_args))
+        pd_decode.disaggregation_mode = "decode"
+        no_iteration_share = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["GlmMoeDsaForCausalLM"],
+                index_share_for_mtp_iteration=False,
+            )
+        )
+        self.assertTrue(
+            selector(
+                pd_decode,
+                no_iteration_share,
+                device_capability=(9, 0),
+                mtp_demand_buffer=True,
+            )
+        )
+
+    def test_mtp_keeps_draft_kv_device_resident(self):
+        from sglang.srt.model_executor import model_runner
+
+        resolve = getattr(model_runner, "resolve_hisparse_for_runner", None)
+        self.assertIsNotNone(resolve, "per-runner HiSparse resolver is missing")
+        if resolve is None:
+            return
+
+        server_args = SimpleNamespace(
+            enable_hisparse=True,
+            hisparse_config='{"mtp_demand_buffer": true}',
+            device="cuda",
+            kv_cache_dtype="fp8_e4m3",
+            dsa_decode_backend="flashmla_kv",
+            speculative_algorithm="EAGLE",
+            speculative_num_steps=3,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=4,
+            speculative_attention_mode="prefill",
+            pp_size=1,
+            attn_cp_size=1,
+            enable_pdmux=False,
+            disaggregation_mode="null",
+        )
+
+        self.assertTrue(resolve(server_args, is_draft_worker=False))
+        self.assertFalse(resolve(server_args, is_draft_worker=True))
+
+        native = SimpleNamespace(**vars(server_args))
+        native.hisparse_config = None
+        self.assertFalse(resolve(native, is_draft_worker=True))
+
+    def test_hisparse_model_runner_rebinds_mapping_to_active_pool(self):
+        from sglang.srt.model_executor import model_runner
+
+        bind = getattr(model_runner, "_bind_hisparse_mapping_to_active_pool", None)
+        self.assertIsNotNone(bind, "active HiSparse pool mapping binder is missing")
+        if bind is None:
+            return
+
+        seen = []
+        mapping = torch.arange(8, dtype=torch.int64)
+        pool = SimpleNamespace(register_mapping=lambda value: seen.append(value))
+        allocator = SimpleNamespace(full_to_hisparse_device_index_mapping=mapping)
+
+        bind(pool, allocator)
+
+        self.assertEqual(seen, [mapping])
+
+    def test_target_verify_keeps_logical_topk_and_builds_four_row_demand_bundle(self):
+        from sglang.srt.layers.attention import dsa_backend
+
+        prepare = getattr(dsa_backend, "_prepare_hisparse_mtp_demand", None)
+        self.assertIsNotNone(prepare, "MTP Demand DSA route is missing")
+        if prepare is None:
+            return
+
+        calls = []
+        coordinator = SimpleNamespace(
+            get_mtp_demand_attention_inputs=lambda **kwargs: (
+                calls.append(kwargs) or {"marker": "demand"}
+            ),
+        )
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([3, 7], dtype=torch.int64),
+            seq_lens=torch.tensor([128, 256], dtype=torch.int64),
+        )
+        metadata = SimpleNamespace(
+            dsa_seqlens_expanded=torch.tensor(
+                [129, 130, 131, 132, 257, 258, 259, 260], dtype=torch.int32
+            )
+        )
+        logical_topk = torch.arange(8 * 2048, dtype=torch.int32).view(8, 2048)
+        page_table, bundle = prepare(
+            coordinator=coordinator,
+            metadata=metadata,
+            logical_topk=logical_topk,
+            layer_id=12,
+        )
+
+        self.assertIs(page_table, logical_topk)
+        self.assertEqual(bundle, {"marker": "demand"})
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertEqual(call["layer_id"], 12)
+
+    def test_target_verify_native_hisparse_runs_multistep_swap(self):
+        from sglang.srt.layers.attention import dsa_backend
+
+        prepare = getattr(dsa_backend, "_prepare_hisparse_mtp_native", None)
+        self.assertIsNotNone(prepare, "native MTP HiSparse route is missing")
+        if prepare is None:
+            return
+
+        logical_topk = torch.arange(8 * 16, dtype=torch.int32).view(8, 16)
+        physical_storage = torch.arange(2 * 4 * 32, dtype=torch.int32).view(2, 4, 32)
+        physical_topk_3d = physical_storage[..., ::2]
+        self.assertFalse(physical_topk_3d.is_contiguous())
+        physical_topk = physical_topk_3d.reshape(8, 16)
+        swap = MagicMock(return_value=physical_topk_3d)
+        coordinator = SimpleNamespace(swap_in_selected_pages_mtp=swap)
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([3, 7], dtype=torch.int64),
+        )
+        metadata = SimpleNamespace(
+            dsa_seqlens_expanded=torch.tensor(
+                [129, 130, 131, 132, 257, 258, 259, 260],
+                dtype=torch.int32,
+            )
+        )
+
+        actual = prepare(
+            coordinator=coordinator,
+            forward_batch=forward_batch,
+            metadata=metadata,
+            relative_topk=logical_topk,
+            layer_id=12,
+            num_steps=4,
+        )
+
+        self.assertTrue(torch.equal(actual, physical_topk))
+        swap.assert_called_once()
+        call = swap.call_args.kwargs
+        self.assertIs(call["req_pool_indices"], forward_batch.req_pool_indices)
+        self.assertIs(call["seq_lens"], metadata.dsa_seqlens_expanded)
+        self.assertEqual(call["top_k_result"].shape, (2, 4, 16))
+        self.assertEqual(call["layer_id"], 12)
+
+    def test_mtp_demand_prepares_expanded_batch_metadata_once(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.mtp_demand_buffer_enabled = True
+        coordinator.mtp_demand_expanded_req_pool_indices = torch.full(
+            (12,), -1, dtype=torch.int64
+        )
+        coordinator.mtp_demand_expanded_committed_lens = torch.full(
+            (12,), -1, dtype=torch.int32
+        )
+        coordinator.mtp_demand_num_real_query_rows = torch.zeros(1, dtype=torch.int32)
+
+        coordinator.prepare_mtp_demand_batch(
+            req_pool_indices=torch.tensor([3, 7], dtype=torch.int64),
+            committed_lens=torch.tensor([128, 256], dtype=torch.int64),
+            num_query_rows=8,
+        )
+
+        self.assertTrue(
+            torch.equal(
+                coordinator.mtp_demand_expanded_req_pool_indices[:8],
+                torch.tensor([3, 3, 3, 3, 7, 7, 7, 7]),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                coordinator.mtp_demand_expanded_committed_lens[:8],
+                torch.tensor(
+                    [128, 128, 128, 128, 256, 256, 256, 256], dtype=torch.int32
+                ),
+            )
+        )
+        self.assertEqual(int(coordinator.mtp_demand_num_real_query_rows.item()), 8)
+
+    def test_mtp_direct_demand_passes_no_precomputed_source_plan(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.mtp_demand_buffer_enabled = True
+        coordinator.mtp_demand_cache_rows = 4096
+        coordinator.top_k_host_locs_buffer = torch.tensor(
+            [[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32
+        )
+        original_host_locs = coordinator.top_k_host_locs_buffer.clone()
+        coordinator.mtp_demand_cache_tags = torch.zeros((1, 2, 4096), dtype=torch.int64)
+        coordinator.mtp_demand_device_locs = torch.zeros((2, 4102), dtype=torch.int64)
+        coordinator.mtp_demand_decode_calls = torch.ones(2, dtype=torch.int32)
+        coordinator.mtp_demand_host_kv = torch.empty((1, 32, 656), dtype=torch.uint8)
+        coordinator.mtp_demand_num_real_query_rows = torch.tensor(
+            [2], dtype=torch.int32
+        )
+        coordinator.mtp_demand_expanded_req_pool_indices = torch.tensor(
+            [0, 1], dtype=torch.int64
+        )
+        coordinator.mtp_demand_expanded_committed_lens = torch.tensor(
+            [128, 256], dtype=torch.int32
+        )
+        coordinator.mem_pool_device = SimpleNamespace(start_layer=12, layer_num=1)
+
+        inputs = coordinator.get_mtp_demand_attention_inputs(
+            layer_id=12,
+            seq_lens=torch.tensor([132, 260], dtype=torch.int32),
+        )
+
+        self.assertFalse(hasattr(inputs, "source_plan"))
+        self.assertTrue(
+            torch.equal(coordinator.top_k_host_locs_buffer, original_host_locs)
+        )
+
+    def test_coordinator_exposes_mtp_demand_metadata_adapter(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        self.assertTrue(
+            hasattr(HiSparseCoordinator, "get_mtp_demand_attention_inputs"),
+            "MTP Demand coordinator adapter is missing",
+        )
+
+    def test_mtp_verify_overlay_binds_resolved_four_rows_across_hot_boundary(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        class MappingWithAsyncPublish:
+            def __init__(self):
+                self.tensor = torch.zeros(64, dtype=torch.int64)
+                self.index_copy_calls = []
+
+            def __getitem__(self, key):
+                return self.tensor[key]
+
+            def __setitem__(self, key, value):
+                if isinstance(key, torch.Tensor) and key.dtype == torch.int32:
+                    raise AssertionError("mapping publish must not use int32 indexing")
+                self.tensor[key] = value
+
+            def index_copy_(self, dim, index, source):
+                self.index_copy_calls.append((dim, index.clone(), source.clone()))
+                return self.tensor.index_copy_(dim, index, source)
+
+        class TokenTableWithAsyncClear:
+            class Slice:
+                def __init__(self, tensor, calls):
+                    self.tensor = tensor
+                    self.calls = calls
+
+                def index_fill_(self, dim, index, value):
+                    self.calls.append((dim, index.clone(), value))
+                    return self.tensor.index_fill_(dim, index, value)
+
+            def __init__(self):
+                self.tensor = torch.full((1, 2, 4160), -1, dtype=torch.int32)
+                self.index_fill_calls = []
+
+            def __getitem__(self, key):
+                value = self.tensor[key]
+                if (
+                    isinstance(key, tuple)
+                    and len(key) == 3
+                    and key[0] == slice(None)
+                    and key[1] == slice(None)
+                    and key[2] == slice(4097, 4160)
+                ):
+                    return self.Slice(value, self.index_fill_calls)
+                return value
+
+            def __setitem__(self, key, value):
+                if isinstance(value, int) and value == -1:
+                    raise AssertionError("slot clear must not copy a CPU scalar")
+                self.tensor[key] = value
+
+        for committed_len in (128, 4094, 4096):
+            with self.subTest(committed_len=committed_len):
+                coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+                coordinator.mtp_demand_buffer_enabled = True
+                coordinator.mtp_demand_cache_rows = 4096
+                coordinator.is_dsv4_hisparse = False
+                coordinator.device_buffer_size = 4096
+                coordinator.padded_buffer_size = 4160
+                coordinator.req_to_device_buffer = torch.arange(
+                    2 * 4160, dtype=torch.int64
+                ).view(2, 4160)
+                coordinator.req_device_buffer_tokens = TokenTableWithAsyncClear()
+                coordinator.mtp_demand_device_locs = torch.zeros(
+                    (2, 4102), dtype=torch.int64
+                )
+                coordinator.req_to_host_pool = torch.full(
+                    (2, 8192), -1, dtype=torch.int64
+                )
+                coordinator.req_to_host_pool_allocated_len = torch.zeros(
+                    2, dtype=torch.int64
+                )
+                coordinator.mem_pool_host = SimpleNamespace(
+                    alloc_paged_token_slots=lambda *args: torch.arange(
+                        4, dtype=torch.int64
+                    )
+                )
+                full_to_device = MappingWithAsyncPublish()
+                coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+                    full_to_hisparse_device_index_mapping=full_to_device
+                )
+                ensure_calls = []
+                coordinator._ensure_padded_buffer = ensure_calls.append
+
+                req_pool_indices = torch.tensor([1], dtype=torch.int64)
+                req_pool_indices_cpu = req_pool_indices.clone()
+                verify_cache_locs = torch.tensor([10, 11, 12, 13], dtype=torch.int32)
+                coordinator.prepare_verify_slots_spec_v2(
+                    req_pool_indices=req_pool_indices,
+                    req_pool_indices_cpu=req_pool_indices_cpu,
+                    verify_cache_locs=verify_cache_locs,
+                    num_tokens_per_req=4,
+                    start_positions=torch.tensor([committed_len]),
+                    host_reserve_end_positions_cpu=[committed_len + 8],
+                )
+                self.assertIs(ensure_calls[0], req_pool_indices_cpu)
+
+                token_positions = torch.arange(committed_len, committed_len + 4)
+                columns = torch.where(
+                    token_positions < 4096,
+                    token_positions,
+                    torch.arange(4097, 4101),
+                )
+                expected = coordinator.req_to_device_buffer[1, columns]
+                self.assertTrue(
+                    torch.equal(
+                        coordinator.mtp_demand_device_locs[1, 4098:4102],
+                        expected,
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(full_to_device[verify_cache_locs], expected)
+                )
+                self.assertEqual(len(full_to_device.index_copy_calls), 1)
+                self.assertEqual(full_to_device.index_copy_calls[0][0], 0)
+                self.assertEqual(
+                    full_to_device.index_copy_calls[0][1].dtype, torch.int64
+                )
+                self.assertTrue(
+                    torch.equal(
+                        full_to_device.index_copy_calls[0][1],
+                        verify_cache_locs.to(torch.int64),
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(full_to_device.index_copy_calls[0][2], expected)
+                )
+                clear_calls = coordinator.req_device_buffer_tokens.index_fill_calls
+                self.assertEqual(len(clear_calls), 1)
+                self.assertEqual(clear_calls[0][0], 1)
+                self.assertTrue(torch.equal(clear_calls[0][1], req_pool_indices))
+                self.assertEqual(clear_calls[0][2], -1)
+
+    def test_eagle_verify_preparation_delegates_four_row_overlay_to_hisparse(self):
+        from sglang.srt.speculative import eagle_utils
+
+        prepare = getattr(eagle_utils, "_prepare_hisparse_mtp_verify_slots", None)
+        self.assertIsNotNone(prepare, "EAGLE HiSparse verify adapter is missing")
+        if prepare is None:
+            return
+
+        calls = []
+        coordinator = SimpleNamespace(
+            prepare_verify_slots_spec_v2=lambda **kwargs: calls.append(kwargs)
+        )
+        seq_lens = torch.tensor([128, 4094], dtype=torch.int64)
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+            hisparse_coordinator=coordinator,
+            reqs=[
+                SimpleNamespace(kv_committed_len=128),
+                SimpleNamespace(kv_committed_len=4094),
+            ],
+            req_pool_indices=torch.tensor([3, 7], dtype=torch.int64),
+            req_pool_indices_cpu=torch.tensor([3, 7], dtype=torch.int64),
+            out_cache_loc=torch.tensor(
+                [101, 102, 103, 104, 201, 202, 203, 204], dtype=torch.int64
+            ),
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens,
+        )
+
+        prepare(batch, draft_token_num=4)
+
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertIs(call["req_pool_indices"], batch.req_pool_indices)
+        self.assertIs(call["req_pool_indices_cpu"], batch.req_pool_indices_cpu)
+        self.assertIs(call["verify_cache_locs"], batch.out_cache_loc)
+        self.assertEqual(call["num_tokens_per_req"], 4)
+        self.assertIs(call["start_positions"], batch.seq_lens)
+        self.assertEqual(call["host_reserve_end_positions_cpu"], [136, 4102])
+
+    def test_eagle_verify_preparation_keeps_gpu_only_seq_lens(self):
+        from sglang.srt.speculative import eagle_utils
+
+        calls = []
+        coordinator = SimpleNamespace(
+            prepare_verify_slots_spec_v2=lambda **kwargs: calls.append(kwargs)
+        )
+        seq_lens = torch.tensor([128, 4094], dtype=torch.int64)
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+            hisparse_coordinator=coordinator,
+            reqs=[
+                SimpleNamespace(kv_committed_len=124),
+                SimpleNamespace(kv_committed_len=4090),
+            ],
+            req_pool_indices=torch.tensor([3, 7], dtype=torch.int64),
+            req_pool_indices_cpu=torch.tensor([3, 7], dtype=torch.int64),
+            out_cache_loc=torch.tensor(
+                [101, 102, 103, 104, 201, 202, 203, 204], dtype=torch.int64
+            ),
+            seq_lens=seq_lens,
+            seq_lens_cpu=None,
+        )
+
+        eagle_utils._prepare_hisparse_mtp_verify_slots(batch, draft_token_num=4)
+
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertIs(call["start_positions"], seq_lens)
+        self.assertEqual(call["host_reserve_end_positions_cpu"], [132, 4098])
+
+    def test_eagle_verify_finalizes_native_hisparse_slots(self):
+        from sglang.srt.speculative import eagle_worker_common
+
+        finalize = getattr(eagle_worker_common, "_finalize_hisparse_mtp_verify", None)
+        self.assertIsNotNone(finalize, "native HiSparse verify finalizer is missing")
+        if finalize is None:
+            return
+
+        calls = []
+        coordinator = SimpleNamespace(
+            mtp_demand_buffer_enabled=False,
+            supports_hisparse_draft_slots=lambda: True,
+            finalize_accepted_tokens_spec_v2=lambda **kwargs: calls.append(kwargs),
+        )
+        batch = SimpleNamespace(
+            hisparse_coordinator=coordinator,
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+            req_pool_indices=torch.tensor([3], dtype=torch.int64),
+            seq_lens=torch.tensor([5000], dtype=torch.int64),
+            out_cache_loc=torch.tensor([10, 11, 12, 13], dtype=torch.int64),
+        )
+        accept_index = torch.tensor([[0, 1, 2, -1]], dtype=torch.int32)
+
+        finalize(batch, accept_index)
+
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertIs(call["req_pool_indices"], batch.req_pool_indices)
+        self.assertIs(call["seq_lens"], batch.seq_lens)
+        self.assertIs(call["verify_cache_locs"], batch.out_cache_loc)
+        self.assertIs(call["accept_index"], accept_index)
+
+    def test_mtp_demand_residency_alloc_and_free_are_request_local(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        freed = []
+        allocator = SimpleNamespace(
+            free_hisparse_indices=lambda rows: freed.append(rows.clone())
+        )
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.mtp_demand_buffer_enabled = True
+        coordinator.mtp_demand_cache_rows = 4096
+        coordinator.token_to_kv_pool_allocator = allocator
+        coordinator.mtp_demand_device_locs = torch.zeros((2, 4102), dtype=torch.int64)
+        coordinator.mtp_demand_cache_tags = torch.zeros((2, 2, 4096), dtype=torch.int64)
+        coordinator.mtp_demand_decode_calls = torch.zeros(2, dtype=torch.int32)
+
+        coordinator._bind_mtp_demand_buffer(
+            1, torch.arange(101, 4197, dtype=torch.int64)
+        )
+        coordinator._bind_mtp_demand_overlay(
+            torch.tensor([1]), torch.tensor([9001, 9002, 9003, 9004])
+        )
+
+        self.assertTrue(
+            torch.equal(
+                coordinator.mtp_demand_device_locs[1, :4096],
+                torch.arange(101, 4197, dtype=torch.int64),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                coordinator.mtp_demand_device_locs[1, 4098:4102],
+                torch.tensor([9001, 9002, 9003, 9004]),
+            )
+        )
+        self.assertEqual(
+            coordinator.mtp_demand_device_locs[0].count_nonzero().item(),
+            0,
+        )
+
+        coordinator._free_mtp_demand_buffer(1)
+
+        self.assertEqual(len(freed), 1)
+        self.assertTrue(torch.equal(freed[0], torch.arange(101, 4197)))
+        self.assertEqual(
+            coordinator.mtp_demand_device_locs[1].count_nonzero().item(),
+            0,
+        )
+
+    def test_mtp_demand_side_reserve_is_claimed_with_hot_buffer(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.is_dsv4_hisparse = False
+        coordinator.device_buffer_size = 4096
+        coordinator.padded_buffer_size = 4160
+        coordinator.mtp_demand_buffer_enabled = True
+        coordinator.mtp_demand_cache_rows = 4096
+        coordinator.mtp_side_reserve_size = 4096
+        coordinator.mtp_staging_size = 0
+        events = []
+        coordinator.mtp_demand_device_locs = torch.zeros((2, 4102), dtype=torch.int64)
+        coordinator.mtp_demand_cache_tags = torch.zeros((1, 2, 4096), dtype=torch.int64)
+        coordinator.mtp_demand_decode_calls = torch.zeros(2, dtype=torch.int32)
+        coordinator.mem_pool_device = SimpleNamespace(
+            page_size=64,
+            translate_loc_from_full_to_compressed=lambda value: value,
+        )
+        coordinator.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(256, dtype=torch.int64).view(2, 128)
+        )
+
+        def alloc_with_reserve(indices, size, reserve_size):
+            events.append((size, reserve_size))
+            return (
+                torch.arange(1000, 1000 + size, dtype=torch.int64),
+                torch.arange(5000, 5000 + reserve_size, dtype=torch.int64),
+            )
+
+        coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+            alloc_device_buffer_with_reserve=alloc_with_reserve
+        )
+        coordinator.req_to_device_buffer = torch.zeros((2, 4160), dtype=torch.int64)
+        coordinator.req_device_buffer_size = torch.zeros(2, dtype=torch.int64)
+        coordinator.req_device_buffer_tokens = torch.full(
+            (1, 2, 4096), -1, dtype=torch.int32
+        )
+        coordinator.req_device_buffer_token_locs = torch.full(
+            (1, 2, 4160), -1, dtype=torch.int32
+        )
+        coordinator._device_buffer_arange_i32 = torch.arange(4096, dtype=torch.int32)
+        req = SimpleNamespace(
+            req_pool_idx=1,
+            rid="capacity-order",
+            kv=SimpleNamespace(kv_allocated_len=128),
+        )
+
+        coordinator.alloc_device_buffer(req)
+
+        self.assertEqual(events, [(128, 4096)])
+        self.assertTrue(
+            torch.equal(
+                coordinator.mtp_demand_device_locs[1, :4096],
+                torch.arange(5000, 9096, dtype=torch.int64),
+            )
+        )
+
+    def test_padded_mtp_arange_does_not_overfill_native_hot_slice(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.is_dsv4_hisparse = False
+        coordinator.mtp_demand_buffer_enabled = False
+        coordinator.mtp_side_reserve_size = 0
+        coordinator.mtp_staging_size = 0
+        coordinator.device_buffer_size = 4096
+        coordinator.padded_buffer_size = 4160
+        coordinator.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(128, dtype=torch.int64).view(1, 128)
+        )
+        coordinator.mem_pool_device = SimpleNamespace(
+            page_size=64,
+            translate_loc_from_full_to_compressed=lambda value: value,
+        )
+        coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+            alloc_device_buffer_with_reserve=lambda logical, size, reserve_size: (
+                torch.arange(1, size + 1, dtype=torch.int64),
+                torch.empty(0, dtype=torch.int64),
+            )
+        )
+        coordinator.req_to_device_buffer = torch.zeros((1, 4160), dtype=torch.int64)
+        coordinator.req_to_mtp_staging = torch.zeros((1, 0), dtype=torch.int64)
+        coordinator.req_device_buffer_size = torch.zeros(1, dtype=torch.int64)
+        coordinator.req_device_buffer_tokens = torch.full(
+            (1, 1, 4160), -1, dtype=torch.int32
+        )
+        coordinator.req_device_buffer_token_locs = torch.full(
+            (1, 1, 4160), -1, dtype=torch.int64
+        )
+        coordinator._device_buffer_arange_i32 = torch.arange(4160, dtype=torch.int32)
+        req = SimpleNamespace(
+            req_pool_idx=0,
+            rid="padded-arange",
+            kv=SimpleNamespace(kv_allocated_len=128),
+        )
+
+        coordinator.alloc_device_buffer(req)
+
+        self.assertTrue(
+            torch.equal(
+                coordinator.req_device_buffer_tokens[0, 0, :4096],
+                torch.arange(4096, dtype=torch.int32),
+            )
+        )
+
+    def test_mtp_demand_request_reset_is_request_local(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.mtp_demand_buffer_enabled = True
+        coordinator.mtp_demand_cache_tags = torch.full((2, 3, 8), 77, dtype=torch.int64)
+        coordinator.mtp_demand_decode_calls = torch.tensor(
+            [11, 22, 33], dtype=torch.int32
+        )
+
+        coordinator._reset_mtp_demand_request_state(1)
+
+        self.assertEqual(
+            coordinator.mtp_demand_cache_tags[:, 1].count_nonzero().item(), 0
+        )
+        self.assertTrue(
+            torch.equal(
+                coordinator.mtp_demand_cache_tags[:, 0],
+                torch.full((2, 8), 77, dtype=torch.int64),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                coordinator.mtp_demand_cache_tags[:, 2],
+                torch.full((2, 8), 77, dtype=torch.int64),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                coordinator.mtp_demand_decode_calls,
+                torch.tensor([11, 0, 33], dtype=torch.int32),
+            )
+        )
+
+    def test_mtp_demand_epoch_advances_once_per_request(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.mtp_demand_buffer_enabled = True
+        coordinator.mtp_demand_decode_calls = torch.tensor(
+            [10, 20, 30, 40], dtype=torch.int32
+        )
+
+        coordinator.advance_mtp_demand_epoch(torch.tensor([3, 1]))
+
+        self.assertTrue(
+            torch.equal(
+                coordinator.mtp_demand_decode_calls,
+                torch.tensor([10, 21, 30, 41], dtype=torch.int32),
+            )
+        )
+
+    def test_mtp_demand_commit_waits_for_draft_extend_then_retires_verify_window(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        class MappingWithAsyncClear:
+            def __init__(self, tensor):
+                self.tensor = tensor
+                self.index_fill_calls = []
+
+            def __getitem__(self, key):
+                return self.tensor[key]
+
+            def __setitem__(self, key, value):
+                if isinstance(value, int) and value == 0:
+                    raise AssertionError("mapping clear must not copy a CPU scalar")
+                self.tensor[key] = value
+
+            def index_fill_(self, dim, index, value):
+                self.index_fill_calls.append((dim, index.clone(), value))
+                return self.tensor.index_fill_(dim, index, value)
+
+        backups = []
+        transfers = []
+        mapping_tensor = torch.zeros(32, dtype=torch.int64)
+        mapping_tensor[10:14] = torch.tensor([100, 101, 102, 103])
+        mapping = MappingWithAsyncClear(mapping_tensor)
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.mtp_demand_buffer_enabled = True
+        coordinator._pending_mtp_demand_commit = None
+        coordinator.device_buffer_size = 4096
+        coordinator.req_to_host_pool = torch.full((2, 6000), -1, dtype=torch.int64)
+        coordinator.req_to_host_pool[1, 5000:5004] = torch.tensor([200, 201, 202, 203])
+        coordinator.req_to_device_buffer = torch.zeros((2, 4160), dtype=torch.int64)
+        coordinator.req_to_device_buffer[1, 4096] = 700
+        coordinator.req_device_buffer_tokens = torch.full(
+            (2, 2, 4160), -1, dtype=torch.int32
+        )
+        coordinator.req_device_buffer_token_locs = torch.full(
+            (2, 2, 4160), -1, dtype=torch.int32
+        )
+        coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+            full_to_hisparse_device_index_mapping=mapping
+        )
+        coordinator.mem_pool_device = SimpleNamespace(
+            transfer_values_on_device=lambda **kwargs: transfers.append(kwargs)
+        )
+        coordinator._backup_device_locs_to_host = (
+            lambda host_locs, device_locs, accept_index: backups.append(
+                (host_locs.clone(), device_locs.clone(), accept_index.clone())
+            )
+        )
+
+        coordinator.finalize_accepted_tokens_spec_v2(
+            req_pool_indices=torch.tensor([1]),
+            seq_lens=torch.tensor([5000]),
+            verify_cache_locs=torch.tensor([10, 11, 12, 13]),
+            accept_index=torch.tensor([[0, 1, 2, -1]]),
+        )
+
+        self.assertEqual(backups, [])
+        self.assertIsNotNone(coordinator._pending_mtp_demand_commit)
+
+        coordinator.finish_pending_mtp_demand_commit()
+
+        self.assertEqual(len(backups), 1)
+        self.assertTrue(torch.equal(backups[0][0], torch.tensor([200, 201, 202, 203])))
+        self.assertTrue(torch.equal(backups[0][1], torch.tensor([100, 101, 102, 103])))
+        self.assertTrue(
+            torch.equal(backups[0][2], torch.tensor([0, 1, 2, -1], dtype=torch.int32))
+        )
+        self.assertEqual(len(transfers), 1)
+        self.assertTrue(torch.equal(transfers[0]["dst_indices"], torch.tensor([700])))
+        self.assertTrue(torch.equal(transfers[0]["src_indices"], torch.tensor([102])))
+        self.assertEqual(len(mapping.index_fill_calls), 1)
+        self.assertEqual(mapping.index_fill_calls[0][0], 0)
+        self.assertTrue(
+            torch.equal(mapping.index_fill_calls[0][1], torch.tensor([10, 11, 12, 13]))
+        )
+        self.assertEqual(mapping.index_fill_calls[0][2], 0)
+        self.assertTrue(torch.equal(mapping[10:14], torch.tensor([0, 0, 700, 0])))
+        self.assertTrue(
+            torch.equal(
+                coordinator.req_device_buffer_tokens[:, 1, 4096],
+                torch.tensor([5002, 5002], dtype=torch.int32),
+            )
+        )
+        self.assertIsNone(coordinator._pending_mtp_demand_commit)
+
+    def test_native_mtp_finalize_commits_accepted_verify_rows(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.mtp_demand_buffer_enabled = False
+        calls = []
+        coordinator.finalize_accepted_tokens = lambda **kwargs: calls.append(kwargs)
+
+        req_pool_indices = torch.tensor([2, 5], dtype=torch.int64)
+        seq_lens = torch.tensor([5000, 7000], dtype=torch.int64)
+        verify_cache_locs = torch.tensor(
+            [10, 11, 12, 13, 20, 21, 22, 23], dtype=torch.int64
+        )
+        accept_index = torch.tensor(
+            [[0, 1, -1, -1], [4, -1, -1, -1]], dtype=torch.int32
+        )
+
+        coordinator.finalize_accepted_tokens_spec_v2(
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            verify_cache_locs=verify_cache_locs,
+            accept_index=accept_index,
+        )
+
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertIs(call["req_pool_indices"], req_pool_indices)
+        self.assertTrue(
+            torch.equal(call["accepted_cache_locs"], torch.tensor([10, 11, 20]))
+        )
+        self.assertIs(call["draft_cache_locs"], verify_cache_locs)
+        self.assertTrue(torch.equal(call["num_correct_drafts"], torch.tensor([1, 0])))
+        self.assertTrue(
+            torch.equal(call["num_correct_drafts_cpu"], torch.tensor([1, 0]))
+        )
+        self.assertTrue(
+            torch.equal(
+                call["accepted_token_positions"],
+                torch.tensor([5000, 5001, 7000]),
+            )
+        )
 
 
 class TestHiSparseMTPNative(unittest.TestCase):
@@ -157,16 +1256,16 @@ class TestHiSparseMTPNative(unittest.TestCase):
             hisparse_coordinator=SimpleNamespace(
                 prepare_verify_slots_spec_v2=lambda **kwargs: calls.append(kwargs)
             ),
+            reqs=[
+                SimpleNamespace(kv_committed_len=128),
+                SimpleNamespace(kv_committed_len=4094),
+            ],
             req_pool_indices=torch.tensor([3, 7], dtype=torch.int64),
             req_pool_indices_cpu=torch.tensor([3, 7], dtype=torch.int64),
             out_cache_loc=torch.tensor(
                 [101, 102, 103, 104, 201, 202, 203, 204], dtype=torch.int64
             ),
             seq_lens=seq_lens,
-            reqs=[
-                SimpleNamespace(kv_committed_len=128),
-                SimpleNamespace(kv_committed_len=4094),
-            ],
         )
 
         eagle_utils._prepare_hisparse_mtp_verify_slots(batch, draft_token_num=4)
@@ -181,6 +1280,7 @@ class TestHiSparseMTPNative(unittest.TestCase):
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 
         coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.mtp_demand_buffer_enabled = False
         calls = []
         coordinator.finalize_accepted_tokens = lambda **kwargs: calls.append(kwargs)
         verify_cache_locs = torch.tensor(

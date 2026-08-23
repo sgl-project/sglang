@@ -2,6 +2,7 @@ import dataclasses
 from typing import Optional, Tuple
 
 import torch
+from sgl_kernel.flashmla_hisparse_demand import HiSparseDemandInputs
 
 try:
     from sgl_kernel import flashmla_ops  # triggers TORCH extension registration
@@ -103,6 +104,7 @@ def flash_mla_with_kvcache(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    hisparse_demand: Optional[HiSparseDemandInputs] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -129,6 +131,30 @@ def flash_mla_with_kvcache(
 
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
+
+    if hisparse_demand is not None:
+        assert not isinstance(tile_scheduler_metadata, FlashMLASchedMeta)
+        assert num_splits is not None
+        assert indices is not None
+        return hisparse_demand.run(
+            q=q,
+            k_cache=k_cache,
+            indices=indices,
+            tile_scheduler_metadata=tile_scheduler_metadata,
+            num_splits=num_splits,
+            head_dim_v=head_dim_v,
+            softmax_scale=softmax_scale,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            causal=causal,
+            is_fp8_kvcache=is_fp8_kvcache,
+            attn_sink=attn_sink,
+            extra_k_cache=extra_k_cache,
+            extra_indices_in_kvcache=extra_indices_in_kvcache,
+            topk_length=topk_length,
+            extra_topk_length=extra_topk_length,
+        )
+
     if isinstance(tile_scheduler_metadata, FlashMLASchedMeta):
         return _flash_mla_with_kvcache_sched_meta(
             q=q,

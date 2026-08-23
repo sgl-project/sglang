@@ -608,6 +608,11 @@ def _prepare_hisparse_mtp_verify_slots(
         verify_cache_locs=batch.out_cache_loc,
         num_tokens_per_req=draft_token_num,
         start_positions=batch.seq_lens,
+        # Under overlap, seq_lens_cpu is intentionally absent. Req metadata can
+        # lag one in-flight verify, so reserve two verify windows without a D2H.
+        host_reserve_end_positions_cpu=[
+            req.kv_committed_len + 2 * draft_token_num for req in batch.reqs
+        ],
     )
 
 
