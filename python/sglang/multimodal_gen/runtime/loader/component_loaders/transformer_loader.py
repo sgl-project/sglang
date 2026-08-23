@@ -100,15 +100,24 @@ def _server_args_for_transformer_component(
 ) -> ServerArgs:
     """Mask global quantized override flags for secondary transformer components."""
     component_weights_path = server_args.component_weights_paths.get(component_name)
-    if component_weights_path is not None:
+    component_quantization = server_args.component_quantizations.get(component_name)
+    if component_weights_path is not None or component_quantization is not None:
         component_server_args = copy.copy(server_args)
-        component_server_args.transformer_weights_path = component_weights_path
-        component_server_args.nunchaku_config = None
-        logger.info(
-            "Using transformer_weights_path override for %s: %s",
-            component_name,
-            component_weights_path,
-        )
+        if component_weights_path is not None:
+            component_server_args.transformer_weights_path = component_weights_path
+            component_server_args.nunchaku_config = None
+            logger.info(
+                "Using transformer_weights_path override for %s: %s",
+                component_name,
+                component_weights_path,
+            )
+        if component_quantization is not None:
+            component_server_args.quantization = component_quantization
+            logger.info(
+                "Using quantization override %s for %s",
+                component_quantization,
+                component_name,
+            )
         return component_server_args
 
     if component_name not in ("transformer_2", "unconditional_transformer"):
@@ -135,6 +144,7 @@ class TransformerLoader(ComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
 
     allow_global_attention_backend_fallback = False
+    supports_online_quantization_override = True
 
     component_names = [
         "transformer",
