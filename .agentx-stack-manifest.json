@@ -80,16 +80,20 @@
     "local_commit": "668cbe00a9c4e828d9669b9badbfab846fa97197",
     "file": "python/sglang/srt/managers/scheduler_components/profiler_manager.py",
     "candidate_sha256": "02e19720a334a1184c5bf3ce9ec32ca097e8cac865d89225a056a51f69761d4e",
-    "change": "Allow CUDA_PROFILER requests to drive an opt-in Nsight Systems NVTX capture range instead of cudaProfilerStart/Stop; model execution is unchanged.",
+    "scheduler_nvtx_fallback_commit": "81e31117d5f321de2102bbe2ad888d581ae45031",
+    "scheduler_nvtx_file": "python/sglang/srt/utils/nvtx_utils.py",
+    "scheduler_nvtx_sha256": "56610ee61c53c39e40fdd6b44c7443140eeb6e25bc499889e70f93a33bf3fcdd",
+    "change": "Allow CUDA_PROFILER requests to drive an opt-in Nsight Systems NVTX capture range instead of cudaProfilerStart/Stop, and emit scheduler ranges through torch.cuda.nvtx when the optional nvtx package is absent; model execution is unchanged.",
     "targeted_validation": {
       "cpu_unit_test": "pass: NVTX range push/pop selected on the base GPU rank and cudaProfilerStart/Stop omitted",
-      "default_behavior": "unchanged when SGLANG_NSYS_NVTX_CAPTURE_RANGE is unset"
+      "scheduler_fallback": "pass: py_compile; missing optional nvtx package no longer disables scheduler markers",
+      "default_behavior": "unchanged when SGLANG_NSYS_NVTX_CAPTURE_RANGE and SGLANG_ENABLE_NVTX_* are unset"
     }
   },
   "srt_slurm": {
-    "commit": "227fdf5f2850df2ef4dcb068ac6f09f7c623e61a",
-    "tree": "0ebd61d2b8067a25039c30a0db9828b503e17ada",
-    "change": "Allow an explicit Nsight capture-range argument to replace the default cudaProfilerApi trigger."
+    "commit": "ebf9b696269c484713bd25b58feead000ca120d1",
+    "tree": "0357423d9ab17cd60e63d320783999c784760e4d",
+    "change": "Allow explicit Nsight capture-range and capture-end arguments to replace defaults, including asynchronous per-range report finalization."
   },
   "aiperf": {
     "repo": "https://github.com/SemiAnalysisAI/aiperf.git",
