@@ -3300,6 +3300,14 @@ class ServerArgs:
         "Start seed server via transfer engine backend for remote instance weight loader.",
         NS("model"),
     ] = False
+    enable_engine_info_bootstrap: A[
+        bool,
+        "Start the EngineInfoBootstrapServer and register per-rank parallelism config, without the mooncake/verbs P2P transfer-engine seeding.",
+    ] = False
+    enable_rdt_weight_sync: A[
+        bool,
+        "Expose SchedulerActor.pull_weights for RDT (Ray Direct Transport / NIXL) weight sync. Requires --use-ray; implies --enable-engine-info-bootstrap.",
+    ] = False
     engine_info_bootstrap_port: A[
         int,
         "Port for the engine info bootstrap server. Default is 6789. Must be set explicitly when running multiple instances on the same node.",
@@ -3641,6 +3649,8 @@ class ServerArgs:
         self._handle_return_hidden_states_mode()
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
+        self._handle_rdt_weight_sync()
+
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -3994,6 +4004,14 @@ class ServerArgs:
             ):
                 ObjectStorageModel.download_and_get_path(model_path)
                 seen_paths.add(model_path)
+
+    def _handle_rdt_weight_sync(self):
+        if not self.enable_rdt_weight_sync:
+            return
+        assert (
+            self.use_ray
+        ), "--enable-rdt-weight-sync requires --use-ray: the trainer pulls weights through SchedulerActors."
+        self.enable_engine_info_bootstrap = True
 
     def _handle_pd_disaggregation(self):
         from sglang.srt.arg_groups.pd_disaggregation_hook import (
@@ -9660,6 +9678,20 @@ class ServerArgs:
         ``page_size * dcp_size`` (``mem_cache/kv_cache_builder.py``).
         """
         return self.page_size * self.dcp_size
+
+    def needs_engine_info_bootstrap(self) -> bool:
+        """Whether this node (rank 0) hosts the EngineInfoBootstrapServer."""
+        return (
+            self.remote_instance_weight_loader_start_seed_via_transfer_engine
+            or self.enable_engine_info_bootstrap
+        )
+
+    def registers_parallelism_config(self) -> bool:
+        """Whether this rank publishes its parallelism config to the bootstrap server."""
+        return (
+            self.remote_instance_weight_loader_use_transfer_engine()
+            or self.enable_engine_info_bootstrap
+        )
 
     def describe_kv_events_publisher(self) -> Optional[dict]:
         """Return a structured description of this server's KV-event
