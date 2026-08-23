@@ -20,6 +20,7 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -27,6 +28,15 @@ register_cpu_ci(est_time=9, suite="base-c-test-cpu")
 
 
 class TestSchedulerPauseGeneration(unittest.TestCase):
+    def setUp(self):
+        # The scheduler runs after its process publishes; retraction reads the
+        # disaggregation and schedule bags rather than the record it is handed.
+        from sglang.srt.server_args import ServerArgs
+
+        super().setUp()
+        publish(ServerArgs(model_path="dummy"), role="test")
+        self.addCleanup(reset_context)
+
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler._engine_paused = False

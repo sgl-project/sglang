@@ -163,6 +163,23 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             args.component_paths["vae"], os.path.expanduser("~/fake/local/vae")
         )
 
+    def test_component_weight_file_keeps_base_component_config(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_paths": {
+                    "text_encoder": "owner/repo/text_encoder/model.safetensors",
+                    "vae": "owner/repo/vae",
+                },
+            }
+        )
+
+        self.assertEqual(args.component_paths, {"vae": "owner/repo/vae"})
+        self.assertEqual(
+            args.component_weights_paths,
+            {"text_encoder": "owner/repo/text_encoder/model.safetensors"},
+        )
+
     def test_component_attention_backends_are_normalized(self):
         args = self._from_dict_without_model_resolution(
             {

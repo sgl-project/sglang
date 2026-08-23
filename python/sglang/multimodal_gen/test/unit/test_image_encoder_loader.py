@@ -27,6 +27,7 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
                 image_encoder_precision="bf16",
                 native_only_components=(),
             ),
+            component_weights_paths={},
             encoder_parallel="replicate",
             resolve_component_attention_backend=lambda _name: (None, None),
         )
