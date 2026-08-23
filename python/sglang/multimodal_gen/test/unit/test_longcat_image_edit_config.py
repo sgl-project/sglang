@@ -5,12 +5,12 @@ import types
 import pytest
 import torch
 
+from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
     LongCatImageEditPipelineConfig,
     LongCatImagePipelineConfig,
     _calculate_edit_dimensions,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 
 
 @pytest.fixture

@@ -145,9 +145,9 @@ class LongCatImageEditTextEncodingStage(PipelineStage):
             batch_size, suffix_len, dtype=body.attention_mask.dtype
         )
 
-        input_ids = torch.cat(
-            (prefix_ids_t, body.input_ids, suffix_ids_t), dim=-1
-        ).to(device)
+        input_ids = torch.cat((prefix_ids_t, body.input_ids, suffix_ids_t), dim=-1).to(
+            device
+        )
         attention_mask = torch.cat(
             (prefix_mask_t, body.attention_mask, suffix_mask_t), dim=-1
         ).to(device)
