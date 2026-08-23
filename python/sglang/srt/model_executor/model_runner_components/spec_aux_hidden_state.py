@@ -6,6 +6,11 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.runtime_context import (
+    configured_tp_size,
+    get_model,
+    get_spec,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -73,16 +78,15 @@ def _resolve_eagle_aux_hidden_state(
     is_draft_worker: bool,
 ) -> None:
     if (
-        (spec_algorithm.is_eagle() or spec_algorithm.is_standalone())
-        and not is_draft_worker
-    ):
+        spec_algorithm.is_eagle() or spec_algorithm.is_standalone()
+    ) and not is_draft_worker:
         # Mirror the draft worker's ModelConfig construction to get its KV layer
         # count. For integrated MTP, a None draft path intentionally falls back
         # to the target checkpoint and applies the is_draft_model conversion.
         draft_model_config = ModelConfig.from_server_args(
             server_args,
-            model_path=server_args.speculative_draft_model_path,
-            model_revision=server_args.speculative_draft_model_revision,
+            model_path=get_spec().speculative_draft_model_path,
+            model_revision=get_spec().speculative_draft_model_revision,
             is_draft_model=True,
         )
         num_nextn_predict_layers = draft_model_config.num_nextn_predict_layers
@@ -135,8 +139,8 @@ def _resolve_dflash_aux_hidden_state(
         # Select target layers to capture for building draft context features.
         draft_model_config = ModelConfig.from_server_args(
             server_args,
-            model_path=(server_args.speculative_draft_model_path),
-            model_revision=server_args.speculative_draft_model_revision,
+            model_path=(get_spec().speculative_draft_model_path),
+            model_revision=get_spec().speculative_draft_model_revision,
             is_draft_model=True,
         )
         dflash_draft_config = parse_dflash_draft_config(
@@ -222,23 +226,23 @@ def _resolve_dflash_draft_cell_size(
 
     try:
         _, draft_kv_cache_dtype = configure_kv_cache_dtype(
-            server_args_kv_cache_dtype=server_args.kv_cache_dtype,
+            server_args_kv_cache_dtype=get_model().kv_cache_dtype,
             speculative_draft_kv_cache_dtype=(
-                server_args.speculative_draft_kv_cache_dtype
+                get_spec().speculative_draft_kv_cache_dtype
             ),
             model=None,
             model_dtype=draft_model_config.dtype,
             is_draft_worker=True,
             is_dflash=True,
             speculative_draft_attention_backend=(
-                server_args.speculative_draft_attention_backend
+                get_spec().speculative_draft_attention_backend
             ),
         )
         return dflash_draft_cell_size_per_token(
             draft_model_config=draft_model_config,
             draft_num_layers=draft_num_layers,
             draft_kv_cache_dtype=draft_kv_cache_dtype,
-            tp_size=server_args.tp_size,
+            tp_size=configured_tp_size(),
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(

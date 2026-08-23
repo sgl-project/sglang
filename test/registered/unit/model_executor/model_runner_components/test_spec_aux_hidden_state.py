@@ -39,18 +39,25 @@ def test_muse_target_layer_id_mapping(target_model_type, draft_architecture, exp
 
 @patch(
     "sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state."
+    "get_spec"
+)
+@patch(
+    "sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state."
     "ModelConfig.from_server_args"
 )
-def test_integrated_mtp_resolves_draft_layer_count(mock_from_server_args):
+def test_integrated_mtp_resolves_draft_layer_count(
+    mock_from_server_args, mock_get_spec
+):
     mock_from_server_args.return_value = SimpleNamespace(
         num_nextn_predict_layers=1,
         is_hybrid_swa=False,
         is_deepseek_v4_arch=False,
     )
-    server_args = SimpleNamespace(
+    mock_get_spec.return_value = SimpleNamespace(
         speculative_draft_model_path=None,
         speculative_draft_model_revision=None,
     )
+    server_args = SimpleNamespace()
     spec_algorithm = SimpleNamespace(
         is_eagle=lambda: True,
         is_standalone=lambda: False,

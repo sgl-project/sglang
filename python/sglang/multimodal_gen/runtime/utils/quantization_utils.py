@@ -77,10 +77,6 @@ def inspect_comfy_quant_markers(
     for prefix, marker in raw_markers.items():
         marker_format = marker.get("format")
         required = {f"{prefix}.weight", f"{prefix}.weight_scale"}
-        if marker_format == "float8_e4m3fn" and not marker.get(
-            "full_precision_matrix_mult", False
-        ):
-            required.add(f"{prefix}.input_scale")
         if marker_format not in ("float8_e4m3fn", "int8_tensorwise"):
             continue
         missing = required - checkpoint_meta.keys()
@@ -89,7 +85,10 @@ def inspect_comfy_quant_markers(
                 f"Comfy layer {prefix!r} is missing checkpoint tensors: "
                 f"{sorted(missing)}"
             )
-        if marker_format != "int8_tensorwise":
+        if marker_format == "float8_e4m3fn":
+            marker["_activation_scheme"] = (
+                "static" if f"{prefix}.input_scale" in checkpoint_meta else "dynamic"
+            )
             continue
         weight_dtype, weight_shape = checkpoint_meta[f"{prefix}.weight"]
         scale_dtype, scale_shape = checkpoint_meta[f"{prefix}.weight_scale"]
