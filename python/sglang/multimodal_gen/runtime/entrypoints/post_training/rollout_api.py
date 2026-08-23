@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.request_timing impo
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
     _maybe_serialize,
+    _quantize_video_uint8,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
@@ -201,7 +202,12 @@ def _serialize_rollout_trajectory(
 
 
 def _build_response(
-    request_id: str, prompt: str, seed: int, rollout: bool, result: OutputBatch
+    request_id: str,
+    prompt: str,
+    seed: int,
+    rollout: bool,
+    result: OutputBatch,
+    video_dtype: str | None = None,
 ) -> list[RolloutResponse]:
     """
     rollout: bool - set to False when evaluating the model
@@ -233,6 +239,8 @@ def _build_response(
     for sample_idx in range(batch_size):
         out_i = result.output[sample_idx]
         if isinstance(out_i, torch.Tensor):
+            if video_dtype == "uint8":
+                out_i = _quantize_video_uint8(out_i)
             out_i = out_i.contiguous()
         serialized_generated_output = _maybe_serialize(out_i)
         if not rollout:
@@ -352,7 +360,12 @@ async def rollout_generate(request: RolloutRequest):
         raise HTTPException(status_code=500, detail=output_batch.error)
     with stamps.span("build"):
         rollout_responses = _build_response(
-            request_id, request.prompt, request.seed, request.rollout, output_batch
+            request_id,
+            request.prompt,
+            request.seed,
+            request.rollout,
+            output_batch,
+            video_dtype=request.rollout_video_dtype,
         )
     with stamps.span("dump"):
         payload = [r.model_dump() for r in rollout_responses]

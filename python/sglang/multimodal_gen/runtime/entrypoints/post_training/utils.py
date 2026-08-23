@@ -42,3 +42,11 @@ def _maybe_deserialize(obj: Any) -> Any:
     if isinstance(obj, (list, tuple)):
         return [_maybe_deserialize(v) for v in obj]
     return obj
+
+
+def _quantize_video_uint8(video: torch.Tensor) -> torch.Tensor:
+    """Map the decoded [0,1] float video to 0..255 uint8; consumers divide by 255."""
+    out = video.float()
+    if float(out.max()) <= 1.0 + 1e-3:
+        out = out * 255.0
+    return out.clamp(0, 255).to(torch.uint8)
