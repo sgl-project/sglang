@@ -1181,6 +1181,10 @@ class LoRAPipeline(ComposedPipelineBase):
             return None
         if any(path is None for path in lora_paths):
             return None
+        if any(layer.weight.device.type != "cpu" for layer in lora_layers.values()):
+            # Cache entries are CPU mappings. Rebinding a resident accelerator
+            # parameter to one would leave the module split across devices.
+            return None
         if dist.is_initialized() and dist.get_world_size() > 1:
             # Sharded weights would need per-rank stores; not worth it until a
             # multi-GPU consumer deployment exists.

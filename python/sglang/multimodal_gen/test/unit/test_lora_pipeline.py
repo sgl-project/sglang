@@ -24,7 +24,11 @@ def _make_layer() -> BaseLayerWithLoRA:
 def _make_pipeline(layer: BaseLayerWithLoRA) -> _TestLoRAPipeline:
     pipeline = object.__new__(_TestLoRAPipeline)
     pipeline.modules = {"transformer": torch.nn.Module()}
-    pipeline.server_args = SimpleNamespace(lora_merge_mode="dynamic")
+    pipeline.server_args = SimpleNamespace(
+        lora_alpha=None,
+        lora_merge_mode="dynamic",
+        model_path="/model",
+    )
     pipeline.lora_initialized = True
     pipeline.lora_adapters = defaultdict(dict)
     pipeline.loaded_adapter_paths = {"adapter": "/adapter"}
@@ -41,6 +45,30 @@ def _make_pipeline(layer: BaseLayerWithLoRA) -> _TestLoRAPipeline:
     pipeline.lora_adapters["adapter"]["linear.lora_A"] = torch.ones(1, 2)
     pipeline.lora_adapters["adapter"]["linear.lora_B"] = torch.ones(2, 1)
     return pipeline
+
+
+def test_merge_cache_only_accepts_cpu_backed_weights():
+    pipeline = _make_pipeline(_make_layer())
+    cpu_cache = pipeline._merge_cache_for(
+        "transformer",
+        pipeline.lora_layers,
+        ["/adapter"],
+        [1.0],
+        enabled=True,
+    )
+    assert cpu_cache is not None
+
+    resident_layer = BaseLayerWithLoRA(
+        torch.nn.Linear(2, 2, bias=False, device="meta"), snapshot_base=False
+    )
+    resident_cache = pipeline._merge_cache_for(
+        "transformer",
+        {"linear": resident_layer},
+        ["/adapter"],
+        [1.0],
+        enabled=True,
+    )
+    assert resident_cache is None
 
 
 def test_dynamic_lora_reactivates_cached_layers_without_weight_update_context():
