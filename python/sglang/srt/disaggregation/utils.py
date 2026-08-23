@@ -962,6 +962,11 @@ def get_transfer_kv_layer_ids(kv_pool, num_entries: int) -> List[int]:
         if len(layer_ids) == num_entries:
             return layer_ids
 
+    if getattr(kv_pool, "layer_shard_enabled", False):
+        shard_start = getattr(kv_pool, "layer_shard_start", None)
+        if shard_start is not None:
+            return list(range(int(shard_start), int(shard_start) + num_entries))
+
     start_layer = int(getattr(kv_pool, "start_layer", 0) or 0)
     end_layer = getattr(kv_pool, "end_layer", None)
     if end_layer is not None:

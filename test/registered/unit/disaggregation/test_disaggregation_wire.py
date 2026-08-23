@@ -27,7 +27,9 @@ from sglang.srt.disaggregation.mooncake.conn import (
 )
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    build_transfer_entry_pairs,
     get_dsv4_c128_state_indices,
+    get_transfer_kv_layer_ids,
     pack_state_types,
     resolve_state_component_dst_index,
     setup_state_kv_args,
@@ -157,6 +159,20 @@ class TestDisaggregationWire(unittest.TestCase):
         state_types = [StateType.SWA, StateType.C128_STATE, StateType.SWA_RING]
 
         self.assertEqual(unpack_state_types(pack_state_types(state_types)), state_types)
+
+    def test_layer_shard_kv_layer_ids_use_shard_start(self):
+        kv_pool = SimpleNamespace(
+            layer_shard_enabled=True,
+            layer_shard_start=20,
+            start_layer=0,
+            end_layer=40,
+        )
+
+        src_layer_ids = get_transfer_kv_layer_ids(kv_pool, 3)
+        pairs = build_transfer_entry_pairs(src_layer_ids, list(range(40)), 3, 40)
+
+        self.assertEqual(src_layer_ids, [20, 21, 22])
+        self.assertEqual(pairs, [(0, 20), (1, 21), (2, 22)])
 
 
 class TestGroupConcurrentContiguous(unittest.TestCase):
