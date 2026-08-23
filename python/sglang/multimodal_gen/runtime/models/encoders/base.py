@@ -211,6 +211,10 @@ class TextEncoder(
         TextEncoderConfig()._supported_attention_backends
     )
 
+    @staticmethod
+    def should_materialize_checkpoint_weight(name: str) -> bool:
+        return True
+
     def __init__(self, config: TextEncoderConfig) -> None:
         super().__init__()
         self.config = config

@@ -162,11 +162,11 @@ backend.
     </tr>
     <tr>
       <td><code>gguf</code></td>
-      <td>One selected GGUF DiT file</td>
-      <td><code>--transformer-weights-path</code></td>
-      <td>MiniMax-H3 original or pruned FL2VA / Ref2VA DiTs</td>
+      <td>One selected GGUF DiT or native encoder file</td>
+      <td><code>--transformer-weights-path</code>, or an explicit encoder file through <code>--component-paths.&lt;component&gt;</code></td>
+      <td>MiniMax-H3 original or pruned FL2VA / Ref2VA DiTs and its Qwen3-VL text encoder</td>
       <td>None</td>
-      <td>CUDA only; auto-detected; supports standard and K-quant GGML types; FSDP and the separate Qwen3-VL text-encoder GGUF files are not supported</td>
+      <td>CUDA only and auto-detected; supports standard and K-quant GGML types. TP requires aligned GGML blocks; component/layerwise offload is supported and FSDP is not.</td>
     </tr>
     <tr>
       <td><code>comfy-fp8</code></td>
@@ -234,11 +234,11 @@ backend.
     </tr>
     <tr>
       <td><code>gguf</code></td>
-      <td>A single community <code>.gguf</code> holding the transformer</td>
-      <td><code>--transformer-weights-path</code></td>
-      <td>MiniMax-H3 <code>fl2va</code> (original and pruned AdaLN curve)</td>
+      <td>A single community <code>.gguf</code> holding a transformer or native encoder</td>
+      <td><code>--transformer-weights-path</code> or <code>--component-paths.&lt;component&gt;</code></td>
+      <td>MiniMax-H3 <code>fl2va</code> DiT (original and pruned AdaLN curve) and Qwen3-VL text encoder</td>
       <td>None</td>
-      <td>CUDA only, no FSDP. TP requires GGML-aligned shard boundaries. Shrinks the download and the host memory offload pins (17.5 vs 61.7 GiB for H3) rather than peak VRAM, which offload already bounds. Dequantized per use, so it is not faster. See <a href="#gguf">GGUF</a>.</td>
+      <td>CUDA only, no FSDP. TP requires GGML-aligned shard boundaries. Packed weights reduce checkpoint and resident-weight memory; they are dequantized per use, so this is not a speed claim. See <a href="#gguf">GGUF</a>.</td>
     </tr>
   </tbody>
 </table>

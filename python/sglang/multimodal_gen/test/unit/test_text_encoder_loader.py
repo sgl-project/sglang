@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_conf
     KitchenW4A8Config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+from sglang.multimodal_gen.runtime.layers.quantization.gguf import GGUFConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
     NativeComponentLoaderRequired,
@@ -24,10 +25,12 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
     TextEncoderLoader,
     _configure_encoder_quantization,
+    _get_encoder_quant_config,
     _process_quantized_encoder_weights,
     _require_quantized_encoder_layers,
     _resolve_and_configure_encoder_quantization,
 )
+from sglang.multimodal_gen.runtime.loader.gguf_weights import GGUFTensorMeta
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3ConditioningProjection,
@@ -449,6 +452,54 @@ class TestTextEncoderQuantization(unittest.TestCase):
         self.assertIn(
             "model.language_model.layers.0.mlp.down_proj",
             model_config.quant_config.layer_markers,
+        )
+
+    def test_gguf_maps_h3_names_and_drops_unused_language_layers(self):
+        self.get_quant_config.return_value = None
+
+        def meta(name: str) -> GGUFTensorMeta:
+            return GGUFTensorMeta(
+                ggml_type=12,
+                logical_shape=(2, 256),
+                stored_shape=(2, 144),
+                stored_dtype=torch.uint8,
+                param_name=f"{name.removesuffix('.weight')}.qweight",
+            )
+
+        checkpoint_meta = {
+            name: meta(name)
+            for name in (
+                "model.layers.49.self_attn.q_proj.weight",
+                "model.layers.50.self_attn.q_proj.weight",
+                "visual.blocks.0.attn.qkv.weight",
+            )
+        }
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.loader.component_loaders."
+            "text_encoder_loader.read_gguf_tensor_meta",
+            return_value=checkpoint_meta,
+        ):
+            config = _get_encoder_quant_config(
+                {},
+                "/model/text_encoder",
+                "/weights/encoder.gguf",
+                MiniMaxH3Qwen3VLEncoder,
+            )
+
+        self.assertIsInstance(config, GGUFConfig)
+        self.assertEqual(
+            config.quantized_prefixes,
+            {"model.language_model.layers.49.self_attn.q_proj"},
+        )
+        vision_meta = config.tensor_meta["model.visual.blocks.0.attn.qkv_proj.weight"]
+        self.assertTrue(vision_meta.dequantize_on_load)
+        self.assertEqual(
+            vision_meta.param_name,
+            "model.visual.blocks.0.attn.qkv_proj.weight",
+        )
+        self.assertNotIn(
+            "model.language_model.layers.50.self_attn.q_proj.weight",
+            config.tensor_meta,
         )
 
     def test_encoder_must_use_native_loader(self):
