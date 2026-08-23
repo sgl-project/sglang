@@ -77,18 +77,18 @@
   },
   "profiling_overlay": {
     "parent_local_commit": "85c23c62fdc58a5a0c3b7c6d61a7bba720a6cbbf",
-    "local_commit": "29e068d852a789a297da9cb53376fdeeca6a336c",
+    "local_commit": "e7ef5517b69d77e8156854b9f7fec8486fc129e0",
     "file": "python/sglang/srt/managers/scheduler_components/profiler_manager.py",
-    "candidate_sha256": "a2047ca7d49e1b1adf47f1b92e820ebd4b9fdb6825c96b615ea936ceac460657",
+    "candidate_sha256": "ff0eca2dd93cc22924ea460bf88e4ff4bb612dfbe3f3c1c8929399ef7dfe203a",
     "symm_mem_gather_file": "python/sglang/srt/distributed/device_communicators/symm_mem_gather.py",
     "symm_mem_gather_sha256": "8a1f8e9a1f13c26b89691eb0dc7bec07595b107778f180d1afa0a93d5e8af9c4",
     "scheduler_nvtx_fallback_commit": "81e31117d5f321de2102bbe2ad888d581ae45031",
     "scheduler_nvtx_file": "python/sglang/srt/utils/nvtx_utils.py",
     "scheduler_nvtx_sha256": "56610ee61c53c39e40fdd6b44c7443140eeb6e25bc499889e70f93a33bf3fcdd",
-    "change": "Allow CUDA_PROFILER requests to drive an opt-in Nsight Systems NVTX start/end capture range instead of cudaProfilerStart/Stop, defer the capture until an explicitly requested rank-local running batch is observed, keep the range open until at least two real decode batches complete even when idle scheduler passes exhaust the nominal forward-count window, and synchronize enqueued GPU work before asynchronous report finalization; the independent start/end handle does not corrupt the already-open scheduler NVTX push/pop stack, and model execution is unchanged unless the profiling-only environment variables are set.",
+    "change": "Allow CUDA_PROFILER requests to drive an opt-in Nsight Systems NVTX start/end capture range instead of cudaProfilerStart/Stop, defer capture until an explicitly requested rank-local running batch is observed, keep the range open for a configurable positive number of real decode batches (default two), and synchronize enqueued GPU work before asynchronous report finalization; model execution is unchanged unless the profiling-only environment variables are set.",
     "targeted_validation": {
       "cpu_unit_test": "pass: independent NVTX range start/end selected on the base GPU rank, GPU work synchronized before finalization, and cudaProfilerStart/Stop omitted",
-      "exact_batch_gate": "py_compile pass; targeted unit coverage covers deferred exact-running-batch start, window rebasing, and idle-pass resistance; full local pytest import unavailable because the host SGLang/Torch import does not complete",
+      "exact_batch_gate": "py_compile pass; capture length is controlled by SGLANG_NSYS_EXACT_DECODE_BATCHES and defaults to two for backward compatibility; targeted unit coverage covers deferred exact-running-batch start, window rebasing, and idle-pass resistance",
       "scheduler_fallback": "pass: py_compile; missing optional nvtx package no longer disables scheduler markers",
       "default_behavior": "unchanged when SGLANG_NSYS_NVTX_CAPTURE_RANGE, SGLANG_NSYS_EXACT_RUNNING_BATCH, SGLANG_SYMM_MEM_GATHER_TIMEOUT_MS, and SGLANG_ENABLE_NVTX_* are unset"
     }
