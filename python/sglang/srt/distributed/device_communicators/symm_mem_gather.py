@@ -1,6 +1,7 @@
 """One-sided fixed-shape gather over torch symmetric memory."""
 
 import logging
+import os
 import time
 from typing import Optional
 
@@ -8,7 +9,9 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-_BARRIER_TIMEOUT_MS = 10_000
+_BARRIER_TIMEOUT_MS = int(
+    os.getenv("SGLANG_SYMM_MEM_GATHER_TIMEOUT_MS", "10000")
+)
 _NUM_SLOTS = 2
 
 

@@ -43,3 +43,32 @@ def test_cuda_profiler_activity_can_use_nsys_nvtx_capture_range(tmp_path):
     range_pop.assert_called_once_with()
     cudart.assert_not_called()
     assert not manager.nsys_nvtx_capture_active
+
+
+def test_nsys_exact_running_batch_defers_and_rebases_capture_window(tmp_path):
+    forward_ct = 100
+    ps = SimpleNamespace(gpu_id=0)
+    with patch.dict(
+        "os.environ", {"SGLANG_NSYS_EXACT_RUNNING_BATCH": "32"}
+    ):
+        manager = SchedulerProfilerManager(
+            ps=ps,
+            dp_tp_cpu_group=MagicMock(),
+            get_forward_ct=lambda: forward_ct,
+        )
+    manager.profiler_start_forward_ct = 100
+    manager.profiler_target_forward_ct = 200
+
+    with patch.object(manager, "_start_profile") as start_profile:
+        manager._profile_batch_predicate(
+            SimpleNamespace(reqs=[object()] * 31, forward_mode=MagicMock())
+        )
+        assert not start_profile.called
+
+        forward_ct = 107
+        manager._profile_batch_predicate(
+            SimpleNamespace(reqs=[object()] * 32, forward_mode=MagicMock())
+        )
+
+    start_profile.assert_called_once_with()
+    assert manager.profiler_target_forward_ct == 207

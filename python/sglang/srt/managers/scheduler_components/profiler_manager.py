@@ -78,6 +78,9 @@ class SchedulerProfilerManager:
         self.profile_in_progress: bool = False
         self.merge_profiles = False
         self.nsys_nvtx_capture_active = False
+        self.nsys_exact_batch = int(
+            os.getenv("SGLANG_NSYS_EXACT_RUNNING_BATCH", "0") or "0"
+        )
 
         # For ROCM
         self.rpd_profiler = None
@@ -430,13 +433,34 @@ class SchedulerProfilerManager:
             if (
                 self.profiler_target_forward_ct
                 and self.profiler_target_forward_ct <= self.get_forward_ct()
+                and self.profile_in_progress
             ):
                 self._stop_profile()
-            if (
-                self.profiler_start_forward_ct
-                and self.profiler_start_forward_ct == self.get_forward_ct()
-            ):
-                self._start_profile()
+            if self.profiler_start_forward_ct and not self.profile_in_progress:
+                forward_ct = self.get_forward_ct()
+                start_reached = (
+                    self.profiler_start_forward_ct <= forward_ct
+                    if self.nsys_exact_batch
+                    else self.profiler_start_forward_ct == forward_ct
+                )
+                batch_matches = (
+                    not self.nsys_exact_batch
+                    or len(batch.reqs) == self.nsys_exact_batch
+                )
+                if start_reached and batch_matches:
+                    if self.nsys_exact_batch and self.profiler_target_forward_ct:
+                        capture_width = (
+                            self.profiler_target_forward_ct
+                            - self.profiler_start_forward_ct
+                        )
+                        self.profiler_target_forward_ct = forward_ct + capture_width
+                        logger.info(
+                            "Exact running-batch Nsight gate matched: "
+                            "batch=%d forward_ct=%d",
+                            self.nsys_exact_batch,
+                            forward_ct,
+                        )
+                    self._start_profile()
 
     def _profile(self, recv_req: ProfileReq):
         if recv_req.req_type == ProfileReqType.START_PROFILE:
