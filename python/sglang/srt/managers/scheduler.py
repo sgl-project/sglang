@@ -1727,7 +1727,9 @@ class Scheduler(
                 _redraws += 1
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
-        self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+        self._war_barrier_enabled = (
+            is_cuda() or _is_hip or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+        )
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 
