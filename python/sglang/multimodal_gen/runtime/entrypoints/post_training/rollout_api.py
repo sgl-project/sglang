@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-import msgspec
 import torch
 from fastapi import APIRouter, HTTPException, Response
+from fastapi.responses import StreamingResponse
 
 from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.request_timing impo
 from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
     _maybe_serialize,
     _quantize_video_uint8,
+    msgpack_encode_spliced,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
@@ -370,15 +371,19 @@ async def rollout_generate(request: RolloutRequest):
     with stamps.span("dump"):
         payload = [r.model_dump() for r in rollout_responses]
     with stamps.span("msgpack"):
-        content = msgspec.msgpack.encode(payload)
+        parts = msgpack_encode_spliced(payload)
 
-    # Timing rides a header: the last marks postdate the encoded body.
-    headers = {TIMING_HEADER: stamps.to_header()}
+    # Timing rides a header: the last marks postdate the encoded body. The
+    # explicit content-length keeps uvicorn on identity framing, not chunked.
+    headers = {
+        TIMING_HEADER: stamps.to_header(),
+        "content-length": str(sum(len(p) for p in parts)),
+    }
     stages = stages_header(output_batch.metrics)
     if stages:
         headers[STAGES_HEADER] = stages
-    return Response(
-        content=content,
+    return StreamingResponse(
+        iter(parts),
         media_type="application/msgpack",
         headers=headers,
     )
