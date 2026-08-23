@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -39,12 +40,12 @@ logger = init_logger(__name__)
 # NPU/ascend) is read from sgl-project/ci-data-diffusion, where the GT-gen workflows
 # publish.
 SGL_TEST_FILES_CI_DATA_REPO = "sgl-project/ci-data-diffusion"
-SGL_TEST_FILES_CI_DATA_REVISION = "cc3f27fd2d1b4d8e1a7d5eec1247a215a502b9c1"
+SGL_TEST_FILES_CI_DATA_REVISION = "15b30030ef980756788ab40072f9223fe21a5526"
 
 # The NPU pin is kept as a separate branch so ascend GT can be bumped independently
 # when it's regenerated on its own cadence.
 if current_platform.is_npu():
-    SGL_TEST_FILES_CI_DATA_REVISION = "d180ad38872dff3d1ad03e4610cffcda874d3eb8"
+    SGL_TEST_FILES_CI_DATA_REVISION = "8e3d717e65fb87339c2974382a092a731669f884"
 
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
@@ -100,6 +101,11 @@ DEFAULT_MEAN_ABS_DIFF_THRESHOLD_IMAGE = 8.0
 DEFAULT_SSIM_THRESHOLD_VIDEO = 0.92
 DEFAULT_PSNR_THRESHOLD_VIDEO = 24.0
 DEFAULT_MEAN_ABS_DIFF_THRESHOLD_VIDEO = 10.0
+AUDIO_CONSISTENCY_SAMPLE_RATE = 16_000
+DEFAULT_AUDIO_SPECTRAL_SIMILARITY_THRESHOLD = 0.95
+DEFAULT_AUDIO_WAVEFORM_CORRELATION_THRESHOLD = 0.90
+DEFAULT_AUDIO_RMS_DB_DIFF_THRESHOLD = 2.0
+DEFAULT_AUDIO_DURATION_DIFF_THRESHOLD = 0.10
 _clip_model_cache: dict[str, Any] = {}
 _consistency_gt_cache: dict[str, Any] = {}
 _official_consistency_gt_outputs_cache: dict[str, frozenset[str]] | None = None
@@ -721,6 +727,162 @@ def validate_video_file(
         ), f"Video height mismatch: expected {expected_height}, got {actual_height}"
 
 
+@dataclass(frozen=True)
+class AudioStreamInfo:
+    sample_rate: int
+    channels: int
+    duration_seconds: float
+
+
+def probe_audio_stream(file_path: str) -> AudioStreamInfo:
+    """Return metadata for the first audio stream in a media file."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type,sample_rate,channels,duration:format=duration",
+                "-of",
+                "json",
+                file_path,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        stderr = getattr(exc, "stderr", None)
+        raise AssertionError(
+            f"Unable to inspect audio stream in {file_path}: {stderr or exc}"
+        ) from exc
+
+    payload = json.loads(result.stdout)
+    stream = next(
+        (
+            item
+            for item in payload.get("streams", [])
+            if item.get("codec_type") == "audio"
+        ),
+        None,
+    )
+    assert stream is not None, f"Media file has no audio stream: {file_path}"
+
+    sample_rate = int(stream.get("sample_rate") or 0)
+    channels = int(stream.get("channels") or 0)
+    duration = float(
+        stream.get("duration") or payload.get("format", {}).get("duration") or 0.0
+    )
+    assert sample_rate > 0, f"Audio stream has invalid sample rate: {sample_rate}"
+    assert channels > 0, f"Audio stream has invalid channel count: {channels}"
+    assert (
+        math.isfinite(duration) and duration > 0
+    ), f"Audio stream has invalid duration: {duration}"
+    return AudioStreamInfo(sample_rate, channels, duration)
+
+
+def extract_audio_pcm(
+    file_path: str,
+    sample_rate: int = AUDIO_CONSISTENCY_SAMPLE_RATE,
+) -> np.ndarray:
+    """Decode the first audio stream as mono float32 PCM."""
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-i",
+                file_path,
+                "-map",
+                "0:a:0",
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                str(sample_rate),
+                "-f",
+                "f32le",
+                "pipe:1",
+            ],
+            check=True,
+            capture_output=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        stderr = getattr(exc, "stderr", b"")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        raise AssertionError(
+            f"Unable to decode audio stream in {file_path}: {stderr or exc}"
+        ) from exc
+    return np.frombuffer(result.stdout, dtype="<f4").copy()
+
+
+def extract_audio_pcm_from_video_bytes(
+    video_bytes: bytes,
+    sample_rate: int = AUDIO_CONSISTENCY_SAMPLE_RATE,
+) -> np.ndarray:
+    with tempfile.NamedTemporaryFile(suffix=".mp4") as tmp:
+        tmp.write(video_bytes)
+        tmp.flush()
+        return extract_audio_pcm(tmp.name, sample_rate)
+
+
+def validate_audio_output(file_path: str) -> AudioStreamInfo:
+    """Validate that a media file contains finite, non-silent audio."""
+    info = probe_audio_stream(file_path)
+    audio = extract_audio_pcm(file_path)
+    assert audio.size > 0, f"Decoded audio stream is empty: {file_path}"
+    assert np.isfinite(audio).all(), f"Decoded audio contains NaN or inf: {file_path}"
+    rms = float(np.sqrt(np.mean(np.square(audio, dtype=np.float64))))
+    assert rms > 1e-5, f"Decoded audio is silent or near-silent: rms={rms:.3e}"
+    return info
+
+
+def encode_audio_gt_wav(
+    audio: np.ndarray,
+    sample_rate: int = AUDIO_CONSISTENCY_SAMPLE_RATE,
+) -> bytes:
+    pcm = np.round(np.clip(audio, -1.0, 1.0) * 32767.0).astype("<i2")
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm.tobytes())
+    return output.getvalue()
+
+
+def save_audio_gt_artifact(
+    artifact_dir: str | None,
+    case_id: str,
+    num_gpus: int,
+    audio: np.ndarray,
+) -> Path | None:
+    if not artifact_dir:
+        return None
+    path = Path(artifact_dir) / f"{case_id}_{num_gpus}gpu_audio.wav"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(encode_audio_gt_wav(audio))
+    return path
+
+
+def decode_audio_gt_wav(
+    content: bytes,
+    expected_sample_rate: int = AUDIO_CONSISTENCY_SAMPLE_RATE,
+) -> np.ndarray:
+    with wave.open(io.BytesIO(content), "rb") as wav:
+        assert wav.getnchannels() == 1, "Audio GT must be mono"
+        assert wav.getsampwidth() == 2, "Audio GT must use signed 16-bit PCM"
+        assert wav.getframerate() == expected_sample_rate, (
+            f"Audio GT sample rate must be {expected_sample_rate}, "
+            f"got {wav.getframerate()}"
+        )
+        pcm = np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2")
+    return pcm.astype(np.float32) / 32767.0
+
+
 def _normalize_consistency_platform(platform: str) -> str:
     normalized = platform.strip().lower().replace("_", "-")
     normalized = normalized.replace("-", "")
@@ -797,6 +959,24 @@ class ConsistencyThresholds:
     mean_abs_diff_threshold: float
 
 
+@dataclass(frozen=True)
+class AudioConsistencyThresholds:
+    spectral_similarity_threshold: float
+    waveform_correlation_threshold: float
+    rms_db_diff_threshold: float
+    duration_diff_threshold: float
+
+
+@dataclass(frozen=True)
+class AudioConsistencyResult:
+    passed: bool
+    spectral_similarity: float
+    waveform_correlation: float
+    rms_db_diff: float
+    duration_diff: float
+    thresholds: AudioConsistencyThresholds
+
+
 def get_consistency_thresholds(
     case_id: str,
     is_video: bool,
@@ -847,6 +1027,130 @@ def get_consistency_thresholds(
                 "mean_abs_diff_threshold", defaults["mean_abs_diff_threshold"]
             )
         ),
+    )
+
+
+def get_audio_consistency_thresholds(
+    case_id: str,
+    metadata: dict[str, Any] | None = None,
+) -> AudioConsistencyThresholds:
+    if metadata is None:
+        metadata = _load_threshold_json()
+    case_meta = metadata.get("cases", {}).get(case_id, {})
+    return AudioConsistencyThresholds(
+        spectral_similarity_threshold=float(
+            case_meta.get(
+                "audio_spectral_similarity_threshold",
+                metadata.get(
+                    "default_audio_spectral_similarity_threshold",
+                    DEFAULT_AUDIO_SPECTRAL_SIMILARITY_THRESHOLD,
+                ),
+            )
+        ),
+        waveform_correlation_threshold=float(
+            case_meta.get(
+                "audio_waveform_correlation_threshold",
+                metadata.get(
+                    "default_audio_waveform_correlation_threshold",
+                    DEFAULT_AUDIO_WAVEFORM_CORRELATION_THRESHOLD,
+                ),
+            )
+        ),
+        rms_db_diff_threshold=float(
+            case_meta.get(
+                "audio_rms_db_diff_threshold",
+                metadata.get(
+                    "default_audio_rms_db_diff_threshold",
+                    DEFAULT_AUDIO_RMS_DB_DIFF_THRESHOLD,
+                ),
+            )
+        ),
+        duration_diff_threshold=float(
+            case_meta.get(
+                "audio_duration_diff_threshold",
+                metadata.get(
+                    "default_audio_duration_diff_threshold",
+                    DEFAULT_AUDIO_DURATION_DIFF_THRESHOLD,
+                ),
+            )
+        ),
+    )
+
+
+def _audio_magnitude_spectrogram(audio: np.ndarray) -> np.ndarray:
+    frame_length = 512
+    hop_length = 160
+    if audio.size < frame_length:
+        audio = np.pad(audio, (0, frame_length - audio.size))
+    frame_count = 1 + (audio.size - frame_length) // hop_length
+    frames = np.lib.stride_tricks.sliding_window_view(audio, frame_length)[
+        : frame_count * hop_length : hop_length
+    ]
+    window = np.hanning(frame_length).astype(np.float32)
+    magnitude = np.abs(np.fft.rfft(frames * window, axis=1))
+    return np.sqrt(magnitude).astype(np.float32, copy=False)
+
+
+def compare_audio_with_gt(
+    output_audio: np.ndarray,
+    gt_audio: np.ndarray,
+    thresholds: AudioConsistencyThresholds,
+    sample_rate: int = AUDIO_CONSISTENCY_SAMPLE_RATE,
+) -> AudioConsistencyResult:
+    output_audio = np.asarray(output_audio, dtype=np.float32).reshape(-1)
+    gt_audio = np.asarray(gt_audio, dtype=np.float32).reshape(-1)
+    if output_audio.size == 0 or gt_audio.size == 0:
+        raise ValueError("Audio consistency inputs must be non-empty")
+    if not np.isfinite(output_audio).all() or not np.isfinite(gt_audio).all():
+        raise ValueError("Audio consistency inputs must be finite")
+
+    duration_diff = abs(output_audio.size - gt_audio.size) / float(sample_rate)
+    sample_count = min(output_audio.size, gt_audio.size)
+    output = output_audio[:sample_count]
+    target = gt_audio[:sample_count]
+
+    output_centered = output - float(output.mean())
+    target_centered = target - float(target.mean())
+    correlation_denominator = float(
+        np.linalg.norm(output_centered) * np.linalg.norm(target_centered)
+    )
+    waveform_correlation = (
+        float(np.dot(output_centered, target_centered)) / correlation_denominator
+        if correlation_denominator > 0
+        else 0.0
+    )
+
+    output_spectrum = _audio_magnitude_spectrogram(output)
+    target_spectrum = _audio_magnitude_spectrogram(target)
+    spectral_denominator = float(
+        np.linalg.norm(output_spectrum) * np.linalg.norm(target_spectrum)
+    )
+    spectral_similarity = (
+        float(np.vdot(output_spectrum, target_spectrum)) / spectral_denominator
+        if spectral_denominator > 0
+        else 0.0
+    )
+
+    output_rms = float(np.sqrt(np.mean(np.square(output, dtype=np.float64))))
+    target_rms = float(np.sqrt(np.mean(np.square(target, dtype=np.float64))))
+    rms_db_diff = abs(
+        20.0 * math.log10(max(output_rms, 1e-12))
+        - 20.0 * math.log10(max(target_rms, 1e-12))
+    )
+
+    passed = (
+        spectral_similarity >= thresholds.spectral_similarity_threshold
+        and waveform_correlation >= thresholds.waveform_correlation_threshold
+        and rms_db_diff <= thresholds.rms_db_diff_threshold
+        and duration_diff <= thresholds.duration_diff_threshold
+    )
+    return AudioConsistencyResult(
+        passed=passed,
+        spectral_similarity=spectral_similarity,
+        waveform_correlation=waveform_correlation,
+        rms_db_diff=rms_db_diff,
+        duration_diff=duration_diff,
+        thresholds=thresholds,
     )
 
 
@@ -1115,6 +1419,30 @@ def get_action_consistency_gt_candidates(case_id: str, num_gpus: int) -> list[st
     ]
 
 
+def _audio_consistency_gt_filenames(case_id: str, num_gpus: int) -> list[str]:
+    case_id = get_consistency_gt_case_id(case_id)
+    return [f"{case_id}_{num_gpus}gpu_audio.wav"]
+
+
+def get_audio_consistency_gt_candidate_sets(
+    case_id: str,
+    num_gpus: int,
+) -> list[list[str]]:
+    candidates = _audio_consistency_gt_filenames(case_id, num_gpus)
+    if _is_ascend_consistency_case(case_id) or current_platform.is_npu():
+        return [candidates]
+    platform = get_consistency_platform()
+    return [[f"{platform}/{candidate}" for candidate in candidates], candidates]
+
+
+def get_audio_consistency_gt_candidates(case_id: str, num_gpus: int) -> list[str]:
+    return [
+        candidate
+        for candidate_set in get_audio_consistency_gt_candidate_sets(case_id, num_gpus)
+        for candidate in candidate_set
+    ]
+
+
 def get_consistency_gt_remote_files(
     case_id: str, num_gpus: int, is_video: bool, output_format: str | None = None
 ) -> list[tuple[str, str]]:
@@ -1137,6 +1465,19 @@ def get_action_consistency_gt_remote_files(
     if files:
         return files
     filenames = get_action_consistency_gt_candidates(case_id, num_gpus)
+    return [
+        (filename, f"{SGL_TEST_FILES_CONSISTENCY_GT_BASE}/{filename}")
+        for filename in filenames
+    ]
+
+
+def get_audio_consistency_gt_remote_files(
+    case_id: str, num_gpus: int
+) -> list[tuple[str, str]]:
+    files = _find_remote_audio_consistency_gt_files(case_id, num_gpus)
+    if files:
+        return files
+    filenames = get_audio_consistency_gt_candidates(case_id, num_gpus)
     return [
         (filename, f"{SGL_TEST_FILES_CONSISTENCY_GT_BASE}/{filename}")
         for filename in filenames
@@ -1291,20 +1632,29 @@ def _remote_file_exists(url: str) -> bool | None:
 
 def _load_remote_gt_image(url: str) -> np.ndarray:
     last_error: Exception | None = None
-    for _ in range(3):
+    attempts = 3
+    for attempt in range(1, attempts + 1):
         try:
             resp = requests.get(url, timeout=60)
             try:
                 if resp.status_code == 200:
-                    image = Image.open(io.BytesIO(resp.content)).convert("RGB")
-                    return np.array(image)
+                    with Image.open(io.BytesIO(resp.content)) as image:
+                        return np.array(image.convert("RGB"))
                 last_error = FileNotFoundError(f"GT image not found: {url}")
                 if resp.status_code not in (403, 429) and resp.status_code < 500:
                     break
             finally:
                 resp.close()
-        except requests.RequestException as exc:
+        except (OSError, ValueError, requests.RequestException) as exc:
             last_error = exc
+        if attempt < attempts:
+            logger.warning(
+                "GT image download failed (attempt %d/%d), retrying: %s",
+                attempt,
+                attempts,
+                url,
+            )
+            time.sleep(attempt)
     raise FileNotFoundError(f"GT image not found: {url}") from last_error
 
 
@@ -1375,6 +1725,35 @@ def _find_remote_action_consistency_gt_files(
     return []
 
 
+def _find_remote_audio_consistency_gt_files(
+    case_id: str,
+    num_gpus: int,
+) -> list[tuple[str, str]]:
+    for filenames in get_audio_consistency_gt_candidate_sets(case_id, num_gpus):
+        for base_url in _remote_consistency_gt_base_urls(case_id):
+            candidates = [
+                (filename, f"{base_url}/{filename}") for filename in filenames
+            ]
+            if _is_official_consistency_gt_base_url(base_url):
+                candidates = [
+                    (filename, url)
+                    for filename, url in candidates
+                    if _official_consistency_gt_candidate_is_declared(case_id, filename)
+                ]
+                if not candidates:
+                    continue
+            uncertain_candidate = None
+            for filename, url in candidates:
+                exists = _remote_file_exists(url)
+                if exists is True:
+                    return [(filename, url)]
+                if exists is None and uncertain_candidate is None:
+                    uncertain_candidate = (filename, url)
+            if uncertain_candidate is not None:
+                return [uncertain_candidate]
+    return []
+
+
 def _get_consistency_gt_dir() -> Path | None:
     """Return the local GT directory when configured."""
     d = os.environ.get("SGLANG_CONSISTENCY_GT_DIR")
@@ -1400,6 +1779,13 @@ def _get_action_consistency_gt_cache_key(case_id: str, num_gpus: int) -> str:
     source = str(gt_dir) if gt_dir is not None else "remote"
     platform = get_consistency_platform()
     return f"{platform}:{case_id}:{num_gpus}:action:{source}"
+
+
+def _get_audio_consistency_gt_cache_key(case_id: str, num_gpus: int) -> str:
+    gt_dir = _get_consistency_gt_dir()
+    source = str(gt_dir) if gt_dir is not None else "remote"
+    platform = get_consistency_platform()
+    return f"{platform}:{case_id}:{num_gpus}:audio:{source}"
 
 
 def load_consistency_gt(
@@ -1534,6 +1920,62 @@ def load_action_consistency_gt(case_id: str, num_gpus: int) -> dict[str, Any]:
     return loaded_gt
 
 
+def _load_remote_gt_bytes(url: str) -> bytes:
+    last_error: Exception | None = None
+    for _ in range(3):
+        try:
+            resp = requests.get(url, timeout=60)
+            try:
+                if resp.status_code == 200:
+                    return resp.content
+                last_error = FileNotFoundError(f"GT file not found: {url}")
+                if resp.status_code not in (403, 429) and resp.status_code < 500:
+                    break
+            finally:
+                resp.close()
+        except requests.RequestException as exc:
+            last_error = exc
+    raise FileNotFoundError(f"GT file not found: {url}") from last_error
+
+
+def load_audio_consistency_gt(case_id: str, num_gpus: int) -> np.ndarray:
+    cache_key = _get_audio_consistency_gt_cache_key(case_id, num_gpus)
+    cached = _consistency_gt_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    gt_dir = _get_consistency_gt_dir()
+    if gt_dir is not None:
+        path = next(
+            (
+                gt_dir / filename
+                for filename in get_audio_consistency_gt_candidates(case_id, num_gpus)
+                if (gt_dir / filename).exists()
+            ),
+            None,
+        )
+        if path is None:
+            candidates = get_audio_consistency_gt_candidates(case_id, num_gpus)
+            raise FileNotFoundError(
+                f"GT audio not found in {gt_dir}. Tried: {', '.join(candidates)}"
+            )
+        content = path.read_bytes()
+        logger.info("Loaded audio GT for %s from %s", case_id, path)
+    else:
+        remote_files = _find_remote_audio_consistency_gt_files(case_id, num_gpus)
+        if not remote_files:
+            candidates = get_audio_consistency_gt_candidates(case_id, num_gpus)
+            raise FileNotFoundError(
+                f"GT audio not found for {case_id}. Tried: {', '.join(candidates)}"
+            )
+        content = _load_remote_gt_bytes(remote_files[0][1])
+        logger.info("Loaded audio GT for %s from %s", case_id, remote_files[0][1])
+
+    loaded_gt = decode_audio_gt_wav(content)
+    _consistency_gt_cache[cache_key] = loaded_gt
+    return loaded_gt
+
+
 def load_gt_embeddings(
     case_id: str,
     num_gpus: int,
@@ -1580,6 +2022,23 @@ def gt_exists(
     found = bool(
         _find_remote_consistency_gt_files(case_id, num_gpus, is_video, output_format)
     )
+    if found:
+        _gt_exists_remote_cache.add(cache_key)
+    return found
+
+
+def audio_gt_exists(case_id: str, num_gpus: int) -> bool:
+    gt_dir = _get_consistency_gt_dir()
+    if gt_dir is not None:
+        return any(
+            (gt_dir / candidate).exists()
+            for candidate in get_audio_consistency_gt_candidates(case_id, num_gpus)
+        )
+
+    cache_key = _get_audio_consistency_gt_cache_key(case_id, num_gpus)
+    if cache_key in _gt_exists_remote_cache:
+        return True
+    found = bool(_find_remote_audio_consistency_gt_files(case_id, num_gpus))
     if found:
         _gt_exists_remote_cache.add(cache_key)
     return found
