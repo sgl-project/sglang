@@ -287,7 +287,7 @@ async def lifespan(fast_api_app: FastAPI):
         thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
 
     # Add prometheus middleware
-    if server_args.enable_metrics:
+    if get_observability().enable_metrics:
         add_prometheus_middleware(app)
         enable_func_timer()
 
@@ -491,6 +491,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
     get_model,
+    get_observability,
     get_parallel,
     get_serving,
     publish,
@@ -2545,7 +2546,7 @@ def _setup_and_run_http_server(
     if tokenizer_manager is not None:
         tokenizer_manager._subprocess_watchdog = subprocess_watchdog
 
-    if server_args.enable_metrics:
+    if get_observability().enable_metrics:
         add_prometheus_track_response_middleware(app)
 
     # Pass additional arguments to the lifespan function.
@@ -2607,12 +2608,13 @@ def _setup_and_run_http_server(
             if server_args.enable_http2:
                 logger.info(
                     f"Starting embedded Granian HTTP/2 server on "
-                    f"{server_args.host}:{server_args.port}"
+                    f"{get_serving().host}:{get_serving().port}"
                 )
                 _run_granian_server(
-                    host=server_args.host,
-                    port=server_args.port,
-                    log_level=server_args.log_level_http or server_args.log_level,
+                    host=get_serving().host,
+                    port=get_serving().port,
+                    log_level=get_observability().log_level_http
+                    or get_observability().log_level,
                     http2_max_concurrent_streams=(
                         server_args.http2_max_concurrent_streams
                     ),
@@ -2626,10 +2628,11 @@ def _setup_and_run_http_server(
                 # Use Config/Server API for access to the SSLContext.
                 config = uvicorn.Config(
                     app,
-                    host=server_args.host,
-                    port=server_args.port,
+                    host=get_serving().host,
+                    port=get_serving().port,
                     root_path=server_args.fastapi_root_path,
-                    log_level=server_args.log_level_http or server_args.log_level,
+                    log_level=get_observability().log_level_http
+                    or get_observability().log_level,
                     timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
                     loop="uvloop",
                     ssl_keyfile=server_args.ssl_keyfile,
@@ -2663,10 +2666,11 @@ def _setup_and_run_http_server(
                 # Default case, one tokenizer process
                 uvicorn.run(
                     app,
-                    host=server_args.host,
-                    port=server_args.port,
+                    host=get_serving().host,
+                    port=get_serving().port,
                     root_path=server_args.fastapi_root_path,
-                    log_level=server_args.log_level_http or server_args.log_level,
+                    log_level=get_observability().log_level_http
+                    or get_observability().log_level,
                     timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
                     loop="uvloop",
                     ssl_keyfile=server_args.ssl_keyfile,
@@ -2694,12 +2698,13 @@ def _setup_and_run_http_server(
             if server_args.enable_http2:
                 logger.info(
                     f"Starting embedded Granian HTTP/2 server on "
-                    f"{server_args.host}:{server_args.port}"
+                    f"{get_serving().host}:{get_serving().port}"
                 )
                 _run_granian_server(
-                    host=server_args.host,
-                    port=server_args.port,
-                    log_level=server_args.log_level_http or server_args.log_level,
+                    host=get_serving().host,
+                    port=get_serving().port,
+                    log_level=get_observability().log_level_http
+                    or get_observability().log_level,
                     http2_max_concurrent_streams=(
                         server_args.http2_max_concurrent_streams
                     ),
@@ -2712,10 +2717,11 @@ def _setup_and_run_http_server(
             else:
                 uvicorn.run(
                     "sglang.srt.entrypoints.http_server:app",
-                    host=server_args.host,
-                    port=server_args.port,
+                    host=get_serving().host,
+                    port=get_serving().port,
                     root_path=server_args.fastapi_root_path,
-                    log_level=server_args.log_level_http or server_args.log_level,
+                    log_level=get_observability().log_level_http
+                    or get_observability().log_level,
                     timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
                     timeout_worker_healthcheck=envs.SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT.get(),
                     loop="uvloop",
@@ -2753,12 +2759,12 @@ def _start_native_grpc_server_for_runtime(
     )
 
     grpc_handle = grpc_native.start_server(
-        host=server_args.host,
+        host=get_serving().host,
         port=grpc_port,
         runtime_handle=runtime_handle,
         worker_threads=server_args.grpc_worker_threads,
     )
-    logger.info(f"Native gRPC server started on {server_args.host}:{grpc_port}")
+    logger.info(f"Native gRPC server started on {get_serving().host}:{grpc_port}")
     return grpc_handle
 
 
