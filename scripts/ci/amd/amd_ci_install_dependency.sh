@@ -305,7 +305,7 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
     git checkout '${MORI_COMMIT}'
     git submodule update --init --recursive
     if [[ '${ROCM_VERSION}' != 'unknown' ]] && [[ \"\$(printf '%s\n' '7.14.0' '${ROCM_VERSION}' | sort -V | head -n1)\" == '7.14.0' ]]; then
-      apt-get update
+      apt-get update || echo '[MORI] apt-get update reported errors; continuing with the indexes it did fetch'
       apt-get install -y --no-install-recommends libgrpc++-dev 2>/dev/null || true
       # Fix ROCm SDK: add find_package(NUMA) before hsakmt
       sed -i '/find_package(hsa-runtime64 REQUIRED)/i find_package(NUMA REQUIRED)' src/application/CMakeLists.txt; \
