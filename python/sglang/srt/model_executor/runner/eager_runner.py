@@ -113,10 +113,10 @@ class EagerRunner(BaseRunner):
             # (expand_for_topk_draft) before the eager fallback.
             max_bs *= get_spec().speculative_eagle_topk
         # Mirror prepare_mlp_sync_batch padding so the registry holds what load_batch copies.
-        max_bs = get_eager_max_batch_size(sa, max_bs)
+        max_bs = get_eager_max_batch_size(max_bs)
         prefill_ceiling = max(mr.max_total_num_tokens, max_prefill_buffer_tokens())
         max_num_token = max(prefill_ceiling, max_bs * num_tokens_per_req)
-        if require_mlp_sync(sa):
+        if require_mlp_sync():
             from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 
             max_num_token = ceil_align(max_num_token, self.attn_tp_size)

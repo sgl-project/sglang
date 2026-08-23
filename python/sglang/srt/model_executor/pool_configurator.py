@@ -259,7 +259,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 calculate_mla_kv_cache_dim(
                     model_config=model_config,
                     kv_cache_dtype=kv_cache_dtype,
-                    server_args=kvc.server_args,
                 )
                 * effective_num_layers
                 * kv_size
@@ -465,7 +464,6 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 calculate_mla_kv_cache_dim(
                     model_config=model_config,
                     kv_cache_dtype=kv_cache_dtype,
-                    server_args=kvc.server_args,
                 )
                 * kv_size
             )

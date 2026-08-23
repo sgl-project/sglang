@@ -538,7 +538,7 @@ def decode(input_token_ids, batch, model_runner):
 
 
 def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
-    if require_mlp_sync(model_runner.server_args):
+    if require_mlp_sync():
         prepare_mlp_sync_batch_raw(
             batch,
             model_runner=model_runner,
@@ -548,7 +548,7 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
             tp_group=model_runner.tp_group,
             get_idle_batch=None,
             disable_cuda_graph=cuda_graph_fully_disabled(),
-            require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
+            require_mlp_tp_gather=require_mlp_tp_gather(),
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=set(),
         )

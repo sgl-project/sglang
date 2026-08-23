@@ -67,9 +67,7 @@ class LoadedModel(msgspec.Struct, frozen=True, kw_only=True):
     startup_weight_load: Optional[Any] = None
 
 
-def maybe_downgrade_dtype_for_legacy_gpu(
-    *, server_args: ServerArgs, model_config: ModelConfig
-) -> None:
+def maybe_downgrade_dtype_for_legacy_gpu(*, model_config: ModelConfig) -> None:
     if torch.cuda.get_device_capability()[0] < 8:
         logger.info(
             "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
@@ -85,7 +83,7 @@ def maybe_downgrade_dtype_for_legacy_gpu(
 
 
 def maybe_trigger_remote_instance_nccl_send_group(
-    *, server_args: ServerArgs, tp_rank: int, load_format: Optional[str] = None
+    *, tp_rank: int, load_format: Optional[str] = None
 ) -> None:
     """``load_format`` is this runner's effective format: a draft loading under
     ``--speculative-draft-draft-load-format`` needs its own send group, and the
@@ -151,7 +149,7 @@ def resolve_sliding_window_size(model, model_config: ModelConfig) -> Optional[in
     return sliding_window_size
 
 
-def report_online_quantization(*, model, server_args: ServerArgs) -> None:
+def report_online_quantization(*, model) -> None:
     # TODO: Make sure all models have `quant_config` attribute, and all online quantization methods register which layers they actually quantize.
     quantized_layers = getattr(
         getattr(model, "quant_config", None), "quantized_layers", None
@@ -170,7 +168,6 @@ def report_online_quantization(*, model, server_args: ServerArgs) -> None:
 def maybe_register_debug_tensor_dump_hook(
     *,
     model,
-    server_args: ServerArgs,
     spec_algorithm: SpeculativeAlgorithm,
     is_draft_worker: bool,
     tp_size: int,
@@ -237,7 +234,6 @@ def build_load_config(
 def maybe_enable_ipc_weight_cache(
     *,
     load_config: LoadConfig,
-    server_args: ServerArgs,
     tp_size: int,
     pp_rank: int,
     tp_rank: int,

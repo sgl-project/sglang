@@ -410,7 +410,6 @@ def build_hybrid_swa_stack(
 def _deepseek_v4_num_host_pages(
     *,
     params: CacheInitParams,
-    server_args: ServerArgs,
     kvcache: Any,
     page_size: int,
     swa_page_size: int,
@@ -511,7 +510,6 @@ def build_deepseek_v4_hicache_stack(
     }
     num_host_pages, swa_num_host_pages = _deepseek_v4_num_host_pages(
         params=params,
-        server_args=server_args,
         kvcache=kvcache,
         page_size=page_size,
         swa_page_size=kvcache.swa_page_size,

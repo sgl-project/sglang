@@ -103,7 +103,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.page_size = get_schedule().page_size
         self.device = target_worker.device
 
-        self._draft_is_moe = draft_is_deepseek_v4(server_args=server_args)
+        self._draft_is_moe = draft_is_deepseek_v4()
         self._draft_dp_context_enabled = (
             get_parallel().config.enable_dp_attention and not self._draft_is_moe
         )
