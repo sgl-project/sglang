@@ -175,7 +175,10 @@ class TestQwen38Mxfp4MI35x(CustomTestCase):
                 "decodes incorrectly is not worth publishing"
             )
 
-        batch_sizes = _parse_int_list_env("NIGHTLY_BATCH_SIZES", "1,8,16,64")
+        # The leading 1 is repeated so generate_simple_markdown_report drops it
+        # as a warmup: bench_one_batch_server measures every batch as it comes,
+        # and batch 1 is both the first and the row a cold cache distorts most.
+        batch_sizes = _parse_int_list_env("NIGHTLY_BATCH_SIZES", "1,1,8,16,64")
         input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "1024"))
         output_lens = tuple(_parse_int_list_env("NIGHTLY_OUTPUT_LENS", "1024"))
 
