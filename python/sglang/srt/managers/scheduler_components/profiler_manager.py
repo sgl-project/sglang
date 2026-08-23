@@ -82,6 +82,11 @@ class SchedulerProfilerManager:
         self.nsys_exact_batch = int(
             os.getenv("SGLANG_NSYS_EXACT_RUNNING_BATCH", "0") or "0"
         )
+        self.nsys_exact_decode_batches = int(
+            os.getenv("SGLANG_NSYS_EXACT_DECODE_BATCHES", "2") or "2"
+        )
+        if self.nsys_exact_decode_batches <= 0:
+            raise ValueError("SGLANG_NSYS_EXACT_DECODE_BATCHES must be positive")
         self.nsys_exact_decode_batches_seen = 0
 
         # For ROCM
@@ -446,7 +451,8 @@ class SchedulerProfilerManager:
             # Check profiler
             exact_decode_boundary_ready = (
                 not self.nsys_exact_batch
-                or self.nsys_exact_decode_batches_seen >= 2
+                or self.nsys_exact_decode_batches_seen
+                >= self.nsys_exact_decode_batches
             )
             if (
                 self.profiler_target_forward_ct
