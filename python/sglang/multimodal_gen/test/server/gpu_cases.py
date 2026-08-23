@@ -1183,11 +1183,6 @@ def _make_5090_h3_consumer_budget_case() -> DiffusionTestCase:
             ],
             env_vars={
                 "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": "32",
-                # The mapped/pinned host economy is the thing under test; the
-                # streamer loads weights without the checkpoint mapping and
-                # turns the whole DiT into anonymous copies (measured 65.9 GiB
-                # on the CI runner, which the host-anon budget rightly fails).
-                "SGLANG_USE_RUNAI_MODEL_STREAMER": "0",
                 "SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB": "12",
                 # the decode holds two thirds of the decoder against the 12 GiB
                 # cap; without expandable segments, fragmentation tips the
