@@ -31,11 +31,15 @@ class TestContextOverride(CustomTestCase):
 
     def test_override_writes_bag_not_server_args(self):
         sa = self._publish()
-        before = sa.hicache_ratio
+        # The published leaf, not the field: `hicache_ratio` is resolved by
+        # declaration, so the field still holds what the caller passed.
+        before = rc.get_memory().hicache_ratio
+        pristine = sa.hicache_ratio
         rc.get_context().override("test", hicache_ratio=before + 1.0)
         self.assertEqual(rc.get_memory().hicache_ratio, before + 1.0)
-        # server_args stays the pristine startup record.
-        self.assertEqual(sa.hicache_ratio, before)
+        # server_args stays the pristine startup record: the override does not
+        # touch it, and neither did resolution.
+        self.assertEqual(sa.hicache_ratio, pristine)
 
     def test_override_routes_across_namespaces(self):
         self._publish()
