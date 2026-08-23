@@ -1195,11 +1195,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # structure about the state rows, so we don't split them across CP ranks
         # -- just let rank 0 send the whole thing (unless layer split already
         # shards it per rank).
-        if (
-            self.attn_cp_size > 1
-            and self.attn_cp_rank != 0
-            and not get_parallel().enable_dsa_cache_layer_split
-        ):
+        if self._should_skip_cp_replicated_state_transfer():
             skip_state = True
 
         if not self.is_hybrid_mla_backend:
