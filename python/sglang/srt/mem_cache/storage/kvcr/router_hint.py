@@ -147,7 +147,7 @@ class RouterHint(msgspec.Struct, frozen=True, kw_only=True):
         """
         if extra_info is None:
             return None
-        raw = getattr(extra_info, "extra_info", None)
+        raw = extra_info.extra_info
         if not isinstance(raw, dict):
             return None
         return cls.maybe_from_payload(raw.get(ROUTER_HINT_KEY))
