@@ -192,10 +192,6 @@ class Platform:
         """Return whether a device type belongs to this platform."""
         return device_type == self.device_type
 
-    def supports_non_blocking_host_transfer(self) -> bool:
-        """Return whether transfers between the host and device can be async."""
-        return False
-
     @lru_cache(maxsize=1)
     def is_mps(self) -> bool:
         return self._enum == PlatformEnum.MPS

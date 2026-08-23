@@ -174,10 +174,7 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
         self.wait_for_use(module, use, state)
         tensor = _module_reference_tensor(module)
         if tensor is not None and tensor.device.type != "cpu":
-            module.to(
-                "cpu",
-                non_blocking=current_platform.supports_non_blocking_host_transfer(),
-            )
+            module.to("cpu", non_blocking=True)
         self._ready_events.pop(use.component_name, None)
 
     def finish_request(

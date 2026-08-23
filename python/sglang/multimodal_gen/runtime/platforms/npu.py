@@ -40,9 +40,6 @@ class NPUPlatformBase(Platform):
     dispatch_key: str = "NPU"
     device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
 
-    def supports_non_blocking_host_transfer(self) -> bool:
-        return True
-
     @classmethod
     def get_local_torch_device(cls) -> torch.device:
         return torch.device(f"npu:{envs.LOCAL_RANK}")

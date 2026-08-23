@@ -401,9 +401,6 @@ class CudaPlatformBase(Platform):
     dispatch_key: str = "CUDA"
     device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
 
-    def supports_non_blocking_host_transfer(self) -> bool:
-        return True
-
     @classmethod
     def get_local_torch_device(cls) -> torch.device:
         return torch.device(f"cuda:{envs.LOCAL_RANK}")
