@@ -125,6 +125,40 @@ _REACHED_BY_SHAPES = frozenset(
 )
 
 
+def _late_resolvers():
+    """Callables that reach `declare_late_resolution`, derived per module."""
+    found = set()
+    for relative in ("server_args.py", "parser/template_detection.py"):
+        tree = ast.parse((_SRT / relative).read_text(encoding="utf-8-sig"))
+        functions = {
+            node.name: node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+
+        def reaches(name, seen=None):
+            seen = seen if seen is not None else set()
+            if name in seen or name not in functions:
+                return False
+            seen.add(name)
+            for node in ast.walk(functions[name]):
+                if not isinstance(node, ast.Call):
+                    continue
+                called = (
+                    node.func.attr
+                    if isinstance(node.func, ast.Attribute)
+                    else getattr(node.func, "id", None)
+                )
+                if called in ("declare_late_resolution", "_late_resolution"):
+                    return True
+                if called and reaches(called, seen):
+                    return True
+            return False
+
+        found |= {name for name in functions if reaches(name)}
+    return found
+
+
 def _server_args_writers(tree, path):
     """Assignment targets that land on a ServerArgs instance.
 
@@ -528,6 +562,79 @@ class TestResolutionDeclarations(CustomTestCase):
         publish(server_args, role="tokenizer")
         self.assertEqual(get_serving().reasoning_parser, "qwen3")
         self.assertEqual(server_args.reasoning_parser, get_serving().reasoning_parser)
+
+    def test_validation_can_still_resolve_before_the_record_is_published(self):
+        """The LoRA checks normalize in place, so they must precede publish.
+
+        `check_server_args` is not read-only: it infers `enable_lora`, parses
+        adapter paths and normalizes target modules through late resolution,
+        which a published record refuses. The launcher order is what keeps this
+        legal, and this is the assertion that notices if it moves.
+        """
+        from sglang.srt.runtime_context import get_lora, publish, reset_context
+
+        server_args = self._resolve(
+            {
+                "enable_lora": True,
+                "max_lora_rank": 16,
+                "lora_target_modules": ["q_proj"],
+            }
+        )
+        self.addCleanup(reset_context)
+        server_args.check_server_args()
+        publish(server_args, role="tokenizer")
+        self.assertEqual(get_lora().enable_lora, server_args.enable_lora)
+        self.assertEqual(
+            get_lora().lora_target_modules, server_args.lora_target_modules
+        )
+
+    def test_the_launcher_finishes_resolving_before_it_publishes(self):
+        """Every late resolver runs above the publish, in the source.
+
+        A published record refuses to be written, so a late resolver below the
+        publish raises at startup rather than at test time -- and only for the
+        configuration that reaches it, which is why the LoRA path can break
+        while every other launch stays green. Both sides are derived: which
+        callables reach `declare_late_resolution`, and where the launcher calls
+        them.
+        """
+        launcher = _SRT / "entrypoints/engine.py"
+        late = {"check_server_args", "resolve_auto_parsers"} | _late_resolvers()
+        tree = ast.parse(launcher.read_text(encoding="utf-8-sig"))
+        function = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "_launch_subprocesses"
+        )
+        published_at = [
+            node.lineno
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "publish"
+        ]
+        self.assertEqual(len(published_at), 1, "the launcher publishes once")
+        too_late = sorted(
+            f"{name}() at line {node.lineno}"
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            for name in [
+                (
+                    node.func.attr
+                    if isinstance(node.func, ast.Attribute)
+                    else getattr(node.func, "id", None)
+                )
+            ]
+            if name in late and node.lineno > published_at[0]
+        )
+        self.assertEqual(
+            too_late,
+            [],
+            f"these resolve after the launcher publishes at line "
+            f"{published_at[0]}, and a published record refuses to be "
+            f"written:\n  " + "\n  ".join(too_late),
+        )
 
     def test_the_stash_agrees_with_the_fields_it_declared(self):
         mismatches = []

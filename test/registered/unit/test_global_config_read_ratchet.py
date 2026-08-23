@@ -56,6 +56,13 @@ _CONFIGURED_SIZE_CALL_SITES = {
         "the launch path decides how many scheduler processes to spawn; it runs "
         "before any of them exists, so there is no group to ask"
     ),
+    ("srt/entrypoints/engine.py", "configured_attn_cp_size"): (
+        "the launcher's per-TP-rank layout, computed while deciding what to "
+        "spawn -- the groups it is laying out do not exist yet"
+    ),
+    ("srt/entrypoints/engine.py", "configured_moe_dp_size"): (
+        "the MoE factor of that same pre-spawn layout"
+    ),
     ("srt/ray/engine.py", "configured_pp_size"): (
         "the Ray driver sizes the actor placement group; the actors it is about "
         "to create are the ones that will hold the process groups"
@@ -136,6 +143,16 @@ _CONFIGURED_SIZE_CALL_SITES = {
     ): ("the same draft window, multi-layer extend"),
     ("srt/speculative/frozen_kv_mtp_cuda_graph_runner.py", "configured_pp_size"): (
         "the same draft window, frozen-KV MTP"
+    ),
+    ("srt/managers/data_parallel_controller.py", "configured_pp_size"): (
+        "the controller lays out its schedulers' ranks before spawning them, so "
+        "the groups it is sizing for do not exist yet"
+    ),
+    ("srt/managers/data_parallel_controller.py", "configured_attn_cp_size"): (
+        "the same pre-spawn rank arithmetic"
+    ),
+    ("srt/managers/data_parallel_controller.py", "configured_moe_dp_size"): (
+        "the same pre-spawn rank arithmetic"
     ),
     ("srt/entrypoints/v1_loads.py", "configured_pp_size"): (
         "the /v1/loads accelerator count is arithmetic over the launch shape, "

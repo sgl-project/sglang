@@ -445,18 +445,16 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         pool = MagicMock()
         transport.pool = pool
         manager.cuda_vmm_feature_transport = transport
-        server_args = SimpleNamespace(
-            remote_instance_weight_loader_start_seed_via_transfer_engine=False,
-            reasoning_parser=None,
-            tool_call_parser=None,
-            weight_cache_mode=None,
-            enable_elastic_expert_backup=False,
-            elastic_ep_backend=None,
-            node_rank=0,
-            tokenizer_worker_num=1,
-            check_server_args=MagicMock(),
-            resolve_once=MagicMock(),
-        )
+        # A real record: the launcher publishes it partway through, and what it
+        # reads after that comes out of the bags, which only project from a
+        # dataclass. The validation is stubbed so the dummy path still launches.
+        from sglang.srt.server_args import ServerArgs
+
+        server_args = ServerArgs(model_path="dummy", tokenizer_worker_num=1)
+        server_args.check_server_args = MagicMock()
+        from sglang.srt.runtime_context import reset_context
+
+        self.addCleanup(reset_context)
         scheduler_init_result = SimpleNamespace(
             all_child_pids=[],
             scheduler_infos=[],
