@@ -16,6 +16,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import ComfyFp8
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
     KitchenInt8Config,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a4_config import (
+    KitchenW4A4Config,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_config import (
     KitchenW4A8Config,
 )
@@ -123,6 +126,7 @@ def inspect_comfy_quant_markers(
             "float8_e4m3fn",
             "int8_tensorwise",
             "asym_w4a8_int8",
+            "convrot_w4a4",
         ):
             continue
         missing = required - checkpoint_meta.keys()
@@ -187,6 +191,33 @@ def inspect_comfy_quant_markers(
                     f"Comfy W4A8 layer {prefix!r} has an incompatible correction tensor"
                 )
             continue
+        if marker_format == "convrot_w4a4":
+            weight_dtype, weight_shape = checkpoint_meta[f"{prefix}.weight"]
+            scale_dtype, scale_shape = checkpoint_meta[f"{prefix}.weight_scale"]
+            if weight_dtype != "I8" or scale_dtype != "F32":
+                raise ValueError(
+                    f"Comfy W4A4 layer {prefix!r} needs I8 packed weights and "
+                    f"F32 scales, got {weight_dtype} and {scale_dtype}"
+                )
+            if len(weight_shape) != 2 or scale_shape != (weight_shape[0],):
+                raise ValueError(
+                    f"Comfy W4A4 layer {prefix!r} has incompatible weight/scale "
+                    f"shapes: {weight_shape} and {scale_shape}"
+                )
+            logical_input_size = weight_shape[1] * 2
+            convrot_group_size = int(marker.get("convrot_groupsize", 256))
+            if convrot_group_size not in (16, 64, 256):
+                raise ValueError(
+                    f"Comfy W4A4 layer {prefix!r} has unsupported "
+                    f"convrot_groupsize={convrot_group_size}"
+                )
+            if logical_input_size % 64 or logical_input_size % convrot_group_size:
+                raise ValueError(
+                    f"Comfy W4A4 layer {prefix!r} has input size "
+                    f"{logical_input_size}, incompatible with quant_group_size=64 "
+                    f"and convrot_groupsize={convrot_group_size}"
+                )
+            continue
         if marker_format != "int8_tensorwise":
             continue
         weight_dtype, weight_shape = checkpoint_meta[f"{prefix}.weight"]
@@ -233,6 +264,8 @@ def resolve_comfy_checkpoint_quantization(
         return KitchenW4A8Config(layer_markers)
     if formats == ["asym_w4a8_int8", "int8_tensorwise"]:
         return KitchenW4A8Config(layer_markers)
+    if formats == ["convrot_w4a4"]:
+        return KitchenW4A4Config(layer_markers)
     if formats == ["float8_e4m3fn"]:
         return ComfyFp8Config(layer_markers)
     raise NotImplementedError(
