@@ -79,6 +79,9 @@ class LTX2AVDecodingStage(DecodingStage):
         # Untiled, every stage attends over the whole volume -- minutes at a
         # full-length 121-frame grid.
         decoder.use_tiling = bool(server_args.pipeline_config.diffusion_decoder_tiling)
+        decoder.use_parallel_tiling = bool(
+            server_args.pipeline_config.diffusion_decoder_parallel_tiling
+        )
         generator = torch.Generator(device=latents.device).manual_seed(int(batch.seed))
         return decoder(latents, generator=generator)
 

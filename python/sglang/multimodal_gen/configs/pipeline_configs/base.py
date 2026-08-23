@@ -226,11 +226,15 @@ class PipelineConfig:
     vae_precision: str = "fp32"
     vae_decode_precision: str | None = None
     vae_tiling: bool = True
+    vae_slicing: bool = False
+    vae_sp: bool = True
+
+    # Diffusion Decoder configuration
     # Bounds the attention grid the diffusion decoder's stages see, which is
     # what makes a full-length decode tractable.
     diffusion_decoder_tiling: bool = True
-    vae_slicing: bool = False
-    vae_sp: bool = True
+    # Splits those tiles across the sequence-parallel ranks.
+    diffusion_decoder_parallel_tiling: bool = True
 
     # Image encoder configuration
     image_encoder_config: EncoderConfig = field(default_factory=EncoderConfig)
@@ -854,6 +858,18 @@ class PipelineConfig:
             dest=f"{prefix_with_dot.replace('-', '_')}diffusion_decoder_tiling",
             default=PipelineConfig.diffusion_decoder_tiling,
             help="Enable tiling for the LTX-2.5 diffusion decoder",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}diffusion-decoder-parallel-tiling",
+            action=StoreBoolean,
+            dest=f"{prefix_with_dot.replace('-', '_')}diffusion_decoder_parallel_tiling",
+            default=PipelineConfig.diffusion_decoder_parallel_tiling,
+            help=(
+                "Split the LTX-2.5 diffusion decoder's tiles across "
+                "sequence-parallel ranks. Requires --diffusion-decoder-tiling, "
+                "since the tiles it splits only exist on that path; inert "
+                "otherwise, and at a single rank"
+            ),
         )
         parser.add_argument(
             f"--{prefix_with_dot}vae-slicing",

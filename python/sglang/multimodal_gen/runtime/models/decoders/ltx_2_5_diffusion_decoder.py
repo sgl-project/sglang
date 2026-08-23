@@ -847,6 +847,80 @@ class LTX2VideoDiffusionDecoder3d(nn.Module):
         return self.denoise(latent_context, x_t, num_inference_steps)
 
 
+def _tile_generator(
+    base_seed: int, tile_index: int, device: torch.device
+) -> torch.Generator:
+    """A generator for one tile, independent of the order tiles are visited.
+
+    Drawing the tiles' noise from one shared generator inside the loop ties the
+    result to that loop order, so a rank that only computes a subset of the
+    tiles would get different noise. Deriving a seed per tile instead makes any
+    rank able to reproduce any tile, and keeps the output identical whatever
+    the rank count.
+    """
+    generator = torch.Generator(device=device)
+    # Odd multiplier, so the sequence of tile indices maps to well-spread seeds.
+    generator.manual_seed((base_seed + 0x9E3779B1 * (tile_index + 1)) % (2**63 - 1))
+    return generator
+
+
+def _all_gather_tiles(
+    local_tiles: list[torch.Tensor], local_indices: list[int], total: int
+) -> list[torch.Tensor]:
+    """Collect every rank's decoded tiles, restoring global tile order.
+
+    Tiles at the grid edges differ in shape, so the payloads are flattened and
+    padded to a common length and the shapes travel alongside them.
+    """
+    import torch.distributed as dist
+
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+        get_sp_group,
+    )
+
+    group = get_sp_group().device_group
+    world_size = dist.get_world_size(group=group)
+
+    if local_tiles:
+        payload = torch.cat([t.reshape(-1) for t in local_tiles]).contiguous()
+    else:
+        payload = torch.empty(0, device="cuda", dtype=torch.bfloat16)
+
+    sizes = [
+        torch.zeros(1, dtype=torch.int64, device=payload.device)
+        for _ in range(world_size)
+    ]
+    dist.all_gather(
+        sizes,
+        torch.tensor([payload.numel()], dtype=torch.int64, device=payload.device),
+        group=group,
+    )
+    max_size = max(int(s.item()) for s in sizes)
+
+    padded = torch.zeros(max_size, device=payload.device, dtype=payload.dtype)
+    padded[: payload.numel()] = payload
+    gathered = torch.zeros(
+        world_size * max_size, device=payload.device, dtype=payload.dtype
+    )
+    dist.all_gather_into_tensor(gathered, padded, group=group)
+
+    meta: list = [None] * world_size
+    dist.all_gather_object(
+        meta,
+        [(i, tuple(t.shape)) for i, t in zip(local_indices, local_tiles)],
+        group=group,
+    )
+
+    tiles: list = [None] * total
+    for rank, per_rank in enumerate(meta):
+        offset = rank * max_size
+        for tile_index, shape in per_rank:
+            count = math.prod(shape)
+            tiles[tile_index] = gathered[offset : offset + count].reshape(shape)
+            offset += count
+    return tiles
+
+
 def _tile_intervals(
     length: int, tile_size: int, stride: int, min_size: int
 ) -> list[tuple[int, int]]:
@@ -898,12 +972,34 @@ class LTX2VideoDiffusionDecoderModel(nn.Module, LayerwiseOffloadableModuleMixin)
         # output only moves near tile borders. Set by the decoding stage from
         # `--diffusion-decoder-tiling`; tile sizes match upstream.
         self.use_tiling = False
+        # Shards the tiles across the sequence-parallel ranks. Only meaningful
+        # with tiling on, and only when there is more than one rank; the
+        # decoding stage sets it from `--diffusion-decoder-parallel-tiling`.
+        self.use_parallel_tiling = False
         self.tile_sample_min_height = 768
         self.tile_sample_min_width = 768
         self.tile_sample_min_num_frames = 32
         self.tile_sample_stride_height = 512
         self.tile_sample_stride_width = 512
         self.tile_sample_stride_num_frames = 16
+
+    def _tile_shard(self) -> tuple[int, int]:
+        """`(rank, world_size)` over which to split tiles, or `(0, 1)` to keep
+        every tile local."""
+        if not self.use_parallel_tiling:
+            return 0, 1
+        try:
+            from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+                get_sp_parallel_rank,
+                get_sp_world_size,
+            )
+
+            world_size = get_sp_world_size()
+        except Exception:
+            return 0, 1
+        if world_size <= 1:
+            return 0, 1
+        return get_sp_parallel_rank(), world_size
 
     @staticmethod
     def _blend(a: torch.Tensor, b: torch.Tensor, extent: int, dim: int) -> torch.Tensor:
@@ -1009,49 +1105,72 @@ class LTX2VideoDiffusionDecoderModel(nn.Module, LayerwiseOffloadableModuleMixin)
                 dtype=hidden_states.dtype,
             )
 
-        frame_groups = []
-        for t0, t1 in temporal_tiles:
+        # Flatten the grid first: the tiles are independent, so which rank runs
+        # which is just a slice of this list.
+        coords = [
+            (t0, t1, h0, h1, w0, w1)
+            for t0, t1 in temporal_tiles
+            for h0, h1 in height_tiles
+            for w0, w1 in width_tiles
+        ]
+        rank, world_size = self._tile_shard()
+        base_seed = generator.initial_seed() if generator is not None else 0
+
+        def _decode_tile(index: int) -> torch.Tensor:
+            t0, t1, h0, h1, w0, w1 = coords[index]
             is_origin = t0 == 0
             is_trailing = t1 == num_frames
             feature_t1 = features.shape[1] if is_trailing else t1
-            rows = []
-            for h0, h1 in height_tiles:
-                row = []
-                for w0, w1 in width_tiles:
-                    context = decoder.forward_stage_4(
-                        features[:, t0:feature_t1, h0:h1, w0:w1],
-                        drop_leading_frame=is_origin,
-                        crop_trailing_ghost=is_trailing,
-                    )
-                    tile_shape = (
-                        batch_size,
-                        decoder.out_channels,
-                        context.shape[1],
-                        context.shape[2] * patch_size,
-                        context.shape[3] * patch_size,
-                    )
-                    if single_step_x0:
-                        x_t = torch.randn(
-                            tile_shape,
-                            generator=generator,
-                            device=hidden_states.device,
-                            dtype=hidden_states.dtype,
-                        )
-                    else:
-                        # A non-origin tile keeps its duplicate leading frame, so
-                        # it starts one pixel frame earlier than t0 * scale_t.
-                        pixel_t0 = t0 * scale_t - (
-                            1 if not is_origin and scale_t == 2 else 0
-                        )
-                        x_t = x_t_full[
-                            :,
-                            :,
-                            pixel_t0 : pixel_t0 + tile_shape[2],
-                            h0 * scale_h : h0 * scale_h + tile_shape[3],
-                            w0 * scale_w : w0 * scale_w + tile_shape[4],
-                        ]
-                    row.append(decoder.denoise(context, x_t, num_inference_steps))
-                rows.append(row)
+            context = decoder.forward_stage_4(
+                features[:, t0:feature_t1, h0:h1, w0:w1],
+                drop_leading_frame=is_origin,
+                crop_trailing_ghost=is_trailing,
+            )
+            tile_shape = (
+                batch_size,
+                decoder.out_channels,
+                context.shape[1],
+                context.shape[2] * patch_size,
+                context.shape[3] * patch_size,
+            )
+            if single_step_x0:
+                x_t = torch.randn(
+                    tile_shape,
+                    generator=_tile_generator(base_seed, index, hidden_states.device),
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+            else:
+                # A non-origin tile keeps its duplicate leading frame, so it
+                # starts one pixel frame earlier than t0 * scale_t.
+                pixel_t0 = t0 * scale_t - (1 if not is_origin and scale_t == 2 else 0)
+                x_t = x_t_full[
+                    :,
+                    :,
+                    pixel_t0 : pixel_t0 + tile_shape[2],
+                    h0 * scale_h : h0 * scale_h + tile_shape[3],
+                    w0 * scale_w : w0 * scale_w + tile_shape[4],
+                ]
+            return decoder.denoise(context, x_t, num_inference_steps)
+
+        if world_size > 1:
+            local_indices = list(range(rank, len(coords), world_size))
+            local_tiles = [_decode_tile(i) for i in local_indices]
+            flat_tiles = _all_gather_tiles(local_tiles, local_indices, len(coords))
+        else:
+            flat_tiles = [_decode_tile(i) for i in range(len(coords))]
+
+        # Back into the (t, h, w) nesting the blending below expects.
+        per_row = len(width_tiles)
+        per_group = len(height_tiles) * per_row
+        frame_groups = []
+        for g in range(len(temporal_tiles)):
+            rows = [
+                flat_tiles[
+                    g * per_group + r * per_row : g * per_group + (r + 1) * per_row
+                ]
+                for r in range(len(height_tiles))
+            ]
 
             result_rows = []
             for i, row in enumerate(rows):
