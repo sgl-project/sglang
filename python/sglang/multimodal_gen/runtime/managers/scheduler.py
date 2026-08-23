@@ -16,6 +16,11 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
 )
+from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
+    materialize_cuda_refs,
+    release_retained_producer_tensors,
+    spill_cuda_tensors,
+)
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
     ReleaseMemoryOccupationReqInput,
@@ -36,11 +41,6 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.ipc_array import (
     is_local_endpoint,
     spill_large_arrays_to_file_refs,
-)
-from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
-    materialize_cuda_refs,
-    release_retained_producer_tensors,
-    spill_cuda_tensors,
 )
 from sglang.multimodal_gen.runtime.managers.cpu_worker import CPUWorker
 from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (

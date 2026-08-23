@@ -7,6 +7,11 @@ from typing import Any, Optional
 import zmq
 import zmq.asyncio
 
+from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
+    materialize_cuda_refs,
+    release_retained_producer_tensors,
+    spill_cuda_tensors,
+)
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
     ReleaseMemoryOccupationReqInput,
@@ -25,11 +30,6 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.ipc_array import (
     is_local_endpoint,
     materialize_file_refs,
-)
-from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
-    materialize_cuda_refs,
-    release_retained_producer_tensors,
-    spill_cuda_tensors,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
