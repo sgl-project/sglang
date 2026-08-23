@@ -178,6 +178,10 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "zai-org/glm-image",
         "z-image",
         "z-image-turbo",
+        "black-forest-labs/flux.2-klein-4b",
+        "black-forest-labs/flux.2-klein-9b",
+        "flux.2-klein-4b",
+        "flux.2-klein-9b",
     }
 )
 
@@ -193,6 +197,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "SanaPipelineConfig",
         "SanaVideoPipelineConfig",
         "ZImagePipelineConfig",
+        "Flux2KleinPipelineConfig",
     }
 )
 
@@ -649,8 +654,8 @@ class ServerArgs(DisaggServerArgsMixin):
             "[Diffusion BCG] disabled for %s: only Ideogram-4, "
             "Lightricks/LTX-2, LongCat-Image, MiniMax-H3, "
             "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, SANA-Video, "
-            "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image are "
-            "currently supported.",
+            "Tongyi-MAI/Z-Image/Z-Image-Turbo, zai-org/GLM-Image, and "
+            "FLUX.2-Klein are currently supported.",
             pipeline_config_name,
         )
         self.enable_breakable_cuda_graph = False
