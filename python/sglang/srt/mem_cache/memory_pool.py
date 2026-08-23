@@ -138,9 +138,7 @@ def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     return np.prod(t.shape) * t.dtype.itemsize
 
 
-def _bump_req_generations(
-    req_generation: torch.Tensor, indices: List[int]
-) -> None:
+def _bump_req_generations(req_generation: torch.Tensor, indices: List[int]) -> None:
     # Preserve the cheaper scalar path for the common bs=1 DSpark case,
     # while avoiding one torch dispatcher call per request for batches.
     if len(indices) == 1:
