@@ -419,6 +419,7 @@ class Plamo3Detector(BaseReasoningFormatDetector):
         force_reasoning: bool = False,
         continue_final_message: bool = False,
         previous_content: str = "",
+        force_nonempty_content: bool = False,
     ):
         super().__init__(
             "<|plamo:begin_think:plamo|>",
@@ -428,6 +429,7 @@ class Plamo3Detector(BaseReasoningFormatDetector):
             tool_start_token="<|plamo:begin_tool_requests:plamo|>",
             continue_final_message=continue_final_message,
             previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
         )
 
 

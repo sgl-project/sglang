@@ -459,6 +459,36 @@ class Plamo3ToolDetector(BaseFormatDetector):
             default=0,
         )
 
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Flush text held for a possible marker at the end of the stream.
+
+        Once a tool section has started, an incomplete request cannot be
+        recovered into a valid tool call. Match the other native-format
+        detectors by dropping that protocol fragment instead of exposing it as
+        normal text or fabricating a completed call.
+        """
+        if self._tool_requests_started:
+            if self.current_tool_name_sent:
+                self._abandon_call()
+            elif self._buffer:
+                logger.warning(
+                    "plamo3: tool requests ended with no complete tool call; "
+                    "dropping %d buffered chars",
+                    len(self._buffer),
+                )
+            self._buffer = ""
+            self._reset_inflight_call_state()
+            return StreamingParseResult()
+
+        held_marker_length = self._partial_marker_hold(self._buffer)
+        normal_text = (
+            self._buffer[: len(self._buffer) - held_marker_length]
+            if held_marker_length
+            else self._buffer
+        )
+        self._buffer = ""
+        return StreamingParseResult(normal_text=normal_text)
+
     # ------------------------------------------------------------------
     # Constrained generation
     # ------------------------------------------------------------------
@@ -524,7 +554,9 @@ class Plamo3ToolDetector(BaseFormatDetector):
                 triggers=[BEGIN_TOOL_REQUESTS],
                 tags=[outer],
                 at_least_one=at_least_one,
-                stop_after_first=False,
+                # PLaMo3 has exactly one outer wrapper. Parallelism is
+                # represented by repeated inner requests inside that wrapper.
+                stop_after_first=True,
             )
         )
 

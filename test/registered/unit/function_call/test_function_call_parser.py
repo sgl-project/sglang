@@ -4665,6 +4665,8 @@ class TestGetStructureConstraint(unittest.TestCase):
         single_content = single[1].model_dump()["format"]["tags"][0]["content"]
         self.assertEqual(parallel_content["type"], "plus")
         self.assertEqual(single_content["type"], "sequence")
+        self.assertTrue(parallel[1].model_dump()["format"]["stop_after_first"])
+        self.assertTrue(single[1].model_dump()["format"]["stop_after_first"])
 
     def test_plamo3_auto_no_strict_returns_structural_tag(self):
         parser = self._make_parser("plamo3", strict=False)
@@ -5513,9 +5515,8 @@ class TestPlamo3ToolDetector(unittest.TestCase):
         compiler = xgrammar.GrammarCompiler(xgrammar.TokenizerInfo(vocab))
         ctx = compiler.compile_structural_tag(tag.model_dump_json())
         matcher = xgrammar.GrammarMatcher(ctx)
-        sample = (
-            BEGIN_TOOL_REQUESTS
-            + BEGIN_TOOL_REQUEST
+        weather_call = (
+            BEGIN_TOOL_REQUEST
             + BEGIN_TOOL_NAME
             + "get_weather"
             + END_TOOL_NAME
@@ -5525,7 +5526,9 @@ class TestPlamo3ToolDetector(unittest.TestCase):
             + '{"city": "Tokyo"}'
             + END_TOOL_ARGUMENTS
             + END_TOOL_REQUEST
-            + BEGIN_TOOL_REQUEST
+        )
+        time_call = (
+            BEGIN_TOOL_REQUEST
             + BEGIN_TOOL_NAME
             + "get_time"
             + END_TOOL_NAME
@@ -5535,10 +5538,33 @@ class TestPlamo3ToolDetector(unittest.TestCase):
             + "{}"
             + END_TOOL_ARGUMENTS
             + END_TOOL_REQUEST
-            + END_TOOL_REQUESTS
         )
+        one_call_sample = BEGIN_TOOL_REQUESTS + weather_call + END_TOOL_REQUESTS
+        sample = BEGIN_TOOL_REQUESTS + weather_call + time_call + END_TOOL_REQUESTS
+
         # Both inner calls must be guided, not just the first one.
         self.assertTrue(matcher.accept_string(sample))
+
+        # Parallel calls belong inside the same outer wrapper. A second outer
+        # wrapper must be rejected even when parallel tool calls are enabled.
+        second_matcher = xgrammar.GrammarMatcher(ctx)
+        self.assertFalse(second_matcher.accept_string(sample + sample))
+
+        single_tag = self.detector.get_structural_tag(
+            tools=tools,
+            tool_choice="required",
+            parallel_tool_calls=False,
+        )
+        single_ctx = compiler.compile_structural_tag(single_tag.model_dump_json())
+        self.assertTrue(
+            xgrammar.GrammarMatcher(single_ctx).accept_string(one_call_sample)
+        )
+        self.assertFalse(xgrammar.GrammarMatcher(single_ctx).accept_string(sample))
+        self.assertFalse(
+            xgrammar.GrammarMatcher(single_ctx).accept_string(
+                one_call_sample + one_call_sample
+            )
+        )
 
     def test_get_structural_tag_named_choice_excludes_other_tools(self):
         tools = [
@@ -5590,6 +5616,39 @@ class TestPlamo3ToolDetector(unittest.TestCase):
         for call in second.calls:
             params += call.parameters or ""
         self.assertEqual(json.loads(params), {"city": "Kyoto"})
+
+    def test_streaming_finish_drops_partial_outer_marker(self):
+        result = self.detector.parse_streaming_increment(
+            "visible text" + BEGIN_TOOL_REQUESTS[:-3], self.tools
+        )
+        self.assertEqual(result.normal_text, "visible text")
+
+        end = self.detector.finish(self.tools)
+        self.assertEqual(end.normal_text, "")
+        self.assertEqual(end.calls, [])
+        self.assertEqual(self.detector._buffer, "")
+
+    def test_streaming_finish_abandons_incomplete_tool_request(self):
+        header = (
+            BEGIN_TOOL_REQUESTS
+            + BEGIN_TOOL_REQUEST
+            + BEGIN_TOOL_NAME
+            + "get_weather"
+            + END_TOOL_NAME
+        )
+        first = self.detector.parse_streaming_increment(header, self.tools)
+        self.assertEqual([call.name for call in first.calls], ["get_weather"])
+
+        end = self.detector.finish(self.tools)
+        self.assertEqual(end.normal_text, "")
+        self.assertEqual(end.calls, [])
+        self.assertEqual(self.detector._buffer, "")
+        self.assertFalse(self.detector.current_tool_name_sent)
+
+        # Finishing is idempotent and must not emit the abandoned call again.
+        second_end = self.detector.finish(self.tools)
+        self.assertEqual(second_end.normal_text, "")
+        self.assertEqual(second_end.calls, [])
 
 
 if __name__ == "__main__":

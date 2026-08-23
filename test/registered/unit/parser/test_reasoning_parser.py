@@ -868,6 +868,29 @@ class TestReasoningParser(CustomTestCase):
         self.assertEqual(all_reasoning, "reasoning")
         self.assertEqual(all_normal, "answer")
 
+    def test_plamo3_force_nonempty_content_via_chat_template_kwargs(self):
+        """force_nonempty_content must reach the PLaMo3 detector."""
+        from sglang.srt.entrypoints.openai.protocol import (
+            ChatCompletionMessageUserParam,
+            ChatCompletionRequest,
+        )
+
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[ChatCompletionMessageUserParam(role="user", content="Hi")],
+            chat_template_kwargs={"force_nonempty_content": True},
+        )
+        parser = ReasoningParser("plamo3", request=request)
+        self.assertTrue(parser.detector._force_nonempty_content)
+
+    def test_plamo3_force_nonempty_content_promotes_reasoning(self):
+        detector = Plamo3Detector(force_nonempty_content=True)
+        result = detector.detect_and_parse(
+            "<|plamo:begin_think:plamo|>only reasoning" "<|plamo:end_think:plamo|>"
+        )
+        self.assertEqual(result.normal_text, "only reasoning")
+        self.assertEqual(result.reasoning_text or "", "")
+
 
 class TestIntegrationScenarios(CustomTestCase):
     """Integration tests for realistic usage scenarios."""

@@ -443,7 +443,7 @@ class Plamo3ForCausalLM(nn.Module):
         ):
             # Only tie weights when both embeddings and lm_head exist.
             # In pipeline parallelism, one or both are PPMissingLayer.
-            self.lm_head.tie_weights(self.model.embed_tokens)
+            self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
         self.capture_aux_hidden_states = False
 
     def get_input_embeddings(self) -> nn.Module:
