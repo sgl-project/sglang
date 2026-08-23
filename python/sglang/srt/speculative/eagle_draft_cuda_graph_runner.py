@@ -116,10 +116,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.pp_size = get_parallel().config.pp_size
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
-        self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
-        self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
-        self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
-        self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
+        self.require_gathered_buffer = require_gathered_buffer()
+        self.require_mlp_tp_gather = require_mlp_tp_gather()
+        self.require_mlp_sync = require_mlp_sync()
+        self.require_attn_tp_gather = require_attn_tp_gather()
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )

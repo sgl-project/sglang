@@ -227,10 +227,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
-        self.require_mlp_tp_gather = require_mlp_tp_gather(
-            model_runner.server_args
-        ) and not self._forward_is_dp_local(model_runner)
-        self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
+        self.require_mlp_tp_gather = (
+            require_mlp_tp_gather() and not self._forward_is_dp_local(model_runner)
+        )
+        self.require_attn_tp_gather = require_attn_tp_gather()
         # Composite predicates derive from the instance values so the dp-local
         # draft exemption above stays consistent (require_gathered_buffer ==
         # mlp_tp_gather or attn_tp_gather; require_mlp_sync adds dp attention).
@@ -597,7 +597,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             draft_is_deepseek_v4,
         )
 
-        return not draft_is_deepseek_v4(server_args=model_runner.server_args)
+        return not draft_is_deepseek_v4()
 
     def _ragged_capture_slots(self, num_tokens: int) -> int:
         if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():

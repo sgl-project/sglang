@@ -331,7 +331,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             embed_dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
             enable_num_token_non_padded=enable_num_token_non_padded(),
-            require_gathered_buffer=require_gathered_buffer(model_runner.server_args),
+            require_gathered_buffer=require_gathered_buffer(),
             enable_prefill_cp=(
                 is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
             ),
@@ -348,8 +348,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
 
         self.dp_size = get_parallel().config.dp_size
-        self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
-        self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
+        self.require_mlp_tp_gather = require_mlp_tp_gather()
+        self.require_attn_tp_gather = require_attn_tp_gather()
 
         # --- backend ---------------------------------------------------
         # TcPiecewise resolves by running a compile pass that calls back into
@@ -601,7 +601,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         buf = self.buffer_registry.get_slot("num_token_non_padded").buffer
         buf.fill_(num_tokens)
-        if require_gathered_buffer(self.model_runner.server_args):
+        if require_gathered_buffer():
             local = compute_local_num_token_non_padded(
                 global_num_token_non_padded=buf,
                 num_tokens_per_dp=num_tokens,

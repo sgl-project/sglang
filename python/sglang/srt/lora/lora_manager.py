@@ -1030,7 +1030,6 @@ class LoRAManager:
 
 def init_lora_cuda_graph_moe_buffers(
     *,
-    server_args: ServerArgs,
     model: torch.nn.Module,
     lora_manager: LoRAManager,
     dtype: torch.dtype,

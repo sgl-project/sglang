@@ -1152,7 +1152,6 @@ class KVCacheConfigurator:
             kv_cache_dim=calculate_mla_kv_cache_dim(
                 model_config=self.model_config,
                 kv_cache_dtype=self.kv_cache_dtype,
-                server_args=self.server_args,
             ),
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
@@ -1356,7 +1355,6 @@ class KVCacheConfigurator:
             kv_cache_dim=calculate_mla_kv_cache_dim(
                 model_config=self.model_config,
                 kv_cache_dtype=self.kv_cache_dtype,
-                server_args=self.server_args,
             ),
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
@@ -1396,7 +1394,6 @@ class KVCacheConfigurator:
                 kv_cache_dim=calculate_mla_kv_cache_dim(
                     model_config=self.model_config,
                     kv_cache_dtype=self.kv_cache_dtype,
-                    server_args=self.server_args,
                 ),
             )
 
@@ -2199,10 +2196,7 @@ class KVCacheConfigurator:
 
 
 def calculate_mla_kv_cache_dim(
-    *,
-    model_config: ModelConfig,
-    kv_cache_dtype: torch.dtype,
-    server_args: ServerArgs,
+    *, model_config: ModelConfig, kv_cache_dtype: torch.dtype
 ) -> int:
     is_dsa_model = is_deepseek_dsa(model_config.hf_config)
     kv_cache_dtype = kv_cache_dtype
