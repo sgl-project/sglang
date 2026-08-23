@@ -3338,9 +3338,7 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
             mamba_prefill_align_size=(
-                self.server_args.mamba_cache_chunk_size
-                if self.is_hybrid_ssm
-                else None
+                self.server_args.mamba_cache_chunk_size if self.is_hybrid_ssm else None
             ),
         )
 

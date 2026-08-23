@@ -1377,9 +1377,7 @@ class PrefillAdder:
             mamba_aligned_input_len = self._align_mamba_prefill_chunk(
                 req, current_extend_input_len
             )
-            needs_mamba_tail_split = (
-                mamba_aligned_input_len < current_extend_input_len
-            )
+            needs_mamba_tail_split = mamba_aligned_input_len < current_extend_input_len
 
             if (
                 self.rem_chunk_tokens is None

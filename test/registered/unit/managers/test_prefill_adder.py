@@ -610,9 +610,7 @@ class TestPrefillAdder(CustomTestCase):
         req.last_node = MagicMock()
         req.sampling_params.ignore_eos = False
 
-        adder.add_one_req(
-            req, has_chunked_req=False, truncation_align_size=None
-        )
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
 
         self.assertIs(adder.new_chunked_req, req)
         req.set_extend_range.assert_called_once_with(0, 896)
