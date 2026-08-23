@@ -221,17 +221,18 @@ def _native_embedding_spec(
 
 
 def resolved_embedding_plan(
-    spec: EmbeddingModelSpec, *, server_args: Any, model_config: Any
+    spec: EmbeddingModelSpec, *, config: Any, model_config: Any
 ) -> dict[str, Any]:
     """Combine static capabilities with the effective server configuration.
 
     This boundary deliberately accepts duck-typed arguments so the declarative
     registry remains independent of ServerArgs and ModelConfig import cycles.
+    `config` must answer with the *resolved* configuration -- the readback
+    callers pass `resolving_view(record)`, since the record's fields are the raw
+    input.
     """
 
-    prefill_graph = getattr(
-        getattr(server_args, "cuda_graph_config", None), "prefill", None
-    )
+    prefill_graph = getattr(getattr(config, "cuda_graph_config", None), "prefill", None)
     backend = getattr(prefill_graph, "backend", None)
     backend_value = getattr(backend, "value", backend)
     capture_sizes = getattr(prefill_graph, "bs", None) or []
@@ -239,7 +240,7 @@ def resolved_embedding_plan(
 
     return {
         **spec.as_dict(),
-        "enabled": bool(getattr(server_args, "is_embedding", False)),
+        "enabled": bool(getattr(config, "is_embedding", False)),
         "supports_dimensions": bool(getattr(model_config, "is_matryoshka", False)),
         "matryoshka_dimensions": list(
             getattr(model_config, "matryoshka_dimensions", None) or []
@@ -252,14 +253,10 @@ def resolved_embedding_plan(
         },
         "cache": {
             "kv_cache_disabled": bool(
-                getattr(server_args, "prefill_only_disable_kv_cache", False)
+                getattr(config, "prefill_only_disable_kv_cache", False)
             ),
-            "radix_cache_disabled": bool(
-                getattr(server_args, "disable_radix_cache", False)
-            ),
-            "chunked_prefill_disabled": getattr(
-                server_args, "chunked_prefill_size", None
-            )
+            "radix_cache_disabled": bool(getattr(config, "disable_radix_cache", False)),
+            "chunked_prefill_disabled": getattr(config, "chunked_prefill_size", None)
             == -1,
         },
     }
