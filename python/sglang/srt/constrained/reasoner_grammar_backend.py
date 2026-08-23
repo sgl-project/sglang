@@ -184,6 +184,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
             # Prevent a successful response with reasoning but no answer/tool call.
             if (
                 self.enable_token_filter
+                and self.tokens_in_think >= 0
                 and self.tokens_after_end == 0
                 and self.model_eos_token_ids
             ):
