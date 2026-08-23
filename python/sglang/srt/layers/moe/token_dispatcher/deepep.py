@@ -32,13 +32,17 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,
     is_blackwell,
+    is_cuda,
     is_flashinfer_available,
     is_hip,
     is_npu,
+    is_xpu,
     load_json_config,
 )
 
+_is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 _use_zbal = _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0
 
 if TYPE_CHECKING:
@@ -51,7 +55,8 @@ try:
     else:
         from deep_ep import Buffer, Config
 
-    if not _is_npu:
+    # NPU/XPU always dispatch bf16: don't gate DeepEP on the fp8 kernel.
+    if not _is_npu and not _is_xpu:
         from sglang.kernels.ops.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
         )
@@ -83,6 +88,10 @@ def _set_nvshmem_qp_depth(num_max_dispatch_tokens_per_rank: int) -> None:
 
 
 def _is_mnnvl_fabric_supported() -> bool:
+    # NVIDIA-only transport, and the probe below touches torch.cuda.
+    if not _is_cuda:
+        return False
+
     if not is_flashinfer_available():
         return False
 
@@ -261,7 +270,8 @@ class DeepEPBuffer:
         else:
             raise NotImplementedError
 
-        if not _is_npu:
+        # SM occupancy is CUDA/HIP-only; XPU/NPU size their comm kernels.
+        if not _is_npu and not _is_xpu:
             total_num_sms = torch.cuda.get_device_properties(
                 device="cuda"
             ).multi_processor_count
@@ -484,6 +494,21 @@ class _DeepEPDispatcherImplBase:
                 raise RuntimeError(
                     "Ascend A2/A3 NPU does not support nvfp4 deepep_dispatcher_output_dtype."
                 )
+        elif _is_xpu:
+            # No fp8 expert path on XPU (supports_fp8() is False): stay bf16.
+            if self.deepep_output_dtype in (
+                DispatcherOutputDtype.FP8,
+                DispatcherOutputDtype.INT8,
+            ):
+                logger.warning_once(
+                    f"Intel XPU does not support {self.deepep_output_dtype.value} "
+                    "deepep_dispatcher_output_dtype, switching to bf16..."
+                )
+                self.deepep_output_dtype = DispatcherOutputDtype.BF16
+            elif self.deepep_output_dtype == DispatcherOutputDtype.NVFP4:
+                raise RuntimeError(
+                    "Intel XPU does not support nvfp4 deepep_dispatcher_output_dtype."
+                )
         else:
             if self.deepep_output_dtype == DispatcherOutputDtype.INT8:
                 logger.warning_once(
@@ -629,7 +654,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
 
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu or _is_xpu:
+            # XPU's bf16 triton post-permute already returns the recv layout.
             output = hidden_states
         else:
             raise NotImplementedError()  # triton runner was supported but it's temporarily disabled
@@ -829,7 +855,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         ctx = nullcontext()
         if overlap_args is not None:
             overlap_args.stream.wait_event(overlap_args.wait_event)
-            ctx = torch.cuda.stream(overlap_args.stream)
+            ctx = self.device_module.stream(overlap_args.stream)
 
             if is_blackwell():
                 overlap_args_dict = dict(

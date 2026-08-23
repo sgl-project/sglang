@@ -7340,6 +7340,30 @@ class ServerArgs:
             logger.info(f"Waterfill is enabled with moe_a2a_backend='{a2a_backend}'.")
 
         if a2a_backend == "deepep":
+            if self.device == "xpu":
+                # low_latency's masked [experts, tokens, hidden] layout needs a
+                # masked grouped GEMM (DeepGEMM on CUDA), which XPU has no
+                # equivalent for, and no deepep_ll permute is registered there.
+                if self.deepep_mode == "auto":
+                    self._declare(
+                        "_handle_a2a_moe",
+                        deepep_mode="normal",
+                    )
+                    logger.warning("auto set deepep_mode=`normal` for Intel XPU")
+                elif self.deepep_mode != "normal":
+                    raise ValueError(
+                        f"--deepep-mode {self.deepep_mode} needs a masked grouped "
+                        "GEMM that Intel XPU does not provide; pass "
+                        "--deepep-mode normal."
+                    )
+                # Only the triton runner registers DeepEP recv-layout permutes
+                # for an unquantized MoE; the others have no XPU kernels and
+                # would fail in the permute lookup instead.
+                assert resolved_view(self).moe_runner_backend in ("auto", "triton"), (
+                    f"--moe-runner-backend {resolved_view(self).moe_runner_backend} "
+                    "cannot consume a DeepEP dispatch on Intel XPU; pass "
+                    "--moe-runner-backend triton."
+                )
             if self.moe_runner_backend == "flashinfer_cutedsl":
                 if self.deepep_mode == "auto":
                     self._declare(

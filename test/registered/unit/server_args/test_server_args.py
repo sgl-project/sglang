@@ -2335,5 +2335,46 @@ class TestDcpKvEventContract(CustomTestCase):
         self.assertEqual(args.kv_event_block_size, 8)
 
 
+class TestXpuDeepEPArgs(CustomTestCase):
+    def _args(self, device="xpu", **overrides):
+        # dummy-model path short-circuits __post_init__; invoke the handler directly.
+        args = ServerArgs(
+            model_path="dummy", device=device, moe_a2a_backend="deepep", **overrides
+        )
+        # deepep_mode=normal reaches into cuda_graph_config, which the pipeline
+        # builds in an earlier handler.
+        args._parse_cuda_graph_config()
+        return args
+
+    def test_auto_deepep_mode_resolves_to_normal(self):
+        args = self._args(deepep_mode="auto")
+        args._handle_a2a_moe()
+        self.assertEqual(args.deepep_mode, "normal")
+
+    def test_low_latency_deepep_mode_raises(self):
+        args = self._args(deepep_mode="low_latency")
+        with self.assertRaisesRegex(ValueError, "--deepep-mode normal"):
+            args._handle_a2a_moe()
+
+    def test_non_triton_moe_runner_backend_raises(self):
+        args = self._args(deepep_mode="normal", moe_runner_backend="deep_gemm")
+        with self.assertRaisesRegex(AssertionError, "--moe-runner-backend triton"):
+            args._handle_a2a_moe()
+
+    def test_other_devices_are_untouched(self):
+        """Both configs below are rejected on XPU, so a missing device check
+        would turn them into startup failures on cuda / npu / cpu."""
+        for device in ("cuda", "npu", "cpu"):
+            with self.subTest(device=device):
+                args = self._args(
+                    device=device,
+                    deepep_mode="low_latency",
+                    moe_runner_backend="deep_gemm",
+                )
+                args._handle_a2a_moe()
+                self.assertEqual(args.deepep_mode, "low_latency")
+                self.assertEqual(args.moe_runner_backend, "deep_gemm")
+
+
 if __name__ == "__main__":
     unittest.main()

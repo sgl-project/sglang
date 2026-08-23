@@ -19,6 +19,10 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        DeepEPNormalCombineInput,
+        DeepEPNormalDispatchOutput,
+    )
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
         StandardDispatchOutput,
@@ -34,6 +38,7 @@ class TritonRunnerInput(RunnerInput):
     sorted_token_ids: torch.Tensor
     expert_ids: torch.Tensor
     num_tokens_post_padded: torch.Tensor
+    apply_routed_scaling_factor: bool = True
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -86,6 +91,14 @@ class TritonRunnerCore(MoeRunnerCore):
         running_state: dict,
         hooks: Optional[Any] = None,
     ) -> TritonRunnerOutput:
+        # A DeepEP combine reduces across ranks, so it needs the unscaled
+        # partial sum and scales after the reduction.
+        routed_scaling_factor = (
+            self.config.routed_scaling_factor
+            if runner_input.apply_routed_scaling_factor
+            else None
+        )
+
         if quant_info.use_mxfp8 and is_hip() and is_gfx95_supported():
             from sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 import (
                 fused_experts_mxfp8,
@@ -106,7 +119,7 @@ class TritonRunnerCore(MoeRunnerCore):
                 no_combine=self.config.no_combine,
                 inplace=self.config.inplace,
                 apply_router_weight_on_input=self.config.apply_router_weight_on_input,
-                routed_scaling_factor=self.config.routed_scaling_factor,
+                routed_scaling_factor=routed_scaling_factor,
                 gemm1_alpha=self.config.gemm1_alpha,
                 gemm1_limit=self.config.gemm1_clamp_limit,
                 swiglu_limit=self.config.swiglu_limit,
@@ -161,7 +174,7 @@ class TritonRunnerCore(MoeRunnerCore):
             no_combine=self.config.no_combine,
             inplace=self.config.inplace,
             apply_router_weight_on_input=self.config.apply_router_weight_on_input,
-            routed_scaling_factor=self.config.routed_scaling_factor,
+            routed_scaling_factor=routed_scaling_factor,
             gemm1_alpha=self.config.gemm1_alpha,
             gemm1_limit=self.config.gemm1_clamp_limit,
             filter_expert=filter_expert,
@@ -260,27 +273,16 @@ def fused_experts_none_to_triton(
     )
 
 
-@register_pre_permute("standard", "triton")
-def pre_permute_standard_to_triton(
-    dispatch_output: StandardDispatchOutput,
+def _align_experts_and_stash_config(
+    *,
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
     quant_info: TritonMoeQuantInfo,
-    runner_config: MoeRunnerConfig,
     running_state: dict,
-) -> TritonRunnerInput:
-
-    # Registered fallback for format-conversion tests and examples.
-
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
         _prepare_fused_moe_run,
     )
-    from sglang.srt.layers.moe.topk import TopKOutputChecker
-
-    hidden_states, topk_output = (
-        dispatch_output.hidden_states,
-        dispatch_output.topk_output,
-    )
-
-    assert TopKOutputChecker.format_is_standard(topk_output)
 
     (
         config,
@@ -294,7 +296,7 @@ def pre_permute_standard_to_triton(
         hidden_states,
         quant_info.w13_weight,
         quant_info.w2_weight,
-        topk_output.topk_ids,
+        topk_ids,
         use_fp8_w8a8=quant_info.use_fp8_w8a8,
         use_int8_w8a8=quant_info.use_int8_w8a8,
         use_int8_w8a16=quant_info.use_int8_w8a16,
@@ -308,6 +310,37 @@ def pre_permute_standard_to_triton(
     running_state["down_moe_use_tma"] = down_moe_use_tma
     running_state["up_moe_use_tma"] = up_moe_use_tma
 
+    return sorted_token_ids, expert_ids, num_tokens_post_padded
+
+
+@register_pre_permute("standard", "triton")
+def pre_permute_standard_to_triton(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> TritonRunnerInput:
+
+    # Registered fallback for format-conversion tests and examples.
+
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+    hidden_states, topk_output = (
+        dispatch_output.hidden_states,
+        dispatch_output.topk_output,
+    )
+
+    assert TopKOutputChecker.format_is_standard(topk_output)
+
+    sorted_token_ids, expert_ids, num_tokens_post_padded = (
+        _align_experts_and_stash_config(
+            hidden_states=hidden_states,
+            topk_ids=topk_output.topk_ids,
+            quant_info=quant_info,
+            running_state=running_state,
+        )
+    )
+
     return TritonRunnerInput(
         hidden_states=hidden_states,
         topk_weights=topk_output.topk_weights,
@@ -315,6 +348,55 @@ def pre_permute_standard_to_triton(
         sorted_token_ids=sorted_token_ids,
         expert_ids=expert_ids,
         num_tokens_post_padded=num_tokens_post_padded,
+    )
+
+
+@register_pre_permute("deepep_normal", "triton")
+def pre_permute_deepep_normal_to_triton(
+    dispatch_output: DeepEPNormalDispatchOutput,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> TritonRunnerInput:
+    (
+        hidden_states,
+        hidden_states_scale,
+        topk_ids,
+        topk_weights,
+        _num_recv_tokens_per_expert,
+    ) = dispatch_output
+
+    assert hidden_states_scale is None, (
+        "The triton MoE runner needs a bf16 DeepEP dispatch; set "
+        "--deepep-dispatcher-output-dtype bf16."
+    )
+    assert (
+        not runner_config.apply_router_weight_on_input
+    ), "apply_router_weight_on_input is not supported for DeepEP normal dispatch"
+
+    # Recv topk ids are local expert ids, -1 where another rank owns the slot;
+    # moe_align_block_size and the kernel's filter_expert branch handle that,
+    # so the recv layout needs no re-scatter.
+    sorted_token_ids, expert_ids, num_tokens_post_padded = (
+        _align_experts_and_stash_config(
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            quant_info=quant_info,
+            running_state=running_state,
+        )
+    )
+
+    running_state["topk_ids"] = topk_ids
+    running_state["topk_weights"] = topk_weights
+
+    return TritonRunnerInput(
+        hidden_states=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        apply_routed_scaling_factor=False,
     )
 
 
@@ -332,4 +414,23 @@ def post_permute_triton_to_standard(
 
     return StandardCombineInput(
         hidden_states=runner_output.hidden_states,
+    )
+
+
+@register_post_permute("triton", "deepep_normal")
+def post_permute_triton_to_deepep_normal(
+    runner_output: TritonRunnerOutput,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> DeepEPNormalCombineInput:
+
+    # The kernel already applied topk_weights and reduced over topk.
+
+    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPNormalCombineInput
+
+    return DeepEPNormalCombineInput(
+        hidden_states=runner_output.hidden_states,
+        topk_ids=running_state["topk_ids"],
+        topk_weights=running_state["topk_weights"],
     )

@@ -283,6 +283,50 @@ via `--cuda-graph-backend-prefill` or `--cuda-graph-config`.
 | Two-batch overlap (`--enable-two-batch-overlap`) | Not yet supported |
 | Speculative decoding | Not yet implemented |
 
+## Expert Parallelism with DeepEP on Intel XPU [Experimental]
+
+MoE expert parallelism on Intel XPU uses the DeepEP all-to-all dispatcher
+(`--moe-a2a-backend deepep`). The SGLang side of the integration is in tree; the
+all-to-all transport itself is not part of SGLang, so you must install a
+`deep_ep`-API-compatible package built for Intel GPUs (importable as `deep_ep`
+and exposing `Buffer` with `get_dispatch_layout` / `dispatch` / `combine`).
+The upstream CUDA DeepEP wheel is NVLink/RDMA-specific and will not work here.
+
+The Intel XPU port used to validate this integration is
+[frameworks.ai.pytorch.deepep, branch `deepep_xpu_us`](https://github.com/dayanandav/frameworks.ai.pytorch.deepep/tree/deepep_xpu_us),
+which implements the transport over ISHMEM instead of NVSHMEM. Build and install
+it before launching with `--moe-a2a-backend deepep`.
+
+**Supported configuration.** Only one combination is runnable on XPU:
+
+```bash
+python -m sglang.launch_server \
+    --model-path <MOE_MODEL> --device xpu --trust-remote-code \
+    --tp 2 --ep-size 2 \
+    --moe-a2a-backend deepep \
+    --deepep-mode normal \
+    --moe-runner-backend triton \
+    --deepep-dispatcher-output-dtype bf16
+```
+
+`--deepep-mode`, `--moe-runner-backend` and `--deepep-dispatcher-output-dtype`
+can be left at their defaults (`auto`); XPU resolves them to the values above.
+`--deepep-mode low_latency` and a non-`triton` MoE runner are rejected at startup
+rather than failing later in a kernel.
+
+### Limitations
+
+| Feature | Status on XPU |
+|---|---|
+| DeepEP transport | Provided out of tree — SGLang only requires a `deep_ep`-compatible package |
+| `--deepep-mode normal` | Supported (flat, contiguous recv layout consumed by the triton MoE runner) |
+| `--deepep-mode low_latency` / `auto`→low_latency | Not supported: the masked `[experts, tokens, hidden]` layout needs a masked grouped GEMM (DeepGEMM on CUDA), which XPU has no equivalent for |
+| Dispatch dtype | BF16 only. FP8/INT8 dispatch is downgraded to BF16 with a warning; NVFP4 dispatch raises |
+| MoE runner backend | `triton` only — the DeepEP recv-layout permutes are registered for that runner |
+| Other A2A backends (`mori`, `pplx`, `flashinfer`, `megamoe`, ...) | Not ported to XPU (they require ROCm or CUDA kernels) |
+| XPU graph with DeepEP | Disabled automatically, because `deepep_mode=normal` disables decode and prefill graph capture |
+| Two-batch overlap (`--enable-two-batch-overlap`) | Not yet supported (see the XPU Graph limitations above) |
+
 ## Prefill-Decode (P/D) Disaggregation on Intel XPU [Experimental]
 
 SGLang supports prefill-decode disaggregation on Intel XPU using the [NIXL](https://github.com/ai-dynamo/nixl) KV-transfer backend.
