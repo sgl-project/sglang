@@ -29,6 +29,9 @@ from sglang.kernels.jit.utils import (
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
+# Must match TopKTrait::kMaxNumBlocks in minimax_decode_topk.cuh.
+_MAX_NUM_BLOCKS = 16384
+
 
 @cache_once
 def _jit_module(seq_dtype: torch.dtype) -> Module:
@@ -59,6 +62,9 @@ def minimax_decode_topk(
     assert seq_lens.dtype in (torch.int32, torch.int64)
     num_heads, batch, max_seqblock = score.shape
     assert seq_lens.shape[0] == batch
+    assert (
+        max_seqblock <= _MAX_NUM_BLOCKS
+    ), f"max_seqblock={max_seqblock} exceeds kMaxNumBlocks={_MAX_NUM_BLOCKS}"
 
     if not score.is_contiguous():
         score = score.contiguous()
@@ -104,6 +110,9 @@ def minimax_decode_topk_page_table(
     TP>=4 behavior (page index == base_page)."""
     assert score.is_cuda and score.dtype == torch.float32 and score.dim() == 3
     num_heads, batch, max_seqblock = score.shape
+    assert (
+        max_seqblock <= _MAX_NUM_BLOCKS
+    ), f"max_seqblock={max_seqblock} exceeds kMaxNumBlocks={_MAX_NUM_BLOCKS}"
     assert block_size % page_size == 0
     assert req_to_token.dtype == torch.int32 and slot_ids.dtype == torch.int64
     if not score.is_contiguous():

@@ -774,6 +774,10 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
     if is_hip():
         if server_args.is_attention_backend_not_set():
             overrides["attention_backend"] = "triton"
+        if server_args.prefill_attention_backend is None and is_gfx95_supported():
+            # Dense-layer prefill uses aiter's ck-tile fmha; decode must stay
+            # on the Triton backend, so only the prefill side defaults to aiter.
+            overrides["prefill_attention_backend"] = "aiter"
         if server_args.moe_runner_backend == "auto" and quant_resolved == "mxfp8":
             overrides["moe_runner_backend"] = "triton"
         if not envs.USE_ROCM_AITER_ROPE_BACKEND.is_set():
@@ -2492,10 +2496,12 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
         is_gfx95_mxfp8 = is_hip() and is_gfx95_supported()
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
         if is_gfx95_mxfp8:
-            allowed.append("triton")
+            allowed.extend(["triton", "aiter"])
         mxfp8_default = "triton" if is_gfx95_mxfp8 else "flashinfer_trtllm"
         if moe_runner_backend == "auto":
             moe_runner_backend = mxfp8_default
+        elif moe_runner_backend == "aiter" and not envs.SGLANG_USE_AITER.get():
+            raise ValueError("--moe-runner-backend aiter requires SGLANG_USE_AITER=1.")
         elif moe_runner_backend not in allowed:
             logger.warning(
                 "mxfp8 quantization supports only %s backends. " "Overriding %r.",

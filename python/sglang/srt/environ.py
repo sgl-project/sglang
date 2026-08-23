@@ -889,6 +889,12 @@ class Envs:
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
+    # Convert MXFP8 dense-linear weights to block-fp8 [128, 128] at load for aiter
+    # block-scale GEMMs, while leaving fused-MoE weights on the native MX per-1x32
+    # path. Use when fully converting MXFP8 weights would route the MoE to a
+    # block-scale kernel that does not support the model's activation (for example,
+    # SwiGLU-OAI).
+    SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
     # On by default; set SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 as a kill switch.
@@ -1067,6 +1073,9 @@ class Envs:
     # Top-k kernels
     # ===================================================================
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
+    # Select the Triton fused gate for sigmoid MoE routing.  This remains
+    # configurable because select_experts uses it to preserve the legacy path.
+    SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
     # Opt-in: route DeepSeek-V3 grouped topk through the unified Triton router
     # instead of the flashinfer/AOT grouped kernels. Off by default (flashinfer is
     # the tuned production path); the Triton path is bit-exact on DeepSeek-V3.2 e2e
@@ -1440,6 +1449,15 @@ class Envs:
     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
+
+    # MiniMax-M3 sparse-attention toggles for ROCm.
+    # Share one index top-k across every N sparse layers; 1 disables sharing.
+    # Changes which KV blocks the skip layers attend, so it applies on ROCm only
+    # (never under two-batch overlap); elsewhere the backend pins 1.
+    SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(2)
+    # Run the sparse prefill main attention through AITER's Gluon paged attention
+    # instead of the Triton kernel. Unsupported cases fall back to Triton.
+    SGLANG_OPT_USE_ATOM_PREFILL = EnvBool(True)
     # MiniMax M3 NPU prefill MAIN-attention: route the sparse main attention through
     # the native Ascend FA op `torch.ops.npu.npu_fused_infer_attention_score` (FIA)
     # with a per-query CUSTOM block_table

@@ -111,6 +111,10 @@ class TritonRunnerCore(MoeRunnerCore):
                 gemm1_limit=self.config.gemm1_clamp_limit,
                 swiglu_limit=self.config.swiglu_limit,
                 gate_up_interleaved=self.config.gate_up_interleaved,
+                sanitize_topk_ids=(
+                    self.config.num_experts is None
+                    or self.config.num_experts != self.config.num_local_experts
+                ),
             )
             return TritonRunnerOutput(hidden_states=out)
 
@@ -211,6 +215,10 @@ def fused_experts_none_to_triton(
             gemm1_limit=runner_config.gemm1_clamp_limit,
             swiglu_limit=runner_config.swiglu_limit,
             gate_up_interleaved=runner_config.gate_up_interleaved,
+            sanitize_topk_ids=(
+                runner_config.num_experts is None
+                or runner_config.num_experts != runner_config.num_local_experts
+            ),
         )
     else:
         if quant_info.use_mxfp8 and is_cuda():

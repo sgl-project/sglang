@@ -23,6 +23,10 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.gemm.router_gemv import (
+    router_gemv,
+    router_gemv_supported,
+)
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.configs.model_config import (
     get_minimax_sparse_disable_value_layer_ids,
@@ -197,6 +201,7 @@ class _FusedQKVIndexProj(nn.Module):
         input_size_per_partition: int,
         logical_widths: List[int],
         orig_dtype: torch.dtype,
+        convert_mxfp8_to_block: bool = False,
     ) -> None:
         super().__init__()
         # Named ``_qm`` (not ``quant_method``) so the loader's post-process loop
@@ -215,12 +220,9 @@ class _FusedQKVIndexProj(nn.Module):
             self.weight_scale_inv.format_ue8m0 = True
             # The loader skips this module (see ``_qm``), so run the weight
             # post-process here instead of process_weights_after_loading.
-            if getattr(quant_method, "convert_mxfp8_to_block", False):
-                # Block-fp8 (gfx942/gfx950): convert the concatenated MXFP8 weight
-                # to block-fp8 [128,128] and run the same fnuz/scale/preshuffle
-                # steps as the per-linear path (this also flips quant_method into
-                # block-fp8 state). q/kv and index output sizes are 128-aligned, so
-                # converting the concatenation equals converting each proj alone.
+            if convert_mxfp8_to_block:
+                # Block-fp8 conversion must run on the concatenated fused
+                # projection, just as it would on the individual projections.
                 quant_method.process_weights_after_loading_block_quant(self)
             else:
                 # Derive the backend scale layout for the native MXFP8 GEMM.
@@ -436,6 +438,7 @@ class MiniMaxM3MoE(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
+        shared_event = None
         if hidden_states.shape[0] > 0:
             if (
                 self.alt_stream is not None
@@ -444,29 +447,29 @@ class MiniMaxM3MoE(nn.Module):
             ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
-                shared_output = self._forward_shared_experts(hidden_states)
                 with torch.cuda.stream(self.alt_stream):
-                    final_hidden_states = self._forward_router_experts(hidden_states)
-                current_stream.wait_stream(self.alt_stream)
+                    shared_output = self._forward_shared_experts(hidden_states)
+                    if shared_output is not None:
+                        shared_output.record_stream(current_stream)
+                        shared_event = self.alt_stream.record_event()
             else:
                 shared_output = self._forward_shared_experts(hidden_states)
-                final_hidden_states = self._forward_router_experts(hidden_states)
+            router_logits = self._compute_router_logits(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+            final_hidden_states = self.experts(hidden_states, topk_output)
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
             final_hidden_states = self.experts(hidden_states, topk_output)
 
         if shared_output is not None:
+            if shared_event is not None:
+                torch.cuda.current_stream().wait_event(shared_event)
             final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1 and not should_allreduce_fusion and not use_reduce_scatter:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states
-
-    def _forward_router_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        router_logits = self._compute_router_logits(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
-        return self.experts(hidden_states, topk_output)
 
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
@@ -512,6 +515,8 @@ class MiniMaxM3MoE(nn.Module):
 
     def _compute_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.bf16_router_gemm:
+            if router_gemv_supported(hidden_states, self.gate.weight):
+                return router_gemv(hidden_states, self.gate.weight)
             if _is_npu:
                 # NPU lacks aten::mm.dtype; bf16 mm then cast keeps topk semantics.
                 return torch.mm(hidden_states, self.gate.weight.t()).float()
@@ -897,6 +902,10 @@ class MiniMaxM3Attention(nn.Module):
             return
 
         is_unquant = isinstance(qm, UnquantizedLinearMethod)
+        # Whether the loader pass would rewrite this layer's weights at load
+        # (block-fp8 conversion); the holder must run the same pass on the
+        # concatenated weights since the loader skips it.
+        needs_load_convert = getattr(qm, "convert_mxfp8_to_block", False)
         use_mxfp8 = getattr(qm, "use_mxfp8", False) and hasattr(qp, "weight_scale_inv")
         if not (is_unquant or use_mxfp8):
             return
@@ -916,6 +925,7 @@ class MiniMaxM3Attention(nn.Module):
             getattr(qp, "input_size_per_partition", qp.input_size),
             [qp.output_size_per_partition, ip.output_size_per_partition],
             getattr(qp, "orig_dtype", qp.params_dtype),
+            convert_mxfp8_to_block=needs_load_convert,
         )
         self.add_module("fused_qkv_index_proj", holder)
         self._fused_qkv_index = holder
@@ -1189,7 +1199,14 @@ class MiniMaxM3Attention(nn.Module):
             else:
                 idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
                 q, k, idx_q, idx_k = self._sparse_qk_index_norm_rope_cache(
-                    positions, q, k, v, idx_q, idx_k, idx_v, forward_batch
+                    positions,
+                    q,
+                    k,
+                    v,
+                    idx_q,
+                    idx_k,
+                    idx_v,
+                    forward_batch,
                 )
 
             inner_state = (q, k, v, idx_q, idx_k, idx_v, forward_batch)
@@ -1348,6 +1365,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
+            is_last_layer=(layer_id == config.num_hidden_layers - 1),
+            enable_fused_ar_quant_per_token=True,
         )
 
     def forward(
@@ -1385,11 +1404,6 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 forward_batch
             )
         )
-        if self.is_layer_sparse and get_parallel().tp_size > 1:
-            # Sparse MoE outputs are TP-partial; deferring their all-reduce into the next
-            # layer's fusion re-triggers the M3 no-EOS runaway. Force immediate all-reduce.
-            should_allreduce_fusion = False
-
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
@@ -1440,7 +1454,11 @@ class MiniMaxM3Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        alt_stream = get_stream("alt") if _is_cuda else None
+        alt_stream = (
+            get_stream("alt")
+            if (_is_cuda or _is_hip) and is_shared_experts_fusion_disabled()
+            else None
+        )
 
         def layer_fn(idx, prefix: str) -> nn.Module:
             return MiniMaxM3DecoderLayer(
@@ -1597,10 +1615,12 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 "Shared and routed experts may use different quantization formats "
                 "in ModelOpt mixed-precision checkpoints."
             )
-        if not _is_cuda:
-            return "Shared experts fusion currently requires CUDA devices."
+        if not (_is_cuda or _is_hip):
+            return "Shared experts fusion currently requires CUDA or ROCm devices."
         if _is_cuda and (_device_sm is not None) and (_device_sm < 80):
             return "Shared experts fusion requires SM80 or newer GPUs."
+        if _is_hip and torch.cuda.get_device_capability("cuda") < (9, 4):
+            return "Shared experts fusion requires gfx942 or newer GPUs."
         if get_parallel().moe_ep_size > 1:
             return "Shared experts fusion is not supported together with expert parallelism yet."
         if get_moe_a2a_backend().is_deepep():

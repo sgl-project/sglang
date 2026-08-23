@@ -654,11 +654,19 @@ def _fwd_grouped_kernel_stage1(
             qpe = tl.load(
                 Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
             )
+        offs_n = split_kv_start + tl.arange(0, BLOCK_N)
+        kv_loc_next = tl.load(
+            kv_indices + cur_batch_kv_start_idx + offs_n,
+            mask=offs_n < split_kv_end,
+            other=0,
+        )
         for start_n in tl.range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
-            kv_loc = tl.load(
-                kv_indices + cur_batch_kv_start_idx + offs_n,
-                mask=offs_n < split_kv_end,
+            kv_loc = kv_loc_next
+            offs_n_next = offs_n + BLOCK_N
+            kv_loc_next = tl.load(
+                kv_indices + cur_batch_kv_start_idx + offs_n_next,
+                mask=offs_n_next < split_kv_end,
                 other=0,
             )
             # Page-aware KV address math (see _fwd_kernel_stage1).
@@ -799,8 +807,8 @@ def _decode_grouped_att_m_fwd(
     Lv = v_buffer.shape[-1]
 
     # [TODO] work around shmem limit on MI3xx
-    if _is_hip and Lk >= 576:
-        BLOCK = 16
+    if _is_hip:
+        BLOCK = 16 if Lk >= 576 else (64 if Lk <= 128 else 32)
 
     if Lk == 576:
         BLOCK_DMODEL = 512
@@ -830,7 +838,7 @@ def _decode_grouped_att_m_fwd(
         # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
-        num_stages = 1
+        num_stages = 2 if Lk <= 128 else 1
 
     if tune_mla:
         # num_warps reorders the fp32 accumulation, so whoever declined the batch-wide
