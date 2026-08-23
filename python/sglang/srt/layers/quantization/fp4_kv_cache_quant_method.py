@@ -279,6 +279,29 @@ class KVCacheQuantMethodBase(ABC):
             f"KV cache method {self.name!r} does not support plain KV dequant reads."
         )
 
+    def dequantize_target_verify_prefix_to_workspace(
+        self,
+        k_fp4: Tensor,
+        v_fp4: Tensor,
+        k_scales: Tensor,
+        v_scales: Tensor,
+        k_current: Tensor,
+        v_current: Tensor,
+        dq_k: Tensor,
+        dq_v: Tensor,
+        req_to_token: Tensor,
+        req_pool_indices: Tensor,
+        prefix_lens: Tensor,
+        current_locs: Tensor,
+        num_current_tokens_per_req: int,
+        layer_id: int,
+    ) -> None:
+        """Populate a physical-slot workspace for speculative verification."""
+        raise NotImplementedError(
+            f"KV cache method {self.name!r} does not support target-verify "
+            "dequant workspaces."
+        )
+
     @abstractmethod
     def compute_cell_size(
         self, head_num: int, head_dim: int, num_layers: int, kv_size: int
@@ -532,6 +555,45 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
             v_fp4.view(torch.uint8), v_scales, cur_v_scale
         )
         return k_bf16.to(torch.float8_e4m3fn), v_bf16.to(torch.float8_e4m3fn)
+
+    def dequantize_target_verify_prefix_to_workspace(
+        self,
+        k_fp4: Tensor,
+        v_fp4: Tensor,
+        k_scales: Tensor,
+        v_scales: Tensor,
+        k_current: Tensor,
+        v_current: Tensor,
+        dq_k: Tensor,
+        dq_v: Tensor,
+        req_to_token: Tensor,
+        req_pool_indices: Tensor,
+        prefix_lens: Tensor,
+        current_locs: Tensor,
+        num_current_tokens_per_req: int,
+        layer_id: int,
+    ) -> None:
+        from sglang.kernels.ops.quantization.nvfp4_kv_cache import (
+            dequantize_nvfp4_kv_for_target_verify,
+        )
+
+        dequantize_nvfp4_kv_for_target_verify(
+            k_fp4,
+            v_fp4,
+            k_scales,
+            v_scales,
+            self.k_scales_gpu[layer_id : layer_id + 1],
+            self.v_scales_gpu[layer_id : layer_id + 1],
+            k_current,
+            v_current,
+            dq_k,
+            dq_v,
+            req_to_token,
+            req_pool_indices,
+            prefix_lens,
+            current_locs,
+            num_current_tokens_per_req,
+        )
 
     def compute_cell_size(
         self, head_num: int, head_dim: int, num_layers: int, kv_size: int

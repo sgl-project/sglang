@@ -1270,18 +1270,44 @@ class FlashInferAttnBackend(AttentionBackend):
         # We perform dequant for chunk prefill/cache reuse.
         pool = self.token_to_kv_pool
         if self.prefill_uses_dequant_workspace:
-            kv_cache = pool.get_flashinfer_dequant_workspace_kv_buffer(
-                layer,
-                self.req_to_token_pool.req_to_token,
-                self.cpu_req_pool_indices,
-                forward_batch.extend_prefix_lens_cpu,
-                forward_batch.extend_seq_lens_cpu,
-                self.page_size,
-                prepare_workspace=self.dq_page_table is not None,
-                use_ragged=self.forward_metadata.use_ragged,
-                k_cur=k,
-                v_cur=v,
-            )
+            if forward_batch.forward_mode.is_target_verify():
+                if k is None or v is None:
+                    raise RuntimeError(
+                        "NVFP4 target verification requires current K/V tensors."
+                    )
+                if forward_batch.spec_info is None:
+                    raise RuntimeError(
+                        "NVFP4 target verification requires speculative metadata."
+                    )
+                if cache_loc is None:
+                    raise RuntimeError(
+                        "NVFP4 target verification requires KV write locations."
+                    )
+                kv_cache = (
+                    pool.get_flashinfer_target_verify_dequant_workspace_kv_buffer(
+                        layer,
+                        self.req_to_token_pool.req_to_token,
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        k,
+                        v,
+                        cache_loc,
+                        forward_batch.spec_info.num_tokens_per_req,
+                    )
+                )
+            else:
+                kv_cache = pool.get_flashinfer_dequant_workspace_kv_buffer(
+                    layer,
+                    self.req_to_token_pool.req_to_token,
+                    self.cpu_req_pool_indices,
+                    forward_batch.extend_prefix_lens_cpu,
+                    forward_batch.extend_seq_lens_cpu,
+                    self.page_size,
+                    prepare_workspace=self.dq_page_table is not None,
+                    use_ragged=self.forward_metadata.use_ragged,
+                    k_cur=k,
+                    v_cur=v,
+                )
         else:
             kv_cache = pool.get_kv_buffer(layer.layer_id)
 

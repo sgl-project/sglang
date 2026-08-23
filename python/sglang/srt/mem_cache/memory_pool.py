@@ -2607,6 +2607,59 @@ class MHATokenToKVPool(KVCache):
             v_buffer_dq.view(-1, layer.tp_v_head_num, layer.head_dim),
         )
 
+    def get_flashinfer_target_verify_dequant_workspace_kv_buffer(
+        self,
+        layer: RadixAttention,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        k_current: torch.Tensor,
+        v_current: torch.Tensor,
+        current_locs: torch.Tensor,
+        num_current_tokens_per_req: int,
+        *,
+        layer_id_override: Optional[int] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build a graph-safe FP8 workspace for speculative target verify.
+
+        FlashInfer verify metadata indexes the regular physical KV slots, unlike
+        the page-aligned contiguous workspace used by prompt/chunk prefill. The
+        quant method therefore dequantizes cached prefixes directly into their
+        physical workspace slots and writes current verify-token K/V to the same
+        slots, using only GPU-resident request metadata.
+        """
+        if not self.is_quantized_kv_cache:
+            raise RuntimeError(
+                "FlashInfer target-verify dequant workspace requested from a "
+                "non-quantized KV pool."
+            )
+
+        local_layer_id = (
+            layer.layer_id if layer_id_override is None else layer_id_override
+        )
+        k_fp4, v_fp4, k_scales, v_scales = self.get_raw_kv_buffer(local_layer_id)
+        dq_k, dq_v = self.get_dequant_workspace()
+        self.quant_method.dequantize_target_verify_prefix_to_workspace(
+            k_fp4,
+            v_fp4,
+            k_scales,
+            v_scales,
+            k_current,
+            v_current,
+            dq_k,
+            dq_v,
+            req_to_token,
+            req_pool_indices,
+            prefix_lens,
+            current_locs,
+            num_current_tokens_per_req,
+            layer.layer_id,
+        )
+        return (
+            dq_k.view(-1, layer.tp_k_head_num, layer.head_dim),
+            dq_v.view(-1, layer.tp_v_head_num, layer.head_dim),
+        )
+
     @staticmethod
     def _to_cpu_int_list(values) -> list[int]:
         if isinstance(values, list):
@@ -3885,6 +3938,17 @@ class HybridLinearKVPool(KVCache):
         local_layer_id = self._transfer_full_attention_id(layer.layer_id)
         return self.full_kv_pool.get_flashinfer_decode_dequant_workspace_kv_buffer(
             layer, *args, layer_id_override=local_layer_id, **kwargs
+        )
+
+    def get_flashinfer_target_verify_dequant_workspace_kv_buffer(
+        self, layer, *args, **kwargs
+    ):
+        self._wait_for_layer(layer.layer_id)
+        local_layer_id = self._transfer_full_attention_id(layer.layer_id)
+        return (
+            self.full_kv_pool.get_flashinfer_target_verify_dequant_workspace_kv_buffer(
+                layer, *args, layer_id_override=local_layer_id, **kwargs
+            )
         )
 
     def get_kv_scale_buffer(self, layer_id: int):
