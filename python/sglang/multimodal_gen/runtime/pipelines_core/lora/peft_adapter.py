@@ -23,6 +23,27 @@ _UNSUPPORTED_CONFIG_FIELDS = (
     "use_qalora",
 )
 _SAFETENSORS_ALPHA_KEYS = ("lora_alpha", "network_alpha", "alpha")
+_NATIVE_LORA_A_SUFFIXES = (
+    ".lora_A.weight",
+    ".lora_down.weight",
+    ".lora.down.weight",
+)
+
+
+def _has_unambiguous_global_alpha(file: Any) -> bool:
+    """Reject bare mixed-rank files whose global alpha semantics are ambiguous."""
+    keys = list(file.keys())
+    if any(_ADAPTER_SLOT.search(name) is not None for name in keys):
+        return True
+
+    ranks = set()
+    for name in keys:
+        if not name.endswith(_NATIVE_LORA_A_SUFFIXES):
+            continue
+        shape = file.get_slice(name).get_shape()
+        if len(shape) >= 2:
+            ranks.add(shape[-2])
+    return len(ranks) == 1
 
 
 def _load_safetensors_lora_alpha(weight_path: str) -> int | None:
@@ -30,6 +51,8 @@ def _load_safetensors_lora_alpha(weight_path: str) -> int | None:
         return None
     with safe_open(weight_path, framework="pt", device="cpu") as file:
         metadata = file.metadata() or {}
+        if not _has_unambiguous_global_alpha(file):
+            return None
     declared = []
     for key in _SAFETENSORS_ALPHA_KEYS:
         value = metadata.get(key)

@@ -60,9 +60,23 @@ def test_invalid_peft_lora_alpha_fails_closed():
 def test_safetensors_alpha_metadata_supplies_peft_config(tmp_path):
     weight_path = tmp_path / "adapter.safetensors"
     save_file(
-        {"proj.lora_A.weight": torch.ones(4, 8)},
+        {"proj.lora_A.default.weight": torch.ones(4, 8)},
         weight_path,
         metadata={"alpha": "128"},
     )
 
     assert load_peft_config(str(weight_path))["lora_alpha"] == 128
+
+
+def test_mixed_rank_native_safetensors_does_not_apply_global_alpha(tmp_path):
+    weight_path = tmp_path / "adapter.safetensors"
+    save_file(
+        {
+            "gate.lora_A.weight": torch.ones(4, 8),
+            "proj.lora_A.weight": torch.ones(8, 8),
+        },
+        weight_path,
+        metadata={"lora_alpha": "8"},
+    )
+
+    assert "lora_alpha" not in load_peft_config(str(weight_path))
