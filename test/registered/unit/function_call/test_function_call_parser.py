@@ -4287,6 +4287,31 @@ class TestLfm2Detector(unittest.TestCase):
         params = json.loads(calls[0].parameters)
         self.assertEqual(params["query"], "line one\nline two")
 
+    def test_reserved_kwarg_suffix_parameter_not_rewritten(self):
+        """A parameter literally named in_pyreservedkw_ must survive the
+        normal parse path; only recovery-renamed kwargs get restored."""
+        text = (
+            "<|tool_call_start|>[search(query='x', in_pyreservedkw_=5)]"
+            "<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params, {"query": "x", "in_pyreservedkw_": 5})
+
+    def test_reserved_kwarg_with_nested_quote_recovered(self):
+        """A keyword-named parameter holding a nested-quote command needs
+        the rename and requote rewrites to compose."""
+        text = (
+            "<|tool_call_start|>[search(from='sed -n '1,5p' f.py')]" "<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params, {"from": "sed -n '1,5p' f.py"})
+
     # ==================== structure_info tests ====================
 
     def test_supports_structural_tag(self):

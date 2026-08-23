@@ -315,21 +315,31 @@ def _normalize_leading_zero_ints(text: str) -> str:
     return "".join(out)
 
 
-def _recovery_candidates(content: str) -> List[str]:
+def _recovery_candidates(content: str) -> List[Tuple[str, bool]]:
     """Progressive rewrites for content that failed to parse.
 
     Each rewrite is a no-op on already-valid text; the first candidate whose
     result parses wins. Nested-quote recovery is re-escaped, since requoting
-    can move raw newlines inside the string.
+    can move raw newlines inside the string. The flag marks candidates that
+    went through reserved-keyword renaming; only their decoded arguments get
+    the original parameter names restored.
     """
     escaped = _escape_ctrl_chars_in_strings(_normalize_leading_zero_ints(content))
-    candidates = [escaped]
+    candidates: List[Tuple[str, bool]] = [(escaped, False)]
     requoted, requote_changed = _escape_nested_quotes_in_strings(escaped)
     if requote_changed:
-        candidates.append(_escape_ctrl_chars_in_strings(requoted))
-    renamed, kw_renamed = _rename_reserved_kwargs(candidates[-1])
-    if kw_renamed:
-        candidates.append(renamed)
+        candidates.append((_escape_ctrl_chars_in_strings(requoted), False))
+    for text, _ in list(candidates):
+        renamed, kw_renamed = _rename_reserved_kwargs(text)
+        if kw_renamed:
+            candidates.append((renamed, True))
+            # A call can stack both quirks; renaming first lets requote
+            # validate candidates the keyword SyntaxError otherwise blocks.
+            requoted_after, requote_after_changed = _escape_nested_quotes_in_strings(
+                renamed
+            )
+            if requote_after_changed:
+                candidates.append((_escape_ctrl_chars_in_strings(requoted_after), True))
     return candidates
 
 
@@ -384,7 +394,7 @@ def _top_level_call_count(module: ast.Module) -> int:
     return 1 if isinstance(value, ast.Call) else 0
 
 
-def _salvage_calls_from_unparsable_block(text: str) -> List[ast.Call]:
+def _salvage_calls_from_unparsable_block(text: str) -> List[Tuple[ast.Call, bool]]:
     """Recover individual calls from a block ``ast.parse`` cannot handle.
 
     When the block as a whole is a SyntaxError no rewrite recovers, there
@@ -393,22 +403,26 @@ def _salvage_calls_from_unparsable_block(text: str) -> List[ast.Call]:
     strategies and parse each segment on its own through the rewrite
     ladder. A wrongly split segment simply fails to parse and is dropped,
     so this can only under-recover, never attribute arguments to the wrong
-    call.
+    call. Each call carries the reserved-keyword flag of the candidate it
+    parsed from.
     """
-    best: List[ast.Call] = []
+    best: List[Tuple[ast.Call, bool]] = []
     for respect_strings in (True, False):
         segments = _split_top_level_calls(text, respect_strings=respect_strings)
         if len(segments) < 2:
             continue
-        calls: List[ast.Call] = []
+        calls: List[Tuple[ast.Call, bool]] = []
         for segment in segments:
-            for candidate in [segment] + _recovery_candidates(segment):
+            for candidate, kw_renamed in [(segment, False)] + _recovery_candidates(
+                segment
+            ):
                 try:
-                    parsed = ast.parse(candidate, mode="eval").body
+                    module = safe_ast_parse(candidate)
                 except (SyntaxError, ValueError):
                     continue
+                parsed = getattr(module.body[0], "value", None) if module.body else None
                 if isinstance(parsed, ast.Call):
-                    calls.append(parsed)
+                    calls.append((parsed, kw_renamed))
                 break
         if len(calls) > len(best):
             best = calls
@@ -513,7 +527,12 @@ class Lfm2Detector(BaseFormatDetector):
         return ".".join(reversed(parts))
 
     def _parse_pythonic_call(
-        self, call: ast.Call, call_index: int, tool_indices: Dict[str, int]
+        self,
+        call: ast.Call,
+        call_index: int,
+        tool_indices: Dict[str, int],
+        *,
+        restore_reserved_kwarg: bool = False,
     ) -> Optional[ToolCallItem]:
         """
         Parse a single AST Call node into a ToolCallItem.
@@ -522,6 +541,8 @@ class Lfm2Detector(BaseFormatDetector):
             call: AST Call node representing a function call
             call_index: Index of this call in the list of calls
             tool_indices: Mapping of tool names to their indices
+            restore_reserved_kwarg: Whether the parsed text went through
+                reserved-keyword renaming
 
         Returns:
             ToolCallItem if successful, None if the call should be skipped
@@ -573,7 +594,10 @@ class Lfm2Detector(BaseFormatDetector):
                 logger.warning(f"Failed to parse argument {keyword.arg}: {e}")
                 return None
 
-        arguments = _restore_reserved_kwarg_names(arguments)
+        if restore_reserved_kwarg:
+            # Unconditional restore would rewrite a parameter literally
+            # named e.g. ``in_pyreservedkw_`` to ``in`` on the normal path.
+            arguments = _restore_reserved_kwarg_names(arguments)
 
         try:
             # allow_nan=False: a non-finite float (e.g. the literal 1e999
@@ -607,13 +631,14 @@ class Lfm2Detector(BaseFormatDetector):
         tool_indices = self._get_tool_indices(tools)
 
         try:
+            kw_renamed = False
             try:
                 module = safe_ast_parse(content)
             except (SyntaxError, ValueError):
                 # Recoverable model quirks are rewritten value-preservingly;
                 # the first rewrite that parses wins. Unrecoverable text
                 # re-raises the original error.
-                for candidate in _recovery_candidates(content):
+                for candidate, kw_renamed in _recovery_candidates(content):
                     try:
                         module = safe_ast_parse(candidate)
                         break
@@ -627,8 +652,13 @@ class Lfm2Detector(BaseFormatDetector):
                     if not salvaged:
                         raise
                     calls = []
-                    for call_index, call in enumerate(salvaged):
-                        item = self._parse_pythonic_call(call, call_index, tool_indices)
+                    for call_index, (call, segment_kw_renamed) in enumerate(salvaged):
+                        item = self._parse_pythonic_call(
+                            call,
+                            call_index,
+                            tool_indices,
+                            restore_reserved_kwarg=segment_kw_renamed,
+                        )
                         if item is not None:
                             calls.append(item)
                     return calls, ""
@@ -654,7 +684,12 @@ class Lfm2Detector(BaseFormatDetector):
 
             calls = []
             for call_index, call in enumerate(call_nodes):
-                item = self._parse_pythonic_call(call, call_index, tool_indices)
+                item = self._parse_pythonic_call(
+                    call,
+                    call_index,
+                    tool_indices,
+                    restore_reserved_kwarg=kw_renamed,
+                )
                 if item is not None:
                     calls.append(item)
 
