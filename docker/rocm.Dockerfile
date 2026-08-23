@@ -987,7 +987,7 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
             ;; \
           *rocm72*) \
             echo "[Triton] ROCm 7.2: installing pinned wheels from ${TRITON_INDEX_URL}"; \
-            pip uninstall -y triton-rocm || true \
+            pip uninstall -y triton-rocm || true && \
             PIP_NO_CACHE_DIR=1 pip install --extra-index-url ${TRITON_INDEX_URL} \
                 "triton==${TRITON_VERSION}" "triton-kernels==${TRITON_KERNELS_VERSION}"; \
             ;; \
