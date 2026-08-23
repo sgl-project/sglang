@@ -11,6 +11,21 @@ import triton
 import triton.language as tl
 
 
+def _require_entry_contiguous_dst(
+    dst: torch.Tensor, entry_start_dim: int, fn_name: str
+) -> None:
+    """Require contiguous entry dims while permitting strided pool dimensions."""
+    expected = 1
+    for i in range(dst.ndim - 1, entry_start_dim - 1, -1):
+        if dst.shape[i] != 1 and dst.stride(i) != expected:
+            raise ValueError(
+                f"{fn_name}: dst entry dims (dims {entry_start_dim}.."
+                f"{dst.ndim - 1}) must be contiguous; got "
+                f"shape={tuple(dst.shape)} strides={tuple(dst.stride())}"
+            )
+        expected *= dst.shape[i]
+
+
 @triton.jit
 def track_mamba_state_if_needed_kernel(
     conv_states_ptr,
@@ -271,9 +286,7 @@ def fused_mamba_state_scatter_with_mask(
     dst_indices_raw = dst_indices_raw.to(torch.int32).contiguous()
     step_indices_raw = step_indices_raw.to(torch.int32).contiguous()
 
-    # Ensure tensors are contiguous
-    if not dst.is_contiguous():
-        raise ValueError("dst tensor must be contiguous")
+    _require_entry_contiguous_dst(dst, 2, "fused_mamba_state_scatter_with_mask")
     if not src.is_contiguous():
         raise ValueError("src tensor must be contiguous")
 
@@ -373,7 +386,7 @@ def _fused_conv_window_scatter_with_mask_kernel(
 
 
 def fused_conv_window_scatter_with_mask(
-    dst: torch.Tensor,  # conv_states [num_layers, cache_size, dim, K-1] (contiguous)
+    dst: torch.Tensor,  # conv_states [num_layers, cache_size, dim, K-1]
     src: torch.Tensor,  # deduped conv-window view [num_layers, spec_size, draft_tokens, dim, K-1]
     dst_indices_raw: torch.Tensor,  # [total_requests]
     step_indices_raw: torch.Tensor,  # [total_requests], entry >= 0 means valid
@@ -384,8 +397,8 @@ def fused_conv_window_scatter_with_mask(
     overlapping ``as_strided`` view over a shared ``[..., dim, D+K-2]`` buffer,
     so its per-step windows are intentionally non-contiguous. This kernel indexes
     ``(dim, win)`` elements through the view's strides instead of flat-copying.
-    ``dst`` (the real conv-state pool) is the usual contiguous
-    ``[layers, cache, dim, K-1]``.
+    ``dst`` may be layer-major or request-major; each ``(dim, K-1)`` row must
+    remain contiguous.
     """
     total_requests = step_indices_raw.shape[0]
     if total_requests == 0:
@@ -420,12 +433,9 @@ def fused_conv_window_scatter_with_mask(
     src_step_size = src.shape[2]
     dst_req_size = dst.shape[1]
 
-    # `dst` stays contiguous; `src` is an intentionally non-contiguous (overlapping)
-    # view, so we do NOT assert src contiguity here (unlike the dense scatter).
-    if not dst.is_contiguous():
-        raise ValueError(
-            "dst tensor in fused_conv_window_scatter_with_mask must be contiguous"
-        )
+    # `src` is intentionally non-contiguous because it is an overlapping
+    # sliding-window view; dst is indexed through its real pool strides.
+    _require_entry_contiguous_dst(dst, 2, "fused_conv_window_scatter_with_mask")
 
     dst_indices_raw = dst_indices_raw.to(torch.int32).contiguous()
     step_indices_raw = step_indices_raw.to(torch.int32).contiguous()
