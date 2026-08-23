@@ -53,6 +53,7 @@ from sglang.srt.runtime_context import (
     get_observability,
     get_parallel,
     get_serving,
+    publish,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, random_uuid, set_prometheus_multiproc_dir
@@ -1473,6 +1474,8 @@ def launch_dp_worker(
     dispatch_path: str,
     result_path: str,
 ):
+    # Spawned DP worker: this is the process entry, so it publishes.
+    publish(server_args, role="encoder")
     try:
         configure_logger(server_args, prefix=f" encode_dp_worker[{dp_rank}]")
         asyncio.run(

@@ -63,6 +63,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_mm,
     get_model,
+    publish,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import configure_media_url_security
@@ -2036,6 +2037,8 @@ async def _handle_encoder_worker_request(encoder: MMEncoder, request):
 
 
 def launch_encoder(server_args, schedule_path, dist_init_method, rank):
+    # Spawned TP worker: this is the process entry, so it publishes.
+    publish(server_args, role="encoder")
     try:
         asyncio.run(run_encoder(server_args, schedule_path, dist_init_method, rank))
     except KeyboardInterrupt:

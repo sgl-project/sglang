@@ -24,7 +24,7 @@ from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 from sglang.srt.disaggregation.encoder.server import MMEncoder, launch_encoder
 from sglang.srt.managers.io_struct import async_sock_send, wrap_as_pickle
 from sglang.srt.managers.schedule_batch import Modality
-from sglang.srt.runtime_context import get_disagg
+from sglang.srt.runtime_context import get_disagg, publish
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import random_uuid
 from sglang.srt.utils.network import NetworkAddress, get_zmq_socket
@@ -201,6 +201,9 @@ class SGLangEncoderServer(SGLangEncoderServicer):
 
 
 async def serve_grpc_encoder(server_args: ServerArgs):
+    # The gRPC entry publishes for this process, as the HTTP entry does in
+    # `encoder/http_server.launch_server`.
+    publish(server_args, role="encoder")
     ctx = mp.get_context("spawn")
     zmq_ctx = zmq.asyncio.Context(10)
     ipc_path_prefix = random_uuid()

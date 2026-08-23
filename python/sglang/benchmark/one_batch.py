@@ -82,7 +82,7 @@ from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.model_executor.cuda_graph_config import Phase, cuda_graph_fully_disabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.runtime_context import get_parallel, get_schedule, publish
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -681,6 +681,8 @@ def correctness_test(
     gpu_id,
     tp_rank,
 ):
+    publish(server_args, role="scheduler")
+
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
@@ -881,6 +883,10 @@ def latency_test(
     gpu_id,
     tp_rank,
 ):
+    # The work function is the process entry: `main` runs it inline for
+    # tp_size == 1 and spawns it per rank otherwise, and a spawned child
+    # receives the record with nothing published.
+    publish(server_args, role="scheduler")
     initialize_moe_config(server_args)
     initialize_fp8_gemm_config(server_args)
     initialize_fp4_gemm_config(server_args)
