@@ -2040,7 +2040,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         part that cannot be reconstructed afterwards.
         """
         try:
-            return self.resolved_config_dict(dataclasses.asdict(self.server_args))
+            return self.resolved_config_dict(self.server_args.resolved_dict())
         except Exception as e:
             logger.error(f"Failed to snapshot the resolved config for the dump: {e!r}")
             return None

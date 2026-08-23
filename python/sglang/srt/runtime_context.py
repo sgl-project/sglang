@@ -969,11 +969,12 @@ class RuntimeContext:
         in a readback: HiCache attach/detach, the generated forward-pass-metrics
         endpoint, tunables set via ``/set_internal_state``.
 
-        ``base`` defaults to ``dict(vars(server_args))`` (matching the legacy
-        ``vars`` dump); pass ``dataclasses.asdict(server_args)`` when nested
-        dataclass fields must be expanded first. Override leaves are flat
-        ``ServerArgs`` field names, so overlaying them onto the top level of
-        either base is exact.
+        ``base`` defaults to ``server_args.resolved_dict()`` -- the record's
+        fields as resolution decided them, nested dataclasses expanded. (It used
+        to be ``dict(vars(server_args))``, which carried the private resolution
+        bookkeeping and the ``model_config`` memo into the readback.) Override
+        leaves are flat ``ServerArgs`` field names, so overlaying them onto the
+        top level of the base is exact.
 
         The log is per process: it carries what *this* process overrode. A
         weight reload records ``model_path`` and ``load_format`` from the
@@ -984,7 +985,7 @@ class RuntimeContext:
         The top-level ``/server_info`` fields are the startup record, not this
         dump.
         """
-        d = dict(vars(self.server_args)) if base is None else dict(base)
+        d = self.server_args.resolved_dict() if base is None else dict(base)
         for _source, fields in self._overrides_log:
             d.update(fields)
         return d

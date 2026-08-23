@@ -7,7 +7,6 @@ TokenizerManager's event loop.
 """
 
 import asyncio
-import dataclasses
 import json
 import logging
 from types import SimpleNamespace
@@ -423,7 +422,7 @@ class RuntimeHandle:
         return json.dumps(result, default=str)
 
     def get_server_info(self) -> str:
-        result: Dict[str, Any] = dataclasses.asdict(self.tokenizer_manager.server_args)
+        result: Dict[str, Any] = self.tokenizer_manager.server_args.resolved_dict()
         result.update(self.scheduler_info)
         result["kv_events"] = (
             self.tokenizer_manager.server_args.describe_kv_events_publisher()
