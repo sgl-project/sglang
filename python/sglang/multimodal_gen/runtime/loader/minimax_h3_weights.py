@@ -10,6 +10,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import ComfyFp8
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
+    KitchenInt8Config,
+)
 
 
 def comfy_quant_key_filter(name: str) -> bool:
@@ -23,6 +26,7 @@ def inspect_minimax_h3_safetensors(
     adaln_curve_shape = None
     layer_markers: dict[str, dict[str, Any]] = {}
     checkpoint_keys: set[str] = set()
+    checkpoint_meta: dict[str, tuple[str, tuple[int, ...]]] = {}
     fp8_weight_prefixes: set[str] = set()
 
     for path in safetensors_list:
@@ -44,11 +48,15 @@ def inspect_minimax_h3_safetensors(
                 adaln_curve_shape = shape
 
             for key in keys:
-                if (
-                    key.endswith(".weight")
-                    and checkpoint.get_slice(key).get_dtype() == "F8_E4M3"
-                ):
-                    fp8_weight_prefixes.add(key.removesuffix(".weight"))
+                if key.endswith((".weight", ".weight_scale")):
+                    tensor_slice = checkpoint.get_slice(key)
+                    dtype = tensor_slice.get_dtype()
+                    checkpoint_meta[key] = (
+                        dtype,
+                        tuple(tensor_slice.get_shape()),
+                    )
+                    if key.endswith(".weight") and dtype == "F8_E4M3":
+                        fp8_weight_prefixes.add(key.removesuffix(".weight"))
                 if not key.endswith(".comfy_quant"):
                     continue
                 try:
@@ -78,17 +86,39 @@ def inspect_minimax_h3_safetensors(
             )
 
     for prefix, marker in layer_markers.items():
-        if marker.get("format") != "float8_e4m3fn":
-            continue
+        marker_format = marker.get("format")
         required = {f"{prefix}.weight", f"{prefix}.weight_scale"}
-        if not marker.get("full_precision_matrix_mult", False):
+        if marker_format == "float8_e4m3fn" and not marker.get(
+            "full_precision_matrix_mult", False
+        ):
             required.add(f"{prefix}.input_scale")
+        if marker_format not in ("float8_e4m3fn", "int8_tensorwise"):
+            continue
         missing = required - checkpoint_keys
         if missing:
             raise ValueError(
-                f"MiniMax-H3 Comfy FP8 layer {prefix!r} is missing checkpoint "
+                f"MiniMax-H3 Comfy layer {prefix!r} is missing checkpoint "
                 f"tensors: {sorted(missing)}"
             )
+        if marker_format == "int8_tensorwise":
+            weight_dtype, weight_shape = checkpoint_meta[f"{prefix}.weight"]
+            scale_dtype, scale_shape = checkpoint_meta[f"{prefix}.weight_scale"]
+            if weight_dtype != "I8" or scale_dtype != "F32":
+                raise ValueError(
+                    f"MiniMax-H3 Comfy INT8 layer {prefix!r} needs I8 weights "
+                    f"and F32 scales, got {weight_dtype} and {scale_dtype}"
+                )
+            if len(weight_shape) != 2:
+                raise ValueError(
+                    f"MiniMax-H3 Comfy INT8 layer {prefix!r} needs a 2D weight, "
+                    f"got {weight_shape}"
+                )
+            expected_scale_shape = (weight_shape[0], 1)
+            if scale_shape != expected_scale_shape:
+                raise ValueError(
+                    f"MiniMax-H3 Comfy INT8 layer {prefix!r} needs scale shape "
+                    f"{expected_scale_shape}, got {scale_shape}"
+                )
 
     return adaln_curve_shape, layer_markers
 
@@ -100,13 +130,8 @@ def resolve_minimax_h3_checkpoint_quantization(
         return None
 
     formats = sorted({str(marker.get("format")) for marker in layer_markers.values()})
-    if "int8_tensorwise" in formats:
-        raise NotImplementedError(
-            "MiniMax-H3 pruned_int8_convrot is not supported yet. Its "
-            "int8_tensorwise weights require an online regular-Hadamard ConvRot "
-            "and dynamic INT8 activation quantization kernel; loading them as "
-            "ordinary INT8/BF16 weights would produce incorrect output."
-        )
+    if formats == ["int8_tensorwise"]:
+        return KitchenInt8Config(layer_markers=layer_markers)
     if formats == ["float8_e4m3fn"]:
         return ComfyFp8Config(layer_markers)
     raise NotImplementedError(
