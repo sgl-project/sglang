@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from transformers import (
+    AutoImageProcessor,
     AutoProcessor,
     AutoTokenizer,
     PreTrainedTokenizerBase,
@@ -47,7 +48,74 @@ from .tokenizer import (
     _TOKENIZERS_BACKEND,
     _fix_added_tokens_encoding,
     _fix_special_tokens_pattern,
+    _install_tokenizer_warnings_filter,
 )
+
+_IMAGE_PROCESSOR_BACKENDS = {"auto", "torchvision", "pil"}
+
+
+def resolve_image_processor_backend(server_args) -> str:
+    """Resolve the new backend option while honoring the legacy disable flag."""
+    if getattr(server_args, "disable_fast_image_processor", False):
+        return "pil"
+    return getattr(server_args, "image_processor_backend", "auto")
+
+
+def _normalize_image_processor_backend(
+    image_processor_backend: Optional[str], use_fast: Optional[bool]
+) -> str:
+    backend = image_processor_backend or "auto"
+    if backend not in _IMAGE_PROCESSOR_BACKENDS:
+        raise ValueError(
+            f"Unsupported image processor backend: {backend}. "
+            f"Expected one of {sorted(_IMAGE_PROCESSOR_BACKENDS)}."
+        )
+
+    if use_fast is not None:
+        legacy_backend = "torchvision" if use_fast else "pil"
+        if backend not in {"auto", legacy_backend}:
+            raise ValueError(
+                f"use_fast={use_fast} conflicts with "
+                f"image_processor_backend={backend!r}."
+            )
+        backend = legacy_backend
+    return backend
+
+
+def _apply_image_processor_backend(
+    processor,
+    tokenizer_name,
+    args,
+    trust_remote_code,
+    revision,
+    backend,
+    kwargs,
+):
+    """Apply an explicit backend only to the image sub-processor.
+
+    ProcessorMixin forwards generic kwargs to every sub-processor. Passing
+    ``backend`` through AutoProcessor therefore also reaches tokenizers and
+    video processors, where it has different semantics or may be read-only.
+    """
+    if backend == "auto" or not hasattr(processor, "image_processor"):
+        return processor
+
+    image_processor = processor.image_processor
+    if getattr(image_processor, "backend", None) == backend:
+        return processor
+
+    image_processor_kwargs = dict(kwargs)
+    image_processor_kwargs.pop("backend", None)
+    image_processor_kwargs.pop("use_fast", None)
+    processor.image_processor = AutoImageProcessor.from_pretrained(
+        tokenizer_name,
+        *args,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        backend=backend,
+        **image_processor_kwargs,
+    )
+    return processor
 
 
 def _build_processor_manually(
@@ -141,7 +209,8 @@ def get_processor(
     tokenizer_mode: str = "auto",
     trust_remote_code: bool = False,
     tokenizer_revision: Optional[str] = None,
-    use_fast: Optional[bool] = True,
+    use_fast: Optional[bool] = None,
+    image_processor_backend: Optional[str] = None,
     tokenizer_backend: str = "huggingface",
     model_name: Optional[str] = None,
     **kwargs,
@@ -152,6 +221,9 @@ def get_processor(
         _ensure_fastokens_patched()
 
     revision = kwargs.pop("revision", tokenizer_revision)
+    image_processor_backend = _normalize_image_processor_backend(
+        image_processor_backend, use_fast
+    )
     tokenizer_name = resolve_runai_obj_uri(tokenizer_name)
     if model_name is not None:
         model_name = resolve_runai_obj_uri(model_name)
@@ -186,7 +258,6 @@ def get_processor(
     # Checkpoints with language_model_only=True are text-only despite their
     # multimodal-family config; route to tokenizer instead of the mm processor.
     if getattr(config, "language_model_only", False):
-        kwargs.pop("use_fast", None)
         return AutoTokenizer.from_pretrained(
             tokenizer_name,
             *args,
@@ -199,8 +270,6 @@ def get_processor(
         if "size" not in kwargs:
             kwargs["size"] = {"shortest_edge": 3136, "longest_edge": 1003520}
 
-    if config.model_type not in {"llava", "clip"}:
-        kwargs["use_fast"] = use_fast
     try:
         if "InternVL3_5" in tokenizer_name:
             processor = AutoTokenizer.from_pretrained(
@@ -230,20 +299,7 @@ def get_processor(
 
     except ValueError as e:
         error_message = str(e)
-        if "does not have a slow version" in error_message:
-            logger.info(
-                "Processor %s does not have a slow version. Automatically use fast version",
-                tokenizer_name,
-            )
-            kwargs["use_fast"] = True
-            processor = AutoProcessor.from_pretrained(
-                tokenizer_name,
-                *args,
-                trust_remote_code=trust_remote_code,
-                revision=revision,
-                **kwargs,
-            )
-        elif "Unrecognized feature extractor" in error_message:
+        if "Unrecognized feature extractor" in error_message:
             logger.info(
                 "AutoProcessor failed on feature extractor for %s, "
                 "constructing processor manually",
@@ -261,10 +317,9 @@ def get_processor(
         ):
             logger.info(
                 "AutoProcessor for %s rejected standard kwargs, "
-                "retrying without trust_remote_code/use_fast",
+                "retrying without trust_remote_code",
                 tokenizer_name,
             )
-            kwargs.pop("use_fast", None)
             kwargs.pop("_from_auto", None)
             processor = AutoProcessor.from_pretrained(
                 tokenizer_name,
@@ -274,6 +329,16 @@ def get_processor(
             )
         else:
             raise
+
+    processor = _apply_image_processor_backend(
+        processor,
+        tokenizer_name,
+        args,
+        trust_remote_code,
+        revision,
+        image_processor_backend,
+        kwargs,
+    )
     if (
         isinstance(processor, PreTrainedTokenizerBase)
         and getattr(config, "model_type", None) == "pixtral"
@@ -303,6 +368,8 @@ def get_processor(
             processor = tokenizer
         else:
             processor.tokenizer = tokenizer
+
+    _install_tokenizer_warnings_filter(tokenizer)
 
     if tokenizer.chat_template is None:
         local_path = download_from_hf(

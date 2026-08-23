@@ -175,10 +175,10 @@ class PrefillBootstrapQueue:
                     f"chunked_prefill_size that is a multiple of page_size "
                     f"({page_size}); got {chunked_prefill_size}."
                 )
-            if self.pp_size > 1:
-                # Staging writer accounting has no pp dimension.
+            if self.pp_size > 1 and self.transfer_backend != TransferBackend.MOONCAKE:
                 raise RuntimeError(
-                    "SGLANG_DISAGG_STAGING_BUFFER does not support pp_size > 1."
+                    "SGLANG_DISAGG_STAGING_BUFFER with pp_size > 1 is only "
+                    "supported by Mooncake."
                 )
             if get_parallel().enable_prefill_context_parallel:
                 # CP rewrites index_slice per rank, breaking the chunk grid.
@@ -253,7 +253,7 @@ class PrefillBootstrapQueue:
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
         )
-        kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
+        kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
 
         req_to_token_pool = getattr(self.scheduler, "req_to_token_pool", None)
@@ -438,8 +438,7 @@ class PrefillBootstrapQueue:
                 failed_reqs.append(req)
             elif poll == KVPoll.Bootstrapping:
                 if (
-                    req.prefill_attempt_count
-                    < self.scheduler.server_args.optimistic_prefill_attempts
+                    req.prefill_attempt_count < get_disagg().optimistic_prefill_attempts
                     and not req.is_retracted  # engine paused
                 ):
                     if not self.ensure_metadata_buffer(req):
@@ -680,6 +679,10 @@ class SchedulerDisaggregationPrefillMixin:
 
         if copy_done is not None:
             copy_done.synchronize()
+        auxiliary_output_starts = (
+            self.batch_result_processor.snapshot_auxiliary_output_starts(batch, result)
+        )
+        auxiliary_output = result.auxiliary_host_output
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None
@@ -790,6 +793,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # Optimistic bootstrap can fail while this overlapped chunk is
                 # already running. Drop aborted chunks instead of sending KV.
                 if is_aborted(req):
+                    self.clear_pending_chunk_send(req)
                     advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
                     continue
@@ -817,6 +821,13 @@ class SchedulerDisaggregationPrefillMixin:
                     ), f"Req {req.rid} does not have metadata buffer allocated"
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
+
+        if auxiliary_output is not None:
+            self.batch_result_processor.consume_auxiliary_output(
+                batch,
+                auxiliary_output,
+                auxiliary_output_starts,
+            )
 
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
@@ -962,25 +973,17 @@ class SchedulerDisaggregationPrefillMixin:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
 
-    def get_transferred_rids(self: Scheduler) -> List[str]:
+    def clear_pending_chunk_send(self: Scheduler, req: Req) -> None:
+        """Drop `req` from the sent-but-unconcluded chunk set.
+
+        Every path that retires a request without a `last_chunk=True` send must
+        call this: a stale entry holds the unified-memory compaction gate closed
+        for the process lifetime.
         """
-        Used by PP, get the transferred rids but **do not pop**
-        """
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
-        )
-
-        transferred_rids: List[str] = []
-
-        for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
-            if poll == KVPoll.Success or poll == KVPoll.Failed:
-                transferred_rids.append(req.rid)
-
-        return transferred_rids
+        self.disagg_prefill_pending_chunk_rids.discard(req.rid)
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
+        self.clear_pending_chunk_send(req)
         error_message = (
             f"Prefill bootstrap failed for request rank={self.ps.tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
@@ -1178,16 +1181,18 @@ class SchedulerDisaggregationPrefillMixin:
 
             def _mamba_payload():
                 return [
-                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                        req.req_pool_idx
-                    ]
+                    self.req_to_token_pool.translate_mamba_indices(
+                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                            req.req_pool_idx
+                        ]
+                    )
                     .cpu()
                     .numpy()
                 ]
 
             def _swa_payload():
                 window_size = self.sliding_window_size
-                window_start = max(0, seq_len - window_size)
+                window_start = max(req.disagg_decode_prefix_len, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, window_start:seq_len
@@ -1199,7 +1204,7 @@ class SchedulerDisaggregationPrefillMixin:
                 )
                 return kv_to_page_indices(window_kv_indices_swa, page_size)
 
-            def _dsa_payload():
+            def _full_kv_pages_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :seq_len
                 ]
@@ -1237,15 +1242,15 @@ class SchedulerDisaggregationPrefillMixin:
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
-            # MINIMAX_INDEX_K reuses _dsa_payload: index rows live at the same loc
-            # as main KV on the same page_size.
             payloads = {
                 StateType.MAMBA: _mamba_payload,
                 StateType.SWA: _swa_payload,
-                StateType.DSA: _dsa_payload,
-                StateType.MINIMAX_INDEX_K: _dsa_payload,
+                StateType.DSA: _full_kv_pages_payload,
+                StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.C128_STATE: _c128_state_payload,
+                StateType.BLOCK_SCALE: _full_kv_pages_payload,
+                StateType.BLOCK_SCALE_SWA: _swa_payload,
             }
             if _is_npu and isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(),
@@ -1261,8 +1266,7 @@ class SchedulerDisaggregationPrefillMixin:
                         req.req_pool_idx,
                         seq_len,
                         page_size,
-                        self.sliding_window_size,
-                        prefix_len=0,
+                        prefix_len=req.disagg_decode_prefix_len,
                     )
                 )
             state_indices = [
@@ -1287,6 +1291,13 @@ class SchedulerDisaggregationPrefillMixin:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, seg_start:seg_end
             ]
+            # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
+            # physical ones. Per segment, since each is its own gather.
+            kv_indices = (
+                self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                    kv_indices
+                )
+            )
             page_indices = kv_to_page_indices(kv_indices, page_size)
             segment_is_last = last_chunk and is_final_segment
             if not req.disagg_kv_sender.should_send_kv_chunk(
@@ -1299,6 +1310,12 @@ class SchedulerDisaggregationPrefillMixin:
                 num_kv_tokens=seg_end - seg_start,
             )
         req.start_send_idx = end_idx
+        # A last chunk needs no entry: every `last_chunk=True` call site has
+        # already put the request on `disagg_prefill_inflight_queue`.
+        if last_chunk:
+            self.disagg_prefill_pending_chunk_rids.discard(req.rid)
+        else:
+            self.disagg_prefill_pending_chunk_rids.add(req.rid)
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
@@ -1308,6 +1325,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.reset_for_retract()
         req.output_ids = array("q")
         req.start_send_idx = 0
+        self.clear_pending_chunk_send(req)  # re-sends from scratch
         req.tmp_end_idx = -1
         req.disagg_decode_prefix_len = 0
         req.early_send_prefix_end = None

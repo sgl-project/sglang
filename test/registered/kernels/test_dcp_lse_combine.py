@@ -265,13 +265,17 @@ class TestCPUReference(CustomTestCase):
 
         self.assertFalse(torch.allclose(result_e, result_2, atol=1e-3))
 
-    def test_flashmla_selects_natural_log_lse(self):
+    def test_natural_log_lse_backends(self):
         from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
             is_mla_dcp_lse_base_on_e,
         )
 
         self.assertTrue(is_mla_dcp_lse_base_on_e("flashmla"))
+        self.assertTrue(is_mla_dcp_lse_base_on_e("cutedsl_mla"))
         self.assertFalse(is_mla_dcp_lse_base_on_e("flashinfer_mla"))
+        self.assertFalse(is_mla_dcp_lse_base_on_e("tokenspeed_mla"))
+        self.assertFalse(is_mla_dcp_lse_base_on_e("trtllm_mla"))
+        self.assertFalse(is_mla_dcp_lse_base_on_e(None))
 
     def test_nan_lse_handled(self):
         from sglang.kernels.ops.attention.dcp_kernels import _lse_weighted_combine_cpu
@@ -447,6 +451,87 @@ class TestDCPA2AReduceWithCUDAGraphBuffers(CustomTestCase):
 
         self.assertEqual(result.shape, (B, H_per_rank, D))
         self.assertFalse(torch.isnan(result).any())
+
+    def test_pack_matches_the_copy_formulation_it_replaces(self):
+        from sglang.kernels.ops.attention.dcp_kernels import (
+            _lse_pack_dim,
+            dcp_pack_a2a_send,
+        )
+
+        for N, B, H_per_rank, D, dtype in (
+            (2, 4, 8, 128, torch.bfloat16),
+            (4, 3, 2, 64, torch.float16),
+            (8, 1, 12, 512, torch.bfloat16),
+        ):
+            with self.subTest(N=N, B=B, H_per_rank=H_per_rank, D=D, dtype=dtype):
+                H = H_per_rank * N
+                lpd = _lse_pack_dim(dtype)
+                max_bs = B + 5
+                out = torch.randn(B, H, D, device=self.device, dtype=dtype)
+                lse = torch.randn(B, H, device=self.device, dtype=torch.float32)
+
+                got = torch.zeros(
+                    N, max_bs, H_per_rank, D + lpd, dtype=dtype, device=self.device
+                )
+                dcp_pack_a2a_send(
+                    out,
+                    lse,
+                    got[:, :, :, :D],
+                    got.view(torch.float32)[:, :, :, D // lpd],
+                )
+
+                want = torch.zeros_like(got)
+                want[:, :B, :, :D] = out.view(B, N, H_per_rank, D).permute(1, 0, 2, 3)
+                want[:, :B, :, D:] = (
+                    lse.view(B, N, H_per_rank)
+                    .permute(1, 0, 2)
+                    .contiguous()
+                    .view(dtype)
+                    .view(N, B, H_per_rank, lpd)
+                )
+                self.assertTrue(
+                    torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+                )
+
+                lane = got.view(torch.float32)[:, :B, :, D // lpd]
+                self.assertTrue(
+                    torch.equal(lane, lse.view(B, N, H_per_rank).permute(1, 0, 2))
+                )
+
+    def test_pack_serves_the_split_peer_inside_layout(self):
+        from sglang.kernels.ops.attention.dcp_kernels import dcp_pack_a2a_send
+
+        for N, B, H_per_rank, D in ((2, 4, 8, 128), (4, 1, 16, 512)):
+            with self.subTest(N=N, B=B, H_per_rank=H_per_rank, D=D):
+                H = H_per_rank * N
+                out = torch.randn(B, H, D, device=self.device, dtype=torch.bfloat16)
+                lse = torch.randn(B, H, device=self.device, dtype=torch.float32)
+
+                partial_o = torch.empty(
+                    B, H_per_rank, N, D, dtype=torch.bfloat16, device=self.device
+                )
+                stats = torch.zeros(
+                    B, H_per_rank, N, 2, dtype=torch.float32, device=self.device
+                )
+                dcp_pack_a2a_send(
+                    out,
+                    lse,
+                    partial_o.permute(2, 0, 1, 3),
+                    stats[..., 0].permute(2, 0, 1),
+                )
+
+                want_o = out.view(B, N, H_per_rank, D).permute(0, 2, 1, 3)
+                want_lse = lse.view(B, N, H_per_rank).permute(0, 2, 1)
+                self.assertTrue(
+                    torch.equal(
+                        partial_o.view(torch.uint8),
+                        want_o.contiguous().view(torch.uint8),
+                    )
+                )
+                self.assertTrue(torch.equal(stats[..., 0], want_lse))
+                self.assertTrue(
+                    torch.equal(stats[..., 1], torch.zeros_like(stats[..., 1]))
+                )
 
     def test_buffers_have_fixed_data_ptrs(self):
         """Pre-allocated buffer data_ptr must not change -- required for graph replay."""

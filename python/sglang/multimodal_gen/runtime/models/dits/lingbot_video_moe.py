@@ -60,6 +60,10 @@ LINGBOT_VIDEO_FP32_MODULES = (
 )
 
 
+def is_lingbot_block(name: str, _module: object) -> bool:
+    return "blocks" in name and name.split(".")[-1].isdigit()
+
+
 def should_keep_in_fp32(name: str) -> bool:
     return any(
         module_name in name.split(".") for module_name in LINGBOT_VIDEO_FP32_MODULES
@@ -344,11 +348,8 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
     _no_split_modules = ("LingBotVideoBlock",)
     _keep_in_fp32_modules = tuple(LINGBOT_VIDEO_FP32_MODULES)
 
-    _fsdp_shard_conditions = LingBotVideoMoEConfig()._fsdp_shard_conditions
-    _compile_conditions = LingBotVideoMoEConfig()._compile_conditions
-    _supported_attention_backends = (
-        LingBotVideoMoEConfig()._supported_attention_backends
-    )
+    _fsdp_shard_conditions = [is_lingbot_block]
+    _compile_conditions = [is_lingbot_block]
     param_names_mapping = LingBotVideoMoEConfig().param_names_mapping
     reverse_param_names_mapping = LingBotVideoMoEConfig().reverse_param_names_mapping
     lora_param_names_mapping = LingBotVideoMoEConfig().lora_param_names_mapping
