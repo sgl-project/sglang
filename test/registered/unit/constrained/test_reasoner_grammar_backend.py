@@ -149,6 +149,15 @@ class TestReasonerGrammarObject(unittest.TestCase):
         self.assertEqual(obj.tokens_after_end, 0)
         self.assertEqual(_allowed_token_ids(mask, [8, 9, 10]), [8, 10])
 
+    def test_non_reasoning_request_does_not_block_eos(self):
+        obj = self._make_strict_object()
+        obj.maybe_init_reasoning(False)
+        mask = obj.allocate_vocab_mask(64, 1, "cpu")
+
+        obj.fill_vocab_mask(mask, 0)
+
+        self.assertTrue(torch.all(mask == 0))
+
     def test_budget_exhaustion_walks_multi_token_end(self):
         obj = ReasonerGrammarObject(
             grammar=None,
