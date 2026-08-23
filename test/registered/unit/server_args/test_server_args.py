@@ -1683,16 +1683,22 @@ class TestCudaGraphConfigDataclassAccess(CustomTestCase):
         mock_backend = mock_get_moe_a2a_backend.return_value
         mock_backend.is_deepep.return_value = False
         mock_backend.is_mooncake.return_value = False
-        server_args = SimpleNamespace(
+        from sglang.srt.runtime_context import get_context
+
+        # The graph configuration is a bag leaf; the debug switch is raw input
+        # and stays on the argument.
+        override = get_context().override_server_args(
             cuda_graph_config=CudaGraphConfig(
                 prefill=PhaseConfig(
                     backend=Backend.TC_PIECEWISE,
                     bs=[32, 64],
                     tc_compiler="eager",
                 )
-            ),
-            enable_torch_compile_debug_mode=False,
+            )
         )
+        override.install()
+        self.addCleanup(override.restore)
+        server_args = SimpleNamespace(enable_torch_compile_debug_mode=False)
 
         config = TcPiecewiseCudaGraphBackend.build_compilation_config(server_args)
 
@@ -2063,15 +2069,15 @@ class TestGrpcServerArgs(CustomTestCase):
 
     def test_sidecar_builds_loopback_grpc_endpoints(self):
         self.assertEqual(
-            build_sidecar_endpoint(SimpleNamespace(host="0.0.0.0", grpc_port=50051)),
+            build_sidecar_endpoint("0.0.0.0", 50051),
             "http://127.0.0.1:50051",
         )
         self.assertEqual(
-            build_sidecar_endpoint(SimpleNamespace(host="::", grpc_port=50051)),
+            build_sidecar_endpoint("::", 50051),
             "http://[::1]:50051",
         )
         self.assertEqual(
-            build_sidecar_endpoint(SimpleNamespace(host="[::]", grpc_port=50051)),
+            build_sidecar_endpoint("[::]", 50051),
             "http://[::1]:50051",
         )
 
@@ -2083,6 +2089,8 @@ class TestGrpcServerArgs(CustomTestCase):
         self.assertEqual(parsed.sidecar_args, argv)
 
     def test_start_sidecar_passes_endpoint_and_provider_argv_separately(self):
+        from sglang.srt.runtime_context import get_context as get_context_for_config
+
         server_args = SimpleNamespace(
             sidecar="example.sidecar",
             sidecar_args=[
@@ -2092,8 +2100,11 @@ class TestGrpcServerArgs(CustomTestCase):
                 "2",
             ],
             host="127.0.0.1",
-            grpc_port=50051,
         )
+        # The port the sidecar dials is the resolved one, off the bag.
+        override = get_context_for_config().override_server_args(grpc_port=50051)
+        override.install()
+        self.addCleanup(override.restore)
         with (
             patch("sglang.srt.entrypoints.sidecar.mp.get_context") as get_context,
             patch("sglang.srt.entrypoints.sidecar.Sidecar") as sidecar_class,

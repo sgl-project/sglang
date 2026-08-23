@@ -101,7 +101,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         )
         # The consumer count comes from the published topology.
         override = get_context().override_server_args(
-            enable_dp_attention=False, tp_size=4
+            enable_dp_attention=False, tp_size=4, mm_feature_transport="cuda_vmm"
         )
         override.install()
         self.addCleanup(override.restore)
@@ -122,13 +122,16 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         )
 
     def test_disabled_transport_is_a_noop(self):
+        from sglang.srt.runtime_context import get_context
         from sglang.srt.utils.cuda_vmm_transport_utils import (
             CudaVmmFeatureTransport,
         )
 
-        transport = CudaVmmFeatureTransport(
-            SimpleNamespace(mm_feature_transport="cpu"), None
-        )
+        # The transport choice is a bag leaf.
+        override = get_context().override_server_args(mm_feature_transport="cpu")
+        override.install()
+        self.addCleanup(override.restore)
+        transport = CudaVmmFeatureTransport(SimpleNamespace(), None)
 
         self.assertEqual(transport.prepare_for_dispatch([None]), [])
         transport.cancel_for_dispatch([])
@@ -136,14 +139,16 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         self.assertIsNone(transport.pool)
 
     def test_vmm_transport_requires_processor(self):
+        from sglang.srt.runtime_context import get_context
         from sglang.srt.utils.cuda_vmm_transport_utils import (
             CudaVmmFeatureTransport,
         )
 
+        override = get_context().override_server_args(mm_feature_transport="cuda_vmm")
+        override.install()
+        self.addCleanup(override.restore)
         with self.assertRaisesRegex(RuntimeError, "multimodal processor"):
-            CudaVmmFeatureTransport(
-                SimpleNamespace(mm_feature_transport="cuda_vmm"), None
-            )
+            CudaVmmFeatureTransport(SimpleNamespace(), None)
 
     def test_image_features_are_packed_per_request(self):
         from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem

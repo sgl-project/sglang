@@ -107,6 +107,40 @@ _CONFIGURED_SIZE_CALL_SITES = {
     ("srt/managers/scheduler.py", "configured_dcp_size"): (
         "same pre-distributed-init arithmetic in configure_scheduler_process"
     ),
+    ("srt/model_executor/runner/base_runner.py", "configured_pp_size"): (
+        "the runner's layer window is arithmetic over the configured stage "
+        "count; a draft runner shares the target's groups, so the live "
+        "property would answer for the wrong runner"
+    ),
+    ("srt/model_executor/cpu_graph_runner.py", "configured_pp_size"): (
+        "the same window, on the CPU graph path"
+    ),
+    (
+        "srt/managers/scheduler_components/metrics_reporter.py",
+        "configured_pp_size",
+    ): (
+        "the reporter labels its metrics with the stage count it was launched "
+        "with, which is configuration; the live group answers per process"
+    ),
+    ("srt/speculative/eagle_draft_cuda_graph_runner.py", "configured_pp_size"): (
+        "the draft runner's window over the target's stages: its own groups are "
+        "the target's, so the configured count is the one that describes it"
+    ),
+    (
+        "srt/speculative/eagle_draft_extend_cuda_graph_runner.py",
+        "configured_pp_size",
+    ): ("the same draft window, on the extend path"),
+    (
+        "srt/speculative/multi_layer_eagle_draft_extend_cuda_graph_runner.py",
+        "configured_pp_size",
+    ): ("the same draft window, multi-layer extend"),
+    ("srt/speculative/frozen_kv_mtp_cuda_graph_runner.py", "configured_pp_size"): (
+        "the same draft window, frozen-KV MTP"
+    ),
+    ("srt/entrypoints/v1_loads.py", "configured_pp_size"): (
+        "the /v1/loads accelerator count is arithmetic over the launch shape, "
+        "reported from the tokenizer process, which holds no model groups"
+    ),
     ("srt/disaggregation/common/conn.py", "configured_pp_size"): (
         "the bootstrap connection is built by the KV manager on the transfer "
         "path, which the CPU-only conn tests exercise without ever starting "
