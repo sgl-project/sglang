@@ -721,7 +721,6 @@ class ModelRunner:
     def maybe_init_eplb_manager(self):
         self.eplb_manager = (
             EPLBManager(
-                server_args=self.server_args,
                 model_config=self.model_config,
                 ps=self.ps,
                 get_model=lambda: self.model,
