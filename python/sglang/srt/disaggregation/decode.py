@@ -408,6 +408,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         host_index = torch.empty(
             index.shape, dtype=torch.int32, device="cpu", pin_memory=True
         )
+        copy_stream.wait_stream(torch.cuda.current_stream(device=index.device))
         with torch.cuda.stream(copy_stream):
             device_index = index.to(dtype=torch.int32)
             host_index.copy_(device_index, non_blocking=True)
