@@ -216,7 +216,7 @@ class BaseRunner(ABC):
         self.model_runner = model_runner
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
-        self.tp_size = model_runner.server_args.tp_size
+        self.tp_size = get_parallel().config.tp_size
         # elastic-EP scale-up rewrites dp_size on the published config
         self.dp_size = get_parallel().config.dp_size
         self.pp_size = get_parallel().config.pp_size
