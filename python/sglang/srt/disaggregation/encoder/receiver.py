@@ -35,7 +35,12 @@ from sglang.srt.managers.multimodal_processor import get_mm_processor, import_pr
 from sglang.srt.managers.schedule_batch import Modality, Req
 from sglang.srt.multimodal.cache import media_preprocess_kwargs
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
-from sglang.srt.runtime_context import get_disagg, get_exec, get_serving
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_mm,
+    get_serving,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData
 from sglang.srt.utils.common import safe_pickle_loads
@@ -1838,7 +1843,7 @@ class MMReceiverBase(ABC):
             tokenizer_mode=server_args.tokenizer_mode,
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
-            image_processor_backend=resolve_image_processor_backend(server_args),
+            image_processor_backend=resolve_image_processor_backend(get_mm()),
             **extra_kwargs,
         )
 
