@@ -138,6 +138,17 @@ def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     return np.prod(t.shape) * t.dtype.itemsize
 
 
+def _bump_req_generations(
+    req_generation: torch.Tensor, indices: List[int]
+) -> None:
+    # Preserve the cheaper scalar path for the common bs=1 DSpark case,
+    # while avoiding one torch dispatcher call per request for batches.
+    if len(indices) == 1:
+        req_generation[indices[0]] += 1
+    elif indices:
+        req_generation[indices] += 1
+
+
 def _set_kv_buffer_impl(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -281,6 +292,13 @@ class ReqToTokenPool:
             )
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
+        # Only DSpark's confidence relay consumes slot generations. Keep the
+        # tensor available for a stable pool interface, but avoid updating it
+        # for every request in all other serving modes.
+        self.track_req_generation = False
+
+    def enable_req_generation_tracking(self) -> None:
+        self.track_req_generation = True
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -314,11 +332,12 @@ class ReqToTokenPool:
         else:
             # Handled separately: free_slots[-0:] is the entire list, not [].
             select_index = []
+        if self.track_req_generation:
+            _bump_req_generations(self.req_generation, select_index)
         offset = 0
         for r in reqs:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_index[offset]
-                self.req_generation[r.req_pool_idx] += 1
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
