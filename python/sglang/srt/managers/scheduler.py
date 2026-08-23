@@ -3337,6 +3337,11 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            mamba_prefill_align_size=(
+                self.server_args.mamba_cache_chunk_size
+                if self.is_hybrid_ssm
+                else None
+            ),
         )
 
         if self.chunked_req is not None:

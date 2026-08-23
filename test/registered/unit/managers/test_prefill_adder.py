@@ -534,6 +534,89 @@ class TestPrefillAdder(CustomTestCase):
         req.set_extend_range.assert_not_called()
         self.assertEqual(len(adder.can_run_list), 0)
 
+    def test_mamba_chunked_prefill_splits_unaligned_tail_at_cache_boundary(self):
+        self.mock_tree_cache.supports_mamba.return_value = True
+        adder, req = self._build_hybrid_swa_chunked_req(
+            page_size=128,
+            rem_swa=100_000,
+            rem_chunk=16_384,
+            is_hybrid_swa=False,
+            full_available=100_000,
+        )
+        adder.is_hybrid_ssm_cache = True
+        adder.mamba_prefill_align_size = 128
+        req.prefix_indices = list(range(16_384))
+        req.full_untruncated_fill_ids = list(range(29_123))
+
+        result = adder.add_chunked_req(req)
+
+        self.assertIs(result, req)
+        req.set_extend_range.assert_called_once_with(16_384, 29_056)
+
+    def test_mamba_chunked_prefill_splits_unaligned_tail_without_radix(self):
+        self.mock_tree_cache.supports_mamba.return_value = False
+        adder, req = self._build_hybrid_swa_chunked_req(
+            page_size=128,
+            rem_swa=100_000,
+            rem_chunk=16_384,
+            is_hybrid_swa=False,
+            full_available=100_000,
+        )
+        # ChunkCache does not expose Mamba radix state, but the model-level
+        # scheduler still supplies the recurrent-state alignment.
+        adder.is_hybrid_ssm_cache = False
+        adder.mamba_prefill_align_size = 128
+        req.prefix_indices = list(range(16_384))
+        req.full_untruncated_fill_ids = list(range(29_123))
+
+        result = adder.add_chunked_req(req)
+
+        self.assertIs(result, req)
+        req.set_extend_range.assert_called_once_with(16_384, 29_056)
+
+    def test_mamba_chunked_prefill_keeps_short_tail_after_cache_boundary(self):
+        self.mock_tree_cache.supports_mamba.return_value = True
+        adder, req = self._build_hybrid_swa_chunked_req(
+            page_size=128,
+            rem_swa=100_000,
+            rem_chunk=16_384,
+            is_hybrid_swa=False,
+            full_available=100_000,
+        )
+        adder.is_hybrid_ssm_cache = True
+        adder.mamba_prefill_align_size = 128
+        req.prefix_indices = list(range(29_056))
+        req.full_untruncated_fill_ids = list(range(29_123))
+
+        result = adder.add_chunked_req(req)
+
+        self.assertIsNone(result)
+        req.set_extend_range.assert_called_once_with(29_056, 29_123)
+
+    def test_mamba_prefill_creates_boundary_chunk_before_unaligned_tail(self):
+        self.mock_tree_cache.supports_mamba.return_value = True
+        adder, req = self._build_hybrid_swa_chunked_req(
+            page_size=128,
+            rem_swa=100_000,
+            rem_chunk=16_384,
+            extend_input_len=1_000,
+            is_hybrid_swa=False,
+            full_available=100_000,
+        )
+        adder.is_hybrid_ssm_cache = True
+        adder.mamba_prefill_align_size = 128
+        req.host_hit_length = 0
+        req.swa_host_hit_length = 0
+        req.last_node = MagicMock()
+        req.sampling_params.ignore_eos = False
+
+        adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertIs(adder.new_chunked_req, req)
+        req.set_extend_range.assert_called_once_with(0, 896)
+
     def test_swa_budget_for_req(self):
         # budget = max(alloc - window, 0) + min(extend + max_new, window) + page,
         # where alloc = min(extend, rem_chunk). The decode headroom is the SWA the
