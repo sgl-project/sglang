@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
-import aiohttp
 import msgspec
 import numpy as np
 import torch
@@ -58,12 +57,12 @@ from sglang.srt.multimodal.encoder_preprocessing import (
 )
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
 from sglang.srt.runtime_context import (
+    ensure_published,
     get_device,
     get_disagg,
     get_exec,
     get_mm,
     get_model,
-    publish,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import configure_media_url_security
@@ -449,9 +448,7 @@ class MMEncoder:
         ``base_gpu_id + rank`` — the DP launcher's per-worker placement. It is
         this instance's value, not a config change, so it travels as an
         argument."""
-        # The DP and TP encoder workers are spawned, so this constructor is
-        # the first publish in those processes.
-        publish(server_args, role="encoder")
+        ensure_published(server_args, role="encoder")
         logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
         self.server_args = server_args
         configure_media_url_security(
@@ -1946,17 +1943,6 @@ class MMEncoder:
         finally:
             logger.info(f"Cleaning up resources for req_id {req_id}")
             await self.release_request(req_id)
-
-    async def get_embedding_port(self, prefill_url):
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=1800)
-        ) as session:
-            response = await session.post(
-                f"{prefill_url}/embedding_bootstrap",
-                json={"embedding_port": None},
-            )
-            response_json = await response.json()
-            return response_json["embedding_port"]
 
 
 class EncoderProfiler:

@@ -45,9 +45,17 @@ class MiniMaxH3DiTModel(torch.nn.Module):
     pass
 
 
+class LongCatImageTransformer2DModel(torch.nn.Module):
+    pass
+
+
 class ZImageTransformer2DModel(torch.nn.Module):
     def rotary_emb(self, pos_ids):
         return torch.zeros(pos_ids.shape[0], 8, device=pos_ids.device)
+
+
+class SanaVideoTransformer3DModel(torch.nn.Module):
+    pass
 
 
 def _fake_cache_dit_batch(*, is_warmup: bool) -> SimpleNamespace:
@@ -62,8 +70,10 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.stage = DenoisingStage.__new__(DenoisingStage)
         self.qwen_model = QwenImageTransformer2DModel()
         self.ideogram_model = Ideogram4Transformer2DModel()
+        self.longcat_model = LongCatImageTransformer2DModel()
         self.minimax_h3_model = MiniMaxH3DiTModel()
         self.zimage_model = ZImageTransformer2DModel()
+        self.sana_video_model = SanaVideoTransformer3DModel()
         self.other_model = OtherTransformer2DModel()
 
     def _patch_buckets(self, *buckets: int):
@@ -132,6 +142,26 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertEqual(_attn_mask_meta_local_pad(None), 0)
         self.assertEqual(_attn_mask_meta_local_pad({"local_pad": 7}), 7)
         self.assertEqual(_attn_mask_meta_local_pad(DynamicVarlenMaskMeta()), 0)
+
+    def test_longcat_keeps_its_fixed_512_token_prompt_shape(self):
+        kwargs = {
+            "hidden_states": torch.zeros(1, 4096, 64),
+            "timestep": torch.zeros(1),
+            "encoder_hidden_states": torch.zeros(1, 512, 3584),
+            "encoder_attention_mask": [torch.ones(1, 512, dtype=torch.long)],
+            "encoder_hidden_states_mask": [torch.ones(1, 512, dtype=torch.bool)],
+            "txt_ids": torch.zeros(512, 3),
+            "img_ids": torch.zeros(4096, 3),
+        }
+
+        with self._patch_buckets(64, 128, 256, 512, 1024):
+            out = self.stage._bcg_pad_prompt_kwargs(
+                kwargs, current_model=self.longcat_model
+            )
+
+        self.assertIs(out, kwargs)
+        self.assertEqual(out["encoder_hidden_states"].shape, (1, 512, 3584))
+        self.assertEqual(out["txt_ids"].shape, (512, 3))
 
     def test_qwen_default_bucket_preserves_mask(self):
         def kwargs(valid_len: int):
@@ -380,6 +410,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
 
     def test_image_generation_models_are_registered_as_bcg_supported(self):
         for model_id in (
+            "meituan-longcat/longcat-image",
             "qwen/qwen-image",
             "qwen/qwen-image-2512",
             "tongyi-mai/z-image",
@@ -390,6 +421,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
 
         for config_name in (
             "GlmImagePipelineConfig",
+            "LongCatImagePipelineConfig",
             "QwenImagePipelineConfig",
             "ZImagePipelineConfig",
         ):
@@ -407,6 +439,28 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         )
         self.assertIn(
             "LTX23PipelineConfig", BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
+        )
+
+    def test_sana_video_keeps_its_fixed_prompt_shape(self):
+        kwargs = {
+            "encoder_hidden_states": torch.zeros(1, 300, 2304),
+            "encoder_attention_mask": torch.ones(1, 300, dtype=torch.long),
+        }
+        with self._patch_buckets(64, 128, 256, 512, 1024):
+            out = self.stage._bcg_pad_prompt_kwargs(
+                kwargs, current_model=self.sana_video_model
+            )
+
+        self.assertIs(out, kwargs)
+        self.assertEqual(out["encoder_hidden_states"].shape, (1, 300, 2304))
+        self.assertEqual(out["encoder_attention_mask"].shape, (1, 300))
+        self.assertIn(
+            "efficient-large-model/sana-video_2b_480p_diffusers",
+            BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
+        )
+        self.assertIn(
+            "SanaVideoPipelineConfig",
+            BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS,
         )
 
     def test_dynamic_varlen_mask_meta_rebuilds_once_per_replay_token(self):
