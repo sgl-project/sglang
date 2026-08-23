@@ -239,6 +239,9 @@ _STRATEGY: Optional[ContextParallelStrategy] = None
 
 def init_cp_strategy(server_args: ServerArgs) -> None:
     """Bind the configured CP strategy for this process."""
+    from sglang.srt.arg_groups.overrides import resolving_view
+
+    cfg = resolving_view(server_args)
     global _STRATEGY
 
     if not getattr(server_args, "enable_prefill_cp", False):
@@ -250,7 +253,7 @@ def init_cp_strategy(server_args: ServerArgs) -> None:
         _STRATEGY = None
         return
 
-    kind = ContextParallelStrategyKind.from_string(server_args.cp_strategy)
+    kind = ContextParallelStrategyKind.from_string(cfg.cp_strategy)
     if kind == ContextParallelStrategyKind.ZIGZAG:
         from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 
@@ -262,7 +265,7 @@ def init_cp_strategy(server_args: ServerArgs) -> None:
     else:
         raise ValueError(
             f"Unsupported cp_strategy kind {kind} for "
-            f"cp_strategy={server_args.cp_strategy!r}"
+            f"cp_strategy={cfg.cp_strategy!r}"
         )
 
 
