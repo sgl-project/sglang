@@ -661,7 +661,10 @@ class ComponentResidencyManager:
             was_on_supported_device and not self._module_on_supported_device(module)
         )
         released_layerwise_storage = isinstance(strategy, LayerwiseOffloadStrategy)
-        if not (released_device_storage or released_layerwise_storage):
+        should_empty_component_cache = (
+            released_device_storage and not current_platform.is_npu()
+        )
+        if not (should_empty_component_cache or released_layerwise_storage):
             return
         if not torch.get_device_module().is_available():
             return
