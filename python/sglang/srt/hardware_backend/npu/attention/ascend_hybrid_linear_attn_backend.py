@@ -292,11 +292,10 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             track_mask = mamba_steps_to_track >= 0
             # Track conv state from the verify-time window before rolling back
             # the working slot; NPU does not keep per-step conv intermediates.
-            track_indices = mamba_track_indices[track_mask]
-            if track_indices.numel() > 0:
-                conv_states[:, track_indices] = conv_states[
-                    :, dst_indices_tensor[track_mask]
-                ]
+            src_slots = torch.where(
+                track_mask, dst_indices_tensor, mamba_track_indices
+            )
+            conv_states[:, mamba_track_indices] = conv_states[:, src_slots]
 
         if dst_indices_tensor.numel() > 0:
             conv_state_rollback(
