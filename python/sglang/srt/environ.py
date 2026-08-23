@@ -594,6 +594,10 @@ class Envs:
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
+    # Fuse the speculative DP-attention prefill-priority probe and steady
+    # decode metadata synchronization into one collective. Opt-in while the
+    # path is validated across accelerator backends.
+    SGLANG_SPECULATIVE_FUSED_DP_MLP_SYNC = EnvBool(False)
 
     # ===================================================================
     # Radix and sparse KV caches

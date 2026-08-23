@@ -89,6 +89,11 @@ class MLPSyncBatchInfo:
     is_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
+    # Speculative DP-attention normally performs one gather to decide whether
+    # any DP rank has prefill work and another gather for the decode metadata.
+    # These fields let the fast path carry both decisions in one collective.
+    local_prefill_priority: bool = False
+    local_decode_probe_valid: bool = True
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -97,6 +102,8 @@ class MLPSyncBatchInfo:
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
+    global_prefill_priority: bool = False
+    global_decode_probe_valid: bool = True
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
         return torch.tensor(
@@ -108,6 +115,8 @@ class MLPSyncBatchInfo:
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
                 int(self.can_run_prefill_cuda_graph),
+                int(self.local_prefill_priority),
+                int(self.local_decode_probe_valid),
             ],
             device=device,
             dtype=dtype,
@@ -123,6 +132,8 @@ class MLPSyncBatchInfo:
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_prefill_cuda_graph
+                0,  # local_prefill_priority
+                1,  # local_decode_probe_valid
             ],
             device=device,
             dtype=dtype,
@@ -133,6 +144,7 @@ class MLPSyncBatchInfo:
         device,
         group: torch.distributed.ProcessGroup,
         use_all_reduce: bool = False,
+        prefer_prefill: bool = False,
     ):
         local_info_tensor = self._get_local_tensor(device=device)
         fallback_tensor = self._get_fallback_tensor(device=device)
@@ -188,6 +200,16 @@ class MLPSyncBatchInfo:
         # `[:, 0, :]` slice -- that slice is non-contiguous once
         # attn_tp * attn_cp > 1, adding a gather kernel inside the wait.
         tp0_info_cpu = global_info_tensor.cpu()[:, 0, :]
+        self.global_prefill_priority = bool(tp0_info_cpu[:, 7].max())
+        self.global_decode_probe_valid = bool(tp0_info_cpu[:, 8].min())
+        if prefer_prefill and self.global_prefill_priority:
+            # Prefill must not be mixed with speculative decode. Non-prefill
+            # rows carried decode probes only to avoid a second collective;
+            # turn them into the exact idle metadata used by the old two-pass
+            # path before deriving global token counts and forward mode.
+            non_prefill = tp0_info_cpu[:, 7] == 0
+            if bool(non_prefill.any()):
+                tp0_info_cpu[non_prefill] = self._get_fallback_tensor("cpu")
         self.tp0_info_cpu = tp0_info_cpu
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
         self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
@@ -225,7 +247,7 @@ def _update_gather_batch(
     batch.can_run_dp_breakable_cuda_graph = mlp_sync_info.can_run_prefill_cuda_graph
 
 
-def prepare_mlp_sync_batch_raw(
+def _prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
     model_runner: ModelRunner,
     dp_size: int,
@@ -238,6 +260,9 @@ def prepare_mlp_sync_batch_raw(
     disable_overlap_schedule: bool,
     offload_tags: set[str],
     dwdp: bool = False,
+    local_prefill_priority: bool = False,
+    local_decode_probe_valid: bool = True,
+    prefer_prefill: bool = False,
 ):
     # Check if other DP workers have running batches
     if (
@@ -341,6 +366,8 @@ def prepare_mlp_sync_batch_raw(
         is_extend_in_batch=is_extend_in_batch,
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
+        local_prefill_priority=local_prefill_priority,
+        local_decode_probe_valid=local_decode_probe_valid,
     )
 
     if not skip_all_gather:
@@ -348,6 +375,7 @@ def prepare_mlp_sync_batch_raw(
             device=device,
             group=group,
             use_all_reduce=use_world_group,
+            prefer_prefill=prefer_prefill,
         )
 
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
@@ -362,6 +390,15 @@ def prepare_mlp_sync_batch_raw(
         need_idle_batch = not dwdp and dp_size > 1
     else:
         need_idle_batch = max(mlp_sync_info.global_num_tokens) > 0
+
+    # A decode probe loses to a prefill on any DP rank. Keep the scheduler's
+    # running batch untouched and emit a fresh idle batch for this forward.
+    if (
+        prefer_prefill
+        and mlp_sync_info.global_prefill_priority
+        and not local_prefill_priority
+    ):
+        local_batch = None
 
     batch_to_gather = local_batch
     if need_idle_batch:
@@ -388,7 +425,38 @@ def prepare_mlp_sync_batch_raw(
     if _ENABLE_METRICS_DP_ATTENTION and local_batch is not None:
         local_batch.dp_cooperation_info = mlp_sync_info.dp_cooperation_info
 
-    return local_batch
+    return local_batch, mlp_sync_info
+
+
+def prepare_mlp_sync_batch_raw(
+    local_batch: ScheduleBatch,
+    model_runner: ModelRunner,
+    dp_size: int,
+    attn_tp_size: int,
+    attn_cp_size: int,
+    tp_group: GroupCoordinator,
+    get_idle_batch: Callable[[], ScheduleBatch],
+    disable_cuda_graph: bool,
+    require_mlp_tp_gather: bool,
+    disable_overlap_schedule: bool,
+    offload_tags: set[str],
+    dwdp: bool = False,
+):
+    batch, _ = _prepare_mlp_sync_batch_raw(
+        local_batch,
+        model_runner=model_runner,
+        dp_size=dp_size,
+        attn_tp_size=attn_tp_size,
+        attn_cp_size=attn_cp_size,
+        tp_group=tp_group,
+        get_idle_batch=get_idle_batch,
+        disable_cuda_graph=disable_cuda_graph,
+        require_mlp_tp_gather=require_mlp_tp_gather,
+        disable_overlap_schedule=disable_overlap_schedule,
+        offload_tags=offload_tags,
+        dwdp=dwdp,
+    )
+    return batch
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -420,6 +488,42 @@ class SchedulerDPAttnAdapter:
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=self.offload_tags,
             dwdp=get_parallel().dwdp_size > 1,
+        )
+
+    def prepare_speculative_prefill_or_decode_batch(
+        self,
+        prefill_batch: Optional[ScheduleBatch],
+        decode_probe_batch: Optional[ScheduleBatch],
+        decode_probe_valid: bool,
+    ) -> tuple[Optional[ScheduleBatch], bool, bool]:
+        """Select prefill over a stable decode probe with one MLP-sync gather."""
+        local_prefill_priority = prefill_batch is not None
+        local_batch = prefill_batch if local_prefill_priority else decode_probe_batch
+        batch, sync_info = _prepare_mlp_sync_batch_raw(
+            local_batch,
+            model_runner=self.model_runner,
+            dp_size=get_parallel().dp_size,
+            attn_tp_size=self.ps.attn_tp_size,
+            attn_cp_size=self.ps.attn_cp_size,
+            tp_group=self.tp_group,
+            get_idle_batch=self.get_idle_batch,
+            disable_cuda_graph=cuda_graph_fully_disabled(),
+            require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
+            disable_overlap_schedule=get_schedule().disable_overlap_schedule,
+            offload_tags=self.offload_tags,
+            dwdp=get_parallel().dwdp_size > 1,
+            local_prefill_priority=local_prefill_priority,
+            # A local prefill makes the decode probe irrelevant. Mark it valid
+            # so it cannot force the no-prefill fallback on other ranks.
+            local_decode_probe_valid=(
+                True if local_prefill_priority else decode_probe_valid
+            ),
+            prefer_prefill=True,
+        )
+        return (
+            batch,
+            sync_info.global_prefill_priority,
+            sync_info.global_decode_probe_valid,
         )
 
     def maybe_prepare_mlp_sync_batch(

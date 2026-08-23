@@ -3237,6 +3237,7 @@ class Scheduler(
             running_batch = prefill_plan.running_batch
 
         need_mlp_sync = self.require_mlp_sync
+        fused_decode_sync_batch = None
         if (
             need_mlp_sync
             and not self.spec_algorithm.is_none()
@@ -3246,8 +3247,49 @@ class Scheduler(
             # Before merging the new batch into running batch:
             # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
-            new_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(new_batch)
-            need_mlp_sync = new_batch is None
+            if (
+                envs.SGLANG_SPECULATIVE_FUSED_DP_MLP_SYNC.get()
+                and not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+            ):
+                decode_probe_valid = self._can_reuse_decode_mlp_sync_probe(
+                    running_batch
+                )
+                decode_probe_batch = (
+                    running_batch
+                    if decode_probe_valid
+                    and not running_batch.is_empty()
+                    and not running_batch.is_prefill_only
+                    else None
+                )
+                (
+                    sync_batch,
+                    global_has_prefill,
+                    global_decode_probe_valid,
+                ) = self.dp_attn_adapter.prepare_speculative_prefill_or_decode_batch(
+                    new_batch,
+                    decode_probe_batch,
+                    decode_probe_valid,
+                )
+                if global_has_prefill:
+                    new_batch = sync_batch
+                    need_mlp_sync = False
+                elif global_decode_probe_valid:
+                    # All ranks supplied stable decode metadata. update_running_batch
+                    # below mutates the same ScheduleBatch object, so the gathered
+                    # global fields remain attached without another collective.
+                    new_batch = None
+                    fused_decode_sync_batch = sync_batch
+                    need_mlp_sync = False
+                else:
+                    # A finished/retracted local decode can change its metadata;
+                    # retain the original second gather for that uncommon step.
+                    new_batch = None
+                    need_mlp_sync = True
+            else:
+                new_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+                    new_batch
+                )
+                need_mlp_sync = new_batch is None
 
         if new_batch is not None:
             # Run prefill first if possible
@@ -3258,7 +3300,9 @@ class Scheduler(
                 running_batch = self.update_running_batch(running_batch)
                 ret = running_batch if not running_batch.is_empty() else None
             else:
-                ret = None
+                # When another DP rank decodes, the fused gather has already
+                # prepared this rank's idle batch and its global token metadata.
+                ret = fused_decode_sync_batch
 
         # Handle DP attention and log stats
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
@@ -3277,6 +3321,20 @@ class Scheduler(
                 ret.fpm_start_time = self._fpm_batch_t0
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
+    def _can_reuse_decode_mlp_sync_probe(self, batch: ScheduleBatch) -> bool:
+        """Whether pre-update decode metadata is guaranteed to stay unchanged."""
+        if batch.is_empty() or batch.is_prefill_only:
+            return True
+        if not batch.forward_mode.is_decode():
+            return False
+        if any(req.finished() for req in batch.reqs):
+            return False
+        if not batch.check_decode_mem():
+            return False
+        if TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0:
+            return False
+        return True
 
     def get_num_allocatable_reqs(self, running_bs):
         res = get_parallel().pp_max_micro_batch_size - running_bs
