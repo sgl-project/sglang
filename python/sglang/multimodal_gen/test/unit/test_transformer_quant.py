@@ -1151,7 +1151,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertEqual(config.checkpoint_weight_scale_layout, "swizzled")
         self.assertTrue(config.swap_weight_nibbles)
 
-    def test_minimax_h3_mixed_nvfp4_int8_dispatches_each_layer(self):
+    def test_minimax_h3_mixed_nvfp4_companions_dispatch_each_layer(self):
         metadata = {
             "_quantization_metadata": json.dumps(
                 {
@@ -1163,6 +1163,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                             "convrot": True,
                             "convrot_groupsize": 256,
                         },
+                        "blocks.0.mlp.fc1": {"format": "float8_e4m3fn"},
                     },
                 }
             )
@@ -1181,6 +1182,10 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                         (32, 256), dtype=torch.int8
                     ),
                     "blocks.0.attn.out_proj.weight_scale": torch.ones((32, 1)),
+                    "blocks.0.mlp.fc1.weight": torch.ones(
+                        (32, 64), dtype=torch.float8_e4m3fn
+                    ),
+                    "blocks.0.mlp.fc1.weight_scale": torch.tensor(1.0),
                 },
                 checkpoint.name,
                 metadata=metadata,
@@ -1215,6 +1220,13 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                 ),
                 KitchenInt8LinearMethod,
             )
+        self.assertIsInstance(
+            config.get_quant_method(
+                LinearBase(input_size=64, output_size=32),
+                "blocks.0.mlp.fc1",
+            ),
+            Fp8LinearMethod,
+        )
 
     def test_builder_adds_diffusers_quant_type_for_nvfp4(self):
         updated = _updated_quant_config(
