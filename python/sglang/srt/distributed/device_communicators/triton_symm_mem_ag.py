@@ -16,6 +16,7 @@ import torch.distributed._symmetric_memory as symm_mem
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
@@ -465,6 +466,8 @@ class MultimemAllGatherer:
     ):
         self._max_tokens = int(max_tokens)
         self._skip_entry_sync = skip_entry_sync
+        if envs.SGLANG_DISABLE_MULTIMEM_AG.get():
+            enabled = False
         # None => always NCCL; _UNINIT => build on first eager call.
         self._state = self._UNINIT if enabled else None
         if self._state is self._UNINIT:
