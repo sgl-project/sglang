@@ -846,6 +846,10 @@ class HunyuanImage3AR(PipelineStage):
         backbone_fn = partial(self._backbone_forward, num_image_tokens)
 
         # 8. Diffusion sampling loop
+        # Keep a reference to the original input_ids so that every denoising
+        # step can rebuild the full sequence (text + image + special tokens).
+        first_step_input_ids = input_ids
+
         for step_idx, t in enumerate(timesteps):
             first_step = step_idx == 0
 
@@ -860,41 +864,39 @@ class HunyuanImage3AR(PipelineStage):
             t_expand = t.repeat(latent_bs).to(device)
 
             with torch.autocast(device_type=current_platform.device_type, dtype=torch.bfloat16, enabled=True):
-                if first_step:
-                    # Embed text tokens
-                    hidden_states = self.ar_model.model.get_input_embeddings(input_ids)
-                    # Scatter VAE image embeddings at image positions
-                    hidden_states = self._instantiate_vae_tokens_first_step(
-                        hidden_states, latent_model_input, t_expand, image_mask,
-                    )
-                    # Scatter timestep embedding
-                    if timestep_index is not None:
-                        hidden_states = self._instantiate_timestep_tokens(
-                            hidden_states, t_expand, timestep_index,
-                        )
-                else:
-                    # No text tokens: build from scratch
-                    hidden_states = self._build_non_first_step_input(
-                        t_expand, latent_model_input, actual_batch_size,
+                # Build hidden_states with the SAME sequence structure on every
+                # step.  The model was trained with the full special-token
+                # layout (<boi>, timestep, <eoi>, shape tokens, <sep>) and
+                # produces garbage when the sequence is shortened.
+                # Re-embed the original input_ids to get a fresh base, then
+                # scatter the updated image + timestep embeddings on top.
+                hidden_states = self.ar_model.model.get_input_embeddings(
+                    first_step_input_ids,
+                ).expand(latent_bs, -1, -1)
+                # Scatter VAE image embeddings at image positions
+                hidden_states = self._instantiate_vae_tokens_first_step(
+                    hidden_states, latent_model_input, t_expand, image_mask,
+                )
+                # Scatter timestep embedding
+                if timestep_index is not None:
+                    hidden_states = self._instantiate_timestep_tokens(
+                        hidden_states, t_expand, timestep_index,
                     )
 
-                # Select the correct RoPE and attention mask for this step
-                if first_step:
-                    step_cos, step_sin = cos, sin
-                    step_attn_mask = attention_mask
-                else:
-                    step_cos, step_sin = non_first_cos, non_first_sin
-                    step_attn_mask = non_first_attention_mask
+                # Use the same RoPE and attention mask on every step
+                step_cos, step_sin = cos, sin
+                step_attn_mask = attention_mask
 
-                # Run backbone
+                # Run backbone (always use first_step=True so the attention
+                # meta matches the full-sequence layout)
                 backbone_out = backbone_fn(
-                    hidden_states, step_attn_mask, (step_cos, step_sin), first_step,
+                    hidden_states, step_attn_mask, (step_cos, step_sin), True,
                 )
 
-                # Extract diffusion prediction
+                # Extract diffusion prediction via image_mask (same for all steps)
                 pred = self._extract_diffusion_pred(
                     backbone_out, t_expand, image_mask,
-                    token_h, token_w, first_step,
+                    token_h, token_w, first_step=True,
                     num_special_tokens=seq_len - num_image_tokens,
                 )
 
@@ -908,13 +910,6 @@ class HunyuanImage3AR(PipelineStage):
             # Scheduler step (latents is always batch_size=1)
             latent_dtype = latents.dtype
             latents = scheduler.step(pred, t, latents, return_dict=False)[0].to(dtype=latent_dtype)
-
-            # After first step, text tokens are no longer needed
-            if first_step:
-                input_ids = None
-                # Update attention mask for shorter sequence (non-first steps)
-                # Non-first steps use a different sequence length, but the
-                # forward_block handles this via the attn_meta mechanism.
 
         # 9. Store latents for the decoding stage.
         # The denoising loop produces latents in the VAE-encoded space.

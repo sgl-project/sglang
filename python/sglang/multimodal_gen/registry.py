@@ -342,7 +342,6 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "pi0.5": "Pi05Pipeline",
     "hunyuan3d": "Hunyuan3D2Pipeline",
     "hunyuanimage-3": "HunyuanImage3Pipeline",
-    "hunyuanimage3": "HunyuanImage3Pipeline",
     "flux.2-dev-nvfp4": "Flux2NvfpPipeline",
     "fal/ideogram-v4-fast": "Ideogram4FastPipeline",
     "fal/ideogram-v4-instant": "Ideogram4InstantPipeline",

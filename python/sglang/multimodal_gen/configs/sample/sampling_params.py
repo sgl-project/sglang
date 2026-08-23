@@ -360,10 +360,7 @@ class SamplingParams:
 
         self._validate()
 
-        # Allow env var to override num_inference_steps (for faster CI testing).
-        # Only applies to the base SamplingParams class — model-specific subclasses
-        # (e.g. HunyuanImage3SamplingParams with num_inference_steps=50) define their
-        # own defaults that should not be silently overridden by a global env var.
+        # Allow env var to override num_inference_steps (for faster CI testing on AMD)
         env_steps = os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS")
         if env_steps is not None and self.num_inference_steps is not None:
             self.num_inference_steps = int(env_steps)

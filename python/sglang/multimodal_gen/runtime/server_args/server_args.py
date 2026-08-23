@@ -155,8 +155,6 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "fal/ideogram-v4-fast",
         "fal/ideogram-v4-instant",
         "glm-image",
-        "hunyuanimage-3",
-        "hunyuan-image-3",
         "ideogram-4",
         "ideogram-4-fp8",
         "ideogram-4-nf4",
@@ -175,7 +173,6 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "qwen/qwen-image-2512",
         "qwen-image",
         "qwen-image-2512",
-        "tencent/hunyuanimage-3.0-instruct",
         "tongyi-mai/z-image",
         "tongyi-mai/z-image-turbo",
         "zai-org/glm-image",
@@ -187,7 +184,6 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
 BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
     {
         "GlmImagePipelineConfig",
-        "HunyuanImage3PipelineConfig",
         "Ideogram4PipelineConfig",
         "LTX2PipelineConfig",
         "LTX23PipelineConfig",
