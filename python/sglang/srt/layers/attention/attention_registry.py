@@ -150,6 +150,13 @@ def _create_nsa_compat(runner):
 
 @register_attention_backend("dsv4")
 def create_dsv4_backend(runner):
+    dsv4_prefill_backend = getattr(runner.server_args, "dsv4_prefill_backend", "auto")
+    if dsv4_prefill_backend == "cutedsl_h16" and (_is_npu or _is_hip):
+        platform = "NPU" if _is_npu else "HIP"
+        raise ValueError(
+            "DeepSeek-V4 cutedsl_h16 prefill is supported only on CUDA SM90; "
+            f"it cannot be selected on {platform}."
+        )
     if _is_npu:
         from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
             DeepseekV4AscendAttnBackend,

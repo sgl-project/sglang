@@ -98,6 +98,11 @@ class TestPrepareServerArgs(CustomTestCase):
         )
         self.assertEqual(q8_args.dsv4_prefill_backend, "flashmla_sparse_q8")
 
+        cutedsl_args = parser.parse_args(
+            base_args + ["--dsv4-prefill-backend", "cutedsl_h16"]
+        )
+        self.assertEqual(cutedsl_args.dsv4_prefill_backend, "cutedsl_h16")
+
         with self.assertRaises(SystemExit):
             parser.parse_args(base_args + ["--dsv4-prefill-backend", "flashmla_kv"])
 

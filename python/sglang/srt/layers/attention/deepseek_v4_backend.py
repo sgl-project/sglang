@@ -18,6 +18,9 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.attention.dsv4.cutedsl_h16_contract import (
+    DSV4_CUTEDSL_H16_MAX_TOPK,
+)
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     cast_q_fp8_for_q8kv8_prefill,
     dequantize_k_cache_paged,
@@ -60,6 +63,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillWorkspace,
+    combined_topk_width,
     use_dsv4_q8kv8_sparse_prefill,
 )
 from sglang.srt.layers.attention.verify_mask import (
@@ -69,6 +73,13 @@ from sglang.srt.layers.attention.verify_mask import (
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import (
@@ -97,6 +108,101 @@ logger = logging.getLogger(__name__)
 SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
+DSV4_CUTEDSL_H16_PREFILL_BACKEND = "cutedsl_h16"
+
+
+def _validate_dsv4_cutedsl_h16_combined_topk(
+    max_context_len: int,
+    c4_topk: int,
+) -> int:
+    """Validate configured sparse widths and return fixed C128 width."""
+    c128_topk = max(max_context_len // 128, 1)
+    combined_widths = {
+        "c4": combined_topk_width(c4_topk, SWA_WINDOW),
+        "c128": combined_topk_width(c128_topk, SWA_WINDOW),
+    }
+    for ratio, width in combined_widths.items():
+        if width > DSV4_CUTEDSL_H16_MAX_TOPK:
+            raise ValueError(
+                f"DeepSeek-V4 cutedsl_h16 {ratio} combined TOPK width "
+                f"{width} exceeds the kernel limit "
+                f"{DSV4_CUTEDSL_H16_MAX_TOPK}. Reduce the configured "
+                "maximum context length or index_topk."
+            )
+    return combined_widths["c128"]
+
+
+def _use_dsv4_cutedsl_h16_sparse_prefill(
+    dsv4_prefill_backend: str,
+    q: torch.Tensor,
+    forward_batch: ForwardBatch,
+    logical_num_heads: int,
+) -> bool:
+    """Select ordinary eager EXTEND and validate the CuTe DSL contract.
+
+    Prefill CUDA graphs and speculative forwards deliberately retain the
+    existing FlashMLA path: the H16 kernel returns a compact 16-head output and
+    does not currently support SGLang's fixed graph output buffers.
+    """
+    if dsv4_prefill_backend != DSV4_CUTEDSL_H16_PREFILL_BACKEND:
+        return False
+    if (
+        forward_batch.forward_mode != ForwardMode.EXTEND
+        or forward_batch._original_forward_mode is not None
+        or forward_batch.tbo_parent_token_range is not None
+    ):
+        return False
+
+    piecewise_context = get_tc_piecewise_forward_context()
+    if (
+        is_in_breakable_cuda_graph()
+        or is_in_tc_piecewise_cuda_graph()
+        or (piecewise_context is not None and piecewise_context.full_graph)
+        or (q.is_cuda and torch.cuda.is_current_stream_capturing())
+    ):
+        return False
+
+    if logical_num_heads != 16:
+        raise ValueError(
+            "DeepSeek-V4 cutedsl_h16 prefill requires exactly 16 TP-local "
+            f"query heads, got {logical_num_heads}."
+        )
+    if (
+        q.ndim != 4
+        or q.shape[1] != 1
+        or q.shape[-2] not in (16, 64)
+        or q.shape[-1] != 512
+        or q.dtype != torch.bfloat16
+    ):
+        raise ValueError(
+            "DeepSeek-V4 cutedsl_h16 prefill requires BF16 Q shaped "
+            f"[TQ, 1, H, 512] with H in {{16, 64}}, got "
+            f"shape={tuple(q.shape)} dtype={q.dtype}."
+        )
+    return True
+
+
+def _run_dsv4_cutedsl_h16_sparse_prefill(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: torch.Tensor,
+    attn_sink: torch.Tensor,
+    sm_scale: float,
+) -> torch.Tensor:
+    """Lazily load the native-H16 kernel and preserve its Tensor-only API."""
+    from sglang.kernels.ops.attention.dsv4.cute_sparse_mla_h16 import (
+        cute_sparse_mla_h16_fwd,
+    )
+
+    return cute_sparse_mla_h16_fwd(
+        q=q,
+        kv=kv,
+        indices=indices,
+        topk_length=topk_length,
+        attn_sink=attn_sink,
+        sm_scale=sm_scale,
+    )
 
 
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -563,6 +669,36 @@ class DeepseekV4AttnBackend(
         self.dsv4_prefill_backend: str = getattr(
             model_runner.server_args, "dsv4_prefill_backend", "auto"
         )
+        self._cutedsl_h16_c128_combined_topk: Optional[int] = None
+        if self.dsv4_prefill_backend == DSV4_CUTEDSL_H16_PREFILL_BACKEND:
+            self._cutedsl_h16_c128_combined_topk = (
+                _validate_dsv4_cutedsl_h16_combined_topk(
+                    self.max_context_len,
+                    self.c4_topk,
+                )
+            )
+            if not is_sm90_supported():
+                raise ValueError(
+                    "DeepSeek-V4 cutedsl_h16 prefill requires SM90 CUDA GPUs."
+                )
+            if model_runner.dtype != torch.bfloat16:
+                raise ValueError(
+                    "DeepSeek-V4 cutedsl_h16 prefill requires a BF16 model, "
+                    f"got {model_runner.dtype}."
+                )
+            local_num_heads = model_runner.model_config.get_num_attention_heads(
+                get_parallel().attn_tp_size
+            )
+            if local_num_heads != 16:
+                raise ValueError(
+                    "DeepSeek-V4 cutedsl_h16 prefill requires exactly 16 "
+                    f"TP-local query heads, got {local_num_heads}."
+                )
+            if self.head_dim_v != 512:
+                raise ValueError(
+                    "DeepSeek-V4 cutedsl_h16 prefill requires d_v=512, "
+                    f"got {self.head_dim_v}."
+                )
         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
             if not is_sm90_supported():
                 raise ValueError(
@@ -1688,6 +1824,13 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
+            use_cutedsl_h16_prefill = _use_dsv4_cutedsl_h16_sparse_prefill(
+                self.dsv4_prefill_backend,
+                q,
+                forward_batch,
+                layer.tp_q_head_num,
+            )
+
             # sparse_prefill_fwd does not support SM120.
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
@@ -1695,6 +1838,7 @@ class DeepseekV4AttnBackend(
                 and (
                     q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                     or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+                    or use_cutedsl_h16_prefill
                 )
             ):
                 if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
@@ -1715,6 +1859,7 @@ class DeepseekV4AttnBackend(
                     token_to_kv_pool=token_to_kv_pool,
                     core_attn_metadata=core_attn_metadata,
                     attn_sink=attn_sink,
+                    use_cutedsl_h16=use_cutedsl_h16_prefill,
                 )
 
             if _is_sm120:
@@ -1771,21 +1916,18 @@ class DeepseekV4AttnBackend(
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
         core_attn_metadata: DSV4AttnMetadata,
         attn_sink: torch.Tensor,
+        use_cutedsl_h16: bool = False,
     ) -> torch.Tensor:
-        """Unified prefill via flash_mla_sparse_fwd. Replaces the
-        flash_mla_with_kvcache call on the extend path. Per request,
-        positionally gathers the SWA window (always) and the compressed
-        cache (c4/c128) into a flat bf16 workspace, then lets
-        flash_mla_sparse_fwd consume the workspace via per-query rebased
-        indices. Chunk-invariant scaffolding lives in
+        """Unified sparse prefill over a compact gathered BF16 workspace.
+
+        Replaces the flash_mla_with_kvcache call on the extend path. Per
+        request, it positionally gathers the SWA window (always) and the
+        compressed cache (c4/c128) into a flat workspace, then dispatches the
+        selected sparse attention kernel over per-query rebased indices.
+        Chunk-invariant scaffolding lives in
         ``self.forward_metadata.sparse_prefill_cache``.
         """
-        if _is_xpu:
-            from sgl_kernel import flash_mla_sparse_fwd
-        else:
-            from sgl_kernel.flash_mla import flash_mla_sparse_fwd
-
-        # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
+        # q is (b, 1, h_q, d_qk); sparse kernels take (s_q, h_q, d_qk).
         q_flat = q.squeeze(1)
 
         cache = self.forward_metadata.sparse_prefill_cache
@@ -1834,8 +1976,13 @@ class DeepseekV4AttnBackend(
                 assert core_attn_metadata.c128_page_indices is not None
                 cache.ensure_c128(core_attn_metadata.c128_page_indices)
                 flat_token_ids = cache.c128_flat_token_ids
-                combined_indices = cache.c128_combined_indices
-                combined_lens = cache.c128_combined_lens
+                if use_cutedsl_h16:
+                    assert self._cutedsl_h16_c128_combined_topk is not None
+                    combined_indices, combined_lens = cache.get_c128_combined(
+                        self._cutedsl_h16_c128_combined_topk
+                    )
+                else:
+                    combined_indices, combined_lens = cache.get_c128_combined()
             else:
                 assert core_attn_metadata.c4_sparse_raw_indices is not None, (
                     "sparse-prefill c4 path requires c4_sparse_raw_indices "
@@ -1869,6 +2016,34 @@ class DeepseekV4AttnBackend(
             out=swa_slice,
         )
         kv = workspace
+
+        if use_cutedsl_h16:
+            if not getattr(self, "_cutedsl_h16_prefill_log_emitted", False):
+                logger.info(
+                    "DSV4_CUTEDSL_H16_SPARSE_PREFILL_HIT layer_id=%s "
+                    "compress_ratio=%s q_shape=%s topk=%s",
+                    layer_id,
+                    compress_ratio,
+                    tuple(q_flat.shape),
+                    combined_indices.shape[1],
+                )
+                self._cutedsl_h16_prefill_log_emitted = True
+            # The model normally supplies an H64 padded Q whose first 16 heads
+            # are live. The kernel returns compact H16; the model's subsequent
+            # ``o[:, :logical_heads, :]`` slice therefore remains valid.
+            return _run_dsv4_cutedsl_h16_sparse_prefill(
+                q=q_flat,
+                kv=kv.squeeze(1),
+                indices=combined_indices,
+                topk_length=combined_lens,
+                attn_sink=attn_sink,
+                sm_scale=self.softmax_scale,
+            )
+
+        if _is_xpu:
+            from sgl_kernel import flash_mla_sparse_fwd
+        else:
+            from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
         o, _, _ = flash_mla_sparse_fwd(
             q=q_flat,

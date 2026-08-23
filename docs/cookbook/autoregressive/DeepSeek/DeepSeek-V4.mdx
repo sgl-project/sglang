@@ -308,6 +308,33 @@ Two options are available for running DeepSeek-V4 on Hopper:
 
 On these FP8 checkpoints you can additionally enable the all-FP8 **MegaMoE** path on SM90 for higher long-context / large-decode throughput — see the **SM90 (Hopper) FP8 MegaMoE** note in Configuration Tips below.
 
+The experimental native-H16 CuTe DSL sparse-prefill kernel can be selected on
+SM90 when tensor parallelism leaves exactly 16 query heads per rank:
+
+```bash Command
+sglang serve \
+  --model-path <deepseek-v4-model> \
+  --tp 8 \
+  --dsv4-prefill-backend cutedsl_h16 \
+  <other args>
+```
+
+This path requires BF16 query and sparse-workspace tensors with 512-wide Q/K/V
+heads. It is used only for ordinary eager prefill. Speculative forwards and
+prefill CUDA graphs retain the existing FlashMLA implementation. The default
+`auto` backend is unchanged. For C128 layers the combined TOPK width is fixed
+from `--context-length` and
+padded to a multiple of 128, allowing different live chunk lengths to reuse the
+same compiled kernel. The first use of each distinct query-storage-head and
+TOPK bucket triggers its own JIT specialization, so warm up every bucket used
+by the serving configuration before measuring steady state. The padded C4 and
+C128 combined TOPK widths must not exceed 8192; unsupported configurations fail
+during server startup. When the live C128 width is smaller than the fixed width,
+the cached padded tensor adds
+`4 * TQ * fixed_combined_topk` bytes of int32 indices per active prefill chunk
+(for example, TQ=4096 at the 8192 limit adds 128 MiB), in addition to the live
+combined-indices tensor. No extra tensor is allocated when the widths match.
+
 PD-Disagg recipes on H200 may require `docker run --privileged --ulimit memlock=-1`
 (or `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK`) so mooncake
 can discover the IB HCAs; without IB exposure mooncake silently falls back to

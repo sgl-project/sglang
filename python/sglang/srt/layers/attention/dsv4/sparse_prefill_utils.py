@@ -60,10 +60,18 @@ from sglang.kernels.ops.attention.dsv4.sparse_prefill_kernels import (
 def use_dsv4_q8kv8_sparse_prefill(dsv4_prefill_backend: str = "auto") -> bool:
     """Return whether DeepSeek-V4 sparse prefill should use Q8KV8.
 
-    ``dsv4_prefill_backend`` is the production configuration. The environment
-    variable remains as a debug override while the runtime path is being
-    hardened: truthy values force Q8 on, falsy values force it off.
+    ``dsv4_prefill_backend`` is the production configuration. For the existing
+    auto/FlashMLA choices, the environment variable remains a debug override:
+    truthy values force Q8 on and falsy values force it off. An explicitly
+    selected ``cutedsl_h16`` backend always takes precedence over that legacy
+    override.
     """
+    # An explicitly selected production backend must not be silently replaced
+    # by this legacy debug override. In particular, the native-H16 CuTe path
+    # has a different dtype/head contract from Q8KV8.
+    if dsv4_prefill_backend == "cutedsl_h16":
+        return False
+
     env_value = os.getenv(DSV4_Q8KV8_PREFILL_ENV)
     if env_value is not None:
         return env_value.lower() in {
@@ -324,6 +332,10 @@ class SparsePrefillChunkCache:
     c128_flat_token_ids: Optional[torch.Tensor] = None  # (num_reqs * c128_max,) int32
     c128_combined_indices: Optional[torch.Tensor] = None
     c128_combined_lens: Optional[torch.Tensor] = None
+    # CuTe H16 specializes on the combined TOPK width. Cache any wider,
+    # configuration-sized C128 padding once per prefill chunk so every layer
+    # reuses the same tensor and JIT specialization.
+    c128_padded_combined_indices: dict[int, torch.Tensor] = field(default_factory=dict)
 
     # c4: positional layout of the c4 cache (combine output is per-layer).
     c4_flat_token_ids: Optional[torch.Tensor] = None  # (num_reqs * c4_max,) int32
@@ -455,6 +467,44 @@ class SparsePrefillChunkCache:
         self.c128_flat_token_ids = flat_c128_ids
         self.c128_combined_indices = combined_indices
         self.c128_combined_lens = combined_lens
+
+    def get_c128_combined(
+        self, padded_width: Optional[int] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return C128 metadata, optionally padded to a fixed aligned width.
+
+        The live combine remains unchanged for FlashMLA/Q8KV8. CuTe H16 passes
+        the width derived from the configured maximum context length, avoiding
+        a new compiled kernel when live chunks (for example 31K and 40K) have
+        different C128 extents.
+        """
+        assert self.c128_combined_indices is not None
+        assert self.c128_combined_lens is not None
+        if padded_width is None or padded_width == self.c128_combined_indices.shape[1]:
+            return self.c128_combined_indices, self.c128_combined_lens
+        if padded_width < self.c128_combined_indices.shape[1]:
+            raise ValueError(
+                f"C128 padded width {padded_width} is smaller than live width "
+                f"{self.c128_combined_indices.shape[1]}"
+            )
+        if padded_width % SPARSE_PREFILL_TOPK_ALIGNMENT != 0:
+            raise ValueError(
+                f"C128 padded width {padded_width} must be aligned to "
+                f"{SPARSE_PREFILL_TOPK_ALIGNMENT}"
+            )
+
+        padded = self.c128_padded_combined_indices.get(padded_width)
+        if padded is None:
+            live_width = self.c128_combined_indices.shape[1]
+            padded = torch.full(
+                (self.num_qo_tokens, padded_width),
+                -1,
+                dtype=torch.int32,
+                device=self.c128_combined_indices.device,
+            )
+            padded[:, :live_width].copy_(self.c128_combined_indices)
+            self.c128_padded_combined_indices[padded_width] = padded
+        return padded, self.c128_combined_lens
 
     def ensure_c4(
         self,

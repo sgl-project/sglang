@@ -378,6 +378,7 @@ DSV4_PREFILL_BACKEND_CHOICES = [
     "auto",
     "flashmla_sparse",
     "flashmla_sparse_q8",
+    "cutedsl_h16",
 ]
 
 DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
@@ -1836,7 +1837,11 @@ class ServerArgs:
             help=(
                 "DeepSeek-V4 sparse prefill backend. 'auto' and "
                 "'flashmla_sparse' use the existing BF16 sparse prefill path; "
-                "'flashmla_sparse_q8' enables the Q8KV8 sparse prefill path."
+                "'flashmla_sparse_q8' enables the Q8KV8 sparse prefill path; "
+                "'cutedsl_h16' enables the experimental BF16 CuTe DSL path "
+                "specialized for 16 TP-local query heads on SM90. The CuTe DSL "
+                "path applies only to non-speculative eager prefill; CUDA-graph "
+                "and speculative paths keep the existing FlashMLA backend."
             ),
             choices=DSV4_PREFILL_BACKEND_CHOICES,
         ),
