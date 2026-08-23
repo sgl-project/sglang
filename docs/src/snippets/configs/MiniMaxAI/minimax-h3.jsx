@@ -6,7 +6,111 @@
 // deployment command engine.
 
 
-export const config = {
+// Single-GPU consumer cards run H3 lossless through layerwise offload. The
+// flags carry only what differs from the defaults; what changes with the
+// machine is the expectation, which the hints spell out per budget. Measured
+// on one RTX 4090 (denoise medians across interleaved runs, outputs verified
+// end to end); 48-64 GB hosts sit between the measured points.
+export const config = (() => {
+// One recipe per VRAM tier, measured under a hard allocator cap of that
+// size: the figures were taken at 12/16/24 GiB caps, so every card of a
+// tier shares them. 30-series cards run the same recipe; their step times
+// land above the measured 40/50-series figures.
+const CONSUMER_12G = ["rtx4070", "rtx5070", "rtx3060"];
+const CONSUMER_16G = ["rtx4080", "rtx5080", "rtx5070ti", "rtx4060ti"];
+const CONSUMER_24G = ["rtx4090", "rtx3090"];
+// Workstation cards a home builder can actually buy. No hard-cap anchor was
+// measured for these sizes (the lab card is 24 GB and caps only shrink), so
+// their recipes are derived from the tier logic, not verified runs.
+const WORKSTATION_48G = ["rtx6000ada"];
+const WORKSTATION_96G = ["rtxpro6000"];
+const CONSUMER_SINGLE = [
+  ...CONSUMER_12G,
+  ...CONSUMER_16G,
+  ...CONSUMER_24G,
+  ...WORKSTATION_48G,
+  ...WORKSTATION_96G,
+];
+const CONSUMER_VRAM_16_PLUS = [...CONSUMER_16G, ...CONSUMER_24G];
+const CONSUMER_AMPERE = ["rtx3060", "rtx3090"];
+
+function consumerFlags(s) {
+  if (WORKSTATION_96G.includes(s.hw)) return workstation96Flags();
+  // The whole video decoder held for the decode only: residency arms at the
+  // decoder's first block and releases when it finishes, so the denoise still
+  // runs on an empty card. All 36 blocks fit 12 GB because decoder weights are
+  // held in their decode compute dtype (fp16, ~4.9 GiB) from load -- the
+  // rounding was already in every output, so the result is bit-identical --
+  // and the decode drops from 60 s streamed to ~10 s.
+  const flags = [
+    "--performance-mode memory",
+    "--layerwise-offload-components dit,text_encoder,vae",
+    "--layerwise-resident-layers video_vae=36",
+  ];
+  if (CONSUMER_VRAM_16_PLUS.includes(s.hw) && s.host_ram === "ram96") {
+    flags.push("--dit-layerwise-resident-layers 4");
+  }
+  // A 24 GB card on a 32 GB host has allocator headroom to keep ten DiT
+  // layers resident (measured 10.4 vs 11.6 s/step); a 16 GB card does not --
+  // there even four resident layers measured slower than none, so it keeps
+  // the plain recipe.
+  if (CONSUMER_24G.includes(s.hw) && s.host_ram === "ram32") {
+    flags.push("--dit-layerwise-resident-layers 10");
+  }
+  if (WORKSTATION_48G.includes(s.hw)) {
+    flags.push("--dit-layerwise-resident-layers 40");
+  }
+  return flags;
+}
+
+function workstation96Flags() {
+  // 96 GB holds the whole 61.7 GB DiT; only the encoders and VAEs step aside.
+  return [
+    "--performance-mode memory",
+    "--layerwise-offload-components text_encoder,vae",
+    "--layerwise-resident-layers video_vae=36",
+  ];
+}
+
+function consumerHints(s) {
+  const hints = [];
+  const bigHost = s.host_ram === "ram96";
+  const midHost = s.host_ram === "ram64";
+  if (bigHost) {
+    if (CONSUMER_VRAM_16_PLUS.includes(s.hw)) {
+      hints.push("verified end to end: ~6 s per denoise step, 13 s decode");
+    } else {
+      hints.push("~6 s per step once the host pins the DiT; the decode holds all 36 blocks in their fp16 decode dtype and takes ~10 s");
+    }
+    return hints;
+  }
+  if (CONSUMER_24G.includes(s.hw)) {
+    hints.push("measured at 32 GB host: ~10.4 s per denoise step with ten resident layers, ~9.6 s decode, ~230 s per request -- ahead of ComfyUI (249-260 s) under the same hard 24 GiB cap");
+  } else if (CONSUMER_16G.includes(s.hw)) {
+    hints.push("measured at 32 GB host: ~11.9 s per denoise step, ~11 s decode, ~250 s per request -- ahead of ComfyUI (292-301 s) under the same hard 16 GiB cap");
+  } else {
+    hints.push("measured at 32 GB host: ~10.6 s per denoise step, ~9.4 s decode, ~235 s per request -- ahead of ComfyUI (276-302 s) on the same weights under the same hard 12 GiB cap, output bit-identical");
+  }
+  if (CONSUMER_AMPERE.includes(s.hw)) {
+    hints.push("the recipe and its memory behavior are tier-exact for this card; the step times above were measured on 40-series compute, and Ampere lands above them");
+  }
+  if (WORKSTATION_96G.includes(s.hw)) {
+    hints.push("derived recipe, not yet verified: 96 GB holds the whole 61.7 GB DiT resident, so only the text encoder and VAEs stream -- expect near-datacenter step times rather than the offload figures above");
+  }
+  if (WORKSTATION_48G.includes(s.hw)) {
+    hints.push("derived recipe, not yet verified: 48 GB holds forty of the fifty DiT layers; the figures above are the 24 GB tier's and this card should land well under them");
+  }
+  hints.push("run with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -- the decode sits close enough to the cap that fragmentation otherwise tips it over");
+  if (midHost) {
+    hints.push("measured on a 12 GB card at a 48 GB host: ~9.6 s/step, ~218 s per request (ComfyUI 246-267 s); at 64 GB: ~8.1 s/step, ~180 s (ComfyUI 194-195 s); larger cards land at or below these");
+  } else {
+    hints.push("a 32 GB host cannot cache the 108 GB checkpoint: NVMe is required, and real runs land above the quoted step time");
+  }
+  hints.push('the startup log should say "leaving ... GiB of weights on the checkpoint mapping" -- if it does not, the host is not the constraint you set');
+  return hints;
+}
+
+return {
   modelName: "MiniMax-H3",
 
   supportedHardware: [
@@ -16,16 +120,51 @@ export const config = {
     "h100",
     "mi300x",
     "mi355x",
+    "rtxpro6000",
+    "rtx6000ada",
     "rtx5090",
+    "rtx4090",
+    "rtx3090",
+    "rtx5080",
+    "rtx5070ti",
+    "rtx4080",
+    "rtx4060ti",
+    "rtx5070",
+    "rtx4070",
+    "rtx3060",
   ],
   hardware: [
+    { id: "rtxpro6000", label: "RTX PRO 6000", vram: "96GB", vendor: "consumer" },
+    { id: "rtx6000ada", label: "RTX 6000 Ada", vram: "48GB", vendor: "consumer" },
     { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "consumer" },
+    { id: "rtx4090", label: "RTX 4090", vram: "24GB", vendor: "consumer" },
+    { id: "rtx3090", label: "RTX 3090", vram: "24GB", vendor: "consumer" },
+    { id: "rtx5080", label: "RTX 5080", vram: "16GB", vendor: "consumer" },
+    { id: "rtx5070ti", label: "RTX 5070 Ti", vram: "16GB", vendor: "consumer" },
+    { id: "rtx4080", label: "RTX 4080", vram: "16GB", vendor: "consumer" },
+    { id: "rtx4060ti", label: "RTX 4060 Ti", vram: "16GB", vendor: "consumer" },
+    { id: "rtx5070", label: "RTX 5070", vram: "12GB", vendor: "consumer" },
+    { id: "rtx4070", label: "RTX 4070", vram: "12GB", vendor: "consumer" },
+    { id: "rtx3060", label: "RTX 3060", vram: "12GB", vendor: "consumer" },
   ],
   groupHardware: false,
 
   matchDims: [],
 
   overlayDims: [
+    {
+      id: "host_ram",
+      title: "Host RAM",
+      scope: "serve",
+      description: "System memory decides where the DiT weights wait between steps: pinned when they fit, on the checkpoint mapping when they do not.",
+      default: "ram32",
+      showWhen: (s) => CONSUMER_SINGLE.includes(s.hw),
+      options: [
+        { id: "ram32", label: "32 GB" },
+        { id: "ram64", label: "48-64 GB" },
+        { id: "ram96", label: "96 GB+" },
+      ],
+    },
     {
       id: "weights",
       title: "Checkpoint Weights",
@@ -120,6 +259,7 @@ export const config = {
           id: "auto",
           label: "Auto",
           flags: (s) => {
+            if (CONSUMER_SINGLE.includes(s.hw)) return consumerFlags(s);
             const recipe = config.commandBuilder.resource.verifiedRecipes.find((entry) =>
               entry.hw === s.hw && entry.nodes === Number(s.nodes)
               && entry.gpus_per_node === Number(s.gpus_per_node));
@@ -128,18 +268,19 @@ export const config = {
             return placement === "offload" ? [
                 "--performance-mode memory",
                 "--layerwise-offload-components dit,text_encoder,vae",
-                "--dit-offload-prefetch-size 1",
                 "--dit-layerwise-resident-layers 20",
-                "--enable-torch-compile false",
               ] : ["--performance-mode speed"];
           },
+          hints: (s) => (CONSUMER_SINGLE.includes(s.hw) ? consumerHints(s) : []),
           description: "Use the recommended placement for the selected hardware and resource shape.",
         },
         {
           id: "resident",
           label: "Resident",
           flags: ["--performance-mode speed"],
-          recommendedWhen: (s) => s.hw !== "rtx5090",
+          disabled: (s) => CONSUMER_SINGLE.includes(s.hw),
+          disableReason: "The 61.7 GB DiT cannot be resident on a single consumer card.",
+          recommendedWhen: (s) => s.hw !== "rtx5090" && !CONSUMER_SINGLE.includes(s.hw),
           description: "Lowest-latency path when the full pipeline fits in aggregate GPU memory.",
         },
         {
@@ -153,16 +294,18 @@ export const config = {
         {
           id: "offload",
           label: "Layerwise offload",
-          flags: [
-            "--performance-mode memory",
-            "--layerwise-offload-components dit,text_encoder,vae",
-            "--dit-offload-prefetch-size 1",
-            "--dit-layerwise-resident-layers 20",
-            "--enable-torch-compile false",
-          ],
-          soft: (s) => s.hw !== "rtx5090",
-          softReason: "Tuned and verified on RTX 5090. It runs on the datacenter GPUs too, where a resident recipe is simply faster.",
-          recommendedWhen: (s) => s.hw === "rtx5090",
+          flags: (s) => {
+            if (CONSUMER_SINGLE.includes(s.hw)) return consumerFlags(s);
+            return [
+              "--performance-mode memory",
+              "--layerwise-offload-components dit,text_encoder,vae",
+              "--dit-layerwise-resident-layers 20",
+            ];
+          },
+          hints: (s) => (CONSUMER_SINGLE.includes(s.hw) ? consumerHints(s) : []),
+          soft: (s) => s.hw !== "rtx5090" && !CONSUMER_SINGLE.includes(s.hw),
+          softReason: "Tuned and verified on the consumer cards. It runs on the datacenter GPUs too, where a resident recipe is simply faster.",
+          recommendedWhen: (s) => s.hw === "rtx5090" || CONSUMER_SINGLE.includes(s.hw),
           description: "Capacity-first PCIe path. It is substantially slower than a resident datacenter recipe.",
         },
       ],
@@ -244,7 +387,7 @@ export const config = {
         {
           id: "auto",
           label: "Auto",
-          flags: (s) => [`--encoder-parallel ${s.nodes > 1 ? "replicate" : "auto"}`],
+          flags: (s) => (s.nodes > 1 ? ["--encoder-parallel replicate"] : []),
           recommended: true,
           description: "Folds on verified single-host P2P systems and resolves to replicate across nodes.",
         },
@@ -382,7 +525,19 @@ export const config = {
         { id: "mi355x-resident-2", hw: "mi355x", nodes: 1, gpus_per_node: 2, placement: "resident", tp_size: 1, ulysses_degree: 2, ring_degree: 1, encoder: "auto" },
         { id: "mi355x-resident-4", hw: "mi355x", nodes: 1, gpus_per_node: 4, placement: "resident", tp_size: 1, ulysses_degree: 4, ring_degree: 1, encoder: "auto" },
         { id: "mi355x-resident-8", hw: "mi355x", nodes: 1, gpus_per_node: 8, placement: "resident", tp_size: 1, ulysses_degree: 8, ring_degree: 1, encoder: "auto", default: true },
-        { id: "rtx5090-offload-2", hw: "rtx5090", nodes: 1, gpus_per_node: 2, placement: "offload", tp_size: 2, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
+        { id: "rtxpro6000-offload-1", hw: "rtxpro6000", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true, unverified: true },
+        { id: "rtx6000ada-offload-1", hw: "rtx6000ada", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true, unverified: true },
+        { id: "rtx5090-offload-1", hw: "rtx5090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
+        { id: "rtx5090-offload-2", hw: "rtx5090", nodes: 1, gpus_per_node: 2, placement: "offload", tp_size: 2, ulysses_degree: 1, ring_degree: 1, encoder: "auto" },
+        { id: "rtx4090-offload-1", hw: "rtx4090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
+        { id: "rtx4080-offload-1", hw: "rtx4080", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
+        { id: "rtx3090-offload-1", hw: "rtx3090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
+        { id: "rtx5080-offload-1", hw: "rtx5080", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
+        { id: "rtx5070ti-offload-1", hw: "rtx5070ti", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
+        { id: "rtx4060ti-offload-1", hw: "rtx4060ti", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
+        { id: "rtx5070-offload-1", hw: "rtx5070", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
+        { id: "rtx3060-offload-1", hw: "rtx3060", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
+        { id: "rtx4070-offload-1", hw: "rtx4070", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
       ],
       autoTopology: (s) => {
         const recipes = config.commandBuilder.resource.verifiedRecipes;
@@ -437,11 +592,16 @@ export const config = {
         && entry.ulysses_degree === topology.ulysses_degree
         && entry.ring_degree === topology.ring_degree);
       const resolvedPlacement = s.placement === "auto"
-        ? (automaticRecipe?.placement || (s.hw === "rtx5090" ? "offload" : "resident"))
+        ? (automaticRecipe?.placement
+          || (s.hw === "rtx5090" || CONSUMER_SINGLE.includes(s.hw) ? "offload" : "resident"))
         : s.placement;
       const coverageWarnings = [];
-      if (resolvedPlacement === "offload" && s.hw !== "rtx5090") {
-        coverageWarnings.push("Layerwise offload is tuned and verified on RTX 5090; on this hardware it runs unverified and a resident recipe is faster.");
+      if (resolvedPlacement === "offload" && s.hw !== "rtx5090"
+        && !CONSUMER_SINGLE.includes(s.hw)) {
+        coverageWarnings.push("Layerwise offload is tuned and verified on consumer cards; on this hardware it runs unverified and a resident recipe is faster.");
+      }
+      if (CONSUMER_SINGLE.includes(s.hw) && s.host_ram === "ram64") {
+        coverageWarnings.push("48-64 GB hosts sit between the measured 32 GB and 96 GB points and have not been through their own verification round.");
       }
       if (resolvedPlacement === "fsdp" && (s.nodes !== 1 || !["b200", "b300", "h200", "h100"].includes(s.hw))) {
         coverageWarnings.push("FSDP outside the single-node NVIDIA recipes runs unverified.");
@@ -465,7 +625,7 @@ export const config = {
         && entry.tp_size === topology.tp_size
         && entry.ulysses_degree === topology.ulysses_degree
         && entry.ring_degree === topology.ring_degree);
-      const topologyVerified = !!recipe && errors.length === 0;
+      const topologyVerified = !!recipe && !recipe.unverified && errors.length === 0;
       const encoderVerified = s.encoder === "auto"
         || s.encoder === recipe?.encoder
         || (s.nodes > 1 && s.encoder === "replicate");
@@ -491,10 +651,11 @@ export const config = {
       topologyParts.push(Number(s.nodes) > 1 ? `${s.nodes} nodes` : "Single node");
 
       const world = Number(s.nodes) * Number(s.gpus_per_node);
-      const flags = ["--model-path {{MODEL_NAME}}", `--num-gpus ${world}`];
+      const flags = ["--model-path {{MODEL_NAME}}"];
+      if (world > 1) flags.push(`--num-gpus ${world}`);
       if (topology.ring_degree > 1) flags.push(`--sp-degree ${world}`);
       if (topology.tp_size > 1) flags.push(`--tp-size ${topology.tp_size}`);
-      flags.push(`--ulysses-degree ${topology.ulysses_degree}`);
+      if (topology.ulysses_degree > 1) flags.push(`--ulysses-degree ${topology.ulysses_degree}`);
       if (topology.ring_degree > 1) flags.push(`--ring-degree ${topology.ring_degree}`);
       flags.push("--host {{HOST_IP}}", "--port {{PORT}}");
 
@@ -505,7 +666,7 @@ export const config = {
       if (resolvedPlacement === "fsdp") {
         warnings.push("FSDP lowers resident DiT memory but adds per-block parameter collectives; prefer Resident when the pipeline fits.");
       }
-      if (s.hw === "rtx5090") {
+      if (s.hw === "rtx5090" && Number(s.gpus_per_node) === 2) {
         warnings.push("The 2× RTX 5090 path requires a 384 GiB-class host and prioritizes capacity over latency.");
       }
 
@@ -781,3 +942,4 @@ export const config = {
 
   cells: [],
 };
+})();

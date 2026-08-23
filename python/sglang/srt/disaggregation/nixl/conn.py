@@ -28,6 +28,8 @@ from sglang.srt.disaggregation.common.conn import (
 from sglang.srt.disaggregation.common.staging_handler import (
     STAGING_WATERMARK_WAIT_S,
     StagingManagerMixin,
+    handle_staging_rsp,
+    handle_watermark_msg,
 )
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
@@ -586,15 +588,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
     def register_staging_room_bootstrap(self, room, bootstrap_infos, receiver):
         self._staging_ctx.room_bootstrap[room] = bootstrap_infos
         self._staging_ctx.room_receivers[room] = receiver
-
-    def _is_watermark_ready(
-        self, agent_name: str, alloc_round: int, alloc_end: int
-    ) -> bool:
-        from sglang.srt.disaggregation.common.staging_handler import (
-            is_watermark_ready,
-        )
-
-        return is_watermark_ready(self._staging_ctx, agent_name, alloc_round, alloc_end)
 
     def _start_decode_listener_thread(self):
         """Decode-side ZMQ listener for STAGING_REQ and ABORT_ACK. A thread, not
@@ -2674,20 +2667,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # Staging: decode reports consumption watermark back to prefill
                 if waiting_req_bytes[0] == b"WATERMARK":
                     if self.enable_staging:
-                        from sglang.srt.disaggregation.common.staging_handler import (
-                            handle_watermark_msg,
-                        )
-
                         handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
                     continue
 
                 # Staging: decode replies with allocated staging offset
                 if waiting_req_bytes[0] == b"STAGING_RSP":
                     if self.enable_staging:
-                        from sglang.srt.disaggregation.common.staging_handler import (
-                            handle_staging_rsp,
-                        )
-
                         handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
                     continue
 
