@@ -1793,7 +1793,7 @@ class Scheduler(
         profiling_stage: str = os.getenv("SGLANG_NPU_PROFILING_STAGE",
                                          "decode")  # envs.SGLANG_NPU_PROFILING_STAGE.get()
         profiling_path: str = os.getenv("SGLANG_NPU_PROFILING_PATH", "profiling")  # envs.SGLANG_NPU_PROFILING_PATH.get()
-        
+        # Keep profiling disabled unless the NPU-specific switch is set.
         if enable_profiling:
             prof_cnt = 0
             import torch_npu
