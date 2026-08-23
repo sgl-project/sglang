@@ -53,6 +53,10 @@ _SLOT_OWNERS = ("srt/runtime_context.py", "srt/server_args.py", "srt/arg_groups/
 # The test below asserts this map is exactly the set of such reads, so the
 # reasons cannot drift away from the code.
 _CONFIGURED_SIZE_CALL_SITES = {
+    ("srt/layers/cp/base.py", "attn_cp_size"): (
+        "the lazy strategy bind in a worker: the CP group is what the strategy "
+        "is being built for, and the configured width is what describes it"
+    ),
     ("srt/entrypoints/engine.py", "pp_size"): (
         "the launch path decides how many scheduler processes to spawn; it runs "
         "before any of them exists, so there is no group to ask"
