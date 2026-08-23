@@ -176,6 +176,39 @@ def _reorder_grouped_qkv_to_qkv(
     )
 
 
+def _install_qkv_row_reorder(
+    param: torch.Tensor,
+    reorder: Callable[[torch.Tensor], torch.Tensor],
+    qkv_rows: int,
+) -> None:
+    """Reorder a per-output-row qkv parameter the same way its rows are reordered.
+
+    Applied to quantization metadata rather than the weight itself. Anything whose
+    leading dim is not the checkpoint's qkv row count is passed through: per-tensor
+    scales are scalars, and a swizzled block-scale layout is not row-indexed.
+    """
+
+    def _maybe_reorder(loaded_weight: torch.Tensor) -> torch.Tensor:
+        if loaded_weight.dim() >= 2 and loaded_weight.shape[0] == qkv_rows:
+            return reorder(loaded_weight)
+        return loaded_weight
+
+    base_loader = (
+        param._weight_loader
+        if hasattr(param, "_weight_loader")
+        else param.weight_loader
+    )
+
+    def _weight_loader(p: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        base_loader(p, _maybe_reorder(loaded_weight))
+
+    if hasattr(param, "_weight_loader"):
+        param._weight_loader = _weight_loader
+    else:
+        param.weight_loader = _weight_loader
+    param.rank_local_weight_transform = _maybe_reorder
+
+
 def _copy_grouped_qkv_tp_shard(
     param: torch.Tensor,
     loaded_weight: torch.Tensor,
@@ -193,8 +226,8 @@ def _copy_grouped_qkv_tp_shard(
         or getattr(param, "output_dim", None) != 0
         or getattr(param, "is_sharded_weight", False)
         or getattr(param, "packed_dim", None) is not None
-        or param.dtype != _BF16_DTYPE
-        or loaded_weight.dtype != _BF16_DTYPE
+        or param.dtype != loaded_weight.dtype
+        or param.dtype not in (_BF16_DTYPE, torch.float8_e4m3fn)
         or not param.is_contiguous()
         or not loaded_weight.is_contiguous()
     ):
@@ -519,7 +552,7 @@ def _minimax_h3_attention_core_impl(
             q,
             k,
             v,
-            softmax_scale=attention.softmax_scale,
+            attn_impl=attention._attention_impl,
             real_seq_len=max_seqlen,
             ring_ws=ring_ws,
         )
@@ -579,10 +612,13 @@ class MiniMaxH3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
-        # The reorder below translates the *safetensors* checkpoint layout. A
-        # GGUF checkpoint already stores qkv as [q_all, k_all, v_all], and its
-        # packed parameter is `qweight`, so there is nothing to reorder.
-        if quant_config is None or quant_config.get_name() != "gguf":
+        # Official safetensors interleave Q/K/V by head. Comfy and GGUF
+        # checkpoints already store [q_all, k_all, v_all].
+        checkpoint_qkv_is_native = quant_config is not None and (
+            quant_config.get_name() == "gguf"
+            or quant_config.checkpoint_uses_native_qkv_layout
+        )
+        if not checkpoint_qkv_is_native:
             self._install_qkv_weight_loader(arch)
         self.q_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         self.k_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
@@ -628,7 +664,7 @@ class MiniMaxH3Attention(nn.Module):
         weight = self.qkv_proj.weight
         # h3 checkpoints interleave each attention head's Q, K, and V rows
         # this parameter needs reordering before the native QKV projection
-        weight.mps_zero_copy_unsafe = True
+        weight.checkpoint_mapping_unsafe = True
         base_loader = weight.weight_loader
 
         def _reorder_checkpoint_weight(loaded_weight: torch.Tensor) -> torch.Tensor:
@@ -661,6 +697,17 @@ class MiniMaxH3Attention(nn.Module):
             weight.weight_loader = _weight_loader
         # rank-local FSDP must reorder grouped QKV before selecting each shard
         weight.rank_local_weight_transform = _reorder_checkpoint_weight
+
+        # A quantized checkpoint stores metadata indexed by output row next to the
+        # rows themselves (NVFP4 block scales, fp8 per-channel scales). Those rows
+        # are permuted above, so the per-row metadata has to be permuted the same
+        # way. Row count is the gate: a swizzled scale layout is not row-indexed,
+        # and per-tensor scales are scalars, so both are passed through untouched.
+        qkv_rows = 3 * arch.num_attention_heads * arch.attention_head_dim
+        for name, param in self.qkv_proj.named_parameters(recurse=False):
+            if name == "weight":
+                continue
+            _install_qkv_row_reorder(param, _reorder_checkpoint_weight, qkv_rows)
 
     def _forward_mps_streamed_attention(
         self,
@@ -1816,7 +1863,11 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
 
     def _mark_missing_params_required(self) -> None:
         for _, param in self.named_parameters():
-            param.missing_param_init = "error"
+            # A quant method's create_weights() declares its own policy for scales
+            # it can synthesize (weight-only NVFP4 has no input_scale and marks it
+            # "ones"); claiming only undeclared params keeps that intact.
+            if getattr(param, "missing_param_init", None) is None:
+                param.missing_param_init = "error"
 
     def post_load_weights(self) -> None:
         fp32_param_names = list(_MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER)
