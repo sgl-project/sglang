@@ -74,14 +74,24 @@ class BaseLayerWithLoRA(nn.Module):
         base_layer: nn.Module,
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
+        snapshot_base: bool = True,
     ):
         super().__init__()
         self.base_layer: nn.Module = base_layer
 
         self.merged: bool = False
         # Immutable base-weight snapshot; `to("cpu")` may alias CPU storage.
-        # Use `clone()` so merge updates cannot mutate this backup tensor.
-        self.cpu_weight = base_layer.weight.detach().to("cpu").clone()
+        # Use `clone()` so in-place merge updates cannot mutate this backup.
+        # With snapshot_base=False the snapshot is a zero-copy view instead:
+        # valid only while every merge on this layer is a copy-merge (the
+        # merged-store path), which never writes the base storage. H3's DiT
+        # backup alone is 38 GB of anonymous memory under clone().
+        if snapshot_base:
+            self.cpu_weight = base_layer.weight.detach().to("cpu").clone()
+            self._base_is_view = False
+        else:
+            self.cpu_weight = base_layer.weight.detach()
+            self._base_is_view = True
         # indicates adapter weights don't contain this layer
         # (which shouldn't normally happen, but we want to separate it from the case of erroneous merging)
         # Default to True to prevent using uninitialized weights; set to False when weights are loaded
@@ -205,6 +215,13 @@ class BaseLayerWithLoRA(nn.Module):
         elif self.merged:
             self.unmerge_lora_weights()
 
+    def _ensure_base_snapshot_owned(self) -> None:
+        """An in-place merge is about to write the base storage; if the
+        snapshot is a zero-copy view into it, materialize the clone now."""
+        if getattr(self, "_base_is_view", False):
+            self.cpu_weight = self.cpu_weight.clone()
+            self._base_is_view = False
+
     @torch.no_grad()
     def _merge_lora_into_data(
         self,
@@ -294,6 +311,7 @@ class BaseLayerWithLoRA(nn.Module):
         if self.disable_lora:
             return
 
+        self._ensure_base_snapshot_owned()
         if self.merged:
             self.unmerge_lora_weights()
 
@@ -476,8 +494,9 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         base_layer: ColumnParallelLinear,
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
+        snapshot_base: bool = True,
     ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha)
+        super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         if self.merged or self.disable_lora:
@@ -538,8 +557,9 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         base_layer: MergedColumnParallelLinear,
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
+        snapshot_base: bool = True,
     ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha)
+        super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
         return A
@@ -574,8 +594,9 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         base_layer: QKVParallelLinear,
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
+        snapshot_base: bool = True,
     ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha)
+        super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
         return A
@@ -606,8 +627,9 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         base_layer: RowParallelLinear,
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
+        snapshot_base: bool = True,
     ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha)
+        super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
 
     def forward(self, input_: torch.Tensor):
         if self.merged or self.disable_lora:
@@ -692,8 +714,9 @@ class LinearWithLoRA(BaseLayerWithLoRA):
         base_layer: nn.Linear,
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
+        snapshot_base: bool = True,
     ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha)
+        super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
 
     @torch.compile()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -732,6 +755,7 @@ def wrap_with_lora_layer(
     layer: nn.Module,
     lora_rank: int | None = None,
     lora_alpha: int | None = None,
+    snapshot_base: bool = True,
 ) -> BaseLayerWithLoRA | None:
     """
     transform the given layer to its corresponding LoRA layer
@@ -754,6 +778,7 @@ def wrap_with_lora_layer(
                 layer,
                 lora_rank=lora_rank,
                 lora_alpha=lora_alpha,
+                snapshot_base=snapshot_base,
             )
             return ret
     return None

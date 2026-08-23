@@ -12,6 +12,7 @@ import torch.distributed as dist
 from safetensors.torch import load_file
 from torch.distributed.tensor import DTensor
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     BaseLayerWithLoRA,
@@ -27,6 +28,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora.format_adapter import (
     normalize_lora_state_dict,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.lora.lora_merge_cache import (
+    LoraMergeCache,
+    lora_merge_cache_key,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora.peft_adapter import (
     get_peft_lora_alpha,
@@ -187,12 +192,13 @@ class LoRAPipeline(ComposedPipelineBase):
         self.lora_path = self.server_args.lora_path
         self.lora_nickname = self.server_args.lora_nickname
         if self.lora_path is not None:
-            self.convert_to_lora_layers()
+            self.convert_to_lora_layers(snapshot_base=False)
             self.set_lora(
                 self.lora_nickname,
                 self.lora_path,
                 strength=self.server_args.lora_scale,  # type: ignore
                 lora_alpha=self.server_args.lora_alpha,
+                cache_merged=True,
             )  # type: ignore
 
     def is_target_layer(self, module_name: str) -> bool:
@@ -323,6 +329,7 @@ class LoRAPipeline(ComposedPipelineBase):
         module_name: str,
         target_lora_layers: dict[str, BaseLayerWithLoRA],
         check_exclude: bool = True,
+        snapshot_base: bool = True,
     ) -> int:
         """
         Convert layers in a module to LoRA layers.
@@ -352,6 +359,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 layer,
                 lora_rank=self.lora_rank,
                 lora_alpha=self.lora_alpha,
+                snapshot_base=snapshot_base,
             )
             if lora_layer is not None:
                 target_lora_layers[name] = lora_layer
@@ -385,9 +393,15 @@ class LoRAPipeline(ComposedPipelineBase):
                         "unquantized checkpoint to use LoRA."
                     )
 
-    def convert_to_lora_layers(self) -> None:
+    def convert_to_lora_layers(self, snapshot_base: bool = True) -> None:
         """
         Unified method to convert the transformer to a LoRA transformer.
+
+        snapshot_base=False keeps the unmerge snapshots as zero-copy views of
+        the base weights instead of clones (38 GB of anonymous memory on H3's
+        DiT). Safe whenever merges go through the LoRA merge cache, which
+        never writes the base storage; a later in-place merge materializes
+        the clone on its own.
         """
         if self.lora_initialized:
             return
@@ -400,6 +414,7 @@ class LoRAPipeline(ComposedPipelineBase):
             "transformer",
             self.lora_layers,
             check_exclude=True,
+            snapshot_base=snapshot_base,
         )
         logger.info("Converted %d layers to LoRA layers", converted_count)
 
@@ -412,6 +427,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 self.modules["transformer_2"],
                 "transformer_2",
                 self.lora_layers_transformer_2,
+                snapshot_base=snapshot_base,
                 check_exclude=True,
             )
             logger.info(
@@ -424,6 +440,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 self.modules["fake_score_transformer"],
                 "fake_score_transformer",
                 self.lora_layers_critic,
+                snapshot_base=snapshot_base,
                 check_exclude=False,
             )
             logger.info(
@@ -607,6 +624,7 @@ class LoRAPipeline(ComposedPipelineBase):
         strengths: list[float],
         clear_existing: bool = False,
         merge_weights: bool = True,
+        merge_cache: LoraMergeCache | None = None,
     ) -> int:
         """
         Apply LoRA weights to the given lora_layers. Supports multiple LoRA adapters.
@@ -667,16 +685,19 @@ class LoRAPipeline(ComposedPipelineBase):
                     layer.lora_rank = inferred_rank
                     layer.lora_alpha = inferred_alpha
 
+                    use_cache = merge_cache is not None and merge_weights
                     layer.set_lora_weights(
                         self.lora_adapters[nickname][lora_A_name],
                         self.lora_adapters[nickname][lora_B_name],
                         lora_path=path,
                         strength=lora_strength,
-                        merge_weights=merge_weights,
+                        merge_weights=merge_weights and not use_cache,
                         clear_existing=(
                             clear_existing and idx == 0
                         ),  # Only clear on first LoRA
                     )
+                    if use_cache and idx == len(lora_nicknames) - 1:
+                        self._merge_via_cache(name, layer, merge_cache)
                     adapted_count += 1
                     applied_count_by_adapter[idx] += 1
                 else:
@@ -912,10 +933,15 @@ class LoRAPipeline(ComposedPipelineBase):
         merge_weights: bool | None = None,
         merge_mode: str | None = None,
         lora_alpha: int | None | list[int | None] = None,
+        cache_merged: bool = False,
     ):  # type: ignore
         """
         Load LoRA adapter(s) into the pipeline and apply them to the specified transformer(s).
         Supports both single LoRA (backward compatible) and multiple LoRA adapters.
+
+        cache_merged re-homes merged weights to a file-backed store so they
+        stop costing anonymous host memory; pass it only for the startup
+        (static) adapter, where the merged combination is stable.
         """
         merge_mode = self._resolve_lora_merge_mode(merge_weights, merge_mode)
 
@@ -1055,6 +1081,13 @@ class LoRAPipeline(ComposedPipelineBase):
                             tgt_strengths,
                         )
                     if count is None:
+                        merge_cache = self._merge_cache_for(
+                            module_name,
+                            lora_layers_dict,
+                            tgt_paths,
+                            tgt_strengths,
+                            enabled=cache_merged and effective_merge_weights,
+                        )
                         count = self._apply_lora_to_layers(
                             lora_layers_dict,
                             tgt_nicknames,
@@ -1063,7 +1096,12 @@ class LoRAPipeline(ComposedPipelineBase):
                             tgt_strengths,
                             clear_existing=True,
                             merge_weights=effective_merge_weights,
+                            merge_cache=merge_cache,
                         )
+                        if merge_cache is not None:
+                            merge_cache.finalize(
+                                {"module": module_name, "paths": tgt_paths}
+                            )
                     adapted_count += count
                     self.cur_adapter_name[module_name] = merged_name
                     self.cur_adapter_path[module_name] = ",".join(
@@ -1091,6 +1129,78 @@ class LoRAPipeline(ComposedPipelineBase):
             ),
             merge_mode,
         )
+
+    def _merge_via_cache(self, name, layer, merge_cache) -> None:
+        """Merge without writing the base storage.
+
+        The in-place merge copy-on-writes the checkpoint mapping: the whole
+        component's bytes become anonymous host memory, and so does the
+        clone() snapshot the layer keeps for unmerging. Merging into a
+        one-layer temporary and parking the result in the file-backed store
+        leaves the base storage untouched — the unmerge snapshot stays a
+        zero-copy view, and the anonymous high-water mark stays one layer
+        wide. If the store cannot take the bytes, fall back to the in-place
+        merge (correctness first, memory second).
+        """
+        base_view = layer.weight.data
+        if merge_cache.get(name, layer.weight):
+            layer.merged = True
+        else:
+            # Same math as merge_lora_weights: compute on the device, in fp32
+            # when the policy says so, and round back once — so the store holds
+            # exactly the bytes the in-place merge would have produced.
+            target_dtype = base_view.dtype
+            work = base_view.detach().to(get_local_torch_device())
+            if (
+                layer._should_merge_in_fp32(layer.lora_weights_list)
+                and work.is_floating_point()
+                and work.dtype != torch.float32
+            ):
+                work = work.to(torch.float32)
+            layer._merge_lora_into_data(work, layer.lora_weights_list)
+            merged = work.to("cpu", dtype=target_dtype)
+            del work
+            if merge_cache.put(name, layer.weight, merged):
+                layer.merged = True
+            else:
+                del merged
+                layer.merge_lora_weights()
+                return
+        layer.cpu_weight = base_view.detach()
+        layer._base_is_view = True
+
+    def _merge_cache_for(
+        self,
+        module_name: str,
+        lora_layers: dict[str, BaseLayerWithLoRA],
+        lora_paths: list[str | None],
+        strengths: list[float],
+        enabled: bool,
+    ) -> LoraMergeCache | None:
+        if not enabled or envs.SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE:
+            return None
+        if any(path is None for path in lora_paths):
+            return None
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            # Sharded weights would need per-rank stores; not worth it until a
+            # multi-GPU consumer deployment exists.
+            return None
+        adapters = [
+            (path, strength, self.server_args.lora_alpha)
+            for path, strength in zip(lora_paths, strengths)
+        ]
+        key = lora_merge_cache_key([self.server_args.model_path, module_name], adapters)
+        expected = sum(
+            layer.weight.numel() * layer.weight.element_size()
+            for layer in lora_layers.values()
+        )
+        store = LoraMergeCache(key, expected)
+        if store.is_complete():
+            logger.info(
+                "LoRA merge cache found for %s; adopting instead of merging",
+                module_name,
+            )
+        return store
 
     def deactivate_lora_weights(self, target: str = "all") -> None:
         """
