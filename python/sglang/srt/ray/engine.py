@@ -35,7 +35,7 @@ from sglang.srt.ray.scheduler_actor import SchedulerActor
 from sglang.srt.runtime_context import (
     get_parallel,
 )
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 
 logger = logging.getLogger(__name__)
 
@@ -108,14 +108,10 @@ def _get_bundle_node_ip(placement_group: PlacementGroup, bundle_idx: int) -> str
 def _compute_world_size() -> int:
     """Compute world_size (total number of scheduler actors/GPUs needed).
 
-    Normal: dp_size * tp_size * pp_size; DP attention: tp_size * pp_size.
     Reads the published parallel leaves: the driver is sizing the actors that
     will hold the process groups, so there is nothing live to ask.
     """
-    parallel = get_parallel().config
-    if parallel.enable_dp_attention:
-        return parallel.tp_size * parallel.pp_size
-    return parallel.dp_size * parallel.tp_size * parallel.pp_size
+    return compute_world_size(get_parallel().config)
 
 
 def _resolve_bundle_indices(pg: PlacementGroup, world_size: int) -> List[int]:

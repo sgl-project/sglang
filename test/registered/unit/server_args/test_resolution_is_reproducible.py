@@ -775,7 +775,7 @@ class TestACopyStaysResolved(_RestoresProcessState, CustomTestCase):
         parent = self._resolved()
         bare = dataclasses.replace(parent, dist_init_addr="1.2.3.4:5000")
         self.assertFalse(
-            getattr(bare, "_declarations_materialized", False),
+            getattr(bare, "_resolution_finished", False),
             "a bare replace carried the flag; then this test proves nothing",
         )
         bare.resolve_once()
@@ -792,7 +792,7 @@ class TestACopyStaysResolved(_RestoresProcessState, CustomTestCase):
     def test_replace_resolved_keeps_the_parents_resolution(self):
         parent = self._resolved()
         copy_ = parent.replace_resolved("ray.test", dist_init_addr="1.2.3.4:5000")
-        self.assertTrue(getattr(copy_, "_declarations_materialized", False))
+        self.assertTrue(getattr(copy_, "_resolution_finished", False))
         drifted = {
             field.name: (getattr(parent, field.name), getattr(copy_, field.name))
             for field in dataclasses.fields(parent)
