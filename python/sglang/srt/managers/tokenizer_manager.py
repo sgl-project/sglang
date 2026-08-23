@@ -663,9 +663,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
         # Keep a reference so the bootstrap server is not garbage-collected.
         self.bootstrap_server = (
-            start_disagg_service(self.server_args)
-            if start_pd_bootstrap_service
-            else None
+            start_disagg_service() if start_pd_bootstrap_service else None
         )
         # Single-source counter for auto-assigning fake bootstrap_room.
         self.fake_bootstrap_room_counter = 0
@@ -761,7 +759,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
             ]
         )
-        self.init_communicators(self.server_args)
+        self.init_communicators()
 
         self.sampling_params_class = SamplingParams
         self.signal_handler_class = SignalHandler

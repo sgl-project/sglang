@@ -193,7 +193,6 @@ class EPLBManager:
     ) -> ExpertLocationMetadata:
         if not broadcast_over_world:
             return ExpertLocationMetadata.init_by_eplb(
-                self._server_args,
                 self._model_config,
                 logical_count,
             )
@@ -204,7 +203,6 @@ class EPLBManager:
         # the mapping chosen for the expanded world.
         if dist.get_rank() == 0:
             computed_metadata = ExpertLocationMetadata.init_by_eplb(
-                self._server_args,
                 self._model_config,
                 logical_count,
                 # Arbitrary append topologies may not preserve node divisibility.
@@ -220,7 +218,6 @@ class EPLBManager:
 
         dist.broadcast(physical_to_logical_map, src=0)
         return ExpertLocationMetadata.init_by_mapping(
-            self._server_args,
             self._model_config,
             physical_to_logical_map,
             moe_ep_rank=self._elastic_global_rank(),
