@@ -191,6 +191,14 @@ def inspect_comfy_quant_markers(
             continue
         weight_dtype, weight_shape = checkpoint_meta[f"{prefix}.weight"]
         scale_dtype, scale_shape = checkpoint_meta[f"{prefix}.weight_scale"]
+        if weight_dtype == "I8" and scale_dtype == "F32" and scale_shape == ():
+            if len(weight_shape) != 2:
+                raise ValueError(
+                    f"Comfy tensorwise INT8 layer {prefix!r} needs a 2D weight, "
+                    f"got {weight_shape}"
+                )
+            marker["_is_tensorwise_scalar"] = True
+            continue
         if weight_dtype != "I8" or scale_dtype != "F32":
             raise ValueError(
                 f"Comfy INT8 layer {prefix!r} needs I8 weights and F32 scales, "
@@ -222,6 +230,8 @@ def resolve_comfy_checkpoint_quantization(
     if formats == ["int8_tensorwise"]:
         return KitchenInt8Config(layer_markers=layer_markers)
     if formats == ["asym_w4a8_int8"]:
+        return KitchenW4A8Config(layer_markers)
+    if formats == ["asym_w4a8_int8", "int8_tensorwise"]:
         return KitchenW4A8Config(layer_markers)
     if formats == ["float8_e4m3fn"]:
         return ComfyFp8Config(layer_markers)

@@ -160,3 +160,7 @@ class QuantizationConfig(ABC):
     ) -> bool:
         """Whether a row-parallel shard preserves this format's input layout."""
         return True
+
+    def quantizes_embedding(self, prefix: str) -> bool:
+        """Whether this checkpoint config owns the named embedding table."""
+        return False
