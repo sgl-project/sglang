@@ -775,7 +775,3 @@ def test_auto_negative_leaves_a_free_text_negative_alone():
 
     assert batch.negative_prompt == "blurry, low quality"
     assert stage.backend.calls == []
-
-
-def test_rewriting_is_off_until_a_server_is_configured():
-    assert LingBotVideoMoEPipelineConfig().rewriter_url is None

@@ -989,7 +989,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 model_name="transformer",
                 sp_group=sp_group,
                 tp_group=tp_group,
-                has_separate_cfg=batch.do_classifier_free_guidance,
+                # CFG parallel gives each rank one branch, so no alternation here.
+                has_separate_cfg=(
+                    batch.do_classifier_free_guidance
+                    and not self.server_args.enable_cfg_parallel
+                ),
             )
             logger.info(
                 "cache-dit enabled on transformer (steps=%d, Fn=%d, Bn=%d, rdt=%.3f)",

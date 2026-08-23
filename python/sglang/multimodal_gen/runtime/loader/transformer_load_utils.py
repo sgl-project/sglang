@@ -761,6 +761,16 @@ def resolve_transformer_quant_load_spec(
             safetensors_list=safetensors_list,
             component_model_path=component_model_path,
         )
+        if quant_config is not None and not getattr(
+            model_cls, "supports_runtime_quantization", True
+        ):
+            logger.warning(
+                "%s does not support runtime %s quantization; loading the "
+                "checkpoint in its source dtype instead.",
+                model_cls.__name__,
+                _get_quant_config_name(quant_config),
+            )
+            quant_config = None
 
     if quant_config is not None:
         packed = getattr(model_cls, "packed_modules_mapping", None)

@@ -76,10 +76,6 @@ LINGBOT_VIDEO_FP32_MODULES = (
 
 
 def should_keep_in_fp32(name: str) -> bool:
-    # fp8 kernels reject a scale that is not fp32, and no scale is named after a
-    # module, so the segment match below cannot cover them.
-    if name.endswith("_scale"):
-        return True
     return any(
         module_name in name.split(".") for module_name in LINGBOT_VIDEO_FP32_MODULES
     )
@@ -324,7 +320,6 @@ class LingBotVideoBlock(nn.Module):
                 topk_group=topk_group,
                 routed_scaling_factor=routed_scaling_factor,
                 n_shared_experts=n_shared_experts,
-                quant_config=quant_config,
             )
         else:
             self.ffn = LingBotVideoMLP(h, intermediate_size)
@@ -369,6 +364,8 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
     _fsdp_shard_conditions = [is_block]
     _compile_conditions = [is_block]
+    # The experts are bare Parameters, so get_quant_method never reaches them.
+    supports_runtime_quantization = False
     param_names_mapping = LingBotVideoMoEConfig().param_names_mapping
     reverse_param_names_mapping = LingBotVideoMoEConfig().reverse_param_names_mapping
     lora_param_names_mapping = LingBotVideoMoEConfig().lora_param_names_mapping
@@ -399,15 +396,6 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
             buffer.data = buffer.data.to(dtype=target_dtype, non_blocking=non_blocking)
 
         return self
-
-    def post_load_weights(self) -> None:
-        super().post_load_weights()
-        for block in self.blocks:
-            if (
-                isinstance(block.ffn, LingBotVideoSparseMoeBlock)
-                and block.ffn.quantize_experts_to_fp8
-            ):
-                block.ffn.experts.quantize_to_fp8()
 
     def preprocess_loaded_state_dict(
         self, weight_iterator: Iterable[tuple[str, torch.Tensor]]
