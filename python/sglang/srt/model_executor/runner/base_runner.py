@@ -46,7 +46,13 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
 )
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import (
+    configured_pp_size,
+    get_disagg,
+    get_exec,
+    get_flags,
+    get_parallel,
+)
 from sglang.srt.speculative.spec_info import create_dummy_verify_input
 from sglang.srt.utils import (
     empty_context,
@@ -215,7 +221,7 @@ class BaseRunner(ABC):
         self.tp_size = model_runner.server_args.tp_size
         # elastic-EP scale-up rewrites dp_size on the published config
         self.dp_size = get_parallel().dp_size
-        self.pp_size = model_runner.server_args.pp_size
+        self.pp_size = configured_pp_size()
         self.enable_pdmux = model_runner.server_args.enable_pdmux
         self.return_hidden_states_mode = (
             CaptureHiddenMode.NULL
@@ -266,7 +272,7 @@ class BaseRunner(ABC):
         with custom_all_reduce.register_graph_buffers).
         """
         mr = self.model_runner
-        if mr.server_args.flashinfer_allreduce_fusion_backend is None:
+        if get_exec().comm.flashinfer_allreduce_fusion_backend is None:
             return
 
         from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
@@ -345,7 +351,7 @@ class BaseRunner(ABC):
             vocab_size=mr.model_config.vocab_size,
             dtype=mr.model_config.dtype,
             dp_size=get_parallel().dp_size,
-            pp_size=mr.server_args.pp_size,
+            pp_size=configured_pp_size(),
             is_encoder_decoder=mr.model_config.is_encoder_decoder,
             require_mlp_tp_gather=require_mlp_tp_gather(mr.server_args),
             seq_len_fill_value=mr.attn_backend.get_cuda_graph_seq_len_fill_value(),
@@ -411,7 +417,7 @@ class BaseRunner(ABC):
         # TARGET_VERIFY dummy forward would trip the linear-attn backend's
         # pool-type assert. Warm up in plain DECODE instead.
         _is_pd_prefill_target = (
-            mr.server_args.disaggregation_mode == "prefill" and not mr.is_draft_worker
+            get_disagg().disaggregation_mode == "prefill" and not mr.is_draft_worker
         )
         if mr.spec_algorithm.is_speculative() and not _is_pd_prefill_target:
             if mr.is_draft_worker:
@@ -515,7 +521,7 @@ class BaseRunner(ABC):
             extend_prefix_lens = None
             extend_start_loc = None
 
-        if mr.server_args.pp_size > 1:
+        if configured_pp_size() > 1:
             # PP0 already cp-split hidden_states before send.
             pp_hidden_tokens = num_tokens
             if (
@@ -639,7 +645,7 @@ class BaseRunner(ABC):
 
             kwargs = {}
             if (
-                mr.server_args.pp_size > 1
+                configured_pp_size() > 1
                 and "pp_proxy_tensors" in inspect.signature(mr.model.forward).parameters
             ):
                 kwargs["pp_proxy_tensors"] = PPProxyTensors(

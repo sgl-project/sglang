@@ -214,7 +214,7 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         source = "default"
 
     if (
-        ctx.server_args.enable_hierarchical_cache
+        get_memory().enable_hierarchical_cache
         and ctx.server_args.hicache_host_memory_mode == "buffer_only"
     ):
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache

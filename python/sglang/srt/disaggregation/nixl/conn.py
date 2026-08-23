@@ -595,15 +595,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._staging_ctx.room_bootstrap[room] = bootstrap_infos
         self._staging_ctx.room_receivers[room] = receiver
 
-    def _is_watermark_ready(
-        self, agent_name: str, alloc_round: int, alloc_end: int
-    ) -> bool:
-        from sglang.srt.disaggregation.common.staging_handler import (
-            is_watermark_ready,
-        )
-
-        return is_watermark_ready(self._staging_ctx, agent_name, alloc_round, alloc_end)
-
     def _start_decode_listener_thread(self):
         """Decode-side ZMQ listener for STAGING_REQ and ABORT_ACK. A thread, not
         NIXL notifs: the decode agent has no progress thread, so notifs only drain

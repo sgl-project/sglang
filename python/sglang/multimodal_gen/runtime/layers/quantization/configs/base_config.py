@@ -67,6 +67,7 @@ class QuantizationConfig(ABC):
 
     # for quantization frameworks with a separate quantized model provided, e.g. Nunchaku
     quantized_model_path: str | None = None
+    checkpoint_uses_native_qkv_layout: bool = False
 
     def __init__(self):
         super().__init__()
@@ -153,3 +154,9 @@ class QuantizationConfig(ABC):
 
     def get_cache_scale(self, name: str) -> str | None:
         return None
+
+    def supports_input_partition(
+        self, prefix: str, input_size_per_partition: int
+    ) -> bool:
+        """Whether a row-parallel shard preserves this format's input layout."""
+        return True
