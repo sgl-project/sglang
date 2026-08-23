@@ -18,7 +18,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 # 1-gpu-large (H100) rather than 1-gpu-small (5090): DeepGEMM is disabled on
-# SM120, so only the large runner exercises the fp32 bf16_gemm_nt path.
+# SM120, so only the large runner exercises the fp32 DeepGEMM store.
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
 # MI300 (gfx942) has a 64KB shared memory limit but the kernel needs 66KB.
 register_amd_ci(est_time=20, suite="nightly-amd-1-gpu-mi35x", nightly=True)

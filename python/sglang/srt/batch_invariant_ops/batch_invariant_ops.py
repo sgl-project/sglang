@@ -264,11 +264,8 @@ def _matmul_persistent_deepgemm(
     out = torch.empty((M, N), device=a.device, dtype=out_dtype)
 
     try:
-        if out_dtype == torch.float32:
-            # bf16_gemm_nn only stores bf16; NT has an fp32 store, [N, K] rhs.
-            deep_gemm.bf16_gemm_nt(a, b.transpose(0, 1), out)
-        else:
-            deep_gemm.bf16_gemm_nn(a, b, out)
+        # NN forwards to bf16_gemm_nt, whose store is bf16 or fp32 either way.
+        deep_gemm.bf16_gemm_nn(a, b, out)
     except RuntimeError as e:
         raise RuntimeError(
             f"DeepGEMM failed for matrix shapes M={M}, N={N}, K={K}. "
@@ -300,7 +297,7 @@ def matmul_persistent(
         and ENABLE_JIT_DEEPGEMM
         and (a.dtype == torch.bfloat16)
         and (b.dtype == torch.bfloat16)
-        # DeepGEMM stores bf16 (NN) or fp32 (NT); anything else belongs on Triton.
+        # DeepGEMM's bf16 GEMM stores bf16 or fp32; anything else belongs on Triton.
         and out_dtype in (None, torch.bfloat16, torch.float32)
         and a.is_contiguous()
         and b.transpose(0, 1).is_contiguous()
@@ -327,12 +324,13 @@ def matmul_persistent(
 
         return _matmul_persistent_deepgemm(a=a, b=b, bias=bias, out_dtype=out_dtype)
 
-    if _ENABLE_MM_FALLBACK_VARIANT:
+    # The variant GEMM stores a.dtype, so a wider out_dtype has to go to Triton
+    # rather than round trip through a narrower store.
+    if _ENABLE_MM_FALLBACK_VARIANT and out_dtype in (None, a.dtype):
         out = torch.einsum("ik,kj->ij", a, b)
         if bias is not None:
             out += bias
-        # Debug-only path: the variant GEMM still stores a.dtype, so this is a cast.
-        return out if out_dtype is None else out.to(out_dtype)
+        return out
 
     return _matmul_persistent_triton(a=a, b=b, bias=bias, out_dtype=out_dtype)
 
