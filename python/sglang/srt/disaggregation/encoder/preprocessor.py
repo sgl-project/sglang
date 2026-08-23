@@ -167,7 +167,7 @@ class EncoderPreprocessor:
         try:
             self.image_processor = AutoImageProcessor.from_pretrained(
                 get_serving().tokenizer_path or get_model().model_path,
-                trust_remote_code=server_args.trust_remote_code,
+                trust_remote_code=get_model().trust_remote_code,
                 revision=server_args.revision,
                 **image_processor_kwargs,
             )
@@ -178,7 +178,7 @@ class EncoderPreprocessor:
         try:
             self.video_processor = AutoVideoProcessor.from_pretrained(
                 get_serving().tokenizer_path or get_model().model_path,
-                trust_remote_code=server_args.trust_remote_code,
+                trust_remote_code=get_model().trust_remote_code,
                 revision=server_args.revision,
             )
         except Exception as e:
@@ -188,7 +188,7 @@ class EncoderPreprocessor:
         try:
             _audio_proc = AutoProcessor.from_pretrained(
                 get_serving().tokenizer_path or get_model().model_path,
-                trust_remote_code=server_args.trust_remote_code,
+                trust_remote_code=get_model().trust_remote_code,
                 revision=server_args.revision,
             )
             if not hasattr(_audio_proc, "feature_extractor"):

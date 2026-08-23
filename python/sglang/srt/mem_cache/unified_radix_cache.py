@@ -81,6 +81,7 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
 )
+from sglang.srt.runtime_context import get_memory
 from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.utils.common import ceil_align
 
@@ -385,7 +386,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.extra_metric_labels = server_args.extra_metric_labels
 
         # Parse storage config once, share with assembler and tree
-        storage_backend = server_args.hicache_storage_backend
+        storage_backend = get_memory().hicache_storage_backend
         storage_extra_config = None
         storage_prefetch_threshold = 256
         prefetch_timeout_base = 1.0
@@ -399,7 +400,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 prefetch_timeout_per_ki_token,
                 hicache_storage_pass_prefix_keys,
             ) = HybridCacheController.parse_storage_backend_extra_config(
-                server_args.hicache_storage_backend_extra_config
+                get_memory().hicache_storage_backend_extra_config
             )
 
         attach_hybrid_pool_to_unified_cache(
@@ -442,7 +443,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # State initialization
         self.write_through_threshold = (
-            1 if server_args.hicache_write_policy == "write_through" else 2
+            1 if get_memory().hicache_write_policy == "write_through" else 2
         )
         self.is_write_back = (
             self.cache_controller is not None
@@ -457,7 +458,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     pool=_COMPONENT_POOL_LABEL[ct],
                 )
         self.load_back_threshold = 10
-        self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
+        self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
 
         # Runtime attach/detach of the L3 backend (startup, admin API, atexit).
         self._storage_attachment = StorageAttachment(self)

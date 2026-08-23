@@ -216,6 +216,19 @@ _CONFIGURED_SIZE_CALL_SITES = {
         "the encode server's launch entry sizes its workers before it has "
         "spawned any of them"
     ),
+    ("srt/disaggregation/encoder/grpc_server.py", "tp_size"): (
+        "the same worker-count arithmetic on the gRPC entry: it spawns the TP "
+        "workers, so their groups do not exist yet"
+    ),
+    ("srt/disaggregation/encoder/server.py", "tp_size"): (
+        "`MMEncoder` builds its own TP group from this size -- "
+        "`initialize_model_parallel` is the call being handed it, so there is "
+        "nothing live to ask"
+    ),
+    ("srt/disaggregation/encoder/receiver.py", "tp_size"): (
+        "the receiver labels and shards by the launch width; it runs in the "
+        "tokenizer process, which holds no encoder groups"
+    ),
     ("srt/utils/common.py", "tp_size"): (
         "the require_*_tp_gather predicates compared the configured tp_size "
         "when they read the record; the live property answers a different "
