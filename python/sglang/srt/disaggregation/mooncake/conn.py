@@ -37,6 +37,7 @@ from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
     build_dcp_token_transfer_plan,
+    debug_log_transfer_fragmentation,
     group_concurrent_contiguous,
     pack_int_lists,
     unpack_int_lists,
@@ -67,6 +68,10 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
+
+# Memfabric SDMA stream submission-queue depth is 2048; stay well under it so
+# one fragmented index list can never wedge the stream (see _transfer_data).
+_HYBM_SQ_SAFE_BATCH = 256
 
 FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
@@ -618,9 +623,155 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if not transfer_blocks:
             return 0
 
-        src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
-        return self.engine.batch_transfer_sync(
+        # The memfabric SDMA stream queues one task per block on a 2048-deep
+        # submission queue; a single oversized batch trips the near-full sync
+        # (1 s poll timeout) and leaves the stream permanently wedged
+        # ("stream synchronize failed!" then "stream is full!"). Each
+        # batch_transfer_sync call drains before returning, so submitting in
+        # sub-queue batches keeps the stream healthy regardless of how
+        # fragmented the index lists are.
+        for start in range(0, len(transfer_blocks), _HYBM_SQ_SAFE_BATCH):
+            batch = transfer_blocks[start : start + _HYBM_SQ_SAFE_BATCH]
+            ret = self._submit_transfer_batch(mooncake_session_id, batch)
+            if ret != 0:
+                return ret
+        return 0
+
+    def _sync_engine_registration(self):
+        """Register kv_args regions the fabric engine has not seen yet.
+
+        kv_args state components (e.g. the DSV4 draft SWA pool) can be
+        appended after register_buffer_to_engine ran at startup; the engine
+        faults with an SDMA smmu-terminate on every transfer that touches
+        them. Register any missing region on first use instead of failing.
+        """
+        current = [
+            (p, p + l, l)
+            for p, l in zip(self._kv_args_ptr_list(), self._kv_args_len_list())
+            if l > 0
+        ]
+        engine = getattr(self, "_mf_engine_regions", None)
+        if engine is None:
+            self._mf_engine_regions = {p for p, _e, _l in current}
+            self._mf_engine_ranges = sorted(
+                (p, e) for p, e, _l in current
+            )
+            engine = self._mf_engine_regions
+        missing = [
+            (p, l) for p, _e, l in current if p not in engine
+        ]
+        if missing:
+            logger.error(
+                "[mf-trans] %d kv_args regions were never fabric-registered; "
+                "registering now: %s",
+                len(missing),
+                [(hex(p), l) for p, l in missing[:4]],
+            )
+            self.engine.batch_register([p for p, _l in missing], [l for _p, l in missing])
+            engine.update(p for p, _l in missing)
+            self._mf_engine_ranges = sorted(
+                (p, p + l) for p, l in current
+            )
+
+    def _kv_args_ptr_list(self):
+        args = self.kv_args
+        state_ptrs = [p for comp in (args.state_data_ptrs or []) for p in comp]
+        return (
+            list(args.kv_data_ptrs)
+            + list(args.aux_data_ptrs or [])
+            + state_ptrs
+        )
+
+    def _kv_args_len_list(self):
+        args = self.kv_args
+        state_lens = [l for comp in (args.state_data_lens or []) for l in comp]
+        return (
+            list(args.kv_data_lens)
+            + list(args.aux_data_lens or [])
+            + state_lens
+        )
+
+    def _drop_unregistered_src_blocks(self, batch):
+        """Drop blocks whose source range escapes every registered buffer.
+
+        A garbage page id computes a source address far outside the pools;
+        the fabric engine answers that with an SDMA smmu-terminate that
+        kills the whole session. First sync late kv_args regions into the
+        engine, then drop whatever still escapes and log it against the
+        nearest region.
+        """
+        import bisect
+
+        self._sync_engine_registration()
+        ranges = getattr(self, "_mf_engine_ranges", None) or []
+        if not ranges:
+            return batch
+        starts = [r[0] for r in ranges]
+        good = []
+        for block in batch:
+            src, _dst, length = block
+            i = bisect.bisect_right(starts, src) - 1
+            inside = i >= 0 and ranges[i][0] <= src and src + length <= (
+                ranges[i][1]
+            )
+            if inside:
+                good.append(block)
+                continue
+            nearest = ranges[i] if i >= 0 else ranges[0]
+            logger.error(
+                "[mf-trans] dropping src outside registered regions: "
+                "src:0x%x len:%d (nearest region [0x%x, 0x%x), delta:0x%x)",
+                src,
+                length,
+                nearest[0],
+                nearest[1],
+                src - nearest[1] if src >= nearest[1] else nearest[0] - src,
+            )
+        return good
+
+    def _submit_transfer_batch(self, mooncake_session_id, batch) -> int:
+        batch = self._drop_unregistered_src_blocks(batch)
+        if not batch:
+            return 0
+        src_addrs, dst_addrs, lengths = zip(*batch)
+        ret = self.engine.batch_transfer_sync(
             mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
+        )
+        if ret == 0:
+            return 0
+
+        # One transient SDMA fault (observed as HYBM "wait copy failed:-7")
+        # otherwise poisons the whole session: a single chunk failure
+        # blacklists it for every later request. Dump the offending blocks
+        # for correlation with the registered pool ranges, then retry once.
+        src_addrs = list(src_addrs)
+        dst_addrs = list(dst_addrs)
+        lengths = list(lengths)
+        # collections.Counter shadows the prometheus_client Counter imported
+        # at module level; import locally for the length histogram.
+        from collections import Counter
+
+        logger.error(
+            "[mf-trans] batch failed ret=%d session=%s blocks=%d "
+            "first=(src:0x%x dst:0x%x len:%d) last=(src:0x%x dst:0x%x len:%d) "
+            "src[min:0x%x max:0x%x] dst[min:0x%x max:0x%x] len_top=%s",
+            ret,
+            mooncake_session_id,
+            len(batch),
+            src_addrs[0],
+            dst_addrs[0],
+            lengths[0],
+            src_addrs[-1],
+            dst_addrs[-1],
+            lengths[-1],
+            min(src_addrs),
+            max(src_addrs),
+            min(dst_addrs),
+            max(dst_addrs),
+            Counter(lengths).most_common(3),
+        )
+        return self.engine.batch_transfer_sync(
+            mooncake_session_id, src_addrs, dst_addrs, lengths
         )
 
     def _send_kvcache_generic(
@@ -927,6 +1078,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             plan.src_token_indices,
             plan.dst_token_indices,
         )
+        # The DCP relayout takes every dcp_size-th token, so src strides by
+        # dcp_size and cannot merge into runs; this surfaces as thousands of
+        # single-token blocks (the memfabric SQ flood signature).
+        debug_log_transfer_fragmentation(
+            "dcp",
+            plan.src_token_indices,
+            plan.dst_token_indices,
+            dcp_token_item_lens,
+        )
 
         layers_params = [
             (
@@ -1072,10 +1232,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # Nothing to transfer for this layer.
                 return 0
             dst_addr_list = dst_slice_addrs.reshape(-1).tolist()
-            total_slices = len(src_addr_list)
-            length_list = [heads_bytes_per_token_to_send] * total_slices
-            return self.engine.batch_transfer_sync(
-                mooncake_session_id, src_addr_list, dst_addr_list, length_list
+            length_list = [heads_bytes_per_token_to_send] * len(src_addr_list)
+            # Per-token tasks; must go through the chunked funnel or a large
+            # batch floods the memfabric submission queue (depth 2048).
+            return self._transfer_data(
+                mooncake_session_id, list(zip(src_addr_list, dst_addr_list, length_list))
             )
 
         futures = []
@@ -1382,6 +1543,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         src_indices = src_indices[: len(dst_indices_local)]
                     else:
                         dst_indices_local = dst_indices_local[: len(src_indices)]
+                debug_log_transfer_fragmentation(
+                    f"state:{st}",
+                    np.array(src_indices, dtype=np.int32),
+                    np.array(dst_indices_local, dtype=np.int32),
+                    list(src_item_lens),
+                    list(
+                        self.kv_args.state_data_lens[i]
+                        if i < len(self.kv_args.state_data_lens)
+                        else []
+                    ),
+                )
                 rc = (
                     self._send_kvcache_generic(
                         mooncake_session_id=req.mooncake_session_id,

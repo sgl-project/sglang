@@ -86,11 +86,35 @@ class AscendTransferEngine(MooncakeTransferEngine):
     def batch_register(self, ptrs: List[int], lengths: List[int]):
         try:
             ret_value = self.engine.batch_register_memory(ptrs, lengths)
-        except Exception:
+        except Exception as e:
             # Mark register as failed
+            logger.error(
+                "Ascend memory registration raised (%s); %d regions, %d bytes "
+                "total. Any later transfer touching them faults with SDMA "
+                "smmu-terminate.",
+                e,
+                len(ptrs),
+                sum(lengths),
+            )
             ret_value = -1
         if ret_value != 0:
-            logger.debug(f"Ascend memory registration for ptr {ptrs} failed.")
+            logger.error(
+                "Ascend memory registration failed ret=%s; %d regions, %d "
+                "bytes total. Transfers into unregistered regions fault "
+                "with SDMA smmu-terminate.",
+                ret_value,
+                len(ptrs),
+                sum(lengths),
+            )
+        else:
+            logger.info(
+                "Ascend memory registration ok: %d regions, %d bytes total, "
+                "VA span [0x%x, 0x%x).",
+                len(ptrs),
+                sum(lengths),
+                min(ptrs),
+                max(p + l for p, l in zip(ptrs, lengths)),
+            )
 
     @staticmethod
     def _get_transfer_protocol():

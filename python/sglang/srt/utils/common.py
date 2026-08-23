@@ -4714,3 +4714,14 @@ def init_cublas():
     b = torch.ones((16, 16), dtype=dtype, device=device)
     c = a @ b
     return c
+
+
+_RATE_LIMIT_STATE: dict = {}
+
+
+def rate_limited_hit(tag: str, first: int = 5, every: int = 500) -> bool:
+    """True for the first `first` hits and then every `every`-th; keeps
+    always-firing sentinels from flooding production logs."""
+    n = _RATE_LIMIT_STATE.get(tag, 0) + 1
+    _RATE_LIMIT_STATE[tag] = n
+    return n <= first or n % every == 0

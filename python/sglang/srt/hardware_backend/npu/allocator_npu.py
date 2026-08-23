@@ -1,3 +1,5 @@
+import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -10,6 +12,8 @@ from sglang.srt.utils import get_num_new_pages, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
+
+logger = logging.getLogger(__name__)
 
 
 class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
@@ -36,9 +40,29 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         num_new_pages: int = None,
     ):
         if self.debug_mode:
-            assert torch.all(
-                (last_loc + 1) % self.page_size == prefix_lens % self.page_size
-            )
+            # Input sentinel: a last_loc outside [-1, size) is garbage from
+            # upstream (the get_last_loc triton defect) and will propagate
+            # verbatim into out_cache_loc and the req_to_token rows.
+            oob = (last_loc < -1) | (last_loc >= self.size)
+            if bool(oob.any()):
+                logger.error(
+                    "alloc_extend got out-of-range last_loc INPUT: rows=%s "
+                    "values=%s (source is upstream of the allocator)",
+                    oob.nonzero(as_tuple=False).flatten().tolist(),
+                    last_loc[oob].cpu().tolist()[:8],
+                )
+            violation = (last_loc + 1) % self.page_size != prefix_lens % self.page_size
+            if bool(violation.any()):
+                # Dump the offending rows so a remote crash log is readable.
+                logger.error(
+                    "alloc_extend invariant violated: page_size=%d rows=%s "
+                    "prefix_lens=%s last_loc=%s",
+                    self.page_size,
+                    violation.nonzero(as_tuple=False).flatten().tolist(),
+                    prefix_lens.cpu().tolist(),
+                    last_loc.cpu().tolist(),
+                )
+            assert torch.all(~violation)
 
         if num_new_pages is None:
             num_new_pages_tensor = (
@@ -74,6 +98,14 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
                 self.page_size,
                 max_num_extend_tokens,
             )
+            if os.getenv("SGLANG_MF_ALLOC_SYNC", "0") == "1":
+                # Diagnostic sync ONLY between out_indices production and its
+                # first consumer (the row write), independent of debug_mode.
+                # If this alone stops the row corruption at DEBUG=0, the bug
+                # is a missing stream dependency on the async alloc kernel and
+                # the payload is torch.empty-recycled activations; the fix is
+                # then an event dependency, not this global sync.
+                torch.npu.synchronize()
 
         else:
             out_indices = torch.empty(

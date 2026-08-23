@@ -270,13 +270,23 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
                     forward_batch.seq_lens_cpu.tolist(),
                     extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
-                if is_dsa_prefill_cp_round_robin_split():
-                    attn_backend = get_attn_backend()
+                attn_backend = get_attn_backend()
+                if hasattr(attn_backend, "prepare_dsv4_cp_metadata"):
+                    # NPU/Ascend DSV4 backend: its ForwardMetadata has none of the
+                    # GPU-DSA fields (core_attn_metadata / indexer_metadata); CP
+                    # metadata is prepared here instead (mirrors the main model's
+                    # DeepseekV4ForCausalLM.forward dispatch).
+                    attn_backend.prepare_dsv4_cp_metadata(forward_batch)
+                elif is_dsa_prefill_cp_round_robin_split():
                     metadata = attn_backend.forward_metadata
-                    core_meta = metadata.core_attn_metadata
-                    core_meta.apply_cp_reindex()
-                    core_meta.init_flashmla_related(is_prefill=True)
-                    if metadata.indexer_metadata is not None:
+                    core_meta = getattr(metadata, "core_attn_metadata", None)
+                    if core_meta is not None:
+                        core_meta.apply_cp_reindex()
+                        core_meta.init_flashmla_related(is_prefill=True)
+                    if (
+                        core_meta is not None
+                        and getattr(metadata, "indexer_metadata", None) is not None
+                    ):
                         metadata.indexer_metadata = (
                             attn_backend.init_forward_metadata_indexer(core_meta)
                         )
