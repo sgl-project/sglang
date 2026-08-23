@@ -224,6 +224,10 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "zai-org/glm-image",
         "z-image",
         "z-image-turbo",
+        "black-forest-labs/flux.2-klein-4b",
+        "black-forest-labs/flux.2-klein-9b",
+        "flux.2-klein-4b",
+        "flux.2-klein-9b",
     }
 )
 
@@ -242,6 +246,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "SanaPipelineConfig",
         "SanaVideoPipelineConfig",
         "ZImagePipelineConfig",
+        "Flux2KleinPipelineConfig",
     }
 )
 
@@ -775,10 +780,10 @@ class ServerArgs(DisaggServerArgsMixin):
             return
 
         logger.warning(
-            "[Diffusion BCG] disabled for %s: only FLUX.1-dev, Ideogram-4, "
-            "jdopensource/JoyAI-Echo, Lightricks/LTX-2, LongCat-Image, "
-            "MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
-            "Qwen/Qwen-Image-2.1, SANA1.5, "
+            "[Diffusion BCG] disabled for %s: only FLUX.1-dev, FLUX.2-Klein, "
+            "Ideogram-4, jdopensource/JoyAI-Echo, Lightricks/LTX-2, "
+            "LongCat-Image, MiniMax-H3, Qwen/Qwen-Image, "
+            "Qwen/Qwen-Image-2512, Qwen/Qwen-Image-2.1, SANA1.5, "
             "SANA-Video, Tongyi-MAI/Z-Image/Z-Image-Turbo, and "
             "zai-org/GLM-Image are currently supported.",
             pipeline_config_name,
