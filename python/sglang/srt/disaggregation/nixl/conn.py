@@ -48,6 +48,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_schedule
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.network import NetworkAddress
 
 try:
     from nixl._bindings import (
@@ -67,6 +68,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 GUARD = "NixlMsgGuard".encode("ascii")
+NIXL_TRANSFER_FAILURE = b"NIXL_TRANSFER_FAILURE"
 KV_MEM_KINDS = {"VRAM", "DRAM"}
 
 
@@ -517,8 +519,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             if self.enable_staging:
                 self._init_staging_decode_ctx()
                 self._staging_handler = None
-            if self.enable_staging or self.enable_deferred_decode_kv_release:
-                self._start_decode_listener_thread()
+            self._start_decode_listener_thread()
             self._start_heartbeat_checker_thread()
         else:
             raise ValueError(
@@ -590,13 +591,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._staging_ctx.room_receivers[room] = receiver
 
     def _start_decode_listener_thread(self):
-        """Decode-side ZMQ listener for STAGING_REQ and ABORT_ACK. A thread, not
-        NIXL notifs: the decode agent has no progress thread, so notifs only drain
-        inside a live receiver's poll() and would be missed while idle."""
+        """Decode-side listener for failure and optional staging control messages.
+
+        This is a thread, not a NIXL notification: the decode agent has no progress
+        thread, so notifications only drain inside a live receiver's poll().
+        """
 
         def decode_listener_thread():
             while True:
                 msg = self.server_socket.recv_multipart()
+                if self._handle_failure_notification(msg):
+                    continue
                 if msg[0] == b"STAGING_REQ":
                     self._handle_staging_req(msg)
                     continue
@@ -613,6 +618,79 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
 
         threading.Thread(target=decode_listener_thread, daemon=True).start()
+
+    def _handle_failure_notification(self, msg: List[bytes]) -> bool:
+        if not msg or msg[0] != NIXL_TRANSFER_FAILURE:
+            return False
+        if len(msg) != 4:
+            logger.warning("Ignoring malformed NIXL transfer failure notification")
+            return True
+
+        try:
+            room = int(msg[1].decode("ascii"))
+            prefill_rank = int(msg[2].decode("ascii"))
+            failure_reason = msg[3].decode("utf-8")
+        except (UnicodeDecodeError, ValueError):
+            logger.warning("Ignoring malformed NIXL transfer failure notification")
+            return True
+
+        # A late notification must not recreate state for a room that has already
+        # concluded and may already have been reused by another request.
+        if room not in self.request_status:
+            logger.debug(
+                "Ignoring late NIXL transfer failure from prefill rank %s for room %s",
+                prefill_rank,
+                room,
+            )
+            return True
+
+        self.record_failure(
+            room,
+            f"Prefill rank {prefill_rank} reported NIXL transfer failure: "
+            f"{failure_reason or 'unknown error'}",
+        )
+        self.prefill_response_tracker.pop(room, None)
+        self.transfer_statuses.pop(room, None)
+        self.update_status(room, KVPoll.Failed)
+        return True
+
+    def _notify_decode_failure(
+        self,
+        room: int,
+        failure_reason: str,
+        transfer_infos: Optional[List[TransferInfo]] = None,
+    ) -> None:
+        if transfer_infos is None:
+            transfer_infos = list(self.transfer_infos.get(room, {}).values())
+        if not transfer_infos:
+            return
+
+        payload = [
+            NIXL_TRANSFER_FAILURE,
+            str(room).encode("ascii"),
+            str(self._prefill_unique_rank()).encode("ascii"),
+            failure_reason.encode("utf-8", errors="replace"),
+        ]
+        notified_endpoints = set()
+        for info in transfer_infos:
+            try:
+                na = NetworkAddress(info.endpoint, info.dst_port)
+                endpoint = na.to_tcp()
+                if endpoint in notified_endpoints:
+                    continue
+                notified_endpoints.add(endpoint)
+                self._send_multipart_locked(
+                    endpoint,
+                    payload,
+                    is_ipv6=na.is_ipv6,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to notify decode endpoint %s about NIXL transfer "
+                    "failure for room %s",
+                    f"{info.endpoint}:{info.dst_port}",
+                    room,
+                )
 
     def _prefetch_staging_reqs(self, room: int):
         """Send STAGING_REQ for all chunks before the prefill forward starts.
@@ -1362,9 +1440,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     logger.exception(
                         f"Unexpected transfer worker error for room {room}"
                     )
+                failure_reason = str(e)
+                transfer_infos = list(self.transfer_infos.get(room, {}).values())
                 self.exceptions[room] = e
-                self.record_failure(room, str(e))
+                self.record_failure(room, failure_reason)
                 self.update_status(room, KVPoll.Failed)
+                self._notify_decode_failure(room, failure_reason, transfer_infos)
                 # No ack here on purpose: the DONE barrier bails on the first
                 # ERR, so siblings may still be writing; fall back to the timeout.
 
