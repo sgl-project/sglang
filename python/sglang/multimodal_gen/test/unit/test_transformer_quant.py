@@ -57,6 +57,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
     KitchenInt8Config,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_config import (
+    KitchenW4A8Config,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
@@ -345,6 +348,78 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertFalse(_needs_device_weight_postprocess(config))
         self.assertTrue(config.supports_input_partition("blocks.0.mlp.fc1", 6400))
         self.assertFalse(config.supports_input_partition("blocks.0.mlp.fc1", 3200))
+
+    def test_minimax_h3_w4a8_metadata_resolves_serialized_kitchen(self):
+        metadata = {
+            "_quantization_metadata": json.dumps(
+                {
+                    "layers": {
+                        "blocks.0.mlp.fc1": {
+                            "format": "asym_w4a8_int8",
+                            "convrot": True,
+                            "group_size": 16,
+                            "convrot_groupsize": 256,
+                        }
+                    }
+                }
+            )
+        }
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as checkpoint:
+            save_file(
+                {
+                    "blocks.0.mlp.fc1.weight": torch.ones((2, 128), dtype=torch.int8),
+                    "blocks.0.mlp.fc1.weight_s_rel": torch.ones(
+                        (2, 16), dtype=torch.float8_e4m3fn
+                    ),
+                    "blocks.0.mlp.fc1.weight_s_channel": torch.ones(2),
+                    "blocks.0.mlp.fc1.weight_codebook": torch.ones(16),
+                },
+                checkpoint.name,
+                metadata=metadata,
+            )
+
+            _, markers = inspect_minimax_h3_safetensors([checkpoint.name])
+
+        config = resolve_minimax_h3_checkpoint_quantization(markers)
+        self.assertIsInstance(config, KitchenW4A8Config)
+        self.assertTrue(markers["blocks.0.mlp.fc1"]["_has_codebook"])
+        self.assertTrue(config.supports_input_partition("blocks.0.mlp.fc1", 256))
+        self.assertFalse(config.supports_input_partition("blocks.0.mlp.fc1", 128))
+
+    @patch(
+        "sglang.multimodal_gen.runtime.layers.quantization.kitchen_w4a8."
+        "w4a8_int8_linear",
+        new=object(),
+    )
+    def test_serialized_w4a8_constructs_packed_weights_and_scales(self):
+        config = KitchenW4A8Config(
+            {
+                "proj": {
+                    "format": "asym_w4a8_int8",
+                    "convrot": True,
+                    "group_size": 16,
+                    "convrot_groupsize": 256,
+                    "_has_codebook": True,
+                    "_has_correction": False,
+                }
+            }
+        )
+        layer = ReplicatedLinear(
+            256,
+            3,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=config,
+            prefix="proj",
+        )
+
+        self.assertEqual(layer.weight.shape, (3, 128))
+        self.assertEqual(layer.weight.dtype, torch.int8)
+        self.assertEqual(layer.weight_s_rel.shape, (3, 16))
+        self.assertEqual(layer.weight_s_rel.dtype, torch.float8_e4m3fn)
+        self.assertEqual(layer.weight_s_channel.shape, (3,))
+        self.assertEqual(layer.weight_codebook.shape, (16,))
+        self.assertIsNone(layer.weight_correction)
 
     @patch(
         "sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8."
