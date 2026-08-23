@@ -79,6 +79,7 @@ class TestReasonerGrammarObject(unittest.TestCase):
             grammar=None,
             think_end_ids=[7],
             think_excluded_token_ids=[3, 5],
+            model_eos_token_ids=[9],
             max_think_tokens=2,
             enable_token_filter=True,
             token_filter_fn=set_token_filter_torch,
@@ -118,6 +119,35 @@ class TestReasonerGrammarObject(unittest.TestCase):
         self.assertEqual(mask.shape, (2, 2))
         self.assertIs(obj.move_vocab_mask(mask, "cpu"), mask)
         self.assertIsNotNone(obj.apply_vocab_mask)
+
+    def test_eos_blocked_until_first_post_reasoning_token(self):
+        obj = self._make_strict_object()
+        obj.maybe_init_reasoning(True)
+        obj.accept_token(10)
+        obj.accept_token(7)
+        mask = obj.allocate_vocab_mask(64, 1, "cpu")
+
+        obj.fill_vocab_mask(mask, 0)
+
+        self.assertEqual(_allowed_token_ids(mask, [8, 9, 10]), [8, 10])
+
+        obj.accept_token(8)
+        mask.zero_()
+        obj.fill_vocab_mask(mask, 0)
+        self.assertTrue(torch.all(mask == 0))
+
+    def test_rollback_restores_post_reasoning_eos_guard(self):
+        obj = self._make_strict_object()
+        obj.maybe_init_reasoning(True)
+        obj.accept_token(7)
+        obj.accept_token(8)
+        obj.rollback(1)
+        mask = obj.allocate_vocab_mask(64, 1, "cpu")
+
+        obj.fill_vocab_mask(mask, 0)
+
+        self.assertEqual(obj.tokens_after_end, 0)
+        self.assertEqual(_allowed_token_ids(mask, [8, 9, 10]), [8, 10])
 
     def test_budget_exhaustion_walks_multi_token_end(self):
         obj = ReasonerGrammarObject(
@@ -176,6 +206,7 @@ class TestReasonerGrammarBackend(unittest.TestCase):
             self._make_parser(),
             self._make_tokenizer(),
             enable_strict_thinking=True,
+            model_eos_token_ids=[9],
         )
 
         obj = reasoner.init_strict_reasoning_grammar(reasoning=True)
@@ -184,6 +215,7 @@ class TestReasonerGrammarBackend(unittest.TestCase):
         self.assertTrue(obj.enable_token_filter)
         self.assertEqual(obj.max_think_tokens, 2)
         self.assertEqual(obj.think_excluded_token_ids, [3, 4])
+        self.assertEqual(obj.model_eos_token_ids, [9])
 
     def test_kimi_k3_excluded_tokens_spare_the_xtml_control_tokens(self):
         """Kimi K3 bans bare channel names, never the marker-composing tokens.
@@ -506,6 +538,31 @@ class TestReasonerGrammarObjectFillVocabMask(unittest.TestCase):
         obj.fill_vocab_mask(mask, 0)
 
         inner_grammar.fill_vocab_mask.assert_called_once_with(mask, 0)
+
+    def test_post_reasoning_eos_guard_composes_with_inner_grammar(self):
+        inner_grammar = MagicMock()
+        inner_grammar.allocate_vocab_mask.side_effect = lambda vs, bs, d: torch.zeros(
+            (bs, (vs + 31) // 32), dtype=torch.int32
+        )
+        inner_grammar.fill_vocab_mask.side_effect = lambda mask, idx: (
+            set_token_filter_torch(mask, [8], idx, is_allowed=False)
+        )
+        obj = ReasonerGrammarObject(
+            grammar=inner_grammar,
+            think_end_ids=[7],
+            think_excluded_token_ids=[3, 5],
+            model_eos_token_ids=[9],
+            max_think_tokens=-1,
+            enable_token_filter=True,
+            token_filter_fn=set_token_filter_torch,
+        )
+        obj.maybe_init_reasoning(True)
+        obj.accept_token(7)
+        mask = obj.allocate_vocab_mask(64, 1, "cpu")
+
+        obj.fill_vocab_mask(mask, 0)
+
+        self.assertEqual(_allowed_token_ids(mask, [7, 8, 9, 10]), [7, 10])
 
     def test_non_strict_thinking_is_noop(self):
         inner_grammar = MagicMock()
