@@ -76,9 +76,10 @@ class TestMxfp4FlashinferActivationPrep(CustomTestCase):
         self.assertTrue(torch.equal(actual_scale.view(torch.uint8), x_scale))
 
     def test_padded_input_keeps_flashinfer_quantizer(self):
-        x = torch.randn(3, 60, dtype=torch.bfloat16)
-        x_quant = torch.empty(3, 64, dtype=torch.float8_e4m3fn)
-        x_scale = torch.arange(6, dtype=torch.uint8)
+        """A group-aligned input must use hidden-size-aligned quantization."""
+        x = torch.randn(3, 96, dtype=torch.bfloat16)
+        x_quant = torch.empty(3, 128, dtype=torch.float8_e4m3fn)
+        x_scale = torch.arange(12, dtype=torch.uint8)
 
         with patch(
             "sglang.srt.layers.quantization.fp8_utils.flashinfer_mxfp8_quantize",
@@ -86,15 +87,15 @@ class TestMxfp4FlashinferActivationPrep(CustomTestCase):
             create=True,
         ) as quantize, patch("sglang.srt.layers.moe.route_quant_handoff.take") as take:
             actual_x, packed_topk, actual_quant, actual_scale = (
-                _prepare_flashinfer_mxfp8_activations(x, 64)
+                _prepare_flashinfer_mxfp8_activations(x, 128)
             )
 
         take.assert_not_called()
-        quantize.assert_called_once_with(x, False, alignment=64)
+        quantize.assert_called_once_with(x, False, alignment=128)
         self.assertIs(actual_x, x)
         self.assertIsNone(packed_topk)
         self.assertIs(actual_quant, x_quant)
-        self.assertEqual(actual_scale.shape, torch.Size([3, 2]))
+        self.assertEqual(actual_scale.shape, torch.Size([3, 4]))
 
     def test_kimi_handoff_skips_flashinfer_quantizer(self):
         x = torch.randn(2, 64, dtype=torch.bfloat16)
