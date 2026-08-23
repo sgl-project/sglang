@@ -3721,13 +3721,13 @@ class ServerArgs:
         try:
             self._run_resolution_pipeline()
         except BaseException:
-            # The handlers that ran already wrote to the record, and they are
-            # not idempotent over their own output.
+            # The handlers that ran already declared, and they are not
+            # idempotent over their own output.
             object.__setattr__(self, "_resolution_failed", True)
             raise
         # Set here too, because the dummy/absent-model path returns before the
-        # materialization that normally sets it: the gate is about whether the
-        # handlers ran, not how far they got.
+        # end of the pipeline that normally sets it: the gate is about whether
+        # the handlers ran, not how far they got.
         self._resolution_finished = True
 
     def resolved_dict(self) -> Dict[str, Any]:
@@ -3735,9 +3735,8 @@ class ServerArgs:
 
         What the whole-object readbacks report (`/server_info` and its gRPC and
         in-process twins). `dataclasses.asdict(self)` reads the fields, which
-        carry resolution's result only while declarations materialize onto the
-        record; this reads the declarations, so it keeps answering with what
-        resolution decided once they stop. Nested dataclass fields are expanded
+        carry the raw input; this reads the declarations, so it answers with what
+        resolution decided. Nested dataclass fields are expanded
         the way `asdict` expands them; the private resolution bookkeeping and the
         `model_config` memo are not fields and do not appear.
         """
@@ -3750,12 +3749,11 @@ class ServerArgs:
 
         `dataclasses.replace` builds a new instance, so the copy carries none of
         what makes a record resolved: no raw snapshot, no declarations, no
-        materialization. The next publish therefore finds an unmaterialized
-        record and runs the pipeline over values it already decided -- DP
-        attention halves `chunked_prefill_size` a second time (8192 -> 4096 ->
-        2048) and the schedule conservativeness is scaled again (0.3 -> 0.09).
-        The Ray paths replace `dist_init_addr` on a resolved record, which is
-        how they hit it.
+        finished flag. The next publish therefore resolves it again, which
+        drops every decision the stash held -- the late ones (the auto-detected
+        parsers) and the direct ones alike -- and re-runs the device probes in
+        whatever process opened the copy. The Ray paths replace
+        `dist_init_addr` on a resolved record, which is how they reach this.
 
         The change is appended to the stash rather than left on the field: the
         projection reads the raw snapshot plus the declarations, so a field the
@@ -9797,9 +9795,8 @@ class ServerArgs:
         declare_late_resolution(self, source, **fields)
 
     def __setattr__(self, name, value):
-        # After materialization the fields are the resolved startup
-        # configuration -- the pristine, READ-ONLY record that the config bags
-        # were projected from. Resolved config changes go to the bags via
+        # Once resolution has finished the record is the READ-ONLY raw input
+        # the config bags were projected from. Resolved config changes go to the bags via
         # get_context().override(source, ...); a value one runner or worker
         # owns travels as a constructor argument to it.
         if (

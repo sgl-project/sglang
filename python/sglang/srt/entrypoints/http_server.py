@@ -803,8 +803,8 @@ async def get_server_info():
 async def server_info():
     """The startup configuration, plus live scheduler state.
 
-    The `ServerArgs` fields here are the record: what the launcher was given,
-    with resolution written back into it. Fields the control plane changes
+    The values here are the resolution result: what the launcher was given,
+    with every decision resolution made applied over it. Fields the control plane changes
     after publication -- the model a weight update swapped in, its load format,
     an operator-set weight version -- are reported by `/model_info`, and the
     HiCache mirror by `GET /hicache/storage-backend`.
