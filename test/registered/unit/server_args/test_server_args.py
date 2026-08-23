@@ -59,6 +59,8 @@ class TestPrepareServerArgs(CustomTestCase):
                     f"parser, got SystemExit({exc.code})"
                 )
 
+            args.resolve_once()
+
             self.assertTrue(args.enable_w4a4_mxfp4_megamoe)
             self.assertEqual(os.environ["DG_USE_FP4_ACTS"], "1")
             self.assertEqual(os.environ["DG_USE_MXF4_KIND"], "1")
@@ -70,6 +72,9 @@ class TestPrepareServerArgs(CustomTestCase):
         }
         with patch.dict(os.environ, deepgemm_env, clear=False):
             args = prepare_server_args(["--model-path", "dummy"])
+            # Resolve, or the check that the environment stays untouched has
+            # nothing to be untouched by.
+            args.resolve_once()
 
             self.assertFalse(args.enable_w4a4_mxfp4_megamoe)
             self.assertEqual(os.environ["DG_USE_FP4_ACTS"], "0")
@@ -77,12 +82,13 @@ class TestPrepareServerArgs(CustomTestCase):
 
     def test_prefill_decode_interval(self):
         args = ServerArgs(model_path="dummy", prefill_decode_interval=16)
+        args.resolve_once()
         self.assertEqual(args.prefill_decode_interval, 16)
 
         with self.assertRaisesRegex(
             ValueError, "--prefill-decode-interval must be non-negative"
         ):
-            ServerArgs(model_path="dummy", prefill_decode_interval=-1)
+            ServerArgs(model_path="dummy", prefill_decode_interval=-1).resolve_once()
 
     def test_dsv4_prefill_backend_cli_choices(self):
         parser = server_args_module.argparse.ArgumentParser()
@@ -102,18 +108,23 @@ class TestPrepareServerArgs(CustomTestCase):
             parser.parse_args(base_args + ["--dsv4-prefill-backend", "flashmla_kv"])
 
     def test_return_hidden_states_mode_configuration(self):
-        disabled = ServerArgs(model_path="dummy")
+        def _resolved(**kwargs):
+            server_args = ServerArgs(**kwargs)
+            server_args.resolve_once()
+            return server_args
+
+        disabled = _resolved(model_path="dummy")
         self.assertFalse(disabled.enable_return_hidden_states)
         self.assertIsNone(disabled.return_hidden_states_mode)
 
-        last = ServerArgs(
+        last = _resolved(
             model_path="dummy",
             return_hidden_states_mode="last",
         )
         self.assertTrue(last.enable_return_hidden_states)
         self.assertEqual(last.return_hidden_states_mode, "last")
 
-        legacy_full = ServerArgs(
+        legacy_full = _resolved(
             model_path="dummy",
             enable_return_hidden_states=True,
         )
@@ -128,14 +139,16 @@ class TestPrepareServerArgs(CustomTestCase):
                 "last",
             ]
         )
+        parsed_last.resolve_once()
         self.assertTrue(parsed_last.enable_return_hidden_states)
         self.assertEqual(parsed_last.return_hidden_states_mode, "last")
 
+        # The rejection is resolution's, not the constructor's.
         with self.assertRaisesRegex(
             ValueError,
             "return_hidden_states_mode must be one of",
         ):
-            ServerArgs(
+            _resolved(
                 model_path="dummy",
                 return_hidden_states_mode="lst",
             )
@@ -1300,9 +1313,11 @@ class TestSSLArgs(unittest.TestCase):
 
 class TestHiCacheArgs(unittest.TestCase):
     def _make_args(self, **overrides) -> ServerArgs:
-        args = ServerArgs(model_path="dummy")
-        for key, value in overrides.items():
-            setattr(args, key, value)
+        # Not resolved: a dummy model path takes the pipeline's early return,
+        # so `_handle_hicache` would never run. Its one prerequisite (the
+        # host/device ratio default) is run by hand.
+        args = ServerArgs(model_path="dummy", **overrides)
+        args._handle_hicache_ratio_default()
         return args
 
     def _assert_hicache_fields(
@@ -1392,7 +1407,6 @@ class TestHiCacheArgs(unittest.TestCase):
             attention_backend="fa3",
             decode_attention_backend=None,
         )
-
         args._handle_hicache()
 
         self.assertEqual(args.hicache_io_backend, "kernel")
@@ -1669,16 +1683,22 @@ class TestCudaGraphConfigDataclassAccess(CustomTestCase):
         mock_backend = mock_get_moe_a2a_backend.return_value
         mock_backend.is_deepep.return_value = False
         mock_backend.is_mooncake.return_value = False
-        server_args = SimpleNamespace(
+        from sglang.srt.runtime_context import get_context
+
+        # The graph configuration is a bag leaf; the debug switch is raw input
+        # and stays on the argument.
+        override = get_context().override_server_args(
             cuda_graph_config=CudaGraphConfig(
                 prefill=PhaseConfig(
                     backend=Backend.TC_PIECEWISE,
                     bs=[32, 64],
                     tc_compiler="eager",
                 )
-            ),
-            enable_torch_compile_debug_mode=False,
+            )
         )
+        override.install()
+        self.addCleanup(override.restore)
+        server_args = SimpleNamespace(enable_torch_compile_debug_mode=False)
 
         config = TcPiecewiseCudaGraphBackend.build_compilation_config(server_args)
 
@@ -2049,15 +2069,15 @@ class TestGrpcServerArgs(CustomTestCase):
 
     def test_sidecar_builds_loopback_grpc_endpoints(self):
         self.assertEqual(
-            build_sidecar_endpoint(SimpleNamespace(host="0.0.0.0", grpc_port=50051)),
+            build_sidecar_endpoint("0.0.0.0", 50051),
             "http://127.0.0.1:50051",
         )
         self.assertEqual(
-            build_sidecar_endpoint(SimpleNamespace(host="::", grpc_port=50051)),
+            build_sidecar_endpoint("::", 50051),
             "http://[::1]:50051",
         )
         self.assertEqual(
-            build_sidecar_endpoint(SimpleNamespace(host="[::]", grpc_port=50051)),
+            build_sidecar_endpoint("[::]", 50051),
             "http://[::1]:50051",
         )
 
@@ -2069,6 +2089,8 @@ class TestGrpcServerArgs(CustomTestCase):
         self.assertEqual(parsed.sidecar_args, argv)
 
     def test_start_sidecar_passes_endpoint_and_provider_argv_separately(self):
+        from sglang.srt.runtime_context import get_context as get_context_for_config
+
         server_args = SimpleNamespace(
             sidecar="example.sidecar",
             sidecar_args=[
@@ -2078,8 +2100,11 @@ class TestGrpcServerArgs(CustomTestCase):
                 "2",
             ],
             host="127.0.0.1",
-            grpc_port=50051,
         )
+        # The port the sidecar dials is the resolved one, off the bag.
+        override = get_context_for_config().override_server_args(grpc_port=50051)
+        override.install()
+        self.addCleanup(override.restore)
         with (
             patch("sglang.srt.entrypoints.sidecar.mp.get_context") as get_context,
             patch("sglang.srt.entrypoints.sidecar.Sidecar") as sidecar_class,

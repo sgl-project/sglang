@@ -168,11 +168,15 @@ from sglang.srt.model_executor.runner import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    ensure_published,
     get_context,
+    get_device,
     get_exec,
     get_global_dwdp_manager,
     get_lora,
+    get_memory,
     get_model,
+    get_observability,
     get_parallel,
     get_schedule,
     get_spec,
@@ -188,7 +192,6 @@ from sglang.srt.server_args import (  # noqa: F401  (re-export)
     ServerArgs,
     add_chunked_prefix_cache_attention_backend,
     get_global_server_args,
-    set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -279,7 +282,7 @@ def resolve_draft_attention_backend(
     """
     if not is_draft_worker:
         return None
-    return draft_attention_backend or server_args.speculative_draft_attention_backend
+    return draft_attention_backend or get_spec().speculative_draft_attention_backend
 
 
 class ModelRunner:
@@ -323,7 +326,6 @@ class ModelRunner:
         # workers so they reuse target's resolved sizes (replaces legacy
         # `server_args._draft_pool_config` mutation hack).
         self.memory_pool_config = memory_pool_config
-        self.device = server_args.device
         self.gpu_id = gpu_id
         self.ps = ps
         self.model_config = model_config
@@ -336,10 +338,11 @@ class ModelRunner:
         # construction (benchmark/one_batch, the manual runner tests) has no
         # earlier publish.
         if not is_draft_worker:
-            set_global_server_args_for_scheduler(server_args)
+            ensure_published(server_args, role="scheduler")
         # Set by maybe_init_lora_manager; stays None when LoRA is off and on
         # draft runners, which serve adapters' target model unadapted.
         self.lora_manager: Optional[LoRAManager] = None
+        self.device = get_device().device
         self.draft_attention_backend = resolve_draft_attention_backend(
             draft_attention_backend=draft_attention_backend,
             server_args=server_args,
@@ -356,7 +359,7 @@ class ModelRunner:
             model_config.is_multimodal_chunked_prefill_supported
         )
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
+            get_spec().speculative_algorithm
         )
         self.capture_tail_hooks = []
         self.page_size = get_schedule().page_size
@@ -367,12 +370,12 @@ class ModelRunner:
         self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
-        self.enable_elastic_ep = server_args.elastic_ep_backend is not None
+        self.enable_elastic_ep = get_exec().moe.elastic_ep_backend is not None
         self.forward_pass_id = 0
         self._pending_elastic_scale_update = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
-        self.enable_hisparse = server_args.enable_hisparse
+        self.enable_hisparse = get_memory().enable_hisparse
         self._sampling_observer: Optional[SamplingObserver] = None
 
         self.init_startup_observability()
@@ -385,7 +388,7 @@ class ModelRunner:
         self.init_spec_aux_hidden_state()
 
         # Apply the rank zero filter to logger
-        if server_args.show_time_cost:
+        if get_observability().show_time_cost:
             enable_show_time_cost()
 
         misc_utils.maybe_disable_chunked_prefix_cache(
@@ -1348,7 +1351,7 @@ class ModelRunner:
                     else False
                 ),
                 speculative_draft_attention_backend=self.draft_attention_backend,
-                speculative_draft_kv_cache_dtype=self.server_args.speculative_draft_kv_cache_dtype,
+                speculative_draft_kv_cache_dtype=get_spec().speculative_draft_kv_cache_dtype,
             )
         )
         # This runner's OWN resolved dtype string (target or draft). Attention
