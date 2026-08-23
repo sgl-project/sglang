@@ -76,6 +76,11 @@ def _resolve_elastic_world_dp_size(
     return live_dp_size
 
 
+# Sentinel emitted by ranks that are idle or not running adaptive spec, so a
+# `.min()` reduce never lets them force everyone to a lower speculative tier.
+ADAPTIVE_STEPS_SENTINEL = 2**31 - 1
+
+
 @dataclass
 class MLPSyncBatchInfo:
     dp_size: int
@@ -89,9 +94,15 @@ class MLPSyncBatchInfo:
     is_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
+    # Locally-desired adaptive speculative num_steps for this rank's batch.
+    # Gathered and min-reduced so every DP rank runs the same tier (equal
+    # draft-token shapes → no NCCL buffer mismatch). Sentinel = no preference.
+    local_adaptive_steps: int = ADAPTIVE_STEPS_SENTINEL
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
+    # min-reduced consensus tier across DP ranks; sentinel if none expressed.
+    consensus_adaptive_steps: int = ADAPTIVE_STEPS_SENTINEL
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
@@ -108,6 +119,7 @@ class MLPSyncBatchInfo:
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
                 int(self.can_run_prefill_cuda_graph),
+                self.local_adaptive_steps,
             ],
             device=device,
             dtype=dtype,
@@ -123,6 +135,7 @@ class MLPSyncBatchInfo:
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_prefill_cuda_graph
+                ADAPTIVE_STEPS_SENTINEL,  # local_adaptive_steps (idle: no vote)
             ],
             device=device,
             dtype=dtype,
@@ -194,6 +207,9 @@ class MLPSyncBatchInfo:
         self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
+        # Smaller tier is always a valid shape for every rank; larger is not.
+        # Idle/non-adaptive ranks emit the sentinel and never win the min.
+        self.consensus_adaptive_steps = int(tp0_info_cpu[:, 7].min())
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 tp0_info_cpu[:, 5].tolist()
@@ -321,6 +337,19 @@ def prepare_mlp_sync_batch_raw(
         group = tp_group.cpu_group
         device = "cpu"
 
+    # Each rank votes its locally-desired adaptive tier; min-reduced below so
+    # all ranks run identical draft-token shapes (no NCCL buffer mismatch).
+    local_adaptive_steps = ADAPTIVE_STEPS_SENTINEL
+    adaptive_params = getattr(model_runner, "adaptive_spec_params", None)
+    if (
+        adaptive_params is not None
+        and local_batch is not None
+        and local_batch.forward_mode.is_decode()
+    ):
+        local_adaptive_steps = adaptive_params.get_steps_for_batch(
+            local_batch.batch_size()
+        )
+
     local_can_run_tbo, local_forward_mode = tbo_preparer.prepare_all_gather(local_batch)
     if use_world_group:
         dp_size = _resolve_elastic_world_dp_size(
@@ -341,6 +370,7 @@ def prepare_mlp_sync_batch_raw(
         is_extend_in_batch=is_extend_in_batch,
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
+        local_adaptive_steps=local_adaptive_steps,
     )
 
     if not skip_all_gather:
@@ -376,13 +406,26 @@ def prepare_mlp_sync_batch_raw(
             batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
         )
 
-    # Set on `local_batch`, not `batch_to_gather`: for PREBUILT batches the
-    # scheduler's `last_batch` is the prebuilt batch, not its inner idle batch.
+    # recv_skipper is read by the scheduler from `last_batch`, which for a
+    # PREBUILT batch is the prebuilt batch itself (not its inner idle batch) —
+    # so this field must live on `local_batch`.
     if local_batch is not None and not skip_all_gather:
         local_batch.recv_skipper_forward_mode = (
             SchedulerRecvSkipper.derive_forward_mode(
                 mlp_sync_info.tp0_info_cpu[:, 5].tolist()
             )
+        )
+
+    # DP-consensus adaptive tier for this round; None when no rank expressed one
+    # (all sentinel) → worker falls back to local batch-size routing. This is
+    # read by the worker from the batch it actually forwards, so it must live on
+    # `batch_to_gather` — for a PREBUILT batch that is the inner idle batch, not
+    # `local_batch`. Writing it to `local_batch` would leave the forwarded idle
+    # batch at None and let ranks diverge on num_draft_tokens (NCCL hang).
+    if batch_to_gather is not None and not skip_all_gather:
+        consensus = mlp_sync_info.consensus_adaptive_steps
+        batch_to_gather.adaptive_consensus_steps = (
+            consensus if consensus < ADAPTIVE_STEPS_SENTINEL else None
         )
 
     if _ENABLE_METRICS_DP_ATTENTION and local_batch is not None:
