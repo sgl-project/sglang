@@ -1,8 +1,15 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.models.deepseek_common.attention_forward_methods import (
+    forward_mla,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dsa_attention import (
     DSA_DECODE_IMPL_VARIANTS,
@@ -32,6 +39,66 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=25, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-large")
+
+
+class TestDSADCPRouting(CustomTestCase):
+    def test_tp_dcp_prefill_selects_q_gather_phase(self):
+        batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        with (
+            patch.object(
+                forward_mla,
+                "get_parallel",
+                return_value=SimpleNamespace(dcp_enabled=True),
+            ),
+            patch.object(forward_mla, "dsa_use_prefill_cp", return_value=False),
+        ):
+            self.assertTrue(
+                forward_mla.is_dsa_tp_dcp_prefill_phase(batch, use_dsa=True)
+            )
+
+    def test_cp_dcp_prefill_does_not_enter_q_gather_phase(self):
+        batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        with (
+            patch.object(
+                forward_mla,
+                "get_parallel",
+                return_value=SimpleNamespace(dcp_enabled=True),
+            ),
+            patch.object(forward_mla, "dsa_use_prefill_cp", return_value=True),
+        ):
+            self.assertFalse(
+                forward_mla.is_dsa_tp_dcp_prefill_phase(batch, use_dsa=True)
+            )
+
+    def test_decode_topk_rejects_extra_rank_rows(self):
+        backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+        topk_indices = torch.zeros((8, 4), dtype=torch.int32)
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            r"topk_indices rows \(8\) > num_tokens \(4\)",
+        ):
+            backend._pad_topk_indices(topk_indices, num_tokens=4)
+
+
+class TestDSACPDCPPrefillPageTable(CustomTestCase):
+    def test_builds_cp_dcp_page_table_for_gathered_kv(self):
+        backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+        metadata = DecodeContextParallelMetadata(
+            dcp_kv_indptr=torch.tensor([0, 3, 5], dtype=torch.int32),
+            dcp_kv_indices=torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32),
+        )
+
+        page_table = backend._build_dcp_prefill_page_table(
+            torch.tensor([3, 2], dtype=torch.int32), metadata
+        )
+
+        torch.testing.assert_close(
+            page_table,
+            torch.tensor([[0, 1, 2], [3, 4, -1]], dtype=torch.int32),
+            rtol=0,
+            atol=0,
+        )
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
