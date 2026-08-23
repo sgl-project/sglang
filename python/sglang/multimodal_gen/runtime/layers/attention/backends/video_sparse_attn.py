@@ -4,6 +4,8 @@
 import functools
 import math
 from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Any, Mapping
 
 import torch
 
@@ -11,8 +13,6 @@ try:
     from vsa import video_sparse_attn
 except ImportError:
     video_sparse_attn = None
-
-from typing import Any
 
 from sglang.multimodal_gen.runtime.distributed import get_sp_group
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
@@ -215,13 +215,63 @@ def _compressed_attention(
     return output, topk_indices
 
 
-def _create_cake_wrapper(device: torch.device):
-    from flashinfer.sparse import BlockSparseAttentionWrapper
+def _plan_cake_vsa(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    from flashinfer.cake_vsa import plan_cake_vsa
 
-    # Cake consumes direct q2k metadata and does not use FlashInfer's generic
-    # sparse-planner workspace. One wrapper is created per transformer layer.
-    workspace = torch.empty((0,), dtype=torch.uint8, device=device)
-    return BlockSparseAttentionWrapper(workspace, backend="cake")
+    return plan_cake_vsa(*args, **kwargs)
+
+
+def _run_cake_vsa(*args: Any, **kwargs: Any) -> Any:
+    from flashinfer.cake_vsa import run_cake_vsa
+
+    return run_cake_vsa(*args, **kwargs)
+
+
+def _cake_stream_key(device: torch.device) -> tuple[int, int]:
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    stream = torch.cuda.current_stream(device)
+    return device_index, int(stream.cuda_stream)
+
+
+@dataclass(frozen=True)
+class _CakePlanSignature:
+    sequence: int
+    num_heads: int
+    head_dim: int
+    topk: int
+    dtype: torch.dtype
+    device: torch.device
+    dit_seq_shape: tuple[int, int, int]
+    sm_scale: float
+
+
+@dataclass(frozen=True)
+class _CakePlanTemplate:
+    signature: _CakePlanSignature
+    static_fields: Mapping[str, Any]
+
+
+def _validate_cake_q2k_indices(
+    q2k_indices: torch.Tensor,
+    signature: _CakePlanSignature,
+) -> None:
+    expected_shape = (
+        signature.num_heads,
+        signature.sequence // math.prod(VSA_TILE_SIZE),
+        signature.topk,
+    )
+    if (
+        q2k_indices.dtype != torch.int32
+        or q2k_indices.device != signature.device
+        or not q2k_indices.is_contiguous()
+        or tuple(q2k_indices.shape) != expected_shape
+    ):
+        raise ValueError(
+            "Cake q2k_indices must be contiguous int32 "
+            "[num_heads, num_query_blocks, topk] on the query device"
+        )
 
 
 def _validate_cake_inputs(
@@ -339,8 +389,11 @@ class VideoSparseAttentionImpl(AttentionImpl):
                     "indices"
                 )
             self.cake_step_indices = frozenset(int(step) for step in raw_cake_steps)
-        self._cake_wrapper = None
         self._cake_q2k_num: dict[tuple[int, ...], torch.Tensor] = {}
+        self._cake_plan_templates: dict[_CakePlanSignature, _CakePlanTemplate] = {}
+        self._cake_plan_workspaces: dict[
+            tuple[_CakePlanSignature, int, int], dict[str, Any]
+        ] = {}
 
     def _forward_cake(
         self,
@@ -381,29 +434,73 @@ class VideoSparseAttentionImpl(AttentionImpl):
             )
             self._cake_q2k_num[q2k_shape] = q2k_num
 
-        if self._cake_wrapper is None:
-            self._cake_wrapper = _create_cake_wrapper(query.device)
         sequence = query.shape[1]
         num_heads = query.shape[2]
-        self._cake_wrapper.plan(
-            None,
-            None,
-            sequence,
-            sequence,
-            math.prod(VSA_TILE_SIZE),
-            math.prod(VSA_TILE_SIZE),
-            num_heads,
-            num_heads,
-            self.head_size,
-            q_data_type=query.dtype,
-            kv_data_type=key.dtype,
-            o_data_type=query.dtype,
-            sm_scale=self.softmax_scale,
-            kv_block_lens=attn_metadata.variable_block_sizes,
-            q2k_indices=q2k_indices,
-            q2k_num=q2k_num,
+        signature = _CakePlanSignature(
+            sequence=sequence,
+            num_heads=num_heads,
+            head_dim=self.head_size,
+            topk=q2k_shape[2],
+            dtype=query.dtype,
+            device=query.device,
+            dit_seq_shape=tuple(attn_metadata.dit_seq_shape),
+            sm_scale=float(self.softmax_scale),
         )
-        output_select = self._cake_wrapper.run(query[0], key[0], value[0])
+        # q2k is regenerated from torch.topk for every invocation. The public
+        # planner validates its values on the first invocation; later calls
+        # retain the host-checkable tensor contract without another GPU sync.
+        _validate_cake_q2k_indices(q2k_indices, signature)
+        template = self._cake_plan_templates.get(signature)
+        if template is None:
+            plan = _plan_cake_vsa(
+                indptr=None,
+                indices=None,
+                block_mask=None,
+                kv_block_lens=attn_metadata.variable_block_sizes,
+                q2k_indices=q2k_indices,
+                q2k_num=q2k_num,
+                M=sequence,
+                N=sequence,
+                R=math.prod(VSA_TILE_SIZE),
+                C=math.prod(VSA_TILE_SIZE),
+                num_qo_heads=num_heads,
+                num_kv_heads=num_heads,
+                head_dim=self.head_size,
+                q_data_type=query.dtype,
+                sm_scale=self.softmax_scale,
+                device=query.device,
+            )
+            static_fields = {
+                key: value
+                for key, value in plan.items()
+                if key not in ("q2k_indices", "workspace")
+            }
+            template = _CakePlanTemplate(
+                signature=signature,
+                static_fields=MappingProxyType(static_fields),
+            )
+            self._cake_plan_templates[signature] = template
+
+        device_index, stream_handle = _cake_stream_key(query.device)
+        workspace = self._cake_plan_workspaces.setdefault(
+            (signature, device_index, stream_handle), {}
+        )
+        # Never write the dynamic q2k pointer into the shared template. A
+        # call-local plan prevents cross-stream aliasing, while each stream's
+        # ordered launches can safely reuse its private scratch workspace.
+        call_plan = dict(template.static_fields)
+        call_plan["q2k_indices"] = q2k_indices
+        call_plan["workspace"] = workspace
+        output_select = _run_cake_vsa(
+            call_plan,
+            query[0],
+            key[0],
+            value[0],
+            out=None,
+            lse=None,
+            return_lse=False,
+            backend="cake",
+        )
         output_select_hsd = output_select.transpose(0, 1).unsqueeze(0)
         return (output_compress * gate_hsd + output_select_hsd).transpose(1, 2)
 
