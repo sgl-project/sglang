@@ -9792,9 +9792,10 @@ class ServerArgs:
     def _late_resolution(self, source: str, **fields) -> None:
         """Resolve fields at the launcher's validation stage (pre-publish).
 
-        See ``arg_groups.overrides.declare_late_resolution``: in place, because
-        every holder of this instance must see the resolved value, and refused
-        outright once the config is published.
+        See ``arg_groups.overrides.declare_late_resolution``: the decision goes
+        to this instance's declaration stash, so every holder of it carries the
+        decision and publishes bags that answer with it. Refused outright once
+        the config is published.
         """
         from sglang.srt.arg_groups.overrides import declare_late_resolution
 
