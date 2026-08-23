@@ -833,6 +833,11 @@ class StagingManagerMixin:
     optionally ``kv_buffer_tensors``.
     """
 
+    def _is_watermark_ready(
+        self, session_id: str, alloc_round: int, alloc_end: int
+    ) -> bool:
+        return is_watermark_ready(self._staging_ctx, session_id, alloc_round, alloc_end)
+
     def _handle_staging_req(self, msg):
         room = int(msg[1].decode("ascii"))
         session_id = msg[4].decode("ascii")

@@ -4,13 +4,17 @@ import os
 import re
 import struct
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from safetensors import safe_open
 
 from sglang.multimodal_gen.runtime.layers.quantization import (
     QuantizationConfig,
     get_quantization_config,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import ComfyFp8Config
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
+    KitchenInt8Config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
@@ -19,6 +23,111 @@ from sglang.srt.model_loader.checkpoint_quantization import (
 )
 
 logger = init_logger(__name__)
+
+
+def inspect_comfy_quant_markers(
+    safetensors_list: list[str],
+    param_name_mapper: Callable[[str], str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Read and validate Comfy's tensor-level quantization markers."""
+    checkpoint_meta: dict[str, tuple[str, tuple[int, ...]]] = {}
+    raw_markers: dict[str, dict[str, Any]] = {}
+    marked_dtype_weight_prefixes: set[str] = set()
+
+    for path in safetensors_list:
+        with safe_open(path, framework="pt", device="cpu") as checkpoint:
+            for key in checkpoint.keys():
+                tensor_slice = checkpoint.get_slice(key)
+                checkpoint_meta[key] = (
+                    tensor_slice.get_dtype(),
+                    tuple(tensor_slice.get_shape()),
+                )
+                if key.endswith(".weight") and tensor_slice.get_dtype() in (
+                    "F8_E4M3",
+                    "I8",
+                ):
+                    marked_dtype_weight_prefixes.add(key.removesuffix(".weight"))
+                if not key.endswith(".comfy_quant"):
+                    continue
+                try:
+                    marker = json.loads(checkpoint.get_tensor(key).numpy().tobytes())
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError(
+                        f"Invalid Comfy quantization marker {key!r} in {path}"
+                    ) from exc
+                if not isinstance(marker, dict):
+                    raise ValueError(
+                        f"Comfy quantization marker {key!r} must contain a JSON object"
+                    )
+                prefix = key.removesuffix(".comfy_quant")
+                previous = raw_markers.get(prefix)
+                if previous is not None and previous != marker:
+                    raise ValueError(
+                        f"Conflicting Comfy quantization markers for {prefix!r}"
+                    )
+                raw_markers[prefix] = marker
+
+    missing_markers = marked_dtype_weight_prefixes - raw_markers.keys()
+    if missing_markers:
+        raise ValueError(
+            "Quantized weights are missing comfy_quant metadata: "
+            f"{sorted(missing_markers)[:5]}"
+        )
+
+    for prefix, marker in raw_markers.items():
+        marker_format = marker.get("format")
+        required = {f"{prefix}.weight", f"{prefix}.weight_scale"}
+        if marker_format == "float8_e4m3fn" and not marker.get(
+            "full_precision_matrix_mult", False
+        ):
+            required.add(f"{prefix}.input_scale")
+        if marker_format not in ("float8_e4m3fn", "int8_tensorwise"):
+            continue
+        missing = required - checkpoint_meta.keys()
+        if missing:
+            raise ValueError(
+                f"Comfy layer {prefix!r} is missing checkpoint tensors: "
+                f"{sorted(missing)}"
+            )
+        if marker_format != "int8_tensorwise":
+            continue
+        weight_dtype, weight_shape = checkpoint_meta[f"{prefix}.weight"]
+        scale_dtype, scale_shape = checkpoint_meta[f"{prefix}.weight_scale"]
+        if weight_dtype != "I8" or scale_dtype != "F32":
+            raise ValueError(
+                f"Comfy INT8 layer {prefix!r} needs I8 weights and F32 scales, "
+                f"got {weight_dtype} and {scale_dtype}"
+            )
+        if len(weight_shape) != 2 or scale_shape != (weight_shape[0], 1):
+            raise ValueError(
+                f"Comfy INT8 layer {prefix!r} has incompatible weight/scale "
+                f"shapes: {weight_shape} and {scale_shape}"
+            )
+
+    mapped_markers: dict[str, dict[str, Any]] = {}
+    for prefix, marker in raw_markers.items():
+        mapped_prefix = param_name_mapper(prefix) if param_name_mapper else prefix
+        if mapped_prefix in mapped_markers:
+            raise ValueError(
+                f"Comfy markers collide after parameter mapping at {mapped_prefix!r}"
+            )
+        mapped_markers[mapped_prefix] = marker
+    return mapped_markers
+
+
+def resolve_comfy_checkpoint_quantization(
+    layer_markers: dict[str, dict[str, Any]],
+) -> QuantizationConfig | None:
+    if not layer_markers:
+        return None
+    formats = sorted({str(marker.get("format")) for marker in layer_markers.values()})
+    if formats == ["int8_tensorwise"]:
+        return KitchenInt8Config(layer_markers=layer_markers)
+    if formats == ["float8_e4m3fn"]:
+        return ComfyFp8Config(layer_markers)
+    raise NotImplementedError(
+        "Unsupported Comfy quantization format(s): " + ", ".join(formats)
+    )
 
 
 def normalize_flat_modelopt_quant_config(
