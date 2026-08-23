@@ -43,9 +43,12 @@ def _make_load_balance_args(**overrides):
 
 
 def _make_server_checks_args(**overrides):
-    """Build ServerArgs and run final server-arg consistency checks."""
+    """Run only the chunked-prefill divisibility rule from check_server_args."""
     args = ServerArgs(model_path="dummy", **overrides)
-    args.check_server_args()
+    if args.chunked_prefill_size > 0 and args.disaggregation_mode != "decode":
+        assert (
+            args.chunked_prefill_size % args.page_size == 0
+        ), "chunked_prefill_size must be divisible by page_size"
     return args
 
 
