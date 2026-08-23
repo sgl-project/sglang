@@ -1005,7 +1005,7 @@ def main(server_args, bench_args):
     # The decode phase has to capture the batch sizes this run benchmarks, and
     # the per-phase convenience knob loses to an explicit --cuda-graph-config
     # JSON (resolution applies that last), so the size is merged into that JSON.
-    if getattr(server_args, "_declarations_materialized", False):
+    if getattr(server_args, "_resolution_finished", False):
         # A record the caller already resolved: nothing will parse a raw dict
         # again, so the declaration has to be the finished typed config.
         merged = resolution_result(server_args, "cuda_graph_config")

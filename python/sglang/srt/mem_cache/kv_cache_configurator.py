@@ -1380,7 +1380,7 @@ class KVCacheConfigurator:
         """
         full_pool_class = DSATokenToKVPool if is_dsa_model else MLATokenToKVPool
         common = {
-            "page_size": self.server_args.page_size,
+            "page_size": get_schedule().page_size,
             "device": self.device,
             "enable_memory_saver": False,
         }
@@ -1401,7 +1401,7 @@ class KVCacheConfigurator:
         return SWAKVPool(
             size=full_max_total_num_tokens,
             size_swa=swa_max_total_num_tokens,
-            page_size=self.server_args.page_size,
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             head_num=0,
             head_dim=0,

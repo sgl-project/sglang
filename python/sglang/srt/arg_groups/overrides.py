@@ -206,10 +206,9 @@ def register_post_process(fn: Callable[..., dict]) -> Callable[..., dict]:
 def _declaration_overlay(server_args: Any) -> Dict[str, Any]:
     """What the declarations say so far, last writer wins.
 
-    Passes declare without touching the fields until
-    ``materialize_declarations``, so a mid-resolution reader needs this to see
-    them; handlers and hooks write as they declare, and for those the overlay
-    repeats what the field already holds."""
+    Passes declare without touching the fields, so a mid-resolution reader
+    needs this to see them; handlers and hooks write as they declare, and for
+    those the overlay repeats what the field already holds."""
     overlay: Dict[str, Any] = {}
     for _source, declared in getattr(server_args, "_resolved_overrides", None) or ():
         overlay.update(declared)
@@ -222,9 +221,9 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
     Evaluates the pass on the resolving state (a read-only view with the
     accumulated declarations overlaid from the stash) and appends its
     declaration to the stash. During ``__post_init__`` the fields stay
-    untouched — ``materialize_declarations`` applies the whole stash once at
-    the end of resolution; a pass invoked after materialization (a post-init
-    slot) writes through immediately.
+    untouched: the stash is what the config bags are projected from. A pass
+    invoked after resolution finished (a post-init slot) writes through
+    immediately, because there is no later projection to pick it up.
     """
     declared = fn(ResolvedView(server_args, overlay=_declaration_overlay(server_args)))
     if not isinstance(declared, dict):
@@ -244,7 +243,7 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
             stash = server_args._resolved_overrides = []
         stash.append(entry)
         validate_declarations(server_args, [entry])
-        if getattr(server_args, "_declarations_materialized", False):
+        if getattr(server_args, "_resolution_finished", False):
             _apply_fields(server_args, declared)
 
 
@@ -384,18 +383,6 @@ def declare_direct_writes(
     return result
 
 
-def materialize_declarations(server_args: Any) -> None:
-    """Apply the accumulated declarations onto ``server_args`` once, at the
-    end of ``__post_init__`` (gate order: last writer wins). After this the
-    fields carry the resolved configuration — every post-init reader, in any
-    process, reads them directly; ``resolved_view`` remains an internal
-    helper for mid-resolution code only."""
-    for _source, declared in getattr(server_args, "_resolved_overrides", None) or ():
-        for field, value in declared.items():
-            setattr(server_args, field, value)
-    server_args._declarations_materialized = True
-
-
 def resolution_result(server_args: Any, field: str, default: Any = None) -> Any:
     """What resolution decided for ``field``: the declaration if there is one,
     otherwise what the caller supplied.
@@ -453,10 +440,14 @@ def _plain(value: Any) -> Any:
 
 
 def resolved_view(server_args: Any) -> ResolvedView:
-    """Read-only view of the resolving configuration for mid-resolution code
-    that is not a pass (``__post_init__`` handlers and hooks). Internal to
-    the resolution pipeline: after ``materialize_declarations`` runs, the
-    fields themselves carry the resolved values — read them directly."""
+    """Read-only view of the resolving configuration: the declarations
+    overlaid on the fields, snapshotted per call.
+
+    For mid-resolution code that is not a pass (``__post_init__`` handlers and
+    hooks), and for the record's own members that must answer with what
+    resolution decided -- a declaration-only resolver (a model-specific
+    override, a registry entry) never writes the field, so a field read there
+    answers with the raw input."""
     return ResolvedView(server_args, overlay=_declaration_overlay(server_args))
 
 

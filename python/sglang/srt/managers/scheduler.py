@@ -39,7 +39,6 @@ from sglang.srt.runtime_context import (
     get_observability,
     get_parallel,
     get_schedule,
-    get_server_args,
     get_serving,
     get_spec,
 )
@@ -4412,7 +4411,7 @@ class Scheduler(
         # Resolved config (pristine server_args + post-publish overrides) so a
         # readback reflects values changed via /set_internal_state, not startup.
         ret = get_context().resolved_server_args_dict()
-        ret["world_size"] = compute_world_size(get_server_args())
+        ret["world_size"] = compute_world_size(get_parallel().config)
         ret["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
         draft_graph_memory_usage = (
             None if self.draft_worker is None else self.draft_worker.graph_memory_usage
