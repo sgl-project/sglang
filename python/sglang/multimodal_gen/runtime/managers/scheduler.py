@@ -37,7 +37,7 @@ from sglang.multimodal_gen.runtime.ipc_array import (
     is_local_endpoint,
     spill_large_arrays_to_file_refs,
 )
-from sglang.multimodal_gen.runtime.ipc_cuda import (
+from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
     materialize_cuda_refs,
     release_retained_producer_tensors,
     spill_cuda_tensors,

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from sglang.multimodal_gen.runtime.ipc_cuda import (
+from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
     CudaIpcRef,
     attach_cuda_tensors,
     detach_cuda_tensors,
