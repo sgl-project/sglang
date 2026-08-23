@@ -127,7 +127,7 @@ class EncoderPreprocessor:
         use_image_processor_gpu = envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get()
         self.use_image_processor_gpu = (
             use_image_processor_gpu
-            and resolve_image_processor_backend(server_args) != "pil"
+            and resolve_image_processor_backend(get_mm()) != "pil"
         )
 
         self._load_mm_processor(server_args)
@@ -158,7 +158,7 @@ class EncoderPreprocessor:
     def _load_mm_processor(self, server_args: ServerArgs):
         from transformers import AutoImageProcessor, AutoVideoProcessor
 
-        image_processor_backend = resolve_image_processor_backend(server_args)
+        image_processor_backend = resolve_image_processor_backend(get_mm())
         image_processor_kwargs = (
             {}
             if image_processor_backend == "auto"
