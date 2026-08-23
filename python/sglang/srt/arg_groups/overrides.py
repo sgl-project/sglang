@@ -599,6 +599,7 @@ def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     "GlmMoeDsaForCausalLM",
     "LongcatFlashForCausalLM",
     "LongcatFlashForCausalLMNextN",
+    "Dots3NoteForCausalLM",
 )
 def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     """Order-safe declarations of the DeepSeek/DSA branch. The CP parallel
@@ -609,6 +610,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
     overrides: Dict[str, Any] = {}
+
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
         # Set attention backend for DeepSeek
         if server_args.is_attention_backend_not_set():
@@ -1769,6 +1771,7 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "GlmMoeDsaForCausalLM",
         "LongcatFlashForCausalLM",
         "LongcatFlashForCausalLMNextN",
+        "Dots3NoteForCausalLM",
     }
 )
 

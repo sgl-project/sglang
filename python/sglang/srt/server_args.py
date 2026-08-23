@@ -208,6 +208,17 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_xpu",
 ]
 
+# trtllm_mha is valid for decode-only dense-MQA drafts. DFLASH rejects it
+# earlier when its per-layer attention requirements are not met.
+DRAFT_ATTENTION_BACKEND_CHOICES = [
+    "flashinfer",
+    "fa3",
+    "fa4",
+    "triton",
+    "ascend",
+    "trtllm_mha",
+]
+
 # Attention backends whose kernels read the chunked prefix-cache layout.
 # Out-of-tree platforms may extend this list (via
 # add_chunked_prefix_cache_attention_backend) before ServerArgs construction;
@@ -404,6 +415,10 @@ def add_quantization_method_choices(choices):
 
 def add_attention_backend_choices(choices):
     ATTENTION_BACKEND_CHOICES.extend(choices)
+
+
+def add_draft_attention_backend_choices(choices):
+    DRAFT_ATTENTION_BACKEND_CHOICES.extend(choices)
 
 
 def add_chunked_prefix_cache_attention_backend(backend_name):
@@ -5376,6 +5391,7 @@ class ServerArgs:
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
             "LongcatFlashForCausalLM",
+            "Dots3NoteForCausalLM",
         ]:
             # Set attention backend for DeepSeek
             if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
@@ -7877,6 +7893,7 @@ class ServerArgs:
             "Qwen3OmniMoeForConditionalGeneration",
             "Qwen2AudioForConditionalGeneration",
             "Qwen2_5OmniForConditionalGeneration",
+            "Dots3NoteForCausalLM",
             "KimiVLForConditionalGeneration",
             "KimiK25ForConditionalGeneration",
             "KimiK3ForConditionalGeneration",
@@ -7884,7 +7901,8 @@ class ServerArgs:
         ]:
             raise ValueError(
                 f"Model type {model_arch} is not supported for encoder disaggregation. "
-                f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, Qwen2Audio, Qwen2.5Omni, Kimi, MiMoV2."
+                f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, "
+                f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2."
             )
 
     def _validate_ib_devices(self, device_str: Optional[str]) -> Optional[str]:
