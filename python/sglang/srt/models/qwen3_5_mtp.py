@@ -99,6 +99,10 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         if self.is_multimodal:
             config = config.text_config
 
+        needs_quant_draft = get_spec().speculative_draft_model_quantization
+        if quant_config is not None and not needs_quant_draft:
+            quant_config = None
+
         # Deep-copy so MTP mutations below don't leak into the target's config.
         config = copy.deepcopy(config)
 
