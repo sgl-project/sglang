@@ -158,6 +158,32 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         self._rebuild_topk1_chain_buffers()
 
+        self.draft_worker = self._build_draft_worker(
+            server_args=server_args,
+            gpu_id=gpu_id,
+            ps=ps,
+            nccl_port=nccl_port,
+            target_worker=target_worker,
+        )
+
+        # Alias for better readability
+        self.draft_runner = self._build_draft_runner()
+        self._init_dsa_index_share_state()
+        # Eager draft-extend seed buffer (graph paths use their own static ones).
+        self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
+        self.draft_tp_context = self._build_draft_tp_context()
+        self.tree_mask_mode = default_tree_mask_mode()
+
+        self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+
+    def _build_draft_worker(
+        self,
+        server_args: ServerArgs,
+        gpu_id: int,
+        ps: ParallelState,
+        nccl_port: int,
+        target_worker: TpModelWorker,
+    ):
         # Load draft model weights only.
         if (
             get_parallel().enable_dp_attention
@@ -169,7 +195,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         with (
             ctx
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), draft_model_build_scope():
-            self.draft_worker = TpModelWorker(
+            return TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
                 # spec workers don't support pipeline parallelism
@@ -180,17 +206,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 context_length=target_worker.model_runner.model_config.context_len,
             )
 
-        # Alias for better readability
-        self.draft_runner = self.draft_worker.model_runner
-        self._init_dsa_index_share_state()
-        # Eager draft-extend seed buffer (graph paths use their own static ones).
-        self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
-        self.draft_tp_context = (
-            draft_tp_context if get_parallel().enable_dp_attention else empty_context
-        )
-        self.tree_mask_mode = default_tree_mask_mode()
+    def _build_draft_runner(self):
+        return self.draft_worker.model_runner
 
-        self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+    def _build_draft_tp_context(self):
+        return draft_tp_context if get_parallel().enable_dp_attention else empty_context
 
     def alloc_memory_pool(
         self,
@@ -1078,12 +1098,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             get_spec().speculative_algorithm
         )
 
-        self._draft_worker = EagleDraftWorker(
-            server_args,
-            gpu_id,
-            ps,
-            nccl_port,
-            target_worker,
+        self._draft_worker = self._build_draft_worker(
+            server_args=server_args,
+            gpu_id=gpu_id,
+            ps=ps,
+            nccl_port=nccl_port,
+            target_worker=target_worker,
         )
 
         # Adaptive speculative
@@ -1101,6 +1121,22 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+
+    def _build_draft_worker(
+        self,
+        server_args: ServerArgs,
+        gpu_id: int,
+        ps: ParallelState,
+        nccl_port: int,
+        target_worker: TpModelWorker,
+    ):
+        return EagleDraftWorker(
+            server_args,
+            gpu_id,
+            ps,
+            nccl_port,
+            target_worker,
+        )
 
     @property
     def last_shared_read_runner(self):
