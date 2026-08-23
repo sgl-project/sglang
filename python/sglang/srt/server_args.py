@@ -7100,7 +7100,11 @@ class ServerArgs:
 
         from sglang.srt.layers.cp.base import init_cp_strategy
 
-        init_cp_strategy(self)
+        init_cp_strategy(
+            enable_prefill_cp=bool(cfg.enable_prefill_cp),
+            cp_size=cfg.attn_cp_size,
+            cp_strategy=cfg.cp_strategy,
+        )
 
     def _handle_dwdp(self):
         cfg = resolving_view(self)
