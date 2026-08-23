@@ -307,12 +307,11 @@ def load_model_with_memory_saver(
                 StartupWeightLoadManager,
             )
 
-            startup_weight_load = StartupWeightLoadManager.create_from_server_args(
+            startup_weight_load = StartupWeightLoadManager.create_from_published_config(
                 loader=loader,
                 model_config=model_config,
                 load_config=load_config,
                 device_config=device_config,
-                server_args=server_args,
                 is_draft_worker=is_draft_worker,
             )
             model = startup_weight_load.prepare()
