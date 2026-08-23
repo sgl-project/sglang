@@ -1705,6 +1705,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 is_dit_component_name(component)
                 or is_text_encoder_component_name(component)
                 or is_image_encoder_component_name(component)
+                or is_vae_component_name(component)
             )
             if (
                 not supports_weight_file_override
