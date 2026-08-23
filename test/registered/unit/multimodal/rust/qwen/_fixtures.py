@@ -89,14 +89,18 @@ def make_processor(case, config, image_processor_cls=None):
         allowed_media_domains=[],
         media_url_max_file_size_mb=64,
     )
-    # The processor reads its media policy, transport and per-modality limits
-    # from the mm bag, so the fixture publishes before building it.
+    # The processor reads its media policy, transport, per-modality limits and
+    # image-processor backend from the mm bag, so the fixture publishes before
+    # building it. The backend matters here: left at the default the fast image
+    # processor runs and sends the tensor to `cuda:<base_gpu_id>`, which a
+    # CPU-only host cannot do.
     publish(
         ServerArgs(
             model_path="dummy",
             mm_feature_transport=server_args.mm_feature_transport,
             mm_process_config=server_args.mm_process_config,
             allowed_media_domains=server_args.allowed_media_domains,
+            disable_fast_image_processor=server_args.disable_fast_image_processor,
         ),
         role="tokenizer",
     )

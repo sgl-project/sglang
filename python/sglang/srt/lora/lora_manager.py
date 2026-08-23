@@ -94,19 +94,17 @@ class LoRAManager:
         self.attn_tp_size: int = get_parallel().attn_tp_size
         self.lora_added_tokens_size: Optional[int] = None
         self.enable_lora_overlap_loading: Optional[bool] = (
-            server_args.enable_lora_overlap_loading
+            get_lora().enable_lora_overlap_loading
         )
         self.pending_lora_load_events = {}
 
-        self.eviction_policy = server_args.lora_eviction_policy
+        self.eviction_policy = get_lora().lora_eviction_policy
         self.enable_dp_attention: bool = get_parallel().config.enable_dp_attention
         self._experts_shared_outer_override: Optional[bool] = (
-            server_args.experts_shared_outer_loras
+            get_lora().experts_shared_outer_loras
         )
-        self.lora_use_virtual_experts: bool = server_args.lora_use_virtual_experts
-        self.lora_strict_loading: bool = getattr(
-            server_args, "lora_strict_loading", False
-        )
+        self.lora_use_virtual_experts: bool = get_lora().lora_use_virtual_experts
+        self.lora_strict_loading: bool = get_lora().lora_strict_loading
         self.speculative_algorithm: Optional[str] = get_spec().speculative_algorithm
 
         # LoRA backend for running sgemm kernels

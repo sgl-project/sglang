@@ -18,11 +18,10 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.runtime_context import get_model
+from sglang.srt.runtime_context import get_exec, get_model, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +30,6 @@ class EPLBManager:
     def __init__(
         self,
         *,
-        server_args: ServerArgs,
         model_config: ModelConfig,
         ps: Any,
         get_model: Callable[[], nn.Module],
@@ -43,7 +41,6 @@ class EPLBManager:
         # These collaborators are set on ModelRunner AFTER EPLBManager is
         # constructed (model load, expert_backup_client, weight_updater), so
         # they are read through getters at rebalance time, not captured here.
-        self._server_args = server_args
         self._model_config = model_config
         self._ps = ps
         self._get_model = get_model
@@ -51,16 +48,16 @@ class EPLBManager:
         self._get_expert_backup_client = get_expert_backup_client
         self._get_weight_updater = get_weight_updater
         self._rebalance_layers_per_chunk = (
-            self._server_args.eplb_rebalance_layers_per_chunk
+            get_exec().moe.eplb_rebalance_layers_per_chunk
         )
-        self._rebalance_num_iterations = self._server_args.eplb_rebalance_num_iterations
+        self._rebalance_num_iterations = get_exec().moe.eplb_rebalance_num_iterations
         self._rebalance_disabled_reason = None
         self._rebalance_disabled_logged = False
 
         # Otherwise, the circular buffer will contain stale data. If the case is needed, it can be implemented.
         assert (
-            self._server_args.eplb_rebalance_num_iterations
-            >= self._server_args.expert_distribution_recorder_buffer_size
+            get_exec().moe.eplb_rebalance_num_iterations
+            >= get_exec().moe.expert_distribution_recorder_buffer_size
         ), "eplb_rebalance_num_iterations must be greater than expert_distribution_recorder_buffer_size"
 
         if not get_global_expert_distribution_recorder().recording:
@@ -160,7 +157,7 @@ class EPLBManager:
                 model=self._get_model(),
                 new_expert_location_metadata=expert_location_metadata,
                 update_layer_ids=chunk_layer_ids,
-                nnodes=self._server_args.nnodes,
+                nnodes=get_parallel().config.nnodes,
                 tp_rank=(
                     self._elastic_global_rank()
                     if is_post_scale_rebalance
@@ -169,7 +166,7 @@ class EPLBManager:
                 use_flat_topology=is_post_scale_rebalance,
                 expert_backup_client=self._get_expert_backup_client(),
                 update_weights_from_disk_callable=self._get_weight_updater().update_weights_from_disk,
-                ep_dispatch_algorithm=self._server_args.ep_dispatch_algorithm,
+                ep_dispatch_algorithm=get_exec().moe.ep_dispatch_algorithm,
                 init_lplb_solvers_callable=lambda: init_lplb_solvers(
                     model_config=self._model_config
                 ),
@@ -224,7 +221,7 @@ class EPLBManager:
         )
 
     def _elastic_global_rank(self) -> int:
-        return self._ps.tp_rank + self._server_args.ep_join_rank_offset
+        return self._ps.tp_rank + get_parallel().config.ep_join_rank_offset
 
     def _check_rebalance_needed(self, average_utilization_rate_over_window):
         if average_utilization_rate_over_window is None:
@@ -232,10 +229,10 @@ class EPLBManager:
 
         if (
             average_utilization_rate_over_window
-            > self._server_args.eplb_min_rebalancing_utilization_threshold
+            > get_exec().moe.eplb_min_rebalancing_utilization_threshold
         ):
             logger.info(
-                f"[EPLBManager] Skipped ep rebalancing: current GPU utilization {average_utilization_rate_over_window:.2f} > minimum rebalance threshold {self._server_args.eplb_min_rebalancing_utilization_threshold:.2f}"
+                f"[EPLBManager] Skipped ep rebalancing: current GPU utilization {average_utilization_rate_over_window:.2f} > minimum rebalance threshold {get_exec().moe.eplb_min_rebalancing_utilization_threshold:.2f}"
             )
             return False
 
