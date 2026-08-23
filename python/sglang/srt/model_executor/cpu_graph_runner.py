@@ -609,7 +609,7 @@ class CPUGraphRunner:
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
-        self.tp_size = model_runner.server_args.tp_size
+        self.tp_size = get_parallel().config.tp_size
         self.dp_size = get_parallel().config.dp_size
         self.pp_size = get_parallel().config.pp_size
 

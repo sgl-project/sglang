@@ -119,6 +119,26 @@ _CONFIGURED_SIZE_CALL_SITES = {
     ("srt/managers/scheduler.py", "dcp_size"): (
         "same pre-distributed-init arithmetic in configure_scheduler_process"
     ),
+    ("srt/model_executor/runner/base_runner.py", "tp_size"): (
+        "the same window as the stage count next to it: a draft runner shares "
+        "the target's groups, so the live property would answer for the wrong "
+        "runner"
+    ),
+    ("srt/model_executor/cpu_graph_runner.py", "tp_size"): (
+        "the same window, on the CPU graph path"
+    ),
+    ("srt/entrypoints/v1_loads.py", "tp_size"): (
+        "the accelerator count is arithmetic over the launch shape, reported "
+        "from the tokenizer process, which holds no model groups"
+    ),
+    ("srt/disaggregation/nixl/conn.py", "tp_size"): (
+        "the NIXL rank arithmetic runs on the transfer path, which the CPU-only "
+        "conn tests exercise without starting torch.distributed"
+    ),
+    ("srt/managers/tokenizer_control_mixin.py", "tp_size"): (
+        "the tokenizer divides its worker count by the launch width; it holds "
+        "no model groups"
+    ),
     ("srt/model_executor/runner/base_runner.py", "pp_size"): (
         "the runner's layer window is arithmetic over the configured stage "
         "count; a draft runner shares the target's groups, so the live "
