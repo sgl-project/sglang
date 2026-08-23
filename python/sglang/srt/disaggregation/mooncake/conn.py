@@ -62,7 +62,7 @@ from sglang.srt.observability.trace import (
     TraceReqContext,
     trace_set_thread_info,
 )
-from sglang.srt.runtime_context import get_memory, get_parallel, get_schedule
+from sglang.srt.runtime_context import get_memory, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
 
