@@ -212,8 +212,7 @@ DeepSeek-V4 uses hybrid compressed attention for long-context efficiency. `SGLAN
 ```bash Command
 SGLANG_DSV4_COMPRESS_STATE_DTYPE=bf16 \
 sglang serve \
-  --model-path deepseek-ai/DeepSeek-V4-Flash \
-  <other args>
+  --model-path deepseek-ai/DeepSeek-V4-Flash
 ```
 
 This BF16 setting applies only to the compressed attention state pools and reduces the GPU memory footprint of each compressed-state slot. It does not change model weight precision or the main KV cache dtype. With automatic pool sizing and no explicit capacity cap, the same memory budget holds more slots, and the startup log shows larger `c4_state` and `c128_state` pool sizes. Keep the default `float32` setting for the most conservative behavior.
@@ -312,11 +311,12 @@ The experimental native-H16 CuTe DSL sparse-prefill kernel can be selected on
 SM90 when tensor parallelism leaves exactly 16 query heads per rank:
 
 ```bash Command
+MODEL_PATH=deepseek-ai/DeepSeek-V4-Flash
+
 sglang serve \
-  --model-path <deepseek-v4-model> \
+  --model-path "$MODEL_PATH" \
   --tp 8 \
-  --dsv4-prefill-backend cutedsl_h16 \
-  <other args>
+  --dsv4-prefill-backend cutedsl_h16
 ```
 
 This path requires BF16 query and sparse-workspace tensors with 512-wide Q/K/V
