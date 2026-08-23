@@ -574,6 +574,39 @@ After implementation, **you must verify that the generated output is not noise**
 2. Running the Diffusers pipeline and SGLang pipeline side-by-side with the same seed
 3. Checking each stage's output shape and value range independently
 
+### Step 10: Decide the ComfyUI Route (Optional)
+
+A model is reachable from ComfyUI two ways. Pick one deliberately — the wrong
+choice costs several hundred lines of weight-mapping code that buys nothing.
+
+**Server route.** ComfyUI sends an HTTP request and SGLang runs the whole
+pipeline. Choose this when the model needs conditioning ComfyUI cannot supply
+(audio, reference materials, task routing), produces more than one modality,
+or has its own request contract.
+
+Cost: nothing, if the request fits the existing `generate_image` /
+`generate_video` fields. If the model has extra request fields, pass them
+through `extra_fields` — the request schemas accept unknown keys, so the
+client in `apps/ComfyUI_SGLDiffusion/core/server_api.py` does **not** need a
+per-model change. Add a node in `nodes.py` only when the inputs are worth
+surfacing as ComfyUI widgets. `SGLDiffusionGenerateH3` is the worked example.
+
+**Executor route.** ComfyUI's KSampler drives the denoise loop and SGLang
+replaces the DiT forward, using ComfyUI's own text encoders and VAE. Choose
+this only when the model denoises a single latent tensor that ComfyUI already
+knows how to build and decode.
+
+Cost, per model: a `runtime/pipelines/comfyui_<model>_pipeline.py` that maps
+ComfyUI's single-file checkpoint layout onto the native module tree (350-690
+lines in the existing three), an executor in
+`apps/ComfyUI_SGLDiffusion/executors/` that adapts latent layout and
+conditioning to `Req`, and entries in both dicts in `core/generator.py`.
+
+The deciding question is not model size or modality — it is whether ComfyUI's
+sampler can drive the model's loop unchanged. If reproducing the conditioning
+inside ComfyUI would duplicate stages the server already runs, take the server
+route.
+
 ## Reference Implementations
 
 ### Hybrid Style (recommended for most new models)

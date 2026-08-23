@@ -21,6 +21,8 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_LOGGING_LEVEL: str = "INFO"
     SGLANG_DIFFUSION_LOGGING_PREFIX: str = ""
     SGLANG_DIFFUSION_TRACE_FUNCTION: int = 0
+    SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST: bool = False
+    SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE: bool = False
     SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
@@ -30,6 +32,9 @@ if TYPE_CHECKING:
     CMAKE_BUILD_TYPE: str | None = None
     VERBOSE: bool = False
     SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
+    SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER: bool = False
+    SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB: float | None = None
+    SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB: float | None = None
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
@@ -109,6 +114,14 @@ def _lazy_int(key: str, default: str | int | None = None) -> Callable[[], int | 
 
 def _lazy_float(key: str, default: str | float) -> Callable[[], float]:
     return lambda: float(os.getenv(key, str(default)))
+
+
+def _lazy_optional_float(key: str) -> Callable[[], float | None]:
+    def _getter():
+        val = os.getenv(key)
+        return float(val) if val is not None else None
+
+    return _getter
 
 
 def _lazy_bool(key: str, default: str = "false") -> Callable[[], bool]:
@@ -222,6 +235,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # some additional endpoints for developing and debugging,
     # e.g. `/reset_prefix_cache`
     "SGLANG_DIFFUSION_SERVER_DEV_MODE": _lazy_bool("SGLANG_DIFFUSION_SERVER_DEV_MODE"),
+    # Kill-switch for the courier thread that ships checkpoint-mapped layers to
+    # the device off the compute thread. The courier already falls back to the
+    # synchronous copy on any failure; this forces that path up front.
+    "SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER"
+    ),
+    # Test hook: make the host memory budget behave as if the machine had this
+    # many GiB of RAM (available = this figure minus the process's own
+    # anonymous memory). CI uses it to exercise the constrained placement
+    # paths -- mapped weights, partial pinning, the courier -- on runners whose
+    # real hosts are never short of memory.
+    "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": _lazy_optional_float(
+        "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB"
+    ),
+    # Test-only: cap the CUDA caching allocator at this many GiB, so a large
+    # CI card behaves like the consumer card a case is written for. Without
+    # the cap the allocator is free to reserve past the pretended budget and
+    # a peak-VRAM baseline stops meaning "fits the card".
+    "SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB": _lazy_optional_float(
+        "SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB"
+    ),
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
@@ -232,6 +266,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_str(
         "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "auto"
+    ),
+    # Kill-switch: keep VAE decoder weights in their checkpoint dtype at load
+    # instead of the decode compute dtype the decode stage would round them to
+    # on first use anyway.
+    "SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST"
+    ),
+    # Kill-switch: keep the decode-dtype VAE decoder weights in anonymous host
+    # memory instead of a file-backed cache mapping the page cache can drop.
+    "SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE"
     ),
     # ================== cache-dit Env Vars ==================
     # Enable cache-dit acceleration for DiT inference

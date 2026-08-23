@@ -46,6 +46,7 @@ from sglang.srt.model_executor.forward_context import ForwardContext, forward_co
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.runtime_context import (
     attention_backends,
+    get_device,
     get_parallel,
     get_schedule,
     get_spec,
@@ -107,16 +108,16 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         EagleDraftWorkerBase.__init__(self)
 
         self.server_args = server_args
-        self.topk = server_args.speculative_eagle_topk
-        self.speculative_num_steps = server_args.speculative_num_steps
-        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        self.topk = get_spec().speculative_eagle_topk
+        self.speculative_num_steps = get_spec().speculative_num_steps
+        self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.ps = ps
         self.gpu_id = gpu_id
-        self.device = server_args.device
+        self.device = get_device().device
         self.target_worker = target_worker
         self.page_size = get_schedule().page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
+            get_spec().speculative_algorithm
         )
         assert self.speculative_algorithm.is_frozen_kv_mtp(), (
             "FrozenKVMTPDraftWorker should only be instantiated for "
@@ -695,16 +696,16 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         # an EagleDraftWorker (with its own draft KV pool). The frozen draft owns
         # no KV, so we mirror the relevant setup and build a FrozenKVMTPDraftWorker.
         self.server_args = server_args
-        self.topk = server_args.speculative_eagle_topk
-        self.speculative_num_steps = server_args.speculative_num_steps
-        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        self.topk = get_spec().speculative_eagle_topk
+        self.speculative_num_steps = get_spec().speculative_num_steps
+        self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.ps = ps
         self.gpu_id = gpu_id
-        self.device = server_args.device
+        self.device = get_device().device
         self._target_worker = target_worker
         self.page_size = get_schedule().page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
+            get_spec().speculative_algorithm
         )
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
@@ -720,7 +721,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
 
         # Frozen MTP does not wire the adaptive controller yet.
         assert (
-            not server_args.speculative_adaptive
+            not get_spec().speculative_adaptive
         ), "Frozen-KV MTP does not support adaptive speculative decoding yet."
         self.adaptive_controller = None
 

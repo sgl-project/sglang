@@ -304,5 +304,6 @@ def _ensure_model_padders_registered() -> None:
         longcat_image,
         minimax_h3,
         qwen_image,
+        sana_video,
         zimage,
     )

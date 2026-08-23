@@ -10,7 +10,11 @@ import torch.nn.functional as F
 from diffusers.models.embeddings import PixArtAlphaTextProjection
 
 from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    can_use_interleaved_rope_fp64,
+    fused_interleaved_rope_fp64,
     mark_sana_video_linear_attention_site,
+    tensors_equal,
     try_sana_video_linear_attention,
 )
 from sglang.multimodal_gen.configs.models.dits.sana_video import SanaVideoConfig
@@ -24,6 +28,11 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.dits.sana import SanaAdaLayerNormSingle
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
+_SANA_VIDEO_ROPE = BitExactFusionGate("SANA-Video fused RoPE")
 
 
 def apply_interleaved_rotary_emb(
@@ -39,6 +48,46 @@ def apply_interleaved_rotary_emb(
     output[..., 0::2] = x1 * cos - x2 * sin
     output[..., 1::2] = x1 * sin + x2 * cos
     return output
+
+
+def apply_interleaved_rotary_emb_pair(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    freqs_cos: torch.Tensor,
+    freqs_sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply paired interleaved RoPE, with a bit-exact eager fallback."""
+    verified = _SANA_VIDEO_ROPE.verified
+    if (
+        not _SANA_VIDEO_ROPE.disabled
+        and can_use_interleaved_rope_fp64(query, key, freqs_cos, freqs_sin)
+        and (verified or _SANA_VIDEO_ROPE.can_attempt_once())
+    ):
+        try:
+            fused = fused_interleaved_rope_fp64(query, key, freqs_cos, freqs_sin)
+        except Exception as exc:
+            _SANA_VIDEO_ROPE.on_exception(exc, logger=logger)
+        else:
+            if verified:
+                return fused
+            eager = (
+                apply_interleaved_rotary_emb(query, freqs_cos, freqs_sin),
+                apply_interleaved_rotary_emb(key, freqs_cos, freqs_sin),
+            )
+            return _SANA_VIDEO_ROPE.accept_or_fallback(
+                fused,
+                eager,
+                equal=tensors_equal,
+                logger=logger,
+                mismatch_msg=(
+                    "SANA-Video fused RoPE is not bit-exact on this platform; "
+                    "falling back to eager"
+                ),
+            )
+    return (
+        apply_interleaved_rotary_emb(query, freqs_cos, freqs_sin),
+        apply_interleaved_rotary_emb(key, freqs_cos, freqs_sin),
+    )
 
 
 class SanaVideoRotaryPosEmbed(nn.Module):
@@ -211,8 +260,9 @@ class SanaVideoLinearAttention(nn.Module):
 
         query = F.relu(query)
         key = F.relu(key)
-        query_rotate = apply_interleaved_rotary_emb(query, *rotary_emb)
-        key_rotate = apply_interleaved_rotary_emb(key, *rotary_emb)
+        query_rotate, key_rotate = apply_interleaved_rotary_emb_pair(
+            query, key, *rotary_emb
+        )
 
         query = query.permute(0, 2, 3, 1)
         key = key.permute(0, 2, 3, 1)

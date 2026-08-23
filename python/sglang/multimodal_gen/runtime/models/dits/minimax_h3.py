@@ -10,6 +10,8 @@ from __future__ import annotations
 import math
 import os
 import struct
+from collections import defaultdict
+from collections.abc import Iterable, Iterator
 from contextlib import ExitStack
 from typing import Any, Callable
 
@@ -58,6 +60,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.usp import _ring_attention_varlen
+from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
     is_layerwise_offloaded_module,
@@ -75,6 +78,48 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 logger = init_logger(__name__)
 
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
+
+
+def _diffusers_h3_checkpoint(
+    iterator: Iterable[tuple[str, torch.Tensor]],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Map Diffusers H3 names/layout to the fused native checkpoint layout."""
+    mapping = get_param_names_mapping(_ARCH_DEFAULTS.param_names_mapping)
+    pending: dict[str, dict[int, torch.Tensor]] = defaultdict(dict)
+
+    for source_name, tensor in iterator:
+        target_name, merge_index, merge_count = mapping(source_name)
+
+        # Diffusers SwiGLU stores [value, gate]; the native fused MLP consumes
+        # [gate, value]. Packed GPTQ tensors carry output channels on dim 1.
+        if ".ff.net.0.proj." in source_name:
+            output_dim = (
+                1 if source_name.endswith((".qweight", ".qzeros", ".scales")) else 0
+            )
+            value, gate = tensor.chunk(2, dim=output_dim)
+            tensor = torch.cat((gate, value), dim=output_dim)
+
+        if merge_index is None:
+            yield target_name, tensor
+            continue
+
+        assert merge_count is not None
+        pending[target_name][merge_index] = tensor
+        if len(pending[target_name]) != merge_count:
+            continue
+
+        merge_dim = 1 if target_name.endswith((".qweight", ".qzeros", ".scales")) else 0
+        yield target_name, torch.cat(
+            [pending[target_name][index] for index in range(merge_count)],
+            dim=merge_dim,
+        )
+        del pending[target_name]
+
+    if pending:
+        incomplete = ", ".join(sorted(pending))
+        raise ValueError(f"Incomplete Diffusers H3 fused parameters: {incomplete}")
+
+
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
 _MPS_MLP_TOKEN_CHUNK_SIZE = 128
@@ -552,7 +597,7 @@ def _minimax_h3_attention_core_impl(
             q,
             k,
             v,
-            softmax_scale=attention.softmax_scale,
+            attn_impl=attention._attention_impl,
             real_seq_len=max_seqlen,
             ring_ws=ring_ws,
         )
@@ -612,10 +657,16 @@ class MiniMaxH3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
-        # The reorder below translates the *safetensors* checkpoint layout. A
-        # GGUF checkpoint already stores qkv as [q_all, k_all, v_all], and its
-        # packed parameter is `qweight`, so there is nothing to reorder.
-        if quant_config is None or quant_config.get_name() != "gguf":
+        # Official safetensors interleave Q/K/V by head. Comfy and GGUF
+        # checkpoints already store [q_all, k_all, v_all].
+        checkpoint_qkv_is_native = quant_config is not None and (
+            quant_config.get_name() == "gguf"
+            or quant_config.checkpoint_uses_native_qkv_layout
+        )
+        checkpoint_qkv_is_native = (
+            checkpoint_qkv_is_native or arch.checkpoint_uses_diffusers_layout
+        )
+        if not checkpoint_qkv_is_native:
             self._install_qkv_weight_loader(arch)
         self.q_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         self.k_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
@@ -1602,6 +1653,7 @@ class MiniMaxH3FinalLayer(nn.Module):
 
 
 class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
+    _aliases = ["MiniMaxH3Transformer3DModel"]
     _fsdp_shard_conditions = [is_block]
     # refine_prompt_embeds drives a forward pass outside __call__.
     _fsdp_forward_methods = ("refine_prompt_embeds",)
@@ -1732,6 +1784,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             adaln_cache_path is not None or adaln_weight_files is not None
         )
         self.arch = arch
+        if arch.checkpoint_uses_diffusers_layout:
+            self.preprocess_loaded_state_dict = _diffusers_h3_checkpoint
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads
         self.num_channels_latents = arch.latents_dim

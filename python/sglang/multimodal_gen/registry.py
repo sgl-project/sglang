@@ -272,11 +272,6 @@ def _discover_and_register_pipelines():
                             cls.pipeline_config_cls,
                             cls.sampling_params_cls,
                         )
-                        logger.debug(
-                            f"Auto-registered config classes for pipeline '{cls.pipeline_name}': "
-                            f"PipelineConfig={cls.pipeline_config_cls.__name__}, "
-                            f"SamplingParams={cls.sampling_params_cls.__name__}"
-                        )
     logger.debug(
         f"Registering pipelines complete, {len(_PIPELINE_REGISTRY)} pipelines registered"
     )
