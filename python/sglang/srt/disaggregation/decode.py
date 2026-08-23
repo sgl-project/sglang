@@ -2567,6 +2567,44 @@ class SchedulerDisaggregationDecodeMixin:
             set_schedule_time_batch(ret)
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _swap_out_by_priority(
+        self: Scheduler,
+        running_batch: ScheduleBatch,
+        waiting_queue: List[Req],
+    ) -> List[Req]:
+        if len(waiting_queue) <= 0 or not running_batch.reqs:
+            return []
+
+        # Smaller rank = scheduled first, so reverse=True puts the weakest
+        # running requests -- the ones to evict -- at the front.
+        rank = self.policy.preference_key
+        candidates = sorted(
+            (r for r in running_batch.reqs if not r.finished()),
+            key=rank,
+            reverse=True,
+        )
+
+        victims = []
+        for victim, req in zip(candidates[: len(waiting_queue)], waiting_queue):
+            if rank(req) >= rank(victim):
+                break
+            victims.append(victim)
+
+        if not victims:
+            return []
+
+        evicted = {id(r) for r in victims}
+        running_batch.filter_batch(
+            keep_indices=[
+                i for i, r in enumerate(running_batch.reqs) if id(r) not in evicted
+            ]
+        )
+
+        for req in victims:
+            req.is_retracted = True
+
+        return victims
+
     def get_new_prebuilt_batch(
         self: Scheduler, running_batch: ScheduleBatch
     ) -> Optional[ScheduleBatch]:
@@ -2597,21 +2635,29 @@ class SchedulerDisaggregationDecodeMixin:
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
-                # Decode-radix path: new requests already matched in
-                # `pop_preallocated`. Retracted requests reset `last_node`,
-                # so re-match only when that state is missing.
-                if get_disagg().disaggregation_decode_enable_radix_cache:
-                    tree_cache = self.tree_cache if req.last_node is None else None
-                else:
-                    tree_cache = self.tree_cache
-                req.init_next_round_input(tree_cache)
-                # Truncate fill_len to kv_committed_len so cache_unfinished_req
-                # only sees committed KV (full array includes one uncommitted
-                # token because init_next_round_input rebuilt it as full).
-                if req.kv_committed_len is not None:
-                    req.set_extend_range(len(req.prefix_indices), req.kv_committed_len)
             else:
                 waiting_queue.append(req)
+
+        if self.enable_priority_preemption and waiting_queue:
+            victims = self._swap_out_by_priority(running_batch, waiting_queue)
+            if victims:
+                can_run_list.extend(waiting_queue[: len(victims)])
+                waiting_queue = waiting_queue[len(victims) :] + victims
+
+        for req in can_run_list:
+            # Decode-radix path: new requests already matched in
+            # `pop_preallocated`. Retracted requests reset `last_node`,
+            # so re-match only when that state is missing.
+            if get_disagg().disaggregation_decode_enable_radix_cache:
+                tree_cache = self.tree_cache if req.last_node is None else None
+            else:
+                tree_cache = self.tree_cache
+            req.init_next_round_input(tree_cache)
+            # Truncate fill_len to kv_committed_len so cache_unfinished_req
+            # only sees committed KV (full array includes one uncommitted
+            # token because init_next_round_input rebuilt it as full).
+            if req.kv_committed_len is not None:
+                req.set_extend_range(len(req.prefix_indices), req.kv_committed_len)
 
         self.waiting_queue = waiting_queue
         if len(can_run_list) == 0:

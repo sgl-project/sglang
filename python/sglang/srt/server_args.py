@@ -8215,15 +8215,6 @@ class ServerArgs:
                 "--disaggregation-decode-retraction-backup=host_pool does not "
                 "support --dcp-size > 1."
             )
-        if (
-            self.disaggregation_decode_retraction_backup == "host_pool"
-            and self.enable_priority_scheduling
-            and not self.disable_priority_preemption
-        ):
-            raise ValueError(
-                "--disaggregation-decode-retraction-backup=host_pool requires "
-                "--disable-priority-preemption when priority scheduling is enabled."
-            )
 
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(

@@ -168,11 +168,8 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
         supports_host_pool = isinstance(kv_cache, MHATokenToKVPool) or (
             isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0
         )
-        schedule = get_schedule()
-        priority_preemption = (
-            schedule.enable_priority_scheduling
-            and not schedule.disable_priority_preemption
-        )
+        # TODO(zhangmj): maintain host_pool for priority scheduling, but need
+        # to disable when disable hicache.
         backend = (
             "host_pool"
             if disagg.disaggregation_mode == "decode"
@@ -180,7 +177,6 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             and not disagg.disaggregation_decode_enable_radix_cache
             # KV offload already owns a host pool; a second one double-books host memory.
             and not disagg.disaggregation_decode_enable_offload_kvcache
-            and not priority_preemption
             and supports_host_pool
             else "cpu_tensor"
         )

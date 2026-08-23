@@ -430,6 +430,14 @@ class SchedulePolicy:
         else:
             waiting_queue.sort(key=lambda x: -x.sampling_params.max_new_tokens)
 
+    def preference_key(self, req: Req):
+        if self.policy == CacheAgnosticPolicy.LOF:
+            return (
+                req.priority * self.priority_sign,
+                -req.sampling_params.max_new_tokens,
+            )
+        return (req.priority * self.priority_sign, req.time_stats.wait_queue_entry_time)
+
     @staticmethod
     def _sort_randomly(waiting_queue: List[Req]) -> None:
         """Shuffles the waiting queue randomly."""
