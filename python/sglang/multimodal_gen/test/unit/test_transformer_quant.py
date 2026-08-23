@@ -1166,13 +1166,18 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             )
 
         self.assertIsInstance(config, ModelOptFp4Config)
-        self.assertIsInstance(
-            config.get_quant_method(
-                LinearBase(input_size=16, output_size=32),
-                "blocks.0.attn.qkv_proj",
-            ),
-            ModelOptFp4LinearMethod,
-        )
+        with patch(
+            "sglang.multimodal_gen.runtime.layers.quantization."
+            "modelopt_quant.current_platform.get_device_capability",
+            return_value=DeviceCapability(10, 0),
+        ):
+            self.assertIsInstance(
+                config.get_quant_method(
+                    LinearBase(input_size=16, output_size=32),
+                    "blocks.0.attn.qkv_proj",
+                ),
+                ModelOptFp4LinearMethod,
+            )
         self.assertIsInstance(
             config.get_quant_method(
                 LinearBase(input_size=256, output_size=32),
