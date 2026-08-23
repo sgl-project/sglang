@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Mixed-precision weight and TP/Ulysses numerical contracts for H3 DiT."""
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -42,6 +43,24 @@ def _ensure_single_process_parallel_runtime() -> None:
         return
     ensure_distributed_env_defaults()
     maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+
+
+def test_pruned_adaln_lora_projection_preserves_affine_term():
+    model = SimpleNamespace(
+        arch=SimpleNamespace(adaln_affine_input_dim=3, time_embed_dim=2),
+        adaln_basis=torch.tensor([[1.0, 0.0, 2.0], [0.0, 1.0, -1.0]]),
+        adaln_mean=torch.tensor([1.0, 2.0, 3.0]),
+    )
+    prefix = "blocks.0.adaln_proj.linear."
+    a = torch.tensor([[2.0, 3.0, 4.0]])
+    b = torch.tensor([[5.0], [6.0]])
+    actual = MiniMaxH3DiTModel.prepare_lora_adapter(
+        model, {prefix + "lora_A": a, prefix + "lora_B": b}
+    )
+    torch.testing.assert_close(actual[prefix + "lora_A"], a @ model.adaln_basis.T)
+    torch.testing.assert_close(
+        actual[prefix + "lora_output_offset"], b @ (a @ model.adaln_mean)
+    )
 
 
 def test_native_weight_names_and_grouped_qkv_reorder():
