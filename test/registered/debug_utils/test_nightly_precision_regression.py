@@ -498,7 +498,16 @@ def _maybe_hf_fetch(
             target_tensors_dir=baseline_exp_dir,
             capture_signature=capture_signature,
         )
-        if src is not None:
+        if src is None:
+            # Without this line a run that found no signature-matching baseline
+            # and a run that compared cleanly both look green in the log; only
+            # the former silently re-establishes instead of detecting drift.
+            print(
+                f"[hf-store] no baseline matching capture_signature="
+                f"{capture_signature} for {model}; re-establishing",
+                flush=True,
+            )
+        else:
             print(f"[hf-store] restored baseline for {model} from {src}", flush=True)
     except Exception as e:
         msg = f"[hf-store] fetch failed for {model}: {e}"
@@ -670,8 +679,10 @@ def _run_comparator(
     return subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
 
-_RANK_TAG_RE = re.compile(r"___rank=(\d+)___")
+_RANK_TAG_RE = re.compile(r"(?:^|___)rank=(\d+)(?:___|$)")
 _NAME_TAG_RE = re.compile(r"(?:^|___)name=(.*?)(?:___|$)")
+_STEP_TAG_RE = re.compile(r"(?:^|___)step=(-?\d+)(?:___|$)")
+_DUMP_INDEX_TAG_RE = re.compile(r"(?:^|___)dump_index=(\d+)(?:___|$)")
 _LAYER_INPUT_RE = re.compile(r"^non_intrusive__model\.layers\.(\d+)\.inputs\.1$")
 _ATTN_INPUT_RE = re.compile(
     r"^non_intrusive__model\.layers\.(\d+)\.self_attn\.inputs\.hidden_states$"
@@ -685,13 +696,20 @@ def _assert_fused_tp_layout(dump_dir: Path, *, tp_size: int) -> None:
     partial_bundles: set[str] = set()
     for path in sorted(dump_dir.glob("*.pt")):
         name_match = _NAME_TAG_RE.search(path.stem)
-        rank_match = _RANK_TAG_RE.search(path.name)
-        if name_match is None or rank_match is None:
+        rank_match = _RANK_TAG_RE.search(path.stem)
+        step_match = _STEP_TAG_RE.search(path.stem)
+        index_match = _DUMP_INDEX_TAG_RE.search(path.stem)
+        if None in (name_match, rank_match, step_match, index_match):
             continue
         name = name_match.group(1)
         if not (_LAYER_INPUT_RE.match(name) or _ATTN_INPUT_RE.match(name)):
             continue
-        bundle = _RANK_TAG_RE.sub("___rank=*___", path.name)
+        # Bundle = the same tensor across ranks. Key on the parsed tags, not on
+        # a rank-masked filename: the dumper appends per-rank parallel tags
+        # under include_parallel_rank_in_filename, and those would survive the
+        # mask and split every bundle into one rank each. dump_index stays in
+        # the key so a name dumped more than once in a step is not collapsed.
+        bundle = f"step={step_match.group(1)}___dump_index={index_match.group(1)}___name={name}"
         names_by_bundle[bundle] = name
         ranks_by_bundle.setdefault(bundle, set()).add(int(rank_match.group(1)))
         raw = torch.load(path, weights_only=False, map_location="cpu")
