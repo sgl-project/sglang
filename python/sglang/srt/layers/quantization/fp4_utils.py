@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils.common import (
     get_device_capability,
     is_cuda,
@@ -146,7 +147,7 @@ def initialize_fp4_gemm_config(server_args: ServerArgs) -> None:
     """Initialize FP4 GEMM configuration from server args."""
     global FP4_GEMM_RUNNER_BACKEND
 
-    backend = server_args.fp4_gemm_runner_backend
+    backend = get_exec().kernel.fp4_gemm_runner_backend
     if backend == "auto":
         if is_sm100_supported():
             backend = "flashinfer_cutedsl"
