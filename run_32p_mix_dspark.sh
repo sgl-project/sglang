@@ -75,6 +75,11 @@ do
         # Keep the pre-quantized shared-AG experiment opt-in: it was not part
         # of the validated combination and regressed the critical path.
         export SGLANG_NPU_QUANT_SHARED_AG=${SGLANG_NPU_QUANT_SHARED_AG:-0}
+        # Preserve the validated K3 stream-overlap paths. Both paths also
+        # check the NPU backend and K3 tensor layout before enabling, so this
+        # launch default cannot alter CUDA/GPU execution.
+        export SGLANG_NPU_K3_FRONT_OVERLAP=${SGLANG_NPU_K3_FRONT_OVERLAP:-1}
+        export SGLANG_NPU_K3_BFA_OVERLAP=${SGLANG_NPU_K3_BFA_OVERLAP:-1}
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_RAGGED_VERIFY_MODE=${SGLANG_RAGGED_VERIFY_MODE:-static}
