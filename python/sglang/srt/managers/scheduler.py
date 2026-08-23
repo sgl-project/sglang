@@ -25,7 +25,7 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import Any, Deque, Dict, List, Optional, Tuple, Union
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
@@ -4051,6 +4051,15 @@ class Scheduler(
         barrier(group=self.tp_group.cpu_group)
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
+    def collect_inflight_reqs(self) -> Set[Req]:
+        if self.ps.pp_size == 1:
+            inflight_batches = [self.running_batch, self.last_batch]
+        else:
+            inflight_batches = [*self.running_mbs, *self.mbs]
+        return {
+            req for batch in inflight_batches if batch is not None for req in batch.reqs
+        }
+
     def abort_request(self, recv_req: AbortReq):
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
@@ -4167,13 +4176,7 @@ class Scheduler(
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
         # Delete requests in the running batch
-        if self.ps.pp_size == 1:
-            inflight_batches = [self.running_batch, self.last_batch]
-        else:
-            inflight_batches = [*self.running_mbs, *self.mbs]
-
-        inflight_reqs = {r for b in inflight_batches if b is not None for r in b.reqs}
-        for req in inflight_reqs:
+        for req in self.collect_inflight_reqs():
             if not req.finished() and (
                 recv_req.abort_all or req.rid.startswith(recv_req.rid)
             ):
