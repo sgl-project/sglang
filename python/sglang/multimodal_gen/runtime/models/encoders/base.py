@@ -158,6 +158,9 @@ class EncoderTensorParallelMixin:
     """Keep an encoder on the TP group that was used to build its shards."""
 
     _encoder_tp_group: GroupCoordinator | None = None
+    # Some encoders own checkpoint quantization end to end because their weight
+    # states or sharding contract cannot use the generic loader lifecycle.
+    manages_checkpoint_quantization = False
 
     def bind_encoder_tp_group(self, tp_group: GroupCoordinator) -> None:
         self._encoder_tp_group = tp_group
@@ -179,9 +182,6 @@ class TextEncoder(
     # Qwen2_5_VLCausalLMOutputWithPast). Off by default so a new encoder is
     # replicated rather than silently broken; flip it once dp is verified there.
     supports_dp_encode = False
-    # Quantized checkpoints are opt-in because an encoder must construct
-    # quantized linears and load the checkpoint's auxiliary scale parameters.
-    supported_checkpoint_quantization_methods: frozenset[str] = frozenset()
     # Some encoders own checkpoint quantization end to end because their weight
     # states or sharding contract cannot use the generic loader lifecycle.
     manages_checkpoint_quantization = False
