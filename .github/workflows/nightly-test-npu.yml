@@ -137,7 +137,6 @@ jobs:
       install_sglang_deps: false
       device_type_for_deps: '910b'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-      test_timeout_minutes: '180'
 
   nightly-1-npu-a3:
     name: nightly-1-npu-a3
@@ -231,7 +230,6 @@ jobs:
       install_sglang_deps: false
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-      test_timeout_minutes: '180'
 
   nightly-perf-4-npu-a3:
     name: nightly-perf-4-npu-a3
@@ -248,7 +246,6 @@ jobs:
       install_sglang_deps: false
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-      test_timeout_minutes: '180'
 
   nightly-perf-8-npu-a3:
     name: nightly-perf-8-npu-a3
@@ -265,7 +262,6 @@ jobs:
       install_sglang_deps: false
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-      test_timeout_minutes: '180'
 
   nightly-perf-16-npu-a3:
     name: nightly-perf-16-npu-a3
@@ -301,7 +297,6 @@ jobs:
       install_sglang_deps: false
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-      test_timeout_minutes: '180'
 
   nightly-acc-4-npu-a3:
     name: nightly-acc-4-npu-a3
@@ -318,7 +313,6 @@ jobs:
       install_sglang_deps: false
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-      test_timeout_minutes: '180'
 
   nightly-acc-16-npu-a3:
     name: nightly-acc-16-npu-a3
@@ -335,7 +329,6 @@ jobs:
       install_sglang_deps: false
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-      test_timeout_minutes: '180'
 
   nightly-poc-multi-node-tests:
     name: multi-node-poc
@@ -398,7 +391,6 @@ jobs:
       prefill_decode_deployment: ${{ matrix.test_config.prefill_decode_deployment }}
       transformers_version: ''
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-      test_timeout_minutes: '180'
 
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
@@ -435,7 +427,6 @@ jobs:
       prefill_decode_deployment: 'mix'
       transformers_version: ''
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-      test_timeout_minutes: '180'
 
   check-all-jobs:
     if: ${{ !cancelled() }}
