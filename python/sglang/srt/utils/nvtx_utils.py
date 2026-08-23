@@ -39,14 +39,30 @@ logger = logging.getLogger(__name__)
 _SCHEDULER_NVTX = envs.SGLANG_ENABLE_NVTX_SCHEDULER.get()
 _OPERATIONS_NVTX = envs.SGLANG_ENABLE_NVTX_OPERATIONS.get()
 
+
+class _TorchNvtxAdapter:
+    """Provide the small ``nvtx.annotate`` surface using PyTorch's NVTX API."""
+
+    @staticmethod
+    @contextmanager
+    def annotate(debug_name: str, color: Optional[str] = None):
+        del color
+        torch.cuda.nvtx.range_push(debug_name)
+        try:
+            yield
+        finally:
+            torch.cuda.nvtx.range_pop()
+
+
 _nvtx_module = None
 if _SCHEDULER_NVTX or _OPERATIONS_NVTX:
     try:
         import nvtx as _nvtx_module  # type: ignore
     except ImportError:
+        _nvtx_module = _TorchNvtxAdapter
         logger.warning(
             "An SGLANG_ENABLE_NVTX_* flag is set, but the `nvtx` package is "
-            "missing. NVTX markers are disabled; torch profiler spans still emit."
+            "missing. Falling back to torch.cuda.nvtx."
         )
 
 NVTX_AVAILABLE = _nvtx_module is not None
