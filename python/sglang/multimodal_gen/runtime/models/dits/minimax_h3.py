@@ -273,8 +273,7 @@ def _modulate_scale_shift(
     """Apply indexed affine modulation, reusing disposable CUDA BF16 input."""
     # Apply per-index affine modulation: x * (1 + scale[idx]) + shift[idx].
     if (
-        (current_platform.is_cuda() or current_platform.is_rocm())
-        and x.is_cuda
+        x.is_cuda
         and x.dtype == _BF16_DTYPE
         and dtype == _BF16_DTYPE
         and shift.dtype == _BF16_DTYPE
@@ -299,8 +298,7 @@ def _modulate_gate(
     """Apply an indexed gated residual, optionally reusing the input buffer."""
     # Apply the per-index gated residual: x + gate[idx] * other.
     if (
-        (current_platform.is_cuda() or current_platform.is_rocm())
-        and x.is_cuda
+        x.is_cuda
         and x.dtype == _BF16_DTYPE
         and dtype == _BF16_DTYPE
         and gate.dtype == _BF16_DTYPE
@@ -317,7 +315,6 @@ def _modulate_gate(
 def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
     if (
         reuse_input
-        and (current_platform.is_cuda() or current_platform.is_rocm())
         and hidden.is_cuda
         and hidden.dtype == _BF16_DTYPE
         and hidden.is_contiguous()
@@ -336,8 +333,7 @@ def _apply_qk_norm(
     head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if (
-        (current_platform.is_cuda() or current_platform.is_rocm())
-        and q.is_cuda
+        q.is_cuda
         and q.dtype == _BF16_DTYPE
         and q.dtype == k.dtype == q_norm.weight.dtype == k_norm.weight.dtype
         and q.stride(-1) == k.stride(-1) == 1
@@ -417,7 +413,7 @@ def _apply_rope_qk(
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if not (current_platform.is_cuda() or current_platform.is_rocm()) or not q.is_cuda:
+    if not q.is_cuda:
         half = cos_sin_cache.shape[-1] // 2
         cos_half, sin_half = cos_sin_cache.split(half, dim=-1)
         cos = torch.cat((cos_half, cos_half), dim=-1).unsqueeze(1)
@@ -542,6 +538,7 @@ def _minimax_h3_attention_core_impl(
                 attention_requirements=AttentionRequirements(packed_varlen=True),
             )
         )
+
     if ring_active:
         ring_ws, _ = get_ring_ctx()
         if attention._attention_backend_enum is not AttentionBackendEnum.FA:
