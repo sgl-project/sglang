@@ -7,18 +7,14 @@ from sglang.multimodal_gen.configs.models.vaes.base import VAEArchConfig, VAECon
 
 @dataclass
 class HunyuanImage3VAEArchConfig(VAEArchConfig):
-    """VAE architecture配置 for HunyuanImage-3."""
 
     spatial_compression_ratio: int = 16
-
-    # VAE architecture params (from HF config)
     block_out_channels: tuple[int, ...] = (128, 256, 512, 1024, 1024)
     layers_per_block: int = 2
     latent_channels: int = 32
     in_channels: int = 3
     out_channels: int = 3
 
-    # Scaling factors
     scaling_factor: float = 0.562679178327931
     ffactor_spatial: int = 16
     ffactor_temporal: int = 4
@@ -28,10 +24,8 @@ class HunyuanImage3VAEArchConfig(VAEArchConfig):
     latents_std: tuple[float, ...] | None = None
     shift_factor: float | None = None
 
-    # Temporal downsampling
     temperal_downsample: tuple[bool, ...] = (False, True, True)
 
-    # Other params
     is_residual: bool = False
     patch_size: int | None = None
     clip_output: bool = True
@@ -39,7 +33,6 @@ class HunyuanImage3VAEArchConfig(VAEArchConfig):
 
 @dataclass
 class HunyuanImage3VAEConfig(VAEConfig):
-    """VAE config for HunyuanImage-3."""
 
     arch_config: HunyuanImage3VAEArchConfig = field(
         default_factory=HunyuanImage3VAEArchConfig
