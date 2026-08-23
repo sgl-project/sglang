@@ -92,6 +92,10 @@ class TRTLLMMHAMetadata:
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: torch.Tensor = None
     is_ragged_verify: bool = False
+    # XQA speculative decode consumes a q-only, bit-packed causal mask.  Each
+    # row has an even number of uint16 words (32-bit aligned), matching
+    # FlashInfer's ``mask`` ABI.
+    xqa_mask: torch.Tensor = None
     # ENCODER_ONLY target-verify (bidirectional attention over the window):
     # bs*L single-token decode rows whose kv length spans the whole window,
     # so each token attends the full window despite the causal decode kernel.
@@ -673,6 +677,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
             self.draft_extend_metadata[bs] = metadata
 
+        if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
+            metadata.xqa_mask = self._build_xqa_causal_mask(
+                num_tokens=num_tokens,
+                max_q_len=metadata.max_seq_len_q,
+                device=device,
+                cu_seqlens_q=(
+                    metadata.cu_seqlens_q if metadata.is_ragged_verify else None
+                ),
+            )
+
         # Bind the SWA write-target buffer slice (refilled by in-graph metadata).
         if self.use_sliding_window_kv_pool:
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
@@ -886,11 +900,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
     def _assert_ragged_verify_supported(self) -> None:
-        if self.is_xqa_impl:
+        # FlashInfer >= 0.6.17 supports packed ragged Q in XQA through
+        # q_cu_seq_lens.  TRTLLM-MHA's speculative integration remains top-k-1,
+        # so its query-only mask is the causal mask built below.
+        if self.topk > 1:
             raise NotImplementedError(
-                "Compact ragged verify (variable-length cum_seq_lens_q) "
-                "requires the trtllm-gen decode kernel; the xqa impl (sm90 / sm120) "
-                "rejects it. Disable SGLANG_RAGGED_VERIFY_MODE for this configuration."
+                "TRTLLM MHA ragged verify currently supports speculative top-k 1 only."
             )
 
     def _write_ragged_verify_graph_metadata(
@@ -918,6 +933,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         metadata.cu_seqlens_k[1:].copy_(
             torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
         )
+        if metadata.xqa_mask is not None:
+            packed_mask = self._build_xqa_causal_mask(
+                num_tokens=metadata.xqa_mask.shape[0],
+                max_q_len=metadata.max_seq_len_q,
+                device=metadata.cache_seqlens_int32.device,
+                cu_seqlens_q=metadata.cu_seqlens_q,
+            )
+            assert (
+                packed_mask is not None and packed_mask.shape == metadata.xqa_mask.shape
+            )
+            metadata.xqa_mask.copy_(packed_mask)
         self._fill_page_table_device(
             metadata, req_pool_indices, metadata.cache_seqlens_int32
         )
@@ -1032,6 +1058,24 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else:
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
+            if self.decode_uses_native_fp4 and self._is_legacy_draft_extend(
+                forward_batch
+            ):
+                metadata.is_ragged_verify = any(
+                    length != metadata.max_seq_len_q
+                    for length in forward_batch.extend_seq_lens_cpu
+                )
+
+        if self._uses_spec_decode_kernel(forward_batch):
+            metadata.xqa_mask = self._build_xqa_causal_mask(
+                num_tokens=forward_batch.input_ids.shape[0],
+                max_q_len=metadata.max_seq_len_q,
+                device=device,
+                cu_seqlens_q=(
+                    metadata.cu_seqlens_q if metadata.is_ragged_verify else None
+                ),
+            )
+
         has_swa = self._swa_kv_pool is not None
         metadata.page_table = torch.empty(
             (batch_size, self.max_num_pages), dtype=torch.int32, device=device
@@ -1103,10 +1147,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         sinks: Optional[torch.Tensor],
         q_len_per_req: int = 1,
         kv_cache_sf=None,
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run decode, optionally sorting and splitting requests by KV length."""
 
-        def run_group(group_query, group_block_tables, group_seq_lens):
+        def run_group(group_query, group_block_tables, group_seq_lens, group_mask):
             kwargs = {}
             if q_len_per_req != 1:
                 kwargs["q_len_per_req"] = q_len_per_req
@@ -1124,6 +1169,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
                 out_dtype=self.q_data_type,
                 kv_cache_sf=kv_cache_sf,
+                mask=group_mask,
                 multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 **kwargs,
             )
@@ -1131,7 +1177,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         num_requests = seq_lens.shape[0]
         num_splits = min(self.decode_seq_len_splits, num_requests)
         if num_splits == 1:
-            return run_group(query, block_tables, seq_lens)
+            return run_group(query, block_tables, seq_lens, mask)
 
         order = torch.argsort(seq_lens)
         query_by_request = query.view(
@@ -1142,6 +1188,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             dtype=self.q_data_type,
             device=query.device,
         )
+        mask_by_request = (
+            mask.view(num_requests, q_len_per_req, *mask.shape[1:])
+            if mask is not None
+            else None
+        )
         for indices in torch.tensor_split(order, num_splits):
             group_output = run_group(
                 query_by_request.index_select(0, indices).reshape(
@@ -1149,6 +1200,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ),
                 block_tables.index_select(0, indices),
                 seq_lens.index_select(0, indices),
+                (
+                    mask_by_request.index_select(0, indices).reshape(
+                        -1, *mask.shape[1:]
+                    )
+                    if mask_by_request is not None
+                    else None
+                ),
             )
             output_by_request.index_copy_(
                 0,
@@ -1157,7 +1215,67 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
         return output_by_request.view(-1, query.shape[-2], query.shape[-1])
 
-    def _get_nvfp4_decode_kv_cache(self, layer: RadixAttention) -> tuple[
+    @staticmethod
+    def _build_xqa_causal_mask(
+        *,
+        num_tokens: int,
+        max_q_len: int,
+        device: torch.device | str,
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Build FlashInfer XQA's bit-packed causal mask for top-k-1 spec decode.
+
+        XQA stores 16 query-column bits per uint16 and requires every row to be
+        aligned to 32 bits.  Uniform queries use ``row % max_q_len``; ragged
+        queries derive the request-local row from their device-side indptr.
+        """
+        if max_q_len <= 1:
+            return None
+
+        row_ids = torch.arange(num_tokens, dtype=torch.int64, device=device)
+        if cu_seqlens_q is None:
+            local_rows = row_ids.remainder(max_q_len)
+        else:
+            request_ids = torch.bucketize(
+                row_ids, cu_seqlens_q[1:], right=True
+            ).clamp_max(cu_seqlens_q.numel() - 2)
+            local_rows = row_ids - cu_seqlens_q[request_ids].to(torch.int64)
+
+        words_per_row = ((max_q_len + 31) // 32) * 2
+        bit_columns = torch.arange(words_per_row * 16, dtype=torch.int64, device=device)
+        bit_values = torch.bitwise_left_shift(
+            torch.ones_like(bit_columns), bit_columns.remainder(16)
+        )
+        return (
+            ((bit_columns.unsqueeze(0) <= local_rows.unsqueeze(1)) * bit_values)
+            .view(num_tokens, words_per_row, 16)
+            .sum(dim=-1)
+            .to(torch.uint16)
+            .contiguous()
+        )
+
+    @staticmethod
+    def _is_legacy_draft_extend(forward_batch: ForwardBatch) -> bool:
+        spec_info = getattr(forward_batch, "spec_info", None)
+        return (
+            forward_batch.forward_mode == ForwardMode.EXTEND
+            and spec_info is not None
+            and spec_info.is_draft_input()
+        )
+
+    def _uses_spec_decode_kernel(self, forward_batch: ForwardBatch) -> bool:
+        return (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+            or (
+                self.decode_uses_native_fp4
+                and self._is_legacy_draft_extend(forward_batch)
+            )
+        )
+
+    def _get_nvfp4_decode_kv_cache(
+        self, layer: RadixAttention
+    ) -> tuple[
         tuple[torch.Tensor, torch.Tensor],
         tuple[torch.Tensor, torch.Tensor],
     ]:
@@ -1269,9 +1387,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         save_kv_cache=True,
         **kwargs,
     ):
-        if self.decode_uses_native_fp4:
+        is_decode_mode = self._uses_spec_decode_kernel(forward_batch)
+        if self.decode_uses_native_fp4 and not is_decode_mode:
             raise RuntimeError(
-                "TRTLLM MHA with native FP4 KV cache supports decode only; "
+                "TRTLLM MHA with native FP4 KV cache supports decode "
+                "(including speculative verify and draft-extend) only; "
                 "use a separate prefill backend such as flashinfer or triton."
             )
 
@@ -1311,8 +1431,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                         KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
                         k,
                         v,
-                        layer.k_scale,
-                        layer.v_scale,
+                        *self._kv_write_scales(layer),
                     )
 
         q_scale = 1.0
@@ -1331,31 +1450,39 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         else:
             q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
 
-        # NHD layout (native pool format): [num_pages, page_size, num_kv_heads, head_dim]
-        k_cache_raw, v_cache_raw = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-
-        is_decode_mode = (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
-        )
-
-        if not self.use_fmha_v2 or is_decode_mode:
-            # Decode and SM100 batch_context kernels require HND layout.
-            k_cache, v_cache = self._reshape_paged_kv_cache(
-                k_cache_raw, v_cache_raw, layer, layer.head_dim
-            )
+        if self.is_nvfp4_kvcache:
+            kv_cache, kv_cache_block_scales = self._get_nvfp4_decode_kv_cache(layer)
         else:
-            k_cache = k_cache_raw.view(
-                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-            )
-            v_cache = v_cache_raw.view(
-                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+            # NHD layout (native pool format):
+            # [num_pages, page_size, num_kv_heads, head_dim]
+            k_cache_raw, v_cache_raw = self.token_to_kv_pool.get_kv_buffer(
+                layer.layer_id
             )
 
-        kv_cache = (k_cache, v_cache)
+            if not self.use_fmha_v2 or is_decode_mode:
+                # Decode and SM100 batch_context kernels require HND layout.
+                k_cache, v_cache = self._reshape_paged_kv_cache(
+                    k_cache_raw, v_cache_raw, layer, layer.head_dim
+                )
+            else:
+                k_cache = k_cache_raw.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+                )
+                v_cache = v_cache_raw.view(
+                    -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+                )
+
+            kv_cache = (k_cache, v_cache)
+            kv_cache_block_scales = None
+
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
-        bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
+        if self.is_nvfp4_kvcache:
+            k_scale, v_scale = self._get_nvfp4_bmm_scales(layer)
+            bmm1_scale = q_scale * k_scale * layer.scaling
+            bmm2_scale = v_scale
+        else:
+            bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
 
         page_table = self._get_layer_page_table(layer, forward_batch)
 
@@ -1369,8 +1496,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 # run bs*L single-token rows over the full window instead (the
                 # window's K/V are already in the pool).
                 assert not self.forward_metadata.is_ragged_verify, (
-                    "ENCODER_ONLY target_verify does not support ragged "
-                    "verify layouts"
+                    "ENCODER_ONLY target_verify does not support ragged verify layouts"
                 )
                 assert self.forward_metadata.encoder_cache_seqlens is not None, (
                     "ENCODER_ONLY target_verify requires the expanded decode "
@@ -1390,9 +1516,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
                     out_dtype=self.q_data_type,
                     q_len_per_req=1,
+                    kv_cache_sf=kv_cache_block_scales,
                     multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 )
-            elif self.forward_metadata.is_ragged_verify:
+            elif (
+                self.forward_metadata.is_ragged_verify
+                and self.forward_metadata.max_seq_len_q > 1
+            ):
                 o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                     query=q,
                     kv_cache=kv_cache,
@@ -1406,9 +1536,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     sinks=attention_sink,
                     skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
                     out_dtype=self.q_data_type,
-                    q_len_per_req=None,
-                    max_q_len=self.forward_metadata.max_seq_len_q,
-                    cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
+                    q_len_per_req=self.forward_metadata.max_seq_len_q,
+                    q_cu_seq_lens=self.forward_metadata.cu_seqlens_q,
+                    mask=self.forward_metadata.xqa_mask,
+                    kv_cache_sf=kv_cache_block_scales,
                     multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 )
             else:
@@ -1422,6 +1553,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     window_left=layer.sliding_window_size,
                     sinks=attention_sink,
                     q_len_per_req=self.forward_metadata.max_seq_len_q,
+                    kv_cache_sf=kv_cache_block_scales,
+                    mask=self.forward_metadata.xqa_mask,
                 )
         elif self.use_fmha_v2 and not cp_v2_active:
             # CP-v2 must go through cp_strategy.run_attention (per-shard
@@ -1509,6 +1642,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     cu_seqlens_kv=self.forward_metadata.cu_seqlens_k,
                     out=out,
                 )
+
+        if self.is_nvfp4_kvcache and o.dtype != self.q_data_type:
+            o = o.to(self.q_data_type)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
