@@ -149,6 +149,58 @@ def test_kda_prefill_cake_matches_triton(num_heads, seq_lens):
     )
 
 
+def test_kda_prefill_cake_matches_triton_across_2k_continuations():
+    chunk_size = 2048
+    num_chunks = 8
+    data = _make_inputs([chunk_size * num_chunks], 12)
+    chunk_cu_seqlens = torch.tensor(
+        [0, chunk_size], device="cuda", dtype=torch.int32
+    )
+
+    def run_continuations(kernel, state):
+        outputs = []
+        for chunk_idx in range(num_chunks):
+            start = chunk_idx * chunk_size
+            stop = start + chunk_size
+            chunk_data = {
+                **data,
+                "q": data["q"][:, start:stop],
+                "k": data["k"][:, start:stop],
+                # Triton aliases its output buffer to V.  Isolate every call
+                # so both backends consume the same frozen input corpus.
+                "v": data["v"][:, start:stop].clone(),
+                "g": data["g"][:, start:stop],
+                "beta": data["beta"][:, start:stop],
+                "cu_seqlens": chunk_cu_seqlens,
+            }
+            outputs.append(_extend(kernel, chunk_data, state, [chunk_size]))
+        return torch.cat(outputs, dim=1)
+
+    source_v = data["v"].clone()
+    state_ref = data["state"].clone()
+    output_ref = run_continuations(TritonKDAKernel(), state_ref)
+    state_cake = data["state"].clone()
+    with patch.object(
+        CakeKDAKernel,
+        "_extend_triton",
+        side_effect=AssertionError("2K continuations must stay on Cake"),
+    ):
+        output_cake = run_continuations(CakeKDAKernel(), state_cake)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        output_cake.float(), output_ref.float(), atol=1e-2, rtol=1e-2
+    )
+    selected = data["cache_indices"].long()
+    torch.testing.assert_close(
+        state_cake[selected].float(),
+        state_ref[selected].float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    assert torch.equal(data["v"], source_v)
+
+
 def test_kda_prefill_cake_aligned_tracking_is_bitwise_identical():
     seq_lens = [64, 128]
     data = _make_inputs(seq_lens, 12)
