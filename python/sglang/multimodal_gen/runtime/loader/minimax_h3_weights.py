@@ -63,7 +63,10 @@ def resolve_minimax_h3_checkpoint_quantization(
         )
         if config is None:
             raise ValueError("Could not resolve MiniMax-H3 NVFP4 checkpoint layout")
+        config.checkpoint_uses_comfy_quantization = True
         config.checkpoint_uses_native_qkv_layout = True
+        config.checkpoint_weight_scale_layout = "swizzled"
+        config.swap_weight_nibbles = True
         return config
     return resolve_comfy_checkpoint_quantization(layer_markers)
 

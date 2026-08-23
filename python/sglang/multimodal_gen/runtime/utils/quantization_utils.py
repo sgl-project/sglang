@@ -653,9 +653,6 @@ def _build_nvfp4_config_from_safetensors_files(
                 if isinstance(layer_cfg, dict) and layer_cfg.get("format") == "nvfp4"
             }
             file_quantized_modules.update(metadata_nvfp4_modules)
-            checkpoint_uses_comfy_quant = checkpoint_uses_comfy_quant or bool(
-                metadata_nvfp4_modules
-            )
 
         tensor_metadata = _read_safetensors_tensor_metadata(file_path)
         with safe_open(file_path, framework="pt", device="cpu") as f:

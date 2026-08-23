@@ -978,6 +978,16 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertTrue(config.load_in_4bit)
 
     def test_nvfp4_safetensors_inference_ignores_fp8_fallback_scales(self):
+        metadata = {
+            "_quantization_metadata": json.dumps(
+                {
+                    "format_version": "1.0",
+                    "layers": {
+                        "layers.0.attention.qkv": {"format": "nvfp4"},
+                    },
+                }
+            )
+        }
         with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
             save_file(
                 {
@@ -1000,6 +1010,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                     ),
                 },
                 f.name,
+                metadata=metadata,
             )
 
             config = build_nvfp4_config_from_safetensors_list([f.name])
@@ -1010,6 +1021,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertNotIn("layers.0.attention.qkv", config.exclude_modules)
         self.assertEqual(config.checkpoint_weight_scale_layout, "linear")
         self.assertFalse(config.swap_weight_nibbles)
+        self.assertFalse(config.checkpoint_uses_comfy_quantization)
 
     def test_nvfp4_safetensors_inference_uses_comfy_checkpoint_layout(self):
         with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
@@ -1106,6 +1118,8 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertIn("blocks.0.mlp.fc1", config.exclude_modules)
         self.assertTrue(config.checkpoint_uses_comfy_quantization)
         self.assertTrue(config.checkpoint_uses_native_qkv_layout)
+        self.assertEqual(config.checkpoint_weight_scale_layout, "swizzled")
+        self.assertTrue(config.swap_weight_nibbles)
 
     def test_builder_adds_diffusers_quant_type_for_nvfp4(self):
         updated = _updated_quant_config(
