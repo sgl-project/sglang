@@ -503,6 +503,22 @@ class ServerArgs:
         ``--speculative-draft-load-format`` needs its own transfer engine."""
         return remote_instance_transfer_engine_of(resolving_view(self), load_format)
 
+    def needs_engine_info_bootstrap(self) -> bool:
+        """Whether this node (rank 0) hosts the EngineInfoBootstrapServer."""
+        return (
+            resolving_view(
+                self
+            ).remote_instance_weight_loader_start_seed_via_transfer_engine
+            or self.enable_engine_info_bootstrap
+        )
+
+    def registers_parallelism_config(self) -> bool:
+        """Whether this rank publishes its parallelism config to the bootstrap server."""
+        return (
+            self.remote_instance_weight_loader_use_transfer_engine()
+            or self.enable_engine_info_bootstrap
+        )
+
 
 # The namespaces whose *input* fields make up the record. A namespace declares
 # its input and derived fields side by side; only the input half is collected,

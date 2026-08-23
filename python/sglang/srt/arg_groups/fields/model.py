@@ -326,6 +326,14 @@ class Model(msgspec.Struct):
         bool,
         "Start seed server via transfer engine backend for remote instance weight loader.",
     ] = False
+    enable_engine_info_bootstrap: A[
+        bool,
+        "Start the EngineInfoBootstrapServer and register per-rank parallelism config, without the mooncake/verbs P2P transfer-engine seeding.",
+    ] = False
+    enable_rdt_weight_sync: A[
+        bool,
+        "Expose SchedulerActor.pull_weights for RDT (Ray Direct Transport / NIXL) weight sync. Requires --use-ray; implies --enable-engine-info-bootstrap.",
+    ] = False
     engine_info_bootstrap_port: A[
         int,
         "Port for the engine info bootstrap server. Default is 6789. Must be set explicitly when running multiple instances on the same node.",

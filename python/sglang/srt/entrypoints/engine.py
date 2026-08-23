@@ -243,10 +243,6 @@ class Engine(EngineScoreMixin, EngineBase):
     run_scheduler_process_func: Callable = staticmethod(run_scheduler_process)
     run_detokenizer_process_func: Callable = staticmethod(run_detokenizer_process)
 
-    # Backend-specific launch handle: the Ray engine schedules its actors onto a
-    # placement group. Not config — a live cluster object.
-    _placement_group = None
-
     def __init__(self, **kwargs):
         """
         The arguments of this function is the same as `sglang/srt/server_args.py::ServerArgs`.
@@ -306,7 +302,6 @@ class Engine(EngineScoreMixin, EngineBase):
             init_tokenizer_manager_func=self.init_tokenizer_manager_func,
             run_scheduler_process_func=self.run_scheduler_process_func,
             run_detokenizer_process_func=self.run_detokenizer_process_func,
-            placement_group=self._placement_group,
         )
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
@@ -852,8 +847,6 @@ class Engine(EngineScoreMixin, EngineBase):
         server_args: ServerArgs,
         port_args: PortArgs,
         run_scheduler_process_func: Callable,
-        *,
-        placement_group=None,
     ) -> Tuple[SchedulerInitResult, Optional[List]]:
         """Launch scheduler processes using multiprocessing.
         Override in subclasses for different backends (e.g. Ray).
@@ -1058,7 +1051,6 @@ class Engine(EngineScoreMixin, EngineBase):
         run_scheduler_process_func: Callable,
         run_detokenizer_process_func: Callable,
         port_args: Optional[PortArgs] = None,
-        placement_group=None,
     ) -> Tuple[
         TokenizerManager,
         TemplateManager,
@@ -1114,7 +1106,7 @@ class Engine(EngineScoreMixin, EngineBase):
             # Start the engine info bootstrap server if per-rank info is needed.
             engine_info_bootstrap_server = None
             if (
-                get_model().remote_instance_weight_loader_start_seed_via_transfer_engine
+                server_args.needs_engine_info_bootstrap()
                 and get_parallel().node_rank == 0
             ):
                 bootstrap_port = get_model().engine_info_bootstrap_port
@@ -1140,13 +1132,8 @@ class Engine(EngineScoreMixin, EngineBase):
             raise
 
         # Launch scheduler processes
-        # Passed only when there is one: this hook is an override point, and a
-        # subclass written against the three-argument signature must keep working.
-        launch_kwargs = (
-            {"placement_group": placement_group} if placement_group is not None else {}
-        )
         scheduler_init_result, scheduler_procs = cls._launch_scheduler_processes(
-            server_args, port_args, run_scheduler_process_func, **launch_kwargs
+            server_args, port_args, run_scheduler_process_func
         )
         scheduler_init_result.engine_info_bootstrap_server = (
             engine_info_bootstrap_server
