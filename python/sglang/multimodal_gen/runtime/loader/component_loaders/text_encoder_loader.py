@@ -27,6 +27,13 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     LinearBase,
     UnquantizedLinearMethod,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import ComfyFp8Config
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+    QuantizationConfig,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
+    KitchenInt8Config,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
     ComponentLoader,
@@ -34,6 +41,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     uses_native_transformers_bnb4,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
+    get_param_names_mapping,
     set_default_torch_dtype,
     skip_init_modules,
 )
@@ -65,6 +73,8 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     get_quant_config,
     get_quant_config_from_safetensors_metadata,
+    inspect_comfy_quant_markers,
+    resolve_comfy_checkpoint_quantization,
 )
 from sglang.multimodal_gen.runtime.weights.source import (
     materialize_weight,
@@ -104,6 +114,7 @@ def _get_encoder_quant_config(
     component_config: dict,
     component_model_path: str,
     component_weights_path: str,
+    model_cls: type[nn.Module] | None = None,
 ):
     quant_config = get_quant_config(component_config, component_model_path)
     if (
@@ -114,6 +125,27 @@ def _get_encoder_quant_config(
         quant_config = get_quant_config_from_safetensors_metadata(
             component_weights_path
         )
+    if quant_config is None and component_weights_path.endswith(".safetensors"):
+        name_mapper = None
+        if model_cls is not None:
+            mapping = vars(model_cls).get("param_names_mapping", {})
+            if mapping:
+                mapping_fn = get_param_names_mapping(mapping)
+
+                def name_mapper(name: str) -> str:
+                    mapped_name, merge_index, _ = mapping_fn(name)
+                    if merge_index is not None:
+                        raise ValueError(
+                            "Comfy quantized component weights cannot use a "
+                            "stacked parameter-name mapping"
+                        )
+                    return mapped_name
+
+        markers = inspect_comfy_quant_markers(
+            [component_weights_path],
+            param_name_mapper=name_mapper,
+        )
+        quant_config = resolve_comfy_checkpoint_quantization(markers)
     return quant_config
 
 
@@ -140,8 +172,9 @@ def _configure_encoder_quantization(
             component_config,
             component_model_path,
             component_weights_path,
+            model_cls,
         )
-    except (KeyError, TypeError, ValueError) as error:
+    except (KeyError, NotImplementedError, TypeError, ValueError) as error:
         raise ComponentCheckpointUnsupportedError(
             f"Cannot configure checkpoint quantization for {component_name!r}: {error}"
         ) from error
@@ -224,7 +257,7 @@ def _module_tensor_device(module: nn.Module) -> torch.device | None:
 
 def _process_quantized_encoder_weights(
     model: nn.Module,
-    process_device: torch.device,
+    process_device: torch.device | None,
     component_name: str,
 ) -> int:
     processed_layers = 0
@@ -236,7 +269,11 @@ def _process_quantized_encoder_weights(
             continue
 
         origin_device = _module_tensor_device(module)
-        should_stage = origin_device is not None and origin_device != process_device
+        should_stage = (
+            process_device is not None
+            and origin_device is not None
+            and origin_device != process_device
+        )
         if should_stage:
             module.to(process_device)
         try:
@@ -258,18 +295,27 @@ def _process_quantized_encoder_weights(
 def _require_quantized_encoder_layers(
     model: nn.Module,
     component_name: str,
+    quant_config: QuantizationConfig | None = None,
 ) -> None:
-    if any(
+    has_quantized_layers = any(
         isinstance(module, LinearBase)
         and module.quant_method is not None
         and not isinstance(module.quant_method, UnquantizedLinearMethod)
         for module in model.modules()
-    ):
-        return
-    raise ComponentCheckpointUnsupportedError(
-        f"The native {type(model).__name__} implementation does not construct "
-        f"quantized linear layers for {component_name!r}"
     )
+    if not has_quantized_layers:
+        raise ComponentCheckpointUnsupportedError(
+            f"The native {type(model).__name__} implementation does not construct "
+            f"quantized linear layers for {component_name!r}"
+        )
+    if isinstance(quant_config, (ComfyFp8Config, KitchenInt8Config)):
+        missing = set(quant_config.layer_markers) - set(quant_config.selected)
+        if missing:
+            raise ComponentCheckpointUnsupportedError(
+                f"The native {type(model).__name__} implementation did not consume "
+                f"Comfy quantization markers for {component_name!r}: "
+                f"{sorted(missing)[:5]}"
+            )
 
 
 def _checkpoint_bytes(model_path: str) -> int:
@@ -478,6 +524,12 @@ class TextEncoderLoader(ComponentLoader):
             Callable[[str], bool] | None,
             getattr(model, "should_materialize_checkpoint_weight", None),
         )
+
+        def include_checkpoint_weight(name: str) -> bool:
+            return not name.endswith(".comfy_quant") and (
+                key_filter is None or key_filter(name)
+            )
+
         primary_weights = TextEncoderLoader.Source(
             model_path,
             prefix="",
@@ -487,7 +539,7 @@ class TextEncoderLoader(ComponentLoader):
         yield from self._get_weights_iterator(
             primary_weights,
             to_cpu,
-            key_filter,
+            include_checkpoint_weight,
         )
 
         secondary_weights = cast(
@@ -498,7 +550,7 @@ class TextEncoderLoader(ComponentLoader):
             yield from self._get_weights_iterator(
                 source,
                 to_cpu,
-                key_filter,
+                include_checkpoint_weight,
             )
 
     def load_customized(
@@ -566,14 +618,23 @@ class TextEncoderLoader(ComponentLoader):
             encoder_index
         ]
         # TODO(will): add support for other dtypes
-        return self.load_model(
-            component_weights_path,
-            encoder_config,
-            server_args,
-            encoder_dtype,
-            component_starts_on_cpu=component_starts_on_cpu,
-            component_name=component_name,
-        )
+        try:
+            return self.load_model(
+                component_weights_path,
+                encoder_config,
+                server_args,
+                encoder_dtype,
+                component_starts_on_cpu=component_starts_on_cpu,
+                component_name=component_name,
+            )
+        except ComponentCheckpointUnsupportedError:
+            raise
+        except Exception as error:
+            if encoder_config.quant_config is None:
+                raise
+            raise ComponentCheckpointUnsupportedError(
+                f"Failed to load quantized native {component_name!r}: {error}"
+            ) from error
 
     @staticmethod
     def _extract_encoder_index(component_name: str) -> int:
@@ -689,7 +750,9 @@ class TextEncoderLoader(ComponentLoader):
             model.bind_encoder_tp_group(encoder_tp_group)
 
             if quant_config is not None:
-                _require_quantized_encoder_layers(model, component_name)
+                _require_quantized_encoder_layers(
+                    model, component_name, quant_config=quant_config
+                )
 
             if component_starts_on_cpu and (
                 current_platform.is_mps() or _keep_this_checkpoint_mapped(model_path)
@@ -713,9 +776,15 @@ class TextEncoderLoader(ComponentLoader):
             )
 
             if quant_config is not None:
+                postprocess_device: torch.device | None = local_torch_device
+                if (
+                    isinstance(quant_config, KitchenInt8Config)
+                    and quant_config.is_checkpoint_int8_serialized
+                ):
+                    postprocess_device = None
                 processed_layers = _process_quantized_encoder_weights(
                     model,
-                    local_torch_device,
+                    postprocess_device,
                     component_name,
                 )
                 logger.info(
