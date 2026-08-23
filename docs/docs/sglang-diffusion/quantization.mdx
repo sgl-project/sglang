@@ -51,10 +51,10 @@ repo contains multiple candidate checkpoints, pass
 `--transformer-weights-path` explicitly.
 
 MiniMax-H3 is a verified example for Comfy safetensors with per-layer metadata,
-including `pruned_fp8_scaled` and serialized ConvRot INT8. Pass one selected
-FL2VA or Ref2VA DiT file by local path, `owner/repo/path/file.safetensors`, or
-direct Hugging Face file URL; do not combine it with `--quantization`. Its GGUF
-usage is documented in
+including `pruned_fp8_scaled`, serialized ConvRot formats, and the official
+NVFP4-AWQ Qwen3-VL encoder. Pass one selected component file by local path,
+`owner/repo/path/file.safetensors`, or direct Hugging Face file URL; do not
+combine it with an explicit quantization option. Its GGUF usage is documented in
 the [MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#pre-quantized-gguf-transformer).
 
 ## Quantized Component Repositories
@@ -189,6 +189,14 @@ backend.
       <td>Native DiTs and encoders with matching parameter mappings; MiniMax-H3 FL2VA / Ref2VA DiTs and Qwen3-VL encoder layouts are recognized</td>
       <td><code>comfy-kitchen</code></td>
       <td>Auto-detected; omit <code>--quantization</code>. Each layer dispatches to its serialized W4A4 or INT8 ConvRot kernel. CUDA requires SM75+; TP must preserve each format's quantization and ConvRot group boundaries. Offload is supported and FSDP is not.</td>
+    </tr>
+    <tr>
+      <td><code>comfy-nvfp4-full-precision</code></td>
+      <td>Safetensors with serialized <code>nvfp4</code> and optional row-wise <code>int8_tensorwise</code> layer metadata</td>
+      <td><code>--component-paths.text_encoder</code></td>
+      <td>MiniMax-H3 native Qwen3-VL encoder</td>
+      <td>None</td>
+      <td>Auto-detected; omit explicit quantization. Preserves packed storage, high-nibble-first weights, swizzled block scales, and AWQ input pre-scales. Each active NVFP4 matrix is dequantized for BF16/FP16 compute, so this is a memory path rather than a native FP4 speed path.</td>
     </tr>
     <tr>
       <td><code>qvg-kv</code></td>
