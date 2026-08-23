@@ -46,6 +46,7 @@ def transfer_kv_mamba_pf_lf(
     layer_id: int,
     item_size: int,
     src_layout_dim: int,
+    dst_layout_dim: int,
     num_warps_per_item: int = 32,
 ):
     module = _jit_transfer_mamba_module()
@@ -57,6 +58,7 @@ def transfer_kv_mamba_pf_lf(
         layer_id,
         item_size,
         src_layout_dim,
+        dst_layout_dim,
     )
 
 
@@ -67,6 +69,7 @@ def transfer_kv_mamba_lf_pf(
     src_indices: torch.Tensor,
     dst_indices: torch.Tensor,
     item_size: int,
+    src_layout_dim: int,
     dst_layout_dim: int,
     num_layers: int,
     num_warps_per_item: int = 32,
@@ -78,6 +81,7 @@ def transfer_kv_mamba_lf_pf(
         src_indices,
         dst_indices,
         item_size,
+        src_layout_dim,
         dst_layout_dim,
         num_layers,
     )

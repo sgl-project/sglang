@@ -31,12 +31,24 @@ DTYPES = [torch.float16, torch.bfloat16]
 LAYOUTS = ["page_first", "page_first_direct"]
 
 
-def make_device_pool(dtype, device=DEVICE):
+def make_device_pool(dtype, device=DEVICE, request_major=False):
     """Create a minimal mock device pool that MambaPoolHost can use."""
-    temporal = torch.zeros(
-        (NUM_LAYERS, SIZE) + TEMPORAL_SHAPE, dtype=dtype, device=device
-    )
-    conv = [torch.zeros((NUM_LAYERS, SIZE) + CONV_SHAPE, dtype=dtype, device=device)]
+    if request_major:
+        temporal = torch.zeros(
+            (SIZE, NUM_LAYERS) + TEMPORAL_SHAPE, dtype=dtype, device=device
+        ).transpose(0, 1)
+        conv = [
+            torch.zeros(
+                (SIZE, NUM_LAYERS) + CONV_SHAPE, dtype=dtype, device=device
+            ).transpose(0, 1)
+        ]
+    else:
+        temporal = torch.zeros(
+            (NUM_LAYERS, SIZE) + TEMPORAL_SHAPE, dtype=dtype, device=device
+        )
+        conv = [
+            torch.zeros((NUM_LAYERS, SIZE) + CONV_SHAPE, dtype=dtype, device=device)
+        ]
 
     mamba_cache = SimpleNamespace(temporal=temporal, conv=conv)
     return SimpleNamespace(
@@ -46,7 +58,7 @@ def make_device_pool(dtype, device=DEVICE):
     )
 
 
-def make_host_pool(dtype, layout):
+def make_host_pool(dtype, layout, request_major=False):
     """Create a MambaPoolHost bypassing __init__, manually setting attributes.
 
     NOTE: If MambaPoolHost adds/renames attributes accessed by
@@ -86,7 +98,7 @@ def make_host_pool(dtype, layout):
     host._conv_can_use_jit = [False]
 
     # Device pointers (needed for backup kernel path)
-    device_pool = make_device_pool(dtype)
+    device_pool = make_device_pool(dtype, request_major=request_major)
     host.device_pool = device_pool
     host.temporal_device_ptrs = torch.tensor(
         [device_pool.mamba_cache.temporal[i].data_ptr() for i in range(NUM_LAYERS)],
@@ -200,9 +212,10 @@ def assert_device_matches_host(host, device_pool, host_indices, device_indices):
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("layout", LAYOUTS)
-def test_mamba_kernel_backup_load_roundtrip(dtype, layout):
+@pytest.mark.parametrize("request_major", [False, True])
+def test_mamba_kernel_backup_load_roundtrip(dtype, layout, request_major):
     """Test D2H backup + H2D load roundtrip with io_backend='kernel'."""
-    host = make_host_pool(dtype, layout)
+    host = make_host_pool(dtype, layout, request_major=request_major)
     assert_host_mock_complete(host)
     device_pool = host.device_pool
 

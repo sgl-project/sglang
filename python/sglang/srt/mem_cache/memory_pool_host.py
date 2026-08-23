@@ -368,6 +368,7 @@ class MambaPoolHost(HostKVCache):
                 layer_id=layer_id,
                 item_size=item_size,
                 src_layout_dim=item_size * num_layers,
+                dst_layout_dim=dst.stride(0) * dst.element_size(),
             )
         elif io_backend == "direct":
             transfer_kv_per_layer_direct_pf_lf(
@@ -409,6 +410,7 @@ class MambaPoolHost(HostKVCache):
                 src_indices=src_indices,
                 dst_indices=dst_indices,
                 item_size=item_size,
+                src_layout_dim=src_layers.stride(1) * src_layers.element_size(),
                 dst_layout_dim=item_size * num_layers,
                 num_layers=num_layers,
             )

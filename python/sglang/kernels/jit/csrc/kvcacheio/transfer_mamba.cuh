@@ -38,7 +38,7 @@ __launch_bounds__(kBlockSize, 1) void transfer_mamba_load_kernel(const __grid_co
 
     const char* src = params.src_base + src_page * params.src_layout_dim + params.layer_id * params.item_size;
 
-    char* dst = params.dst_base + dst_page * params.item_size;
+    char* dst = params.dst_base + dst_page * params.dst_layout_dim;
 
     const int64_t base = static_cast<int64_t>(tid) * kBytesPerThreadPerStep;
     if (base < params.item_size) {
@@ -66,7 +66,7 @@ __launch_bounds__(kBlockSize, 1) void transfer_mamba_backup_kernel(const __grid_
     const int64_t src_page = params.src_indices[item_id];
     const int64_t dst_page = params.dst_indices[item_id];
 
-    const char* src = reinterpret_cast<const char*>(params.layer_ptrs[layer_id]) + src_page * params.item_size;
+    const char* src = reinterpret_cast<const char*>(params.layer_ptrs[layer_id]) + src_page * params.src_layout_dim;
 
     char* dst = params.dst_base + dst_page * params.dst_layout_dim + layer_id * params.item_size;
 
@@ -93,7 +93,8 @@ struct TransferMambaKernel {
       const tvm::ffi::TensorView dst_indices,
       const int64_t layer_id,
       const int64_t item_size,
-      const int64_t src_layout_dim) {
+      const int64_t src_layout_dim,
+      const int64_t dst_layout_dim) {
     using namespace host;
 
     auto L = SymbolicSize{"num_indices"};
@@ -122,7 +123,7 @@ struct TransferMambaKernel {
         .dst_indices = static_cast<const int64_t*>(dst_indices.data_ptr()),
         .item_size = item_size,
         .src_layout_dim = src_layout_dim,
-        .dst_layout_dim = 0,
+        .dst_layout_dim = dst_layout_dim,
         .layer_id = layer_id,
         .num_items = num_items,
         .num_layers = 1,
@@ -138,6 +139,7 @@ struct TransferMambaKernel {
       const tvm::ffi::TensorView src_indices,
       const tvm::ffi::TensorView dst_indices,
       const int64_t item_size,
+      const int64_t src_layout_dim,
       const int64_t dst_layout_dim,
       const int64_t num_layers) {
     using namespace host;
@@ -174,7 +176,7 @@ struct TransferMambaKernel {
         .src_indices = static_cast<const int64_t*>(src_indices.data_ptr()),
         .dst_indices = static_cast<const int64_t*>(dst_indices.data_ptr()),
         .item_size = item_size,
-        .src_layout_dim = 0,
+        .src_layout_dim = src_layout_dim,
         .dst_layout_dim = dst_layout_dim,
         .layer_id = 0,
         .num_items = num_items,
