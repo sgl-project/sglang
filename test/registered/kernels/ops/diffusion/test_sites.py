@@ -27,6 +27,7 @@ import torch.nn.functional as F
 
 import sglang.kernels.ops.diffusion.sites.fused_gate_rmsnorm_site as gate_rmsnorm
 import sglang.kernels.ops.diffusion.sites.fused_linear_gelu_site as linear_gelu
+import sglang.kernels.ops.diffusion.sites.sana_video_linear_attention_site as sana_video_linear_attention
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     QualityGatedFusion,
@@ -410,6 +411,49 @@ def test_mounted_gelu_site_compiles_fullgraph():
     torch.testing.assert_close(
         torch.compile(site, fullgraph=True)(x), expected, atol=2e-2, rtol=2e-2
     )
+
+
+@requires_cuda
+@torch.no_grad()
+def test_sana_video_linear_attention_quality_path_and_guards():
+    torch.manual_seed(0)
+    site = nn.Module()
+    sana_video_linear_attention.mark_sana_video_linear_attention_site(site)
+    shape = (1, 4, 16, 128)
+    query = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    normalizer = torch.randn(
+        shape[0], shape[1], 1, shape[-1], device="cuda", dtype=torch.bfloat16
+    )
+
+    assert (
+        sana_video_linear_attention.try_sana_video_linear_attention(
+            site, query, key, value, normalizer
+        )
+        is None
+    )
+    assert sana_video_linear_attention.mount_sana_video_linear_attention(site)
+    output = sana_video_linear_attention.try_sana_video_linear_attention(
+        site, query, key, value, normalizer
+    )
+    reference = ((value.float() @ key.float().transpose(-1, -2)) @ query.float()) * (
+        normalizer
+    )
+    torch.testing.assert_close(output, reference, atol=1e-2, rtol=1e-2)
+
+    assert (
+        sana_video_linear_attention.try_sana_video_linear_attention(
+            site,
+            query.expand(2, -1, -1, -1),
+            key.expand(2, -1, -1, -1),
+            value.expand(2, -1, -1, -1),
+            normalizer.expand(2, -1, -1, -1),
+        )
+        is None
+    )
+    sana_video_linear_attention.unmount_sana_video_linear_attention(site)
+    assert not sana_video_linear_attention.sana_video_linear_attention_active(site)
 
 
 if __name__ == "__main__":

@@ -472,3 +472,37 @@ class FlashAttentionImpl(AttentionImpl):
             ver=fa_ver,
         )
         return output[0] if isinstance(output, tuple) else output
+
+    def forward_ring_kv_chunk(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one non-causal FlashAttention ring chunk with LSE output."""
+        cu_seqlens_q = torch.tensor(
+            [0, query.shape[0]], dtype=torch.int32, device=query.device
+        )
+        cu_seqlens_k = torch.tensor(
+            [0, key.shape[0]], dtype=torch.int32, device=key.device
+        )
+        result = flash_attn_varlen_func(
+            query,
+            key,
+            value,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=query.shape[0],
+            max_seqlen_k=key.shape[0],
+            softmax_scale=self.softmax_scale,
+            causal=False,
+            ver=fa_ver,
+            return_softmax_lse=True,
+        )
+        if not isinstance(result, tuple):
+            raise RuntimeError(
+                "FlashAttention did not return the softmax LSE required by ring "
+                "attention"
+            )
+        output, softmax_lse, *_ = result
+        return output, softmax_lse
