@@ -292,7 +292,59 @@ def declare_late_resolution(server_args: Any, source: str, **fields: Any) -> Non
         log = []
         object.__setattr__(server_args, "_runtime_mutations", log)
     log.append((source, dict(fields)))
+    stash = getattr(server_args, "_resolved_overrides", None)
+    if stash is None:
+        stash = []
+        object.__setattr__(server_args, "_resolved_overrides", stash)
+    stash.append((source, dict(fields)))
     _apply_fields(server_args, fields)
+
+
+def declare_direct_writes(
+    server_args: Any, source: str, resolve: Callable[[Any], Any]
+) -> Any:
+    """Run a resolver that writes the fields directly, and declare what it moved.
+
+    Returns whatever the resolver returned, so a provider with a return value
+    can go through the same capture.
+
+    Out-of-tree platform plugins are handed the record and set fields on it.
+    Their implementations live outside this tree, so they cannot be converted
+    by editing the resolver; and the raw snapshot is taken before the pipeline
+    starts, so a plugin's default is neither declared nor raw.
+
+    Rebinding is what the diff sees, and rebinding is all it needs to see: a
+    plugin that mutates a value in place reaches the projection anyway, because
+    the raw snapshot and the stash entries hold the same object it mutated.
+
+    A stand-in record (tests drive the hooks with a plain namespace) has no
+    fields to diff and no projection to feed, so the resolver runs uncaptured.
+    """
+    if not dataclasses.is_dataclass(server_args):
+        return resolve(server_args)
+    before = {
+        field.name: getattr(server_args, field.name)
+        for field in dataclasses.fields(server_args)
+    }
+    already = len(getattr(server_args, "_resolved_overrides", None) or ())
+    result = resolve(server_args)
+    stash = getattr(server_args, "_resolved_overrides", None)
+    if stash is None:
+        stash = []
+        object.__setattr__(server_args, "_resolved_overrides", stash)
+    # A resolver reached this way can also declare properly -- the in-tree
+    # implementations of these hooks do. Those fields are already explained, and
+    # recording them again would attribute them to the wrapper and bury an
+    # actual direct write among the echoes.
+    declared = {name for _source, fields in stash[already:] for name in fields}
+    changed = {
+        name: getattr(server_args, name)
+        for name, previous in before.items()
+        if name not in declared and getattr(server_args, name) is not previous
+    }
+    if changed:
+        stash.append((source, changed))
+    return result
 
 
 def materialize_declarations(server_args: Any) -> None:
@@ -305,6 +357,27 @@ def materialize_declarations(server_args: Any) -> None:
         for field, value in declared.items():
             setattr(server_args, field, value)
     server_args._declarations_materialized = True
+
+
+def resolution_result(server_args: Any, field: str, default: Any = None) -> Any:
+    """What resolution decided for ``field``: the declaration if there is one,
+    otherwise what the caller supplied.
+
+    This is what the config projection reads. Reading the field instead would
+    work only for as long as declarations materialize onto the record -- and
+    the point of declaring is that they will not, so the projection must not
+    depend on it. A config that never ran the pipeline (a mock, a partial
+    fixture) carries no raw snapshot; its fields are all it has.
+    """
+    for _source, declared in reversed(
+        getattr(server_args, "_resolved_overrides", None) or ()
+    ):
+        if field in declared:
+            return declared[field]
+    raw = getattr(server_args, "_raw_input", None)
+    if raw is not None and field in raw:
+        return raw[field]
+    return getattr(server_args, field, default)
 
 
 def resolved_view(server_args: Any) -> ResolvedView:

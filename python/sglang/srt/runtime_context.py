@@ -678,18 +678,22 @@ class _ConfigBag:
 
 
 def _build_config_bags(server_args: Any) -> dict:
-    """Snapshot resolved ``server_args`` into the namespace bag tree, driven by
-    the ``NS(...)`` metadata on the dataclass fields. Returns
+    """Snapshot the resolution result into the namespace bag tree, driven by
+    the ``NS(...)`` metadata on the dataclass fields. Each leaf comes from
+    ``resolution_result`` -- the declaration if resolution made one, else what
+    the caller supplied -- rather than from the field, which carries the same
+    value only while declarations still materialize. Returns
     ``{top_level_name: _ConfigBag}``, arbitrarily nested (``exec.moe.eplb.…``).
     Only dataclass fields carry ``NS`` markers, so derived properties/methods are
     naturally excluded (they stay on the bag). A name used as both a leaf and a
     subgroup at the same level is a hard error — no silent shadowing."""
     from sglang.srt.arg_groups.arg_utils import namespace_of
+    from sglang.srt.arg_groups.overrides import resolution_result
 
     _MISSING = object()
     tops: dict = {}
     for field, path in namespace_of(type(server_args)).items():
-        value = getattr(server_args, field, _MISSING)
+        value = resolution_result(server_args, field, _MISSING)
         if value is _MISSING:
             # Every NS-declared field is a dataclass field, so a resolved config
             # always carries it; a miss means a malformed/partial config object
@@ -1028,7 +1032,10 @@ class _ServerArgsOverride:
         self._prev_publish_role = ctx._publish_role
         self._prev_parallel_config = ctx.parallel._config
         self._prev_capture = ctx.flags.capture.enable_torch_compile
-        from sglang.srt.arg_groups.overrides import _apply_fields
+        from sglang.srt.arg_groups.overrides import (
+            _apply_fields,
+            declare_resolution,
+        )
 
         server_args = ServerArgs(model_path="dummy")
         # Underscore names seed private property caches (the strict guard
@@ -1040,7 +1047,18 @@ class _ServerArgsOverride:
             raise ValueError(
                 f"override_server_args: unknown ServerArgs field(s): {sorted(unknown)}"
             )
-        _apply_fields(server_args, self._fields)
+        # Declared so the projection sees it.
+        # Underscore names are not fields at all (they seed private property
+        # caches), so they stay a direct write.
+        declared = {
+            name: value for name, value in self._fields.items() if name[0] != "_"
+        }
+        if declared:
+            declare_resolution(server_args, "override_server_args", **declared)
+        _apply_fields(
+            server_args,
+            {name: value for name, value in self._fields.items() if name[0] == "_"},
+        )
         # The dummy boundary skips materialization, which would leave the
         # strict mutation guard unarmed on the published object — mark it
         # materialized so bare post-publish writes raise like they do on a
@@ -1660,6 +1678,10 @@ def configured_moe_dp_size() -> int:
 
 def configured_attn_cp_size() -> int:
     return _configured_parallel("attn_cp_size")
+
+
+def configured_dcp_size() -> int:
+    return _configured_parallel("dcp_size")
 
 
 def is_ep_joiner() -> bool:
