@@ -78,9 +78,7 @@ _KNOWN_ENTRIES = frozenset(
             "run_data_parallel_controller_process",
         ),
         ("srt/ray/scheduler_actor.py", "__init__"),
-        ("srt/disaggregation/encoder/server.py", "__init__"),
         ("srt/disaggregation/encoder/http_server.py", "launch_server"),
-        ("srt/managers/tokenizer_manager.py", "__init__"),
         ("srt/entrypoints/engine.py", "_launch_subprocesses"),
         (
             "srt/elastic_ep/expert_backup_manager.py",
