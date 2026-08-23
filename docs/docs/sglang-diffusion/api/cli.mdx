@@ -142,9 +142,10 @@ single-file checkpoint as follows:
 ```
 
 The transformer-specific `--transformer-weights-path` spelling remains
-supported for compatibility. Prefer
-`--component-weights-paths.transformer` in new commands. Use `--quantization`
-only to override the method inferred by the transformer loader, and
+supported for the primary DiT. Do not mechanically replace it with
+`--component-weights-paths.transformer`: the component-scoped form requires an
+actual component name, which is pipeline-specific. Use `--quantization` only
+to override the method inferred by the transformer loader, and
 `--quantization-ignored-layers` to keep matching transformer layers
 unquantized during online quantization.
 
