@@ -62,7 +62,10 @@ def test_nsys_exact_running_batch_defers_and_rebases_capture_window(tmp_path):
     manager.profiler_start_forward_ct = 100
     manager.profiler_target_forward_ct = 200
 
-    with patch.object(manager, "_start_profile") as start_profile:
+    with (
+        patch.object(manager, "_start_profile") as start_profile,
+        patch("torch.distributed.all_reduce") as all_reduce,
+    ):
         manager._profile_batch_predicate(
             SimpleNamespace(reqs=[object()] * 31, forward_mode=MagicMock())
         )
@@ -74,7 +77,40 @@ def test_nsys_exact_running_batch_defers_and_rebases_capture_window(tmp_path):
         )
 
     start_profile.assert_called_once_with()
+    assert all_reduce.call_count == 2
     assert manager.profiler_target_forward_ct == 207
+
+
+def test_nsys_exact_running_batch_waits_for_every_dp_rank():
+    forward_ct = 100
+    ps = SimpleNamespace(gpu_id=0)
+    with patch.dict(
+        "os.environ", {"SGLANG_NSYS_EXACT_RUNNING_BATCH": "32"}
+    ):
+        manager = SchedulerProfilerManager(
+            ps=ps,
+            dp_tp_cpu_group=MagicMock(),
+            get_forward_ct=lambda: forward_ct,
+        )
+    manager.profiler_start_forward_ct = 100
+    manager.profiler_target_forward_ct = 132
+    batch = SimpleNamespace(reqs=[object()] * 32, forward_mode=MagicMock())
+
+    def peer_readiness(ready, **_kwargs):
+        if peer_readiness.calls == 0:
+            ready.zero_()
+        peer_readiness.calls += 1
+
+    peer_readiness.calls = 0
+    with (
+        patch.object(manager, "_start_profile") as start_profile,
+        patch("torch.distributed.all_reduce", side_effect=peer_readiness),
+    ):
+        manager._profile_batch_predicate(batch)
+        start_profile.assert_not_called()
+        manager._profile_batch_predicate(batch)
+
+    start_profile.assert_called_once_with()
 
 
 def test_nsys_exact_capture_waits_for_two_real_decode_batches_after_idle_steps():
@@ -96,6 +132,8 @@ def test_nsys_exact_capture_waits_for_two_real_decode_batches_after_idle_steps()
     with (
         patch.object(manager, "_start_profile") as start_profile,
         patch.object(manager, "_stop_profile") as stop_profile,
+        patch("torch.distributed.all_reduce"),
+        patch("torch.distributed.barrier") as barrier,
     ):
         start_profile.side_effect = lambda: setattr(
             manager, "profile_in_progress", True
@@ -128,3 +166,4 @@ def test_nsys_exact_capture_waits_for_two_real_decode_batches_after_idle_steps()
 
     start_profile.assert_called_once_with()
     stop_profile.assert_called_once_with()
+    assert barrier.call_count == 2

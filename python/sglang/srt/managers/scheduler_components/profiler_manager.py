@@ -454,13 +454,22 @@ class SchedulerProfilerManager:
                 or self.nsys_exact_decode_batches_seen
                 >= self.nsys_exact_decode_batches
             )
-            if (
+            stop_ready = (
                 self.profiler_target_forward_ct
                 and self.profiler_target_forward_ct <= self.get_forward_ct()
                 and self.profile_in_progress
                 and exact_decode_boundary_ready
-            ):
+            )
+            if stop_ready:
+                if self.nsys_exact_batch:
+                    # Exact-batch Nsight is a worker-wide capture.  All DP
+                    # ranks must leave the measured window together: otherwise
+                    # rank 0 can block while Nsight flushes its report while a
+                    # peer enters the next symmetric-memory collective.
+                    torch.distributed.barrier(self.dp_tp_cpu_group)
                 self._stop_profile()
+                if self.nsys_exact_batch:
+                    torch.distributed.barrier(self.dp_tp_cpu_group)
             if self.profiler_start_forward_ct and not self.profile_in_progress:
                 forward_ct = self.get_forward_ct()
                 start_reached = (
@@ -472,7 +481,24 @@ class SchedulerProfilerManager:
                     not self.nsys_exact_batch
                     or len(batch.reqs) == self.nsys_exact_batch
                 )
-                if start_reached and batch_matches:
+                exact_worker_ready = start_reached and batch_matches
+                if self.nsys_exact_batch:
+                    # The control request is broadcast to every rank.  Poll a
+                    # worker-wide readiness bit before capture so an early DP
+                    # rank cannot start a report while another rank is still
+                    # admitting its exact batch.  This collective is outside
+                    # the captured interval and disappears after the gate is
+                    # satisfied.
+                    ready = torch.tensor(
+                        [int(exact_worker_ready)], dtype=torch.int32, device="cpu"
+                    )
+                    torch.distributed.all_reduce(
+                        ready,
+                        op=torch.distributed.ReduceOp.MIN,
+                        group=self.dp_tp_cpu_group,
+                    )
+                    exact_worker_ready = bool(ready.item())
+                if exact_worker_ready:
                     if self.nsys_exact_batch and self.profiler_target_forward_ct:
                         capture_width = (
                             self.profiler_target_forward_ct
@@ -480,7 +506,7 @@ class SchedulerProfilerManager:
                         )
                         self.profiler_target_forward_ct = forward_ct + capture_width
                         logger.info(
-                            "Exact running-batch Nsight gate matched: "
+                            "All-DP exact running-batch Nsight gate matched: "
                             "batch=%d forward_ct=%d",
                             self.nsys_exact_batch,
                             forward_ct,
