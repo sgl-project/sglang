@@ -12,6 +12,11 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+_DSPARK_SPARSE_ATTN_OPS = (
+    "npu_sparse_attn_sharedkv_metadata",
+    "npu_sparse_attn_sharedkv",
+)
+
 
 @dataclass
 class OpLibSpec:
@@ -108,15 +113,41 @@ class TorchOpLoader:
 
 
 def initialize_dspark_sparse_attn_ops() -> Optional[Path]:
-    """Register the DSpark sparse-attention ops before backend execution."""
+    """Register the DSpark sparse-attention ops before backend execution.
+
+    Newer standalone builds register the draft-specific ABI in ``_C_ascend``.
+    Existing NPU images package the previously supported ABI in ``custom_ops``;
+    keep that path usable when no standalone library was explicitly requested.
+    """
     spec = OpLibSpec(
         name="DSpark sparse-attention",
         so_env="SGLANG_DSPARK_EXTRA_OPS_SO",
         namespace="_C_ascend",
-        required_ops=(
-            "npu_sparse_attn_sharedkv_metadata",
-            "npu_sparse_attn_sharedkv",
-        ),
+        required_ops=_DSPARK_SPARSE_ATTN_OPS,
         pre_load_imports=("torch_npu",),
     )
-    return TorchOpLoader(spec).initialize()
+    loader = TorchOpLoader(spec)
+    if loader.registered() or os.environ.get(spec.so_env):
+        return loader.initialize()
+
+    try:
+        import custom_ops  # noqa: F401  register the packaged legacy ABI
+    except ImportError:
+        return loader.initialize()
+
+    custom = getattr(torch.ops, "custom", None)
+    missing = [op for op in _DSPARK_SPARSE_ATTN_OPS if not hasattr(custom, op)]
+    if missing:
+        return loader.initialize()
+
+    logger.warning(
+        "SGLANG_DSPARK_EXTRA_OPS_SO is unset; using the packaged custom_ops "
+        "DSpark sparse-attention ABI."
+    )
+    return None
+
+
+def dspark_sparse_attn_uses_standalone_abi() -> bool:
+    """Return whether the draft-specific standalone DSpark ABI is registered."""
+    namespace = getattr(torch.ops, "_C_ascend", None)
+    return all(hasattr(namespace, op) for op in _DSPARK_SPARSE_ATTN_OPS)

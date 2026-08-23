@@ -17,6 +17,9 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
+from sglang.srt.hardware_backend.npu.extra_ops_loader import (
+    dspark_sparse_attn_uses_standalone_abi,
+)
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel
@@ -817,6 +820,7 @@ class DeepseekV4AscendAttnBackend(
             getattr(model_runner, "is_draft_worker", False)
             and self._is_dspark_algorithm
         )
+        self._use_standalone_dspark_abi = False
         self._dsv4_graph_tokens_per_req = int(model_runner.decode_num_tokens_per_req())
         self._dsv4_state_pools_by_ratio = {
             pool.ratio: pool
@@ -1535,7 +1539,12 @@ class DeepseekV4AscendAttnBackend(
             "has_cmp_kv": False,
         }
         c1a_kwargs = base_kwargs | common
-        if self._is_dspark_draft_worker:
+        use_standalone_dspark_abi = (
+            self._is_dspark_draft_worker
+            and dspark_sparse_attn_uses_standalone_abi()
+        )
+        self._use_standalone_dspark_abi = use_standalone_dspark_abi
+        if use_standalone_dspark_abi:
             seq_lens_cpu = getattr(fm, "seq_lens_cpu_int", None)
             max_seqlen_kv = (
                 int(seq_lens_cpu[:bs].max().item())
@@ -1659,15 +1668,19 @@ class DeepseekV4AscendAttnBackend(
             softmax_scale=layer.scaling,
             cmp_ratio=1,
         )
-        if self._is_dspark_draft_worker:
+        use_standalone_dspark_abi = self._use_standalone_dspark_abi
+        if use_standalone_dspark_abi:
             attn_kwargs["cu_seqlens_ori_kv"] = fm.actual_seq_lengths_q_pa
         ori_sparse_indices = getattr(fm, "ori_sparse_indices", None)
         if ori_sparse_indices is not None:
             attn_kwargs["ori_sparse_indices"] = ori_sparse_indices
-        q_arg = attn_kwargs.pop("q")
-        if self._is_dspark_draft_worker:
+        if use_standalone_dspark_abi:
+            q_arg = attn_kwargs.pop("q")
             out, _ = torch.ops._C_ascend.npu_sparse_attn_sharedkv(q_arg, **attn_kwargs)
+        elif self._is_dspark_draft_worker:
+            out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
         else:
+            q_arg = attn_kwargs.pop("q")
             out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(q_arg, **attn_kwargs)
         return out
 
