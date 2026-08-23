@@ -552,7 +552,7 @@ def _minimax_h3_attention_core_impl(
             q,
             k,
             v,
-            softmax_scale=attention.softmax_scale,
+            attn_impl=attention._attention_impl,
             real_seq_len=max_seqlen,
             ring_ws=ring_ws,
         )
@@ -612,10 +612,13 @@ class MiniMaxH3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
-        # The reorder below translates the *safetensors* checkpoint layout. A
-        # GGUF checkpoint already stores qkv as [q_all, k_all, v_all], and its
-        # packed parameter is `qweight`, so there is nothing to reorder.
-        if quant_config is None or quant_config.get_name() != "gguf":
+        # Official safetensors interleave Q/K/V by head. Comfy and GGUF
+        # checkpoints already store [q_all, k_all, v_all].
+        checkpoint_qkv_is_native = quant_config is not None and (
+            quant_config.get_name() == "gguf"
+            or quant_config.checkpoint_uses_native_qkv_layout
+        )
+        if not checkpoint_qkv_is_native:
             self._install_qkv_weight_loader(arch)
         self.q_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         self.k_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)

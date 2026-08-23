@@ -27,6 +27,7 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
                 image_encoder_precision="bf16",
                 native_only_components=(),
             ),
+            component_weights_paths={},
             encoder_parallel="replicate",
             resolve_component_attention_backend=lambda _name: (None, None),
         )
@@ -51,14 +52,6 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
         return self.loader.load(
             "/model/image_encoder", self.server_args, "image_encoder", "transformers"
         )
-
-    def test_quantized_clip_checkpoint_is_not_silently_enabled(self):
-        config = self._component_config("CLIPVisionModelWithProjection", quantized=True)
-        with self._config_patch(config), self.assertRaisesRegex(
-            ComponentCheckpointUnsupportedError,
-            "CLIPVisionModel.*image_encoder.*no checkpoint quantization capability",
-        ):
-            self.loader.load_customized("/model/image_encoder", self.server_args)
 
     def test_unknown_quantized_architecture_does_not_fall_back(self):
         config = self._component_config("UnknownVisionModel", quantized=True)

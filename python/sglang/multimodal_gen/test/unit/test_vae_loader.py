@@ -1,3 +1,4 @@
+import pathlib
 import unittest
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -24,7 +25,10 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import (
     _require_native_loader_for_quantized_vae,
     _should_use_channels_last_3d,
 )
-from sglang.multimodal_gen.runtime.loader.utils import keep_checkpoint_mapped
+from sglang.multimodal_gen.runtime.loader.utils import (
+    checkpoint_bytes,
+    keep_checkpoint_mapped,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
     host_memory_budget,
 )
@@ -48,6 +52,29 @@ class _FakeServerArgs:
 
     def should_configure_layerwise_offload_for_lazy_component(self, component_name):
         return component_name in self.layerwise_components
+
+
+class TestDeploymentBytesRoot(unittest.TestCase):
+    """A hub repo id is not a directory; the component path always is."""
+
+    def test_the_component_parent_carries_the_variant_weight(self):
+        with TemporaryDirectory() as root:
+            variant = pathlib.Path(root) / "FL2VA"
+            (variant / "video_vae").mkdir(parents=True)
+            (variant / "transformer").mkdir()
+            (variant / "video_vae" / "w.safetensors").write_bytes(b"x" * 128)
+            (variant / "transformer" / "w.safetensors").write_bytes(b"x" * 512)
+            self.assertEqual(
+                checkpoint_bytes(str(variant)),
+                640,
+                "the parent of a component dir sums every sibling's shards",
+            )
+            self.assertEqual(
+                checkpoint_bytes("MiniMaxAI/MiniMax-H3"),
+                0,
+                "a repo id globs nothing -- which is why the gate must never "
+                "be fed one",
+            )
 
 
 class TestKeepCheckpointMapped(unittest.TestCase):
