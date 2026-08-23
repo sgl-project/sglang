@@ -663,14 +663,22 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         `speculative_draft_attention_backend`, and no entry ran it) showed
         that a family nobody listed leaves its readers unpinned. The hook
         modules under `arg_groups/` are the resolution pipeline's extension
-        points, and their assignment surface (`server_args.field = ...`) is
-        the may-write set, family-blind by construction. Collected like the
+        points -- along with the NPU default helper, which the pipeline calls
+        the same way -- and their write surface is the may-write set,
+        family-blind by
+        construction. A hook writes two ways: `server_args.field = ...`, and
+        `declare_resolution(server_args, source, field=...)`, which records
+        the write in the declaration stash on its way to the field. Counting
+        only the assignment would read a hook's conversion to a declaration as
+        the field having stopped being written. Collected like the
         late-resolution keywords: statically, failing loudly on an
         unparsable module. Underscore-prefixed targets are pipeline
         bookkeeping, not config leaves.
         """
         targets = set()
-        for path in sorted((_PACKAGE_ROOT / "arg_groups").glob("*.py")):
+        modules = sorted((_PACKAGE_ROOT / "arg_groups").glob("*.py"))
+        modules.append(_PACKAGE_ROOT / "hardware_backend/npu/utils.py")
+        for path in modules:
             try:
                 tree = ast.parse(path.read_text(encoding="utf-8-sig"))
             except SyntaxError:
@@ -680,6 +688,17 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                     tgts = node.targets
                 elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
                     tgts = [node.target]
+                elif (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "declare_resolution"
+                ):
+                    targets |= {
+                        kw.arg
+                        for kw in node.keywords
+                        if kw.arg and not kw.arg.startswith("_")
+                    }
+                    continue
                 else:
                     continue
                 for tgt in tgts:
@@ -702,6 +721,12 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         A write site that can never fire is a dead branch to delete upstream,
         not a census exemption. Only names that are declared dataclass fields
         count; underscore bookkeeping does not.
+
+        Two spellings write: an assignment, and ``self._declare(source,
+        field=value)``, which records the write in the declaration stash on
+        its way to the field. Counting only assignments would read a handler's
+        conversion to a declaration as the field having stopped being written,
+        which would quietly retire every pinned pair that reads it.
         """
         tree = ast.parse(
             (_PACKAGE_ROOT / "server_args.py").read_text(encoding="utf-8-sig")
@@ -722,6 +747,17 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                 tgts = node.targets
             elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
                 tgts = [node.target]
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_declare"
+            ):
+                targets |= {
+                    kw.arg
+                    for kw in node.keywords
+                    if kw.arg in declared and not kw.arg.startswith("_")
+                }
+                continue
             else:
                 continue
             for tgt in tgts:
@@ -733,27 +769,24 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                     and not tgt.attr.startswith("_")
                 ):
                     targets.add(tgt.attr)
-        # The deprecated-alias normalization loop writes through a *name
-        # tuple* (`for attr in (...): setattr(self, attr, "dsv4")`), which no
-        # assignment scan sees; its field set is pinned here with a drift
-        # guard on the tuple itself.
+        # The deprecated-alias normalization declares through `**renamed`, so
+        # the keyword scan sees no names; its field set is pinned here.
         alias_fields = {
             "attention_backend",
             "decode_attention_backend",
             "prefill_attention_backend",
             "speculative_draft_attention_backend",
         }
+        deprecated = next(
+            node
+            for node in ast.walk(sa_class)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_handle_deprecated_args"
+        )
         found_tuples = [
             {elt.value for elt in node.iter.elts if isinstance(elt, ast.Constant)}
-            for node in ast.walk(sa_class)
-            if isinstance(node, ast.For)
-            and isinstance(node.iter, ast.Tuple)
-            and any(
-                isinstance(inner, ast.Call)
-                and isinstance(inner.func, ast.Name)
-                and inner.func.id == "setattr"
-                for inner in ast.walk(node)
-            )
+            for node in ast.walk(deprecated)
+            if isinstance(node, ast.For) and isinstance(node.iter, ast.Tuple)
         ]
         self.assertIn(
             alias_fields,
