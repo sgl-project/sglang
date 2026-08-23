@@ -15,6 +15,7 @@ logger = init_logger(__name__)
 class ImageEncoderLoader(TextEncoderLoader):
     component_names = ["image_encoder"]
     expected_library = "transformers"
+    supports_component_quantization_override = False
 
     def load_customized(
         self,

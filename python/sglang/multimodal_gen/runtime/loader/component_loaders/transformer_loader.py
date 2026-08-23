@@ -100,8 +100,27 @@ def _server_args_for_transformer_component(
 ) -> ServerArgs:
     """Mask global quantized override flags for secondary transformer components."""
     component_weights_path = server_args.component_weights_paths.get(component_name)
+    component_quantization = server_args.resolve_component_quantization(component_name)
+    component_ignored_layers = (
+        server_args.resolve_component_quantization_ignored_layers(component_name)
+    )
+    secondary_ignores_global_weights = component_name in (
+        "transformer_2",
+        "unconditional_transformer",
+    ) and (
+        server_args.transformer_weights_path is not None
+        or server_args.nunchaku_config is not None
+    )
+    if (
+        component_weights_path is None
+        and component_quantization is None
+        and component_ignored_layers is None
+        and not secondary_ignores_global_weights
+    ):
+        return server_args
+
+    component_server_args = copy.copy(server_args)
     if component_weights_path is not None:
-        component_server_args = copy.copy(server_args)
         component_server_args.transformer_weights_path = component_weights_path
         component_server_args.nunchaku_config = None
         logger.info(
@@ -109,25 +128,25 @@ def _server_args_for_transformer_component(
             component_name,
             component_weights_path,
         )
-        return component_server_args
+    elif secondary_ignores_global_weights:
+        component_server_args.transformer_weights_path = None
+        component_server_args.nunchaku_config = None
+        logger.info(
+            "Ignoring global transformer_weights_path for %s; keep it on the base "
+            "checkpoint unless a per-component override path is provided.",
+            component_name,
+        )
 
-    if component_name not in ("transformer_2", "unconditional_transformer"):
-        return server_args
-
-    if (
-        server_args.transformer_weights_path is None
-        and server_args.nunchaku_config is None
-    ):
-        return server_args
-
-    component_server_args = copy.copy(server_args)
-    component_server_args.transformer_weights_path = None
-    component_server_args.nunchaku_config = None
-    logger.info(
-        "Ignoring global transformer_weights_path for %s; keep it on the base "
-        "checkpoint unless a per-component override path is provided.",
-        component_name,
-    )
+    if component_quantization is not None:
+        component_server_args.quantization = component_quantization
+        component_server_args.nunchaku_config = None
+    if component_ignored_layers is not None:
+        component_server_args.quantization_ignored_layers = component_ignored_layers
+        if component_server_args.quantization is None:
+            raise ValueError(
+                "A component quantization method is required when setting ignored "
+                f"layers for {component_name!r}"
+            )
     return component_server_args
 
 
@@ -135,6 +154,7 @@ class TransformerLoader(ComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
 
     allow_global_attention_backend_fallback = False
+    supports_component_quantization_override = True
 
     component_names = [
         "transformer",

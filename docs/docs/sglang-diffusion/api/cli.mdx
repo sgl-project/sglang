@@ -130,6 +130,8 @@ For a pre-quantized main transformer checkpoint, prefer:
   repo, or a supported GGUF transformer file
 - `--quantization` to override the quantization method used by the transformer loader
 - `--quantization-ignored-layers` transformer layer name patterns to keep unquantized during online quantization (e.g. `attention.to_`)
+- `--component-quantizations.<component>` to explicitly apply supported online quantization to an unquantized component; `--component-quantizations transformer=fp8,text_encoder=kitchen_int8` is the map form. Omit it for pre-quantized checkpoints whose format is auto-detected from metadata.
+- `--component-quantization-ignored-layers.<component>` to keep selected native component layers unquantized
 
 Component checkpoint paths are selected separately, so changing DiT precision
 never silently changes prompt embeddings. Use
@@ -140,6 +142,7 @@ For a native text encoder:
 
 - `--component-paths.text_encoder {MODEL}` replaces the text-encoder checkpoint; `--text-encoder-path {MODEL}` is its shorter alias
 - Quantization metadata is auto-detected from that checkpoint. The native loader accepts compatible serialized formats without a model-name allowlist and rejects implementations that do not construct the required quantized layers.
+- For an unquantized checkpoint, `--component-quantizations.text_encoder {fp8|kitchen_int8}` applies supported online quantization when the native encoder constructs compatible quantized layers.
 
 The same contract applies to every weighted component: path routing is generic,
 while quantized materialization is capability-based. Native auxiliary loaders

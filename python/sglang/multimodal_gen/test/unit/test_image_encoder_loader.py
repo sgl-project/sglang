@@ -30,6 +30,8 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
             component_weights_paths={},
             encoder_parallel="replicate",
             resolve_component_attention_backend=lambda _name: (None, None),
+            resolve_component_quantization=lambda _name: None,
+            resolve_component_quantization_ignored_layers=lambda _name: None,
         )
 
     def _component_config(self, architecture, *, quantized):

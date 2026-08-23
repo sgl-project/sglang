@@ -127,6 +127,9 @@ class ComponentLoader(ABC):
     # explicit --component-attention-backends entry remains strict.
     allow_global_attention_backend_fallback = True
 
+    # loaders opt in only after they consume component-scoped overrides
+    supports_component_quantization_override = False
+
     _loaders_registered = False
 
     def __init_subclass__(cls, **kwargs):
@@ -223,6 +226,18 @@ class ComponentLoader(ABC):
         If all of the above methods failed, an error will be thrown
 
         """
+        requested_quantization = server_args.resolve_component_quantization(
+            component_name
+        )
+        if (
+            requested_quantization is not None
+            and not self.supports_component_quantization_override
+        ):
+            raise ComponentCheckpointUnsupportedError(
+                f"{component_name!r} does not support an explicit component "
+                f"quantization override ({requested_quantization!r}); use a "
+                "checkpoint format that its loader can auto-detect"
+            )
         gpu_mem_before_loading = current_platform.get_available_gpu_memory()
         logger.info(
             "Loading %s from %s. avail mem: %.2f GB",

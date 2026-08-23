@@ -193,6 +193,46 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             {"text_encoder": "torch_sdpa", "transformer": "fa"},
         )
 
+    def test_component_quantizations_are_normalized(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_quantizations": "text-encoder=FP8,transformer=kitchen-int8",
+                "component_quantization_ignored_layers": {
+                    "text-encoder": ["model.layers.0"]
+                },
+            }
+        )
+
+        self.assertEqual(
+            args.component_quantizations,
+            {"text_encoder": "fp8", "transformer": "kitchen_int8"},
+        )
+        self.assertEqual(
+            args.component_quantization_ignored_layers,
+            {"text_encoder": ["model.layers.0"]},
+        )
+
+    def test_dynamic_component_quantization_cli_args(self):
+        quantizations, ignored_layers, remaining = (
+            ServerArgs._extract_component_quantizations(
+                [
+                    "--component-quantizations.text-encoder",
+                    "fp8",
+                    "--component-quantization-ignored-layers.text-encoder",
+                    "model.layers.0",
+                    "lm_head",
+                    "--unrelated",
+                ]
+            )
+        )
+
+        self.assertEqual(quantizations, {"text_encoder": "fp8"})
+        self.assertEqual(
+            ignored_layers, {"text_encoder": ["model.layers.0", "lm_head"]}
+        )
+        self.assertEqual(remaining, ["--unrelated"])
+
     def test_component_attention_backend_lookup(self):
         args = self._from_dict_without_model_resolution(
             {

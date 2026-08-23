@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     LinearBase,
     UnquantizedLinearMethod,
 )
+from sglang.multimodal_gen.runtime.layers.quantization import get_quantization_config
 from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import ComfyFp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -85,6 +86,8 @@ from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
 
+_ONLINE_ENCODER_QUANTIZATIONS = {"fp8", "kitchen_int8"}
+
 _TRANSFORMERS_ENCODER_ONLY_CLASSES = {
     "T5EncoderModel": transformers.T5EncoderModel,
     "T5Model": transformers.T5EncoderModel,
@@ -115,6 +118,8 @@ def _get_encoder_quant_config(
     component_model_path: str,
     component_weights_path: str,
     model_cls: type[nn.Module] | None = None,
+    explicit_quantization: str | None = None,
+    ignored_layers: list[str] | None = None,
 ):
     quant_config = get_quant_config(component_config, component_model_path)
     if (
@@ -146,6 +151,27 @@ def _get_encoder_quant_config(
             param_name_mapper=name_mapper,
         )
         quant_config = resolve_comfy_checkpoint_quantization(markers)
+
+    if explicit_quantization is None:
+        if ignored_layers is not None:
+            raise ValueError(
+                "Component quantization ignored layers require an explicit "
+                "component quantization method"
+            )
+        return quant_config
+    if quant_config is not None:
+        raise ValueError(
+            "Checkpoint quantization is encoded in component metadata; do not "
+            "also set an explicit component quantization method"
+        )
+    if explicit_quantization not in _ONLINE_ENCODER_QUANTIZATIONS:
+        supported = ", ".join(sorted(_ONLINE_ENCODER_QUANTIZATIONS))
+        raise ValueError(
+            f"Native encoder online quantization supports {supported}; got "
+            f"{explicit_quantization!r}"
+        )
+    quant_cls = get_quantization_config(explicit_quantization)
+    quant_config = quant_cls(ignored_layers=ignored_layers)
     return quant_config
 
 
@@ -156,12 +182,19 @@ def _configure_encoder_quantization(
     component_model_path: str,
     component_weights_path: str,
     component_name: str,
+    explicit_quantization: str | None = None,
+    ignored_layers: list[str] | None = None,
 ) -> None:
     if getattr(model_cls, "manages_checkpoint_quantization", False):
         # Preserve model-owned formats such as Ideogram's bitsandbytes state.
         # Those models parse metadata, construct layers, and attach quant states
         # themselves; running the generic lifecycle as well would process twice.
-        return
+        if explicit_quantization is None:
+            return
+        raise ComponentCheckpointUnsupportedError(
+            f"{model_cls.__name__} manages checkpoint quantization internally "
+            "and cannot apply an explicit component quantization override"
+        )
 
     _delegate_standard_bnb4_to_transformers(
         component_config,
@@ -173,6 +206,8 @@ def _configure_encoder_quantization(
             component_model_path,
             component_weights_path,
             model_cls,
+            explicit_quantization,
+            ignored_layers,
         )
     except (KeyError, NotImplementedError, TypeError, ValueError) as error:
         raise ComponentCheckpointUnsupportedError(
@@ -195,6 +230,8 @@ def _resolve_and_configure_encoder_quantization(
     component_model_path: str,
     component_weights_path: str,
     component_name: str,
+    explicit_quantization: str | None = None,
+    ignored_layers: list[str] | None = None,
 ) -> type[nn.Module]:
     architectures = getattr(model_config, "architectures", [])
     try:
@@ -209,6 +246,8 @@ def _resolve_and_configure_encoder_quantization(
                 component_config,
                 component_model_path,
                 component_weights_path,
+                explicit_quantization=explicit_quantization,
+                ignored_layers=ignored_layers,
             )
         except Exception as quantization_error:
             raise ComponentCheckpointUnsupportedError(
@@ -229,6 +268,8 @@ def _resolve_and_configure_encoder_quantization(
         component_model_path,
         component_weights_path,
         component_name,
+        explicit_quantization,
+        ignored_layers,
     )
     return model_cls
 
@@ -353,6 +394,15 @@ class TextEncoderLoader(ComponentLoader):
 
     component_names = ["text_encoder"]
     expected_library = "transformers"
+    supports_component_quantization_override = True
+
+    def should_raise_customized_load_error(
+        self, server_args: ServerArgs, component_name: str
+    ) -> bool:
+        return (
+            super().should_raise_customized_load_error(server_args, component_name)
+            or server_args.resolve_component_quantization(component_name) is not None
+        )
 
     @staticmethod
     def resolve_model_weights_path(
@@ -599,6 +649,8 @@ class TextEncoderLoader(ComponentLoader):
             component_model_path,
             component_weights_path,
             component_name,
+            server_args.resolve_component_quantization(component_name),
+            server_args.resolve_component_quantization_ignored_layers(component_name),
         )
         encoder_dp_group = get_encoder_data_parallel_group()
         prefer_dp = (

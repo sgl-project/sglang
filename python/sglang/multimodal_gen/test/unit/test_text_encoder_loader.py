@@ -220,6 +220,39 @@ class TestTextEncoderQuantization(unittest.TestCase):
         )
         self.assertIs(model_config.quant_config, self.serialized)
 
+    def test_online_component_quantization_configures_native_encoder(self):
+        self.get_quant_config.return_value = None
+        model_config = SimpleNamespace(quant_config=None)
+
+        _configure_encoder_quantization(
+            model_config,
+            TextEncoder,
+            {},
+            "/model/text_encoder",
+            "/model/text_encoder",
+            "text_encoder",
+            explicit_quantization="fp8",
+            ignored_layers=["lm_head"],
+        )
+
+        self.assertIsInstance(model_config.quant_config, Fp8Config)
+        self.assertEqual(model_config.quant_config.ignored_layers, ["lm_head"])
+
+    def test_explicit_quantization_rejects_serialized_checkpoint(self):
+        with self.assertRaisesRegex(
+            ComponentCheckpointUnsupportedError,
+            "encoded in component metadata",
+        ):
+            _configure_encoder_quantization(
+                SimpleNamespace(quant_config=None),
+                TextEncoder,
+                {},
+                "/model/text_encoder",
+                "/model/text_encoder",
+                "text_encoder",
+                explicit_quantization="fp8",
+            )
+
     def test_weight_file_metadata_configures_native_encoder(self):
         model_config = SimpleNamespace(quant_config=None)
         self.get_quant_config.return_value = None
