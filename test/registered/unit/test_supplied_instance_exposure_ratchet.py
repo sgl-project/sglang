@@ -118,6 +118,12 @@ _LATE_RESOLUTION_DYNAMIC_SITES = {
     "parser/template_detection.py": frozenset({"reasoning_parser", "tool_call_parser"}),
 }
 
+# `get_context().override(...)` declares through the same seam, but the fields
+# are the caller's -- a test names them one call at a time. There is no static
+# set to collect, and nothing resolution decides: whatever a caller overrides
+# there is exposure only through that caller's own reads.
+_CALLER_SUPPLIED_LATE_SITES = frozenset({"runtime_context.py"})
+
 # Resolution also branches on ambient environment; those shapes are explicit
 # entries so the written set is the same on every host. `SGLANG_IS_IN_CI`
 # makes resolution fill `soft_watchdog_timeout`.
@@ -439,6 +445,7 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                 resolved = ServerArgs(
                     model_path=model_path, device="cuda", random_seed=42, **extra
                 )
+                resolved.resolve_once()
             except Exception as exc:
                 self.fail(
                     f"the matrix entry {extra} (env={env}) did not resolve in "
@@ -717,6 +724,8 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                     if kw.arg and kw.arg != "source":
                         written.add(kw.arg)
                     elif kw.arg is None:
+                        if rel in _CALLER_SUPPLIED_LATE_SITES:
+                            continue
                         dynamic = _LATE_RESOLUTION_DYNAMIC_SITES.get(rel)
                         if dynamic is not None:
                             constants = {

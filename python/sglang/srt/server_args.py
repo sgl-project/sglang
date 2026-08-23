@@ -16,7 +16,9 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
+import functools
 import glob
 import importlib
 import importlib.util
@@ -28,7 +30,6 @@ import random
 import socket
 import tempfile
 import uuid
-from functools import cached_property
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
@@ -3642,7 +3643,96 @@ class ServerArgs:
     ] = None
 
     def __post_init__(self):
-        self._run_resolution_pipeline()
+        """Construction leaves the record at what the caller asked for.
+
+        Resolution is a separate act, entered through ``resolve_once``: the
+        launcher runs it once per engine, and every publishing process asks the
+        gate on the way in. A record that is only constructed -- a fixture, a
+        config being inspected, one being handed to a subprocess that will
+        resolve it itself -- stays raw.
+        """
+
+    def resolve_once(self) -> None:
+        """Run the resolution pipeline, unless this record has been through it.
+
+        Resolution is a deterministic function of the raw inputs -- two records
+        built from the same arguments declare the same things -- but the
+        handlers do not survive a second pass over their own output: DP
+        attention halves ``chunked_prefill_size`` again on every re-entry.
+
+        The publishing entry of every process calls this. In a child the record
+        arrived by pickle and brought its declarations along, so the child has
+        nothing left to derive and projects what the parent decided.
+        """
+        if getattr(self, "_declarations_materialized", False):
+            return
+        if getattr(self, "_resolution_failed", False):
+            raise RuntimeError(
+                "resolution already failed on this ServerArgs; the handlers that "
+                "ran left their writes on the record, and a second pass would "
+                "read that partial output as fresh input. Build a new record "
+                "from the corrected arguments."
+            )
+        try:
+            self._run_resolution_pipeline()
+        except BaseException:
+            # The handlers that ran already wrote to the record, and they are
+            # not idempotent over their own output.
+            object.__setattr__(self, "_resolution_failed", True)
+            raise
+        # Set here too, because the dummy/absent-model path returns before the
+        # materialization that normally sets it: the gate is about whether the
+        # handlers ran, not how far they got.
+        self._declarations_materialized = True
+
+    def replace_resolved(self, source: str, **changes: Any) -> ServerArgs:
+        """A copy of this record that stays resolved, and says what it changed.
+
+        `dataclasses.replace` builds a new instance, so the copy carries none of
+        what makes a record resolved: no raw snapshot, no declarations, no
+        materialization. The next publish therefore finds an unmaterialized
+        record and runs the pipeline over values it already decided -- DP
+        attention halves `chunked_prefill_size` a second time (8192 -> 4096 ->
+        2048) and the schedule conservativeness is scaled again (0.3 -> 0.09).
+        The Ray paths replace `dist_init_addr` on a resolved record, which is
+        how they hit it.
+
+        The change is appended to the stash rather than left on the field: the
+        projection reads the raw snapshot plus the declarations, so a field the
+        copy set on its own would publish the parent's raw value instead.
+
+        The carry is shallow. The containers are copied so the copy's own
+        declaration does not travel back into the parent, but everything inside
+        them -- the stash entries, the raw-input values, the memoized
+        `ModelConfig` -- is shared. That is fine for what this is for: a copy
+        that immediately crosses a process boundary (Ray actors, the gateway's
+        workers), where pickling severs the sharing. A caller that mutates the
+        copy's deep structure in-process mutates the parent's too.
+        """
+        replacement = dataclasses.replace(self, **changes)
+        if not getattr(self, "_declarations_materialized", False):
+            # Not resolved yet: the copy goes through the gate itself.
+            return replacement
+
+        # Everything outside the fields, enumerated from the instance: the raw
+        # snapshot, the stash, and what resolution memoized -- including the
+        # `get_model_config()` cache, which a resolved copy can no longer fill
+        # (the read-only guard refuses the write).
+        field_names = {field.name for field in dataclasses.fields(self)}
+        for name, value in vars(self).items():
+            if name in field_names or name == "_declarations_materialized":
+                continue
+            if isinstance(value, (dict, list, set)):
+                value = copy.copy(value)
+            object.__setattr__(replacement, name, value)
+        stash = getattr(replacement, "_resolved_overrides", None)
+        if stash is None:
+            stash = []
+            object.__setattr__(replacement, "_resolved_overrides", stash)
+        if changes:
+            stash.append((source, dict(changes)))
+        object.__setattr__(replacement, "_declarations_materialized", True)
+        return replacement
 
     def _declare(self, source: str, **fields: Any) -> None:
         """This record's handlers declaring their resolution writes.
@@ -9522,8 +9612,17 @@ class ServerArgs:
         # Lazy init to avoid circular import
         from sglang.srt.configs.model_config import ModelConfig
 
-        if hasattr(self, "model_config"):
-            return self.model_config
+        memo = getattr(self, "model_config", None)
+        if memo is not None:
+            # A configuration built before resolution describes the path the
+            # caller typed; the GGUF and ModelScope handlers declare a
+            # different `model_path`, and every later decision keyed on the
+            # architecture would read the wrong contents. Only a real
+            # `ModelConfig` is checked -- a fixture's stand-in stays untouched.
+            if not (
+                isinstance(memo, ModelConfig) and memo.model_path != self.model_path
+            ):
+                return memo
         self.model_config = ModelConfig.from_server_args(self)
         if self.model_config.is_hybrid_swa:
             logger.info(
@@ -9556,9 +9655,9 @@ class ServerArgs:
         # get_context().override(source, ...); a value one runner or worker
         # owns travels as a constructor argument to it.
         if (
-            not name.startswith("_")
-            and getattr(self, "_declarations_materialized", False)
+            getattr(self, "_declarations_materialized", False)
             and not getattr(self, "_internal_write", False)
+            and (not name.startswith("_") or name in _underscore_field_names())
         ):
             raise AttributeError(
                 f"server_args.{name} assigned after resolution; server_args is "
@@ -9599,30 +9698,47 @@ class ServerArgs:
     def enable_mamba_extra_buffer_lazy(self) -> bool:
         return mamba_extra_buffer_lazy_of(self)
 
-    @cached_property
+    @property
     def max_speculative_num_draft_tokens(self) -> Optional[int]:
-        """Return the maximum draft-token count speculative decoding may use."""
+        """Return the maximum draft-token count speculative decoding may use.
+
+        Memoized only once the record is resolved: an answer computed off a raw
+        record describes inputs resolution is about to rewrite (auto speculative
+        sizing fills `speculative_num_draft_tokens` in), and a cache filled that
+        early would keep answering with it.
+        """
+        memo = self.__dict__.get("_max_speculative_num_draft_tokens")
+        if memo is not None:
+            return memo
         if self.speculative_num_draft_tokens is None:
-            return None
-        if not self.speculative_adaptive:
-            return self.speculative_num_draft_tokens
+            result = None
+        elif not self.speculative_adaptive:
+            result = self.speculative_num_draft_tokens
+        else:
+            from sglang.srt.speculative.adaptive_spec_params import (
+                resolve_candidate_steps_from_config,
+            )
 
-        from sglang.srt.speculative.adaptive_spec_params import (
-            resolve_candidate_steps_from_config,
-        )
-
-        candidate_steps = resolve_candidate_steps_from_config(
-            cfg_path=self.speculative_adaptive_config,
-        )
-        # TODO: adaptive spec currently requires topk=1, so each runtime state
-        # needs steps + 1 draft-token slots. Revisit this if topk>1 is supported.
-        return max(candidate_steps) + 1
+            candidate_steps = resolve_candidate_steps_from_config(
+                cfg_path=self.speculative_adaptive_config,
+            )
+            # TODO: adaptive spec currently requires topk=1, so each runtime
+            # state needs steps + 1 draft-token slots. Revisit this if topk>1
+            # is supported.
+            result = max(candidate_steps) + 1
+        if getattr(self, "_declarations_materialized", False):
+            object.__setattr__(self, "_max_speculative_num_draft_tokens", result)
+        return result
 
     @property
     def mamba_cache_chunk_size(self) -> int:
         # For mamba cache with extra buffer, the chunk size is the max of FLA_CHUNK_SIZE
         # (or mamba_chunk_size if it is defined in the model's config) and page_size.
         # It is used to determine the caching point in a sequence during prefill.
+        # A pre-seeded `_mamba_cache_chunk_size` (fixtures supply one so a dummy
+        # model never loads an HF config) is honored as-is; otherwise the memo
+        # is only kept once the record is resolved, because `page_size` below
+        # is resolution-written.
         if not hasattr(self, "_mamba_cache_chunk_size"):
 
             try:
@@ -9639,6 +9755,8 @@ class ServerArgs:
             assert (
                 max(chunk_size, page_size) % min(chunk_size, page_size) == 0
             ), f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {page_size=}"
+            if not getattr(self, "_declarations_materialized", False):
+                return max(chunk_size, page_size)
             self._mamba_cache_chunk_size = max(chunk_size, page_size)
         return self._mamba_cache_chunk_size
 
@@ -10331,6 +10449,23 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
 # reference. Do not add new call-sites — the counts are ratcheted
 # (decrease-only) by test/registered/unit/test_legacy_global_ratchet.py.
 # Imports are in-function so the two modules stay cycle-free at import time.
+@functools.lru_cache(maxsize=1)
+def _underscore_field_names() -> frozenset:
+    """Real dataclass fields whose names start with an underscore.
+
+    The read-only guard exempts underscore names because they are the record's
+    own bookkeeping (the stash, the flags, the memoized model config). A *field*
+    that happens to start with an underscore is still resolved configuration --
+    `_speculative_draft_quantization_explicitly_set` is one -- and exempting it
+    by spelling would leave exactly one leaf writable on a read-only record.
+    """
+    return frozenset(
+        field.name
+        for field in dataclasses.fields(ServerArgs)
+        if field.name.startswith("_")
+    )
+
+
 def set_global_server_args_for_scheduler(server_args: ServerArgs):
     """Legacy publish shim (role=scheduler) — prefer
     ``runtime_context.publish(server_args, role=...)`` in new code."""

@@ -989,8 +989,10 @@ def latency_test(
 
 
 def main(server_args, bench_args):
-    # Post-init write to the legacy cuda_graph_max_bs_decode field would
-    # not propagate to cuda_graph_config; update the decode phase directly.
+    server_args.resolve_once()
+
+    # The legacy cuda_graph_max_bs_decode field does not propagate; set the
+    # decode phase.
     if server_args.cuda_graph_config is not None:
         server_args.cuda_graph_config[Phase.DECODE].max_bs = max(bench_args.batch_size)
 

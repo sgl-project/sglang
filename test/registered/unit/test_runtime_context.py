@@ -217,8 +217,8 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
     """V2b: the context owns the slot; the legacy getters are identity shims."""
 
     def test_legacy_setter_publishes_into_context(self):
-        # Identity (not equality) is the contract; publish accepts any object.
-        sentinel = object()
+        # Identity, not equality: the slot holds the very object published.
+        sentinel = ServerArgs(model_path="dummy")
         server_args_module.set_global_server_args_for_scheduler(sentinel)
         self.assertIs(server_args_module.get_global_server_args(), sentinel)
         self.assertIs(get_server_args(), sentinel)
@@ -240,13 +240,16 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
             self.assertEqual(str(cm.exception), "Global server args is not set yet!")
 
     def test_republish_overwrite_allowed(self):
-        first, second = object(), object()
+        first = ServerArgs(model_path="dummy")
+        second = ServerArgs(model_path="dummy")
         server_args_module.set_global_server_args_for_scheduler(first)
         server_args_module.set_global_server_args_for_scheduler(second)
         self.assertIs(get_server_args(), second)
 
     def test_reset_context_clears_owned_store(self):
-        server_args_module.set_global_server_args_for_scheduler(object())
+        server_args_module.set_global_server_args_for_scheduler(
+            ServerArgs(model_path="dummy")
+        )
         reset_context()
         with self.assertRaises(ValueError):
             get_server_args()

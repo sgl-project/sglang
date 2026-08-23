@@ -1034,10 +1034,11 @@ class _ServerArgsOverride:
         self._prev_capture = ctx.flags.capture.enable_torch_compile
         from sglang.srt.arg_groups.overrides import (
             _apply_fields,
-            declare_resolution,
+            declare_late_resolution,
         )
 
         server_args = ServerArgs(model_path="dummy")
+        server_args.resolve_once()
         # Underscore names seed private property caches (the strict guard
         # exempts them); everything else must be a real config field.
         unknown = {name for name in self._fields if not name.startswith("_")} - set(
@@ -1047,23 +1048,19 @@ class _ServerArgsOverride:
             raise ValueError(
                 f"override_server_args: unknown ServerArgs field(s): {sorted(unknown)}"
             )
-        # Declared so the projection sees it.
+        # Declared so the projection sees it; late, because the record is
+        # resolved already and not yet published.
         # Underscore names are not fields at all (they seed private property
         # caches), so they stay a direct write.
         declared = {
             name: value for name, value in self._fields.items() if name[0] != "_"
         }
         if declared:
-            declare_resolution(server_args, "override_server_args", **declared)
+            declare_late_resolution(server_args, "override_server_args", **declared)
         _apply_fields(
             server_args,
             {name: value for name, value in self._fields.items() if name[0] == "_"},
         )
-        # The dummy boundary skips materialization, which would leave the
-        # strict mutation guard unarmed on the published object — mark it
-        # materialized so bare post-publish writes raise like they do on a
-        # fully resolved config.
-        object.__setattr__(server_args, "_declarations_materialized", True)
         ctx.set_server_args(server_args)
         self._installed = True
         return server_args
@@ -1205,6 +1202,9 @@ ROLE_NAMESPACE_SETS: dict[str, frozenset[str] | None] = {
     "encoder": None,
     "expert_backup": None,
     "weight_cache_daemon": None,
+    # The diffusion GPU worker runs a model and publishes a placeholder so
+    # shared SRT reads do not fail closed; declared full for that reason.
+    "diffusion_gpu_worker": None,
 }
 
 
@@ -1325,6 +1325,7 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
             f"publish role {role!r} has no ROLE_NAMESPACE_SETS entry; declare "
             "its namespace set (None for the full tree)."
         )
+    server_args.resolve_once()
     discarded = _CONTEXT.overrides_log()
     _CONTEXT.set_server_args(server_args)
     if discarded:
