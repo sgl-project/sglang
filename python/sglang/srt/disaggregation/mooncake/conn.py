@@ -2067,12 +2067,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 if self.request_status.get(req.room, KVPoll.Failed) == KVPoll.Failed:
                     return rc
-            elif st in (StateType.MINIMAX_INDEX_K, StateType.MINIMAX_DENSE_KV):
-                # Compacted layer lists require equal TP and PP=1 on both peers.
-                if self.pp_size is not None and self.pp_size > 1:
-                    raise RuntimeError(
-                        "PD disagg: PP>1 not supported for MiniMax state yet."
-                    )
+            elif st == StateType.MINIMAX_INDEX_K:
+                # Equal attention-TP only. Sparse sub-pools are compacted per
+                # pipeline stage, so pair their entries by global layer id.
                 if (
                     target_rank_registration_info is not None
                     and self.attn_tp_size
@@ -2084,13 +2081,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
-                if st == StateType.MINIMAX_DENSE_KV:
-                    if len(src_indices) != len(dst_indices_local):
-                        raise RuntimeError(
-                            f"{st.value} state index length mismatch: "
-                            f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
-                        )
-                elif len(src_indices) > len(dst_indices_local):
+                if len(src_indices) > len(dst_indices_local):
                     src_indices = src_indices[: len(dst_indices_local)]
                 elif len(src_indices) < len(dst_indices_local):
                     dst_indices_local = dst_indices_local[: len(src_indices)]
@@ -2103,7 +2094,51 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         prefill_data_indices=np.array(src_indices, dtype=np.int32),
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
+                        state_type=st,
                         force_flat=True,
+                        src_layer_ids=src_state_layer_ids,
+                        dst_layer_ids=dst_state_layer_ids,
+                        dst_item_lens=dst_item_lens,
+                        bootstrap_room=req.room,
+                    )
+                    or rc
+                )
+            elif st == StateType.MINIMAX_DENSE_KV:
+                # Dense state still has no global layer identity; keep the
+                # existing equal-TP / PP=1 restriction.
+                if self.pp_size is not None and self.pp_size > 1:
+                    raise RuntimeError(
+                        "PD disagg: PP>1 not supported for MiniMax dense state yet."
+                    )
+                if (
+                    target_rank_registration_info is not None
+                    and self.attn_tp_size
+                    != target_rank_registration_info.dst_attn_tp_size
+                ):
+                    raise RuntimeError(
+                        "PD disagg: heterogeneous TP not supported for MiniMax "
+                        "state yet."
+                    )
+                src_indices = list(indices)
+                dst_indices_local = list(dst_indices)
+                if len(src_indices) != len(dst_indices_local):
+                    raise RuntimeError(
+                        f"{st.value} state index length mismatch: "
+                        f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
+                    )
+                rc = (
+                    self._send_kvcache_generic(
+                        mooncake_session_id=req.mooncake_session_id,
+                        src_data_ptrs=src_data_ptrs,
+                        dst_data_ptrs=dst_data_ptrs,
+                        item_lens=src_item_lens,
+                        prefill_data_indices=np.array(src_indices, dtype=np.int32),
+                        dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
+                        executor=executor,
+                        state_type=st,
+                        force_flat=True,
+                        dst_item_lens=dst_item_lens,
+                        bootstrap_room=req.room,
                     )
                     or rc
                 )
