@@ -244,11 +244,11 @@ def init_cp_strategy(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     global _STRATEGY
 
-    if not getattr(server_args, "enable_prefill_cp", False):
+    if not cfg.enable_prefill_cp:
         _STRATEGY = None
         return
 
-    cp_size = getattr(server_args, "attn_cp_size", 1)
+    cp_size = cfg.attn_cp_size
     if cp_size <= 1:
         _STRATEGY = None
         return

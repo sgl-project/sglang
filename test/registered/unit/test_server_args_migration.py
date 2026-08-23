@@ -96,8 +96,7 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
                     "32",
                 ]
             )
-            # The normalization is a declaration, so it lands in the
-            # resolution result rather than on the field.
+            # The normalization is a declaration.
             self.assertEqual(
                 resolution_result(sa, "allowed_media_domains"),
                 ["127.0.0.1", "media.example.com"],

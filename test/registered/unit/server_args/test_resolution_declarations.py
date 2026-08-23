@@ -764,7 +764,7 @@ class TestResolutionDeclarations(CustomTestCase):
         # Snapshot before publishing: the bag serves the very object the record
         # holds, so comparing them after the fact compares an object with
         # itself and passes however the projection behaves.
-        expected = copy.deepcopy(server_args.cuda_graph_config)
+        expected = copy.deepcopy(resolution_result(server_args, "cuda_graph_config"))
         publish(server_args, role="scheduler")
         published = get_exec().graph.cuda_graph_config
         resolved = expected
