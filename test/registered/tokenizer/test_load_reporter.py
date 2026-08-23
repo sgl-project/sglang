@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import socket
-import subprocess
 import threading
 import time
 import unittest
-import uuid
 from typing import Any, AsyncIterator, List, Optional
 
 import grpc
@@ -388,143 +385,6 @@ class TestLoadReporterMultiOwner(CustomTestCase):
                 router.wait_for_ranked_report(),
                 "shared fire loop produced no ranked report",
             )
-        finally:
-            router.stop()
-
-
-# ============================================================================
-# Standalone SMG gRPC
-# ============================================================================
-
-
-def port_open(host: str, port: int) -> bool:
-    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        return probe.connect_ex((host, port)) == 0
-    finally:
-        probe.close()
-
-
-class TestLoadReporterStandaloneGrpc(CustomTestCase):
-    """Standalone SMG RPC exposes the reporter on its own port, no FastAPI."""
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        try:
-            from smg_grpc_servicer.sglang.server import serve_grpc
-        except ImportError as exc:
-            raise unittest.SkipTest(
-                f"compatible optional smg-grpc-servicer is unavailable: {exc}"
-            ) from exc
-
-        if "on_request_manager_ready" not in inspect.signature(serve_grpc).parameters:
-            raise unittest.SkipTest(
-                "smg-grpc-servicer lacks on_request_manager_ready support"
-            )
-
-        cls.host = "127.0.0.1"
-        cls.smg_port = get_free_port()
-        cls.sidecar_port = get_free_port()
-        cls.reporter_port = get_free_port()
-        cls.process = subprocess.Popen(
-            [
-                "python3",
-                "-m",
-                "sglang.launch_server",
-                "--model-path",
-                DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-                "--host",
-                cls.host,
-                "--port",
-                str(cls.smg_port),
-                "--smg-grpc-mode",
-                "--smg-http-sidecar-port",
-                str(cls.sidecar_port),
-                "--load-reporter-port",
-                str(cls.reporter_port),
-                "--mem-fraction-static",
-                "0.5",
-            ]
-        )
-        # Wait for the reporter listener, started in the ready callback before the gRPC server accepts requests.
-        deadline = time.monotonic() + DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
-        cls.reporter_up = False
-        while time.monotonic() < deadline:
-            if cls.process.poll() is not None:
-                break
-            if port_open(cls.host, cls.reporter_port):
-                cls.reporter_up = True
-                break
-            time.sleep(1.0)
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        process = getattr(cls, "process", None)
-        if process is not None:
-            kill_process_tree(process.pid)
-            cls.process = None
-
-    def test_inference_and_reporting_coexist(self) -> None:
-        """Inference and periodic reporting run independently — requests never trigger a snapshot pull."""
-        from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
-
-        self.assertTrue(
-            self.reporter_up, "standalone reporter port never started listening"
-        )
-        # Reporter port is distinct from the SMG inference port and sidecar.
-        self.assertNotEqual(self.reporter_port, self.smg_port)
-        self.assertNotEqual(self.reporter_port, self.sidecar_port)
-
-        report_interval_ms = 500
-        router = FakeRouterClient(
-            self.host,
-            self.reporter_port,
-            interval_ms=report_interval_ms,
-            lease_ttl_ms=30_000,
-        )
-        router.start()
-        try:
-            self.assertTrue(
-                router.wait_for_register(),
-                "standalone reporter did not accept the register stream",
-            )
-            self.assertTrue(
-                router.wait_for_reports(1, timeout=8.0),
-                "no initial report after register",
-            )
-
-            # Run a real inference request — must succeed without affecting the reporter stream.
-            channel = grpc.insecure_channel(f"{self.host}:{self.smg_port}")
-            try:
-                stub = sglang_scheduler_pb2_grpc.SglangSchedulerStub(channel)
-                request = sglang_scheduler_pb2.GenerateRequest(
-                    request_id=f"load-reporter-e2e-{uuid.uuid4().hex}",
-                    tokenized=sglang_scheduler_pb2.TokenizedInput(
-                        input_ids=[123, 456, 789, 234],
-                        original_text="load reporter e2e",
-                    ),
-                    sampling_params=sglang_scheduler_pb2.SamplingParams(
-                        temperature=0.0,
-                        max_new_tokens=1,
-                    ),
-                    stream=False,
-                )
-                responses = list(stub.Generate(request, timeout=60))
-            finally:
-                channel.close()
-            self.assertTrue(responses and responses[-1].HasField("complete"))
-
-            # Periodic reports must continue arriving after inference.
-            reports_after_inference = router.report_count()
-            self.assertTrue(
-                router.wait_for_reports(
-                    reports_after_inference + 1,
-                    timeout=report_interval_ms / 1000 + 3,
-                ),
-                "no deadline report after real standalone inference",
-            )
-            report = router.reports_snapshot()[-1]
-            self.assertTrue(report.ranks, "post-inference report has no rank snapshot")
         finally:
             router.stop()
 

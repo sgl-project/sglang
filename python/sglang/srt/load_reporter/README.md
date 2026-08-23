@@ -270,8 +270,9 @@ only; its parameter name is chosen by the Router owner and is not defined here.
   the new set.
 - E2E (GPU + model, CUDA CI) under `test/registered/tokenizer/`: a real
   `grpc.aio` fake Router dials in and verifies that periodic reports continue
-  through inference activity. The standalone SMG test verifies coexistence of
-  inference and reporting without a request-end pull path.
+  through HTTP inference activity. Standalone SMG composition is covered by
+  the capability, reporting, cancellation, and cleanup integration tests that
+  use the SGLang-owned callback boundary rather than an external package build.
 
 ## Known limitations
 
