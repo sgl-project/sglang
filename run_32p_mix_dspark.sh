@@ -71,7 +71,10 @@ do
         export SGLANG_NPU_FUSED_KDA_RAGGED_IO=${SGLANG_NPU_FUSED_KDA_RAGGED_IO:-1}
         export SGLANG_NPU_FUSED_KDA_ONORM=${SGLANG_NPU_FUSED_KDA_ONORM:-1}
         export SGLANG_NPU_REUSE_KDA_VERIFY_METADATA=${SGLANG_NPU_REUSE_KDA_VERIFY_METADATA:-1}
-        export SGLANG_NPU_QUANT_SHARED_AG=${SGLANG_NPU_QUANT_SHARED_AG:-1}
+        # The 8.50 ms five-run baseline used the regular shared-expert gather.
+        # Keep the pre-quantized shared-AG experiment opt-in: it was not part
+        # of the validated combination and regressed the critical path.
+        export SGLANG_NPU_QUANT_SHARED_AG=${SGLANG_NPU_QUANT_SHARED_AG:-0}
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_RAGGED_VERIFY_MODE=${SGLANG_RAGGED_VERIFY_MODE:-static}
