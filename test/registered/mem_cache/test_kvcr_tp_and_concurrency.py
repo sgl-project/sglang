@@ -55,9 +55,17 @@ try:
 
     from sglang.srt.mem_cache.storage.kvcr import kvcr_store
     from sglang.srt.mem_cache.storage.kvcr.kvcr_store import KVCRStore
+
+    _HAS_KVCR = True
 except ImportError:  # pragma: no cover - wheel not installed on this tier
-    # Every case here drives a real KVCRStore, so there is nothing left to run.
-    raise unittest.SkipTest("nvidia-kvcr wheel not installed")
+    _HAS_KVCR = False
+
+# Every case here drives a real KVCRStore, so all of them gate on the wheel.
+# A module-level raise would be the shorter spelling, but SkipTest outside a
+# test is an uncaught exception: the CI runner invokes this file as a
+# subprocess and reads its exit code, so it would fail the whole CPU suite on
+# every runner rather than skipping.
+_needs_kvcr = unittest.skipUnless(_HAS_KVCR, "nvidia-kvcr wheel not installed")
 
 
 _BASE_CONTROL_PORT = 25000
@@ -241,6 +249,7 @@ class FakeKVCR:
             return drained
 
 
+@_needs_kvcr
 class TPColocationTest(unittest.TestCase):
     """Two ranks of one engine, same host, same extra_config."""
 
@@ -302,6 +311,7 @@ class TPColocationTest(unittest.TestCase):
         self.assertEqual(_store(0, 1)._control_port(), _BASE_CONTROL_PORT)
 
 
+@_needs_kvcr
 class SourceEndpointRankTest(unittest.TestCase):
     """Which source port each rank dials for a hint-driven fetch.
 
@@ -366,6 +376,7 @@ class SourceEndpointRankTest(unittest.TestCase):
         self.assertIsNone(store._parse_hint(_hint_extra_info("tcp://10.0.0.7")))
 
 
+@_needs_kvcr
 class DPColocationTest(unittest.TestCase):
     """Attention DP: several DP ranks of one engine on one host.
 
@@ -500,6 +511,7 @@ class DPColocationTest(unittest.TestCase):
         )
 
 
+@_needs_kvcr
 class UnusableHostPoolTest(unittest.TestCase):
     """Host pool layouts the backend cannot run against must fail at startup."""
 
@@ -558,6 +570,7 @@ class UnusableHostPoolTest(unittest.TestCase):
         self.assertIn("local DRAM tier", str(raised.exception))
 
 
+@_needs_kvcr
 class ConcurrentDrainTest(unittest.TestCase):
     """_drain_until and the source pump racing for the same completion queue."""
 
@@ -725,6 +738,7 @@ class ConcurrentDrainTest(unittest.TestCase):
         self.assertEqual(_per_op_residue(self.store, handle), [])
 
 
+@_needs_kvcr
 class CloseTest(unittest.TestCase):
     """Shutdown ordering between our pump thread and the KVCR core."""
 
@@ -776,6 +790,7 @@ class CloseTest(unittest.TestCase):
         self.assertIsNone(store._kvcr)
 
 
+@_needs_kvcr
 class HintRequestIdTest(unittest.TestCase):
     """Ids scoping the core's per-request hint table."""
 
@@ -805,6 +820,7 @@ class HintRequestIdTest(unittest.TestCase):
         self.assertNotEqual(first, second)
 
 
+@_needs_kvcr
 class RemoteFailureTest(unittest.TestCase):
     """A remote source that is slow, gone, or lying must degrade to recompute.
 
@@ -911,6 +927,7 @@ class RemoteFailureTest(unittest.TestCase):
         self.assertEqual(self.store.stats()["exists_hint_covered_nothing"], 1)
 
 
+@_needs_kvcr
 class RaisingCoreTest(unittest.TestCase):
     """A core that raises must degrade to a miss, never out of the store.
 
@@ -1036,6 +1053,7 @@ class RaisingCoreTest(unittest.TestCase):
         self.assertEqual(self.store.stats()["faults_discard_hint"], 1)
 
 
+@_needs_kvcr
 class StatsTest(unittest.TestCase):
     """The counters that make a silent remote path diagnosable."""
 
@@ -1102,6 +1120,7 @@ class StatsTest(unittest.TestCase):
         self.assertNotIn("entries_dropped_by_policy", stats)
 
 
+@_needs_kvcr
 class PolicySelectionTest(unittest.TestCase):
     """The local-tier policy is named by config, never left to the core.
 
@@ -1146,6 +1165,7 @@ class PolicySelectionTest(unittest.TestCase):
             kvcr_store._resolve_policy("collections.OrderedDict")
 
 
+@_needs_kvcr
 class SourcePumpFaultToleranceTest(unittest.TestCase):
     """The pump is what makes this worker usable as a P2P source.
 

@@ -179,5 +179,21 @@ class ParseTest(unittest.TestCase):
         )
 
 
+class ExtraInfoKeyAgreementTest(unittest.TestCase):
+    def test_the_controller_and_the_backend_name_the_same_key(self):
+        """The producer and consumer of the hint hold separate literals.
+
+        ``cache_controller`` writes the hint under its own constant so the
+        generic controller does not import a backend, and the KVCR backend
+        reads it under its own. That layering is deliberate, but it means a
+        rename on one side is invisible to the other: every hint would simply
+        stop being found, no fetch would be issued, and the only symptom is
+        that P2P quietly stops working. Nothing else pins the two together.
+        """
+        from sglang.srt.managers.cache_controller import _ROUTER_HINT_EXTRA_INFO_KEY
+
+        self.assertEqual(_ROUTER_HINT_EXTRA_INFO_KEY, ROUTER_HINT_KEY)
+
+
 if __name__ == "__main__":
     unittest.main()
