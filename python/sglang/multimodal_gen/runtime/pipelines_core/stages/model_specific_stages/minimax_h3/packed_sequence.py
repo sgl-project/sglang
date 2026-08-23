@@ -279,6 +279,8 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     latent_w: int,
     audio_t: int,
     ref_blocks: Sequence[Mapping[str, object]],
+    keyframe_frame_indices: list[int] | tuple[int, ...] | None = None,
+    frame_count: int | None = None,
     audio_channel: int = 2,
     seq_len: int | None = None,
 ) -> dict[str, Any]:
@@ -290,10 +292,12 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     - ``{"kind": "video"|"video_audio", "ref_audio_t": T,
        "latent_t": RT, "latent_h": RH, "latent_w": RW}``
 
-    Video-bearing blocks pack their audio rows immediately before their video
-    rows; both share the same temporal origin and advance by the longer of the
-    audio and video spans. Standalone audio advances the target origin by its
-    own T, and image blocks advance it by one integer slot.
+    Optional first/last keyframes are packed immediately after text, matching
+    Comfy's hybrid Ref2VA + guide layout. Video-bearing blocks pack their audio
+    rows immediately before their video rows; both share the same temporal
+    origin and advance by the longer of the audio and video spans. Standalone
+    audio advances the target origin by its own T, and image blocks advance it
+    by one integer slot.
     """
     if not isinstance(ref_blocks, Sequence) or isinstance(ref_blocks, (str, bytes)):
         raise ValueError("ref_blocks must be a sequence")
@@ -345,10 +349,19 @@ def minimax_h3_packed_sequence_ref2va_blocks(
 
     ph, pw = latent_h // _PATCH_H, latent_w // _PATCH_W
     frame_rows = ph * pw
+    keyframe_indices = _keyframe_cond_frame_indices(
+        include_keyframe_cond=keyframe_frame_indices is not None,
+        keyframe_frame_indices=keyframe_frame_indices,
+    )
+    resolved_keyframe_indices = _resolve_keyframe_frame_indices(
+        keyframe_indices,
+        frame_count=frame_count,
+    )
+    keyframe_rows = len(keyframe_indices) * frame_rows
     video_rows = latent_t * frame_rows
     audio_rows = audio_t * audio_channel
     ref_rows = ref_visual_rows + ref_audio_rows
-    used = text_len + ref_rows + audio_rows + video_rows
+    used = text_len + keyframe_rows + ref_rows + audio_rows + video_rows
     if seq_len is None:
         seq_len = (
             (used + MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT - 1)
@@ -359,7 +372,8 @@ def minimax_h3_packed_sequence_ref2va_blocks(
         raise ValueError(f"seq_len {seq_len} < used rows {used}")
 
     text_sl = slice(0, text_len)
-    cursor = text_len
+    keyframe_sl = slice(text_len, text_len + keyframe_rows)
+    cursor = keyframe_sl.stop
     block_slices: list[dict[str, object]] = []
     for item in parsed:
         kind = str(item["kind"])
@@ -466,13 +480,31 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     video_g[:, :, 0] = _video_t_grid(latent_t, t_cursor)[:, None]
     video_g[:, :, 1:] = target_frame[None]
 
+    for block_index, pixel_index in enumerate(resolved_keyframe_indices):
+        sl = slice(
+            keyframe_sl.start + block_index * frame_rows,
+            keyframe_sl.start + (block_index + 1) * frame_rows,
+        )
+        if pixel_index == 0:
+            cond_t = t_cursor
+        elif frame_count is not None and pixel_index == frame_count - 1:
+            cond_t = t_cursor + _temporal_position_span(latent_t) - _FRAME_RESCALE
+        else:
+            raise ValueError(
+                "hybrid ref2va layout only supports first/last keyframe anchors, "
+                f"got resolved frame index {pixel_index}"
+            )
+        g[sl, 0] = cond_t
+        g[sl, 1:] = target_frame
+
+    keyframe_img_pos = _range_for_slice(keyframe_sl)
     target_img_pos = _range_for_slice(video_sl)
     target_audio_pos = _range_for_slice(audio_sl)
-    img_pos = _cat_ranges(ref_img_pos_parts + [target_img_pos])
+    img_pos = _cat_ranges([keyframe_img_pos] + ref_img_pos_parts + [target_img_pos])
     audio_pos = _cat_ranges(ref_audio_pos_parts + [target_audio_pos])
 
     update_mask = torch.zeros(img_pos.shape[0], dtype=torch.bool)
-    update_mask[ref_visual_rows:] = True
+    update_mask[keyframe_rows + ref_visual_rows :] = True
     audio_update_mask = torch.zeros(audio_pos.shape[0], dtype=torch.bool)
     audio_update_mask[ref_audio_rows:] = True
     text_pos = torch.arange(0, text_len)
