@@ -67,6 +67,7 @@ class QuantizationConfig(ABC):
 
     # for quantization frameworks with a separate quantized model provided, e.g. Nunchaku
     quantized_model_path: str | None = None
+    checkpoint_uses_native_qkv_layout: bool = False
 
     def __init__(self):
         super().__init__()
