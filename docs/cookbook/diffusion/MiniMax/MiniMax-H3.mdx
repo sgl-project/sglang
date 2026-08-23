@@ -273,8 +273,10 @@ sglang serve \
   --port 30010
 ```
 
-SGLang uses its native static-activation FP8 linear path for attention and
-`fc1`. The checkpoint marks `fc2` for full-precision matrix multiplication, so
+SGLang uses its native static-activation FP8 linear path when the checkpoint
+stores input scales, and automatically uses dynamic activation scaling for
+Comfy FP8 exports that omit them. The checkpoint above marks `fc2` for
+full-precision matrix multiplication, so
 SGLang retains its FP8 storage but materializes and scales one compute-dtype
 `fc2` matrix for each call. This preserves the checkpoint's mixed execution
 contract and low resident weight memory, but that part is slower than a fully
